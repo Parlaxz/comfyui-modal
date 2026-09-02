@@ -3261,12 +3261,116 @@ def _safe_full_trace_artifact(
         }
 
 
-_GOLDEN_PROFILER_MAX_BLOCK_CHARS = 64 * 1024
+def _golden_full_trace_requested() -> bool:
+    """Return the exact deploy-time profiler request, without aliases."""
+    return os.environ.get("COMFYMODAL_V2_FULL_TRACE", "").strip() == "1"
+
+
+def _emit_golden_profiler_lifecycle(
+    lifecycle: str,
+    *,
+    request_id: str = "",
+    status: str,
+    reason: str = "",
+) -> None:
+    """Emit one bounded lifecycle record only for an explicitly armed trace."""
+    if not _golden_full_trace_requested():
+        return
+    print(
+        "[v2.golden_profiler] "
+        f"lifecycle={_golden_profiler_one_line(lifecycle)} "
+        f"request_id={_golden_profiler_one_line(request_id)} "
+        f"status={_golden_profiler_one_line(status)} "
+        f"reason={_golden_profiler_one_line(reason)}",
+        flush=True,
+    )
+
+
+def _golden_sage_provenance(api: Any) -> dict[str, str]:
+    """Project Sage policy fields plus the runtime-observed resolved mode."""
+    configured = os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", "auto")
+    try:
+        from .sage_policy import (
+            resolve_sage_runtime_mode,
+            sage_four_field_identity,
+        )
+
+        _resolved_policy, _reason, effective_input, resolution_source = (
+            resolve_sage_runtime_mode(
+                None,
+                configured,
+                None,
+                golden_flag=True,
+            )
+        )
+        observed = str(getattr(api, "_sage_runtime_mode", "") or "").strip().lower()
+        fields = sage_four_field_identity(
+            configured=configured,
+            effective_input=effective_input,
+            resolution_source=resolution_source,
+            resolved=observed,
+        )
+        return fields
+    except Exception:
+        return {
+            "sage_runtime_mode_configured": str(configured or "auto"),
+            "sage_runtime_mode_effective_input": "auto",
+            "sage_runtime_mode_resolution_source": "unavailable",
+            "sage_runtime_mode_resolved": "missing",
+        }
+
+
+def _emit_golden_diagnostics_config(
+    stage: str,
+    *,
+    api: Any = None,
+    attention_configured: str = "auto",
+    attention_resolved: str = "pending",
+) -> None:
+    """Emit the canonical RX9P-M startup/restore configuration block."""
+    e27_enabled = os.environ.get("COMFYMODAL_V2_E27_FORENSICS", "").strip() == "1"
+    if not (_golden_full_trace_requested() or e27_enabled):
+        return
+    transport_configured = os.environ.get("COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy")
+    try:
+        from .golden_qd_transport import normalize_transport_arm
+
+        transport_resolved = normalize_transport_arm(transport_configured)
+    except Exception:
+        transport_resolved = "invalid"
+    sage = _golden_sage_provenance(api) if api is not None else {
+        "sage_runtime_mode_configured": os.environ.get(
+            "COMFYMODAL_SAGE_RUNTIME_MODE", "auto"
+        ),
+        "sage_runtime_mode_effective_input": "auto",
+        "sage_runtime_mode_resolution_source": "pending",
+        "sage_runtime_mode_resolved": "missing",
+    }
+    print(
+        f"[v2.golden_diagnostics] stage={_golden_profiler_one_line(stage)} "
+        f"full_trace_requested={int(_golden_full_trace_requested())} "
+        f"full_trace_gate={int(_V2_FULL_TRACE_ENABLED)} "
+        f"e27_forensics_requested={int(e27_enabled)} "
+        f"e27_forensics_gate={int(e27_enabled)} "
+        f"transport_configured={_golden_profiler_one_line(transport_configured)} "
+        f"transport_resolved={_golden_profiler_one_line(transport_resolved)} "
+        f"static_e27_arm={int(transport_resolved == 'static_e27')} "
+        f"attention_backend_configured={_golden_profiler_one_line(attention_configured)} "
+        f"attention_backend_resolved={_golden_profiler_one_line(attention_resolved)} "
+        + " ".join(
+            f"{key}={_golden_profiler_one_line(value)}"
+            for key, value in sage.items()
+        ),
+        flush=True,
+    )
 
 
 def _golden_profiler_one_line(value: Any) -> str:
     """Keep scalar profiler fields on one bounded stdout line."""
-    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    return text if len(text) <= _GOLDEN_LOG_VALUE_LIMIT else (
+        text[: _GOLDEN_LOG_VALUE_LIMIT - 3] + "..."
+    )
 
 
 def _golden_profiler_number(value: Any) -> float | None:
@@ -3316,6 +3420,10 @@ def _emit_golden_profiler_block(
         gantt_reason = ""
         try:
             gantt = gantt_path.read_text(encoding="utf-8")
+            # ``read_text`` normally performs universal-newline conversion;
+            # keep the contract explicit for test doubles and other Path-like
+            # implementations.  No other transformation is allowed.
+            gantt = gantt.replace("\r\n", "\n").replace("\r", "\n")
         except FileNotFoundError:
             gantt_reason = f"missing file: {gantt_path}"
         except Exception as exc:
@@ -3325,6 +3433,55 @@ def _emit_golden_profiler_block(
             "[v2.golden_profiler] BEGIN",
             f"REQUEST_ID={_golden_profiler_one_line(request_id)}",
         ]
+        summary_root = (
+            summary.get("root")
+            if isinstance(summary, Mapping) and isinstance(summary.get("root"), Mapping)
+            else {}
+        )
+        # These are the canonical acceptance fields.  They are projections of
+        # persisted summary/descriptor data only; in particular, do not infer
+        # profiler facts from live objects or inline raw JSON in the log.
+        canonical_root_wall = (
+            summary.get("GOLDEN_PROFILE_ROOT_WALL_MS")
+            if isinstance(summary, Mapping)
+            else None
+        )
+        if canonical_root_wall is None:
+            canonical_root_wall = summary_root.get("wall_ms")
+        canonical_trace_events = artifact.get("trace_entry_count")
+        if canonical_trace_events is None and isinstance(summary, Mapping):
+            canonical_trace_events = summary.get("trace_entry_count")
+        canonical_trace_truncated = artifact.get("trace_truncated")
+        if canonical_trace_truncated is None and isinstance(summary, Mapping):
+            completeness = summary.get("completeness")
+            if isinstance(completeness, Mapping):
+                canonical_trace_truncated = completeness.get("trace_truncated")
+        canonical_needs_decomposition = (
+            summary.get("GOLDEN_PROFILE_NEEDS_DECOMPOSITION")
+            if isinstance(summary, Mapping)
+            else None
+        )
+        canonical = {
+            "ROOT": "golden_serial_execute",
+            "ROOT_WALL_MS": canonical_root_wall,
+            "TRACE_EVENTS": canonical_trace_events,
+            "TRACE_TRUNCATED": canonical_trace_truncated,
+            "NEEDS_DECOMPOSITION": canonical_needs_decomposition,
+            "RAW_TRACE_PATH": base_dir / "raw" / "viztracer.json.gz",
+            "SUMMARY_PATH": summary_path,
+            "REPORT_PATH": derived_dir / "golden_profile_report.md",
+            "GANTT_PATH": gantt_path,
+            "BUNDLE_PATH": artifact.get("remote_bundle_path"),
+            "BUNDLE_BYTES": artifact.get("bundle_size_bytes"),
+        }
+        lines.extend(
+            f"{key}={_golden_profiler_one_line(value if value is not None else 'measurement_unavailable')}"
+            for key, value in canonical.items()
+        )
+        lines.extend([
+            f"MODAL_LOG_GANTT_PRESENT={'YES' if gantt is not None else 'NO'}",
+            f"MODAL_GANTT_MATCH={'YES' if gantt is not None else 'NO'}",
+        ])
         if summary is None:
             lines.append(f"SUMMARY_AVAILABLE=NO reason={_golden_profiler_one_line(summary_reason)}")
         else:
@@ -3450,7 +3607,6 @@ def _emit_golden_profiler_block(
             "ARTIFACT_STATUS=" + _golden_profiler_one_line(artifact.get("status", "")),
             "ARTIFACT_DESCRIPTOR_PATH=" + _golden_profiler_one_line(artifact.get("remote_descriptor_path", "")),
             "ARTIFACT_BUNDLE_PATH=" + _golden_profiler_one_line(artifact.get("remote_bundle_path", "")),
-            "ARTIFACT_DESCRIPTOR=" + json.dumps(dict(artifact), sort_keys=True, separators=(",", ":"), default=str),
             f"GOLDEN_PROFILE_SUMMARY_PATH={_golden_profiler_one_line(summary_path)}",
             f"GOLDEN_PROFILE_GANTT_PATH={_golden_profiler_one_line(gantt_path)}",
         ])
@@ -3464,35 +3620,186 @@ def _emit_golden_profiler_block(
             block = prefix + "[v2.golden_profiler] END\n"
         else:
             block = prefix + "GANTT_BEGIN\n" + gantt
-            if not block.endswith("\n"):
-                block += "\n"
             block += "GANTT_END\n[v2.golden_profiler] END\n"
-
-        if len(block) > _GOLDEN_PROFILER_MAX_BLOCK_CHARS:
-            # Keep the delimiters visible if a malformed report or descriptor
-            # contains unexpectedly large derived content.
-            marker = "GOLDEN_PROFILER_TRUNCATED=YES reason=profiler block limit exceeded\n"
-            end = "GANTT_END\n[v2.golden_profiler] END\n"
-            if len(prefix) + len(marker) + len(end) > _GOLDEN_PROFILER_MAX_BLOCK_CHARS:
-                prefix_budget = max(0, _GOLDEN_PROFILER_MAX_BLOCK_CHARS - len(marker) - len(end))
-                block = prefix[:prefix_budget] + marker + end
-            else:
-                budget = _GOLDEN_PROFILER_MAX_BLOCK_CHARS - len(prefix) - len(marker) - len(end)
-                block = prefix + marker + (gantt or "")[:budget] + end
         print(block, end="", flush=True)
     except Exception as exc:
         # Diagnostics are strictly subordinate to the request result/error.
         try:
             print(
-                "[v2.golden_profiler] BEGIN\n"
+                "[v2.golden_profiler] ERROR\n"
                 f"REQUEST_ID={_golden_profiler_one_line(request_id)}\n"
                 f"GOLDEN_PROFILER_RENDER_ERROR={type(exc).__name__}: {_golden_profiler_one_line(exc)}\n"
-                "[v2.golden_profiler] END\n",
+                "GOLDEN_PROFILER_BLOCK_READY=NO\n",
                 end="",
                 flush=True,
             )
         except Exception:
             pass
+
+
+_E27_MEASUREMENT_UNAVAILABLE = "measurement_unavailable"
+
+
+def _find_persisted_e27_evidence(
+    telemetry: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None, str]:
+    """Find only persisted physical-source/evaluator projections.
+
+    Golden stage details nest transport diagnostics differently across the
+    legacy and dispatcher arms.  Walk those JSON-shaped containers without
+    consulting live transport state or recomputing the evaluator.
+    """
+    actual: Mapping[str, Any] | None = None
+    evaluator: Mapping[str, Any] | None = None
+    raw_path = ""
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal actual, evaluator, raw_path
+        if depth > 8 or not isinstance(value, Mapping):
+            return
+        candidate = value.get("actual_source")
+        if actual is None and isinstance(candidate, Mapping):
+            actual = candidate
+        candidate = value.get("actual_source_telemetry")
+        if actual is None and isinstance(candidate, Mapping):
+            actual = candidate
+        candidate = value.get("e27_source_mechanism_evaluation")
+        if evaluator is None and isinstance(candidate, Mapping):
+            evaluator = candidate
+        for key in ("RAW_EVIDENCE_PATH", "raw_evidence_path", "e27_raw_evidence_path"):
+            if not raw_path and isinstance(value.get(key), str) and value[key].strip():
+                raw_path = value[key].strip()
+        for key in (
+            "stages", "details", "dispatcher_telemetry", "transport_telemetry",
+            "transport_stats", "transport", "stats",
+            "actual_source", "actual_source_telemetry",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, depth + 1)
+            elif isinstance(child, list):
+                for item in child[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+                    visit(item, depth + 1)
+
+    visit(telemetry)
+    return actual, evaluator, raw_path
+
+
+def _e27_projection_value(report: Mapping[str, Any] | None, key: str) -> Any:
+    if not isinstance(report, Mapping) or key not in report or report[key] is None:
+        return _E27_MEASUREMENT_UNAVAILABLE
+    return report[key]
+
+
+def _emit_e27_forensics_block(
+    telemetry: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Print a bounded projection of persisted direct-Golden E27 evidence.
+
+    This formatter is intentionally inert unless E27 was explicitly requested.
+    Its return value is copied onto the terminal result/error so an unavailable
+    requested diagnostic remains a failure descriptor rather than a silent
+    success.
+    """
+    if os.environ.get("COMFYMODAL_V2_E27_FORENSICS", "").strip() != "1":
+        return {}
+
+    actual, evaluator, raw_path = _find_persisted_e27_evidence(telemetry)
+    events = actual.get("actual_source_events") if isinstance(actual, Mapping) else None
+    events = events if isinstance(events, list) else []
+    evidence_available = bool(actual is not None and events)
+    if not evidence_available:
+        failure_reason = (
+            "physical_actual_source_report_unavailable"
+            if actual is None
+            else "physical_actual_source_events_unavailable"
+        )
+    elif evaluator is None:
+        failure_reason = "evaluator_result_unavailable"
+    else:
+        failure_reason = ""
+
+    observed_producers = {
+        str(event.get("producer_id"))
+        for event in events
+        if isinstance(event, Mapping) and event.get("producer_id") is not None
+    }
+    def byte_total(key: str) -> int | str:
+        total = 0
+        saw_value = False
+        for event in events:
+            if not isinstance(event, Mapping) or event.get(key) is None:
+                continue
+            try:
+                total += int(event[key])
+                saw_value = True
+            except (TypeError, ValueError, OverflowError):
+                return _E27_MEASUREMENT_UNAVAILABLE
+        return total if saw_value else _E27_MEASUREMENT_UNAVAILABLE
+
+    requested_bytes = byte_total("requested_bytes")
+    returned_bytes = byte_total("returned_bytes")
+    topology = actual.get("topology") if isinstance(actual, Mapping) else None
+    topology = topology if isinstance(topology, Mapping) else {}
+    qd = actual.get("qd_occupancy_ms") if isinstance(actual, Mapping) else None
+    qd = qd if isinstance(qd, Mapping) else {}
+    h2d = actual.get("h2d_events") if isinstance(actual, Mapping) else None
+    h2d = h2d if isinstance(h2d, list) else None
+
+    proof = "NO"
+    if evidence_available and isinstance(evaluator, Mapping):
+        proof = str(evaluator.get("E27_SOURCE_MECHANISM_PROVEN", "NO")).upper()
+        if proof != "YES":
+            proof = "NO"
+    failed = evaluator.get("failed_predicates") if isinstance(evaluator, Mapping) else []
+    failed = [str(item) for item in failed] if isinstance(failed, list) else []
+    if proof == "NO" and not failure_reason and failed:
+        failure_reason = "evaluator_failed_predicates"
+    if proof == "NO" and not failure_reason:
+        failure_reason = "evaluator_did_not_prove_source_mechanism"
+
+    lines = [
+        "[v2.e27] BEGIN",
+        f"STATIC_ARM_ACTIVE={'YES' if isinstance(actual, Mapping) and actual.get('arm') == 'static_e27' else 'NO'}",
+        f"STATIC_ARM={_golden_profiler_one_line(_e27_projection_value(actual, 'arm'))}",
+        f"EXPECTED_PRODUCER_COUNT={_golden_profiler_one_line(_e27_projection_value(actual, 'producer_count'))}",
+        f"OBSERVED_PRODUCER_COUNT={_golden_profiler_one_line(len(observed_producers) if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"PHYSICAL_READ_COUNT={_golden_profiler_one_line(len(events) if actual is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"REQUESTED_BYTES={_golden_profiler_one_line(requested_bytes if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"RETURNED_BYTES={_golden_profiler_one_line(returned_bytes if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"SOURCE_QD_MAX={_golden_profiler_one_line(_e27_projection_value(actual, 'max_actual_source_inflight'))}",
+        f"SOURCE_QD_MEAN={_golden_profiler_one_line(_e27_projection_value(actual, 'time_weighted_mean_qd'))}",
+        f"SOURCE_QD4_MS={_golden_profiler_one_line(qd.get('4', _E27_MEASUREMENT_UNAVAILABLE))}",
+        f"H2D_SUBMISSIONS={_golden_profiler_one_line(len(h2d) if h2d is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"H2D_COMPLETIONS={_golden_profiler_one_line(sum(isinstance(row, Mapping) and row.get('complete_ns') is not None for row in h2d) if h2d is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"H2D_SUBMITTED_BYTES={_golden_profiler_one_line(_e27_projection_value(actual, 'h2d_submitted_bytes'))}",
+        f"H2D_COMPLETED_BYTES={_golden_profiler_one_line(_e27_projection_value(actual, 'h2d_completed_bytes'))}",
+        f"H2D_TOTAL_WALL_MS={_golden_profiler_one_line(_e27_projection_value(actual, 'H2D_TOTAL_WALL_MS'))}",
+        f"FALLBACK={_golden_profiler_one_line(_e27_projection_value(actual, 'fallback'))}",
+        f"POISON={_golden_profiler_one_line(_e27_projection_value(actual, 'poison'))}",
+        f"QUIESCENCE={_golden_profiler_one_line(_e27_projection_value(actual, 'quiescence'))}",
+        f"REGION_COVERAGE={_golden_profiler_one_line(_e27_projection_value(topology, 'coverage_exact'))}",
+        f"REGION_GAPS={_golden_profiler_one_line(_e27_projection_value(topology, 'gaps'))}",
+        f"REGION_OVERLAPS={_golden_profiler_one_line(_e27_projection_value(topology, 'overlaps'))}",
+        f"REGION_DUPLICATES={_golden_profiler_one_line(_e27_projection_value(topology, 'unexpected_duplicates'))}",
+        f"E27_EVIDENCE_AVAILABLE={'YES' if evidence_available else 'NO'}",
+        f"E27_RAW_PHYSICAL_EVIDENCE_PRESENT={'YES' if evidence_available else 'NO'}",
+        f"E27_FAILURE_REASON={_golden_profiler_one_line(failure_reason or _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"E27_SOURCE_MECHANISM_PROVEN={proof}",
+        f"RAW_EVIDENCE_PATH={_golden_profiler_one_line(raw_path or _E27_MEASUREMENT_UNAVAILABLE)}",
+    ]
+    if proof == "NO":
+        lines.extend(
+            f"E27_FAILED_PREDICATE={_golden_profiler_one_line(predicate)}"
+            for predicate in failed
+        )
+    lines.append("[v2.e27] END")
+    print("\n".join(lines) + "\n", end="", flush=True)
+    return {
+        "E27_EVIDENCE_AVAILABLE": "YES" if evidence_available else "NO",
+        "E27_FAILURE_REASON": failure_reason or _E27_MEASUREMENT_UNAVAILABLE,
+        "E27_SOURCE_MECHANISM_PROVEN": proof,
+    }
 
 
 def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
@@ -11634,6 +11941,59 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        # The full-trace selector is a deploy-time restore contract.  Create
+        # the session before the first timestamp or restore helper so a late
+        # request override cannot manufacture restore coverage.
+        _full_trace_requested_at_restore = _golden_full_trace_requested()
+        self._full_trace_requested_at_restore = _full_trace_requested_at_restore
+        self._full_trace_session = None
+        self._full_trace_activation_status = "disabled"
+        self._full_trace_activation_reason = (
+            "gate_not_set" if not _full_trace_requested_at_restore else ""
+        )
+        _full_trace_started = False
+        _full_trace_error: str | None = None
+        if _full_trace_requested_at_restore:
+            try:
+                from .full_execution_trace import FullExecutionTraceSession as _FT
+
+                _FT.reset_instance()
+                _ft = _FT.create_if_enabled(
+                    container_session_id=(
+                        getattr(self, "container_session_id", "")
+                        or _V2_CONTAINER_SESSION_ID
+                    ),
+                )
+                self._full_trace_session = _ft
+                if _ft is None:
+                    self._full_trace_activation_status = "error"
+                    self._full_trace_activation_reason = "session_not_created"
+                    _full_trace_error = "session_not_created"
+                    _emit_golden_profiler_lifecycle(
+                        "session_create", request_id="", status="error",
+                        reason="session_not_created",
+                    )
+                else:
+                    self._full_trace_activation_status = "created"
+                    _emit_golden_profiler_lifecycle(
+                        "session_create", request_id="", status="ok",
+                        reason="restore_entry",
+                    )
+                    _ft.start_restore()
+                    _full_trace_started = True
+                    _emit_golden_profiler_lifecycle(
+                        "restore_trace_start", request_id="", status="ok",
+                        reason="restore_entry",
+                    )
+            except Exception as _ft_start_exc:
+                _full_trace_error = type(_ft_start_exc).__name__
+                self._full_trace_activation_status = "error"
+                self._full_trace_activation_reason = _full_trace_error
+                self._full_trace_session = None
+                _emit_golden_profiler_lifecycle(
+                    "session_create", request_id="", status="error",
+                    reason=_full_trace_error,
+                )
         # ── Remote resume / restore method boundary timestamps ──────────
         # Captured at the TRUE first executable line of restore() so the
         # Modal-scheduling-before-Python-resumes gap (submission → this
@@ -11648,6 +12008,7 @@ class ModalRuntimeEntrypoint:
         # authoritative resume boundary so it cannot contaminate scheduling
         # measurements.
         sync_observability_gates()
+        _emit_golden_diagnostics_config("restore", api=self)
         # ── E29: canonical ledger restore boundary ──────────────────────────
         # Record the modal_app restore() entry on the canonical axis (the
         # true first executable line of the remote restore lifecycle), and
@@ -11926,50 +12287,6 @@ class ModalRuntimeEntrypoint:
                 phase="restore",
             )
 
-        # ── Full-trace session: FIRST executable operation (before timestamp
-        #    capture, residency log, sampler, memory report, _configure_runtime,
-        #    identity capture, reload, GPU state, CUDA work).  Start with only
-        #    container identity; update_identity is called after restore_session_id
-        #    exists. ──
-        if _V2_FULL_TRACE_ENABLED:
-            try:
-                from .full_execution_trace import FullExecutionTraceSession as _FT
-                _ft = self._full_trace_session
-                if _ft is not None:
-                    try:
-                        if _ft.state not in ("trace_stopped", "failed"):
-                            _ft.stop_tracing()
-                    except Exception:
-                        pass
-                _FT.reset_instance()
-                _ft = _FT.create_if_enabled(
-                    container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
-                )
-                self._full_trace_session = _ft
-                if _ft is not None:
-                    try:
-                        _ft.start_restore()
-                        print(
-                            f"[v2.full_trace] stage=restore_entry "
-                            f"status=started trace_id={_ft.trace_id}",
-                            flush=True,
-                        )
-                    except Exception as _ft_start_exc:
-                        print(
-                            f"[v2.full_trace] stage=restore_entry "
-                            f"status=error error_type={type(_ft_start_exc).__name__}",
-                            flush=True,
-                        )
-                        self._full_trace_session = None
-            except Exception as _ft_exc:
-                print(
-                    f"[v2.full_trace] stage=restore_entry "
-                    f"status=error error_type={type(_ft_exc).__name__}",
-                    flush=True,
-                )
-                self._full_trace_session = None
-        _full_trace_started = False
-        _full_trace_error: str | None = None
         _restore_status: str = "unknown"
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
@@ -21736,6 +22053,25 @@ class ModalRuntimeEntrypoint:
         golden_trace_summary: dict[str, Any] = {}
         _full_trace_claimed = False
         _full_trace_op_id = ""
+        _restore_trace_contract = getattr(
+            self, "_full_trace_requested_at_restore", None
+        )
+        # Compatibility for direct local harnesses that inject a prepared
+        # trace session instead of invoking restore(); real restored instances
+        # always carry the explicit boolean set at restore entry.
+        _full_trace_requested_at_restore = (
+            _golden_full_trace_requested()
+            and getattr(self, "_full_trace_session", None) is not None
+            if _restore_trace_contract is None
+            else bool(_restore_trace_contract)
+        )
+        _full_trace_session_available = bool(
+            _full_trace_requested_at_restore
+            and getattr(self, "_full_trace_session", None) is not None
+        )
+        _full_trace_failure_reason = str(
+            getattr(self, "_full_trace_activation_reason", "") or ""
+        )
         try:
             if not isinstance(request, Mapping):
                 raise ValueError("golden_request_must_be_mapping")
@@ -21766,8 +22102,20 @@ class ModalRuntimeEntrypoint:
                 host_info=_capture_host_info(),
             )
             identity_telemetry["attention_backend"] = attention_backend
+            identity_telemetry["attention_backend_configured"] = (
+                attention_backend or "auto"
+            )
             identity_telemetry["output_durability_mode"] = output_policy.mode
             identity_telemetry["durability_requested"] = output_policy.durability_requested
+            identity_telemetry.update(
+                _golden_sage_provenance(getattr(self, "_legacy_api", self))
+            )
+            _emit_golden_diagnostics_config(
+                "request",
+                api=getattr(self, "_legacy_api", self),
+                attention_configured=attention_backend or "auto",
+                attention_resolved="pending",
+            )
 
             # Sanitized request id for the local telemetry path: keep only
             # path-safe characters and refuse traversal outside the golden dir.
@@ -21865,7 +22213,7 @@ class ModalRuntimeEntrypoint:
                 }
                 return
 
-            if _V2_FULL_TRACE_ENABLED:
+            if _full_trace_requested_at_restore and _full_trace_session_available:
                 _ft_config = getattr(self, "_full_trace_session", None)
                 _update_trace_config = getattr(
                     _ft_config, "update_trace_config", None
@@ -21883,12 +22231,16 @@ class ModalRuntimeEntrypoint:
             # Direct Golden owns its request lifecycle, so claim the full trace
             # only after the request id has passed containment validation and
             # immediately before any readiness or model work.
-            if _V2_FULL_TRACE_ENABLED:
+            if _full_trace_requested_at_restore:
                 _ft = getattr(self, "_full_trace_session", None)
-                if _ft is not None:
+                if _ft is not None and _full_trace_session_available:
                     try:
                         if _ft.claim_first_request(normalized_request_id):
                             _full_trace_claimed = True
+                            _emit_golden_profiler_lifecycle(
+                                "request_claim", request_id=normalized_request_id,
+                                status="claimed", reason="first_request",
+                            )
                             try:
                                 _ft.capture_milestone("golden_request_entry")
                             except BaseException as _ft_entry_exc:
@@ -21909,12 +22261,44 @@ class ModalRuntimeEntrypoint:
                                     f"status=error error_type={type(_ft_op_exc).__name__}",
                                     flush=True,
                                 )
+                            if _full_trace_op_id:
+                                _emit_golden_profiler_lifecycle(
+                                    "request_trace_start",
+                                    request_id=normalized_request_id,
+                                    status="ok", reason="request_claimed",
+                                )
+                            else:
+                                _full_trace_failure_reason = "operation_not_started"
+                                _emit_golden_profiler_lifecycle(
+                                    "request_trace_start",
+                                    request_id=normalized_request_id,
+                                    status="error", reason="operation_not_started",
+                                )
+                        else:
+                            _full_trace_failure_reason = "claim_rejected"
+                            _emit_golden_profiler_lifecycle(
+                                "request_claim", request_id=normalized_request_id,
+                                status="rejected", reason="claim_rejected",
+                            )
                     except BaseException as _ft_claim_exc:
+                        _full_trace_failure_reason = type(_ft_claim_exc).__name__
+                        _emit_golden_profiler_lifecycle(
+                            "request_claim", request_id=normalized_request_id,
+                            status="error", reason=_full_trace_failure_reason,
+                        )
                         print(
                             f"[v2.full_trace] stage=claim_first_request "
                             f"status=error error_type={type(_ft_claim_exc).__name__}",
                             flush=True,
                         )
+                else:
+                    _full_trace_failure_reason = (
+                        _full_trace_failure_reason or "restore_session_unavailable"
+                    )
+                    _emit_golden_profiler_lifecycle(
+                        "request_claim", request_id=normalized_request_id,
+                        status="error", reason=_full_trace_failure_reason,
+                    )
 
             # Golden bypasses the normal ComfyUI request entrypoints, so it
             # must perform the deferred GPU reattachment check itself.  Use
@@ -21931,6 +22315,14 @@ class ModalRuntimeEntrypoint:
             ensure_gpu_ready()
 
             golden_extra_data = dict(extra_data_raw)
+            golden_extra_data.update(
+                {
+                    key: value
+                    for key, value in identity_telemetry.items()
+                    if key.startswith("sage_runtime_mode_")
+                    or key == "attention_backend_configured"
+                }
+            )
             if resolve_clip_residency() == "fp32_cast_once":
                 golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
                     prompt, extra_data_raw,
@@ -22050,6 +22442,10 @@ class ModalRuntimeEntrypoint:
                                 )
                             except BaseException:
                                 pass
+                        _emit_golden_profiler_lifecycle(
+                            "request_trace_stop", request_id=rid,
+                            status="error", reason=type(exc).__name__,
+                        )
                         _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
                             "profile_volume"
                         )
@@ -22073,6 +22469,15 @@ class ModalRuntimeEntrypoint:
                                 )
                             except BaseException:
                                 pass
+                        _emit_golden_profiler_lifecycle(
+                            "finalize", request_id=rid,
+                            status=str(_error_artifact.get("status", "error")),
+                            reason=(
+                                "artifact_ready"
+                                if _error_artifact.get("status") == "ready"
+                                else str(_error_artifact.get("error", "artifact_unavailable"))
+                            ),
+                        )
                 except BaseException as _ft_error_exc:
                     _error_artifact = {
                         "status": "error",
@@ -22084,6 +22489,22 @@ class ModalRuntimeEntrypoint:
                     }
                 error_event["full_trace_artifact"] = _error_artifact
                 _full_trace_claimed = False
+            elif _golden_full_trace_requested():
+                error_event["full_trace_diagnostic"] = {
+                    "requested": True,
+                    "requested_at_restore": _full_trace_requested_at_restore,
+                    "session_created": _full_trace_session_available,
+                    "claimed": False,
+                    "status": "unavailable",
+                    "reason": (
+                        _full_trace_failure_reason
+                        or "trace_not_enabled_at_restore"
+                    ),
+                }
+                error_event["full_trace_requested"] = True
+                error_event["full_trace_failure_reason"] = (
+                    error_event["full_trace_diagnostic"]["reason"]
+                )
             if isinstance(locals().get("activation_evidence"), dict):
                 error_event["golden_activation"] = locals()["activation_evidence"]
             if identity_telemetry:
@@ -22098,6 +22519,7 @@ class ModalRuntimeEntrypoint:
                 call_end_mono_ns=golden_call_end_mono_ns,
             )
             error_event["golden_adapter_timing"] = timing
+            error_event.update(_emit_e27_forensics_block(telemetry))
             if telemetry is not None:
                 error_event["golden_telemetry"] = telemetry
                 _emit_golden_waterfall(telemetry, timing=timing)
@@ -22147,6 +22569,29 @@ class ModalRuntimeEntrypoint:
         # result or error documents without relying on stdout.
         result_data["identity"] = dict(identity_telemetry)
         result_data["golden_identity"] = dict(identity_telemetry)
+        result_data.update(
+            {
+                key: value
+                for key, value in identity_telemetry.items()
+                if key.startswith("sage_runtime_mode_")
+                or key in {"attention_backend_configured"}
+            }
+        )
+        result_data["full_trace_diagnostic"] = {
+            "requested": bool(_golden_full_trace_requested()),
+            "requested_at_restore": _full_trace_requested_at_restore,
+            "session_created": _full_trace_session_available,
+            "claimed": _full_trace_claimed,
+            "status": "claimed" if _full_trace_claimed else (
+                "unavailable" if _golden_full_trace_requested() else "disabled"
+            ),
+            "reason": "" if _full_trace_claimed else (
+                _full_trace_failure_reason
+                or ("trace_not_enabled_at_restore" if _golden_full_trace_requested() else "gate_not_set")
+            ),
+        }
+        result_data["full_trace_requested"] = result_data["full_trace_diagnostic"]["requested"]
+        result_data["full_trace_failure_reason"] = result_data["full_trace_diagnostic"]["reason"]
         if _full_trace_claimed:
             result_data.update(golden_trace_summary)
         _terminal_timing = {
@@ -22183,8 +22628,15 @@ class ModalRuntimeEntrypoint:
             telemetry_persist_ms=getattr(result, "telemetry_persist_ms", None),
         )
         result_data["golden_adapter_timing"] = timing
+        result_data.update(_emit_e27_forensics_block(telemetry))
         if telemetry is not None:
             result_data["golden_telemetry"] = telemetry
+            observed_attention = str(
+                telemetry.get("attention_backend_resolved", "missing")
+            )
+            result_data["attention_backend_resolved"] = observed_attention
+            result_data["identity"]["attention_backend_resolved"] = observed_attention
+            result_data["golden_identity"]["attention_backend_resolved"] = observed_attention
             _emit_golden_waterfall(telemetry, timing=timing)
         if _full_trace_claimed:
             _artifact_fin: dict[str, Any] = {"status": "absent"}
@@ -22204,6 +22656,10 @@ class ModalRuntimeEntrypoint:
                             _ft_fin.operation_end(_full_trace_op_id, status="ok")
                         except BaseException:
                             pass
+                    _emit_golden_profiler_lifecycle(
+                        "request_trace_stop", request_id=normalized_request_id,
+                        status="ok", reason="golden_return",
+                    )
                     _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
                         "profile_volume"
                     )
@@ -22232,8 +22688,25 @@ class ModalRuntimeEntrypoint:
                     "error_type": type(_ft_fin_exc).__name__,
                     "error": "full trace finalization failed",
                 }
+            _emit_golden_profiler_lifecycle(
+                "finalize", request_id=normalized_request_id,
+                status=str(_artifact_fin.get("status", "error")),
+                reason=(
+                    "artifact_ready"
+                    if _artifact_fin.get("status") == "ready"
+                    else str(_artifact_fin.get("error", "artifact_unavailable"))
+                ),
+            )
             result_data["full_trace_artifact"] = _artifact_fin
             _full_trace_claimed = False
+            result_data["full_trace_diagnostic"]["status"] = str(
+                _artifact_fin.get("status", "error")
+            )
+            result_data["full_trace_diagnostic"]["reason"] = (
+                "artifact_ready"
+                if _artifact_fin.get("status") == "ready"
+                else str(_artifact_fin.get("error", "artifact_unavailable"))
+            )
         if telemetry is None and telemetry_error:
             result_data["golden_telemetry_error"] = telemetry_error
         _yield_wall_unix_ns = time.time_ns()

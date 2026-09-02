@@ -732,6 +732,108 @@ class FullTraceV2GapsTest(unittest.TestCase):
         self.assertIn("GANTT_AVAILABLE=NO reason=missing file:", block)
         self.assertTrue(block.endswith("[v2.golden_profiler] END\n"))
 
+    def test_golden_profiler_preserves_exact_persisted_gantt(self) -> None:
+        persisted = ("header\r\n" + "x" * (70 * 1024) + "\r\nfooter")
+        (self._session_dir / "derived" / "golden_profile_summary.json").write_text(
+            json.dumps({
+                "GOLDEN_PROFILE_COMPLETE": "YES",
+                "GOLDEN_PROFILE_ROOT_WALL_MS": 12.5,
+                "GOLDEN_PROFILE_NEEDS_DECOMPOSITION": True,
+                "root": {"wall_ms": 12.5, "needs_decomposition": True},
+            }),
+            encoding="utf-8",
+        )
+        (self._session_dir / "derived" / "golden_profile_gantt.txt").write_text(
+            persisted, encoding="utf-8", newline=""
+        )
+        session = SimpleNamespace(base_dir=self._session_dir)
+        artifact = {
+            "status": "ready",
+            "trace_entry_count": 17,
+            "trace_truncated": False,
+            "remote_bundle_path": "profiles/bundle.tar.gz",
+            "bundle_size_bytes": 123,
+        }
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), \
+             patch.dict(os.environ, {"COMFYMODAL_V2_FULL_TRACE": "1"}, clear=False), \
+             patch("builtins.print") as mock_print:
+            modal_app._emit_golden_profiler_block(session, artifact, "exact-gantt")
+
+        block = mock_print.call_args.args[0]
+        normalized = persisted.replace("\r\n", "\n").replace("\r", "\n")
+        start = block.index("GANTT_BEGIN\n") + len("GANTT_BEGIN\n")
+        end = block.index("GANTT_END\n", start)
+        self.assertEqual(block[start:end], normalized)
+        self.assertNotIn("GOLDEN_PROFILER_TRUNCATED", block)
+        self.assertIn("ROOT=golden_serial_execute", block)
+        self.assertIn("TRACE_EVENTS=17", block)
+        self.assertIn("BUNDLE_BYTES=123", block)
+
+    def test_e27_formatter_emits_failed_predicate_from_persisted_report(self) -> None:
+        telemetry = {
+            "e27_raw_evidence_path": "raw/e27_source_mechanism.json",
+            "stages": [{"details": {"transport_stats": {
+                "actual_source": {
+                    "arm": "static_e27",
+                    "producer_count": 4,
+                    "actual_source_events": [{
+                        "producer_id": 0, "requested_bytes": 8, "returned_bytes": 8,
+                    }],
+                    "max_actual_source_inflight": 1,
+                    "time_weighted_mean_qd": 1.0,
+                    "qd_occupancy_ms": {"4": 0.0},
+                    "h2d_events": [{"complete_ns": 2}],
+                    "h2d_submitted_bytes": 8,
+                    "h2d_completed_bytes": 8,
+                    "H2D_TOTAL_WALL_MS": 1.0,
+                    "fallback": 0,
+                    "poison": 0,
+                    "quiescence": True,
+                    "topology": {
+                        "coverage_exact": False,
+                        "gaps": 1,
+                        "overlaps": 0,
+                        "unexpected_duplicates": 0,
+                    },
+                },
+                "e27_source_mechanism_evaluation": {
+                    "E27_SOURCE_MECHANISM_PROVEN": "NO",
+                    "failed_predicates": ["max_actual_source_inflight", "coverage_exact"],
+                },
+            }}}],
+        }
+        with patch.dict(os.environ, {"COMFYMODAL_V2_E27_FORENSICS": "1"}, clear=False), \
+             patch("builtins.print") as mock_print:
+            projection = modal_app._emit_e27_forensics_block(telemetry)
+
+        block = mock_print.call_args.args[0]
+        self.assertIn("[v2.e27] BEGIN", block)
+        self.assertIn("STATIC_ARM=static_e27", block)
+        self.assertIn("E27_SOURCE_MECHANISM_PROVEN=NO", block)
+        self.assertIn("E27_FAILED_PREDICATE=max_actual_source_inflight", block)
+        self.assertIn("E27_FAILED_PREDICATE=coverage_exact", block)
+        self.assertEqual(projection["E27_EVIDENCE_AVAILABLE"], "YES")
+
+    def test_e27_formatter_is_inert_when_disabled(self) -> None:
+        with patch.dict(os.environ, {"COMFYMODAL_V2_E27_FORENSICS": "0"}, clear=False), \
+             patch("builtins.print") as mock_print:
+            projection = modal_app._emit_e27_forensics_block({})
+        self.assertEqual(projection, {})
+        mock_print.assert_not_called()
+
+    def test_e27_requested_without_physical_evidence_is_explicit_failure(self) -> None:
+        with patch.dict(os.environ, {"COMFYMODAL_V2_E27_FORENSICS": "1"}, clear=False), \
+             patch("builtins.print") as mock_print:
+            projection = modal_app._emit_e27_forensics_block(None)
+        block = mock_print.call_args.args[0]
+        self.assertIn("[v2.e27] BEGIN", block)
+        self.assertIn("E27_EVIDENCE_AVAILABLE=NO", block)
+        self.assertIn(
+            "E27_FAILURE_REASON=physical_actual_source_report_unavailable", block
+        )
+        self.assertIn("E27_SOURCE_MECHANISM_PROVEN=NO", block)
+        self.assertEqual(projection["E27_EVIDENCE_AVAILABLE"], "NO")
+
 
 if __name__ == "__main__":
     unittest.main()

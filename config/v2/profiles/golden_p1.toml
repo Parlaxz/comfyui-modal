@@ -55,9 +55,13 @@ COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
 COMFYMODAL_SAMPLING_DEEP_PROFILE = "off"
-COMFYMODAL_GOLDEN_QD_TRANSPORT = "legacy"
 COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "0"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+# RX9P-M diagnostic profile: the profiler and physical E27 source evidence
+# must be armed in the deployed environment, before restore begins.
+COMFYMODAL_V2_FULL_TRACE = "1"
+COMFYMODAL_V2_E27_FORENSICS = "1"
+COMFYMODAL_GOLDEN_QD_TRANSPORT = "static_e27"
 COMFYMODAL_OUTPUT_DURABILITY = "off"
 
 # The Golden request contract requires canonical workflow SHA verification.

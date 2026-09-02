@@ -963,6 +963,26 @@ class GoldenStageInterval:
     details: dict = field(default_factory=dict)
 
 
+def _observed_attention_backend(events: Iterable[Mapping[str, Any]]) -> str:
+    """Map the actual sampler selection event to a public backend name."""
+    observed: set[str] = set()
+    for event in events:
+        if str(event.get("name", "")) != "attention_backend_selection":
+            continue
+        fields = event.get("fields", {})
+        fields = fields if isinstance(fields, Mapping) else event
+        selected = str(fields.get("selected_callable", "")).strip().lower()
+        if "sageattention.sageattn" in selected or selected.endswith(".sageattn"):
+            observed.add("sage")
+        elif "attention_pytorch" in selected:
+            observed.add("pytorch")
+        elif "comfy_kitchen" in selected or "kitchen" in selected:
+            observed.add("comfy_kitchen")
+    return next(iter(observed)) if len(observed) == 1 else (
+        "mixed" if observed else "missing"
+    )
+
+
 class GoldenTelemetryRecorder:
     """Authoritative stage-interval telemetry.
 
@@ -1247,6 +1267,13 @@ class GoldenTelemetryRecorder:
             payload["run_identity"] = dict(run_identity)
         named_telemetry = copy.deepcopy(self.clip_residency_telemetry)
         payload.update(named_telemetry)
+        configured_attention = str(
+            (run_identity or {}).get("attention_backend_configured", "auto")
+        ) if isinstance(run_identity, dict) else "auto"
+        payload["attention_backend_configured"] = configured_attention
+        payload["attention_backend_resolved"] = _observed_attention_backend(
+            self._events
+        )
         diagnostics = self.sampling_diagnostics
         if diagnostics is not None:
             payload["sampling_diagnostics"] = diagnostics.to_json_dict()
@@ -4811,6 +4838,8 @@ class GoldenFinalResult:
     # intentionally not part of any stage interval.
     telemetry_persist_ms: Optional[float] = None
     attention_backend: Optional[str] = None
+    attention_backend_configured: str = "auto"
+    attention_backend_resolved: str = "missing"
     run_identity: dict = field(default_factory=dict)
     output_durability_mode: str = "off"
     durability_requested: bool = False
@@ -4958,12 +4987,26 @@ class GoldenSession:
             "request_id": str(request.request_id),
             "workflow_sha256": canonical_workflow_sha256(request.prompt),
             "attention_backend": request.attention_backend,
+            "attention_backend_configured": request.attention_backend or "auto",
             "qd_transport_arm": self.qd_transport_arm,
             "clip_residency": self.clip_residency,
             "clip_residency_requested": self.clip_residency,
             "clip_residency_effective": self.clip_residency,
             "clip_source_identity_supplied": bool(self.clip_source_identity),
         }
+        if isinstance(request.extra_data, Mapping):
+            self.run_identity.update(
+                {
+                    key: str(request.extra_data[key])
+                    for key in (
+                        "sage_runtime_mode_configured",
+                        "sage_runtime_mode_effective_input",
+                        "sage_runtime_mode_resolution_source",
+                        "sage_runtime_mode_resolved",
+                    )
+                    if key in request.extra_data
+                }
+            )
         self.recorder.event("golden_qd_transport_selector", arm=self.qd_transport_arm)
         self.recorder.run_identity = dict(self.run_identity)
 
@@ -5041,6 +5084,14 @@ class GoldenSession:
             executed_nodes=list(self.runner.executed_summary()) if self.runner else [],
             restore_observation=dict(getattr(self.recorder, "_external_restore", {})),
             attention_backend=self.request.attention_backend,
+            attention_backend_configured=str(
+                getattr(self, "run_identity", {}).get(
+                    "attention_backend_configured", "auto"
+                )
+            ),
+            attention_backend_resolved=_observed_attention_backend(
+                self.recorder.events
+            ),
             run_identity=dict(getattr(self, "run_identity", {})),
             output_durability_mode=output_mode,
             durability_requested=durability_requested,
