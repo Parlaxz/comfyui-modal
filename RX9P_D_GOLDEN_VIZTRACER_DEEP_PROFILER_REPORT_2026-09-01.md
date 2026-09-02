@@ -54,7 +54,7 @@ Normal pytest collection is no longer blocked. Persisted successful suites:
 
 The previous four Torch/Kineto failures reported pre-reconciliation are no longer present after reconciliation; `test_v2_full_execution_trace` now passes 167/167.
 
-`python -m py_compile` on changed D files passes; `git diff --check` clean (canonical `tools/v2_control/cli.py` syntax issue remains as in `9024bbc`, not introduced by D).
+`python -m py_compile` on changed D files passes; `git diff --check` clean; `tools/v2_control/cli.py` compiles cleanly on canonical TESTING2 and the reconciled D branch. The earlier apparent null-byte/BadGzipFile/syntax failure was an audit-harness artifact caused by PowerShell UTF-16LE output redirection, not a repository syntax defect.
 
 ## Independent reconciled-branch audit (RX9P-E)
 
