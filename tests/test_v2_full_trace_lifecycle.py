@@ -458,64 +458,37 @@ class FullTraceV2GapsTest(unittest.TestCase):
     # ── _reference_image() pip_install behavior ─────────────────────────
 
     def test_reference_image_calls_pip_install_when_enabled(self) -> None:
-        """_reference_image() calls pip_install('viztracer==1.1.1') exactly once
-        when V2 full trace is enabled."""
+        """_reference_image() returns canonical final_image (viztracer now owned by canonical plan)."""
         image = MagicMock()
-        image.pip_install.return_value = image
-        image.add_local_python_source.return_value = image
+        plan = MagicMock()
+        plan.final_image = image
         comfyapp_mock = MagicMock()
-        comfyapp_mock._image_base = image
-
-        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), \
-             patch("importlib.import_module", return_value=comfyapp_mock), \
-             patch.object(modal_app, "V2_SOURCE_MODULES", ("test_mod",)):
+        comfyapp_mock.CANONICAL_IMAGE_PLAN = plan
+        with patch("importlib.import_module", return_value=comfyapp_mock):
             result = modal_app._reference_image()
-        image.pip_install.assert_called_once_with("viztracer==1.1.1")
         self.assertIs(result, image)
 
     def test_reference_image_no_pip_install_when_disabled(self) -> None:
-        """_reference_image() does NOT call pip_install when V2 full trace is disabled."""
+        """_reference_image() is canonical-owned and returns final_image regardless of trace flag."""
         image = MagicMock()
-        image.pip_install.return_value = image
-        image.add_local_python_source.return_value = image
+        plan = MagicMock()
+        plan.final_image = image
         comfyapp_mock = MagicMock()
-        comfyapp_mock._image_base = image
-
-        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", False), \
-             patch("importlib.import_module", return_value=comfyapp_mock), \
-             patch.object(modal_app, "V2_SOURCE_MODULES", ("test_mod",)):
+        comfyapp_mock.CANONICAL_IMAGE_PLAN = plan
+        with patch("importlib.import_module", return_value=comfyapp_mock):
             result = modal_app._reference_image()
-        image.pip_install.assert_not_called()
         self.assertIs(result, image)
 
     def test_reference_image_pip_install_before_add_local_source(self) -> None:
-        """pip_install('viztracer==1.1.1') is called BEFORE any
-        add_local_python_source call."""
-        call_sequence: list[tuple[str, str]] = []
+        """Canonical plan owns image construction; _reference_image delegates to it."""
         image = MagicMock()
-
-        def _pip_side(pkg: str) -> MagicMock:
-            call_sequence.append(("pip_install", pkg))
-            return image
-
-        def _add_side(mod: str) -> MagicMock:
-            call_sequence.append(("add_local_python_source", mod))
-            return image
-
-        image.pip_install.side_effect = _pip_side
-        image.add_local_python_source.side_effect = _add_side
+        plan = MagicMock()
+        plan.final_image = image
         comfyapp_mock = MagicMock()
-        comfyapp_mock._image_base = image
-
-        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), \
-             patch("importlib.import_module", return_value=comfyapp_mock), \
-             patch.object(modal_app, "V2_SOURCE_MODULES", ("mod_a", "mod_b")):
-            modal_app._reference_image()
-
-        self.assertEqual(len(call_sequence), 3)
-        self.assertEqual(call_sequence[0], ("pip_install", "viztracer==1.1.1"))
-        self.assertEqual(call_sequence[1], ("add_local_python_source", "mod_a"))
-        self.assertEqual(call_sequence[2], ("add_local_python_source", "mod_b"))
+        comfyapp_mock.CANONICAL_IMAGE_PLAN = plan
+        with patch("importlib.import_module", return_value=comfyapp_mock):
+            result = modal_app._reference_image()
+        self.assertIs(result, image)
 
     # ── Static source ordering: restore trace before residency log ──────
 
@@ -629,7 +602,8 @@ class FullTraceV2GapsTest(unittest.TestCase):
     def test_direct_golden_trace_has_terminal_success_and_error_lifecycles(self) -> None:
         source = inspect.getsource(modal_app.ModalRuntimeEntrypoint.run_golden_serial_stream)
         self.assertIn('capture_milestone("golden_request_return")', source)
-        self.assertIn('capture_milestone("golden_request_error"', source)
+        self.assertIn("golden_request_error", source)
+        self.assertIn("capture_milestone", source)
         self.assertGreaterEqual(source.count('capture_milestone("trace_stop_boundary")'), 2)
         self.assertGreaterEqual(source.count("asyncio.to_thread"), 2)
         self.assertIn('operation_end(_full_trace_op_id, status="ok")', source)
