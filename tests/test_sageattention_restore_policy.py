@@ -137,6 +137,25 @@ class SageAttentionRestorePolicyTests(unittest.TestCase):
         result = module.get_sage_func("sageattn_qk_int8_pv_fp16_cuda")(q, k, v, heads=8)
         self.assertEqual(result, "pytorch")
 
+    def test_patch_kjnodes_get_sage_func_preserves_explicit_pytorch_selection(self):
+        calls = []
+
+        class FakeModule:
+            attention_pytorch = staticmethod(lambda *args, **kwargs: "pytorch")
+            wrap_attn = staticmethod(lambda fn: fn)
+
+            @staticmethod
+            def get_sage_func(sage_attention, allow_compile=False):
+                calls.append((sage_attention, allow_compile))
+                return lambda *args, **kwargs: "explicit-pytorch"
+
+        module = FakeModule()
+        self.assertTrue(patch_kjnodes_get_sage_func(module, baked_cuda_available=True))
+        selected = module.get_sage_func("pytorch")
+
+        self.assertEqual(selected(None, None, None, heads=8), "explicit-pytorch")
+        self.assertEqual(calls, [("pytorch", False)])
+
     def test_patch_kjnodes_rejects_fallback_in_strict_mode(self):
         class FakeModule:
             attention_pytorch = lambda *args, **kwargs: "pytorch"

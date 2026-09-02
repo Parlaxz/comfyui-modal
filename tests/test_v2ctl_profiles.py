@@ -52,6 +52,7 @@ def test_load_production(real_profiles):
     assert profile.runtime_overrides == {"policy": "forbid"}
     assert profile.environment["COMFYMODAL_V2_ENV_PROFILE"] == "production"
     assert profile.environment["COMFYMODAL_V2_CPU_REQUEST"] == "12"
+    assert profile.environment["COMFYMODAL_SAGE_RUNTIME_MODE"] == "baked_cuda"
 
 
 # ── profile inheritance (integration) ──────────────────────────────────────

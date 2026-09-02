@@ -117,6 +117,8 @@ def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
         }
     attempt = {
         "request_id": request_id,
+        "v2ctl_invocation_id": "invocation",
+        "attention_backend": "pytorch",
         "mode": "golden_p1_serial",
         "method": "run_golden_serial_stream",
         "valid": True,
@@ -138,6 +140,10 @@ def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
         "gpu": "rtx-pro-6000",
     }
     manifest = {
+        "v2ctl_invocation_id": "invocation",
+        "profile": "golden_p1",
+        "profile_config_fingerprint": "profile-fingerprint",
+        "attention_backend": "pytorch",
         "mode": "golden_p1_serial",
         "method": "run_golden_serial_stream",
         "target": target,
@@ -153,6 +159,13 @@ def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
             attempt_path.name: hashlib.sha256(attempt_path.read_bytes()).hexdigest(),
         },
     }
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text(json.dumps({
+        "v2ctl_invocation_id": "invocation",
+        "request_id": request_id,
+        "attention_backend": "pytorch",
+        "mode": "golden_p1_serial",
+    }), encoding="utf-8")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     config = FakeConfig(profile_name="golden_p1")
     config.target.app = target["app_name"]
@@ -161,6 +174,7 @@ def _golden_cohort_record(tmp_path: Path, *, include_warning: bool = True,
     config.workload.expected_output_sha = GOLDEN_EXPECTED_SHA
     artifacts = FakeArtifactSet(
         run_artifact=attempt_path,
+        summary_artifact=summary_path,
         campaign_manifest=manifest_path,
         request_id=request_id,
     )
@@ -336,6 +350,24 @@ class TestValidators:
             missing_warning, _golden_config(missing_warning)
         )
         assert any("lacks explicit warning evidence" in failure for failure in failures)
+
+    @pytest.mark.parametrize("artifact_name", ["summary.json", "attempt_0.json"])
+    def test_golden_cohort_requires_invocation_id_in_summary_and_attempt(
+        self, tmp_path, artifact_name
+    ):
+        record = _golden_cohort_record(tmp_path)
+        artifact_path = tmp_path / artifact_name
+        data = json.loads(artifact_path.read_text(encoding="utf-8"))
+        del data["v2ctl_invocation_id"]
+        artifact_path.write_text(json.dumps(data), encoding="utf-8")
+
+        failures = GoldenCohortValidator().validate(record, _golden_config(record))
+
+        assert any(
+            f"Golden {'summary' if artifact_name.startswith('summary') else 'attempt'} invocation ID is missing"
+            in failure
+            for failure in failures
+        )
 
 
 class TestGateRunner:

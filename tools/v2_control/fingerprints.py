@@ -231,6 +231,42 @@ class FingerprintEngine:
     def profile_fingerprint(self) -> str:
         return self.config_fingerprint()
 
+    def experiment_identity(
+        self,
+        *,
+        invocation_id: str = "",
+        request_id: str = "",
+    ) -> dict[str, str]:
+        """Return the resolved identity carried by a Golden/RX invocation.
+
+        The attention selector is included even when its resolved value is the
+        accepted PyTorch default, so changing it cannot reuse a cohort or run
+        fingerprint accidentally.
+        """
+        backend = "pytorch"
+        for flag in list(getattr(self._config, "flags", ()) or ()) + list(
+            getattr(self._config, "unregistered", ()) or ()
+        ):
+            if getattr(flag, "name", "") == "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND":
+                backend = str(getattr(flag, "value", "pytorch") or "pytorch").strip().lower()
+                break
+        configured_sage = "auto"
+        for flag in list(getattr(self._config, "flags", ()) or ()):
+            if getattr(flag, "name", "") == "COMFYMODAL_SAGE_RUNTIME_MODE":
+                configured_sage = str(getattr(flag, "value", "auto") or "auto").strip().lower()
+                break
+        return {
+            "profile": str(getattr(self._config, "profile_name", "") or ""),
+            "v2ctl_invocation_id": str(invocation_id or ""),
+            "request_id": str(request_id or ""),
+            "profile_config_fingerprint": self.profile_config_fingerprint(),
+            "deploy_fingerprint": self.deploy_fingerprint(),
+            "run_fingerprint": self.run_fingerprint(),
+            "attention_backend": backend,
+            "configured_sage_runtime_mode": configured_sage,
+            "resolved_sage_runtime_mode": "",
+        }
+
     def deployment_hash_namespace(self) -> str:
         """Name the hash domain shared with the runtime image plan."""
         return DEPLOYMENT_HASH_NAMESPACE
