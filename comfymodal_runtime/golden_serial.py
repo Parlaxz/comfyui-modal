@@ -1018,6 +1018,10 @@ class GoldenTelemetryRecorder:
         self.clip_forward_conversion: dict[str, Any] = {}
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         self.seriality_violations: list[str] = []
+        # FULL-TRACE-ONLY: actual node FUNCTION-call windows.  This remains
+        # empty on the production path and is deliberately separate from the
+        # stage intervals, which are the authoritative stage walls.
+        self.node_timing_records: list[dict[str, Any]] = []
 
     def record_external_restore(self, metadata: Optional[dict]) -> None:
         """Record adapter-observed restore boundaries without timing them here."""
@@ -1151,6 +1155,15 @@ class GoldenTelemetryRecorder:
             }
         )
 
+    def record_node_timing(self, record: Mapping[str, Any]) -> None:
+        """Persist one FULL-TRACE-ONLY node execution record.
+
+        The runner has already measured the existing node call before this is
+        invoked.  Keep this append-only and side-effect free so diagnostic
+        persistence cannot alter execution or mask the primary result.
+        """
+        self.node_timing_records.append(copy.deepcopy(dict(record)))
+
     def mark_true_durable(self) -> None:
         if getattr(self, "output_durability_mode", "off") != "strict":
             raise RuntimeError("true_durable_requires_output_durability_strict")
@@ -1263,6 +1276,8 @@ class GoldenTelemetryRecorder:
             ],
             "events": list(self._events),
         }
+        if self.node_timing_records:
+            payload["node_timing_records"] = copy.deepcopy(self.node_timing_records)
         run_identity = getattr(self, "run_identity", None)
         if isinstance(run_identity, dict):
             payload["run_identity"] = dict(run_identity)
@@ -1346,6 +1361,32 @@ def _golden_trace_span(name: str) -> ContextManager[Any]:
     except BaseException:
         pass
     return contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _golden_trace_phase(
+    span_name: str,
+    records: list[dict[str, Any]],
+    *,
+    phase: Optional[str] = None,
+):
+    """Time one stable Golden operation only while FULL-TRACE is enabled."""
+    if not _full_trace_active():
+        yield
+        return
+    start_ns = time.monotonic_ns()
+    try:
+        with _golden_trace_span(span_name):
+            yield
+    finally:
+        end_ns = time.monotonic_ns()
+        records.append({
+            "name": str(span_name),
+            "phase": str(phase or span_name),
+            "start_monotonic_ns": int(start_ns),
+            "end_monotonic_ns": int(end_ns),
+            "wall_ms": round(max(0, end_ns - start_ns) / 1_000_000, 3),
+        })
 
 
 def _trace_golden_serial_root(func: Callable) -> Callable:
@@ -1992,6 +2033,12 @@ def build_vae_load_decomposition(
     return {
         "schema": "vae_load_decomposition_v1",
         "clock": "perf_counter_ns",
+        # Explicit diagnostic window; do not make the report reconstruct this
+        # from component extrema.
+        "window_start_monotonic_ns": int(stage_start_ns),
+        "window_end_monotonic_ns": int(stage_end_ns),
+        "window_start_ns": int(stage_start_ns),
+        "window_end_ns": int(stage_end_ns),
         "stage_wall_ns": max(0, int(stage_end_ns) - int(stage_start_ns)),
         "stage_wall_ms": round(max(0, int(stage_end_ns) - int(stage_start_ns)) / 1e6, 4),
         "components": component_list,
@@ -5211,6 +5258,10 @@ class GoldenSerialRunner:
             self._golden_task_baseline_ready = False
         self._golden_tasks: set[asyncio.Task] = set()
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
+        # Bound by Golden request setup for persistence.  Direct runner users
+        # still get the in-memory records when FULL-TRACE is explicitly on.
+        self.trace_recorder: Any = None
+        self.node_timing_records: list[dict[str, Any]] = []
         # Narrow, request-local boundary for the sampler node's actual
         # FUNCTION call.  These fields intentionally exclude dependency
         # resolution, input assembly, cache insertion, and other closure work.
@@ -5262,6 +5313,10 @@ class GoldenSerialRunner:
         self.sampler_target_class = str(class_type)
         self.sampler_call_start = None
         self.sampler_call_end = None
+
+    def set_trace_recorder(self, recorder: Any) -> None:
+        """Bind the request-local recorder used by FULL-TRACE node hooks."""
+        self.trace_recorder = recorder
 
     def executed_summary(self) -> list:
         return [(item["node_id"], item["class_type"], item["stage_class"]) for item in self.executed]
@@ -5563,6 +5618,10 @@ class GoldenSerialRunner:
             )
         if sampler_call:
             self.sampler_call_start = time.monotonic_ns()
+        # Keep the generic record at the existing FUNCTION-call boundary: it
+        # excludes input decoration above, but includes complete async result
+        # resolution below.
+        trace_node_start_ns = time.monotonic_ns() if _full_trace_active() else None
         try:
             if inspect.iscoroutinefunction(func):
                 # Await inline: a task is never left pending across nodes.  The
@@ -5577,6 +5636,34 @@ class GoldenSerialRunner:
         finally:
             if sampler_call:
                 self.sampler_call_end = time.monotonic_ns()
+            if trace_node_start_ns is not None:
+                trace_node_end_ns = time.monotonic_ns()
+                record = {
+                    "node_id": str(unique_id),
+                    "node_class": str(self.prompt[unique_id].get("class_type", "")),
+                    "stage": str(
+                        getattr(self.trace_recorder, "_open_stage", None)
+                        or classify_node(self.prompt[unique_id].get("class_type", ""))
+                    ),
+                    "start_monotonic_ns": int(trace_node_start_ns),
+                    "end_monotonic_ns": int(trace_node_end_ns),
+                    "wall_ms": round(
+                        max(0, trace_node_end_ns - trace_node_start_ns) / 1_000_000,
+                        3,
+                    ),
+                }
+                self.node_timing_records.append(record)
+                try:
+                    recorder = self.trace_recorder
+                    record_node_timing = getattr(recorder, "record_node_timing", None)
+                    if callable(record_node_timing):
+                        record_node_timing(record)
+                    else:
+                        recorder.event("golden_node_timing", **record)
+                except BaseException:
+                    # Full tracing is diagnostic-only and must never affect the
+                    # node result, including with a partial test recorder.
+                    pass
 
     # -- closure execution ------------------------------------------------------
 
@@ -6442,6 +6529,7 @@ async def golden_request_setup(session: GoldenSession) -> GoldenNodeMap:
             node_classes=session.node_classes,
             extra_data=session.request.extra_data,
         )
+        session.runner.set_trace_recorder(rec)
         rec.end_stage(
             "golden_request_setup",
             ready=True,
@@ -6490,6 +6578,7 @@ class _ClipTiming:
         self.enabled = bool(enabled)
         self.trace_prefix = str(trace_prefix).strip(".")
         self.started_ns = time.perf_counter_ns() if self.enabled else None
+        self.finished_ns: Optional[int] = None
         self.phases: list[dict[str, Any]] = []
         self.qwen_forwards: list[dict[str, Any]] = []
         self.qwen_hook_status = "UNPROVEN"
@@ -6550,10 +6639,19 @@ class _ClipTiming:
             elif end > previous_end:
                 union_ns += end - previous_end
             previous_end = max(previous_end or end, end)
-        wall_ns = max(0, time.perf_counter_ns() - int(self.started_ns))
+        self.finished_ns = time.perf_counter_ns()
+        wall_ns = max(0, self.finished_ns - int(self.started_ns))
         return {
             "schema": "golden_clip_timing_v1",
             "clock": "perf_counter_ns",
+            # Explicit boundaries keep the report independent of VizTracer
+            # origin inference.  These fields exist only for diagnostic/full
+            # trace ledgers; the normal path never constructs this payload.
+            "window_start_monotonic_ns": int(self.started_ns),
+            "window_end_monotonic_ns": int(self.finished_ns),
+            "window_start_ns": int(self.started_ns),
+            "window_end_ns": int(self.finished_ns),
+            "window_wall_ms": round(wall_ns / 1_000_000, 3),
             "phases": list(self.phases),
             "required_phases": list(_CLIP_LOAD_TIMING_PHASES),
             "parent_reconciliation": {
@@ -8419,8 +8517,9 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         )
         session.clip_load_page_faults = clip_page_faults
         session.clip_load_timing = clip_timing.finish() if clip_timing_enabled else {}
-        if diagnostics_enabled:
+        if clip_timing_enabled:
             rec.event("clip_load_timing", **session.clip_load_timing)
+        if diagnostics_enabled:
             rec.event("clip_page_faults", **clip_page_faults)
         rec.end_stage(
             "golden_clip_load",
@@ -8446,9 +8545,9 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             source_read_count=sum(int(t["stats"]["source_read_count"]) for t in transports),
             h2d_completed_bytes=sum(int(t["stats"]["h2d_completed_bytes"]) for t in transports),
             qd_quiescence=qd_quiescence,
+            **({"clip_load_timing": session.clip_load_timing} if clip_timing_enabled else {}),
             **(
                 {
-                    "clip_load_timing": session.clip_load_timing,
                     "clip_page_faults": clip_page_faults,
                     "transport_stats": [
                         build_qd_transport_diagnostics(t["stats"]) for t in transports
@@ -8515,6 +8614,8 @@ async def golden_clip_load(session: GoldenSession) -> Any:
             ) if diagnostics_enabled else {}
         )
         session.clip_load_page_faults = clip_page_faults
+        if clip_timing_enabled:
+            session.clip_load_timing = clip_timing.finish()
         if diagnostics_enabled:
             try:
                 rec.event("clip_page_faults", **clip_page_faults)
@@ -8522,7 +8623,13 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                 pass
         rec.fail_stage(
             "golden_clip_load", exc,
-            **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
+            **(
+                {
+                    "clip_load_timing": session.clip_load_timing,
+                    "clip_page_faults": clip_page_faults,
+                }
+                if clip_timing_enabled or diagnostics_enabled else {}
+            ),
         )
         raise
 
@@ -8808,8 +8915,9 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         )
         session.clip_forward_page_faults = clip_page_faults
         session.clip_forward_timing = clip_timing_payload
-        if diagnostics_enabled:
+        if clip_timing_enabled:
             rec.event("clip_forward_timing", **session.clip_forward_timing)
+        if diagnostics_enabled:
             rec.event("clip_page_faults", **clip_page_faults)
             rec.event(
                 "clip_forward_readiness_recheck",
@@ -8838,13 +8946,8 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             conversion_instrumentation=(
                 dict(conversion_telemetry) if conversion_telemetry is not None else "NOT RUN"
             ),
-            **(
-                {
-                    "clip_forward_timing": session.clip_forward_timing,
-                    "clip_page_faults": clip_page_faults,
-                }
-                if diagnostics_enabled else {}
-            ),
+            **({"clip_forward_timing": session.clip_forward_timing} if clip_timing_enabled else {}),
+            **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
         )
         if diagnostics_enabled:
             _clip_attach_forward_decomposition(
@@ -8858,6 +8961,12 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             ) if diagnostics_enabled else {}
         )
         session.clip_forward_page_faults = clip_page_faults
+        if clip_timing_enabled:
+            session.clip_forward_timing = clip_timing.finish()
+            try:
+                rec.event("clip_forward_timing", **session.clip_forward_timing)
+            except Exception:
+                pass
         if diagnostics_enabled:
             try:
                 rec.event("clip_page_faults", **clip_page_faults)
@@ -8865,7 +8974,13 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                 pass
         rec.fail_stage(
             "golden_clip_forward", exc,
-            **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
+            **(
+                {
+                    "clip_forward_timing": session.clip_forward_timing,
+                    "clip_page_faults": clip_page_faults,
+                }
+                if clip_timing_enabled or diagnostics_enabled else {}
+            ),
         )
         if diagnostics_enabled:
             _clip_attach_forward_decomposition(
@@ -9472,46 +9587,67 @@ async def golden_sampler_prepare(session: GoldenSession) -> dict:
     already seeded, so graph dependencies consume the exact Golden objects."""
     rec = session.recorder
     rec.begin_stage("golden_sampler_prepare")
+    full_trace_phases: list[dict[str, Any]] = []
     try:
         runner = session.runner
         node_map = session.node_map
         # Seed the already-produced Golden objects in the native socket-major
         # cache shape (one socket, one item: [[value]]) so loader/encode nodes
         # can never execute or reread.  Idempotent with the clip_forward seed.
-        runner.seed(node_map.clip_loader_id, [[session.clip]])
-        runner.seed(node_map.clip_encode_id, [[session.conditioning]])
-        runner.seed(node_map.unet_loader_id, [[session.patcher]])
+        with _golden_trace_phase(
+            "golden.sampler_prepare.prepare_seed_cache",
+            full_trace_phases,
+            phase="prepare_seed_cache",
+        ):
+            runner.seed(node_map.clip_loader_id, [[session.clip]])
+            runner.seed(node_map.clip_encode_id, [[session.conditioning]])
+            runner.seed(node_map.unet_loader_id, [[session.patcher]])
 
         unet_ready_ns = session.recorder.intervals["golden_unet_load"].ready_monotonic_ns
         cuda_before = int(torch.cuda.memory_allocated())
         patcher_identity_before = id(session.patcher)
 
-        runner.begin_scope(set())  # only 'prepare' classes permitted
-        executed_start = len(runner.executed)
-        try:
-            await runner.run_closure(node_map.sampler_id, include_target=False)
-        finally:
-            runner.end_scope()
-        _assert_runner_quiescence(runner)
+        with _golden_trace_phase(
+            "golden.sampler_prepare.prepare_dependency_closure",
+            full_trace_phases,
+            phase="prepare_dependency_closure",
+        ):
+            runner.begin_scope(set())  # only 'prepare' classes permitted
+            executed_start = len(runner.executed)
+            try:
+                await runner.run_closure(node_map.sampler_id, include_target=False)
+            finally:
+                runner.end_scope()
+        with _golden_trace_phase(
+            "golden.sampler_prepare.prepare_quiescence",
+            full_trace_phases,
+            phase="prepare_quiescence",
+        ):
+            _assert_runner_quiescence(runner)
 
-        cuda_delta = int(torch.cuda.memory_allocated()) - cuda_before
-        prep_executed = runner.executed[executed_start:]
-        source_reads = sum(
-            1 for item in prep_executed if classify_node(item["class_type"]) in HEAVY_NODE_STAGES.values()
-        )
-        if source_reads:
-            executed_heavy = [
-                (item["node_id"], item["class_type"], item["stage_class"])
-                for item in prep_executed
-                if classify_node(item["class_type"]) in HEAVY_NODE_STAGES.values()
-            ]
-            raise RuntimeError(
-                f"prepare_forbidden_heavy_executions:{source_reads}:{executed_heavy!r}"
+        with _golden_trace_phase(
+            "golden.sampler_prepare.prepare_validation",
+            full_trace_phases,
+            phase="prepare_validation",
+        ):
+            cuda_delta = int(torch.cuda.memory_allocated()) - cuda_before
+            prep_executed = runner.executed[executed_start:]
+            source_reads = sum(
+                1 for item in prep_executed if classify_node(item["class_type"]) in HEAVY_NODE_STAGES.values()
             )
-        if cuda_delta > 64 * 1024 * 1024:
-            raise RuntimeError(f"prepare_large_cuda_allocation:{cuda_delta}")
-        if id(session.patcher) != patcher_identity_before:
-            raise RuntimeError("prepare_patcher_identity_changed")
+            if source_reads:
+                executed_heavy = [
+                    (item["node_id"], item["class_type"], item["stage_class"])
+                    for item in prep_executed
+                    if classify_node(item["class_type"]) in HEAVY_NODE_STAGES.values()
+                ]
+                raise RuntimeError(
+                    f"prepare_forbidden_heavy_executions:{source_reads}:{executed_heavy!r}"
+                )
+            if cuda_delta > 64 * 1024 * 1024:
+                raise RuntimeError(f"prepare_large_cuda_allocation:{cuda_delta}")
+            if id(session.patcher) != patcher_identity_before:
+                raise RuntimeError("prepare_patcher_identity_changed")
         # Measured evidence only: the heavy-class execution ban above is exact;
         # the CUDA delta is a bounded sanity check, NOT proof that zero hidden
         # weight movement occurred — do not overclaim.
@@ -9520,6 +9656,8 @@ async def golden_sampler_prepare(session: GoldenSession) -> dict:
             "cuda_alloc_delta_bytes_bounded_check": cuda_delta,
             "patcher_identity": patcher_identity_before,
         }
+        if _full_trace_active():
+            details["full_trace_phases"] = full_trace_phases
         if unet_ready_ns is not None:
             prep_entry_ns = session.recorder.intervals["golden_sampler_prepare"].entry_monotonic_ns
             rec.event(
@@ -9529,7 +9667,11 @@ async def golden_sampler_prepare(session: GoldenSession) -> dict:
         rec.end_stage("golden_sampler_prepare", ready=True, **details)
         return details
     except BaseException as exc:
-        rec.fail_stage("golden_sampler_prepare", exc)
+        rec.fail_stage(
+            "golden_sampler_prepare",
+            exc,
+            **({"full_trace_phases": full_trace_phases} if _full_trace_active() else {}),
+        )
         raise
 
 
@@ -10185,6 +10327,7 @@ async def golden_vae_decode(session: GoldenSession) -> Any:
     IMAGE tensor(s).  Begins only after sampling and tail have ended."""
     rec = session.recorder
     rec.begin_stage("golden_vae_decode")
+    full_trace_phases: list[dict[str, Any]] = []
     try:
         tail = session.recorder.intervals.get("golden_sampler_tail")
         if tail is None or tail.end_monotonic_ns is None or tail.ok is not True:
@@ -10192,23 +10335,50 @@ async def golden_vae_decode(session: GoldenSession) -> Any:
         runner = session.runner
         node_map = session.node_map
         # Native socket-major cache shape: one output socket, one item.
-        runner.seed(node_map.vae_loader_id, [[session.vae]])
-        runner.begin_scope({"vae_decode"})
-        try:
-            await runner.run_closure(node_map.vae_decode_id, include_target=True)
-        finally:
-            runner.end_scope()
-        _assert_runner_quiescence(runner)
-        entry = runner.cache.get(node_map.vae_decode_id)
-        if entry is None or not entry.outputs:
-            raise RuntimeError("vae_decode_output_missing")
-        images = entry.outputs[0][0] if isinstance(entry.outputs[0], list) else entry.outputs[0]
-        session.images = images
-        shape = tuple(images.shape) if hasattr(images, "shape") else None
-        rec.end_stage("golden_vae_decode", ready=True, image_shape=str(shape))
+        with _golden_trace_phase(
+            "golden.vae_decode.vae_decode_seed",
+            full_trace_phases,
+            phase="vae_decode_seed",
+        ):
+            runner.seed(node_map.vae_loader_id, [[session.vae]])
+        with _golden_trace_phase(
+            "golden.vae_decode.vae_decode_dependency_closure",
+            full_trace_phases,
+            phase="vae_decode_dependency_closure",
+        ):
+            runner.begin_scope({"vae_decode"})
+            try:
+                await runner.run_closure(node_map.vae_decode_id, include_target=True)
+            finally:
+                runner.end_scope()
+        with _golden_trace_phase(
+            "golden.vae_decode.vae_decode_quiescence",
+            full_trace_phases,
+            phase="vae_decode_quiescence",
+        ):
+            _assert_runner_quiescence(runner)
+        with _golden_trace_phase(
+            "golden.vae_decode.vae_decode_output_extract",
+            full_trace_phases,
+            phase="vae_decode_output_extract",
+        ):
+            entry = runner.cache.get(node_map.vae_decode_id)
+            if entry is None or not entry.outputs:
+                raise RuntimeError("vae_decode_output_missing")
+            images = entry.outputs[0][0] if isinstance(entry.outputs[0], list) else entry.outputs[0]
+            session.images = images
+            shape = tuple(images.shape) if hasattr(images, "shape") else None
+        details = {"image_shape": str(shape)}
+        if _full_trace_active():
+            details["full_trace_phases"] = full_trace_phases
+        rec.end_stage("golden_vae_decode", ready=True, **details)
         return images
     except BaseException as exc:
-        rec.fail_stage("golden_vae_decode", exc)
+        rec.fail_stage(
+            "golden_vae_decode",
+            exc,
+            **({"full_trace_phases": full_trace_phases} if _full_trace_active() else {}),
+        )
         raise
 
 

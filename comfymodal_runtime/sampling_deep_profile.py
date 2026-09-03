@@ -286,6 +286,19 @@ def _ms(ns: Optional[int]) -> Optional[float]:
     return round(ns / 1_000_000, 3)
 
 
+def _temporal_interval(start: Any, end: Any) -> Optional[tuple[int, int, int]]:
+    """Return a sane monotonic interval, or None for untrusted boundaries."""
+    if (
+        isinstance(start, int)
+        and not isinstance(start, bool)
+        and isinstance(end, int)
+        and not isinstance(end, bool)
+        and end >= start
+    ):
+        return start, end, end - start
+    return None
+
+
 _CALLABLE_METADATA_FALLBACK = "<callable_metadata_unavailable>"
 _MAX_METADATA_CHARS = 384
 _MAX_BACKEND_CALLS = 1_000_000
@@ -294,6 +307,7 @@ _MAX_NATIVE_LEAF_EVENTS = 64
 _MAX_EVAL_RECORDS = 64
 _MAX_CALLBACK_RECORDS = 64
 _MAX_PROCESS_COMPUTE_RECORDS = 64
+_MAX_BLOCK_INTERVALS = 512
 _MISSING = object()
 
 # These are dispatch controls rather than tensor inputs.  Keep this list
@@ -2227,8 +2241,25 @@ class SamplingDeepProfile:
                 "request_id": str(getattr(self.trace, "request_id", "")),
                 "steps": self.steps,
                 "authoritative_sampling_window_ms": None,
+                "sampling_window_start_monotonic_ns": self.sampling_start_mono_ns,
+                "sampling_window_end_monotonic_ns": self.sampling_end_mono_ns,
+                "alignment": {
+                    "clock": "monotonic_ns",
+                    "source": "golden_sampling",
+                    "boundary": "sampling_start_to_sampling_end",
+                    "monotonic_origin_ns": self.sampling_start_mono_ns,
+                },
                 "callbacks": {"observed_indices": [], "expected": []},
                 "evals": {"count": 0, "expected": 2 * self.steps + 1, "per_eval": []},
+                "timeline_steps": [],
+                "summary_metrics": {},
+                "block_intervals": [],
+                "block_intervals_cap": _MAX_BLOCK_INTERVALS,
+                "block_intervals_observed_count": 0,
+                "block_intervals_stored_count": 0,
+                "block_intervals_truncated": False,
+                "block_intervals_truncation_count": 0,
+                "block_intervals_invalid_count": 0,
                 "compute_or_skip": {"compute": 0, "skip": 0, "unknown": 0},
                 "reconciliation": {},
                 "categories_ms": {},
@@ -2296,14 +2327,21 @@ class SamplingDeepProfile:
             index = int(ev["index"])
             is_final = observed_eval_count == expected_evals and index == expected_evals - 1
             eval_step = index // 2 if not is_final else None
+            eval_interval = _temporal_interval(ev.get("start_ns"), ev.get("end_ns"))
+            eval_duration_ns = eval_interval[2] if eval_interval is not None else None
             d: dict[str, Any] = {
                 "index": index,
+                "evaluation_index": index,
                 "phase": "teardown" if is_final else "sampling_step",
                 "step": eval_step,
+                "step_index": eval_step,
                 "row": None if is_final else index % 2,
                 "is_first_eval": index == 0,
                 "is_final_post_loop_eval": is_final,
-                "ms": _ms(None if ev["end_ns"] is None else ev["end_ns"] - ev["start_ns"]),
+                "start_monotonic_ns": ev.get("start_ns"),
+                "end_monotonic_ns": ev.get("end_ns"),
+                "duration_ms": _ms(eval_duration_ns),
+                "ms": _ms(eval_duration_ns),
                 "compute_or_skip": ev["compute_or_skip"],
                 "classification_source": (
                     "inner_block_marker" if self._inner_marker_available else "unavailable"
@@ -2327,6 +2365,7 @@ class SamplingDeepProfile:
 
         # ── Per-step decomposition (ns-precision; rounded for the payload) ──
         steps_ms: list[dict[str, Any]] = []
+        timeline_steps: list[dict[str, Any]] = []
         step_total_ns_list: list[int] = []
         for s in range(steps):
             e0 = evals[2 * s] if len(evals) > 2 * s else None
@@ -2383,6 +2422,17 @@ class SamplingDeepProfile:
                     if isinstance(v, int)
                 ]
                 entry["residual_ms"] = round((total_ns - sum(children_ns)) / 1e6, 3)
+            step_interval = _temporal_interval(step_start_ns, step_end_ns)
+            if step_interval is None and step_start_ns is not None and step_end_ns is not None:
+                warnings.append(f"step_boundary_invalid:{s}")
+            timeline_steps.append({
+                "step_index": s,
+                "start_monotonic_ns": step_interval[0] if step_interval is not None else None,
+                "end_monotonic_ns": step_interval[1] if step_interval is not None else None,
+                "duration_ms": (
+                    _ms(step_interval[2]) if step_interval is not None else None
+                ),
+            })
             entry["solver_controller_gaps_ms"] = {
                 "pre_model": entry.get("pre_model_ms"),
                 "row_0_to_row_1": entry.get("gap_ms"),
@@ -2491,6 +2541,45 @@ class SamplingDeepProfile:
                     "norm_gate_residual_ms": round(residual_ns / 1e6, 3),
                     "residual_ms": round(residual_ns / 1e6, 3),
                 })
+        # Block-total hooks already run in both diagnostic levels.  Keep their
+        # temporal evidence separate from the aggregate block/category rows;
+        # consumers must not mistake a summary row for a timeline interval.
+        block_intervals: list[dict[str, Any]] = []
+        block_intervals_observed = 0
+        block_intervals_invalid = 0
+        for ev in evals:
+            index = int(ev["index"])
+            is_final = observed_eval_count == expected_evals and index == expected_evals - 1
+            eval_step = index // 2 if not is_final else None
+            for bi, span in sorted((ev.get("spans", {}).get("blocks", {}) or {}).items()):
+                try:
+                    block = int(bi)
+                    block_start, block_end = span
+                except (TypeError, ValueError):
+                    block_intervals_invalid += 1
+                    continue
+                interval = _temporal_interval(block_start, block_end)
+                if interval is None:
+                    block_intervals_invalid += 1
+                    continue
+                block_intervals_observed += 1
+                if len(block_intervals) >= _MAX_BLOCK_INTERVALS:
+                    continue
+                block_intervals.append({
+                    "evaluation": index,
+                    "step": eval_step,
+                    "block": block,
+                    "start_monotonic_ns": interval[0],
+                    "end_monotonic_ns": interval[1],
+                    "host_wall_ms": _ms(interval[2]),
+                })
+        block_intervals_truncation_count = max(
+            0, block_intervals_observed - _MAX_BLOCK_INTERVALS
+        )
+        if block_intervals_invalid:
+            warnings.append(
+                f"block_interval_invalid_boundaries:{block_intervals_invalid}"
+            )
         categories_ms = {k: round(v / 1e6, 3) for k, v in sorted(categories.items())}
         if self.level == "blocks":
             categories_ms["norm_gate_residual"] = round(norm_gate_residual_ns / 1e6, 3)
@@ -2654,6 +2743,16 @@ class SamplingDeepProfile:
                 "Sage or Comfy Kitchen call; native markers are observational and "
                 "missing markers do not prove a zero native count"
             ),
+            "temporal_data": (
+                "sampling window, evaluation, and timeline_steps boundaries all use "
+                "the supplied monotonic_ns clock. summary_metrics and reconciliation "
+                "contain aggregates/decompositions, not additional timeline rows."
+            ),
+            "block_intervals": (
+                f"per-evaluation host-wall block intervals are capped at {_MAX_BLOCK_INTERVALS}; "
+                "CUDA elapsed timings remain separate; block/category aggregates are "
+                "inclusive observations and are not presented as exclusive time"
+            ),
         }
 
         # ── CacheDiT cross-check ──
@@ -2686,6 +2785,22 @@ class SamplingDeepProfile:
         else:
             warnings.append("cachedit_counters_unavailable")
 
+        # Keep aggregate/decomposition rows under an explicitly separate
+        # namespace.  ``timeline_steps`` above is the only step-boundary
+        # sequence; these rows are summaries and are not temporal samples.
+        summary_metrics = {
+            "sampling_total_ms": sampling_total_ms,
+            "setup_ms": setup_ms,
+            "steps_ms": steps_ms,
+            "teardown_ms": teardown_ms,
+            "teardown_final_eval_ms": final_eval_ms,
+            "categories_ms": categories_ms,
+            "blocks": blocks_payload,
+            "compute_or_skip": cs,
+            "summary_step_count": len(steps_ms),
+            "timeline_step_count": len(timeline_steps),
+        }
+
         status = "ok"
         if self.rejected:
             status = "rejected"
@@ -2705,6 +2820,14 @@ class SamplingDeepProfile:
             "request_id": str(getattr(self.trace, "request_id", "")),
             "steps": steps,
             "authoritative_sampling_window_ms": sampling_total_ms,
+            "sampling_window_start_monotonic_ns": start_ns,
+            "sampling_window_end_monotonic_ns": end_ns,
+            "alignment": {
+                "clock": "monotonic_ns",
+                "source": "golden_sampling",
+                "boundary": "sampling_start_to_sampling_end",
+                "monotonic_origin_ns": start_ns,
+            },
             "authoritative_wall": {
                 "source": "golden_sampling",
                 "boundary": "sampling_start_to_sampling_end",
@@ -2740,6 +2863,15 @@ class SamplingDeepProfile:
                     expected_evals - 1 if observed_eval_count == expected_evals else None
                 ),
             },
+            "timeline_steps": timeline_steps,
+            "summary_metrics": summary_metrics,
+            "block_intervals": block_intervals,
+            "block_intervals_cap": _MAX_BLOCK_INTERVALS,
+            "block_intervals_observed_count": block_intervals_observed,
+            "block_intervals_stored_count": len(block_intervals),
+            "block_intervals_truncated": bool(block_intervals_truncation_count),
+            "block_intervals_truncation_count": block_intervals_truncation_count,
+            "block_intervals_invalid_count": block_intervals_invalid,
             "compute_or_skip": cs,
             "first_use": {
                 "first_eval_index": 0 if evals else None,

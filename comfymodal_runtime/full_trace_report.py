@@ -219,6 +219,15 @@ def _write_json(path: Path, data: Any, *, sort_keys: bool = True) -> None:
         pass
 
 
+def _write_text_exact(path: Path, text: str) -> None:
+    """Persist UTF-8 text without platform newline translation."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(str(text).replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
+    except Exception:
+        pass
+
+
 def _micros(ts: float) -> int:
     """Convert seconds to microseconds."""
     return int(round(ts * 1_000_000))
@@ -2907,12 +2916,73 @@ def _sampling_temporal_rows(
                 "label": (
                     f"eval step={item.get('step', MEASUREMENT_UNAVAILABLE)} "
                     f"row={item.get('row', MEASUREMENT_UNAVAILABLE)}"
+                    + (
+                        f" [{item.get('compute_or_skip')}]"
+                        if item.get("compute_or_skip") else ""
+                    )
                 ),
                 "start_ms": round(start_ms, 3),
                 "end_ms": round(end_ms, 3),
                 "interval_ms": round((end - start) / 1_000_000.0, 3),
                 "source": "sampling_deep_profile.host_monotonic.aligned",
             })
+        # ``timeline_steps`` is the bounded, authoritative step sequence from
+        # sampling_deep_profile.  It is intentionally projected separately
+        # from aggregate reconciliation rows and uses the same explicit clock
+        # alignment as per-evaluation evidence.
+        timeline_steps = payload.get("timeline_steps", [])
+        if isinstance(timeline_steps, list):
+            for item in timeline_steps:
+                if not isinstance(item, Mapping):
+                    continue
+                start = _sampling_number(item.get("start_monotonic_ns", item.get("start_ns")))
+                end = _sampling_number(item.get("end_monotonic_ns", item.get("end_ns")))
+                if start is None or end is None or end <= start:
+                    continue
+                start_ms = alignment["to_golden_ms"](start)
+                end_ms = alignment["to_golden_ms"](end)
+                if start_ms is None or end_ms is None or end_ms <= start_ms:
+                    continue
+                rows.append({
+                    "label": f"step {item.get('step_index', item.get('step', MEASUREMENT_UNAVAILABLE))}",
+                    "start_ms": round(start_ms, 3),
+                    "end_ms": round(end_ms, 3),
+                    "interval_ms": round((end - start) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.timeline_steps.aligned",
+                })
+        # Setup and finalization are drawable only when the producer persisted
+        # both sampling-window endpoints and an evaluation endpoint.  These are
+        # local-window complements, never inferred from the report wall.
+        window_start = _sampling_number(payload.get("sampling_window_start_monotonic_ns"))
+        window_end = _sampling_number(payload.get("sampling_window_end_monotonic_ns"))
+        eval_intervals = []
+        for item in per_eval:
+            if not isinstance(item, Mapping):
+                continue
+            start = _sampling_number(item.get("start_monotonic_ns", item.get("start_ns")))
+            end = _sampling_number(item.get("end_monotonic_ns", item.get("end_ns")))
+            if start is not None and end is not None and end > start:
+                eval_intervals.append((start, end))
+        if window_start is not None and eval_intervals:
+            first_start = min(start for start, _end in eval_intervals)
+            if first_start > window_start:
+                rows.append({
+                    "label": "setup",
+                    "start_ms": round(alignment["to_golden_ms"](window_start), 3),
+                    "end_ms": round(alignment["to_golden_ms"](first_start), 3),
+                    "interval_ms": round((first_start - window_start) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.sampling_window.aligned",
+                })
+        if window_end is not None and eval_intervals:
+            last_end = max(end for _start, end in eval_intervals)
+            if window_end > last_end:
+                rows.append({
+                    "label": "finalization",
+                    "start_ms": round(alignment["to_golden_ms"](last_end), 3),
+                    "end_ms": round(alignment["to_golden_ms"](window_end), 3),
+                    "interval_ms": round((window_end - last_end) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.sampling_window.aligned",
+                })
     rows.sort(key=lambda row: (row["start_ms"], row["end_ms"], row["label"]))
     return rows
 
@@ -3102,6 +3172,68 @@ _SOURCE_H2D_FIELDS = (
     "h2d_completion_count",
 )
 
+_SOURCE_H2D_STAGE_ROLES = {
+    "golden_clip_load": "clip",
+    "golden_unet_load": "unet",
+    "golden_vae_load": "vae",
+}
+_SOURCE_H2D_ROLES = tuple(_SOURCE_H2D_STAGE_ROLES.values())
+_SOURCE_H2D_ROLE_STAGES = {
+    role: stage for stage, role in _SOURCE_H2D_STAGE_ROLES.items()
+}
+
+
+def _source_h2d_stages_from_value(value: Any) -> set[str]:
+    """Extract only the canonical Golden load stages from a context value."""
+    if not isinstance(value, str):
+        return set()
+    token = value.strip().lower().replace(".", "_").replace("-", "_").replace(" ", "_")
+    return {stage for stage in _SOURCE_H2D_STAGE_ROLES if stage in token}
+
+
+def _source_h2d_roles_from_value(value: Any) -> set[str]:
+    """Extract transport roles without guessing from measurements."""
+    if not isinstance(value, str) or not value.strip():
+        return {"__invalid__"}
+    token = value.strip().lower().replace(".", "_").replace("-", "_").replace(" ", "_")
+    roles = {role for role in _SOURCE_H2D_ROLES if token == role or role in token.split("_")}
+    return roles or {"__invalid__"}
+
+
+def _source_h2d_identity(
+    stage_context: str,
+    record: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Resolve stage/role identity from the record and its traversal context."""
+    stage_values: list[Any] = [stage_context]
+    role_values: list[Any] = []
+    for container in (record, record.get("actual_source"), record.get("actual_source_telemetry")):
+        if not isinstance(container, Mapping):
+            continue
+        for key in ("name", "stage", "stage_name", "event", "event_type", "traversal", "context", "path"):
+            if key in container:
+                stage_values.append(container[key])
+        if "role" in container:
+            role_values.append(container["role"])
+    stages: set[str] = set()
+    for value in stage_values:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                stages.update(_source_h2d_stages_from_value(item))
+        else:
+            stages.update(_source_h2d_stages_from_value(value))
+    for container in (record, record.get("actual_source"), record.get("actual_source_telemetry")):
+        if not isinstance(container, Mapping):
+            continue
+        for key in ("stage", "stage_name"):
+            value = container.get(key)
+            if value is not None and isinstance(value, str) and value.strip() and not _source_h2d_stages_from_value(value):
+                stages.add("__invalid__")
+    roles: set[str] = set()
+    for value in role_values:
+        roles.update(_source_h2d_roles_from_value(value))
+    return stages, roles
+
 
 def _source_h2d_unavailable(*, status: str = "unavailable", reason: str = "") -> dict[str, Any]:
     """Return a stable projection shape without manufacturing measurements."""
@@ -3175,7 +3307,10 @@ def _source_h2d_candidates(
 
     candidates: list[tuple[str, Mapping[str, Any]]] = []
     seen: set[int] = set()
-    seen_content: set[str] = set()
+    # Copies of one record under the same traversal stage are duplicates.  The
+    # same payload under different stage contexts is not: suppressing it would
+    # make an ambiguous projection look like the first record was authoritative.
+    seen_content: set[tuple[str, str]] = set()
 
     def add(stage: str, value: Any) -> None:
         if not isinstance(value, Mapping) or id(value) in seen:
@@ -3187,17 +3322,27 @@ def _source_h2d_candidates(
             ).hexdigest()
         except Exception:
             content_key = ""
-        if content_key and content_key in seen_content:
+        context_stages = _source_h2d_stages_from_value(stage)
+        context_key = "|".join(sorted(context_stages)) if context_stages else str(stage).strip().lower()
+        content_identity = (content_key, context_key)
+        if content_key and content_identity in seen_content:
             return
         seen.add(id(value))
         if content_key:
-            seen_content.add(content_key)
+            seen_content.add(content_identity)
         candidates.append((stage or "golden_transport", value))
 
     def visit(value: Any, stage: str, depth: int = 0) -> None:
         if depth > 10 or not isinstance(value, Mapping):
             return
-        current_stage = str(value.get("name", stage)) if value.get("name") else stage
+        named_stage = value.get("name")
+        # Keep a useful parent traversal context when a transport wrapper has a
+        # generic name such as ``transport_stats``.
+        current_stage = (
+            str(named_stage)
+            if named_stage and _source_h2d_stages_from_value(named_stage)
+            else stage
+        )
         for key in ("transport_stats", "transport_telemetry"):
             child = value.get(key)
             if isinstance(child, Mapping):
@@ -3495,14 +3640,120 @@ def build_source_h2d_transport_projection(
         _load_persisted_e27_raw(session_dir),
     )
     if not candidates:
-        return _source_h2d_unavailable()
+        unavailable = _source_h2d_unavailable()
+        unavailable["by_stage"] = {
+            stage: _source_h2d_unavailable(
+                reason=f"no persisted E27 transport record for {stage}"
+            )
+            for stage in _SOURCE_H2D_STAGE_ROLES
+        }
+        unavailable["by_role"] = {
+            role: _source_h2d_unavailable(
+                reason=f"no persisted E27 transport record for role {role}"
+            )
+            for role in _SOURCE_H2D_ROLES
+        }
+        return unavailable
     projections = [_project_source_h2d_record(stage, record) for stage, record in candidates]
-    # Golden serial emits one transport record for each model-load stage.  Keep
-    # every record auditable while exposing the first applicable one directly.
-    selected = projections[0]
-    selected = dict(selected)
+
+    # Resolve identity independently from the measurements.  A projection is
+    # usable only when one record has one canonical stage and its matching role;
+    # there is deliberately no positional fallback here.
+    identities: list[dict[str, Any]] = []
+    for (stage_context, record), projection in zip(candidates, projections):
+        stages, roles = _source_h2d_identity(stage_context, record)
+        reason = ""
+        if len(stages) > 1:
+            reason = "ambiguous persisted E27 stage identity"
+        elif len(roles) > 1:
+            reason = "ambiguous persisted E27 role identity"
+        elif not stages and len(roles) == 1 and next(iter(roles)) in _SOURCE_H2D_ROLE_STAGES:
+            stages = {_SOURCE_H2D_ROLE_STAGES[next(iter(roles))]}
+        elif not roles and len(stages) == 1:
+            resolved_stage = next(iter(stages))
+            if resolved_stage in _SOURCE_H2D_STAGE_ROLES:
+                roles = {_SOURCE_H2D_STAGE_ROLES[resolved_stage]}
+        if not stages or not roles:
+            reason = reason or "persisted E27 stage/role identity is unavailable"
+        elif len(stages) == 1 and len(roles) == 1:
+            resolved_stage = next(iter(stages))
+            resolved_role = next(iter(roles))
+            if (
+                resolved_stage not in _SOURCE_H2D_STAGE_ROLES
+                or resolved_role not in _SOURCE_H2D_ROLES
+                or _SOURCE_H2D_STAGE_ROLES[resolved_stage] != resolved_role
+            ):
+                reason = "persisted E27 stage and role disagree"
+        identities.append({
+            "stage": next(iter(stages)) if len(stages) == 1 else None,
+            "role": next(iter(roles)) if len(roles) == 1 else None,
+            "projection": projection,
+            "reason": reason,
+        })
+
+    def get_transport_for_stage(
+        stage: str,
+        role: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return the unique stage/role projection, or ``(None, reason)``."""
+        expected_stage = stage if stage in _SOURCE_H2D_STAGE_ROLES else None
+        expected_role = role if role in _SOURCE_H2D_ROLES else None
+        if expected_stage is None or expected_role is None:
+            return None, "requested E27 stage or role is not canonical"
+        related = [
+            identity for identity in identities
+            if identity["stage"] == expected_stage or identity["role"] == expected_role
+        ]
+        reasons = sorted({str(identity["reason"]) for identity in related if identity["reason"]})
+        matches = [
+            identity for identity in related
+            if identity["stage"] == expected_stage and identity["role"] == expected_role
+        ]
+        if len(matches) == 1 and len(related) == 1 and not reasons:
+            projection = dict(matches[0]["projection"])
+            projection["stage"] = expected_stage
+            projection["role"] = expected_role
+            return projection, ""
+        if reasons:
+            return None, reasons[0]
+        if len(matches) > 1 or len(related) > 1:
+            return None, f"ambiguous persisted E27 transport records for {expected_stage}/{expected_role}"
+        return None, reasons[0] if reasons else f"no unique persisted E27 record for {expected_stage}/{expected_role}"
+
+    def unavailable_mapping(stage: str, role: str, reason: str) -> dict[str, Any]:
+        result = _source_h2d_unavailable(status="unavailable", reason=reason)
+        result["stage"] = stage
+        result["role"] = role
+        return result
+
+    by_stage: dict[str, dict[str, Any]] = {}
+    by_role: dict[str, dict[str, Any]] = {}
+    for stage, role in _SOURCE_H2D_STAGE_ROLES.items():
+        match, reason = get_transport_for_stage(stage, role)
+        value = match if match is not None else unavailable_mapping(stage, role, reason)
+        by_stage[stage] = value
+        by_role[role] = dict(value)
+
+    # Keep every raw-derived projection auditable while exposing a direct
+    # projection only when the complete candidate set has one unique identity.
+    usable = [identity for identity in identities if not identity["reason"]]
+    if len(usable) == 1 and len(identities) == 1:
+        selected = dict(usable[0]["projection"])
+        selected["stage"] = usable[0]["stage"]
+        selected["role"] = usable[0]["role"]
+    else:
+        reason = (
+            identities[0]["reason"]
+            if len(identities) == 1 and identities[0]["reason"]
+            else "ambiguous persisted E27 stage/role identities; use by_stage/by_role"
+        )
+        selected = _source_h2d_unavailable(
+            reason=reason
+        )
     selected["stages"] = projections
     selected["stage_count"] = len(projections)
+    selected["by_stage"] = by_stage
+    selected["by_role"] = by_role
     return selected
 
 
@@ -4118,6 +4369,7 @@ def _golden_profile_json(profile: dict[str, Any]) -> dict[str, Any]:
             "sampling_decomposition_status", "unavailable"
         ),
         "transport_reconciled": profile.get("transport_reconciled", False),
+        "stage_evidence": profile.get("stage_evidence", {}),
     }
 
 
@@ -4273,41 +4525,19 @@ def _transport_breakdown_text(transport: Mapping[str, Any]) -> str:
             lines.append(f"{qd} | {value}")
     else:
         lines.append(f"(unavailable) | {MEASUREMENT_UNAVAILABLE}")
-    lanes = transport.get("timestamp_lanes")
-    lines.extend(["", "TIMESTAMP LANES (actual persisted monotonic timestamps only)"])
-    if isinstance(lanes, list) and lanes:
-        lines.append("LANE | LABEL | START_NS | END_NS | DURATION_MS")
-        for row in lanes:
-            if isinstance(row, Mapping):
-                lines.append(
-                    f"{row.get('lane')} | {row.get('label')} | {row.get('start_ns')} | "
-                    f"{row.get('end_ns')} | {row.get('duration_ms')}"
-                )
-    else:
-        lines.append(
-            "UNAVAILABLE: actual source/H2D start/end timestamps were not persisted; "
-            "no transport lane is drawn."
-        )
+    # Per-read/per-copy timestamps are machine evidence only.  Keeping them in
+    # the JSON projection permits independent reconstruction without flooding
+    # the human report with one line per transport event.
+    lines.extend(["", "TIMESTAMP_LANES=JSON_ONLY"])
     axis = transport.get("timestamp_axis")
-    if isinstance(axis, Mapping) and axis.get("clock") == "monotonic_ns" and isinstance(lanes, list) and lanes:
+    if isinstance(axis, Mapping):
         axis_start = _sampling_number(axis.get("start_ns"))
         axis_end = _sampling_number(axis.get("end_ns"))
-        if axis_start is not None and axis_end is not None and axis_end > axis_start:
-            lines.extend([
-                "TIMELINE AXIS=monotonic_ns (transport-local; not Golden/VizTracer axis)",
-                "LANE | TIMELINE",
-            ])
-            width = 80
-            for row in lanes:
-                if not isinstance(row, Mapping):
-                    continue
-                start = _sampling_number(row.get("start_ns"))
-                end = _sampling_number(row.get("end_ns"))
-                if start is None or end is None or end <= start:
-                    continue
-                lo = max(0, min(width - 1, int((start - axis_start) / (axis_end - axis_start) * width)))
-                hi = max(lo + 1, min(width, int((end - axis_start) / (axis_end - axis_start) * width + 0.999999)))
-                lines.append(f"{row.get('lane')}:{row.get('label')} | {' ' * lo}{'█' * (hi - lo)}{' ' * (width - hi)}")
+        if axis_start is not None and axis_end is not None:
+            lines.append(
+                f"TIMESTAMP_AXIS_CLOCK={axis.get('clock', MEASUREMENT_UNAVAILABLE)} "
+                f"START_NS={axis_start} END_NS={axis_end}"
+            )
     semantics = transport.get("timing_semantics")
     if isinstance(semantics, Mapping) and semantics.get("non_additive"):
         lines.append("WARNING=TRANSPORT OVERLAP IS A UNION; WALLS AND LANES ARE NOT ADDITIVE")
@@ -4394,10 +4624,60 @@ def _augment_golden_profile(
             continue
         if any(token in name.lower() for token in ("transport", "source", "h2d")) and transport_explained:
             continue
-        unresolved.append({"name": name, "wall_ms": wall, "residual_ms": residual})
+        unresolved.append({
+            "name": name,
+            "wall_ms": wall,
+            "residual_ms": residual,
+            "coverage": "VizTracer coverage",
+            "evidence_source": "viztracer",
+            "clock_domain": "host_monotonic",
+            "reason": str(node.get("residual_reason", "untraced or self time")),
+        })
+    # Cross-evidence is intentionally not folded into VizTracer residuals.  If
+    # persisted sampling/E27 data exists but cannot be aligned/reconciled, make
+    # that limitation explicit; aligned regions are omitted from unresolved.
+    if deep.get("status") not in {"unavailable", ""} and not sampling_explained:
+        unresolved.append({
+            "name": "sampling_window",
+            "wall_ms": _sampling_number(deep.get("authoritative_sampling_window_ms")),
+            "residual_ms": _sampling_number(deep.get("reconciliation", {}).get("sampling_residual_ms"))
+            if isinstance(deep.get("reconciliation"), Mapping) else None,
+            "coverage": "cross-evidence",
+            "evidence_source": "sampling_deep_profile",
+            "clock_domain": "monotonic_ns",
+            "reason": str(deep.get("temporal_alignment_reason", "sampling clock alignment unavailable")),
+        })
+    if transport.get("status") not in {"unavailable", ""} and not transport_explained:
+        unresolved.append({
+            "name": "source/H2D transport",
+            "wall_ms": _sampling_number(transport.get("SOURCE_TOTAL_WALL_MS")),
+            "residual_ms": None,
+            "coverage": "cross-evidence",
+            "evidence_source": "E27 persisted transport",
+            "clock_domain": "monotonic_ns",
+            "reason": str(transport.get("reason", "E27 reconciliation or timestamp coverage unavailable")),
+        })
     profile["unresolved_over_50ms"] = unresolved
     profile["sampling_reconciled"] = sampling_explained
     profile["transport_reconciled"] = transport_explained
+    profile["stage_evidence"] = {
+        stage: {
+            "source": "VizTracer parent clock",
+            "clock_domain": "host_monotonic",
+            "transport_role": role,
+            "transport_clock": "monotonic_ns separate local mini-Gantt"
+            if role in {"clip", "unet", "vae"} else MEASUREMENT_UNAVAILABLE,
+        }
+        for stage, role in {
+            "golden_clip_load": "clip",
+            "golden_clip_forward": "clip",
+            "golden_unet_load": "unet",
+            "golden_sampler_prepare": "sampler",
+            "golden_vae_load": "vae",
+            "golden_sampling": "sampling_window",
+            "golden_vae_decode": "vae_decode",
+        }.items()
+    }
 
 
 def _flatten_golden_nodes(root: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -4481,7 +4761,10 @@ def _generate_golden_profile_report(profile: dict[str, Any]) -> str:
     if unresolved:
         for area in unresolved:
             lines.append(
-                f"- {area.get('name', '')}: wall_ms={area.get('wall_ms')} residual_ms={area.get('residual_ms')}"
+                f"- {area.get('name', '')}: {area.get('coverage', 'remaining')} "
+                f"wall_ms={area.get('wall_ms')} residual_ms={area.get('residual_ms')} "
+                f"clock={area.get('clock_domain', MEASUREMENT_UNAVAILABLE)} "
+                f"reason={area.get('reason', 'not established')}"
             )
     else:
         lines.append("None; separately explained sampling and transport evidence is excluded.")
@@ -4985,9 +5268,12 @@ def _build_manifest(raw_dir: Path, derived_dir: Path) -> list[dict[str, Any]]:
                     "sha256": _sha256_file(fpath),
                 })
 
-    # Derived files (exclude manifest.json from its own inventory)
+    # Derived files (exclude manifest.json from its own inventory).  Golden
+    # stage Gantts live under derived/gantts/, so the inventory must recurse;
+    # otherwise the manifest would claim a complete report while omitting the
+    # seven per-stage artifacts.
     if derived_dir.exists():
-        for fpath in sorted(derived_dir.iterdir()):
+        for fpath in sorted(derived_dir.rglob("*")):
             if fpath.is_file() and fpath.name != "manifest.json":
                 entries.append({
                     "path": str(fpath.relative_to(derived_dir.parent)).replace("\\", "/"),
@@ -5005,6 +5291,7 @@ def _combine_profiler_artifacts(report: str, derived_dir: Path) -> str:
     for name in (
         "golden_profile_report.md",
         "golden_profile_gantt.txt",
+        "golden_stage_gantts.txt",
         "golden_sampling_breakdown.txt",
         "e27_transport_breakdown.txt",
     ):
@@ -5015,6 +5302,12 @@ def _combine_profiler_artifacts(report: str, derived_dir: Path) -> str:
         else:
             parts.append(MEASUREMENT_UNAVAILABLE)
         parts.extend(["```", ""])
+    stage_dir = derived_dir / "gantts"
+    if stage_dir.is_dir():
+        for path in sorted(stage_dir.glob("golden_*.txt")):
+            parts.extend([f"### gantts/{path.name}", "", "```text"])
+            parts.extend(path.read_text(encoding="utf-8").rstrip("\n").splitlines())
+            parts.extend(["```", ""])
     return "\n".join(parts).rstrip("\n")
 
 
@@ -5404,22 +5697,121 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "operation", "expected", "observed", "classification",
     ])
 
-    # Golden profile artifacts are generated before the existing reports so
-    # their paths and hashes participate in the normal inventory/manifest path.
+    # Build one normalized machine-facing report first.  The human renderer is
+    # then the sole owner of console/stage/Gantt presentation; Modal reads the
+    # persisted console verbatim and never reconstructs it independently.
+    derived_files_info = {
+        "trace_entry_count": entry_count,
+        "trace_entry_capacity": entry_capacity,
+        "trace_truncated": truncated,
+        "files": _build_manifest(raw_dir, derived_dir),
+    }
+    structured_report = _build_report_data(
+        status=status,
+        warnings=warnings,
+        calls=calls,
+        timeline=timeline,
+        func_summary=func_summary,
+        duplicates=duplicates,
+        semantic_duplicates=semantic_duplicates,
+        survivors=survivors,
+        wrapper_chains=wrapper_chains,
+        wrapper_changes=wrapper_changes,
+        expected_vs_observed=expected_vs_observed,
+        torch_cpu_ops=torch_cpu_ops,
+        torch_cuda_ops=torch_cuda_ops,
+        resource_result=resource_result,
+        process_timeline=process_timeline,
+        thread_timeline=thread_timeline,
+        resource_owners=resource_owners,
+        overlaps=overlaps,
+        milestones=milestones,
+        sessions=sessions,
+        trace_config=trace_config,
+        runtime_result=runtime_result,
+        stack_issues=stack_issues,
+        async_tasks=async_tasks,
+        derived_files=derived_files_info,
+        golden_profile=golden_profile,
+        sampling_deep_evidence=sampling_deep_evidence,
+        source_h2d_transport=source_h2d_transport,
+    )
+    from . import golden_human_report
+
+    structured_report["human_artifacts"] = {
+        "console": "derived/golden_profiler_console.txt",
+        "summary": "derived/golden_profile_summary.json",
+        "report": "derived/golden_profile_report.md",
+        "overall_gantt": "derived/golden_profile_gantt.txt",
+        "stage_gantts": "derived/golden_stage_gantts.txt",
+        "sampling": "derived/golden_sampling_breakdown.txt",
+        "transport": "derived/e27_transport_breakdown.txt",
+        "stage_directory": "derived/gantts/",
+    }
+
     golden_summary_path = derived_dir / "golden_profile_summary.json"
     golden_report_path = derived_dir / "golden_profile_report.md"
     golden_gantt_path = derived_dir / "golden_profile_gantt.txt"
+    golden_stage_gantts_path = derived_dir / "golden_stage_gantts.txt"
+    golden_console_path = derived_dir / "golden_profiler_console.txt"
     golden_sampling_path = derived_dir / "golden_sampling_breakdown.txt"
     e27_transport_path = derived_dir / "e27_transport_breakdown.txt"
     _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+    MODAL_HUMAN_REPORT = ""
+    sampling_artifact = ""
+    transport_artifact = ""
     try:
-        golden_report_path.write_text(_generate_golden_profile_report(golden_profile), encoding="utf-8")
-        golden_gantt_path.write_text(_golden_profile_gantt(golden_profile), encoding="utf-8")
-        golden_sampling_path.write_text(
-            _sampling_breakdown_text(sampling_deep_evidence), encoding="utf-8"
+        MODAL_HUMAN_REPORT = golden_human_report.render_full_console(structured_report)
+        stage_gantts = golden_human_report.render_stage_gantts(structured_report)
+        overall_gantt = golden_human_report.render_overall_timeline(structured_report)
+        _write_text_exact(golden_console_path, MODAL_HUMAN_REPORT)
+        persisted_console = golden_console_path.read_text(encoding="utf-8")
+        normalize_newlines = lambda value: value.replace("\r\n", "\n").replace("\r", "\n")
+        if normalize_newlines(MODAL_HUMAN_REPORT) != normalize_newlines(persisted_console):
+            raise RuntimeError("MODAL_HUMAN_REPORT does not match persisted console")
+        _write_text_exact(golden_stage_gantts_path, stage_gantts)
+        _write_text_exact(golden_gantt_path, overall_gantt + "\n" + stage_gantts)
+        # The compact console uses dominant sampling rows.  The artifact and
+        # report retain the complete bounded deep-profile breakdown.
+        sampling_artifact = (
+            golden_human_report.render_sampling_stage(structured_report)
+            + "\n\n"
+            + _sampling_breakdown_text(sampling_deep_evidence)
         )
-        e27_transport_path.write_text(
-            _transport_breakdown_text(source_h2d_transport), encoding="utf-8"
+        transport_artifact = (
+            golden_human_report.render_transport_mini_gantt(source_h2d_transport)
+            + "\n\n"
+            + _transport_breakdown_text(source_h2d_transport)
+        )
+        _write_text_exact(golden_sampling_path, sampling_artifact)
+        _write_text_exact(e27_transport_path, transport_artifact)
+        gantt_dir = derived_dir / "gantts"
+        stage_file_specs = (
+            ("golden_clip_load", "CLIP LOAD", "clip"),
+            ("golden_clip_forward", "CLIP FORWARD", "clip"),
+            ("golden_unet_load", "UNET LOAD", "unet"),
+            ("golden_sampler_prepare", "SAMPLER PREPARE", "sampler"),
+            ("golden_vae_load", "VAE LOAD", "vae"),
+            ("golden_sampling", "SAMPLING", "sampling"),
+            ("golden_vae_decode", "VAE DECODE", "vae_decode"),
+        )
+        for stage_name, title, role in stage_file_specs:
+            _write_text_exact(
+                gantt_dir / f"{stage_name}.txt",
+                golden_human_report.render_stage_artifact(
+                    structured_report, title, stage_name, role=role,
+                ) + "\n",
+            )
+        _write_text_exact(
+            golden_report_path,
+            _generate_golden_profile_report(golden_profile).rstrip("\n")
+            + "\n\n## Detailed Golden stage Gantts\n\n"
+            + stage_gantts.rstrip("\n")
+            + "\n\n## Detailed sampling evidence\n\n"
+            + sampling_artifact.rstrip("\n")
+            + "\n\n## Detailed E27 transport evidence\n\n"
+            + transport_artifact.rstrip("\n")
+            + "\n",
         )
     except Exception as exc:
         golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
@@ -5427,19 +5819,20 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         _write_json(golden_summary_path, _golden_profile_json(golden_profile))
     if not all(path.is_file() for path in (
         golden_summary_path, golden_report_path, golden_gantt_path,
-        golden_sampling_path, e27_transport_path,
+        golden_stage_gantts_path, golden_console_path, golden_sampling_path,
+        e27_transport_path,
     )):
         golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
         golden_profile["GOLDEN_PROFILE_REASON"] = "derived generation failed: missing Golden artifact"
         _write_json(golden_summary_path, _golden_profile_json(golden_profile))
 
+    # Refresh the inventory after the complete Golden family exists.  The
+    # structured report remains the same object used for rendering, while its
+    # machine inventory now includes nested derived/gantts files as well.
+    derived_files_info["files"] = _build_manifest(raw_dir, derived_dir)
+    structured_report["derived_files"] = derived_files_info["files"]
+
     # ── Generate report.md ──
-    derived_files_info = {
-        "trace_entry_count": entry_count,
-        "trace_entry_capacity": entry_capacity,
-        "trace_truncated": truncated,
-        "files": _build_manifest(raw_dir, derived_dir),
-    }
     # Note: manifest is rebuilt at the end after all files exist; this is a placeholder.
 
     report_md = _generate_report_md(
@@ -5472,40 +5865,11 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     report_md = _combine_profiler_artifacts(report_md, derived_dir)
 
     report_path = derived_dir / "report.md"
-    report_path.write_text(report_md, encoding="utf-8")
+    _write_text_exact(report_path, report_md)
 
     # ── Generate report_data.json ──
     report_data_path = derived_dir / "report_data.json"
-    _write_json(report_data_path, _build_report_data(
-        status=status,
-        warnings=warnings,
-        calls=calls,
-        timeline=timeline,
-        func_summary=func_summary,
-        duplicates=duplicates,
-        semantic_duplicates=semantic_duplicates,
-        survivors=survivors,
-        wrapper_chains=wrapper_chains,
-        wrapper_changes=wrapper_changes,
-        expected_vs_observed=expected_vs_observed,
-        torch_cpu_ops=torch_cpu_ops,
-        torch_cuda_ops=torch_cuda_ops,
-        resource_result=resource_result,
-        process_timeline=process_timeline,
-        thread_timeline=thread_timeline,
-        resource_owners=resource_owners,
-        overlaps=overlaps,
-        milestones=milestones,
-        sessions=sessions,
-        trace_config=trace_config,
-        runtime_result=runtime_result,
-        stack_issues=stack_issues,
-        async_tasks=async_tasks,
-        derived_files=derived_files_info,
-        golden_profile=golden_profile,
-        sampling_deep_evidence=sampling_deep_evidence,
-        source_h2d_transport=source_h2d_transport,
-    ))
+    _write_json(report_data_path, structured_report)
 
     # ── Generate manifest.json (built AFTER all derived files exist, including report_data.json) ──
     manifest_path = derived_dir / "manifest.json"
@@ -5521,7 +5885,7 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     # ── Collect derived file listing (as list[str] of POSIX relative paths) ──
     derived_files_list: list[str] = sorted(
         str(p.relative_to(session_dir)).replace("\\", "/")
-        for p in derived_dir.iterdir()
+        for p in derived_dir.rglob("*")
         if p.is_file()
     )
 
@@ -5540,6 +5904,9 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "golden_profile_summary_path": str(golden_summary_path).replace("\\", "/"),
         "golden_profile_report_path": str(golden_report_path).replace("\\", "/"),
         "golden_profile_gantt_path": str(golden_gantt_path).replace("\\", "/"),
+        "golden_stage_gantts_path": str(golden_stage_gantts_path).replace("\\", "/"),
+        "golden_profiler_console_path": str(golden_console_path).replace("\\", "/"),
+        "MODAL_HUMAN_REPORT": MODAL_HUMAN_REPORT,
         "golden_sampling_breakdown_path": str(golden_sampling_path).replace("\\", "/"),
         "e27_transport_breakdown_path": str(e27_transport_path).replace("\\", "/"),
         "source_h2d_transport": source_h2d_transport,
