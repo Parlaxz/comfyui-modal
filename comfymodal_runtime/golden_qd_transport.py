@@ -36,6 +36,243 @@ STATIC_E27_PRODUCERS = 4
 DEFAULT_QUEUE_DEPTH = 4
 DEFAULT_BLOCK_BYTES = 32 * 1024 * 1024
 DEFAULT_STAGING_SLOTS = 8
+REQUEST_ARENA_BYTES = DEFAULT_STAGING_SLOTS * DEFAULT_BLOCK_BYTES
+
+
+@dataclass
+class CompletionTicket:
+    """A generation-specific completion/timing receipt for one staging slot."""
+
+    slot_index: int
+    submission_id: int
+    start_event: Any
+    end_event: Any
+    byte_count: int
+    completion: bool = False
+    timing_consumed: bool = False
+
+
+class GoldenTransferResources:
+    """Request-lifetime CPU staging and CUDA copy resources.
+
+    This object deliberately does not retain model storage, modules, patchers,
+    readers, or checkpoint state.  Every transport creates its own lease/pool
+    metadata while borrowing these stable views.
+    """
+
+    slot_count = DEFAULT_STAGING_SLOTS
+    slot_bytes = DEFAULT_BLOCK_BYTES
+    arena_bytes = REQUEST_ARENA_BYTES
+
+    def __init__(self, arena: Any, views: Sequence[Any], stream: Any, events: Sequence[tuple[Any, Any]], span_events: tuple[Any, Any]) -> None:
+        if len(views) != self.slot_count or len(events) != self.slot_count:
+            raise ValueError("request transport resources require exactly eight slots and event pairs")
+        self.arena = arena
+        self.views = tuple(views)
+        self.slot_indices = tuple(range(self.slot_count))
+        self.h2d_stream = stream
+        self.events = tuple(events)
+        self.span_events = span_events
+        self._event_object_count = self.slot_count * 2 + len(self.span_events)
+        self.physical_pinned_alloc_count = 1
+        self.transport_physical_pinned_alloc_count = 0
+        self.created = True
+        self.closed = False
+        self._poisoned = False
+        self._poison_observed = False
+        self._active_tickets: dict[int, CompletionTicket] = {}
+        self._active_transports = 0
+        self.transport_use_count = 0
+        self._next_submission_id = 0
+        self._span_started = False
+        self._span_finished = False
+        self.gpu_copy_active_sum_ms = 0.0
+        self.gpu_copy_count = 0
+        self.gpu_copy_bytes = 0
+        self.gpu_copy_stream_span_ms: float | None = None
+        self.gpu_copy_active_union_ms = 0.0
+        self.gpu_copy_idle_inside_stream_span_ms = 0.0
+        self.event_rerecord_count = 0
+        self.h2d_submit_count = 0
+        self.h2d_completion_count = 0
+
+    @classmethod
+    def create(cls, device: str | None = None) -> "GoldenTransferResources":
+        try:
+            import torch
+        except ImportError as exc:
+            raise TransportError("request transport resources require torch") from exc
+        if not torch.cuda.is_available():
+            raise TransportError("CUDA is unavailable for request transport resources")
+        dev = device or f"cuda:{torch.cuda.current_device()}"
+        # Exactly one physical pinned allocation.  All slot objects below are
+        # stable views into this allocation, never additional allocations.
+        arena = torch.empty(cls.arena_bytes, dtype=torch.uint8, pin_memory=True)
+        views = tuple(
+            arena[index * cls.slot_bytes : (index + 1) * cls.slot_bytes]
+            for index in range(cls.slot_count)
+        )
+        stream = torch.cuda.Stream(device=dev)
+        events = tuple(
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in range(cls.slot_count)
+        )
+        span_events = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        return cls(arena, views, stream, events, span_events)
+
+    @property
+    def event_object_count(self) -> int:
+        return self._event_object_count
+
+    @property
+    def active_tickets(self) -> int:
+        return len(self._active_tickets)
+
+    def new_pool(self, capacity_class: str) -> "StagingPool":
+        if self.closed:
+            raise TransportError("request transport resources are closed")
+        return StagingPool(
+            self.slot_count, self.slot_bytes, capacity_class,
+            buffers=self.views,
+        )
+
+    def transport_enter(self) -> None:
+        if self.closed:
+            raise TransportError("request transport resources are closed")
+        self._active_transports += 1
+        self.transport_use_count += 1
+        self.transport_physical_pinned_alloc_count = 1 if self.transport_use_count == 1 else 0
+
+    def transport_exit(self, *, poisoned: bool = False) -> None:
+        self._active_transports = max(0, self._active_transports - 1)
+        if poisoned:
+            self._poisoned = True
+
+    def acknowledge_poison(self) -> None:
+        """Record that a fail-closed transport poison reached its caller."""
+        self._poison_observed = True
+
+    def begin_span(self) -> None:
+        if self._span_started:
+            return
+        record = getattr(self.span_events[0], "record", None)
+        if not callable(record):
+            raise TransportError("request H2D span event is not recordable")
+        record(self.h2d_stream)
+        self._span_started = True
+
+    def finish_span(self) -> None:
+        if not self._span_started or self._span_finished:
+            return
+        record = getattr(self.span_events[1], "record", None)
+        if not callable(record):
+            raise TransportError("request H2D span event is not recordable")
+        record(self.h2d_stream)
+        self._span_finished = True
+        elapsed = _event_elapsed_ms(self.span_events[0], self.span_events[1])
+        if elapsed is not None:
+            self.gpu_copy_stream_span_ms = elapsed
+            self.gpu_copy_active_union_ms = self.gpu_copy_active_sum_ms
+            self.gpu_copy_idle_inside_stream_span_ms = max(
+                0.0, elapsed - self.gpu_copy_active_union_ms
+            )
+
+    def begin_ticket(self, slot_index: int, byte_count: int) -> CompletionTicket:
+        if slot_index in self._active_tickets:
+            raise TransportError("staging slot event is still in use")
+        if not 0 <= int(slot_index) < self.slot_count:
+            raise TransportError("invalid request staging slot")
+        self._next_submission_id += 1
+        start, end = self.events[int(slot_index)]
+        ticket = CompletionTicket(int(slot_index), self._next_submission_id, start, end, int(byte_count))
+        self._active_tickets[int(slot_index)] = ticket
+        if self._next_submission_id > self.slot_count:
+            self.event_rerecord_count += 2
+        return ticket
+
+    def submit_ticket(self, ticket: CompletionTicket) -> None:
+        record_start = getattr(ticket.start_event, "record", None)
+        record_end = getattr(ticket.end_event, "record", None)
+        if not callable(record_start) or not callable(record_end):
+            raise TransportError("request H2D completion ticket is not recordable")
+        record_start(self.h2d_stream)
+        self.h2d_submit_count += 1
+        record_end(self.h2d_stream)
+
+    def harvest_ticket(self, ticket: CompletionTicket) -> None:
+        if self._active_tickets.get(ticket.slot_index) is not ticket:
+            raise TransportError("completion ticket is stale")
+        if not ticket.completion:
+            ticket.completion = True
+            self.h2d_completion_count += 1
+        if not ticket.timing_consumed:
+            elapsed = _event_elapsed_ms(ticket.start_event, ticket.end_event)
+            if elapsed is not None:
+                self.gpu_copy_active_sum_ms += elapsed
+            ticket.timing_consumed = True
+            self.gpu_copy_count += 1
+            self.gpu_copy_bytes += ticket.byte_count
+
+    def return_ticket(self, ticket: CompletionTicket) -> None:
+        if not ticket.completion or not ticket.timing_consumed:
+            raise TransportError("event pair returned before completion and timing harvest")
+        if self._active_tickets.get(ticket.slot_index) is not ticket:
+            raise TransportError("completion ticket is stale")
+        self._active_tickets.pop(ticket.slot_index, None)
+
+    def telemetry(self) -> dict[str, Any]:
+        return {
+            "arena_bytes": self.arena_bytes,
+            "slot_count": self.slot_count,
+            "slot_bytes": self.slot_bytes,
+            "request_physical_pinned_alloc_count": self.physical_pinned_alloc_count,
+            "transport_physical_pinned_alloc_count": (
+                1 if self.transport_use_count == 1 else 0
+            ),
+            "created_vs_reused": "CREATED" if self.transport_use_count <= 1 else "REUSED",
+            "dedicated_h2d_stream_count": 1,
+            "event_object_count": self.event_object_count,
+            "event_rerecord_count": self.event_rerecord_count,
+            "h2d_submit_count": self.h2d_submit_count,
+            "h2d_completion_count": self.h2d_completion_count,
+            "GPU_COPY_ACTIVE_SUM_MS": self.gpu_copy_active_sum_ms,
+            "GPU_COPY_STREAM_SPAN_MS": self.gpu_copy_stream_span_ms,
+            "GPU_COPY_ACTIVE_UNION_MS": self.gpu_copy_active_union_ms,
+            "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": self.gpu_copy_idle_inside_stream_span_ms,
+            "GPU_COPY_COUNT": self.gpu_copy_count,
+            "GPU_COPY_BYTES": self.gpu_copy_bytes,
+        }
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if self._active_tickets or self._active_transports:
+            raise TransportError("request transport resources are not quiescent")
+        if getattr(self, "_poisoned", False) and not self._poison_observed:
+            raise TransportError("request transport resources have unsurfaced poison")
+        self.arena = None
+        self.views = ()
+        self.events = ()
+        self.span_events = ()
+        self.h2d_stream = None
+        self.closed = True
+
+
+def _event_elapsed_ms(start_event: Any, end_event: Any) -> float | None:
+    elapsed = getattr(start_event, "elapsed_time", None)
+    if not callable(elapsed):
+        return None
+    try:
+        value = float(elapsed(end_event))
+    except Exception:
+        return None
+    return value if value >= 0 else None
 
 
 class TransportError(RuntimeError):
@@ -671,6 +908,17 @@ class _Telemetry:
     event_cancel_count: int | None = None
     completion_classification: str = "normal"
     actual_source: ActualSourceTelemetry | None = None
+    gpu_copy_active_sum_ms: float = 0.0
+    gpu_copy_stream_span_ms: float | None = None
+    gpu_copy_active_union_ms: float = 0.0
+    gpu_copy_idle_inside_stream_span_ms: float = 0.0
+    gpu_copy_count: int = 0
+    gpu_copy_bytes: int = 0
+    event_object_count: int | None = None
+    event_rerecord_count: int | None = None
+    request_physical_pinned_alloc_count: int | None = None
+    transport_physical_pinned_alloc_count: int | None = None
+    transport_resources: Mapping[str, Any] | None = None
     _lock: threading.Lock | None = field(default=None, repr=False)
     _correctness_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -840,6 +1088,7 @@ class _Telemetry:
             actual_source_report = (
                 self.actual_source.to_dict() if self.actual_source is not None else None
             )
+            resource_report = dict(self.transport_resources or {})
             return {
                 "timing_scope": {
                     "total_entry_to_return_wall_ms": "TOTAL",
@@ -976,6 +1225,34 @@ class _Telemetry:
                     actual_source_report.get("POST_SOURCE_H2D_TAIL_MS")
                     if actual_source_report is not None else None
                 ),
+                "GPU_COPY_ACTIVE_SUM_MS": self.gpu_copy_active_sum_ms,
+                "GPU_COPY_STREAM_SPAN_MS": self.gpu_copy_stream_span_ms,
+                "GPU_COPY_ACTIVE_UNION_MS": self.gpu_copy_active_union_ms,
+                "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": self.gpu_copy_idle_inside_stream_span_ms,
+                "GPU_COPY_COUNT": self.gpu_copy_count,
+                "GPU_COPY_BYTES": self.gpu_copy_bytes,
+                "event_object_count": self.event_object_count,
+                "event_rerecord_count": self.event_rerecord_count,
+                "request_physical_pinned_alloc_count": self.request_physical_pinned_alloc_count,
+                "transport_physical_pinned_alloc_count": self.transport_physical_pinned_alloc_count,
+                "transport_resources": _json_safe(self.transport_resources),
+                "arena_bytes": resource_report.get("arena_bytes"),
+                "slot_count": resource_report.get("slot_count"),
+                "slot_bytes": resource_report.get("slot_bytes"),
+                "request_physical_pinned_alloc_count": resource_report.get(
+                    "request_physical_pinned_alloc_count"
+                ),
+                "transport_physical_pinned_alloc_count": resource_report.get(
+                    "transport_physical_pinned_alloc_count"
+                ),
+                "created_vs_reused": resource_report.get("created_vs_reused"),
+                "dedicated_h2d_stream_count": resource_report.get(
+                    "dedicated_h2d_stream_count"
+                ),
+                "event_object_count": resource_report.get("event_object_count"),
+                "event_rerecord_count": resource_report.get("event_rerecord_count"),
+                "h2d_submit_count": resource_report.get("h2d_submit_count"),
+                "h2d_completion_count": resource_report.get("h2d_completion_count"),
                 "quiescence_evidence": (
                     actual_source_report.get("quiescence_evidence")
                     if actual_source_report is not None else None
@@ -1146,10 +1423,20 @@ class TransportDispatcher:
             self._stop = True
             self._queue_condition.notify_all()
 
-    def _record_h2d_complete(self, key: int) -> None:
+    def _record_h2d_complete(self, key: int, ticket: CompletionTicket | None = None) -> None:
         token = self._actual_h2d_tokens.pop(key, None)
         if token is not None and self.telemetry.actual_source is not None:
             self.telemetry.actual_source.record_h2d_complete(token)
+        harvest = getattr(self.backend, "harvest_completion", None)
+        if callable(harvest) and ticket is not None:
+            harvest(ticket)
+            resource_stats = getattr(getattr(self.backend, "resources", None), "telemetry", None)
+            if callable(resource_stats):
+                self.telemetry.transport_resources = resource_stats()
+                resource = getattr(self.backend, "resources", None)
+                self.telemetry.gpu_copy_active_sum_ms = resource.gpu_copy_active_sum_ms
+                self.telemetry.gpu_copy_count = resource.gpu_copy_count
+                self.telemetry.gpu_copy_bytes = resource.gpu_copy_bytes
 
     def _poll(self) -> None:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
@@ -1158,9 +1445,9 @@ class TransportDispatcher:
             if self.telemetry.diagnostics_enabled:
                 assert self.telemetry.qd_samples is not None
                 self.telemetry.qd_samples.append(len(active))
-        for key, (lease, record, event, submit_ns) in active:
+        for key, (lease, record, ticket, submit_ns) in active:
             try:
-                raw_status = self.backend.poll_event(event)
+                raw_status = self.backend.poll_event(ticket.end_event)
                 status = EventStatus(raw_status)
             except BaseException as exc:
                 with self._lease_cleanup_lock:
@@ -1189,8 +1476,11 @@ class TransportDispatcher:
                     # cleanup race cannot make telemetry claim it did not.
                     self.telemetry.h2d_completed_bytes += record.nbytes
                     self.telemetry.h2d_completed_count += 1
-                    self._record_h2d_complete(key)
+                    self._record_h2d_complete(key, ticket)
                     self.pool._return_completed(lease)
+                    release_ticket = getattr(self.backend, "release_ticket", None)
+                    if callable(release_ticket):
+                        release_ticket(ticket)
                     with self._queue_condition:
                         self._completed_records.append(record)
                     if self.telemetry.diagnostics_enabled:
@@ -1233,14 +1523,14 @@ class TransportDispatcher:
         # is held by _run.
         with self._queue_condition:
             active = list(self._in_flight.items()) + list(self._late_submissions.items())
-        for key, (lease, record, event, _submit_ns) in active:
+        for key, (lease, record, ticket, _submit_ns) in active:
             with self._queue_condition:
                 is_late_submission = key in self._late_submissions
             try:
                 if self.telemetry.diagnostics_enabled:
                     assert self.telemetry.event_cancel_count is not None
                     self.telemetry.event_cancel_count += 1
-                self.backend.cancel_event(event)
+                self.backend.cancel_event(ticket.end_event)
             except BaseException as exc:
                 self._note_cleanup(exc)
             status: EventStatus | None = None
@@ -1252,7 +1542,7 @@ class TransportDispatcher:
                 if poll_index and deadline is not None and time.monotonic() >= deadline:
                     break
                 try:
-                    status = EventStatus(self.backend.poll_event(event))
+                    status = EventStatus(self.backend.poll_event(ticket.end_event))
                 except BaseException as exc:
                     self._note_cleanup(exc)
                     status = None
@@ -1273,9 +1563,12 @@ class TransportDispatcher:
                     try:
                         self.telemetry.h2d_completed_bytes += record.nbytes
                         self.telemetry.h2d_completed_count += 1
-                        self._record_h2d_complete(key)
+                        self._record_h2d_complete(key, ticket)
                         if not lease._returned:
                             self.pool._return_completed(lease)
+                        release_ticket = getattr(self.backend, "release_ticket", None)
+                        if callable(release_ticket):
+                            release_ticket(ticket)
                         with self._queue_condition:
                             self._completed_records.append(record)
                             self._in_flight.pop(key, None)
@@ -1365,7 +1658,7 @@ class TransportDispatcher:
                         self._queue_condition.wait(0.001)
                     continue
                 lease, record = item
-                event = None
+                ticket: CompletionTicket | None = None
                 try:
                     with self._lease_cleanup_lock:
                         self.pool._mark_in_flight(lease)
@@ -1379,8 +1672,20 @@ class TransportDispatcher:
                         actual_h2d_token = self.telemetry.actual_source.record_h2d_submit(
                             record.nbytes, timestamp_ns=submit_ns
                         )
-                    event = self.backend.submit_h2d(source, record.destination_offset)
-                    if event is None:
+                    submit_ticket = getattr(self.backend, "submit_h2d_ticket", None)
+                    if callable(submit_ticket):
+                        ticket = submit_ticket(
+                            source, record.destination_offset,
+                            slot_index=lease.slot_index,
+                            submission_id=lease.generation,
+                        )
+                    else:
+                        event = self.backend.submit_h2d(source, record.destination_offset)
+                        if event is not None:
+                            ticket = CompletionTicket(
+                                lease.slot_index, lease.generation, None, event, record.nbytes
+                            )
+                    if ticket is None:
                         raise TransportError("backend returned no completion event")
                     # The backend accepted the copy.  Count it before the
                     # handoff bookkeeping so a bounded-drain race cannot
@@ -1409,7 +1714,7 @@ class TransportDispatcher:
                         if handoff is item:
                             self._handoff.pop(lease.slot_index, None)
                             self._in_flight[lease.slot_index] = (
-                                lease, record, event,
+                                lease, record, ticket,
                                 submit_ns if self.telemetry.diagnostics_enabled else None,
                             )
                             registration_error = None
@@ -1418,7 +1723,7 @@ class TransportDispatcher:
                             # cancellation detached the handoff.  It is now a
                             # first-class event, not an ignorable late return.
                             self._late_submissions[lease.slot_index] = (
-                                lease, record, event,
+                                lease, record, ticket,
                                 submit_ns if self.telemetry.diagnostics_enabled else None,
                             )
                             if self.telemetry.diagnostics_enabled:
@@ -1517,6 +1822,7 @@ class GoldenQDTransport:
         arm: str | None = None,
         pool: StagingPool | None = None,
         diagnostics: bool = True,
+        resources: GoldenTransferResources | None = None,
     ) -> None:
         self.config = config or TransportConfig()
         # This class is the dispatcher implementation.  The legacy default is
@@ -1526,12 +1832,21 @@ class GoldenQDTransport:
         if self.arm == DISPATCHER_ARM and backend is None:
             raise ValueError("dispatcher arm requires an explicitly supplied backend")
         self.backend = backend
+        self.resources = resources
+        if resources is not None and (
+            self.config.staging_slots != resources.slot_count
+            or self.config.block_bytes != resources.slot_bytes
+        ):
+            raise ValueError("request transport resources require the fixed E27 staging dimensions")
         if pool is None:
             buffers = None
+            if resources is not None:
+                pool = resources.new_pool(self.config.capacity_class)
             allocator = getattr(backend, "allocate_staging_buffers", None)
-            if callable(allocator):
+            if pool is None and callable(allocator):
                 buffers = cast(Sequence[Any], allocator(self.config.staging_slots, self.config.block_bytes))
-            pool = StagingPool(self.config.staging_slots, self.config.block_bytes, self.config.capacity_class, buffers=buffers)
+            if pool is None:
+                pool = StagingPool(self.config.staging_slots, self.config.block_bytes, self.config.capacity_class, buffers=buffers)
         self.pool = pool
         self.telemetry = _Telemetry(
             execution_arm=self.arm, diagnostics_enabled=bool(diagnostics)
@@ -2017,6 +2332,17 @@ class GoldenQDTransport:
         return evidence
 
     def execute(
+        self, *args: Any, **kwargs: Any
+    ) -> TransportResult:
+        if self.resources is not None:
+            self.resources.transport_enter()
+        try:
+            return self._execute(*args, **kwargs)
+        finally:
+            if self.resources is not None:
+                self.resources.transport_exit(poisoned=self.pool.poisoned)
+
+    def _execute(
         self,
         ranges: Iterable[SourceRange],
         reader: PinnedRangeReader | Callable[[int, int], bytes],
@@ -2031,6 +2357,12 @@ class GoldenQDTransport:
         adoption_result: Any = None,
         diagnostics: bool | None = None,
     ) -> TransportResult:
+        if self.resources is not None:
+            self.telemetry.request_physical_pinned_alloc_count = self.resources.physical_pinned_alloc_count
+            self.telemetry.transport_physical_pinned_alloc_count = 0
+            self.telemetry.event_object_count = self.resources.event_object_count
+            self.telemetry.event_rerecord_count = self.resources.event_rerecord_count
+            self.telemetry.transport_resources = self.resources.telemetry()
         if diagnostics is not None and bool(diagnostics) != self.telemetry.diagnostics_enabled:
             self.telemetry = _Telemetry(
                 execution_arm=self.arm, diagnostics_enabled=bool(diagnostics)
@@ -2283,6 +2615,16 @@ class GoldenQDTransport:
             self.drain(None, bounded=False)
         else:
             self.drain(deadline=abort_deadline)
+        if self.resources is not None:
+            self.resources.finish_span()
+            self.telemetry.gpu_copy_active_sum_ms = self.resources.gpu_copy_active_sum_ms
+            self.telemetry.gpu_copy_stream_span_ms = self.resources.gpu_copy_stream_span_ms
+            self.telemetry.gpu_copy_active_union_ms = self.resources.gpu_copy_active_union_ms
+            self.telemetry.gpu_copy_idle_inside_stream_span_ms = self.resources.gpu_copy_idle_inside_stream_span_ms
+            self.telemetry.gpu_copy_count = self.resources.gpu_copy_count
+            self.telemetry.gpu_copy_bytes = self.resources.gpu_copy_bytes
+            self.telemetry.event_rerecord_count = self.resources.event_rerecord_count
+            self.telemetry.transport_resources = self.resources.telemetry()
         if self.telemetry.diagnostics_enabled:
             self.telemetry.final_drain_end_ns = time.monotonic_ns()
         # Never close a source behind a producer that did not retire; the
@@ -2422,6 +2764,7 @@ class GoldenQDTransport:
             self.pool.poisoned or producers or dispatcher_live or queue_live or handoff_live
             or events_live or open_readers or slot_live or actual_source_inflight
             or actual_h2d_inflight
+            or (self.resources is not None and self.resources.active_tickets)
             or (final_evidence is not None and not ActualSourceTelemetry._quiescent(final_evidence))
         ):
             raise TransportError(
@@ -2454,13 +2797,14 @@ def create_transport(
     config: TransportConfig | None = None,
     backend: TransportBackend | None = None,
     diagnostics: bool = True,
+    resources: GoldenTransferResources | None = None,
 ) -> GoldenQDTransport | LegacyTransport:
     selected = normalize_transport_arm(arm)
     return (
         LegacyTransport(config, backend)
         if selected == LEGACY_ARM
         else GoldenQDTransport(
-            config, backend, arm=selected, diagnostics=diagnostics
+            config, backend, arm=selected, diagnostics=diagnostics, resources=resources
         )
     )
 
@@ -2518,7 +2862,7 @@ class FakeBackend:
 class CudaTransferBackend:
     """Minimal production adapter for a caller-owned CUDA uint8 destination."""
 
-    def __init__(self, destination: Any, *, stream: Any = None) -> None:
+    def __init__(self, destination: Any, *, stream: Any = None, resources: GoldenTransferResources | None = None) -> None:
         try:
             import torch
         except ImportError as exc:
@@ -2528,7 +2872,8 @@ class CudaTransferBackend:
             raise ValueError("destination must be a one-dimensional CUDA uint8 torch tensor")
         self.torch = torch
         self.destination = destination
-        self.stream = stream
+        self.resources = resources
+        self.stream = stream if stream is not None else (resources.h2d_stream if resources is not None else None)
 
     @staticmethod
     def allocate_staging_buffers(slots: int, block_bytes: int) -> list[Any]:
@@ -2540,22 +2885,67 @@ class CudaTransferBackend:
             raise TransportError("CUDA is unavailable for pinned staging allocation")
         torch_empty = getattr(torch, "empty")
         torch_uint8 = getattr(torch, "uint8")
+        if slots == DEFAULT_STAGING_SLOTS and block_bytes == DEFAULT_BLOCK_BYTES:
+            arena = torch_empty(REQUEST_ARENA_BYTES, dtype=torch_uint8, pin_memory=True)
+            return [
+                arena[index * block_bytes : (index + 1) * block_bytes]
+                for index in range(slots)
+            ]
         return [torch_empty(block_bytes, dtype=torch_uint8, pin_memory=True) for _ in range(slots)]
 
     def submit_h2d(self, source: Any, destination_offset: int) -> Any:
+        raise TransportError(
+            "CudaTransferBackend requires a reusable completion ticket; "
+            "use submit_h2d_ticket"
+        )
+
+    def submit_h2d_ticket(
+        self, source: Any, destination_offset: int, *, slot_index: int, submission_id: int
+    ) -> CompletionTicket:
+        if self.resources is None:
+            raise TransportError("request resources are required for ticketed CUDA copies")
+        ticket = self.resources.begin_ticket(slot_index, int(source.numel()))
+        try:
+            self._submit(source, destination_offset, ticket=ticket)
+        except BaseException:
+            self.resources._active_tickets.pop(ticket.slot_index, None)
+            raise
+        return ticket
+
+    def _submit(self, source: Any, destination_offset: int, *, ticket: CompletionTicket | None) -> Any:
         torch = self.torch
+        if self.resources is None or ticket is None:
+            raise TransportError("request resources are required for CUDA submission")
         torch_uint8 = getattr(torch, "uint8")
         if not isinstance(source, torch.Tensor) or source.dtype != torch_uint8 or source.dim() != 1 or source.is_cuda:
             raise ValueError("CUDA backend requires a one-dimensional CPU uint8 staging tensor")
         end = destination_offset + source.numel()
         if destination_offset < 0 or end > self.destination.numel():
             raise ReconciliationError("CUDA destination offset is out of bounds")
-        stream = self.stream or torch.cuda.current_stream(device=self.destination.device)
+        stream = self.stream
+        if stream is None:
+            raise TransportError("CUDA submission requires a request-owned dedicated stream")
         with torch.cuda.stream(stream):
+            self.resources.begin_span()
+            record_start = getattr(ticket.start_event, "record", None)
+            if not callable(record_start):
+                raise TransportError("request H2D start event is not recordable")
+            record_start(stream)
             self.destination[destination_offset:end].copy_(source, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(stream)
-        return event
+            record_end = getattr(ticket.end_event, "record", None)
+            if not callable(record_end):
+                raise TransportError("request H2D end event is not recordable")
+            record_end(stream)
+            self.resources.h2d_submit_count += 1
+        return ticket
+
+    def harvest_completion(self, ticket: CompletionTicket) -> None:
+        if self.resources is not None:
+            self.resources.harvest_ticket(ticket)
+
+    def release_ticket(self, ticket: CompletionTicket) -> None:
+        if self.resources is not None:
+            self.resources.return_ticket(ticket)
 
     def poll_event(self, event: Any) -> EventStatus:
         try:
@@ -2664,9 +3054,9 @@ def _read_destination(destination: Any, size: int) -> bytes:
 
 
 __all__ = [
-    "BackingAdoption", "BackingOwner", "CancellationError", "CudaTransferBackend", "DEFAULT_BLOCK_BYTES",
-    "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "DISPATCHER_ARM", "CONTROL_ARM", "STATIC_E27_ARM", "TEST_ARM",
-    "STATIC_E27_PRODUCERS", "EventStatus", "FakeBackend", "FakeEvent", "FakeSource", "GoldenQDTransport", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
+    "BackingAdoption", "BackingOwner", "CancellationError", "CompletionTicket", "CudaTransferBackend", "DEFAULT_BLOCK_BYTES",
+    "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "REQUEST_ARENA_BYTES", "DISPATCHER_ARM", "CONTROL_ARM", "STATIC_E27_ARM", "TEST_ARM",
+    "STATIC_E27_PRODUCERS", "EventStatus", "FakeBackend", "FakeEvent", "FakeSource", "GoldenQDTransport", "GoldenTransferResources", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
     "PoolPoisonedError", "QDTransport", "ReadyRecord", "ReconciliationError", "SlotState", "SourceRange",
     "StageLease", "StagingPool", "PinnedRangeReader", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
     "evaluate_e27_source_mechanism",

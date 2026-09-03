@@ -1756,9 +1756,9 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     if "per_read" not in source_reads and experiment.get("source_reads_per_read") is not None:
         source_reads["per_read"] = copy.deepcopy(experiment["source_reads_per_read"])
     if execution_arm in {"dispatcher", "static_e27"}:
-        # The dispatcher performs the positioned read directly into the lease.
-        # There is no separate CPU-to-pinned copy or legacy pinned-slot reuse,
-        # but CudaTransferBackend still allocates real pinned staging storage.
+        # The dispatcher performs the positioned read directly into the
+        # request-owned lease.  There is no separate CPU-to-pinned copy or
+        # per-transport pinned allocation in this candidate.
         pinned_staging = {
             "status": "NOT RUN",
             "reason": "positioned readinto fills the acquired staging lease directly",
@@ -1931,6 +1931,36 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         "fallback_reason": (stats.get("fallback") or {}).get("fallback_reason"),
         "source_open_header_layout": source,
         "staging": staging,
+        "arena_bytes": stats.get("arena_bytes", experiment.get("arena_bytes")),
+        "slot_count": stats.get("slot_count", experiment.get("slot_count")),
+        "slot_bytes": stats.get("slot_bytes", experiment.get("slot_bytes")),
+        "request_physical_pinned_alloc_count": stats.get(
+            "request_physical_pinned_alloc_count",
+            experiment.get("request_physical_pinned_alloc_count"),
+        ),
+        "transport_physical_pinned_alloc_count": stats.get(
+            "transport_physical_pinned_alloc_count",
+            experiment.get("transport_physical_pinned_alloc_count"),
+        ),
+        "created_vs_reused": stats.get("created_vs_reused", experiment.get("created_vs_reused")),
+        "dedicated_h2d_stream_count": stats.get(
+            "dedicated_h2d_stream_count", experiment.get("dedicated_h2d_stream_count")
+        ),
+        "event_object_count": stats.get("event_object_count", experiment.get("event_object_count")),
+        "event_rerecord_count": stats.get("event_rerecord_count", experiment.get("event_rerecord_count")),
+        "h2d_submit_count": stats.get("h2d_submit_count", experiment.get("h2d_submit_count")),
+        "h2d_completion_count": stats.get(
+            "h2d_completion_count", experiment.get("h2d_completion_count")
+        ),
+        "GPU_COPY_ACTIVE_SUM_MS": stats.get("GPU_COPY_ACTIVE_SUM_MS", experiment.get("GPU_COPY_ACTIVE_SUM_MS")),
+        "GPU_COPY_STREAM_SPAN_MS": stats.get("GPU_COPY_STREAM_SPAN_MS", experiment.get("GPU_COPY_STREAM_SPAN_MS")),
+        "GPU_COPY_ACTIVE_UNION_MS": stats.get("GPU_COPY_ACTIVE_UNION_MS", experiment.get("GPU_COPY_ACTIVE_UNION_MS")),
+        "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": stats.get(
+            "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS",
+            experiment.get("GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS"),
+        ),
+        "GPU_COPY_COUNT": stats.get("GPU_COPY_COUNT", experiment.get("GPU_COPY_COUNT")),
+        "GPU_COPY_BYTES": stats.get("GPU_COPY_BYTES", experiment.get("GPU_COPY_BYTES")),
         "source_reads": source_reads,
         "source_read_wall_ns": source_wall_ns,
         "source_read_wall_ms": source_wall_ms,
@@ -3356,6 +3386,7 @@ def _read_file_qd_gpu_dispatcher(
     block_bytes: int,
     diagnostics: Optional[bool],
     transport_arm: str = "dispatcher",
+    resources: Any = None,
 ) -> dict:
     """Run the opt-in dispatcher/static-E27 arm and adapt it to Golden.
 
@@ -3366,6 +3397,12 @@ def _read_file_qd_gpu_dispatcher(
     """
     transport_module = importlib.import_module("comfymodal_runtime.golden_qd_transport")
     selected = transport_module.normalize_transport_arm(transport_arm)
+    if resources is not None:
+        # The request-resource candidate is deliberately not an environment
+        # arm: it is fixed E27 transport with one request-owned arena.
+        selected = "static_e27"
+        qd = 4
+        block_bytes = transport_module.DEFAULT_BLOCK_BYTES
     if selected not in ("dispatcher", "static_e27"):
         raise RuntimeError(f"unexpected_qd_transport_arm:{selected}")
     qd = max(1, min(32, int(qd)))
@@ -3403,13 +3440,14 @@ def _read_file_qd_gpu_dispatcher(
     try:
         gpu_buf = torch.empty(total, dtype=torch.uint8, device=dev)
         owner = GoldenQDOwner(gpu_buf, [], dev, role=role)
-        cuda_backend = transport_module.CudaTransferBackend(gpu_buf)
+        cuda_backend = transport_module.CudaTransferBackend(gpu_buf, resources=resources)
 
         class _MeasuredCudaBackend:
             """Measure host submit calls without copying the lease payload."""
 
             def __init__(self, backend: Any):
                 self.backend = backend
+                self.resources = getattr(backend, "resources", None)
                 self.staging_allocation_ns = 0 if diagnostics_enabled else None
                 self.submit_wall_ns = 0 if diagnostics_enabled else None
                 self.submit_count = 0
@@ -3439,14 +3477,38 @@ def _read_file_qd_gpu_dispatcher(
                         self.submit_wall_ns += max(0, time.perf_counter_ns() - started)
                     self.submit_count += 1
 
+            def submit_h2d_ticket(
+                self, source: Any, destination_offset: int, *,
+                slot_index: int, submission_id: int,
+            ) -> Any:
+                if not isinstance(source, torch.Tensor):
+                    source = torch.frombuffer(source, dtype=torch.uint8)
+                started = time.perf_counter_ns() if diagnostics_enabled else None
+                try:
+                    return self.backend.submit_h2d_ticket(
+                        source, destination_offset,
+                        slot_index=slot_index, submission_id=submission_id,
+                    )
+                finally:
+                    if diagnostics_enabled:
+                        assert started is not None and self.submit_wall_ns is not None
+                        self.submit_wall_ns += max(0, time.perf_counter_ns() - started)
+                    self.submit_count += 1
+
             def poll_event(self, event: Any) -> Any:
                 return self.backend.poll_event(event)
 
             def cancel_event(self, event: Any) -> None:
                 return self.backend.cancel_event(event)
 
+            def harvest_completion(self, ticket: Any) -> None:
+                return self.backend.harvest_completion(ticket)
+
+            def release_ticket(self, ticket: Any) -> None:
+                return self.backend.release_ticket(ticket)
+
         backend = _MeasuredCudaBackend(cuda_backend)
-        staging_slots = max(2 * qd, 1)
+        staging_slots = resources.slot_count if resources is not None else max(2 * qd, 1)
         config = transport_module.TransportConfig(
             queue_depth=qd,
             block_bytes=block_bytes,
@@ -3458,6 +3520,7 @@ def _read_file_qd_gpu_dispatcher(
         dispatcher = transport_module.create_transport(
             selected, config=config, backend=backend,
             diagnostics=diagnostics_enabled,
+            resources=resources,
         )
         staging_allocation_ns = (
             int(backend.staging_allocation_ns)
@@ -3823,6 +3886,7 @@ def _read_file_qd_gpu_dispatcher(
             ),
             "pinned_bytes": staging_slots * block_bytes,
             "gpu_bytes": total,
+            "request_transport_resource": resources.telemetry() if resources is not None else None,
             "buffer_pool_wait_ms": telemetry.get("producer_capacity_block_wall_ms"),
             "source_open_header_layout": (
                 {
@@ -3836,7 +3900,9 @@ def _read_file_qd_gpu_dispatcher(
                 if diagnostics_enabled else {}
             ),
             "staging": {
-                "allocation_count": staging_slots,
+                "allocation_count": 1 if resources is not None else staging_slots,
+                "physical_allocation_count": 1 if resources is not None else staging_slots,
+                "logical_view_count": staging_slots,
                 "allocated_bytes": staging_slots * block_bytes,
                 "reuse_count": max(0, planned_count - staging_slots),
                 "retained_bytes": 0,
@@ -3865,7 +3931,9 @@ def _read_file_qd_gpu_dispatcher(
             "allocation_pinning": {
                 "status": "OBSERVED",
                 "allocation_ns": staging_allocation_ns,
-                "allocation_count": staging_slots,
+                "allocation_count": 1 if resources is not None else staging_slots,
+                "physical_allocation_count": 1 if resources is not None else staging_slots,
+                "logical_view_count": staging_slots,
                 "allocated_bytes": staging_slots * block_bytes,
                 "pinned_bytes": staging_slots * block_bytes,
                 "pinned": True,
@@ -3900,11 +3968,18 @@ def _read_file_qd_gpu_dispatcher(
                 "timing_scope": "TOTAL host CudaTransferBackend.submit_h2d intervals",
             } if diagnostics_enabled else {},
             "h2d_gpu_event": {
-                "duration_ns": None,
-                "duration_ms": None,
+                "duration_ns": (
+                    int(float(telemetry.get("GPU_COPY_ACTIVE_SUM_MS") or 0) * 1e6)
+                    if resources is not None else None
+                ),
+                "duration_ms": telemetry.get("GPU_COPY_ACTIVE_SUM_MS") if resources is not None else None,
                 "copy_count": int(telemetry.get("h2d_completed_count") or 0),
                 "bytes": h2d_bytes,
-                "scope": "event completion latency is reported separately",
+                "GPU_COPY_ACTIVE_SUM_MS": telemetry.get("GPU_COPY_ACTIVE_SUM_MS") if resources is not None else None,
+                "GPU_COPY_STREAM_SPAN_MS": telemetry.get("GPU_COPY_STREAM_SPAN_MS") if resources is not None else None,
+                "GPU_COPY_ACTIVE_UNION_MS": telemetry.get("GPU_COPY_ACTIVE_UNION_MS") if resources is not None else None,
+                "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": telemetry.get("GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS") if resources is not None else None,
+                "scope": "CUDA event copy-active duration on request H2D stream",
                 "non_additive": True,
             } if diagnostics_enabled else {},
             "h2d_submit_wall": h2d_submit_wall,
@@ -3971,6 +4046,10 @@ def _read_file_qd_gpu_dispatcher(
         }
         if actual_source_report is not None:
             stats.update(_actual_source_report_fields(actual_source_report))
+        if resources is not None:
+            resource_stats = resources.telemetry()
+            stats.update(resource_stats)
+            stats["request_transport_resource"] = resource_stats
         stats["owner_count"] = 1
         stats["adoption_result"] = "backing_owner_retained_for_adoption"
         views: dict[str, Any] = {}
@@ -3990,6 +4069,11 @@ def _read_file_qd_gpu_dispatcher(
             "header_metadata": header.get("__metadata__"),
         }
     except BaseException as exc:
+        if resources is not None and (
+            getattr(exc, "transport_failure", None) is not None
+            or bool(getattr(getattr(dispatcher, "pool", None), "poisoned", False))
+        ):
+            resources.acknowledge_poison()
         retain_owner = bool(
             owner is not None
             and dispatcher is not None
@@ -4032,6 +4116,7 @@ def read_file_qd_gpu(
     block_bytes: int = GOLDEN_BLOCK_BYTES,
     diagnostics: Optional[bool] = None,
     transport_arm: Optional[str] = None,
+    transport_resources: Any = None,
 ) -> dict:
     """Single-source QD physical transport: parse header -> plan -> four source
     workers (one fd each, two pinned slots each) -> positioned reads -> async
@@ -4046,6 +4131,8 @@ def read_file_qd_gpu(
     fallback, and NO reread.
     """
     selected_transport_arm = golden_qd_transport_arm(transport_arm)
+    if transport_resources is not None:
+        selected_transport_arm = "static_e27"
     if selected_transport_arm in ("dispatcher", "static_e27"):
         adapter_kwargs = dict(
             role=role,
@@ -4054,6 +4141,8 @@ def read_file_qd_gpu(
             block_bytes=block_bytes,
             diagnostics=diagnostics,
         )
+        if transport_resources is not None:
+            adapter_kwargs["resources"] = transport_resources
         if selected_transport_arm != "dispatcher":
             adapter_kwargs["transport_arm"] = selected_transport_arm
         return _read_file_qd_gpu_dispatcher(
@@ -5027,6 +5116,9 @@ class GoldenSession:
         self.clip_paths: list[str] = []
         self.clip: Any = None
         self.clip_owner: Optional[GoldenQDOwner] = None
+        # Lazily created after request setup, when CUDA transport is usable.
+        # The object owns only request-local pinned staging/copy resources.
+        self.transport_resources: Any = None
         # One retained QD owner PER checkpoint (canonical spec has exactly one).
         self.clip_owners: list = []
         # Transaction visibility begins at transport success, before a later
@@ -5085,6 +5177,24 @@ class GoldenSession:
             )
         self.recorder.event("golden_qd_transport_selector", arm=self.qd_transport_arm)
         self.recorder.run_identity = dict(self.run_identity)
+
+    def get_transport_resources(self) -> Any:
+        """Create the single request-lifetime transport resource on demand."""
+        # Some focused loader tests construct a minimal session with __new__;
+        # those tests deliberately replace the transport seam and must not
+        # initialize CUDA resources behind that seam.
+        if not hasattr(self, "transport_resources"):
+            return None
+        if self.transport_resources is None:
+            transport_module = importlib.import_module(
+                "comfymodal_runtime.golden_qd_transport"
+            )
+            self.transport_resources = transport_module.GoldenTransferResources.create()
+            resource_telemetry = self.transport_resources.telemetry()
+            self.recorder.event(
+                "golden_transfer_resources_created", **resource_telemetry
+            )
+        return self.transport_resources
 
     def register_qd_owner(self, owner: GoldenQDOwner) -> None:
         """Make a successful transport owner cleanup-visible immediately."""
@@ -7931,6 +8041,19 @@ def _ra9h_forward_conversion_instrumentation(
                 )
 
 
+def _transport_read_options(session: GoldenSession) -> dict[str, Any]:
+    """Pass request resources only through readers that expose the seam."""
+    parameters = inspect.signature(read_file_qd_gpu).parameters
+    accepts_resources = "transport_resources" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    return (
+        {"transport_resources": session.get_transport_resources()}
+        if accepts_resources else {}
+    )
+
+
 async def golden_clip_load(session: GoldenSession) -> Any:
     """Load CLIP via the contract's :class:`ClipLoadSpec` and the real
     upstream constructor.
@@ -8018,6 +8141,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                         role=role,
                         qd=contract.qd,
                         block_bytes=contract.block_bytes,
+                        **_transport_read_options(session),
                     )
             transports.append(transport)
             session.register_qd_owner(transport["owner"])
@@ -9455,9 +9579,6 @@ async def golden_unet_load(session: GoldenSession) -> Any:
         def checkpoint(name: str) -> dict:
             if not torch.cuda.is_available():
                 raise RuntimeError("cuda_unavailable")
-            synchronize = getattr(torch.cuda, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
             allocated = int(torch.cuda.memory_allocated())
             peak = int(torch.cuda.max_memory_allocated()) if peak_supported else allocated
             value = {
@@ -9468,6 +9589,8 @@ async def golden_unet_load(session: GoldenSession) -> Any:
                 ),
                 "peak_allocated_bytes": peak,
                 "peak_measurement_supported": peak_supported,
+                "allocator_observation": "NON-SYNCHRONIZING",
+                "synchronizing": False,
             }
             allocation_checkpoints.append(value)
             rec.event(
@@ -9483,9 +9606,6 @@ async def golden_unet_load(session: GoldenSession) -> Any:
         def reset_peak_stats() -> None:
             reset = getattr(torch.cuda, "reset_peak_memory_stats", None)
             if callable(reset):
-                synchronize = getattr(torch.cuda, "synchronize", None)
-                if callable(synchronize):
-                    synchronize()
                 reset()
 
         reset_peak_stats()
@@ -9511,6 +9631,7 @@ async def golden_unet_load(session: GoldenSession) -> Any:
                     role="unet",
                     qd=contract.qd,
                     block_bytes=contract.block_bytes,
+                    **_transport_read_options(session),
                 )
         views = {
             k[len(prefix):] if prefix and k.startswith(prefix) else k: v
@@ -10164,6 +10285,7 @@ async def golden_vae_load(session: GoldenSession) -> Any:
                 role="vae",
                 qd=contract.qd,
                 block_bytes=contract.block_bytes,
+                **_transport_read_options(session),
             )
         transport_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
         if diagnostics_enabled:
@@ -11150,6 +11272,14 @@ async def golden_teardown(session: GoldenSession) -> dict:
         t2 = time.monotonic_ns()
         reconcile = rec.reconcile_seriality()
         substage_timings["reconcile_ms"] = (time.monotonic_ns() - t2) / 1e6
+
+        # The request arena is released only after workers, copies, leases,
+        # threads, and reconciliation have all reached their terminal proof.
+        # close() is fail-closed and refuses a live/poisoned resource.
+        resources = getattr(session, "transport_resources", None)
+        if resources is not None:
+            resources.close()
+            rec.event("golden_transfer_resources_closed", **resources.telemetry())
 
         rec.end_stage(
             "golden_teardown",
