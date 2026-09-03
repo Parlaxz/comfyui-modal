@@ -62,7 +62,7 @@ def _memory_request(environment: Mapping[str, Any]) -> int:
         return _positive_int("COMFYMODAL_V2_MEMORY_REQUEST", str(request_raw).strip())
     if mb_present:
         return _positive_int("COMFYMODAL_V2_MEMORY_MB", str(mb_raw).strip())
-    return 49152
+    return 8192
 
 
 def _shape_label(environment: Mapping[str, Any]) -> str | None:

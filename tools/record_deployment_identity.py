@@ -243,7 +243,7 @@ def main() -> int:
 
         # Deployed runtime-shape record (canonical deploy-batch env): computed
         # from the SAME pinned env the deploy launcher sets
-        # (COMFYMODAL_V2_CPU_REQUEST=12, COMFYMODAL_V2_MEMORY_MB=32768,
+        # (COMFYMODAL_V2_CPU_REQUEST=12, COMFYMODAL_V2_MEMORY_MB=8192,
         # THREAD_POLICY=TBASE, SNAPSHOT_MODEL_ORDER=O0), which is also what
         # the container bakes, so the run batch's preflight can compare the
         # planned request shape against the deployment's recorded shape with
@@ -298,7 +298,7 @@ def main() -> int:
             "memory_request": int(_shape.get("memory_request") or 0),
             "baseline_cpu_request": _env_int("COMFYMODAL_V2_BASELINE_CPU_REQUEST", 12),
             "baseline_memory_request": _env_int(
-                "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", 32768
+                "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST", 8192
             ),
             "thread_policy": str(_shape.get("thread_policy") or ""),
             "snapshot_model_order": str(_shape.get("snapshot_model_order") or ""),

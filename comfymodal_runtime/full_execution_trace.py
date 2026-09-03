@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import copy
 import contextlib
+import contextvars
 import functools
 import gzip
 import hashlib
@@ -56,6 +57,17 @@ _LEGACY_ENV_RESOURCE_INTERVAL = "FULL_TRACE_RESOURCE_INTERVAL_MS"
 _DEFAULT_VIZTRACER_ENTRIES = 8_000_000
 _DEFAULT_MAX_STACK_DEPTH = 64
 _DEFAULT_RESOURCE_INTERVAL_MS = 50
+
+# A Golden request must use the tracer owned by its restore-scoped session,
+# even when another VizTracer instance has subsequently replaced VizTracer's
+# process-global registration.  A sentinel distinguishes an unbound caller
+# (where the legacy optional global seam remains available) from an explicitly
+# bound request whose missing tracer must fail closed.
+_GOLDEN_TRACER_UNBOUND = object()
+_GOLDEN_TRACER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "comfymodal_golden_tracer",
+    default=_GOLDEN_TRACER_UNBOUND,
+)
 
 # Request-bound contract fields may be added to the top-level trace config by
 # an adapter after construction.  Keep this seam deliberately narrow: these
@@ -217,19 +229,39 @@ def _env_int_chain(*names: str, default: int) -> int:
 
 
 @contextlib.contextmanager
-def golden_trace_span(name: str):
-    """Record a Golden duration event on an already-running global VizTracer.
+def bind_golden_tracer(tracer: Any):
+    """Bind one request's Golden spans to *tracer* until the scope exits.
 
-    This seam is deliberately inert unless a tracer has already been created
-    and registered by the full-trace session.  It never imports or starts
-    VizTracer, and failures in optional tracing are never allowed to affect
-    Golden execution.
+    ``ContextVar`` state follows an async task across suspension without
+    changing VizTracer's process-global registration.  Resetting the exact
+    token in ``finally`` prevents the session-owned tracer from leaking into a
+    later request or task.
+    """
+    token = _GOLDEN_TRACER.set(tracer)
+    try:
+        yield
+    finally:
+        _GOLDEN_TRACER.reset(token)
+
+
+@contextlib.contextmanager
+def golden_trace_span(name: str):
+    """Record a Golden duration event on the request-bound VizTracer.
+
+    When called outside a request binding, retain the compatibility seam of
+    reading an already-registered global VizTracer.  Once bound, never consult
+    ``viztracer.get_tracer()``: the binding is authoritative, including when it
+    contains ``None`` so an unavailable session cannot accidentally capture on
+    an unrelated global tracer.  This function never imports or starts
+    VizTracer, and tracing failures never affect Golden execution.
     """
     event: Any = None
     try:
-        tracer_module = sys.modules.get("viztracer")
-        get_tracer = getattr(tracer_module, "get_tracer", None)
-        tracer = get_tracer() if callable(get_tracer) else None
+        tracer = _GOLDEN_TRACER.get()
+        if tracer is _GOLDEN_TRACER_UNBOUND:
+            tracer_module = sys.modules.get("viztracer")
+            get_tracer = getattr(tracer_module, "get_tracer", None)
+            tracer = get_tracer() if callable(get_tracer) else None
         log_event = getattr(tracer, "log_event", None)
         event = log_event(str(name)) if callable(log_event) else None
         enter = getattr(event, "__enter__", None)
@@ -1780,9 +1812,63 @@ class FullExecutionTraceSession:
             self._resource_sampler._session_phase = "request_tracing"
 
         # Transition to request_tracing so mark/operations can proceed
-        self._transition("request_tracing")
+        if self._transition("request_tracing"):
+            self._handoff_request_thread_tracing()
 
         return True
+
+    def _handoff_request_thread_tracing(self) -> None:
+        """Enable VizTracer tracing on the thread that owns the request.
+
+        VizTracer is started during restore, but request execution may be
+        handed to a different thread.  This compatibility hook is optional:
+        missing or failing VizTracer support is recorded and never escapes
+        into request execution.
+        """
+        event_data: dict[str, Any] = {
+            "hook": "enable_thread_tracing",
+            "called": False,
+            "succeeded": False,
+            "skipped": False,
+        }
+
+        try:
+            hook = (
+                getattr(self._viztracer, "enable_thread_tracing", None)
+                if self._viztracer is not None
+                else None
+            )
+        except BaseException:
+            hook = None
+            event_data["skipped"] = True
+            event_data["reason"] = "hook_unavailable"
+
+        if not callable(hook):
+            event_data["skipped"] = True
+            event_data.setdefault(
+                "reason",
+                "viztracer_unavailable" if self._viztracer is None else "unsupported",
+            )
+        else:
+            event_data["called"] = True
+            try:
+                hook()
+            except BaseException as exc:
+                event_data["reason"] = "hook_failed"
+                event_data["error_type"] = type(exc).__name__
+                try:
+                    print(
+                        f"[v2.full_trace] stage=request_thread_tracing "
+                        f"status=error error_type={type(exc).__name__} "
+                        f"trace_id={self.trace_id}",
+                        flush=True,
+                    )
+                except BaseException:
+                    pass
+            else:
+                event_data["succeeded"] = True
+
+        self._write_event("request_thread_tracing_handoff", event_data)
 
     def mark(self, name: str, **metadata: Any) -> None:
         """Record a trace mark event with safe metadata.
@@ -2463,6 +2549,17 @@ class FullExecutionTraceSession:
     @property
     def resource_sampler(self) -> ContainerResourceSampler | None:
         return self._resource_sampler
+
+    @contextlib.contextmanager
+    def golden_trace_scope(self):
+        """Bind Golden spans to this session's exact VizTracer instance.
+
+        The tracer is read when the request scope is entered, before any
+        suspension in Golden execution.  Binding ``None`` is intentional: an
+        unavailable owner must not fall through to a different global tracer.
+        """
+        with bind_golden_tracer(self._viztracer):
+            yield
 
     def close_for_exit(self, *, timeout: float = 0.5) -> dict[str, Any]:
         """Stop runtime tracing services without packaging or volume writes."""

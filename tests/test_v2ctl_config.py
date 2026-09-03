@@ -64,7 +64,7 @@ def test_resolve_production_defaults(resolver):
     assert config.owner == "v2-core"
     assert config.target.app == "stable-modal-comfy-v2-restore-only-shadow"
     assert config.resources.cpu == 12
-    assert config.resources.memory_mb == 32768
+    assert config.resources.memory_mb == 8192
     assert config.workload.fresh_required is True
     assert config.workload.run_count == 10
     assert config.workload.gap_seconds == 35.0
@@ -75,6 +75,11 @@ def test_resolve_production_defaults(resolver):
     assert flag.value == "12"
     assert flag.source == "profile:production"
     assert flag.registered is True
+
+
+def test_memory_registry_defaults_are_canonical(registry):
+    assert registry.get("COMFYMODAL_V2_MEMORY_MB").default == "8192"
+    assert registry.get("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST").default == "8192"
 
 
 def test_production_sage_runtime_mode_reaches_child_environment(resolver):

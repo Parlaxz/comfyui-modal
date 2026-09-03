@@ -51,7 +51,7 @@ class TestConfig:
         assert data["target"]["class"] == "ModalRuntimeEntrypointV2"
         assert data["target"]["method"] == "run_plan_stream"
         assert data["resources"]["gpu"] == "rtx-pro-6000"
-        assert data["resources"]["memory_mb"] == 32768
+        assert data["resources"]["memory_mb"] == 8192
         assert data["runtime_override_policy"] == "forbid"
         assert data["deploy_fingerprint"] and data["run_fingerprint"]
         names = {f["name"] for f in data["flags"]}
@@ -74,6 +74,7 @@ class TestConfig:
             "class": "ModalRuntimeEntrypointV2",
             "method": "run_golden_serial_stream",
         }
+        assert data["resources"]["memory_mb"] == 8192
         flags = {flag["name"]: flag["value"] for flag in data["flags"]}
         assert flags["COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"] == "1"
     def test_config_e29_profile(self) -> None:

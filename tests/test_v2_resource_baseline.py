@@ -98,11 +98,11 @@ class TestV2Defaults(unittest.TestCase):
     def test_scaledown_window_four(self):
         self.assertEqual(SCALEDOWN_WINDOW, 4)
 
-    def test_memory_default_is_49152(self):
+    def test_memory_default_is_8192(self):
         saved = os.environ.pop("COMFYMODAL_V2_MEMORY_MB", None)
         try:
             mem = _parse_memory_mb()
-            self.assertEqual(mem, 49152)
+            self.assertEqual(mem, 8192)
         finally:
             if saved is not None:
                 os.environ["COMFYMODAL_V2_MEMORY_MB"] = saved
@@ -123,7 +123,7 @@ class TestV2Defaults(unittest.TestCase):
         saved = os.environ.get("COMFYMODAL_V2_MEMORY_MB")
         os.environ["COMFYMODAL_V2_MEMORY_MB"] = ""
         try:
-            self.assertEqual(_parse_memory_mb(), 49152)
+            self.assertEqual(_parse_memory_mb(), 8192)
         finally:
             if saved is not None:
                 os.environ["COMFYMODAL_V2_MEMORY_MB"] = saved
@@ -132,7 +132,7 @@ class TestV2Defaults(unittest.TestCase):
 
     def test_modal_runtime_spec_has_no_hard_memory_limit(self):
         spec = ModalRuntimeSpec()
-        self.assertEqual(spec.memory, 49152)
+        self.assertEqual(spec.memory, 8192)
         self.assertIsInstance(spec.memory, int)
 
     def test_modal_binding_uses_string_for_single_gpu_and_integer_memory(self):
@@ -528,7 +528,7 @@ class TestModalRuntimeSpec(unittest.TestCase):
         identity = _resource_identity(spec)
         self.assertIn("memory_mb", identity)
         self.assertIsInstance(identity["memory_mb"], int)
-        self.assertEqual(identity["memory_mb"], 49152)
+        self.assertEqual(identity["memory_mb"], 8192)
         # Verify no memory-limit tuple is present
         for key in identity:
             self.assertFalse(
@@ -537,10 +537,10 @@ class TestModalRuntimeSpec(unittest.TestCase):
             )
 
     def test_memory_is_int_not_tuple(self):
-        """Memory must be a flat int, 49152, with no hard maximum tuple."""
+        """Memory must be a flat int, 8192, with no hard maximum tuple."""
         spec = ModalRuntimeSpec()
         self.assertIsInstance(spec.memory, int)
-        self.assertEqual(spec.memory, 49152)
+        self.assertEqual(spec.memory, 8192)
         self.assertFalse(isinstance(spec.memory, tuple))
 
     def test_no_warm_containers(self):

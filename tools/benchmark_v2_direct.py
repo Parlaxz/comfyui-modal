@@ -25,7 +25,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Awaitable, Mapping, cast
 from collections.abc import Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -281,6 +281,10 @@ _PLAN_VALIDATION_PROOF = env_flag(
 _PERSISTENCE_DRAIN_JOIN_TIMEOUT = float(
     os.environ.get("COMFYMODAL_V2_PERSISTENCE_DRAIN_JOIN_TIMEOUT", "15")
 )
+
+# Closing a remote stream is best-effort cleanup and must not delay returning a
+# terminal result indefinitely if the transport's close/drain path is stuck.
+_GOLDEN_P1_STREAM_CLOSE_TIMEOUT = 1.0
 
 
 def _resolve_restore_publisher(transport: ModalTransport, workspace: dict) -> Any | None:
@@ -558,8 +562,8 @@ RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 # ── Golden P1 serial-stream benchmark (isolated lane; opt-in) ──────────────
 # Strictly serial full-generation cohort driven by the dedicated remote
 # method ``run_golden_serial_stream``.  Each attempt consumes the remote
-# event stream to exhaustion and is validated FAIL-CLOSED: exactly one
-# terminal result, zero error events, the selected output endpoint (ready by
+# event stream through its terminal result and is validated FAIL-CLOSED:
+# exactly one terminal result, zero error events, the selected output endpoint (ready by
 # default or true-durable in strict mode), expected output SHA, zero seriality
 # violations, completed teardown telemetry, snapshot proof, and canonical
 # runtime-flag agreement.  Strict mode additionally requires the unchanged
@@ -3224,7 +3228,9 @@ async def _handle_full_trace_artifact(
 ) -> dict[str, Any] | None:
     """Handle ``full_trace_artifact`` from a remote result.
 
-    Descriptor contract (the artifact dict):
+    Descriptor contract (the artifact dict). The canonical remote result nests
+    it at ``result['data']['full_trace_artifact']``; the historical top-level
+    ``result['full_trace_artifact']`` form is also supported:
       - ``status == 'ready'`` plus ``volume_name``, ``remote_bundle_path``,
         ``bundle_sha256``, ``trace_id`` → invoke the downloader exactly once,
         write ``full_trace_download.json`` beside the run file.
@@ -3241,11 +3247,13 @@ async def _handle_full_trace_artifact(
     Raises ``RuntimeError`` on error artifacts and on any download /
     verification / extraction / CLI failure.
     """
-    full_trace_artifact = (
-        result.get("full_trace_artifact")
-        if isinstance(result, dict)
-        else None
-    )
+    full_trace_artifact = None
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, dict):
+            full_trace_artifact = data.get("full_trace_artifact")
+        if not isinstance(full_trace_artifact, dict):
+            full_trace_artifact = result.get("full_trace_artifact")
     if not isinstance(full_trace_artifact, dict):
         return None  # absent
 
@@ -10564,10 +10572,18 @@ def _golden_p1_capture_guard_context(
     return GoldenCaptureGuard.path_for_deployment(ROOT, identity), identity
 
 
+def _golden_p1_is_terminal_result(event: Any) -> bool:
+    """Return whether *event* is the terminal result for the Golden stream."""
+    if not isinstance(event, Mapping):
+        return False
+    event_type = event.get("type") or event.get("event")
+    return str(event_type or "").strip().lower() in {"result", "terminal_result"}
+
+
 async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> list[Any]:
     """Call the remote ``run_golden_serial_stream`` method via the existing
-    app/class handle and consume the event stream to exhaustion.  Mirrors the
-    established ``run_plan_stream.remote_gen.aio(...)`` transport pattern."""
+    app/class handle and stop at its terminal result.  Mirrors the established
+    ``run_plan_stream.remote_gen.aio(...)`` transport pattern."""
     fn = getattr(handle, GOLDEN_P1_REMOTE_METHOD, None)
     if fn is None:
         raise RuntimeError(
@@ -10588,11 +10604,16 @@ async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> lis
         try:
             async for event in ait:
                 events.append(event)
+                if _golden_p1_is_terminal_result(event):
+                    break
         finally:
             aclose: Any = getattr(ait, "aclose", None)
             if callable(aclose):
                 try:
-                    await aclose()
+                    await asyncio.wait_for(
+                        cast(Awaitable[Any], aclose()),
+                        timeout=_GOLDEN_P1_STREAM_CLOSE_TIMEOUT,
+                    )
                 except Exception:  # noqa: BLE001
                     pass
     elif hasattr(stream, "__await__"):
@@ -10732,7 +10753,7 @@ def _golden_p1_scan_events(events: list[Any]) -> dict[str, Any]:
         if _golden_p1_positive_durability_claimed(event):
             scan["durability_claims"].append((idx, event))
         etype = str(event.get("type") or event.get("event") or "").strip().lower()
-        if etype in {"result", "terminal_result"}:
+        if _golden_p1_is_terminal_result(event):
             scan["terminal_results"].append((idx, event))
         if etype in {"error", "failed", "exception"} or event.get("error"):
             scan["error_events"].append((idx, event))
@@ -11672,8 +11693,8 @@ async def _run_golden_p1(
                 attention_backend=attention_backend,
                 invocation_id=invocation_id,
             )
-            # Strict serial: exactly one stream in flight; consumed to
-            # exhaustion before anything else happens.
+            # Strict serial: exactly one stream in flight; consumed through its
+            # terminal result before anything else happens.
             events = await _golden_p1_consume_stream(handle, payload)
             artifact["event_count"] = len(events)
             artifact["golden_telemetry"] = _golden_p1_extract_telemetry(events)
@@ -11702,8 +11723,7 @@ async def _run_golden_p1(
             terminal_event = next(
                 (
                     event for event in reversed(events)
-                    if isinstance(event, dict)
-                    and str(event.get("type", "")).lower() in {"result", "terminal_result"}
+                    if _golden_p1_is_terminal_result(event)
                 ),
                 None,
             )
@@ -12993,7 +13013,8 @@ if __name__ == "__main__":
              "cohort (default 5 attempts; --run-count overrides, e.g. 1 for a "
              "structural run) over the dedicated remote method "
              "run_golden_serial_stream, using the existing app/class lookup. "
-             "Each attempt consumes the remote event stream to exhaustion and "
+             "Each attempt consumes the remote event stream through its terminal "
+             "result and "
              "is validated fail-closed: exactly one terminal result, zero "
              "error events, true_durable, expected output SHA, zero seriality "
              "violations, completed teardown telemetry, snapshot proof, "

@@ -33,7 +33,7 @@ def make_provenance() -> Provenance:
         run_fingerprint="ef567890" * 8,
         git_head="0ba7000bd5f3c7ed52e8d9e0facbc0c598eb6997",
         target={"app": "stable-modal-comfy-v2-restore-only-shadow", "class_name": "ModalRuntimeEntrypointV2", "method": "run_plan_stream"},
-        resources={"gpu": "rtx-pro-6000", "cpu": 12, "memory_mb": 32768},
+        resources={"gpu": "rtx-pro-6000", "cpu": 12, "memory_mb": 8192},
         requested_environment={"PATH": "/usr/bin", "COMFYMODAL_V2_ENV_PROFILE": "production"},
         effective_environment={"PATH": "/usr/bin", "COMFYMODAL_V2_ENV_PROFILE": "production"},
         flag_sources={"COMFYMODAL_V2_UNET_FASTSAFETENSORS": "profile:production"},
@@ -48,6 +48,7 @@ class TestSerialization:
         data = make_provenance().to_dict()
         assert data["schema_version"] == PROVENANCE_SCHEMA_VERSION
         assert data["profile"] == "production"
+        assert data["resources"]["memory_mb"] == 8192
         assert data["deploy_fingerprint"] == "abcd1234" * 8
         assert data["unregistered_flags"] == ["COMFYMODAL_V2_NEW_EXPERIMENT"]
 

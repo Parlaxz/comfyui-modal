@@ -15,9 +15,15 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
 
 try:
-    from .e27_source_mechanism import ActualSourceTelemetry
+    from .e27_source_mechanism import (
+        ActualSourceTelemetry,
+        evaluate_e27_source_mechanism,
+    )
 except ImportError:  # The existing focused tests load this file directly.
-    from comfymodal_runtime.e27_source_mechanism import ActualSourceTelemetry
+    from comfymodal_runtime.e27_source_mechanism import (
+        ActualSourceTelemetry,
+        evaluate_e27_source_mechanism,
+    )
 
 
 TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
@@ -2663,6 +2669,7 @@ __all__ = [
     "STATIC_E27_PRODUCERS", "EventStatus", "FakeBackend", "FakeEvent", "FakeSource", "GoldenQDTransport", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
     "PoolPoisonedError", "QDTransport", "ReadyRecord", "ReconciliationError", "SlotState", "SourceRange",
     "StageLease", "StagingPool", "PinnedRangeReader", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
+    "evaluate_e27_source_mechanism",
     "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm", "static_e27_regions", "static_segments",
     "prove_backing_survives_stage_release",
 ]

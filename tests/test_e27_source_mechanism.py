@@ -13,6 +13,7 @@ from comfymodal_runtime.golden_qd_transport import (
     GoldenQDTransport,
     SourceRange,
     TransportConfig,
+    evaluate_e27_source_mechanism as transport_evaluate_e27_source_mechanism,
 )
 
 
@@ -23,6 +24,11 @@ def _telemetry(*, expected=(0, 16), regions=None):
         expected_destination_ranges=(expected,),
         expected_h2d_bytes=16,
     )
+
+
+def test_transport_exposes_canonical_e27_evaluator():
+    """Golden serial's transport seam must expose the canonical evaluator."""
+    assert transport_evaluate_e27_source_mechanism is evaluate_e27_source_mechanism
 
 
 def _read(t, producer, offset, timestamp, retry=0, returned=4):

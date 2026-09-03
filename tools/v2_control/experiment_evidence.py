@@ -2,14 +2,16 @@
 
 This module is intentionally a small, stdlib-only boundary.  It does not run
 anything and it never chooses an artifact by age.  Callers provide the result
-identity; cohort discovery is by the canonical Golden artifact root and every
-cohort is indexed, including incomplete cohorts.
+identity; cohort discovery is bound to the result/record artifact owners, so a
+finalization cannot walk unrelated historical cohorts.  Explicit control-plane
+paths and the local .v2ctl/config inputs remain part of the evidence bundle.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -32,6 +34,9 @@ _SECRET_RE = re.compile(
 )
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _OMIT_EVENTS_BYTES = 256 * 1024
+# Shared upper bound for JSON path projection and textual embedding.  Evidence
+# above 128 KiB is copied and SHA-256 inventoried, but not parsed or embedded.
+_MAX_PATH_PROJECTION_BYTES = 128 * 1024
 _GOLDEN_P1_BACKENDS = frozenset({"pytorch", "sage", "comfy_kitchen"})
 
 
@@ -488,6 +493,38 @@ def _nested_values(value: Any, names: set[str]) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _direct_values(sources: Iterable[Any], names: set[str]) -> list[str]:
+    """Read policy values from the record envelopes, not nested telemetry."""
+    normalized = {name.lower() for name in names}
+    found: list[str] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key, item in source.items():
+            if str(key).lower() in normalized and item not in (None, ""):
+                text = str(item).strip().lower()
+                if text and text not in found:
+                    found.append(text)
+    return found
+
+
+def _fallback_values(value: Any, *, in_predicates: bool = False) -> list[str]:
+    """Collect fallback outcomes while ignoring diagnostic predicates."""
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if not in_predicates and key_text in {"fallback", "fallback_attempted"}:
+                text = str(item).strip().lower()
+                if text and text not in found:
+                    found.append(text)
+            found.extend(_fallback_values(item, in_predicates=in_predicates or key_text == "predicates"))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_fallback_values(item, in_predicates=in_predicates))
+    return list(dict.fromkeys(found))
+
+
 def _output_sha_values(value: Any) -> list[str]:
     values: list[str] = []
     if isinstance(value, Mapping):
@@ -515,15 +552,23 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     summary = summary_value or {}
     attempts = sorted(
         p for p in path.glob("attempt_*.json")
-        if p.is_file() and not p.name.endswith("_events.json")
+        if (
+            p.is_file()
+            and not p.name.endswith("_events.json")
+            and not p.name.endswith(".json.v2ctl-provenance.json")
+        )
     )
     loaded_attempts = [_read_json(p) for p in attempts]
     attempt_data = [item or {} for item in loaded_attempts]
     all_data = [manifest, summary, *attempt_data]
     target = manifest.get("target", {}) if isinstance(manifest, dict) else {}
     resources = manifest.get("resources", {}) if isinstance(manifest, dict) else {}
+    deployment_identity = manifest.get("deployment_identity", {}) if isinstance(manifest, dict) else {}
     target = target if isinstance(target, Mapping) else {}
     resources = resources if isinstance(resources, Mapping) else {}
+    deployment_identity = deployment_identity if isinstance(deployment_identity, Mapping) else {}
+    if not resources and isinstance(deployment_identity.get("resources"), Mapping):
+        resources = deployment_identity["resources"]
     # RX9P-H: attention backend is frozen with separate configured/resolved provenance.
     configured_backend_values = _nested_values(
         all_data, {"attention_backend_configured", "ATTENTION_BACKEND_CONFIGURED"}
@@ -543,15 +588,15 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         resolved_backend_values[0] if len(resolved_backend_values) == 1 else ("mixed" if resolved_backend_values else "missing")
     )
     # Sage 4-field model: configured, effective_input, resolution_source, resolved
-    configured_sage_values = _nested_values(
-        all_data,
-        {
-            "configured_sage_runtime_mode",
-            "sage_runtime_mode_configured",
-            "sage_env_mode",
-            SAGE_RUNTIME_MODE_FLAG.lower(),
-        },
-    )
+    configured_sage_names = {
+        "configured_sage_runtime_mode",
+        "sage_runtime_mode_configured",
+        "sage_env_mode",
+        SAGE_RUNTIME_MODE_FLAG.lower(),
+    }
+    configured_sage_values = _direct_values(all_data, configured_sage_names)
+    if not configured_sage_values:
+        configured_sage_values = _nested_values(all_data, configured_sage_names)
     configured_sage_value = (
         configured_sage_values[0]
         if len(configured_sage_values) == 1
@@ -772,7 +817,7 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     output_modes = _nested_values(all_data, {
         "output_durability_mode", "output_durability", "durability_mode",
     })
-    fallback_values = _nested_values(all_data, {"fallback", "fallback_attempted"})
+    fallback_values = _fallback_values(all_data)
     fallback = any(value in {"1", "true", "yes", "on", "ok"} for value in fallback_values)
     failed_attempts = [
         item for item in attempt_data
@@ -791,8 +836,11 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         "ram": _value(resources, "memory_mb", "ram_mb", default=""),
         "min_containers": _value(resources, "min_containers", default=""),
         "scaledown_window": _value(resources, "scaledown_window", default=""),
-        "deployment_fingerprint": _value(manifest, "deploy_fingerprint", "deployment_fingerprint", default=""),
-        "run_fingerprint": _value(manifest, "run_fingerprint", default=""),
+        "deployment_fingerprint": _value(
+            manifest, "deploy_fingerprint", "deployment_fingerprint",
+            default=_value(deployment_identity, "deploy_fingerprint", "deployment_combined_hash", default=identity.get("deploy_fingerprint", "")),
+        ),
+        "run_fingerprint": _value(manifest, "run_fingerprint", default=identity.get("run_fingerprint", "")),
         "profile_fingerprint": _value(manifest, "profile_config_fingerprint", default=""),
         "attention_backend": configured_backend_value,
         "attention_backend_configured": configured_backend_value,
@@ -850,6 +898,28 @@ def _default_experiment_id(identity: Mapping[str, Any]) -> str:
     return f"{profile}_{digest}"
 
 
+def _owner_cohort_dir(owner: Any, root: Path) -> Path | None:
+    """Return the invocation-owned cohort directory, if one is identifiable."""
+    if owner is None:
+        return None
+
+    def normalize(value: Any) -> Path:
+        candidate = Path(value)
+        return candidate if candidate.is_absolute() else root / candidate
+
+    output_dir = getattr(owner, "output_dir", None)
+    run_artifact = getattr(owner, "run_artifact", None)
+    if output_dir:
+        candidate = normalize(output_dir)
+        if candidate.is_file():
+            return candidate.parent
+        if candidate.is_dir() or not run_artifact:
+            return candidate
+    if run_artifact:
+        return normalize(run_artifact).parent
+    return None
+
+
 def finalize_experiment_evidence(
     repo_root: Path,
     *,
@@ -863,6 +933,10 @@ def finalize_experiment_evidence(
     experiment_id: str | None = None,
 ) -> EvidenceResult:
     """Write the ignored raw bundle and the Git-visible evidence index.
+
+    Cohort collection is invocation-bound: only cohorts owned by ``result`` or
+    ``records`` are compacted and copied.  Historical cohorts are not
+    selectors and are never enumerated here.
 
     The Markdown file is always written before this function returns.  If
     collection fails, a FAILED/INCONCLUSIVE document is written instead and
@@ -938,26 +1012,50 @@ def finalize_experiment_evidence(
                 ".log", ".txt", ".json", ".md",
             }:
                 paths.append(candidate)
-        cohort_root = root / GOLDEN_COHORT_ROOT
+        # Cohort collection is invocation-bound.  Do not enumerate the
+        # canonical artifact root: it contains historical cohorts that are not
+        # evidence for this result and may contain very large event streams.
+        # Result/record owners are the authoritative current-cohort selectors;
+        # every file in each explicitly owned cohort is retained, including
+        # invalid attempts, so missing/integrity classifications remain true.
         cohorts = []
-        if cohort_root.is_dir():
-            for cohort in sorted(p for p in cohort_root.iterdir() if p.is_dir()):
-                cohorts.append(_compact_cohort(cohort, frozen))
-                paths.extend(p for p in cohort.rglob("*") if p.is_file())
+        seen_cohorts: set[str] = set()
+        for owner in owners:
+            cohort = _owner_cohort_dir(owner, root)
+            if cohort is None or not cohort.is_dir():
+                continue
+            cohort_key = os.path.abspath(cohort).casefold()
+            if cohort_key in seen_cohorts:
+                continue
+            seen_cohorts.add(cohort_key)
+            cohorts.append(_compact_cohort(cohort, frozen))
+            paths.extend(p for p in cohort.rglob("*") if p.is_file())
         # Explicit path references embedded in known manifests/receipts/log
         # projections are retained too.
         for path in list(paths):
-            data = _read_json(path) if path.is_file() else None
+            # Event streams are retained in the raw bundle and inventory below,
+            # but are not path-reference projections.  Re-reading a large
+            # repeated stream here can block finalization after the request has
+            # already returned.
+            if path.name.casefold().endswith("_events.json"):
+                continue
+            if not path.is_file():
+                continue
+            # Large evidence files stay in the raw bundle, but path projection
+            # is best-effort and must not parse them on the finalization path.
+            try:
+                if path.stat().st_size > _MAX_PATH_PROJECTION_BYTES:
+                    continue
+            except OSError:
+                continue
+            data = _read_json(path)
             if data:
                 paths.extend(_extract_paths(data))
         unique: list[Path] = []
         seen: set[str] = set()
         for path in paths:
             candidate = path if path.is_absolute() else root / path
-            try:
-                candidate = candidate.resolve()
-            except OSError:
-                continue
+            candidate = Path(os.path.abspath(candidate))
             key = str(candidate).casefold()
             if candidate.is_file() and key not in seen:
                 seen.add(key)
@@ -986,6 +1084,9 @@ def finalize_experiment_evidence(
                 item["text_omitted"] = True
                 item["cohort"] = source.parent.name
                 item["omission_reason"] = "large repeated attempt event stream; raw copy and integrity metadata retained"
+            elif size > _MAX_PATH_PROJECTION_BYTES:
+                item["text_omitted"] = True
+                item["omission_reason"] = "oversized evidence source; raw copy and integrity metadata retained"
             else:
                 try:
                     evidence_text.append((source, _redact(source.read_text(encoding="utf-8", errors="replace")), digest))

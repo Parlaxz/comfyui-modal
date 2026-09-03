@@ -46,13 +46,20 @@ def test_load_production(real_profiles):
     assert profile.owner == "v2-core"
     assert profile.target["app"] == "stable-modal-comfy-v2-restore-only-shadow"
     assert profile.resources["cpu"] == 12
-    assert profile.resources["memory_mb"] == 32768
+    assert profile.resources["memory_mb"] == 8192
     assert profile.workload["fresh_required"] is True
     assert profile.workload["run_count"] == 10
     assert profile.runtime_overrides == {"policy": "forbid"}
     assert profile.environment["COMFYMODAL_V2_ENV_PROFILE"] == "production"
     assert profile.environment["COMFYMODAL_V2_CPU_REQUEST"] == "12"
     assert profile.environment["COMFYMODAL_SAGE_RUNTIME_MODE"] == "baked_cuda"
+
+
+def test_golden_p1_resolves_canonical_memory_and_keeps_golden_environment(real_profiles):
+    profile = real_profiles.resolve("golden_p1")
+    assert profile.resources["memory_mb"] == 8192
+    assert profile.environment["COMFYMODAL_SAGE_RUNTIME_MODE"] == "auto"
+    assert profile.environment["COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"] == "1"
 
 
 # ── profile inheritance (integration) ──────────────────────────────────────
@@ -66,7 +73,7 @@ def test_e29_extends_production(real_profiles):
     # production defaults survive…
     assert rp.target["app"] == "stable-modal-comfy-v2-restore-only-shadow"
     assert rp.resources["cpu"] == 12
-    assert rp.resources["memory_mb"] == 32768
+    assert rp.resources["memory_mb"] == 8192
     assert rp.workload["conditioning_cache"] == "forced_miss"
     assert rp.environment["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] == "1"
     # …e29 overrides apply.
@@ -112,7 +119,7 @@ def test_e31_extends_production(real_profiles, profile_name, cast_once):
     assert rp.environment["COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"] == cast_once
     assert rp.environment["COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"] == "8"
     assert rp.environment["COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"] == "67108864"
-    assert rp.environment["COMFYMODAL_V2_MEMORY_MB"] == "32768"  # inherited
+    assert rp.environment["COMFYMODAL_V2_MEMORY_MB"] == "8192"  # inherited
     assert rp.workload["fresh_required"] is True
     assert rp.runtime_overrides["policy"] == "forbid"
 

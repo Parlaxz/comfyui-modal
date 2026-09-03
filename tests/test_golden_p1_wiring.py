@@ -145,6 +145,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
 
     expected = {
         "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+        "COMFYMODAL_V2_OBSERVABILITY_MODE": "full",
         "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "0",
         "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
         "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
@@ -158,7 +159,12 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         flag = config.flag(name)
         assert flag is not None
         assert flag.source == "profile:golden_p1"
-        assert flag.change_requires == "deploy"
+        expected_change = (
+            "run"
+            if name == "COMFYMODAL_V2_OBSERVABILITY_MODE"
+            else "deploy"
+        )
+        assert flag.change_requires == expected_change
         effective[name] = flag.value
     assert effective == expected
     assert config.workload.run_count == 1
@@ -171,11 +177,11 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
 
-def test_golden_p1_keeps_sampling_decomposition_opt_in_by_default():
+def test_golden_p1_enables_sampling_decomposition_for_diagnostics():
     config = _config("golden_p1")
     flag = config.flag(SAMPLING_DEEP_PROFILE_FLAG)
     assert flag is not None
-    assert flag.value == "off"
+    assert flag.value == "blocks"
     assert flag.source == "profile:golden_p1"
 
 

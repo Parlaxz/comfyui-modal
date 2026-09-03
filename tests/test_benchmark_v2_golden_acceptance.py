@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 
@@ -11,6 +12,7 @@ from comfymodal_runtime.contracts import DEPLOYMENT_HASH_NAMESPACE
 import tools.benchmark_v2_direct as benchmark
 from tools.benchmark_v2_direct import (
     GOLDEN_P1_REQUIRED_FLAGS,
+    _golden_p1_consume_stream,
     _golden_p1_extract_telemetry,
     _golden_p1_deployed_identity,
     _golden_p1_scan_events,
@@ -268,6 +270,60 @@ def test_host_artifact_projection_keeps_telemetry_on_result_or_error():
     assert _golden_p1_extract_telemetry(
         [{"type": "error", "golden_telemetry": telemetry}]
     ) == telemetry
+
+
+@pytest.mark.fast_unit
+def test_golden_stream_stops_at_terminal_and_closes_once_with_metadata():
+    telemetry = {"schema": "golden_p1_telemetry_v1", "events": [{"name": "done"}]}
+    progress = {"type": "progress", "data": {"stage": "output"}}
+    terminal = {
+        "type": "result",
+        "data": {
+            "golden_telemetry": telemetry,
+            "artifact_metadata": {"asset_id": SHA, "byte_count": 7},
+        },
+    }
+
+    class _NeverExhaustingStream:
+        def __init__(self):
+            self.events = [progress, terminal]
+            self.close_calls = 0
+            self.exhaustion_attempted = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.events:
+                return self.events.pop(0)
+            self.exhaustion_attempted = True
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        async def aclose(self):
+            self.close_calls += 1
+            await asyncio.Future()
+
+    stream = _NeverExhaustingStream()
+
+    class _RemoteMethod:
+        remote_gen = None
+
+        def aio(self, _payload):
+            return stream
+
+    class _Handle:
+        run_golden_serial_stream = _RemoteMethod()
+
+    events = asyncio.run(asyncio.wait_for(
+        _golden_p1_consume_stream(_Handle(), {"request_id": "r"}), timeout=2
+    ))
+
+    assert events == [progress, terminal]
+    assert stream.close_calls == 1
+    assert not stream.exhaustion_attempted
+    assert _golden_p1_extract_telemetry(events) == telemetry
+    assert terminal["data"]["artifact_metadata"] == {"asset_id": SHA, "byte_count": 7}
 
 
 @pytest.mark.parametrize(

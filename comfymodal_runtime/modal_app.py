@@ -23,7 +23,7 @@ import copy
 from types import MappingProxyType
 
 import dataclasses
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -2948,6 +2948,67 @@ def _upload_full_trace_bundle(
         return None
 
 
+def _verify_full_trace_bundle_readback(
+    profile_volume: Any,
+    remote_bundle_path: str,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    """Verify the committed bundle through a fresh named-Volume handle.
+
+    ``profile_volume`` is the write-side handle, which may be a
+    ``ModalMountedStateVolume`` wrapper.  Readback deliberately uses the raw
+    Modal Volume returned by a new ``from_name`` lookup so a stale mounted
+    handle cannot turn an invisible upload into a ready artifact.
+
+    Readback is mandatory.  A raw named-Volume handle without ``read_file`` or
+    an unavailable Modal module cannot prove that the committed bundle is
+    visible, so it fails closed rather than allowing a false ready artifact.
+    Any missing, malformed, or mismatched stream also raises.
+    """
+    _raw_write_volume = getattr(profile_volume, "_modal_volume", None)
+    if _raw_write_volume is None:
+        _raw_write_volume = profile_volume
+    if _modal is None:
+        raise RuntimeError("Modal unavailable for named profile Volume readback")
+    if not callable(getattr(_raw_write_volume, "read_file", None)):
+        raise RuntimeError("raw named profile Volume read_file unavailable")
+
+    _volume_type = getattr(_modal, "Volume", None)
+    _from_name = getattr(_volume_type, "from_name", None)
+    if not callable(_from_name):
+        raise RuntimeError("named profile Volume resolver unavailable")
+    _read_volume = _from_name(PROFILE_VOLUME_NAME, create_if_missing=False)
+    if _read_volume is None:
+        raise RuntimeError("named profile Volume unavailable for readback")
+    _read_file = getattr(_read_volume, "read_file", None)
+    if not callable(_read_file):
+        raise RuntimeError("named profile Volume read_file unavailable")
+
+    _hasher = hashlib.sha256()
+    _read_size = 0
+    try:
+        _chunks = _read_file(remote_bundle_path)
+        for _chunk in _chunks:
+            if not isinstance(_chunk, (bytes, bytearray, memoryview)):
+                raise TypeError("named profile Volume returned a non-byte chunk")
+            _chunk_bytes = bytes(_chunk)
+            _read_size += len(_chunk_bytes)
+            _hasher.update(_chunk_bytes)
+    except Exception as _exc:
+        raise RuntimeError(
+            f"named profile Volume bundle readback failed: {type(_exc).__name__}"
+        ) from _exc
+
+    _read_sha256 = _hasher.hexdigest()
+    if _read_size != expected_size or _read_sha256 != expected_sha256:
+        raise RuntimeError(
+            "named profile Volume bundle readback mismatch: "
+            f"size={_read_size}/{expected_size} "
+            f"sha256={_read_sha256}/{expected_sha256}"
+        )
+
+
 def _finalize_full_trace(
     session: Any,
     profile_volume: Any,
@@ -2965,7 +3026,8 @@ def _finalize_full_trace(
       6. Write sanitized runtime summary
       7. Generate report (not traced)
       8. Package bundle (not traced)
-      9. Persist bundle and descriptor to profile Volume, commit once
+      9. Persist bundle and descriptor to profile Volume, commit once, and
+         verify the bundle through a fresh named-Volume readback
      10. Attach ``full_trace_artifact`` with exact descriptor fields
 
     Never captures a milestone after ``stop_tracing()``.
@@ -3009,8 +3071,37 @@ def _finalize_full_trace(
             _r = _stop_result.get("resource_sampler", {})
             if isinstance(_r, dict) and "sample_count" in _r:
                 _resource_sampler_status = "ok"
-        # ── 6. Write sanitized runtime summary (allowlist only, write after stop) ──
-        _summary = dict(result_summary or {})
+        # ── 6. Persist request-owned rich evidence, then write the scalar summary ──
+        # The result envelope is deliberately scalar-only on the summary path,
+        # but Golden telemetry is the raw evidence consumed by the offline
+        # profiler.  Keep that evidence in its own invocation-owned artifact;
+        # never put the nested document on stdout or rely on the result
+        # envelope retaining it after finalization.
+        _summary_source = result_summary
+        if not isinstance(_summary_source, Mapping):
+            _summary_source = getattr(session, "_result_summary", {})
+        _summary = dict(_summary_source) if isinstance(_summary_source, Mapping) else {}
+        _golden_telemetry = _summary.get("golden_telemetry")
+        _golden_telemetry_path = session.base_dir / "raw" / "golden_telemetry.json"
+        _golden_telemetry_sha256 = ""
+        if isinstance(_golden_telemetry, Mapping):
+            try:
+                _telemetry_bytes = json.dumps(
+                    _golden_telemetry,
+                    sort_keys=True,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                _golden_telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+                _golden_telemetry_path.write_bytes(_telemetry_bytes)
+                _golden_telemetry_sha256 = hashlib.sha256(_telemetry_bytes).hexdigest()
+            except Exception as _telemetry_exc:
+                print(
+                    f"[v2.full_trace] stage=golden_telemetry status=error "
+                    f"error_type={type(_telemetry_exc).__name__} trace_id={_trace_id}",
+                    flush=True,
+                )
         _allowlist = {
             "status", "error", "correlation_id", "request_id",
             "finalized_at", "trace_id", "elapsed_seconds",
@@ -3020,18 +3111,23 @@ def _finalize_full_trace(
             "golden_profile_require_canonical_stages",
             "output_durability_mode",
             "durability_requested",
+            "golden_telemetry_artifact_path",
+            "golden_telemetry_artifact_sha256",
         }
         _sanitized = {k: v for k, v in _summary.items() if k in _allowlist
                       and isinstance(v, (str, int, float, bool, type(None)))}
         _sanitized["finalized_at"] = time.time()
         _sanitized["request_id"] = request_id
         _sanitized["trace_id"] = _trace_id
+        if _golden_telemetry_sha256:
+            _sanitized["golden_telemetry_artifact_path"] = "raw/golden_telemetry.json"
+            _sanitized["golden_telemetry_artifact_sha256"] = _golden_telemetry_sha256
         session.set_result_summary(_sanitized)
         # Overwrite the summary file (stop_tracing wrote the pre-sanitized version)
         _summary_path = session.base_dir / "raw" / "runtime_result_summary.json"
         try:
             _summary_path.write_text(
-                json.dumps(dict(session._result_summary), indent=2, default=str),
+                json.dumps(_sanitized, indent=2, ensure_ascii=False, allow_nan=False),
                 encoding="utf-8",
             )
         except OSError as _se:
@@ -3046,7 +3142,18 @@ def _finalize_full_trace(
             from .full_trace_report import generate_full_trace_report as _gen_report
             _report = _gen_report(session.base_dir)
             if isinstance(_report, dict):
-                _trace_truncated = bool(_report.get("trace_truncated", False))
+                # The offline parser is authoritative for the persisted trace
+                # descriptor.  Keep live VizTracer values only when a parsed
+                # value is unavailable or malformed.
+                _parsed_count = _report.get("trace_entry_count")
+                if isinstance(_parsed_count, int) and not isinstance(_parsed_count, bool):
+                    _trace_entry_count = _parsed_count
+                _parsed_capacity = _report.get("trace_entry_capacity")
+                if isinstance(_parsed_capacity, int) and not isinstance(_parsed_capacity, bool):
+                    _trace_entry_capacity = _parsed_capacity
+                _parsed_truncated = _report.get("trace_truncated")
+                if isinstance(_parsed_truncated, bool):
+                    _trace_truncated = _parsed_truncated
                 if _report.get("status") != "error":
                     _report_ok = True
                     _report_status = "ok"
@@ -3192,6 +3299,34 @@ def _finalize_full_trace(
                 "error_type": "CommitError",
                 "error": "profile volume commit failed",
             }
+        # The commit above is the sole commit.  Only a fresh raw named-Volume
+        # handle can prove that the committed path is visible outside this
+        # container's mounted handle.
+        try:
+            _verify_full_trace_bundle_readback(
+                profile_volume,
+                _remote_bundle_path,
+                _bundle_size,
+                _sha256,
+            )
+        except Exception as _readback_exc:
+            print(
+                f"[v2.full_trace] stage=readback status=error "
+                f"error_type=ReadbackError trace_id={_trace_id} "
+                f"detail={str(_readback_exc)[:160]}",
+                flush=True,
+            )
+            print(
+                f"[v2.full_trace_artifact] status=error "
+                f"trace_id={_trace_id} error_type=ReadbackError",
+                flush=True,
+            )
+            return {
+                "status": "error",
+                "trace_id": _trace_id,
+                "error_type": "ReadbackError",
+                "error": "profile volume bundle readback failed",
+            }
         print(
             f"[v2.full_trace_artifact] status=ready "
             f"trace_id={_trace_id} "
@@ -3237,11 +3372,26 @@ def _safe_full_trace_artifact(
     volume: Any,
     request_id: str,
     result_summary: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Safe wrapper: returns ``{"status": "absent"}`` when disabled, else
-    delegates to ``_finalize_full_trace``.  Returns error descriptor on
-    exception.  Never raises."""
-    if not _V2_FULL_TRACE_ENABLED or session is None:
+    """Finalize a trace, preserving disabled behavior unless explicitly forced.
+
+    A claimed restore-scoped session is an explicit request to finalize even if
+    the mutable process gate has since changed.  A missing forced session is an
+    error, not an absent artifact, so the claim failure remains observable.
+    Never raises.
+    """
+    if session is None:
+        if force:
+            return {
+                "status": "error",
+                "error_type": "FullTraceSessionUnavailable",
+                "error": "claimed full trace session unavailable",
+                "reason": "claimed_session_missing",
+            }
+        return {"status": "absent"}
+    if not _V2_FULL_TRACE_ENABLED and not force:
         return {"status": "absent"}
     try:
         return _finalize_full_trace(session, volume, request_id, result_summary=result_summary)
@@ -3303,7 +3453,13 @@ def _golden_sage_provenance(api: Any) -> dict[str, str]:
                 golden_flag=True,
             )
         )
-        observed = str(getattr(api, "_sage_runtime_mode", "") or "").strip().lower()
+        bootstrap = getattr(api, "bootstrap", None)
+        bootstrap_state = getattr(bootstrap, "state", None)
+        observed = str(
+            getattr(bootstrap_state, "sage_mode", "") or ""
+        ).strip().lower()
+        if not observed:
+            observed = str(getattr(api, "_sage_runtime_mode", "") or "").strip().lower()
         fields = sage_four_field_identity(
             configured=configured,
             effective_input=effective_input,
@@ -3380,6 +3536,265 @@ def _golden_profiler_number(value: Any) -> float | None:
         return None
 
 
+def _golden_profiler_summary_value(
+    span: Mapping[str, Any], *keys: str,
+) -> Any:
+    """Read a persisted span field without manufacturing a measurement."""
+    for key in keys:
+        value = span.get(key)
+        if value is not None:
+            return value
+    return "measurement_unavailable"
+
+
+def _load_modal_report_data(derived_dir: Path) -> Mapping[str, Any] | None:
+    """Load the persisted report projection used by the Modal log."""
+    try:
+        value = json.loads(
+            (derived_dir / "report_data.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _modal_report_value(value: Any) -> str:
+    """Render a report scalar without turning missing evidence into zero."""
+    if value is None:
+        value = "measurement_unavailable"
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            value = "measurement_unavailable"
+    return _golden_profiler_one_line(value)
+
+
+def _append_modal_evidence_projection(
+    lines: list[str],
+    report_data: Mapping[str, Any] | None,
+    summary: Mapping[str, Any] | None,
+) -> None:
+    """Append persisted deep-sampler and source/H2D evidence as separate domains.
+
+    These records are never converted into ``SPAN`` rows or Gantt children.
+    Host monotonic and CUDA elapsed measurements remain separate, and overlap
+    remains a union/non-additive diagnostic.
+    """
+    def report_domain(name: str, default: Mapping[str, Any]) -> Mapping[str, Any]:
+        for container in (report_data, summary):
+            if isinstance(container, Mapping):
+                value = container.get(name)
+                if isinstance(value, Mapping):
+                    return value
+        return default
+
+    deep = report_domain("sampling_deep_profile", {
+        "status": "unavailable", "record_count": 0, "duplicate_count": 0,
+        "step_breakdown": [], "model_breakdown": [],
+    })
+    profile = report_data.get("golden_profile") if isinstance(report_data, Mapping) else None
+    if not isinstance(profile, Mapping):
+        profile = summary if isinstance(summary, Mapping) else {}
+    lines.extend([
+        f"VIZTRACER_CHILD_COVERAGE={_modal_report_value(profile.get('VIZTRACER_CHILD_COVERAGE', 'measurement_unavailable'))}",
+        f"VIZTRACER_CHILD_COVERAGE_STATUS={_modal_report_value(profile.get('VIZTRACER_CHILD_COVERAGE_STATUS', 'unavailable'))}",
+        f"CROSS_EVIDENCE_DECOMPOSITION={_modal_report_value(profile.get('CROSS_EVIDENCE_DECOMPOSITION', 'NONE'))}",
+        "EVIDENCE_DOMAINS=golden_profile,sampling_deep_profile,source_h2d_transport",
+    ])
+    unresolved = profile.get("unresolved_over_50ms", [])
+    if not isinstance(unresolved, list):
+        unresolved = []
+    lines.append("UNRESOLVED >50ms AREAS")
+    if unresolved:
+        for area in unresolved:
+            if isinstance(area, Mapping):
+                lines.append(
+                    f"UNRESOLVED name={_modal_report_value(area.get('name'))} "
+                    f"wall_ms={_modal_report_value(area.get('wall_ms'))} "
+                    f"residual_ms={_modal_report_value(area.get('residual_ms'))}"
+                )
+    else:
+        lines.append("UNRESOLVED none; sampling/transport are excluded when separately explained")
+    step_rows = deep.get("step_breakdown")
+    step_rows = step_rows if isinstance(step_rows, list) else []
+    lines.extend([
+        "SAMPLING SUMMARY",
+        "STEP BREAKDOWN",
+        "EVIDENCE_DOMAIN=sampling_deep_profile",
+        f"SAMPLING_DEEP_PROFILE_STATUS={_modal_report_value(deep.get('status'))}",
+        f"SAMPLING_DEEP_PROFILE_RECORD_COUNT={_modal_report_value(deep.get('record_count'))}",
+        f"SAMPLING_DEEP_PROFILE_DUPLICATE_COUNT={_modal_report_value(deep.get('duplicate_count'))}",
+    ])
+    # Detailed rows remain in the persisted text/JSON artifacts.  Keep Modal
+    # stdout readable and bounded with aggregate values only.
+    lines.append(f"SAMPLING_STEP_ROW_COUNT={len(step_rows)}")
+
+    summary_metrics = (
+        "FIRST_PASS_WALL_MS", "SUBSEQUENT_STEPS_WALL_MS", "TOTAL_STEP_UNION_MS",
+        "SAMPLER_PARENT_WALL_MS", "UNACCOUNTED_MS",
+    )
+    for metric in summary_metrics:
+        matches = [
+            row for row in step_rows
+            if isinstance(row, Mapping) and str(row.get("label", "")) == metric
+        ]
+        if not matches:
+            lines.append(f"STEP_METRIC {metric}=measurement_unavailable SOURCE=measurement_unavailable")
+        for row in matches[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            lines.append(
+                f"STEP_METRIC {metric}={_modal_report_value(row.get('wall_ms'))} "
+                f"SOURCE={_modal_report_value(row.get('source'))}"
+            )
+    lines.append("STEP_EVIDENCE_TRACE_SPAN=NO STEP_EVIDENCE_GANTT_CHILD=NO")
+
+    model_rows = deep.get("human_model_breakdown")
+    model_rows = model_rows if isinstance(model_rows, list) else []
+    if not model_rows:
+        raw_model_rows = deep.get("model_breakdown")
+        model_rows = raw_model_rows if isinstance(raw_model_rows, list) else []
+    lines.extend([
+        "DEEP SAMPLING BREAKDOWN",
+        "DEEP MODEL BREAKDOWN",
+        "EVIDENCE_DOMAIN=sampling_deep_profile",
+        "TIMING_SEMANTICS=host_monotonic_and_cuda_device_elapsed_are_separate_non_additive_measurements",
+    ])
+    if deep.get("model_non_additive") or any(
+        isinstance(row, Mapping)
+        and (row.get("timing_domain") != "host_monotonic" or row.get("scope") not in (None, "eval"))
+        for row in model_rows
+    ):
+        lines.append("NON-ADDITIVE MODEL EVIDENCE=YES; do not sum model phases or host/device clocks")
+    lines.append(f"SAMPLING_MODEL_ROW_COUNT={len(model_rows)}")
+    host_total = 0.0
+    cuda_total = 0.0
+    host_count = 0
+    cuda_count = 0
+    for row in model_rows:
+        if not isinstance(row, Mapping):
+            continue
+        host = _golden_profiler_number(row.get("host_monotonic_ms"))
+        cuda = _golden_profiler_number(row.get("cuda_device_ms"))
+        if host is not None:
+            host_total += host
+            host_count += 1
+        if cuda is not None:
+            cuda_total += cuda
+            cuda_count += 1
+    lines.append(
+        "MODEL_SUMMARY "
+        f"COUNT={len(model_rows)} "
+        f"HOST_MONOTONIC_MS={round(host_total, 3) if host_count else 'measurement_unavailable'} "
+        f"CUDA_DEVICE_ELAPSED_MS={round(cuda_total, 3) if cuda_count else 'measurement_unavailable'}"
+    )
+    lines.append("DEEP_MODEL_EVIDENCE_TRACE_SPAN=NO DEEP_MODEL_EVIDENCE_GANTT_CHILD=NO")
+
+    transport = report_domain("source_h2d_transport", {
+        "status": "unavailable", "availability": "unavailable",
+        "reason": "persisted E27 source/H2D evidence is unavailable",
+        "reconciliation": {"state": "unavailable", "complete": "measurement_unavailable"},
+        "timing_semantics": {
+            "overlap_is_union": True, "non_additive": True,
+            "waits_or_fences_inferred": False,
+        },
+    })
+    reconciliation = transport.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, Mapping) else {}
+    semantics = transport.get("timing_semantics")
+    semantics = semantics if isinstance(semantics, Mapping) else {}
+    lines.extend([
+        "SOURCE/H2D TRANSPORT EVIDENCE",
+        "EVIDENCE_DOMAIN=source_h2d_transport",
+        f"SOURCE_H2D_STATUS={_modal_report_value(transport.get('status'))}",
+        f"SOURCE_H2D_AVAILABILITY={_modal_report_value(transport.get('availability'))}",
+        f"SOURCE_H2D_STAGE={_modal_report_value(transport.get('stage'))}",
+        f"SOURCE_H2D_ROLE={_modal_report_value(transport.get('role'))}",
+        f"SOURCE_H2D_REASON={_modal_report_value(transport.get('reason'))}",
+    ])
+    for label, key in (
+        ("SOURCE_TOTAL_WALL_MS", "SOURCE_TOTAL_WALL_MS"),
+        ("SOURCE_SYSCALL_UNION_BUSY_MS", "SOURCE_SYSCALL_UNION_BUSY_MS"),
+        ("SOURCE_READ_COUNT", "source_read_count"),
+        ("SOURCE_READ_BYTES", "source_read_bytes"),
+        ("OBSERVED_PRODUCER_COUNT", "observed_producer_count"),
+        ("PRODUCERS", "producer_ids"),
+        ("SOURCE_MAX_INFLIGHT", "max_actual_source_inflight"),
+        ("SOURCE_QD_PEAK", "qd_peak"),
+        ("SOURCE_QD_OCCUPANCY_MS", "qd_occupancy_ms"),
+        ("SOURCE_TIME_WEIGHTED_MEAN_QD", "time_weighted_mean_qd"),
+        ("H2D_TOTAL_WALL_MS", "H2D_TOTAL_WALL_MS"),
+        ("H2D_SUBMISSIONS", "h2d_submission_count"),
+        ("H2D_COMPLETIONS", "h2d_completion_count"),
+        ("H2D_SUBMITTED_BYTES", "h2d_submitted_bytes"),
+        ("H2D_COMPLETED_BYTES", "h2d_completed_bytes"),
+        ("H2D_RECONCILIATION_COMPLETE", "h2d_reconciliation_complete"),
+        ("SOURCE_H2D_OVERLAP_MS", "SOURCE_H2D_OVERLAP_MS"),
+        ("SOURCE_TO_GPU_READY_MS", "SOURCE_TO_GPU_READY_MS"),
+        ("POST_SOURCE_H2D_TAIL_MS", "POST_SOURCE_H2D_TAIL_MS"),
+        ("STARVATION_GAPS", "starvation_gaps"),
+        ("FALLBACK", "fallback"),
+        ("POISON", "poison"),
+        ("REGION_COVERAGE", "region_coverage"),
+        ("REGION_GAPS", "region_gaps"),
+        ("REGION_OVERLAPS", "region_overlaps"),
+        ("REGION_DUPLICATES", "region_duplicates"),
+    ):
+        lines.append(f"{label}={_modal_report_value(transport.get(key))}")
+    # Preserve the report schema spellings as well as the readable log labels;
+    # consumers can compare this projection directly with report_data.json.
+    for key in (
+        "read_count", "read_bytes", "max_inflight", "max_actual_source_inflight",
+        "qd_occupancy_ms", "time_weighted_mean_qd",
+    ):
+        value = transport.get(key)
+        if value is None and key == "read_count":
+            value = transport.get("source_read_count")
+        if value is None and key == "read_bytes":
+            value = transport.get("source_read_bytes")
+        lines.append(f"{key}={_modal_report_value(value)}")
+    lines.extend([
+        f"RECONCILIATION_STATE={_modal_report_value(reconciliation.get('state', transport.get('reconciliation_state')))}",
+        f"RECONCILIATION_COMPLETE={_modal_report_value(reconciliation.get('complete', transport.get('h2d_reconciliation_complete')))}",
+        f"OVERLAP_IS_UNION={_modal_report_value(semantics.get('overlap_is_union'))}",
+        f"NON_ADDITIVE={_modal_report_value(semantics.get('non_additive'))}",
+        f"WAITS_OR_FENCES_INFERRED={_modal_report_value(semantics.get('waits_or_fences_inferred'))}",
+        f"QUIESCENCE_EVIDENCE={_modal_report_value(transport.get('quiescence', transport.get('QUIESCENCE_EVIDENCE')))}",
+        f"FENCE_EVIDENCE={_modal_report_value(transport.get('fence', transport.get('FENCE_EVIDENCE')))}",
+        "SOURCE_H2D_EVIDENCE_TRACE_SPAN=NO SOURCE_H2D_EVIDENCE_GANTT_CHILD=NO",
+    ])
+    stages = transport.get("stages")
+    if isinstance(stages, list):
+        for stage in stages[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            if isinstance(stage, Mapping):
+                lines.append(
+                    f"TRANSPORT_STAGE stage={_modal_report_value(stage.get('stage'))} "
+                    f"status={_modal_report_value(stage.get('status'))} "
+                    f"reconciliation_state={_modal_report_value(stage.get('reconciliation_state'))}"
+                )
+    lines.append("E27 TRANSPORT BREAKDOWN")
+    lines.append("QD OCCUPANCY HISTOGRAM")
+    occupancy = transport.get("qd_occupancy_ms")
+    if isinstance(occupancy, Mapping):
+        for qd, value in sorted(occupancy.items(), key=lambda pair: str(pair[0])):
+            lines.append(f"QD={_modal_report_value(qd)} OCCUPANCY_MS={_modal_report_value(value)}")
+    else:
+        lines.append("QD=measurement_unavailable OCCUPANCY_MS=measurement_unavailable")
+    lanes = transport.get("timestamp_lanes")
+    if isinstance(lanes, list) and lanes:
+        lines.append("TRANSPORT TIMESTAMP LANES")
+        for lane in lanes[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            if isinstance(lane, Mapping):
+                lines.append(
+                    f"LANE={_modal_report_value(lane.get('lane'))} "
+                    f"LABEL={_modal_report_value(lane.get('label'))} "
+                    f"START_NS={_modal_report_value(lane.get('start_ns'))} "
+                    f"END_NS={_modal_report_value(lane.get('end_ns'))} "
+                    f"DURATION_MS={_modal_report_value(lane.get('duration_ms'))}"
+                )
+    else:
+        lines.append("TRANSPORT TIMESTAMP LANES unavailable: actual start/end timestamps were not persisted")
+
+
 def _emit_golden_profiler_block(
     session: Any,
     artifact: Mapping[str, Any] | None,
@@ -3403,6 +3818,7 @@ def _emit_golden_profiler_block(
         derived_dir = base_dir / "derived"
         summary_path = derived_dir / "golden_profile_summary.json"
         gantt_path = derived_dir / "golden_profile_gantt.txt"
+        report_data = _load_modal_report_data(derived_dir)
 
         summary: Mapping[str, Any] | None = None
         summary_reason = ""
@@ -3478,13 +3894,22 @@ def _emit_golden_profiler_block(
             f"{key}={_golden_profiler_one_line(value if value is not None else 'measurement_unavailable')}"
             for key, value in canonical.items()
         )
+        # The persisted text is the single canonical Gantt source.  Compare
+        # the exact normalized payload that will be placed between the markers
+        # rather than treating file existence as a match.
+        canonical_gantt = gantt
+        modal_gantt = canonical_gantt
         lines.extend([
             f"MODAL_LOG_GANTT_PRESENT={'YES' if gantt is not None else 'NO'}",
-            f"MODAL_GANTT_MATCH={'YES' if gantt is not None else 'NO'}",
+            f"MODAL_GANTT_MATCH={'YES' if gantt is not None and modal_gantt == canonical_gantt else 'NO'}",
         ])
         if summary is None:
             lines.append(f"SUMMARY_AVAILABLE=NO reason={_golden_profiler_one_line(summary_reason)}")
         else:
+            lines.extend([
+                "TRACE HIERARCHY",
+                "EVIDENCE_DOMAIN=golden_profile",
+            ])
             root = summary.get("root")
             root = root if isinstance(root, Mapping) else {}
             lines.extend([
@@ -3499,9 +3924,19 @@ def _emit_golden_profiler_block(
                 f"GOLDEN_PROFILE_ROOT_CHILD_UNION_MS={_golden_profiler_one_line(root.get('direct_child_union_ms', 'measurement_unavailable'))}",
                 f"GOLDEN_PROFILE_ROOT_COVERAGE_PCT={_golden_profiler_one_line(root.get('coverage_pct', 'measurement_unavailable'))}",
                 f"GOLDEN_PROFILE_ROOT_RESIDUAL_MS={_golden_profiler_one_line(root.get('exclusive_residual_ms', root.get('residual_ms', 'measurement_unavailable')))}",
+                f"GOLDEN_PROFILE_ROOT_DIRECT_CHILD_COUNT={_golden_profiler_one_line(root.get('direct_child_count', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_DIRECT_CHILD_SUM_MS={_golden_profiler_one_line(root.get('direct_child_sum_ms', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_DIRECT_CHILD_OVERLAP_MS={_golden_profiler_one_line(root.get('child_overlap_ms', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_SUBTHRESHOLD_CHILD_COUNT={_golden_profiler_one_line(root.get('subthreshold_child_count', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_SUBTHRESHOLD_CHILD_UNION_MS={_golden_profiler_one_line(root.get('subthreshold_child_union_ms', root.get('subthreshold_children_union_ms', 'measurement_unavailable')))}",
+                f"GOLDEN_PROFILE_ROOT_DISPLAY_CHILDREN_GT50MS={_golden_profiler_one_line(root.get('display_children_gt50ms', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_TRACED_CHILDREN={_golden_profiler_one_line(root.get('traced_children', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_RESIDUAL_PCT={_golden_profiler_one_line(root.get('residual_pct', 'measurement_unavailable'))}",
+                f"GOLDEN_PROFILE_ROOT_RESIDUAL_REASON={_golden_profiler_one_line(root.get('residual_reason', 'measurement_unavailable'))}",
             ])
 
             spans: list[Mapping[str, Any]] = []
+            span_rows: list[tuple[Mapping[str, Any], int]] = []
             if root:
                 spans.append(root)
 
@@ -3516,6 +3951,22 @@ def _emit_golden_profiler_block(
 
             collect_nodes(summary.get("nodes"))
             collect_nodes(summary.get("canonical_spans"))
+
+            def collect_display_rows(node: Any, depth: int) -> None:
+                if not isinstance(node, Mapping):
+                    return
+                span_rows.append((node, depth))
+                children = node.get("children")
+                if isinstance(children, list):
+                    for child in children:
+                        collect_display_rows(child, depth + 1)
+
+            if root:
+                collect_display_rows(root, 0)
+            for node_list in (summary.get("nodes"), summary.get("canonical_spans")):
+                if isinstance(node_list, list):
+                    for node in node_list:
+                        collect_display_rows(node, 0)
 
             largest_residual: tuple[float, Mapping[str, Any] | None] = (-1.0, None)
             for span in spans:
@@ -3571,8 +4022,10 @@ def _emit_golden_profiler_block(
                     )
 
             seen_spans: set[tuple[Any, ...]] = set()
-            for span in spans:
-                wall = _golden_profiler_number(span.get("wall_ms"))
+            for span, depth in span_rows:
+                wall = _golden_profiler_number(
+                    _golden_profiler_summary_value(span, "wall_ms", "WALL_MS")
+                )
                 if wall is None or wall <= 50.0:
                     continue
                 key = (span.get("kind"), span.get("name"), span.get("start_ms"), span.get("end_ms"))
@@ -3580,15 +4033,40 @@ def _emit_golden_profiler_block(
                     continue
                 seen_spans.add(key)
                 warning = "YES" if bool(span.get("needs_decomposition")) else "NO"
+                detail_fields = (
+                    ("WALL_MS", ("WALL_MS", "wall_ms")),
+                    ("DIRECT_CHILD_COUNT", ("DIRECT_CHILD_COUNT", "direct_child_count", "direct_children_count")),
+                    ("DIRECT_CHILD_SUM_MS", ("DIRECT_CHILD_SUM_MS", "direct_child_sum_ms", "direct_children_sum_ms")),
+                    ("DIRECT_CHILD_UNION_MS", ("DIRECT_CHILD_UNION_MS", "direct_child_union_ms", "direct_children_union_ms")),
+                    ("DIRECT_CHILD_OVERLAP_MS", ("DIRECT_CHILD_OVERLAP_MS", "direct_child_overlap_ms", "child_overlap_ms", "overlap_ms")),
+                    ("SUBTHRESHOLD_CHILD_COUNT", ("SUBTHRESHOLD_CHILD_COUNT", "subthreshold_child_count")),
+                    ("SUBTHRESHOLD_CHILD_UNION_MS", ("SUBTHRESHOLD_CHILD_UNION_MS", "subthreshold_children_union_ms", "subthreshold_child_union_ms")),
+                    ("RESIDUAL_MS", ("RESIDUAL_MS", "exclusive_residual_ms", "residual_ms")),
+                    ("RESIDUAL_PCT", ("RESIDUAL_PCT", "residual_pct")),
+                    ("DISPLAY_CHILDREN_GT50MS", ("DISPLAY_CHILDREN_GT50MS", "display_children_gt50ms")),
+                    ("TRACED_CHILDREN", ("TRACED_CHILDREN", "traced_children")),
+                    ("RESIDUAL_REASON", ("RESIDUAL_REASON", "residual_reason")),
+                    ("TRUE_SELF_OR_UNTRACED_RESIDUAL_MS", ("TRUE_SELF_OR_UNTRACED_RESIDUAL_MS", "true_self_or_untraced_residual_ms")),
+                )
+                indent = "  " * depth
                 lines.append(
-                    "SPAN name="
+                    indent
+                    + "SPAN name="
                     + _golden_profiler_one_line(span.get("name", ""))
                     + " duration_ms="
-                    + _golden_profiler_one_line(span.get("wall_ms"))
+                    + _golden_profiler_one_line(_golden_profiler_summary_value(span, "wall_ms", "WALL_MS"))
                     + " residual_ms="
-                    + _golden_profiler_one_line(span.get("exclusive_residual_ms", span.get("residual_ms", "measurement_unavailable")))
+                    + _golden_profiler_one_line(_golden_profiler_summary_value(span, "exclusive_residual_ms", "residual_ms", "RESIDUAL_MS"))
                     + f" NEEDS_DECOMPOSITION={warning}"
+                    + " "
+                    + " ".join(
+                        f"{label}={_golden_profiler_one_line(_golden_profiler_summary_value(span, *keys))}"
+                        for label, keys in detail_fields
+                    )
+                    + f" depth={depth}"
                 )
+
+            _append_modal_evidence_projection(lines, report_data, summary)
 
             torch_status = summary.get("GOLDEN_PROFILE_TORCH", summary.get("torch", "measurement_unavailable"))
             cuda_ops = summary.get("torch_cuda_ops")
@@ -3693,6 +4171,8 @@ def _e27_projection_value(report: Mapping[str, Any] | None, key: str) -> Any:
 
 def _emit_e27_forensics_block(
     telemetry: Mapping[str, Any] | None,
+    *,
+    persisted_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Print a bounded projection of persisted direct-Golden E27 evidence.
 
@@ -3705,6 +4185,17 @@ def _emit_e27_forensics_block(
         return {}
 
     actual, evaluator, raw_path = _find_persisted_e27_evidence(telemetry)
+    if not raw_path and persisted_path is not None:
+        try:
+            candidate_path = os.fspath(persisted_path)
+        except TypeError:
+            candidate_path = ""
+        if (
+            isinstance(candidate_path, str)
+            and candidate_path.strip()
+            and not any(ord(char) < 32 or ord(char) == 127 for char in candidate_path)
+        ):
+            raw_path = candidate_path.strip()
     events = actual.get("actual_source_events") if isinstance(actual, Mapping) else None
     events = events if isinstance(events, list) else []
     evidence_available = bool(actual is not None and events)
@@ -3755,6 +4246,8 @@ def _emit_e27_forensics_block(
     failed = [str(item) for item in failed] if isinstance(failed, list) else []
     if proof == "NO" and not failure_reason and failed:
         failure_reason = "evaluator_failed_predicates"
+    if proof == "YES" and evidence_available and isinstance(evaluator, Mapping):
+        failure_reason = "none"
     if proof == "NO" and not failure_reason:
         failure_reason = "evaluator_did_not_prove_source_mechanism"
 
@@ -22108,7 +22601,7 @@ class ModalRuntimeEntrypoint:
             identity_telemetry["output_durability_mode"] = output_policy.mode
             identity_telemetry["durability_requested"] = output_policy.durability_requested
             identity_telemetry.update(
-                _golden_sage_provenance(getattr(self, "_legacy_api", self))
+                _golden_sage_provenance(self)
             )
             _emit_golden_diagnostics_config(
                 "request",
@@ -22387,16 +22880,26 @@ class ModalRuntimeEntrypoint:
                             f"status=error error_type={type(_ft_torch_start_exc).__name__}",
                             flush=True,
                         )
-                result = await golden_serial_execute(
-                    golden_request,
-                    volume=volume,
-                    volume_mount_root=volume_mount_root,
-                    output_root=str(output_root),
-                    telemetry_path=str(telemetry_path),
-                    node_classes=node_classes,
-                    snapshot_proof=_golden_snapshot_proof_supplier,
-                    restore_metadata=restore_metadata,
+                # Bind the actual request-local Golden await to the tracer
+                # owned by this restore-scoped session.  ContextVar state is
+                # preserved across coroutine suspension and reset by the
+                # context manager on success, failure, or cancellation.
+                _golden_trace_scope = (
+                    _ft.golden_trace_scope()
+                    if _full_trace_claimed
+                    else nullcontext()
                 )
+                with _golden_trace_scope:
+                    result = await golden_serial_execute(
+                        golden_request,
+                        volume=volume,
+                        volume_mount_root=volume_mount_root,
+                        output_root=str(output_root),
+                        telemetry_path=str(telemetry_path),
+                        node_classes=node_classes,
+                        snapshot_proof=_golden_snapshot_proof_supplier,
+                        restore_metadata=restore_metadata,
+                    )
             finally:
                 golden_call_end_wall_ns = time.time_ns()
                 golden_call_end_mono_ns = time.monotonic_ns()
@@ -22446,38 +22949,42 @@ class ModalRuntimeEntrypoint:
                             "request_trace_stop", request_id=rid,
                             status="error", reason=type(exc).__name__,
                         )
-                        _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
-                            "profile_volume"
-                        )
-                        _error_artifact = await asyncio.to_thread(
-                            _safe_full_trace_artifact,
-                            _ft_error,
-                            _profile_volume,
-                            rid.strip() if isinstance(rid, str) else rid,
-                            {
-                                "status": "error",
-                                "error": type(exc).__name__,
-                                **golden_trace_summary,
-                            },
-                        )
-                        if _error_artifact.get("status") == "ready":
-                            try:
-                                _emit_golden_profiler_block(
-                                    _ft_error,
-                                    _error_artifact,
-                                    rid.strip() if isinstance(rid, str) else rid,
-                                )
-                            except BaseException:
-                                pass
-                        _emit_golden_profiler_lifecycle(
-                            "finalize", request_id=rid,
-                            status=str(_error_artifact.get("status", "error")),
-                            reason=(
-                                "artifact_ready"
-                                if _error_artifact.get("status") == "ready"
-                                else str(_error_artifact.get("error", "artifact_unavailable"))
-                            ),
-                        )
+                    _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                        "profile_volume"
+                    )
+                    _error_artifact = await asyncio.to_thread(
+                        _safe_full_trace_artifact,
+                        _ft_error,
+                        _profile_volume,
+                        rid.strip() if isinstance(rid, str) else rid,
+                        {
+                            "status": "error",
+                            "error": type(exc).__name__,
+                            **golden_trace_summary,
+                        },
+                        force=True,
+                    )
+                    if _error_artifact.get("status") == "ready" and _ft_error is not None:
+                        try:
+                            _emit_golden_profiler_block(
+                                _ft_error,
+                                _error_artifact,
+                                rid.strip() if isinstance(rid, str) else rid,
+                            )
+                        except BaseException:
+                            pass
+                    _emit_golden_profiler_lifecycle(
+                        "finalize", request_id=rid,
+                        status=str(_error_artifact.get("status", "error")),
+                        reason=(
+                            "artifact_ready"
+                            if _error_artifact.get("status") == "ready"
+                            else str(
+                                _error_artifact.get("reason")
+                                or _error_artifact.get("error", "artifact_unavailable")
+                            )
+                        ),
+                    )
                 except BaseException as _ft_error_exc:
                     _error_artifact = {
                         "status": "error",
@@ -22519,7 +23026,9 @@ class ModalRuntimeEntrypoint:
                 call_end_mono_ns=golden_call_end_mono_ns,
             )
             error_event["golden_adapter_timing"] = timing
-            error_event.update(_emit_e27_forensics_block(telemetry))
+            error_event.update(
+                _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
+            )
             if telemetry is not None:
                 error_event["golden_telemetry"] = telemetry
                 _emit_golden_waterfall(telemetry, timing=timing)
@@ -22628,7 +23137,9 @@ class ModalRuntimeEntrypoint:
             telemetry_persist_ms=getattr(result, "telemetry_persist_ms", None),
         )
         result_data["golden_adapter_timing"] = timing
-        result_data.update(_emit_e27_forensics_block(telemetry))
+        result_data.update(
+            _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
+        )
         if telemetry is not None:
             result_data["golden_telemetry"] = telemetry
             observed_attention = str(
@@ -22660,25 +23171,26 @@ class ModalRuntimeEntrypoint:
                         "request_trace_stop", request_id=normalized_request_id,
                         status="ok", reason="golden_return",
                     )
-                    _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
-                        "profile_volume"
-                    )
-                    _artifact_fin = await asyncio.to_thread(
-                        _safe_full_trace_artifact,
-                        _ft_fin,
-                        _profile_volume,
-                        normalized_request_id,
-                        result_data,
-                    )
-                    if _artifact_fin.get("status") == "ready":
-                        try:
-                            _emit_golden_profiler_block(
-                                _ft_fin,
-                                _artifact_fin,
-                                normalized_request_id,
-                            )
-                        except BaseException:
-                            pass
+                _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                    "profile_volume"
+                )
+                _artifact_fin = await asyncio.to_thread(
+                    _safe_full_trace_artifact,
+                    _ft_fin,
+                    _profile_volume,
+                    normalized_request_id,
+                    result_data,
+                    force=True,
+                )
+                if _artifact_fin.get("status") == "ready" and _ft_fin is not None:
+                    try:
+                        _emit_golden_profiler_block(
+                            _ft_fin,
+                            _artifact_fin,
+                            normalized_request_id,
+                        )
+                    except BaseException:
+                        pass
             except BaseException as _ft_fin_exc:
                 _artifact_fin = {
                     "status": "error",
@@ -22694,7 +23206,10 @@ class ModalRuntimeEntrypoint:
                 reason=(
                     "artifact_ready"
                     if _artifact_fin.get("status") == "ready"
-                    else str(_artifact_fin.get("error", "artifact_unavailable"))
+                    else str(
+                        _artifact_fin.get("reason")
+                        or _artifact_fin.get("error", "artifact_unavailable")
+                    )
                 ),
             )
             result_data["full_trace_artifact"] = _artifact_fin
@@ -22705,7 +23220,10 @@ class ModalRuntimeEntrypoint:
             result_data["full_trace_diagnostic"]["reason"] = (
                 "artifact_ready"
                 if _artifact_fin.get("status") == "ready"
-                else str(_artifact_fin.get("error", "artifact_unavailable"))
+                else str(
+                    _artifact_fin.get("reason")
+                    or _artifact_fin.get("error", "artifact_unavailable")
+                )
             )
         if telemetry is None and telemetry_error:
             result_data["golden_telemetry_error"] = telemetry_error

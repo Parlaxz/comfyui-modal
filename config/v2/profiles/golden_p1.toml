@@ -15,7 +15,7 @@ method = "run_golden_serial_stream"
 [resources]
 gpu = "rtx-pro-6000"
 cpu = 4
-memory_mb = 16384
+memory_mb = 8192
 min_containers = 0
 scaledown_window = 4
 
@@ -38,6 +38,9 @@ policy = "forbid"
 # Keep this profile out of production's CPU-model invariant when disabling
 # that legacy path.
 COMFYMODAL_V2_ENV_PROFILE = "inherit"
+# Golden diagnostics are explicitly requested by this profile; do not inherit
+# production's full-trace suppression policy from the parent profile.
+COMFYMODAL_V2_OBSERVABILITY_MODE = "full"
 COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
 COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "1"
 COMFYMODAL_V2_VAE_SNAPSHOT = "0"
@@ -54,7 +57,7 @@ COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
 
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
-COMFYMODAL_SAMPLING_DEEP_PROFILE = "off"
+COMFYMODAL_SAMPLING_DEEP_PROFILE = "blocks"
 COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "0"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
 # RX9P-M diagnostic profile: the profiler and physical E27 source evidence

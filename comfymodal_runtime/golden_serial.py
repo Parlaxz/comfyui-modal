@@ -46,6 +46,7 @@ import dataclasses
 import hashlib
 import importlib
 import inspect
+import functools
 import json
 import logging
 import math
@@ -59,7 +60,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, ContextManager, Iterable, Mapping, Optional
 
 import torch
 
@@ -1328,8 +1329,13 @@ def _full_trace_active() -> bool:
     return os.environ.get("COMFYMODAL_V2_FULL_TRACE") == "1"
 
 
-def _golden_trace_span(name: str):
-    """Resolve the narrow optional full-trace span seam without importing it eagerly."""
+def _golden_trace_span(name: str) -> ContextManager[Any]:
+    """Resolve the optional full-trace span seam without importing eagerly.
+
+    The Modal adapter binds the request's session-owned VizTracer around the
+    actual Golden await; this helper deliberately remains a thin forwarding
+    layer so the root and stage ``VizEvent`` wrappers use that binding.
+    """
     if not _full_trace_active():
         return contextlib.nullcontext()
     try:
@@ -1340,6 +1346,24 @@ def _golden_trace_span(name: str):
     except BaseException:
         pass
     return contextlib.nullcontext()
+
+
+def _trace_golden_serial_root(func: Callable) -> Callable:
+    """Trace the actual async Golden invocation, including suspension time.
+
+    VizTracer's Python call hook is scoped to the thread on which it is
+    enabled.  The direct Modal adapter can resume this coroutine on a
+    different execution context, so the call hook alone is not reliable
+    evidence for the request root.  This span is emitted by the invoked
+    coroutine itself and therefore remains a real boundary, not a report-side
+    reconstruction.
+    """
+    @functools.wraps(func)
+    async def traced(*args: Any, **kwargs: Any) -> Any:
+        with _golden_trace_span("golden_serial_execute"):
+            return await func(*args, **kwargs)
+
+    return traced
 
 
 def _stage_diagnostics_enabled() -> bool:
@@ -10965,6 +10989,7 @@ def _persist_final_telemetry(session: GoldenSession) -> Optional[str]:
 # ── Top-level explicit serial executor ────────────────────────────────────
 
 
+@_trace_golden_serial_root
 async def golden_serial_execute(
     request: GoldenRequest,
     *,
@@ -11017,24 +11042,36 @@ async def golden_serial_execute(
     # read, even if the environment changes mid-request.
     transport_arm_token = _GOLDEN_QD_ARM_CONTEXT.set(session.qd_transport_arm)
     try:
-        await golden_restore(session)
-        await golden_request_setup(session)
-        await golden_clip_load(session)
-        await golden_clip_forward(session)
-        await golden_unet_load(session)
-        await golden_sampler_prepare(session)
-        await golden_vae_load(session)
-        await golden_sampling(session)
-        await golden_sampler_tail(session)
-        await golden_vae_decode(session)
-        await golden_output(session)
+        with _golden_trace_span("golden_restore"):
+            await golden_restore(session)
+        with _golden_trace_span("golden_request_setup"):
+            await golden_request_setup(session)
+        with _golden_trace_span("golden_clip_load"):
+            await golden_clip_load(session)
+        with _golden_trace_span("golden_clip_forward"):
+            await golden_clip_forward(session)
+        with _golden_trace_span("golden_unet_load"):
+            await golden_unet_load(session)
+        with _golden_trace_span("golden_sampler_prepare"):
+            await golden_sampler_prepare(session)
+        with _golden_trace_span("golden_vae_load"):
+            await golden_vae_load(session)
+        with _golden_trace_span("golden_sampling"):
+            await golden_sampling(session)
+        with _golden_trace_span("golden_sampler_tail"):
+            await golden_sampler_tail(session)
+        with _golden_trace_span("golden_vae_decode"):
+            await golden_vae_decode(session)
+        with _golden_trace_span("golden_output"):
+            await golden_output(session)
         if session.output_durability_mode == "strict":
-            await golden_durable_commit(
-                session.volume_contract or session.volume,
-                session.pending_durability,
-                session.recorder,
-                expected_sha256=session.contract.expected_output_png_sha256,
-            )
+            with _golden_trace_span("golden_durable_commit"):
+                await golden_durable_commit(
+                    session.volume_contract or session.volume,
+                    session.pending_durability,
+                    session.recorder,
+                    expected_sha256=session.contract.expected_output_png_sha256,
+                )
             session.recorder.mark_true_durable()
         result = session.build_final_result()
         session.recorder.event(EVENT_RESULT_ASSEMBLED, request_id=request.request_id)

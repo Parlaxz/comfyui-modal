@@ -459,6 +459,7 @@ def test_direct_golden_repaired_lifecycle_persists_and_projects_every_gate(tmp_p
                     "sage_runtime_mode_resolved": "baked_cuda",
                 },
                 verdict="ACCEPT",
+                result=SimpleNamespace(artifacts=SimpleNamespace(output_dir=cohort)),
             )
             assert evidence.status == "OK"
             evidence_index = json.loads(

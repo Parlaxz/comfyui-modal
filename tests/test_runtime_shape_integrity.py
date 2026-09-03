@@ -41,14 +41,15 @@ def test_tbase_is_pass_through_and_keeps_native_settings_out_of_environment() ->
     config = runtime_shape.runtime_shape_config()
     assert config.thread_policy == "TBASE"
     assert config.snapshot_model_order == "O0"
+    assert config.memory_request == 8192
     assert config.torch_intraop_threads is None
     assert config.torch_interop_threads is None
     assert config.environment() == {
         "COMFYMODAL_V2_THREAD_POLICY": "TBASE",
         "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER": "O0",
         "COMFYMODAL_V2_CPU_REQUEST": "16",
-        "COMFYMODAL_V2_MEMORY_REQUEST": "49152",
-        "COMFYMODAL_V2_MEMORY_MB": "49152",
+        "COMFYMODAL_V2_MEMORY_REQUEST": "8192",
+        "COMFYMODAL_V2_MEMORY_MB": "8192",
         "COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT": config.runtime_shape_fingerprint,
     }
 
