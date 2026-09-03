@@ -1016,6 +1016,9 @@ class GoldenTelemetryRecorder:
         self.clip_residency_record: dict[str, Any] = {}
         self.clip_residency_telemetry = _new_ra9h_telemetry()
         self.clip_forward_conversion: dict[str, Any] = {}
+        # Diagnostic CLIP forward envelope.  The stage attaches the completed
+        # decomposition here before the single final telemetry persistence.
+        self.clip_forward_timing: dict[str, Any] = {}
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         self.seriality_violations: list[str] = []
         # FULL-TRACE-ONLY: actual node FUNCTION-call windows.  This remains
@@ -1158,7 +1161,7 @@ class GoldenTelemetryRecorder:
     def record_node_timing(self, record: Mapping[str, Any]) -> None:
         """Persist one FULL-TRACE-ONLY node execution record.
 
-        The runner has already measured the existing node call before this is
+        The caller has already measured the diagnostic boundary before this is
         invoked.  Keep this append-only and side-effect free so diagnostic
         persistence cannot alter execution or mask the primary result.
         """
@@ -1276,6 +1279,8 @@ class GoldenTelemetryRecorder:
             ],
             "events": list(self._events),
         }
+        if self.clip_forward_timing:
+            payload["clip_forward_timing"] = copy.deepcopy(self.clip_forward_timing)
         if self.node_timing_records:
             payload["node_timing_records"] = copy.deepcopy(self.node_timing_records)
         run_identity = getattr(self, "run_identity", None)
@@ -10347,9 +10352,30 @@ async def golden_vae_decode(session: GoldenSession) -> Any:
             phase="vae_decode_dependency_closure",
         ):
             runner.begin_scope({"vae_decode"})
+            closure_start_ns = time.monotonic_ns() if _full_trace_active() else None
             try:
                 await runner.run_closure(node_map.vae_decode_id, include_target=True)
             finally:
+                if closure_start_ns is not None:
+                    closure_end_ns = time.monotonic_ns()
+                    closure_record = {
+                        "node_id": str(node_map.vae_decode_id),
+                        "node_class": str(
+                            session.request.prompt[node_map.vae_decode_id].get("class_type", "")
+                        ),
+                        "stage": "golden_vae_decode",
+                        "start_monotonic_ns": int(closure_start_ns),
+                        "end_monotonic_ns": int(closure_end_ns),
+                        "wall_ms": round(
+                            max(0, closure_end_ns - closure_start_ns) / 1_000_000,
+                            3,
+                        ),
+                    }
+                    try:
+                        rec.record_node_timing(closure_record)
+                    except BaseException:
+                        # Diagnostic persistence must not affect node execution.
+                        pass
                 runner.end_scope()
         with _golden_trace_phase(
             "golden.vae_decode.vae_decode_quiescence",

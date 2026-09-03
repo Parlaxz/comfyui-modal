@@ -189,6 +189,7 @@ def _visible_rows(
     parent_start: float,
     wall: float,
     depth: int = 0,
+    include_subthreshold: bool = False,
 ) -> list[tuple[Mapping[str, Any], float, float, int]]:
     rows: list[tuple[Mapping[str, Any], float, float, int]] = []
     for child, start, end in _clip_intervals(
@@ -201,7 +202,7 @@ def _visible_rows(
             if isinstance(nested, list)
             else []
         )
-        if duration > THRESHOLD_MS or duration == 0.0:
+        if include_subthreshold or duration > THRESHOLD_MS or duration == 0.0:
             rows.append((child, start, end, depth))
             child_depth = depth + 1
         else:
@@ -215,6 +216,7 @@ def _visible_rows(
                 parent_start=parent_start,
                 wall=wall,
                 depth=child_depth,
+                include_subthreshold=include_subthreshold,
             )
         )
     return rows
@@ -226,6 +228,7 @@ def render_mini_gantt(
     *,
     clock_domain: str = "host_monotonic",
     alignment: Mapping[str, Any] | None = None,
+    include_subthreshold: bool = False,
 ) -> str:
     """Render one 100-column parent/child timeline and its accounting footer."""
     if not isinstance(children, Sequence) or isinstance(children, (str, bytes)):
@@ -259,7 +262,8 @@ def render_mini_gantt(
         )
     ]
     for child, start, end, depth in _visible_rows(
-        valid_children, parent_start=parent_start, wall=wall
+        valid_children, parent_start=parent_start, wall=wall,
+        include_subthreshold=include_subthreshold,
     ):
         duration = end - start
         label = ("  " * depth) + _text(child.get("label", child.get("name", "?")), "?")
@@ -408,6 +412,109 @@ def _root(report: Mapping[str, Any]) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+_OVERALL_CANONICAL_STAGES = (
+    "golden_clip_load",
+    "golden_clip_forward",
+    "golden_unet_load",
+    "golden_sampler_prepare",
+    "golden_vae_load",
+    "golden_sampling",
+    "golden_vae_decode",
+    "golden_output",
+)
+
+
+def _canonical_interval(
+    span: Mapping[str, Any], *, root_start: float, wall: float
+) -> tuple[float, float] | None:
+    """Return an aligned canonical interval without deriving an end time."""
+    start = _number(span.get("start_ms"))
+    end = _number(span.get("end_ms"))
+    if start is None:
+        start_offset = _number(span.get("start_offset_ms"))
+        if start_offset is None or end is None:
+            return None
+        start = start_offset
+        end -= root_start
+    else:
+        if end is None:
+            return None
+        start -= root_start
+        end -= root_start
+    if end < start:
+        return None
+    raw_start, raw_end = start, end
+    if raw_end < 0.0 or raw_start > wall:
+        return None
+    return max(0.0, min(wall, raw_start)), max(0.0, min(wall, raw_end))
+
+
+def _render_canonical_overall(
+    root: Mapping[str, Any], spans: Mapping[str, Mapping[str, Any]], *,
+    clock_domain: str, alignment: Mapping[str, Any] | None,
+) -> str:
+    """Render canonical stage ownership and accounting on the root clock."""
+    parent_start, _parent_end, wall = _parent_window(root)
+    intervals: list[tuple[str, Mapping[str, Any], float, float]] = []
+    for name in _OVERALL_CANONICAL_STAGES:
+        span = spans.get(name)
+        if span is None:
+            continue
+        _check_clock(span, clock_domain, alignment)
+        interval = _canonical_interval(span, root_start=parent_start, wall=wall)
+        if interval is not None:
+            intervals.append((name, span, *interval))
+
+    union = _union([(start, end) for _name, _span, start, end in intervals])
+    stage_sum = sum(end - start for _name, _span, start, end in intervals)
+    overlap = max(0.0, stage_sum - _length(union))
+    subthreshold_union = _length(
+        _union([
+            (start, end)
+            for _name, _span, start, end in intervals
+            if end - start <= THRESHOLD_MS
+        ])
+    )
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in union:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < wall:
+        gaps.append((cursor, wall))
+    true_gaps = _length(gaps)
+
+    lines = [
+        _row(
+            "parent", _bar(0.0, wall, wall), wall,
+            100.0 if wall > 0.0 else 0.0, _domain(root) or clock_domain,
+        )
+    ]
+    for name, span, start, end in intervals:
+        duration = end - start
+        lines.append(_row(
+            name, _bar(start, end, wall, point=duration == 0.0), duration,
+            duration / wall * 100.0 if wall > 0.0 else 0.0,
+            span.get("source", span.get("evidence_source", "canonical")),
+        ))
+    for start, end in gaps:
+        if end - start > THRESHOLD_MS:
+            gap = end - start
+            lines.append(_row(
+                "[true gap]", _bar(start, end, wall), gap,
+                gap / wall * 100.0 if wall > 0.0 else 0.0, "derived",
+            ))
+    lines.append(
+        "ACCOUNTING "
+        f"wall {_fmt_ms(wall)} canonical_stage_union {_fmt_ms(_length(union))} "
+        f"overlap {_fmt_ms(overlap)} subthreshold_union {_fmt_ms(subthreshold_union)} "
+        f"true_gaps {_fmt_ms(true_gaps)} residual {_fmt_ms(true_gaps)} "
+        f"residual_pct {_fmt_pct(true_gaps / wall * 100.0 if wall > 0.0 else None)}"
+    )
+    return "\n".join(lines)
+
+
 def render_overall_timeline(
     report: Mapping[str, Any],
     *,
@@ -419,10 +526,24 @@ def render_overall_timeline(
         raise TypeError("report must be a mapping")
     root = _root(report)
     _check_clock(report, clock_domain, alignment)
+    profile = _profile(report)
+    canonical = profile.get("canonical_spans")
+    canonical_spans = (
+        [span for span in canonical if isinstance(span, Mapping)]
+        if isinstance(canonical, list) else []
+    )
+    canonical_by_name = {
+        str(span.get("name")): span for span in canonical_spans
+        if str(span.get("name")) in _OVERALL_CANONICAL_STAGES
+    }
     children = root.get("children", [])
     children = [item for item in children if isinstance(item, Mapping)] if isinstance(children, list) else []
     if not root:
         return "OVERALL GOLDEN TIMELINE\nprofile unavailable"
+    if canonical_by_name:
+        return "OVERALL GOLDEN TIMELINE\n" + _render_canonical_overall(
+            root, canonical_by_name, clock_domain=clock_domain, alignment=alignment
+        )
     return "OVERALL GOLDEN TIMELINE\n" + render_mini_gantt(
         root, children, clock_domain=clock_domain, alignment=alignment
     )
@@ -683,6 +804,35 @@ def _clip_module_rows(report: Mapping[str, Any]) -> list[tuple[str, float]]:
     return sorted(merged.items(), key=lambda pair: (-pair[1], pair[0]))[:12]
 
 
+def _persisted_node_rows(report: Mapping[str, Any], stage_name: str) -> list[tuple[str, float]]:
+    """Return explicit node timings belonging to a canonical stage."""
+    runtime_result = report.get("runtime_result")
+    if not isinstance(runtime_result, Mapping):
+        return []
+    records = runtime_result.get("node_timing_records")
+    if not isinstance(records, list):
+        return []
+    expected_class = {
+        "golden_vae_decode": "VAEDecode",
+    }.get(stage_name)
+    if expected_class is None:
+        return []
+    rows: list[tuple[str, float]] = []
+    for record in records[:128]:
+        if not isinstance(record, Mapping):
+            continue
+        class_type = str(record.get("class_type", record.get("node_class", "")))
+        if class_type != expected_class:
+            continue
+        duration = _number(record.get("duration_ms"))
+        if duration is None:
+            duration_ns = _number(record.get("duration_ns"))
+            duration = duration_ns / 1_000_000.0 if duration_ns is not None else None
+        if duration is not None and duration >= 0.0:
+            rows.append((class_type, duration))
+    return rows
+
+
 def _clock_line(source: str, clock: str) -> str:
     display = "VizTracer parent clock (host_monotonic)" if clock == "host_monotonic" else clock
     return f"evidence {source}; clock {display}"
@@ -709,6 +859,9 @@ def render_stage_gantt(
     children = _phase_children_with_labels(span)
     if children:
         lines.append(render_mini_gantt(span, children, clock_domain=clock_domain, alignment=alignment))
+    elif stage_name == "golden_vae_load":
+        _parent_start, _parent_end, wall = _parent_window(span)
+        lines.append(f"{title} — {_fmt_ms(wall)} parent")
     else:
         lines.append("measurement unavailable; no traced stage phases")
 
@@ -746,7 +899,9 @@ def render_stage_gantt(
     if stage_name == "golden_vae_decode" and not children:
         lines.append("opaque-node fallback: VAEDecode node detail unavailable; stage wall retained")
     if stage_name == "golden_vae_decode":
-        lines.append("VAEDecode node row: " + ("persisted" if any("vae" in _phase_name(item.get("name")).lower() for item in children) else "measurement unavailable"))
+        node_rows = _persisted_node_rows(report, stage_name)
+        lines.append("VAEDecode node row: " + ("persisted" if node_rows else "measurement unavailable"))
+        lines.extend(f"{name} inclusive {_fmt_ms(duration)}" for name, duration in node_rows)
     if stage_name == "golden_sampler_prepare" and not children:
         lines.append("node rows >50ms unavailable; dependency closure evidence is not a trace span")
     elif stage_name == "golden_sampler_prepare":
@@ -885,7 +1040,9 @@ def render_sampling_stage(report: Mapping[str, Any]) -> str:
     if stage is not None and temporal:
         children = [dict(row, label=row.get("label", "step/eval"), source=row.get("source", "sampling_window")) for row in temporal if isinstance(row, Mapping)]
         try:
-            lines.append(render_mini_gantt(stage, children, clock_domain="host_monotonic"))
+            lines.append(render_mini_gantt(
+                stage, children, clock_domain="host_monotonic", include_subthreshold=True,
+            ))
         except ClockDomainError:
             lines.append("sampling window present but clock alignment is unavailable")
     else:
@@ -939,6 +1096,72 @@ def render_stage_gantts(report: Mapping[str, Any]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
+_TRANSPORT_LOAD_STAGES = {
+    "golden_clip_load",
+    "golden_unet_load",
+    "golden_vae_load",
+}
+
+
+def _stage_transport(
+    transport: Mapping[str, Any], stage: str, role: str,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    """Resolve one load-stage transport projection, failing closed on identity."""
+    by_stage = transport.get("by_stage")
+    if isinstance(by_stage, Mapping) and stage in by_stage:
+        selected = by_stage.get(stage)
+        if not isinstance(selected, Mapping):
+            return None, False
+        reason = str(selected.get("reason", "")).lower()
+        if "ambiguous" in reason or "disagree" in reason:
+            return None, True
+        selected_stage = selected.get("stage")
+        selected_role = selected.get("role")
+        if (selected_stage is not None and str(selected_stage) != stage) or (
+            selected_role is not None and str(selected_role) != role
+        ):
+            return None, True
+        if str(selected.get("status", "")).lower() in {
+            "unavailable", "timestamps_unavailable", "reconciliation_invalid",
+        }:
+            return None, False
+        return selected, False
+
+    by_role = transport.get("by_role")
+    if isinstance(by_role, Mapping) and role in by_role:
+        selected = by_role.get(role)
+        if not isinstance(selected, Mapping):
+            return None, False
+        reason = str(selected.get("reason", "")).lower()
+        if "ambiguous" in reason or "disagree" in reason:
+            return None, True
+        selected_stage = selected.get("stage")
+        selected_role = selected.get("role")
+        if (selected_stage is not None and str(selected_stage) != stage) or (
+            selected_role is not None and str(selected_role) != role
+        ):
+            return None, True
+        if str(selected.get("status", "")).lower() in {
+            "unavailable", "timestamps_unavailable", "reconciliation_invalid",
+        }:
+            return None, False
+        return selected, False
+
+    selected_stage = transport.get("stage")
+    selected_role = transport.get("role")
+    if selected_stage is not None or selected_role is not None:
+        if (selected_stage is not None and str(selected_stage) != stage) or (
+            selected_role is not None and str(selected_role) != role
+        ):
+            return None, True
+        if str(transport.get("status", "")).lower() in {
+            "unavailable", "timestamps_unavailable", "reconciliation_invalid",
+        }:
+            return None, False
+        return transport, False
+    return None, bool(transport.get("timestamp_lanes"))
+
+
 def render_stage_artifact(
     report: Mapping[str, Any], title: str, stage: str, *, role: str = ""
 ) -> str:
@@ -947,19 +1170,14 @@ def render_stage_artifact(
     if stage == "golden_sampling":
         parts.append(render_sampling_stage(report))
     transport = report.get("source_h2d_transport")
-    if role in {"clip", "unet", "vae"} and isinstance(transport, Mapping):
-        by_role = transport.get("by_role")
-        selected = by_role.get(role) if isinstance(by_role, Mapping) else None
-        if not isinstance(selected, Mapping):
-            by_stage = transport.get("by_stage")
-            selected = (
-                by_stage.get(f"golden_{role}_load")
-                if isinstance(by_stage, Mapping) else None
-            )
-        if not isinstance(selected, Mapping):
-            selected = transport if transport.get("role") == role else None
-        if isinstance(selected, Mapping):
-            parts.append(render_transport_mini_gantt(selected, title=f"{role.upper()} TRANSPORT (nested)"))
+    if stage in _TRANSPORT_LOAD_STAGES and role and isinstance(transport, Mapping):
+        selected, ambiguous = _stage_transport(transport, stage, role)
+        if ambiguous:
+            parts.append("TRANSPORT UNAVAILABLE — ambiguous stage ownership")
+        elif isinstance(selected, Mapping):
+            parts.append(render_transport_mini_gantt(
+                selected, title=f"{role.upper()} TRANSPORT (nested)"
+            ))
     return "\n\n".join(parts)
 
 

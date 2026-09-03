@@ -642,18 +642,61 @@ def _parse_runtime_result_summary(session_dir: Path) -> dict[str, Any]:
         if isinstance(loaded, dict):
             data = loaded
 
+    def telemetry_document(value: Any, depth: int = 0) -> Mapping[str, Any] | None:
+        """Find a Golden telemetry document without flattening its payload."""
+        if depth > 6:
+            return None
+        if isinstance(value, (list, tuple)):
+            for child in value[:64]:
+                found = telemetry_document(child, depth + 1)
+                if found is not None:
+                    return found
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        nested = value.get("golden_telemetry")
+        if isinstance(nested, Mapping):
+            return nested
+        # golden_telemetry.json is normally the document itself.  Cohort
+        # envelopes may instead put it under result/data/payload.
+        for key in ("result", "data", "payload", "attempt", "runtime_result"):
+            found = telemetry_document(value.get(key), depth + 1)
+            if found is not None:
+                return found
+        if value.get("schema") == "golden_p1_telemetry_v1" or any(
+            key in value for key in ("events", "stages", "node_timing_records")
+        ):
+            return value
+        return None
+
+    def merge_documents(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge copied telemetry documents while retaining all event lists."""
+        merged = dict(left)
+        for key, value in right.items():
+            previous = merged.get(key)
+            if isinstance(previous, list) and isinstance(value, list):
+                merged[key] = [*previous, *value]
+            elif isinstance(previous, Mapping) and isinstance(value, Mapping):
+                merged[key] = merge_documents(previous, value)
+            elif key not in merged or previous is None:
+                merged[key] = value
+        return merged
+
+    telemetry_documents: list[Mapping[str, Any]] = []
+    summary_telemetry = telemetry_document(data.get("golden_telemetry"))
+    if summary_telemetry is not None:
+        telemetry_documents.append(summary_telemetry)
     telemetry_path = session_dir / "raw" / "golden_telemetry.json"
-    telemetry = _json_load(telemetry_path) if telemetry_path.is_file() else None
-    if isinstance(telemetry, Mapping):
-        data["golden_telemetry"] = telemetry
-        return data
-    if data:
-        return data
+    if telemetry_path.is_file():
+        telemetry = telemetry_document(_json_load(telemetry_path))
+        if telemetry is not None:
+            telemetry_documents.append(telemetry)
 
     # Golden runs persist their complete runtime result in the invocation-owned
     # cohort envelope rather than in the generic full-trace raw layout.  Keep
     # this fallback local to report generation; it does not alter instrumentation
-    # or synthesize trace events.
+    # or synthesize trace events.  Do this even when the scalar summary exists:
+    # the sanitized summary is deliberately not the authority for rich evidence.
     for attempt_path in sorted(session_dir.glob("attempt_*.json")):
         if (
             not attempt_path.is_file()
@@ -662,9 +705,16 @@ def _parse_runtime_result_summary(session_dir: Path) -> dict[str, Any]:
         ):
             continue
         attempt = _json_load(attempt_path)
-        if isinstance(attempt, dict) and isinstance(attempt.get("golden_telemetry"), Mapping):
-            return attempt
-    return {}
+        telemetry = telemetry_document(attempt)
+        if telemetry is not None:
+            telemetry_documents.append(telemetry)
+
+    if telemetry_documents:
+        telemetry = telemetry_documents[0]
+        for document in telemetry_documents[1:]:
+            telemetry = merge_documents(telemetry, document)
+        data["golden_telemetry"] = telemetry
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -2587,6 +2637,204 @@ def _build_async_tasks(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_clip_module_records(runtime_result: dict[str, Any]) -> dict[str, Any]:
+    """Promote CLIP module spans to the report's renderer-facing result tree.
+
+    Golden telemetry keeps this payload with its owning interval, under
+    ``details.clip_forward_decomposition``.  That is a good producer shape,
+    but it is easy for envelope serializers to hide from consumers that start
+    at ``runtime_result``.  Normalize only explicit module boundaries; a
+    duration without both endpoints remains non-temporal evidence.
+    """
+    decompositions: list[Mapping[str, Any]] = []
+    producer_present = False
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal producer_present
+        if depth > 10 or not isinstance(value, (Mapping, list, tuple)):
+            return
+        if isinstance(value, Mapping):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            decomposition = value.get("clip_forward_decomposition")
+            if isinstance(decomposition, Mapping):
+                producer_present = True
+                decompositions.append(decomposition)
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child, depth + 1)
+        else:
+            for child in value[:256]:
+                visit(child, depth + 1)
+
+    visit(runtime_result)
+    normalized: list[dict[str, Any]] = []
+    seen_records: set[str] = set()
+    invalid_count = 0
+    for decomposition in decompositions:
+        raw_records = decomposition.get("module_records")
+        if not isinstance(raw_records, list):
+            invalid_count += 1
+            continue
+        for record in raw_records[:256]:
+            if not isinstance(record, Mapping):
+                invalid_count += 1
+                continue
+            start = _sampling_number(
+                record.get("start_monotonic_ns", record.get("start_ns"))
+            )
+            end = _sampling_number(
+                record.get("end_monotonic_ns", record.get("end_ns"))
+            )
+            if start is None or end is None or end <= start:
+                invalid_count += 1
+                continue
+            # The explicit endpoints are the temporal authority.  Preserve a
+            # producer duration only as a diagnostic comparison; never let a
+            # stale summary duration change the plotted wall.
+            duration_ns = end - start
+            recorded_duration_ns = _sampling_number(record.get("duration_ns"))
+            name = str(
+                record.get("module_path")
+                or record.get("qualified_name")
+                or record.get("module_name")
+                or record.get("name")
+                or "module"
+            )
+            module_name = str(record.get("module_name") or record.get("name") or name)
+            clock = str(
+                record.get("clock")
+                or record.get("clock_domain")
+                or decomposition.get("clock")
+                or "perf_counter_ns"
+            )
+            item = {
+                "name": name,
+                "module_path": name,
+                "module_name": module_name,
+                "qualified_name": str(record.get("qualified_name") or name),
+                "start_ns": start,
+                "end_ns": end,
+                "start_monotonic_ns": start,
+                "end_monotonic_ns": end,
+                "duration_ns": duration_ns,
+                "duration_ms": round(duration_ns / 1_000_000.0, 3),
+                "wall_ms": round(duration_ns / 1_000_000.0, 3),
+                "clock": clock,
+                "clock_domain": clock,
+                "boundary_kind": record.get("boundary_kind", "host_observed_inclusive"),
+            }
+            if recorded_duration_ns is not None and recorded_duration_ns != duration_ns:
+                item["recorded_duration_ns"] = recorded_duration_ns
+            try:
+                identity = json.dumps(
+                    (item["qualified_name"], item["start_ns"], item["end_ns"]),
+                    separators=(",", ":"),
+                )
+            except Exception:
+                identity = ""
+            if identity and identity in seen_records:
+                continue
+            if identity:
+                seen_records.add(identity)
+            normalized.append(item)
+
+    if not producer_present:
+        status = "producer_absent"
+    elif invalid_count:
+        status = "ingest_failure"
+    else:
+        status = "available"
+    promoted = runtime_result.get("clip_forward_decomposition")
+    promoted = dict(promoted) if isinstance(promoted, Mapping) else {}
+    promoted["module_records"] = normalized
+    promoted["module_records_status"] = status
+    promoted["module_records_producer_present"] = producer_present
+    promoted["module_records_ingest_error_count"] = invalid_count
+    runtime_result["clip_forward_decomposition"] = promoted
+    # Keep the status easy to inspect without requiring consumers to know the
+    # producer's nesting, while retaining the full normalized record list in
+    # the decomposition object above.
+    runtime_result["clip_module_records_status"] = status
+    runtime_result["clip_module_records_producer_present"] = producer_present
+    return promoted
+
+
+def _normalize_node_timing_records(runtime_result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Promote explicit Golden runner node windows into report data."""
+    raw_records: list[Mapping[str, Any]] = []
+    producer_present = False
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal producer_present
+        if depth > 10 or not isinstance(value, (Mapping, list, tuple)):
+            return
+        if isinstance(value, Mapping):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            records = value.get("node_timing_records")
+            if isinstance(records, list):
+                producer_present = True
+                raw_records.extend(item for item in records if isinstance(item, Mapping))
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child, depth + 1)
+        else:
+            for child in value[:256]:
+                visit(child, depth + 1)
+
+    visit(runtime_result)
+    normalized: list[dict[str, Any]] = []
+    seen_records: set[str] = set()
+    invalid_count = 0
+    for record in raw_records[:512]:
+        start = _sampling_number(record.get("start_monotonic_ns", record.get("start_ns")))
+        end = _sampling_number(record.get("end_monotonic_ns", record.get("end_ns")))
+        if start is None or end is None or end <= start:
+            invalid_count += 1
+            continue
+        class_type = str(record.get("class_type") or record.get("node_class") or record.get("name") or "node")
+        node_id = str(record.get("node_id") or record.get("id") or "")
+        clock = str(record.get("clock") or record.get("clock_domain") or "perf_counter_ns")
+        item = {
+            "node_id": node_id,
+            "class_type": class_type,
+            "name": class_type,
+            "start_ns": start,
+            "end_ns": end,
+            "start_monotonic_ns": start,
+            "end_monotonic_ns": end,
+            "duration_ns": end - start,
+            "duration_ms": round((end - start) / 1_000_000.0, 3),
+            "wall_ms": round((end - start) / 1_000_000.0, 3),
+            "clock": clock,
+            "clock_domain": clock,
+            "pass_outcome": record.get("pass_outcome", "UNKNOWN"),
+        }
+        identity = json.dumps(
+            (node_id, class_type, item["start_ns"], item["end_ns"]),
+            separators=(",", ":"),
+        )
+        if identity in seen_records:
+            continue
+        seen_records.add(identity)
+        normalized.append(item)
+
+    runtime_result["node_timing_records"] = normalized
+    runtime_result["node_timing_records_status"] = (
+        "producer_absent" if not producer_present else (
+            "ingest_failure" if invalid_count else "available"
+        )
+    )
+    runtime_result["node_timing_records_producer_present"] = producer_present
+    runtime_result["node_timing_records_ingest_error_count"] = invalid_count
+    return normalized
+
+
 def _sampling_profile_name(record: Mapping[str, Any]) -> bool:
     """Return whether *record* names the persisted deep-profile event."""
     for key in ("event_type", "event", "name"):
@@ -2598,26 +2846,36 @@ def _sampling_profile_name(record: Mapping[str, Any]) -> bool:
 
 def _sampling_profile_payload(record: Mapping[str, Any]) -> Any:
     """Extract an artifact from RuntimeTrace or GoldenTelemetry event shapes."""
-    if all(key in record for key in ("schema_version", "level", "status")):
-        return record
-    containers: list[Any] = [record]
-    for key in ("data", "fields", "metadata", "args"):
-        value = record.get(key)
-        if isinstance(value, Mapping):
-            containers.append(value)
-    for container in containers:
-        if not isinstance(container, Mapping):
+    pending: list[Mapping[str, Any]] = [record]
+    seen: set[int] = set()
+    wrapper_keys = (
+        "data", "fields", "metadata", "args", "payload", "artifact",
+        "sampling_deep_profile", "sampling_profile", "decomposition", "result",
+        "value",
+    )
+    while pending and len(seen) < 64:
+        container = pending.pop(0)
+        if id(container) in seen:
             continue
-        for key in ("metadata", "payload", "artifact", "sampling_deep_profile"):
+        seen.add(id(container))
+        if all(key in container for key in ("schema_version", "level", "status")):
+            return container
+        if any(key in container for key in ("schema_version", "level", "status", "steps", "evals")):
+            # Prefer a nested, richer artifact when this is only an event
+            # envelope, but retain this mapping as a valid final fallback.
+            fallback = container
+        else:
+            fallback = None
+        for key in wrapper_keys:
             value = container.get(key)
             if isinstance(value, Mapping):
-                return value
-            if isinstance(value, str):
+                pending.append(value)
+            elif isinstance(value, str):
                 parsed = _json_loads(value)
                 if isinstance(parsed, Mapping):
-                    return parsed
-        if any(key in container for key in ("schema_version", "level", "status", "steps", "evals")):
-            return container
+                    pending.append(parsed)
+        if fallback is not None and not pending:
+            return fallback
     return None
 
 
@@ -2638,14 +2896,18 @@ def _sampling_profile_event_records(
         telemetry = runtime_result.get("telemetry")
 
     def visit(value: Any, path: str, depth: int = 0) -> None:
-        if depth > 5 or not isinstance(value, (Mapping, list, tuple)):
+        if depth > 8 or not isinstance(value, (Mapping, list, tuple)):
             return
         if isinstance(value, Mapping):
             if _sampling_profile_name(value):
                 candidates.append((_sampling_profile_payload(value), f"golden_telemetry:{path}"))
                 return
             for key, child in value.items():
-                if key in {"events", "golden_telemetry", "telemetry", "fields", "data", "metadata"}:
+                if key in {
+                    "events", "golden_telemetry", "telemetry", "stages", "details",
+                    "fields", "data", "metadata", "payload", "artifact",
+                    "decomposition", "sampling_profile", "sampling_diagnostics", "result",
+                }:
                     visit(child, f"{path}.{key}", depth + 1)
         else:
             for index, child in enumerate(value[:256]):
@@ -2660,6 +2922,47 @@ def _sampling_number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     return _safe_float(value, None)
+
+
+def _sampling_interval_bounds(value: Mapping[str, Any]) -> tuple[float | None, float | None]:
+    """Read explicit nanosecond endpoints after JSON envelope nesting."""
+    containers: list[Mapping[str, Any]] = [value]
+    for key in ("interval", "timing", "temporal"):
+        child = value.get(key)
+        if isinstance(child, Mapping):
+            containers.append(child)
+    start: float | None = None
+    end: float | None = None
+    for container in containers:
+        if start is None:
+            for key in ("start_monotonic_ns", "start_ns"):
+                start = _sampling_number(container.get(key))
+                if start is not None:
+                    break
+        if end is None:
+            for key in ("end_monotonic_ns", "end_ns"):
+                end = _sampling_number(container.get(key))
+                if end is not None:
+                    break
+    return start, end
+
+
+def _sampling_window_endpoint(payload: Mapping[str, Any], side: str) -> float | None:
+    names = (
+        f"sampling_window_{side}_monotonic_ns",
+        f"sampling_window_{side}_ns",
+    )
+    for name in names:
+        value = _sampling_number(payload.get(name))
+        if value is not None:
+            return value
+    window = payload.get("sampling_window")
+    if isinstance(window, Mapping):
+        for name in (f"{side}_monotonic_ns", f"{side}_ns"):
+            value = _sampling_number(window.get(name))
+            if value is not None:
+                return value
+    return None
 
 
 def _sampling_metric(payload: Mapping[str, Any], *names: str) -> tuple[float | None, str]:
@@ -2898,8 +3201,12 @@ def _sampling_temporal_rows(
         for item in per_eval:
             if not isinstance(item, Mapping):
                 continue
-            start = _sampling_number(item.get("start_monotonic_ns", item.get("start_ns")))
-            end = _sampling_number(item.get("end_monotonic_ns", item.get("end_ns")))
+            # A skipped evaluation may still have a wrapper lifecycle span,
+            # but it has no compute interval.  Do not turn that wrapper wall
+            # into a plotted evaluation row or imply work that did not run.
+            if str(item.get("compute_or_skip", "")).strip().lower() == "skip":
+                continue
+            start, end = _sampling_interval_bounds(item)
             if start is None or end is None or end <= start:
                 continue
             start_ms = alignment["to_golden_ms"](start)
@@ -2935,8 +3242,7 @@ def _sampling_temporal_rows(
             for item in timeline_steps:
                 if not isinstance(item, Mapping):
                     continue
-                start = _sampling_number(item.get("start_monotonic_ns", item.get("start_ns")))
-                end = _sampling_number(item.get("end_monotonic_ns", item.get("end_ns")))
+                start, end = _sampling_interval_bounds(item)
                 if start is None or end is None or end <= start:
                     continue
                 start_ms = alignment["to_golden_ms"](start)
@@ -2953,14 +3259,13 @@ def _sampling_temporal_rows(
         # Setup and finalization are drawable only when the producer persisted
         # both sampling-window endpoints and an evaluation endpoint.  These are
         # local-window complements, never inferred from the report wall.
-        window_start = _sampling_number(payload.get("sampling_window_start_monotonic_ns"))
-        window_end = _sampling_number(payload.get("sampling_window_end_monotonic_ns"))
+        window_start = _sampling_window_endpoint(payload, "start")
+        window_end = _sampling_window_endpoint(payload, "end")
         eval_intervals = []
         for item in per_eval:
             if not isinstance(item, Mapping):
                 continue
-            start = _sampling_number(item.get("start_monotonic_ns", item.get("start_ns")))
-            end = _sampling_number(item.get("end_monotonic_ns", item.get("end_ns")))
+            start, end = _sampling_interval_bounds(item)
             if start is not None and end is not None and end > start:
                 eval_intervals.append((start, end))
         if window_start is not None and eval_intervals:
@@ -3034,9 +3339,15 @@ def _sampling_clock_alignment(
     )
     # A producer may declare the node's monotonic endpoints directly.  This
     # is equivalent evidence and avoids requiring a second origin object.
-    if mono_origin is None and sampling_node is not None:
-        mono_origin = _sampling_number(sampling_node.get("start_monotonic_ns"))
-        golden_origin_ms = _sampling_number(sampling_node.get("start_ms"))
+    if sampling_node is not None:
+        if mono_origin is None:
+            mono_origin = _sampling_number(sampling_node.get("start_monotonic_ns"))
+        if golden_origin_ms is None:
+            # ``golden_sampling`` is an explicit VizTracer stage boundary.
+            # Its start_ms is the report axis origin; pairing it with the
+            # payload's declared monotonic origin is clock mapping evidence,
+            # not duration or wall-time inference.
+            golden_origin_ms = _sampling_number(sampling_node.get("start_ms"))
     if mono_origin is None or golden_origin_ms is None:
         return None
 
@@ -4315,7 +4626,8 @@ def _golden_profile_json(profile: dict[str, Any]) -> dict[str, Any]:
             "residual_ms", "residual_pct", "coverage_pct", "coverage", "subthreshold_children_union_ms",
             "direct_child_count", "subthreshold_child_count", "subthreshold_child_union_ms",
             "display_children_gt50ms", "traced_children", "true_self_or_untraced_residual_ms",
-            "residual_reason",
+            "residual_reason", "classification", "decomposition_classification",
+            "DECOMPOSITION_CLASSIFICATION",
             "thread_task", "completeness", "needs_decomposition", "flag",
             "WALL_MS", "DIRECT_CHILD_COUNT", "DIRECT_CHILD_SUM_MS", "DIRECT_CHILD_UNION_MS",
             "DIRECT_CHILD_OVERLAP_MS", "SUBTHRESHOLD_CHILD_COUNT", "SUBTHRESHOLD_CHILD_UNION_MS",
@@ -4552,8 +4864,18 @@ def _augment_golden_profile(
 ) -> None:
     root = profile.get("root")
     sampling_node: Mapping[str, Any] | None = None
+    roots_to_search: list[Mapping[str, Any]] = []
     if isinstance(root, Mapping):
-        stack = [root]
+        roots_to_search.append(root)
+    # Canonical spans can be valid stage evidence even when parent
+    # reconstruction did not attach the stage to the visible root tree.
+    for candidate in profile.get("canonical_spans", []):
+        if isinstance(candidate, Mapping):
+            roots_to_search.append(candidate)
+    for search_root in roots_to_search:
+        if sampling_node is not None:
+            break
+        stack = [search_root]
         while stack:
             node = stack.pop()
             if node.get("name") == "golden_sampling":
@@ -4613,16 +4935,85 @@ def _augment_golden_profile(
             "unaligned" if deep.get("status") != "unavailable" else "unavailable"
         )
     )
+    sampling_residuals: list[float] = []
+    for record in deep.get("records", []) if isinstance(deep.get("records"), list) else []:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        reconciliation = payload.get("reconciliation") if isinstance(payload, Mapping) else None
+        if isinstance(reconciliation, Mapping):
+            residual = _sampling_number(reconciliation.get("sampling_residual_ms"))
+            if residual is not None and residual > _GOLDEN_PROFILE_THRESHOLD_MS:
+                sampling_residuals.append(residual)
+    sampling_residual = max(sampling_residuals, default=None)
+    transport_residual = None
+    if isinstance(transport, Mapping):
+        for key in ("transport_residual_ms", "residual_ms", "unaccounted_ms"):
+            transport_residual = _sampling_number(transport.get(key))
+            if transport_residual is not None:
+                break
+
+    transport_stages: set[str] = set()
+    by_stage = transport.get("by_stage") if isinstance(transport, Mapping) else None
+    if isinstance(by_stage, Mapping):
+        for stage_name, stage_data in by_stage.items():
+            if not isinstance(stage_data, Mapping):
+                continue
+            lanes = stage_data.get("timestamp_lanes")
+            lane_types = {
+                str(row.get("lane")) for row in lanes if isinstance(row, Mapping)
+            } if isinstance(lanes, list) else set()
+            if (
+                stage_data.get("reconciliation_state") == "valid"
+                and {"source", "h2d"}.issubset(lane_types)
+            ):
+                transport_stages.add(str(stage_name))
+
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(root, Mapping):
+        candidates.extend(_flatten_golden_nodes(root))
+    candidates.extend(
+        span for span in profile.get("canonical_spans", [])
+        if isinstance(span, Mapping) and span not in candidates
+    )
     unresolved: list[dict[str, Any]] = []
-    for node in _flatten_golden_nodes(root) if isinstance(root, Mapping) else []:
+    for node in candidates:
         wall = _sampling_number(node.get("wall_ms"))
         residual = _sampling_number(node.get("residual_ms", node.get("exclusive_residual_ms")))
-        if wall is None or residual is None or wall <= _GOLDEN_PROFILE_THRESHOLD_MS or residual <= _GOLDEN_PROFILE_THRESHOLD_MS:
-            continue
         name = str(node.get("name", ""))
-        if name == "golden_sampling" and sampling_explained:
+        lower_name = name.lower().replace("-", "_").replace("/", "_")
+        sampling_cross = name == "golden_sampling" and sampling_explained
+        transport_cross = (
+            (name in transport_stages)
+            or (transport_explained
+            and (
+                "source_h2d_transport" in lower_name
+                or lower_name in {"source_h2d", "source_h2d_transport"}
+                or any(token in lower_name for token in ("transport", "source", "h2d"))
+            ))
+        )
+        viz_children = int(node.get("traced_children", 0) or 0)
+        displayed_children = int(node.get("display_children_gt50ms", 0) or 0)
+        if sampling_cross or transport_cross:
+            classification = (
+                "PARTIALLY_DECOMPOSED" if viz_children else "CROSS_EVIDENCE_DECOMPOSED"
+            )
+        elif displayed_children:
+            classification = "VIZTRACER_DECOMPOSED"
+        elif viz_children:
+            classification = "PARTIALLY_DECOMPOSED"
+        else:
+            classification = "OPAQUE"
+        # Keep the classification on the normalized candidate as well as on
+        # any unresolved row.  NO_TRACED_CHILDREN remains a VizTracer fact; it
+        # must not erase an independent cross-evidence classification.
+        if isinstance(node, dict):
+            node["classification"] = classification
+            node["decomposition_classification"] = classification
+            node["DECOMPOSITION_CLASSIFICATION"] = classification
+        if wall is None or wall <= _GOLDEN_PROFILE_THRESHOLD_MS:
             continue
-        if any(token in name.lower() for token in ("transport", "source", "h2d")) and transport_explained:
+        if residual is None or residual <= _GOLDEN_PROFILE_THRESHOLD_MS:
+            continue
+        if sampling_cross or transport_cross:
             continue
         unresolved.append({
             "name": name,
@@ -4632,6 +5023,32 @@ def _augment_golden_profile(
             "evidence_source": "viztracer",
             "clock_domain": "host_monotonic",
             "reason": str(node.get("residual_reason", "untraced or self time")),
+            "classification": classification,
+        })
+    # A cross-evidence parent is never itself an unresolved row.  If its own
+    # producer reconciliation leaves a material residual, expose that residual
+    # explicitly instead of relabeling the whole parent as opaque.
+    if sampling_explained and sampling_residual is not None:
+        unresolved.append({
+            "name": "sampling residual",
+            "wall_ms": sampling_residual,
+            "residual_ms": sampling_residual,
+            "coverage": "cross-evidence",
+            "evidence_source": "sampling_deep_profile",
+            "clock_domain": "monotonic_ns",
+            "reason": "explicit sampling reconciliation residual",
+            "classification": "PARTIALLY_DECOMPOSED",
+        })
+    if transport_explained and transport_residual is not None and transport_residual > _GOLDEN_PROFILE_THRESHOLD_MS:
+        unresolved.append({
+            "name": "transport residual",
+            "wall_ms": transport_residual,
+            "residual_ms": transport_residual,
+            "coverage": "cross-evidence",
+            "evidence_source": "E27 persisted transport",
+            "clock_domain": "monotonic_ns",
+            "reason": "explicit source/H2D reconciliation residual",
+            "classification": "PARTIALLY_DECOMPOSED",
         })
     # Cross-evidence is intentionally not folded into VizTracer residuals.  If
     # persisted sampling/E27 data exists but cannot be aligned/reconciled, make
@@ -4646,6 +5063,7 @@ def _augment_golden_profile(
             "evidence_source": "sampling_deep_profile",
             "clock_domain": "monotonic_ns",
             "reason": str(deep.get("temporal_alignment_reason", "sampling clock alignment unavailable")),
+            "classification": "OPAQUE",
         })
     if transport.get("status") not in {"unavailable", ""} and not transport_explained:
         unresolved.append({
@@ -4656,6 +5074,7 @@ def _augment_golden_profile(
             "evidence_source": "E27 persisted transport",
             "clock_domain": "monotonic_ns",
             "reason": str(transport.get("reason", "E27 reconciliation or timestamp coverage unavailable")),
+            "classification": "OPAQUE",
         })
     profile["unresolved_over_50ms"] = unresolved
     profile["sampling_reconciled"] = sampling_explained
@@ -4764,6 +5183,7 @@ def _generate_golden_profile_report(profile: dict[str, Any]) -> str:
                 f"- {area.get('name', '')}: {area.get('coverage', 'remaining')} "
                 f"wall_ms={area.get('wall_ms')} residual_ms={area.get('residual_ms')} "
                 f"clock={area.get('clock_domain', MEASUREMENT_UNAVAILABLE)} "
+                f"classification={area.get('classification', 'OPAQUE')} "
                 f"reason={area.get('reason', 'not established')}"
             )
     else:
@@ -4862,7 +5282,12 @@ def _generate_report_md(
         if unresolved:
             _w("Areas below are residuals not separately explained by sampling or transport evidence.")
             for area in unresolved:
-                _w(f"- {area.get('name', '')}: wall_ms={area.get('wall_ms')} residual_ms={area.get('residual_ms')}")
+                _w(
+                    f"- {area.get('name', '')}: wall_ms={area.get('wall_ms')} "
+                    f"residual_ms={area.get('residual_ms')} "
+                    f"classification={area.get('classification', 'OPAQUE')} "
+                    f"reason={area.get('reason', 'not established')}"
+                )
         else:
             _w("None; sampling and transport are separate evidence domains when available.")
         _w("")
@@ -5348,6 +5773,8 @@ def _build_report_data(
     source_h2d_transport: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured report_data.json."""
+    _normalize_clip_module_records(runtime_result)
+    _normalize_node_timing_records(runtime_result)
     data: dict[str, Any] = {
         "schema_version": VERSION,
         "status": status,
@@ -5391,6 +5818,12 @@ def _build_report_data(
         "session_events": sessions,
         "trace_config": trace_config,
         "runtime_result": runtime_result,
+        "clip_module_records_status": runtime_result.get(
+            "clip_module_records_status", "producer_absent"
+        ),
+        "clip_module_records_producer_present": runtime_result.get(
+            "clip_module_records_producer_present", False
+        ),
         "derived_files": derived_files.get("files", []),
         "golden_profile": _golden_profile_json(golden_profile) if golden_profile is not None else None,
         "golden_profile_complete": (
@@ -5831,6 +6264,17 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     # machine inventory now includes nested derived/gantts files as well.
     derived_files_info["files"] = _build_manifest(raw_dir, derived_dir)
     structured_report["derived_files"] = derived_files_info["files"]
+
+    # Stage artifacts are created after the first console render.  Refresh the
+    # persisted console against the now-complete inventory so offline consumers
+    # get the same projection as render_full_console(report_data).
+    try:
+        MODAL_HUMAN_REPORT = golden_human_report.render_full_console(structured_report)
+        _write_text_exact(golden_console_path, MODAL_HUMAN_REPORT)
+    except Exception:
+        # Keep the fail-closed behavior used by the first render: mixed-clock
+        # unresolved evidence must not be projected onto the host timeline.
+        pass
 
     # ── Generate report.md ──
     # Note: manifest is rebuilt at the end after all files exist; this is a placeholder.
