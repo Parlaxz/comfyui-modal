@@ -2662,6 +2662,17 @@ def _normalize_clip_module_records(runtime_result: dict[str, Any]) -> dict[str, 
             if isinstance(decomposition, Mapping):
                 producer_present = True
                 decompositions.append(decomposition)
+            # The recorder persists the envelope as
+            # ``clip_forward_timing.decomposition``.  The standalone
+            # ``clip_forward_decomposition`` event is only a second copy when
+            # diagnostics are enabled, so accept both producer handoffs
+            # without treating an absent optional producer as an ingest error.
+            timing = value.get("clip_forward_timing")
+            if isinstance(timing, Mapping):
+                nested = timing.get("decomposition")
+                if isinstance(nested, Mapping):
+                    producer_present = True
+                    decompositions.append(nested)
             for child in value.values():
                 if isinstance(child, (Mapping, list, tuple)):
                     visit(child, depth + 1)
@@ -2794,12 +2805,24 @@ def _normalize_node_timing_records(runtime_result: dict[str, Any]) -> list[dict[
     for record in raw_records[:512]:
         start = _sampling_number(record.get("start_monotonic_ns", record.get("start_ns")))
         end = _sampling_number(record.get("end_monotonic_ns", record.get("end_ns")))
+        # A persisted node record may already carry the report-axis endpoints.
+        # Prefer those explicit endpoints when the monotonic copy is absent;
+        # never derive an endpoint from duration alone.
+        axis_start = _sampling_number(record.get("start_ms"))
+        axis_end = _sampling_number(record.get("end_ms"))
         if start is None or end is None or end <= start:
-            invalid_count += 1
-            continue
+            if axis_start is None or axis_end is None or axis_end <= axis_start:
+                invalid_count += 1
+                continue
+            start = axis_start * 1_000_000.0
+            end = axis_end * 1_000_000.0
         class_type = str(record.get("class_type") or record.get("node_class") or record.get("name") or "node")
         node_id = str(record.get("node_id") or record.get("id") or "")
-        clock = str(record.get("clock") or record.get("clock_domain") or "perf_counter_ns")
+        clock = str(
+            record.get("clock")
+            or record.get("clock_domain")
+            or ("host_monotonic" if axis_start is not None else "host_monotonic")
+        )
         item = {
             "node_id": node_id,
             "class_type": class_type,
@@ -2815,6 +2838,12 @@ def _normalize_node_timing_records(runtime_result: dict[str, Any]) -> list[dict[
             "clock_domain": clock,
             "pass_outcome": record.get("pass_outcome", "UNKNOWN"),
         }
+        if axis_start is not None and axis_end is not None:
+            item["start_ms"] = axis_start
+            item["end_ms"] = axis_end
+        else:
+            item["start_ms"] = round(start / 1_000_000.0, 3)
+            item["end_ms"] = round(end / 1_000_000.0, 3)
         identity = json.dumps(
             (node_id, class_type, item["start_ns"], item["end_ns"]),
             separators=(",", ":"),
@@ -3483,6 +3512,14 @@ _SOURCE_H2D_FIELDS = (
     "h2d_completion_count",
 )
 
+_SOURCE_H2D_PROOF_FIELDS = (
+    "e27_source_mechanism_evaluation",
+    "E27_SOURCE_MECHANISM_PROVEN",
+    "e27_source_mechanism_failed_predicates",
+    "e27_source_mechanism_line",
+    "e27_source_mechanism_status",
+)
+
 _SOURCE_H2D_STAGE_ROLES = {
     "golden_clip_load": "clip",
     "golden_unet_load": "unet",
@@ -3516,11 +3553,10 @@ def _source_h2d_identity(
     record: Mapping[str, Any],
 ) -> tuple[set[str], set[str]]:
     """Resolve stage/role identity from the record and its traversal context."""
+    containers = _source_h2d_record_containers(record)
     stage_values: list[Any] = [stage_context]
     role_values: list[Any] = []
-    for container in (record, record.get("actual_source"), record.get("actual_source_telemetry")):
-        if not isinstance(container, Mapping):
-            continue
+    for container in containers:
         for key in ("name", "stage", "stage_name", "event", "event_type", "traversal", "context", "path"):
             if key in container:
                 stage_values.append(container[key])
@@ -3533,9 +3569,7 @@ def _source_h2d_identity(
                 stages.update(_source_h2d_stages_from_value(item))
         else:
             stages.update(_source_h2d_stages_from_value(value))
-    for container in (record, record.get("actual_source"), record.get("actual_source_telemetry")):
-        if not isinstance(container, Mapping):
-            continue
+    for container in containers:
         for key in ("stage", "stage_name"):
             value = container.get(key)
             if value is not None and isinstance(value, str) and value.strip() and not _source_h2d_stages_from_value(value):
@@ -3582,6 +3616,7 @@ def _source_h2d_unavailable(*, status: str = "unavailable", reason: str = "") ->
         },
     }
     result.update({field: _SOURCE_H2D_UNAVAILABLE for field in _SOURCE_H2D_FIELDS})
+    result.update({field: _SOURCE_H2D_UNAVAILABLE for field in _SOURCE_H2D_PROOF_FIELDS})
     return result
 
 
@@ -3600,6 +3635,111 @@ def _source_h2d_first(container: Mapping[str, Any], *keys: str) -> Any:
         if key in container and container[key] is not None:
             return container[key]
     return None
+
+
+_SOURCE_H2D_NESTED_KEYS = (
+    "actual_source",
+    "actual_source_telemetry",
+    "dispatcher",
+    "dispatcher_telemetry",
+    "dispatcher_control",
+    "transport_telemetry",
+)
+
+
+def _source_h2d_record_containers(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return the bounded record/actual/dispatcher evidence containers."""
+    containers: list[Mapping[str, Any]] = []
+    pending: list[tuple[Mapping[str, Any], int]] = [(record, 0)]
+    seen: set[int] = set()
+    while pending:
+        value, depth = pending.pop(0)
+        if depth > 4 or id(value) in seen:
+            continue
+        seen.add(id(value))
+        containers.append(value)
+        for key in _SOURCE_H2D_NESTED_KEYS:
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                pending.append((child, depth + 1))
+    return containers
+
+
+def _source_h2d_actual_source(
+    record: Mapping[str, Any], containers: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Select the physical-source payload without interpreting its evidence."""
+    for container in containers:
+        for key in ("actual_source", "actual_source_telemetry"):
+            actual = container.get(key)
+            if isinstance(actual, Mapping):
+                return actual
+    # Dispatcher payloads from older envelopes sometimes contain the actual
+    # fields directly rather than under an actual_source key.
+    for container in containers[1:]:
+        if any(key in container for key in (
+            "actual_source_events", "source_reads", "h2d_events", "SOURCE_TOTAL_WALL_MS",
+        )):
+            return container
+    return record
+
+
+def _source_h2d_e27_fields(
+    containers: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Normalize persisted E27 evaluator fields without recomputing proof."""
+    evaluator: Mapping[str, Any] | None = None
+    for container in containers:
+        candidate = container.get("e27_source_mechanism_evaluation")
+        if isinstance(candidate, Mapping):
+            evaluator = candidate
+            break
+
+    def first_value(*keys: str) -> Any:
+        for container in containers:
+            value = _source_h2d_first(container, *keys)
+            if value is not None:
+                return value
+        if isinstance(evaluator, Mapping):
+            return _source_h2d_first(evaluator, *keys)
+        return None
+
+    proof_value = first_value("E27_SOURCE_MECHANISM_PROVEN")
+    if proof_value is None and isinstance(evaluator, Mapping):
+        proof_value = evaluator.get("proven")
+    if proof_value is True or str(proof_value).upper() in {"YES", "TRUE"}:
+        proof = "YES"
+        status = "proven"
+    elif proof_value is False or str(proof_value).upper() in {"NO", "FALSE"}:
+        proof = "NO"
+        status = "failed"
+    else:
+        proof = _SOURCE_H2D_UNAVAILABLE
+        status = _SOURCE_H2D_UNAVAILABLE
+
+    failed = first_value("e27_source_mechanism_failed_predicates")
+    if failed is None and isinstance(evaluator, Mapping):
+        failed = evaluator.get("failed_predicates")
+    if isinstance(failed, list):
+        failed = [str(item) for item in failed]
+    else:
+        failed = _SOURCE_H2D_UNAVAILABLE
+
+    line = first_value("e27_source_mechanism_line")
+    if line is None and isinstance(evaluator, Mapping):
+        line = _source_h2d_first(evaluator, "emitted_line", "line")
+    if not isinstance(line, str):
+        line = _SOURCE_H2D_UNAVAILABLE
+
+    return {
+        "e27_source_mechanism_evaluation": (
+            dict(evaluator) if evaluator is not None else _SOURCE_H2D_UNAVAILABLE
+        ),
+        "E27_SOURCE_MECHANISM_PROVEN": proof,
+        "e27_source_mechanism_failed_predicates": failed,
+        "e27_source_mechanism_line": line,
+        "e27_source_mechanism_status": status,
+    }
 
 
 def _source_h2d_candidates(
@@ -3626,7 +3766,20 @@ def _source_h2d_candidates(
     def add(stage: str, value: Any) -> None:
         if not isinstance(value, Mapping) or id(value) in seen:
             return
-        content = value.get("actual_source", value.get("actual_source_telemetry", value))
+        content = value.get("actual_source")
+        if not isinstance(content, Mapping):
+            content = value.get("actual_source_telemetry")
+        if not isinstance(content, Mapping):
+            for key in _SOURCE_H2D_NESTED_KEYS:
+                nested = value.get(key)
+                if not isinstance(nested, Mapping):
+                    continue
+                content = nested.get(
+                    "actual_source", nested.get("actual_source_telemetry", nested)
+                )
+                break
+        if not isinstance(content, Mapping):
+            content = value
         try:
             content_key = hashlib.sha256(
                 json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
@@ -3670,7 +3823,11 @@ def _source_h2d_candidates(
                     add(current_stage, child.get("transport"))
         if any(key in value for key in ("actual_source", "actual_source_telemetry")):
             add(current_stage, value)
-        for key in ("stages", "details", "events", "data", "result"):
+        for key in (
+            "stages", "details", "events", "data", "result", "dispatcher",
+            "dispatcher_telemetry", "dispatcher_control", "transport_telemetry",
+            "actual_source", "actual_source_telemetry", "report", "payload",
+        ):
             child = value.get(key)
             if isinstance(child, Mapping):
                 visit(child, current_stage, depth + 1)
@@ -3703,11 +3860,9 @@ def _load_persisted_e27_raw(session_dir: Path | None) -> Mapping[str, Any] | Non
 
 
 def _project_source_h2d_record(stage: str, record: Mapping[str, Any]) -> dict[str, Any]:
-    actual = record.get("actual_source")
-    if not isinstance(actual, Mapping):
-        actual = record.get("actual_source_telemetry")
-    if not isinstance(actual, Mapping):
-        actual = record
+    containers = _source_h2d_record_containers(record)
+    actual = _source_h2d_actual_source(record, containers)
+    e27_fields = _source_h2d_e27_fields(containers)
 
     source_reads_value = actual.get("source_reads")
     source_reads: Mapping[str, Any] = source_reads_value if isinstance(source_reads_value, Mapping) else {}
@@ -3824,6 +3979,15 @@ def _project_source_h2d_record(stage: str, record: Mapping[str, Any]) -> dict[st
         "stage": stage,
         "role": _source_h2d_first(record, "role") or _source_h2d_first(actual, "role") or _SOURCE_H2D_UNAVAILABLE,
         "evidence_source": "golden_telemetry",
+        **e27_fields,
+        # The human renderer's established compatibility field is the active
+        # arm.  Fall back only to the explicit proof status when an arm was not
+        # persisted; never infer an arm from transport measurements.
+        "mechanism": (
+            raw_value("mechanism", "arm", "execution_arm")
+            if raw_value("mechanism", "arm", "execution_arm") != _SOURCE_H2D_UNAVAILABLE
+            else e27_fields["e27_source_mechanism_status"]
+        ),
         "SOURCE_TOTAL_WALL_MS": metric("SOURCE_TOTAL_WALL_MS"),
         "SOURCE_SYSCALL_UNION_BUSY_MS": metric("SOURCE_SYSCALL_UNION_BUSY_MS"),
         "read_count": _source_h2d_number(read_count),
@@ -4061,6 +4225,25 @@ def build_source_h2d_transport_projection(
         selected = _source_h2d_unavailable(
             reason=reason
         )
+        # Multiple canonical load records make aggregate transport timing
+        # intentionally unavailable, but scalar proof remains safe to expose
+        # when every candidate agrees.  Do not select one stage's evaluator
+        # mapping as the aggregate evidence unless it is byte-for-byte shared.
+        for key in (
+            "e27_source_mechanism_evaluation",
+            "E27_SOURCE_MECHANISM_PROVEN",
+            "e27_source_mechanism_failed_predicates",
+            "e27_source_mechanism_line",
+            "e27_source_mechanism_status",
+            "mechanism",
+        ):
+            values = [projection.get(key) for projection in projections]
+            if (
+                values
+                and all(value != _SOURCE_H2D_UNAVAILABLE for value in values)
+                and all(value == values[0] for value in values[1:])
+            ):
+                selected[key] = values[0]
     selected["stages"] = projections
     selected["stage_count"] = len(projections)
     selected["by_stage"] = by_stage
@@ -4908,6 +5091,23 @@ def _augment_golden_profile(
     sampling_temporal_aligned = bool(profile["sampling_temporal_rows"])
     sampling_additive = _sampling_has_additive_reconciliation(deep)
     sampling_explained = sampling_temporal_aligned or sampling_additive
+    # A deep profile can be a valid decomposition even when its monotonic
+    # clock cannot be mapped onto VizTracer.  Keep that evidence distinct from
+    # ``sampling_explained``: the former suppresses a false whole-parent
+    # unresolved row, while the latter controls whether it may be plotted on
+    # the parent timeline.
+    sampling_decomposed = deep.get("status") in {"available", "ok"}
+    if sampling_decomposed:
+        sampling_decomposed = False
+        for record in deep.get("records", []) if isinstance(deep.get("records"), list) else []:
+            payload = record.get("payload") if isinstance(record, Mapping) else None
+            if isinstance(payload, Mapping) and (
+                isinstance(payload.get("evals"), Mapping)
+                or isinstance(payload.get("timeline_steps"), list)
+                or isinstance(payload.get("reconciliation"), Mapping)
+            ):
+                sampling_decomposed = True
+                break
     lanes = transport.get("timestamp_lanes") if isinstance(transport, Mapping) else None
     lane_types = {
         str(row.get("lane")) for row in lanes
@@ -4962,10 +5162,14 @@ def _augment_golden_profile(
                 str(row.get("lane")) for row in lanes if isinstance(row, Mapping)
             } if isinstance(lanes, list) else set()
             if (
-                stage_data.get("reconciliation_state") == "valid"
-                and {"source", "h2d"}.issubset(lane_types)
+                stage_data.get("status") == "available"
+                and (
+                    stage_data.get("reconciliation_state") == "valid"
+                    or {"source", "h2d"}.issubset(lane_types)
+                )
             ):
                 transport_stages.add(str(stage_name))
+    transport_decomposed = transport_explained or bool(transport_stages)
 
     candidates: list[Mapping[str, Any]] = []
     if isinstance(root, Mapping):
@@ -4980,10 +5184,10 @@ def _augment_golden_profile(
         residual = _sampling_number(node.get("residual_ms", node.get("exclusive_residual_ms")))
         name = str(node.get("name", ""))
         lower_name = name.lower().replace("-", "_").replace("/", "_")
-        sampling_cross = name == "golden_sampling" and sampling_explained
+        sampling_cross = name == "golden_sampling" and sampling_decomposed
         transport_cross = (
             (name in transport_stages)
-            or (transport_explained
+            or (transport_decomposed
             and (
                 "source_h2d_transport" in lower_name
                 or lower_name in {"source_h2d", "source_h2d_transport"}
@@ -5028,7 +5232,7 @@ def _augment_golden_profile(
     # A cross-evidence parent is never itself an unresolved row.  If its own
     # producer reconciliation leaves a material residual, expose that residual
     # explicitly instead of relabeling the whole parent as opaque.
-    if sampling_explained and sampling_residual is not None:
+    if sampling_decomposed and sampling_residual is not None:
         unresolved.append({
             "name": "sampling residual",
             "wall_ms": sampling_residual,
@@ -5039,7 +5243,7 @@ def _augment_golden_profile(
             "reason": "explicit sampling reconciliation residual",
             "classification": "PARTIALLY_DECOMPOSED",
         })
-    if transport_explained and transport_residual is not None and transport_residual > _GOLDEN_PROFILE_THRESHOLD_MS:
+    if transport_decomposed and transport_residual is not None and transport_residual > _GOLDEN_PROFILE_THRESHOLD_MS:
         unresolved.append({
             "name": "transport residual",
             "wall_ms": transport_residual,
@@ -5053,7 +5257,7 @@ def _augment_golden_profile(
     # Cross-evidence is intentionally not folded into VizTracer residuals.  If
     # persisted sampling/E27 data exists but cannot be aligned/reconciled, make
     # that limitation explicit; aligned regions are omitted from unresolved.
-    if deep.get("status") not in {"unavailable", ""} and not sampling_explained:
+    if deep.get("status") not in {"unavailable", ""} and not sampling_decomposed:
         unresolved.append({
             "name": "sampling_window",
             "wall_ms": _sampling_number(deep.get("authoritative_sampling_window_ms")),

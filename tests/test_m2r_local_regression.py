@@ -10,11 +10,13 @@ from typing import Any
 import pytest
 
 from comfymodal_runtime.full_trace_report import generate_full_trace_report
+from comfymodal_runtime.golden_serial import _normalize_e27_evaluator_input
 from comfymodal_runtime.golden_human_report import (
     ClockDomainError,
     render_full_console,
     render_overall_timeline,
     render_stage_artifact,
+    render_transport_mini_gantt,
 )
 
 pytestmark = pytest.mark.fast_unit
@@ -60,7 +62,7 @@ def _load_report(session: Path) -> dict[str, Any]:
     return json.loads((session / "derived" / "report_data.json").read_text(encoding="utf-8"))
 
 
-def _golden_events(*, sampling_duration_us: int = 40_000) -> list[dict[str, Any]]:
+def _golden_events(*, sampling_duration_us: int = 40_000, vae_decode_duration_us: int = 40_000) -> list[dict[str, Any]]:
     names = (
         "golden_restore", "golden_request_setup", "golden_clip_load",
         "golden_clip_forward", "golden_unet_load", "golden_sampler_prepare",
@@ -71,7 +73,9 @@ def _golden_events(*, sampling_duration_us: int = 40_000) -> list[dict[str, Any]
         _x("golden_serial_execute", 0, 1_000_000),
         *[_x(
             name, (index + 1) * 50_000,
-            sampling_duration_us if name == "golden_sampling" else 40_000,
+            sampling_duration_us if name == "golden_sampling" else (
+                vae_decode_duration_us if name == "golden_vae_decode" else 40_000
+            ),
         ) for index, name in enumerate(names)],
     ]
 
@@ -161,6 +165,10 @@ def test_transport_is_load_only_and_ambiguous_identity_is_unavailable(tmp_path: 
     ):
         text = render_stage_artifact(report, title, stage, role=role)
         assert "TRANSPORT (nested)" not in text
+    assert all(
+        row["name"] not in {"golden_clip_load", "golden_unet_load", "golden_vae_load"}
+        for row in report["unresolved_over_50ms"]
+    )
     ambiguous = _load_report(_session(
         tmp_path / "ambiguous", events=_golden_events(),
         runtime_result={"golden_telemetry": {"stages": [
@@ -203,19 +211,19 @@ def test_vae_parent_and_cross_evidence_residual_only_classification(tmp_path: Pa
 
 def test_module_and_vae_decode_node_records_survive_envelope_report(tmp_path: Path):
     report = _load_report(_session(
-        tmp_path, events=_golden_events(),
+        tmp_path, events=_golden_events(vae_decode_duration_us=100_000),
         runtime_result={
             "golden_telemetry": {"stages": [{"name": "golden_clip_forward", "details": {
-                "clip_forward_decomposition": {"module_records": [{
+                "clip_forward_timing": {"decomposition": {"module_records": [{
                     "qualified_name": "clip.encoder.layer.0",
                     "start_monotonic_ns": 1_000_000_000,
                     "end_monotonic_ns": 1_060_000_000,
-                }]},
+                }]}},
             }}]},
             "node_timing_records": [{
                 "node_id": "3", "class_type": "VAEDecode",
-                "start_monotonic_ns": 2_000_000_000,
-                "end_monotonic_ns": 2_060_000_000,
+                "start_monotonic_ns": 510_000_000,
+                "end_monotonic_ns": 570_000_000,
             }],
         },
     ))
@@ -226,6 +234,87 @@ def test_module_and_vae_decode_node_records_survive_envelope_report(tmp_path: Pa
     vae_text = render_stage_artifact(report, "VAE DECODE", "golden_vae_decode", role="vae_decode")
     assert "VAEDecode node row: persisted" in vae_text
     assert "VAEDecode inclusive 60.0ms" in vae_text
+    assert "persisted node timing" in vae_text
+
+
+def test_e27_evaluator_handoff_unwraps_raw_persisted_schema():
+    events = [{"producer_id": 0}]
+    transitions = [{"timestamp_ns": 1, "delta": 1, "depth": 1, "producer_id": 0}]
+    normalized = _normalize_e27_evaluator_input({
+        "execution_arm": "static_e27",
+        "actual_source": {
+            "events": events,
+            "transitions": transitions,
+            "topology_inputs": {"regions": []},
+        },
+    })
+    assert normalized["arm"] == "static_e27"
+    assert normalized["actual_source_events"] == events
+    assert normalized["actual_source_transitions"] == transitions
+
+
+def test_e27_proof_survives_serialized_projection_and_human_summary(tmp_path: Path):
+    evaluator = {
+        "proven": True,
+        "emitted_line": "E27_SOURCE_MECHANISM_PROVEN=YES",
+        "line": "E27_SOURCE_MECHANISM_PROVEN=YES",
+        "E27_SOURCE_MECHANISM_PROVEN": "YES",
+        "predicates": {"arm": True, "coverage_exact": True, "quiescence": True},
+        "failed_predicates": [],
+    }
+    actual = {
+        "arm": "static_e27",
+        "role": "vae",
+        "SOURCE_TOTAL_WALL_MS": 22.0,
+        "h2d_submitted_bytes": 128,
+        "h2d_completed_bytes": 128,
+        "h2d_reconciliation_complete": True,
+        "actual_source_events": [{"producer_id": 0, "start_ns": 100, "end_ns": 200}],
+        "h2d_events": [{"token": 0, "submit_ns": 120, "complete_ns": 180}],
+    }
+    direct = {
+        "name": "golden_vae_load",
+        "role": "vae",
+        "execution_arm": "static_e27",
+        "actual_source": actual,
+        **{
+            "e27_source_mechanism_evaluation": evaluator,
+            "E27_SOURCE_MECHANISM_PROVEN": "YES",
+            "e27_source_mechanism_failed_predicates": [],
+            "e27_source_mechanism_line": "E27_SOURCE_MECHANISM_PROVEN=YES",
+        },
+    }
+    nested = {
+        "name": "golden_vae_load",
+        "role": "vae",
+        "dispatcher": {
+            "actual_source": actual,
+            "e27_source_mechanism_evaluation": evaluator,
+            "E27_SOURCE_MECHANISM_PROVEN": "YES",
+            "e27_source_mechanism_failed_predicates": [],
+            "e27_source_mechanism_line": "E27_SOURCE_MECHANISM_PROVEN=YES",
+        },
+    }
+
+    for index, transport in enumerate((direct, nested)):
+        report = _load_report(_session(
+            tmp_path / str(index),
+            events=_golden_events(),
+            runtime_result={"golden_telemetry": {"stages": [{
+                "name": "golden_vae_load", "details": {"transport_stats": transport},
+            }]}},
+        ))
+        projections = (
+            report["source_h2d_transport"],
+            report["source_h2d_transport"]["by_stage"]["golden_vae_load"],
+        )
+        for projection in projections:
+            assert projection["e27_source_mechanism_evaluation"] == evaluator
+            assert projection["E27_SOURCE_MECHANISM_PROVEN"] == "YES"
+            assert projection["e27_source_mechanism_failed_predicates"] == []
+            assert projection["e27_source_mechanism_line"] == "E27_SOURCE_MECHANISM_PROVEN=YES"
+            assert projection["e27_source_mechanism_status"] == "proven"
+            assert "mechanism measurement_unavailable" not in render_transport_mini_gantt(projection)
 
 
 def test_renderer_contracts_width_point_cross_clock_and_persisted_projection(tmp_path: Path):

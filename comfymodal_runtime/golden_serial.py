@@ -1722,6 +1722,88 @@ def _reconcile_actual_source_h2d(
     return report
 
 
+def _normalize_e27_evaluator_input(value: Any) -> dict[str, Any]:
+    """Present the persisted physical-source schema to the E27 evaluator.
+
+    Golden result envelopes have carried the same raw report in a few
+    equivalent locations (and older envelopes called the raw arrays simply
+    ``events``/``transitions``).  The evaluator intentionally accepts only its
+    strict schema, so normalize the handoff here rather than weakening the
+    mechanism proof or teaching the transport another result shape.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+
+    source = dict(value)
+    seen: set[int] = set()
+
+    def find_raw_source(candidate: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        if id(candidate) in seen:
+            return None
+        seen.add(id(candidate))
+        if any(key in candidate for key in (
+            "actual_source_events", "actual_source_transitions", "topology_inputs",
+        )):
+            return candidate
+        # Prefer an explicitly named nested physical report over generic
+        # envelope events (which may be Golden recorder events).
+        for key in ("actual_source", "actual_source_telemetry", "report", "payload", "data"):
+            child = candidate.get(key)
+            if isinstance(child, Mapping):
+                found = find_raw_source(child)
+                if found is not None:
+                    return found
+        if "events" in candidate or "transitions" in candidate:
+            return candidate
+        return None
+
+    raw_source = find_raw_source(source)
+
+    if raw_source is not None and raw_source is not source:
+        normalized = dict(source)
+        normalized.update(raw_source)
+    else:
+        normalized = dict(source)
+
+    def alias(target: str, *names: str) -> None:
+        if normalized.get(target) is not None:
+            return
+        for name in names:
+            if normalized.get(name) is not None:
+                normalized[target] = normalized[name]
+                return
+
+    # These are raw-evidence aliases, not summary fallbacks.  They preserve
+    # the evaluator's fail-closed validation once the envelope is unwrapped.
+    alias("actual_source_events", "events", "source_events")
+    alias("actual_source_transitions", "transitions", "source_transitions")
+    alias("physical_syscall_provenance", "syscall_provenance", "provenance")
+    alias("quiescence_checkpoints", "quiescence_checkpoint_history")
+    alias("h2d_events", "h2d")
+    alias("arm", "mechanism_arm")
+    if normalized.get("arm") is None and normalized.get("execution_arm") == "static_e27":
+        normalized["arm"] = "static_e27"
+
+    if normalized.get("topology_inputs") is None:
+        topology = normalized.get("topology")
+        if isinstance(topology, Mapping) and all(
+            key in topology for key in (
+                "regions", "expected_ranges", "expected_destination_ranges",
+                "expected_h2d_bytes",
+            )
+        ):
+            normalized["topology_inputs"] = dict(topology)
+
+    # Some result envelopes expose these scalar fields only under the explicit
+    # dispatcher report.  Copy them without interpreting counts or booleans.
+    nested_dispatcher = normalized.get("dispatcher_control")
+    if isinstance(nested_dispatcher, Mapping):
+        for key in ("h2d_reconciliation_complete", "h2d_submitted_bytes", "h2d_completed_bytes"):
+            if normalized.get(key) is None and nested_dispatcher.get(key) is not None:
+                normalized[key] = nested_dispatcher[key]
+    return normalized
+
+
 def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
     source = dict(stats.get("source_open_header_layout") or {})
     staging = dict(stats.get("staging") or {})
@@ -3829,7 +3911,7 @@ def _read_file_qd_gpu_dispatcher(
         # fields have been reconciled. Missing or malformed evidence remains
         # an explicit NO; it is never promoted from a performance observation.
         e27_source_mechanism_evaluation = transport_module.evaluate_e27_source_mechanism(
-            actual_source_report
+            _normalize_e27_evaluator_input(actual_source_report)
         )
         e27_source_mechanism_line = e27_source_mechanism_evaluation["emitted_line"]
         e27_source_mechanism_proven = e27_source_mechanism_evaluation[

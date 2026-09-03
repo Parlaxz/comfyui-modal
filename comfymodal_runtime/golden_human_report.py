@@ -427,20 +427,38 @@ _OVERALL_CANONICAL_STAGES = (
 def _canonical_interval(
     span: Mapping[str, Any], *, root_start: float, wall: float
 ) -> tuple[float, float] | None:
-    """Return an aligned canonical interval without deriving an end time."""
-    start = _number(span.get("start_ms"))
-    end = _number(span.get("end_ms"))
-    if start is None:
-        start_offset = _number(span.get("start_offset_ms"))
-        if start_offset is None or end is None:
+    """Return an aligned canonical interval without deriving an end time.
+
+    ``golden_profile`` contains both absolute VizTracer milliseconds and the
+    already-normalized ``*_offset_ms`` values.  The real adapter can also
+    provide an absolute end alongside a normalized start.  Select the
+    coordinate system from the explicit root window; do not use duration as a
+    substitute for a missing endpoint.
+    """
+    absolute_start = _number(span.get("start_ms"))
+    absolute_end = _number(span.get("end_ms"))
+    offset_start = _number(span.get("start_offset_ms"))
+    offset_end = _number(span.get("end_offset_ms"))
+    if offset_start is not None:
+        start = offset_start
+        if offset_end is not None:
+            end = offset_end
+        elif absolute_end is not None:
+            end = absolute_end - root_start
+        else:
             return None
-        start = start_offset
-        end -= root_start
     else:
-        if end is None:
+        if absolute_start is None or absolute_end is None:
             return None
-        start -= root_start
-        end -= root_start
+        # Prefer the root-relative interpretation only when the pair is
+        # already inside the normalized window.  Otherwise, accept the
+        # absolute VizTracer pair and align it to the root origin.
+        if root_start > 0.0 and root_start <= absolute_start <= root_start + wall and root_start <= absolute_end <= root_start + wall:
+            start, end = absolute_start - root_start, absolute_end - root_start
+        elif 0.0 <= absolute_start <= wall and 0.0 <= absolute_end <= wall:
+            start, end = absolute_start, absolute_end
+        else:
+            return None
     if end < start:
         return None
     raw_start, raw_end = start, end
@@ -804,8 +822,8 @@ def _clip_module_rows(report: Mapping[str, Any]) -> list[tuple[str, float]]:
     return sorted(merged.items(), key=lambda pair: (-pair[1], pair[0]))[:12]
 
 
-def _persisted_node_rows(report: Mapping[str, Any], stage_name: str) -> list[tuple[str, float]]:
-    """Return explicit node timings belonging to a canonical stage."""
+def _persisted_node_rows(report: Mapping[str, Any], stage_name: str) -> list[dict[str, Any]]:
+    """Return explicit, report-axis node timings for a canonical stage."""
     runtime_result = report.get("runtime_result")
     if not isinstance(runtime_result, Mapping):
         return []
@@ -817,19 +835,32 @@ def _persisted_node_rows(report: Mapping[str, Any], stage_name: str) -> list[tup
     }.get(stage_name)
     if expected_class is None:
         return []
-    rows: list[tuple[str, float]] = []
+    rows: list[dict[str, Any]] = []
     for record in records[:128]:
         if not isinstance(record, Mapping):
             continue
         class_type = str(record.get("class_type", record.get("node_class", "")))
         if class_type != expected_class:
             continue
-        duration = _number(record.get("duration_ms"))
-        if duration is None:
-            duration_ns = _number(record.get("duration_ns"))
-            duration = duration_ns / 1_000_000.0 if duration_ns is not None else None
-        if duration is not None and duration >= 0.0:
-            rows.append((class_type, duration))
+        node_id = str(record.get("node_id", record.get("id", "")))
+        start_ms = _number(record.get("start_ms"))
+        end_ms = _number(record.get("end_ms"))
+        if start_ms is None or end_ms is None:
+            start_ns = _number(record.get("start_monotonic_ns", record.get("start_ns")))
+            end_ns = _number(record.get("end_monotonic_ns", record.get("end_ns")))
+            if start_ns is not None and end_ns is not None:
+                start_ms, end_ms = start_ns / 1_000_000.0, end_ns / 1_000_000.0
+        if start_ms is None or end_ms is None or end_ms <= start_ms:
+            continue
+        rows.append({
+            "label": f"{class_type} node {node_id}" if node_id else class_type,
+            "name": class_type,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "duration_ms": end_ms - start_ms,
+            "source": "persisted node timing",
+            "clock_domain": "host_monotonic",
+        })
     return rows
 
 
@@ -857,8 +888,13 @@ def render_stage_gantt(
     source = span.get("source", "VizTracer")
     lines.append(_clock_line(source, clock_domain))
     children = _phase_children_with_labels(span)
-    if children:
-        lines.append(render_mini_gantt(span, children, clock_domain=clock_domain, alignment=alignment))
+    node_rows = _persisted_node_rows(report, stage_name)
+    timeline_children = [*children, *node_rows]
+    if timeline_children:
+        lines.append(render_mini_gantt(
+            span, timeline_children, clock_domain=clock_domain, alignment=alignment,
+            include_subthreshold=True,
+        ))
     elif stage_name == "golden_vae_load":
         _parent_start, _parent_end, wall = _parent_window(span)
         lines.append(f"{title} — {_fmt_ms(wall)} parent")
@@ -895,13 +931,21 @@ def render_stage_gantt(
         if module_rows:
             lines.extend(f"{name} inclusive {_fmt_ms(duration)}" for name, duration in module_rows)
         else:
-            lines.append("module detail unavailable; aggregate forward wall retained")
-    if stage_name == "golden_vae_decode" and not children:
+            module_status = str(
+                report.get("clip_module_records_status")
+                or report.get("runtime_result", {}).get("clip_module_records_status", "producer_absent")
+                if isinstance(report.get("runtime_result"), Mapping)
+                else report.get("clip_module_records_status", "producer_absent")
+            )
+            if module_status == "ingest_failure":
+                lines.append("module detail unavailable; aggregate forward wall retained (ingest failure)")
+            else:
+                lines.append("module detail unavailable; aggregate forward wall retained (producer absent)")
+    if stage_name == "golden_vae_decode" and not children and not node_rows:
         lines.append("opaque-node fallback: VAEDecode node detail unavailable; stage wall retained")
     if stage_name == "golden_vae_decode":
-        node_rows = _persisted_node_rows(report, stage_name)
         lines.append("VAEDecode node row: " + ("persisted" if node_rows else "measurement unavailable"))
-        lines.extend(f"{name} inclusive {_fmt_ms(duration)}" for name, duration in node_rows)
+        lines.extend(f"{row['name']} inclusive {_fmt_ms(row['duration_ms'])}" for row in node_rows)
     if stage_name == "golden_sampler_prepare" and not children:
         lines.append("node rows >50ms unavailable; dependency closure evidence is not a trace span")
     elif stage_name == "golden_sampler_prepare":
