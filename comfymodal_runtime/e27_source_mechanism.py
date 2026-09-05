@@ -6,7 +6,7 @@ import copy
 import math
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 
@@ -50,6 +50,7 @@ class _Call:
     destination_offset: int | None
     enter_ns: int
     sequence: int
+    physical_provenance: str | None
 
 
 @dataclass
@@ -162,21 +163,32 @@ class ActualSourceTelemetry:
             self.expected_ranges = self._ranges(expected_ranges)
             self.expected_destination_ranges = self._ranges(expected_destination_ranges)
 
-    def mark_physical_syscall_provenance(self, marker: str) -> None:
+    def mark_physical_syscall_provenance(
+        self, marker: str, *, allow_change: bool = False
+    ) -> None:
         """Mark events as coming from the physical syscall boundary.
 
         Reader adapters intentionally do not set this marker.  Callers which
         have established that their reader is the real positioned syscall
         path (or a test fixture explicitly standing in for it) must opt in.
+
+        Re-marking the same path is deliberately an O(1) operation: the
+        marker is copied onto events when they are closed, so there is no need
+        to rewrite the event history.  A different marker requires an
+        explicit opt-in and applies only to future events; existing event
+        provenance is never changed.
         """
         if not isinstance(marker, str) or not marker.strip():
             raise ValueError("physical syscall provenance marker must be non-empty")
+        normalized = marker.strip()
         with self._lock:
-            self._physical_provenance = marker.strip()
-            self._events = [
-                replace(event, physical_provenance=self._physical_provenance)
-                for event in self._events
-            ]
+            if normalized == self._physical_provenance:
+                return
+            if self._physical_provenance is not None and not allow_change:
+                raise RuntimeError(
+                    "changing physical syscall provenance requires allow_change=True"
+                )
+            self._physical_provenance = normalized
 
     @property
     def actual_inflight(self) -> int:
@@ -225,7 +237,7 @@ class ActualSourceTelemetry:
             call = _Call(
                 int(producer_id), self._resolve_region(producer_id, source_offset, region_id),
                 int(source_offset), int(requested_bytes), int(retry_number), destination_offset,
-                now, self._sequence,
+                now, self._sequence, self._physical_provenance,
             )
             self._open[id(call)] = call
             self._actual_inflight += 1
@@ -260,7 +272,7 @@ class ActualSourceTelemetry:
                 int(returned_bytes), call.retry_number, returned_bytes < call.requested_bytes,
                 call.enter_ns, now, call.destination_offset,
                 None if error is None else str(error),
-                self._physical_provenance,
+                call.physical_provenance,
             )
             self._events.append(event)
             return event
@@ -420,6 +432,16 @@ class ActualSourceTelemetry:
             for e in events if e.destination_offset is not None and e.returned_bytes
         )
         destination_expected = _interval_union(self.expected_destination_ranges)
+        read_destination_correspondence = True
+        if destination_expected and expected:
+            source_base = expected[0][0]
+            destination_base = destination_expected[0][0]
+            read_destination_correspondence = all(
+                event.destination_offset is not None
+                and event.destination_offset - destination_base
+                == event.source_offset - source_base
+                for event in events
+            )
         if destination_expected:
             destination_gaps = 0
             destination_overlaps = sum(
@@ -449,6 +471,7 @@ class ActualSourceTelemetry:
             "fixed_ownership": fixed_ownership,
             "monotonic_reads": monotonic,
             "coverage_exact": coverage_exact,
+            "read_destination_correspondence": read_destination_correspondence,
             "gaps": gaps,
             "overlaps": overlaps,
             "unexpected_duplicates": duplicates,
@@ -502,6 +525,17 @@ class ActualSourceTelemetry:
                 }
             source_ms = None if source_wall is None else source_wall / 1e6
             final_gpu = h2d_end
+            occupancy_ns = {
+                str(key): occupancy.get(key, 0)
+                for key in range(self.producer_count + 1)
+            }
+            occupancy_ns.update({
+                str(key): value for key, value in occupancy.items()
+                if key > self.producer_count
+            })
+            occupancy_ms = {
+                key: value / 1e6 for key, value in occupancy_ns.items()
+            }
             report = {
                 "arm": self.arm,
                 "producer_count": self.producer_count,
@@ -509,13 +543,28 @@ class ActualSourceTelemetry:
                 "actual_source_events": [event.to_dict() for event in events],
                 "transitions": [transition.to_dict() for transition in transitions],
                 "actual_source_transitions": [transition.to_dict() for transition in transitions],
+                "source_qd_timeline": [transition.to_dict() for transition in transitions],
+                "achieved_source_qd_timeline": [transition.to_dict() for transition in transitions],
                 "physical_syscall_provenance": self._physical_provenance,
                 "actual_source_inflight": self._actual_inflight,
                 "max_actual_source_inflight": self._max_actual_inflight,
                 "SOURCE_TOTAL_WALL_MS": source_ms,
                 "SOURCE_SYSCALL_UNION_BUSY_MS": busy / 1e6,
-                "milliseconds_at_qd": {str(key): occupancy.get(key, 0) / 1e6 for key in range(5)} | {str(key): value / 1e6 for key, value in occupancy.items() if key > 4},
-                "qd_occupancy_ms": {str(key): occupancy.get(key, 0) / 1e6 for key in range(5)} | {str(key): value / 1e6 for key, value in occupancy.items() if key > 4},
+                "source_active_interval_start_ns": source_start,
+                "source_active_interval_end_ns": source_end,
+                "source_active_wall_ns": source_wall,
+                "source_active_wall_ms": source_ms,
+                "source_active_start_ns": source_start,
+                "source_active_end_ns": source_end,
+                "source_active_duration_ns": source_wall,
+                "source_active_duration_ms": source_ms,
+                "source_requested_bytes": sum(event.requested_bytes for event in events),
+                "source_returned_bytes": sum(event.returned_bytes for event in events),
+                "qd_occupancy_ns": occupancy_ns,
+                "qd_occupancy_ms": occupancy_ms,
+                "milliseconds_at_qd": occupancy_ms,
+                "time_at_qd_ns": occupancy_ns,
+                "time_at_qd_ms": occupancy_ms,
                 "time_weighted_mean_qd": (sum(key * value for key, value in occupancy.items()) / source_wall if source_wall else None),
                 "percentage_source_wall_at_qd4": (occupancy.get(4, 0) * 100 / source_wall if source_wall else None),
                 "starvation_gaps": starvation,
@@ -678,9 +727,9 @@ def _checkpoint_history_validation(history: Any) -> dict[str, Any]:
 
 PREDICATES = (
     "arm", "producer_count", "fixed_contiguous_regions", "fixed_ownership", "monotonic_reads",
-    "coverage_exact", "gaps", "overlaps", "unexpected_duplicates", "actual_syscall_qd_telemetry_complete",
+    "coverage_exact", "read_destination_correspondence", "gaps", "overlaps", "unexpected_duplicates", "actual_syscall_qd_telemetry_complete",
     "max_actual_source_inflight", "source_total_wall_present", "qd_occupancy_present",
-    "h2d_reconciliation_complete", "fallback", "poison", "quiescence_checkpoint_history",
+    "h2d_reconciliation_complete", "source_h2d_bytes_reconciled", "fallback", "poison", "quiescence_checkpoint_history",
     "checkpoint_fields", "bind_checkpoint", "source_completion_checkpoint",
     "final_completion_checkpoint", "checkpoint_order", "quiescence", "required_evidence_persisted",
 )
@@ -774,8 +823,10 @@ def _validate_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
         "provenance_ok": False, "max_inflight": 0, "source_wall_ns": None,
         "busy_ns": None, "occupancy": {}, "starvation": [], "gaps": 1,
         "overlaps": 0, "duplicates": 0, "coverage_exact": False,
+        "read_destination_correspondence": False,
         "fixed_contiguous_regions": False, "fixed_ownership": False,
         "monotonic_reads": False,
+        "source_h2d_bytes_reconciled": False,
     }
     try:
         # Only the explicitly persisted raw keys are authoritative.  In
@@ -925,7 +976,14 @@ def _validate_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
         destination_spans = [(e["destination_offset"], e["destination_offset"] + e["returned_bytes"]) for e in clean_events if e["returned_bytes"]]
         source_exact, source_gaps, source_overlaps = _coverage(expected, source_spans)
         destination_exact, destination_gaps, destination_overlaps = _coverage(expected_dest, destination_spans)
-        result["coverage_exact"] = source_exact and destination_exact
+        source_base = _interval_union(expected)[0][0]
+        destination_base = _interval_union(expected_dest)[0][0]
+        result["read_destination_correspondence"] = all(
+            event["destination_offset"] - destination_base
+            == event["source_offset"] - source_base
+            for event in clean_events
+        )
+        result["coverage_exact"] = source_exact and destination_exact and result["read_destination_correspondence"]
         result["gaps"] = source_gaps + destination_gaps
         result["overlaps"] = source_overlaps + destination_overlaps
         identities: set[tuple[int, int, int, int, int]] = set()
@@ -1016,6 +1074,11 @@ def _validate_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
         result["h2d"] = h2d
         result["h2d_submitted"] = submitted
         result["h2d_completed"] = completed
+        source_returned = sum(event["returned_bytes"] for event in clean_events)
+        source_expected = sum(end - start for start, end in _interval_union(expected))
+        result["source_h2d_bytes_reconciled"] = (
+            submitted == completed == source_returned == source_expected
+        )
         result["h2d_wall_ns"] = h2d_end - h2d_start
         result["h2d_ok"] = submitted == expected_h2d
         source_h2d_overlap = _union_ns([
@@ -1070,6 +1133,7 @@ def evaluate_e27_source_mechanism(value: ActualSourceTelemetry | Mapping[str, An
             "fixed_ownership": evidence["fixed_ownership"],
             "monotonic_reads": evidence["monotonic_reads"],
             "coverage_exact": evidence["coverage_exact"],
+            "read_destination_correspondence": evidence["read_destination_correspondence"],
             "gaps": evidence["gaps"] == 0,
             "overlaps": evidence["overlaps"] == 0,
             "unexpected_duplicates": evidence["duplicates"] == 0,
@@ -1078,6 +1142,7 @@ def evaluate_e27_source_mechanism(value: ActualSourceTelemetry | Mapping[str, An
             "source_total_wall_present": source_wall_ok,
             "qd_occupancy_present": qd_ok,
             "h2d_reconciliation_complete": evidence["h2d_ok"],
+            "source_h2d_bytes_reconciled": evidence["source_h2d_bytes_reconciled"],
             "fallback": fallback_ok,
             "poison": poison_ok,
             "quiescence_checkpoint_history": bool(checkpoint_validation.get("history_ok")),

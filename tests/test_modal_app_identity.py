@@ -395,6 +395,19 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
             os.environ[env_name] = "dispatcher"
             self.assertEqual(modal_app._runtime_env()[env_name], "dispatcher")
 
+    def test_runtime_env_projects_all_decoupled_transport_dimensions(self):
+        values = {
+            "COMFYMODAL_GOLDEN_SOURCE_QD": "8",
+            "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "64",
+            "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "32",
+            "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+            "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "3",
+        }
+        with patch.dict(os.environ, values, clear=False):
+            runtime_env = modal_app._runtime_env()
+        for name, value in values.items():
+            self.assertEqual(runtime_env[name], value)
+
     def test_runtime_env_projects_workflow_hash_check_default_on_and_env_zero(self):
         env_name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
         with patch.dict(os.environ, clear=False):

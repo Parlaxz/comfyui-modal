@@ -101,6 +101,15 @@ GOLDEN_STAGE_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
 # QD transport is an explicit experiment selector, deliberately independent
 # from stage diagnostics.  ``legacy`` remains the byte-for-byte control arm.
 GOLDEN_QD_TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
+GOLDEN_DIRECT_BLOCK_BYTES_ENV = "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES"
+GOLDEN_DIRECT_BLOCK_BYTES = {
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+    256 * 1024 * 1024,
+    512 * 1024 * 1024,
+    1024 * 1024 * 1024,
+}
 _GOLDEN_QD_ARM_CONTEXT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "golden_qd_transport_arm", default=None
 )
@@ -118,6 +127,56 @@ ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 
 GOLDEN_QD = 4
 GOLDEN_BLOCK_BYTES = 32 * 1024 * 1024
+DECOUPLED_SOURCE_QD_ENV = "COMFYMODAL_GOLDEN_SOURCE_QD"
+DECOUPLED_SOURCE_BLOCK_BYTES_ENV = "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES"
+DECOUPLED_H2D_COPY_BYTES_ENV = "COMFYMODAL_GOLDEN_H2D_COPY_BYTES"
+DECOUPLED_H2D_DEPTH_ENV = "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH"
+DECOUPLED_SOURCE_CAPACITY_ENV = "COMFYMODAL_GOLDEN_SOURCE_CAPACITY"
+
+
+def _resolve_decoupled_dimension(name: str, fallback: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return int(fallback)
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name.lower()}_invalid") from exc
+    if value < 1:
+        raise ValueError(f"{name.lower()}_must_be_positive")
+    return value
+
+
+def _decoupled_dimension_provenance(name: str, value: int) -> dict[str, Any]:
+    """Describe where one decoupled dimension came from.
+
+    The value is resolved once at the reader boundary.  Keeping the source
+    marker beside the resolved value prevents a report from presenting a
+    profile/default as if it had been observed in the request container.
+    """
+    raw = os.environ.get(name)
+    return {
+        "env": name,
+        "value": int(value),
+        "source": "environment" if raw is not None and raw.strip() else "default",
+    }
+
+
+def resolve_golden_direct_block_bytes(value: Any = None) -> int:
+    raw = os.environ.get(GOLDEN_DIRECT_BLOCK_BYTES_ENV) if value is None else value
+    if raw is None or str(raw).strip() == "":
+        return GOLDEN_BLOCK_BYTES
+    try:
+        block_bytes = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("golden_direct_block_bytes_invalid") from exc
+    if block_bytes not in GOLDEN_DIRECT_BLOCK_BYTES:
+        raise ValueError(f"golden_direct_block_bytes_unsupported:{block_bytes}")
+    return block_bytes
+
+
+def _session_transport_block_bytes(session: Any) -> int:
+    return int(getattr(session, "transport_block_bytes", session.contract.block_bytes))
 
 
 def golden_qd_transport_arm(value: Optional[str] = None) -> str:
@@ -1837,7 +1896,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         source_reads.setdefault("wall_ms", source_wall_ms)
     if "per_read" not in source_reads and experiment.get("source_reads_per_read") is not None:
         source_reads["per_read"] = copy.deepcopy(experiment["source_reads_per_read"])
-    if execution_arm in {"dispatcher", "static_e27"}:
+    if execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         # The dispatcher performs the positioned read directly into the
         # request-owned lease.  There is no separate CPU-to-pinned copy or
         # per-transport pinned allocation in this candidate.
@@ -1904,7 +1963,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
                 "timing_scope": "PARTIAL H2D submit-to-event completion latency",
             }
     lease_wait = dict(stats.get("lease_wait") or {})
-    if not lease_wait and execution_arm in {"dispatcher", "static_e27"}:
+    if not lease_wait and execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         lease_wait = {
             "wait_ns": (
                 int(float(experiment["producer_capacity_block_wall_ms"]) * 1e6)
@@ -1921,7 +1980,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timing_scope": "TOTAL waits to acquire a reusable dispatcher lease",
         }
     ready_backpressure = dict(stats.get("ready_backpressure") or {})
-    if not ready_backpressure and execution_arm in {"dispatcher", "static_e27"}:
+    if not ready_backpressure and execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         ready_backpressure = {
             "wait_ns": (
                 int(float(experiment["ready_queue_block_wall_ms"]) * 1e6)
@@ -1939,7 +1998,7 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timing_scope": "TOTAL producer waits for dispatcher ready-queue capacity",
         }
     qd_occupancy = dict(stats.get("producer_qd_occupancy") or {})
-    if not qd_occupancy and execution_arm in {"dispatcher", "static_e27"}:
+    if not qd_occupancy and execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         qd_occupancy = {
             "target": experiment.get("source_qd_target"),
             "max_depth": (
@@ -1950,13 +2009,13 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "timeline": experiment.get("source_qd_timeline"),
         }
     free_ready_depth = dict(stats.get("free_ready_depth") or {})
-    if not free_ready_depth and execution_arm in {"dispatcher", "static_e27"}:
+    if not free_ready_depth and execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         free_ready_depth = {
             "minimum_free_slots": experiment.get("minimum_free_slots"),
             "ready_queue_depth_at_end": experiment.get("ready_queue_depth"),
         }
     fallback = dict(stats.get("fallback") or {})
-    if not fallback and execution_arm in {"dispatcher", "static_e27"}:
+    if not fallback and execution_arm in {"dispatcher", "static_e27", "decoupled"}:
         fallback = {
             "count": int(experiment.get("fallback_count") or 0),
             "reason": experiment.get("fallback_reason"),
@@ -2016,6 +2075,10 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         "arena_bytes": stats.get("arena_bytes", experiment.get("arena_bytes")),
         "slot_count": stats.get("slot_count", experiment.get("slot_count")),
         "slot_bytes": stats.get("slot_bytes", experiment.get("slot_bytes")),
+        "pinned_arena_physical_allocation_count": stats.get("pinned_arena_physical_allocation_count", experiment.get("pinned_arena_physical_allocation_count")),
+        "pinned_arena_physical_allocation_bytes": stats.get("pinned_arena_physical_allocation_bytes", experiment.get("pinned_arena_physical_allocation_bytes")),
+        "logical_slot_count": stats.get("logical_slot_count", experiment.get("logical_slot_count")),
+        "logical_slot_bytes": stats.get("logical_slot_bytes", experiment.get("logical_slot_bytes")),
         "request_physical_pinned_alloc_count": stats.get(
             "request_physical_pinned_alloc_count",
             experiment.get("request_physical_pinned_alloc_count"),
@@ -2030,6 +2093,11 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "event_object_count": stats.get("event_object_count", experiment.get("event_object_count")),
         "event_rerecord_count": stats.get("event_rerecord_count", experiment.get("event_rerecord_count")),
+        "cuda_h2d_stream_object_count": stats.get("cuda_h2d_stream_object_count", experiment.get("cuda_h2d_stream_object_count")),
+        "cuda_start_event_object_count": stats.get("cuda_start_event_object_count", experiment.get("cuda_start_event_object_count")),
+        "cuda_end_event_object_count": stats.get("cuda_end_event_object_count", experiment.get("cuda_end_event_object_count")),
+        "cuda_event_rerecord_count": stats.get("cuda_event_rerecord_count", experiment.get("cuda_event_rerecord_count")),
+        "fresh_cuda_event_per_copy_count": stats.get("fresh_cuda_event_per_copy_count", experiment.get("fresh_cuda_event_per_copy_count")),
         "h2d_submit_count": stats.get("h2d_submit_count", experiment.get("h2d_submit_count")),
         "h2d_completion_count": stats.get(
             "h2d_completion_count", experiment.get("h2d_completion_count")
@@ -2041,8 +2109,51 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS",
             experiment.get("GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS"),
         ),
+        "h2d_target_bytes": stats.get("h2d_target_bytes", experiment.get("h2d_target_bytes")),
+        "h2d_submission_sizes": copy.deepcopy(
+            stats.get("h2d_submission_sizes", experiment.get("h2d_submission_sizes"))
+        ),
+        "h2d_submission_size_distribution": copy.deepcopy(
+            stats.get(
+                "h2d_submission_size_distribution",
+                experiment.get("h2d_submission_size_distribution"),
+            )
+        ),
+        "H2D_SUBMISSION_SIZES": copy.deepcopy(
+            stats.get("H2D_SUBMISSION_SIZES", experiment.get("H2D_SUBMISSION_SIZES"))
+        ),
+        "h2d_min_submission_bytes": stats.get("h2d_min_submission_bytes", experiment.get("h2d_min_submission_bytes")),
+        "h2d_max_submission_bytes": stats.get("h2d_max_submission_bytes", experiment.get("h2d_max_submission_bytes")),
+        "h2d_mean_submission_bytes": stats.get("h2d_mean_submission_bytes", experiment.get("h2d_mean_submission_bytes")),
+        "h2d_submission_count": stats.get(
+            "h2d_submission_count",
+            experiment.get("h2d_submission_count", stats.get("h2d_submitted_count")),
+        ),
+        "H2D_SUBMISSION_COUNT": stats.get(
+            "H2D_SUBMISSION_COUNT", experiment.get("H2D_SUBMISSION_COUNT")
+        ),
+        "H2D_SUBMISSIONS": stats.get(
+            "H2D_SUBMISSIONS", experiment.get("H2D_SUBMISSIONS")
+        ),
+        "aggregated_submission_count": stats.get("aggregated_submission_count", experiment.get("aggregated_submission_count")),
+        "non_aggregated_submission_count": stats.get("non_aggregated_submission_count", experiment.get("non_aggregated_submission_count")),
+        "tail_submission_count": stats.get("tail_submission_count", experiment.get("tail_submission_count")),
+        "aggregation_fallback_count": stats.get("aggregation_fallback_count", experiment.get("aggregation_fallback_count")),
+        "aggregation_fallback_reasons": copy.deepcopy(stats.get("aggregation_fallback_reasons", experiment.get("aggregation_fallback_reasons"))),
+        "source_block_count": stats.get("source_block_count", experiment.get("source_block_count")),
+        "source_block_bytes": stats.get("source_block_bytes", experiment.get("source_block_bytes")),
         "GPU_COPY_COUNT": stats.get("GPU_COPY_COUNT", experiment.get("GPU_COPY_COUNT")),
         "GPU_COPY_BYTES": stats.get("GPU_COPY_BYTES", experiment.get("GPU_COPY_BYTES")),
+        "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP": stats.get(
+            "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP",
+            experiment.get("GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP"),
+        ),
+        "GPU_COPY_TIMING_AVAILABLE": stats.get(
+            "GPU_COPY_TIMING_AVAILABLE", experiment.get("GPU_COPY_TIMING_AVAILABLE")
+        ),
+        "GPU_COPY_ACTIVE_UNION_PROOF": stats.get(
+            "GPU_COPY_ACTIVE_UNION_PROOF", experiment.get("GPU_COPY_ACTIVE_UNION_PROOF")
+        ),
         "source_reads": source_reads,
         "source_read_wall_ns": source_wall_ns,
         "source_read_wall_ms": source_wall_ms,
@@ -2077,6 +2188,12 @@ def build_qd_transport_diagnostics(stats: Mapping[str, Any]) -> dict[str, Any]:
             copy.deepcopy(actual_source.get("actual_source_transitions"))
             if actual_source is not None else None
         ),
+        "pipeline_telemetry": copy.deepcopy(stats.get("pipeline_telemetry")),
+        "h2d_events": copy.deepcopy(stats.get("h2d_events")),
+        "source_base": stats.get("source_base"),
+        "destination_base": stats.get("destination_base"),
+        "decoupled_dimensions": copy.deepcopy(stats.get("decoupled_dimensions")),
+        "decoupled_dimension_provenance": stats.get("decoupled_dimension_provenance"),
         "e27_source_mechanism_evaluation": copy.deepcopy(
             e27_source_mechanism_evaluation
         ),
@@ -3481,16 +3598,15 @@ def _read_file_qd_gpu_dispatcher(
     selected = transport_module.normalize_transport_arm(transport_arm)
     if resources is not None:
         # The request-resource candidate is deliberately not an environment
-        # arm: it is fixed E27 transport with one request-owned arena.
+        # arm: it is fixed-dimension E27 transport with one request-owned arena.
         selected = "static_e27"
-        qd = 4
-        block_bytes = transport_module.DEFAULT_BLOCK_BYTES
+        block_bytes = resources.slot_bytes
     if selected not in ("dispatcher", "static_e27"):
         raise RuntimeError(f"unexpected_qd_transport_arm:{selected}")
     qd = max(1, min(32, int(qd)))
     block_bytes = max(1, int(block_bytes))
-    if selected == "static_e27" and (qd != 4 or block_bytes != 32 * 1024 * 1024):
-        raise RuntimeError("static_e27_requires_qd4_32m")
+    if selected == "static_e27" and qd not in (1, 2, 4, 8):
+        raise RuntimeError("static_e27_qd_must_be_2_4_or_8")
     diagnostics_enabled = stage_diagnostics_enabled() if diagnostics is None else bool(diagnostics)
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_unavailable")
@@ -3598,6 +3714,8 @@ def _read_file_qd_gpu_dispatcher(
             ready_queue_capacity=staging_slots,
             producer_workers=qd,
             capacity_class=f"qd{qd}-{block_bytes}",
+            h2d_target_bytes=block_bytes,
+            aggregation_enabled=False,
         )
         dispatcher = transport_module.create_transport(
             selected, config=config, backend=backend,
@@ -3610,10 +3728,7 @@ def _read_file_qd_gpu_dispatcher(
         )
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
 
-        source_telemetry = _SourceTelemetry(
-            4 if selected == "static_e27" else qd,
-            enabled=diagnostics_enabled,
-        )
+        source_telemetry = _SourceTelemetry(qd, enabled=diagnostics_enabled)
         actual_source_telemetry = None
 
         class _PositionedSource:
@@ -3631,7 +3746,7 @@ def _read_file_qd_gpu_dispatcher(
                 self.actual_source_telemetry = None
 
             def _fd_for_producer(self, producer_id: int) -> int:
-                producer_limit = 4 if selected == "static_e27" else qd
+                producer_limit = qd
                 if not isinstance(producer_id, int) or not 0 <= producer_id < producer_limit:
                     raise RuntimeError(f"invalid_producer_id:{producer_id!r}")
                 with self._lock:
@@ -3713,7 +3828,7 @@ def _read_file_qd_gpu_dispatcher(
             source_start = source_ranges[0].source_offset if source_ranges else 0
             actual_source_telemetry = transport_module.ActualSourceTelemetry(
                 arm=selected,
-                producer_count=4,
+                producer_count=qd,
                 regions=tuple(
                     {
                         "producer_id": producer_id,
@@ -3859,6 +3974,19 @@ def _read_file_qd_gpu_dispatcher(
             "source_read_bytes": source_bytes,
             "h2d_submitted_bytes": int(result.submitted_bytes),
             "h2d_completed_bytes": h2d_bytes,
+            "h2d_submission_count": int(telemetry.get("h2d_submitted_count") or 0),
+            "GPU_COPY_ACTIVE_SUM_MS": telemetry.get("GPU_COPY_ACTIVE_SUM_MS"),
+            "GPU_COPY_STREAM_SPAN_MS": telemetry.get("GPU_COPY_STREAM_SPAN_MS"),
+            "GPU_COPY_ACTIVE_UNION_MS": telemetry.get("GPU_COPY_ACTIVE_UNION_MS"),
+            "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": telemetry.get("GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS"),
+            "GPU_COPY_COUNT": telemetry.get("GPU_COPY_COUNT"),
+            "GPU_COPY_BYTES": telemetry.get("GPU_COPY_BYTES"),
+            "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP": telemetry.get(
+                "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP"
+            ),
+            "GPU_COPY_ACTIVE_UNION_PROOF": telemetry.get(
+                "GPU_COPY_ACTIVE_UNION_PROOF"
+            ),
         }
         dispatcher_stats = {
             **telemetry,
@@ -3945,6 +4073,45 @@ def _read_file_qd_gpu_dispatcher(
             "planned_block_count": planned_count,
             "submitted_block_count": len(records),
             "completed_block_count": len(records),
+            "source_block_count": int(telemetry.get("source_block_count") or planned_count),
+            "source_block_bytes": int(telemetry.get("source_block_bytes") or block_bytes),
+            "h2d_target_bytes": telemetry.get("h2d_target_bytes"),
+            "aggregation_enabled": telemetry.get("aggregation_enabled"),
+            "aggregation_wait_count": int(telemetry.get("aggregation_wait_count") or 0),
+            "aggregation_scheduler_enter_count": int(
+                telemetry.get("aggregation_scheduler_enter_count") or 0
+            ),
+            "h2d_submission_sizes": copy.deepcopy(
+                telemetry.get("h2d_submission_sizes")
+            ),
+            "h2d_submission_size_distribution": copy.deepcopy(
+                telemetry.get("h2d_submission_size_distribution")
+            ),
+            "H2D_SUBMISSION_SIZES": copy.deepcopy(
+                telemetry.get("H2D_SUBMISSION_SIZES")
+            ),
+            "h2d_min_submission_bytes": telemetry.get("h2d_min_submission_bytes"),
+            "h2d_max_submission_bytes": telemetry.get("h2d_max_submission_bytes"),
+            "h2d_mean_submission_bytes": telemetry.get("h2d_mean_submission_bytes"),
+            "h2d_submission_count": int(
+                telemetry.get("h2d_submission_count", telemetry.get("h2d_submitted_count")) or 0
+            ),
+            "H2D_SUBMISSION_COUNT": int(
+                telemetry.get("H2D_SUBMISSION_COUNT", telemetry.get("h2d_submitted_count")) or 0
+            ),
+            "H2D_SUBMISSIONS": int(
+                telemetry.get("H2D_SUBMISSIONS", telemetry.get("h2d_submitted_count")) or 0
+            ),
+            "aggregated_submission_count": int(telemetry.get("aggregated_submission_count") or 0),
+            "non_aggregated_submission_count": int(telemetry.get("non_aggregated_submission_count") or 0),
+            "tail_submission_count": int(telemetry.get("tail_submission_count") or 0),
+            "aggregation_fallback_count": int(telemetry.get("aggregation_fallback_count") or 0),
+            "aggregation_fallback_reasons": copy.deepcopy(telemetry.get("aggregation_fallback_reasons") or {}),
+            "AGGREGATION_ENABLED": telemetry.get("AGGREGATION_ENABLED"),
+            "AGGREGATION_WAIT_COUNT": int(telemetry.get("AGGREGATION_WAIT_COUNT") or 0),
+            "AGGREGATION_SCHEDULER_ENTER_COUNT": int(
+                telemetry.get("AGGREGATION_SCHEDULER_ENTER_COUNT") or 0
+            ),
             "bytes_read": source_bytes,
             "source_read_count": source_read_count,
             "source_read_bytes": source_bytes,
@@ -3969,6 +4136,15 @@ def _read_file_qd_gpu_dispatcher(
             "pinned_bytes": staging_slots * block_bytes,
             "gpu_bytes": total,
             "request_transport_resource": resources.telemetry() if resources is not None else None,
+            "cuda_h2d_stream_object_count": telemetry.get("cuda_h2d_stream_object_count"),
+            "cuda_start_event_object_count": telemetry.get("cuda_start_event_object_count"),
+            "cuda_end_event_object_count": telemetry.get("cuda_end_event_object_count"),
+            "cuda_event_rerecord_count": telemetry.get("cuda_event_rerecord_count"),
+            "fresh_cuda_event_per_copy_count": telemetry.get("fresh_cuda_event_per_copy_count"),
+            "pinned_arena_physical_allocation_count": telemetry.get("pinned_arena_physical_allocation_count"),
+            "pinned_arena_physical_allocation_bytes": telemetry.get("pinned_arena_physical_allocation_bytes"),
+            "logical_slot_count": telemetry.get("logical_slot_count"),
+            "logical_slot_bytes": telemetry.get("logical_slot_bytes"),
             "buffer_pool_wait_ms": telemetry.get("producer_capacity_block_wall_ms"),
             "source_open_header_layout": (
                 {
@@ -4051,8 +4227,9 @@ def _read_file_qd_gpu_dispatcher(
             } if diagnostics_enabled else {},
             "h2d_gpu_event": {
                 "duration_ns": (
-                    int(float(telemetry.get("GPU_COPY_ACTIVE_SUM_MS") or 0) * 1e6)
-                    if resources is not None else None
+                    int(float(telemetry["GPU_COPY_ACTIVE_SUM_MS"]) * 1e6)
+                    if resources is not None
+                    and telemetry.get("GPU_COPY_ACTIVE_SUM_MS") is not None else None
                 ),
                 "duration_ms": telemetry.get("GPU_COPY_ACTIVE_SUM_MS") if resources is not None else None,
                 "copy_count": int(telemetry.get("h2d_completed_count") or 0),
@@ -4061,6 +4238,12 @@ def _read_file_qd_gpu_dispatcher(
                 "GPU_COPY_STREAM_SPAN_MS": telemetry.get("GPU_COPY_STREAM_SPAN_MS") if resources is not None else None,
                 "GPU_COPY_ACTIVE_UNION_MS": telemetry.get("GPU_COPY_ACTIVE_UNION_MS") if resources is not None else None,
                 "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": telemetry.get("GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS") if resources is not None else None,
+                "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP": telemetry.get(
+                    "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP"
+                ) if resources is not None else None,
+                "GPU_COPY_ACTIVE_UNION_PROOF": telemetry.get(
+                    "GPU_COPY_ACTIVE_UNION_PROOF"
+                ) if resources is not None else None,
                 "scope": "CUDA event copy-active duration on request H2D stream",
                 "non_additive": True,
             } if diagnostics_enabled else {},
@@ -4189,6 +4372,292 @@ def _read_file_qd_gpu_dispatcher(
             # Preserve a retriable source handle after a close failure.
             wrapped.retained_transport = exc.retained_transport
         raise wrapped from exc
+
+
+def _read_file_preplanned_gpu(
+    path: str,
+    *,
+    role: str,
+    device: Optional[str],
+    source_qd: int,
+    source_block_bytes: int,
+    h2d_copy_bytes: int,
+    h2d_inflight_depth: int,
+    source_capacity: int,
+    diagnostics: Optional[bool],
+) -> dict:
+    """Read preplanned source blocks into independent reusable H2D extents."""
+    transport_module = importlib.import_module("comfymodal_runtime.golden_qd_transport")
+    diagnostics_enabled = stage_diagnostics_enabled() if diagnostics is None else bool(diagnostics)
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_unavailable")
+    parsed = parse_safetensors_header(path)
+    if parsed.get("status") != "ok":
+        raise RuntimeError(f"header_invalid:{parsed.get('reason')}")
+    header = parsed["header"]
+    data_start = int(parsed["data_start"])
+    total = int(parsed["total_data_bytes"])
+    extents = transport_module.plan_preplanned_extents(
+        total,
+        int(source_block_bytes),
+        int(h2d_copy_bytes),
+        source_offset=data_start,
+    )
+    coverage_ok, coverage_reason = transport_module.validate_preplanned_extents(
+        extents,
+        total,
+        source_offset=data_start,
+        destination_offset=0,
+    )
+    if not coverage_ok:
+        raise RuntimeError(f"preplanned_coverage:{coverage_reason}")
+    dev = device or f"cuda:{torch.cuda.current_device()}"
+    gpu_buf = torch.empty(total, dtype=torch.uint8, device=dev)
+    extent_arena = torch.empty(
+        max(1, int(h2d_inflight_depth)) * int(h2d_copy_bytes),
+        dtype=torch.uint8,
+        pin_memory=True,
+    )
+    extent_buffers = tuple(
+        extent_arena[index * h2d_copy_bytes : (index + 1) * h2d_copy_bytes]
+        for index in range(max(1, int(h2d_inflight_depth)))
+    )
+    stream = torch.cuda.Stream(device=dev)
+    events = tuple(
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in extent_buffers
+    )
+    submit_index = 0
+
+    class _Backend:
+        destination = gpu_buf
+
+        def submit_h2d(self, source: Any, destination_offset: int) -> Any:
+            nonlocal submit_index
+            event_index = submit_index % len(events)
+            submit_index += 1
+            start, end = events[event_index]
+            if not isinstance(source, torch.Tensor):
+                source = torch.frombuffer(source, dtype=torch.uint8)
+            with torch.cuda.stream(stream):
+                start.record(stream)
+                gpu_buf[destination_offset : destination_offset + source.numel()].copy_(
+                    source, non_blocking=True
+                )
+                end.record(stream)
+            return event_index, end
+
+        def poll_event(self, event: Any) -> Any:
+            _index, end = event
+            return "complete" if bool(end.query()) else "pending"
+
+    backend = _Backend()
+    actual_source = transport_module.ActualSourceTelemetry(
+        arm="decoupled",
+        producer_count=source_qd,
+        expected_ranges=((data_start, data_start + total),) if total else (),
+        expected_destination_ranges=((0, total),) if total else (),
+        expected_h2d_bytes=total,
+    )
+
+    class _PositionedSource:
+        handles_actual_source_telemetry = True
+
+        def __init__(self) -> None:
+            self._fds: dict[int, int] = {}
+            self._lock = threading.Lock()
+            self.actual_source_telemetry = actual_source
+            self.open_count = 0
+
+        def _fd_for(self, producer_id: int) -> int:
+            with self._lock:
+                fd = self._fds.get(producer_id)
+                if fd is None:
+                    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                    self._fds[producer_id] = fd
+                    self.open_count += 1
+                return fd
+
+        def readinto(self, target: Any, offset: int, producer_id: int | None = None) -> int:
+            if producer_id is None:
+                raise RuntimeError("producer_id_required")
+            return int(_read_at(
+                self._fd_for(producer_id),
+                _writable_bytes_view(target),
+                int(offset),
+                actual_source=actual_source,
+                producer_id=producer_id,
+                destination_offset=int(offset) - data_start,
+            ))
+
+        def close(self) -> None:
+            with self._lock:
+                fds = tuple(self._fds.values())
+                self._fds.clear()
+            for fd in fds:
+                os.close(fd)
+
+    source = _PositionedSource()
+    pipeline = transport_module.PreplannedExtentTransport(
+        source_qd=source_qd,
+        source_block_bytes=source_block_bytes,
+        h2d_copy_bytes=h2d_copy_bytes,
+        h2d_inflight_depth=h2d_inflight_depth,
+        source_capacity=source_capacity,
+        buffers=extent_buffers,
+        diagnostics=diagnostics_enabled,
+        metadata={
+            "provider": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+            "region": os.environ.get("MODAL_REGION", ""),
+            "pinned_arena_bytes": int(extent_arena.numel()),
+            "pinned_arena_physical_allocation_count": 1,
+            "dedicated_h2d_stream_count": 1,
+            "reusable_event_pair_count": len(events),
+        },
+    )
+    try:
+        result = pipeline.execute(
+            extents,
+            source,
+            backend,
+            total_bytes=total,
+            materialize_output=False,
+            h2d_observer=actual_source,
+            source_offset=data_start,
+            destination_offset=0,
+        )
+    finally:
+        source.close()
+    actual_report = actual_source.report()
+    pipeline_report = dict(result["telemetry"])
+    # Keep the two evidence planes explicit.  ``actual_source`` contains the
+    # positioned syscall records and the observer's host-visible H2D submit /
+    # completion records; ``pipeline`` contains scheduling/backpressure
+    # measurements.  Neither plane is inferred from the other's counters.
+    pipeline_report["telemetry_scope"] = "preplanned_pipeline"
+    pipeline_report["h2d_completion_observation"] = "host_event_query"
+    pipeline_report["physical_reads"] = actual_report.get("actual_source_events", [])
+    pipeline_report["source_read_count"] = len(actual_source.events)
+    pipeline_report["source_read_bytes"] = sum(event.returned_bytes for event in actual_source.events)
+    tensor_map = build_header_tensor_map(header)
+    views = {
+        key: make_zero_copy_view(gpu_buf, _TORCH_DTYPE[dtype_str], shape, rel_start, length)
+        for key, dtype_str, shape, rel_start, length in tensor_map
+    }
+    stats = {
+        "kind": "golden_preplanned_extent_read",
+        "role": str(role),
+        "status": "ok",
+        "execution_arm": "decoupled",
+        "configured_qd": source_qd,
+        "source_qd": source_qd,
+        "source_block_bytes": source_block_bytes,
+        "h2d_copy_bytes": h2d_copy_bytes,
+        "h2d_inflight_depth": h2d_inflight_depth,
+        "source_capacity": source_capacity,
+        "source_base": data_start,
+        "destination_base": 0,
+        "decoupled_dimensions": {
+            "source_qd": _decoupled_dimension_provenance(DECOUPLED_SOURCE_QD_ENV, source_qd),
+            "source_block_bytes": _decoupled_dimension_provenance(
+                DECOUPLED_SOURCE_BLOCK_BYTES_ENV, source_block_bytes
+            ),
+            "h2d_copy_bytes": _decoupled_dimension_provenance(
+                DECOUPLED_H2D_COPY_BYTES_ENV, h2d_copy_bytes
+            ),
+            "h2d_inflight_depth": _decoupled_dimension_provenance(
+                DECOUPLED_H2D_DEPTH_ENV, h2d_inflight_depth
+            ),
+            "source_capacity": _decoupled_dimension_provenance(
+                DECOUPLED_SOURCE_CAPACITY_ENV, source_capacity
+            ),
+        },
+        "decoupled_dimension_provenance": "runtime_environment_or_reader_defaults",
+        "file_bytes": total,
+        "source_bytes": pipeline_report["source_read_bytes"],
+        "source_read_count": pipeline_report["source_read_count"],
+        "bytes_read": pipeline_report["source_read_bytes"],
+        "physical_read_provenance": actual_report.get("physical_syscall_provenance"),
+        "physical_syscall_provenance": actual_report.get("physical_syscall_provenance"),
+        "source_active_interval_start_ns": pipeline_report.get("source_active_interval_start_ns"),
+        "source_active_interval_end_ns": pipeline_report.get("source_active_interval_end_ns"),
+        "source_active_wall_ns": pipeline_report.get("source_active_wall_ns"),
+        "source_active_wall_ms": pipeline_report.get("source_active_wall_ms"),
+        "source_active_start_ns": pipeline_report.get("source_active_start_ns"),
+        "source_active_end_ns": pipeline_report.get("source_active_end_ns"),
+        "source_active_duration_ns": pipeline_report.get("source_active_duration_ns"),
+        "source_active_duration_ms": pipeline_report.get("source_active_duration_ms"),
+        "active_source_interval_start_ns": pipeline_report.get("active_source_interval_start_ns"),
+        "active_source_interval_end_ns": pipeline_report.get("active_source_interval_end_ns"),
+        "active_source_wall_ns": pipeline_report.get("active_source_wall_ns"),
+        "active_source_wall_ms": pipeline_report.get("active_source_wall_ms"),
+        "source_qd_integral_ns": pipeline_report.get("source_qd_integral_ns"),
+        "qd_occupancy_ns": pipeline_report.get("qd_occupancy_ns"),
+        "qd_occupancy_ms": pipeline_report.get("qd_occupancy_ms"),
+        "time_at_qd_ns": pipeline_report.get("time_at_qd_ns"),
+        "time_at_qd_ms": pipeline_report.get("time_at_qd_ms"),
+        "source_worker_timing": pipeline_report.get("source_worker_timing"),
+        "source_worker_busy_ns": pipeline_report.get("source_worker_busy_ns"),
+        "source_worker_busy_ms": pipeline_report.get("source_worker_busy_ms"),
+        "h2d_submitted_bytes": actual_report.get("h2d_submitted_bytes"),
+        "h2d_completed_bytes": actual_report.get("h2d_completed_bytes"),
+        "h2d_submission_count": len(actual_report.get("h2d_events", [])),
+        "h2d_completion_count": sum(
+            event.get("complete_ns") is not None
+            for event in actual_report.get("h2d_events", [])
+        ),
+        "h2d_copy_count": pipeline_report["h2d_copy_count"],
+        "h2d_submission_sizes": [extent.length for extent in extents],
+        "planned_block_count": sum(len(extent.reads) for extent in extents),
+        "extent_count": len(extents),
+        "post_hoc_aggregation": False,
+        "preplanned_extents": pipeline_report["preplanned_extents"],
+        "actual_source": actual_report,
+        "actual_source_telemetry": actual_report,
+        "pipeline_telemetry": pipeline_report,
+        "h2d_events": actual_report.get("h2d_events", []),
+        "h2d_submit_count": len(actual_report.get("h2d_events", [])),
+        "SOURCE_TOTAL_WALL_MS": actual_report.get("SOURCE_TOTAL_WALL_MS"),
+        "SOURCE_SYSCALL_UNION_BUSY_MS": actual_report.get("SOURCE_SYSCALL_UNION_BUSY_MS"),
+        "SOURCE_TO_GPU_READY_MS": actual_report.get("SOURCE_TO_GPU_READY_MS"),
+        "H2D_TOTAL_WALL_MS": actual_report.get("H2D_TOTAL_WALL_MS"),
+        "SOURCE_H2D_OVERLAP_MS": actual_report.get("SOURCE_H2D_OVERLAP_MS"),
+        "source_capacity_wait_ms": pipeline_report["source_capacity_wait_ms"],
+        "source_capacity_wait_count": pipeline_report["source_capacity_wait_count"],
+        "ready_queue_wait_ms": pipeline_report["ready_queue_wait_ms"],
+        "ready_queue_wait_count": pipeline_report["ready_queue_wait_count"],
+        "h2d_capacity_wait_ms": pipeline_report["h2d_capacity_wait_ms"],
+        "h2d_capacity_wait_count": pipeline_report["h2d_capacity_wait_count"],
+        "achieved_source_qd_max": pipeline_report["achieved_source_qd_max"],
+        "achieved_source_qd_mean": pipeline_report["achieved_source_qd_mean"],
+        "achieved_h2d_inflight_depth_max": pipeline_report["achieved_h2d_inflight_depth_max"],
+        "source_reads": pipeline_report,
+        "pinned_bytes": int(extent_arena.numel()),
+        "gpu_bytes": total,
+        "fallback": {"count": 0, "reason": None},
+        "coverage": {"ok": coverage_ok, "reason": coverage_reason},
+        "record_reconciliation": {"ok": True, "reason": "preplanned_exact"},
+        "h2d_reconciliation": {
+            "ok": bool(actual_report.get("h2d_reconciliation_complete")),
+            "submitted_bytes": actual_report.get("h2d_submitted_bytes"),
+            "completed_bytes": actual_report.get("h2d_completed_bytes"),
+            "completion_observation": "host_event_query",
+        },
+        "quiescence": {
+            "workers_joined": True,
+            "h2d_events_waited": True,
+            "copies_complete": bool(actual_report.get("h2d_reconciliation_complete")),
+            "operation_live": False,
+        },
+        "diagnostics": {
+            "status": "OBSERVED",
+            "optional_timing_diagnostics": "OBSERVED" if diagnostics_enabled else "NOT RUN",
+            "source_telemetry": "actual_source_telemetry",
+            "pipeline_telemetry": "pipeline_telemetry",
+            "h2d_completion_observation": "host_event_query",
+        },
+    }
+    return {"status": "ok", "sd": views, "owner": GoldenQDOwner(gpu_buf, list(extent_buffers), dev, role), "stats": stats, "tensor_map": tensor_map, "header_metadata": header.get("__metadata__")}
 def read_file_qd_gpu(
     path: str,
     *,
@@ -4215,6 +4684,31 @@ def read_file_qd_gpu(
     selected_transport_arm = golden_qd_transport_arm(transport_arm)
     if transport_resources is not None:
         selected_transport_arm = "static_e27"
+    if selected_transport_arm == "decoupled":
+        source_qd = _resolve_decoupled_dimension(DECOUPLED_SOURCE_QD_ENV, qd)
+        source_block_bytes = _resolve_decoupled_dimension(
+            DECOUPLED_SOURCE_BLOCK_BYTES_ENV, block_bytes
+        )
+        h2d_copy_bytes = _resolve_decoupled_dimension(
+            DECOUPLED_H2D_COPY_BYTES_ENV, block_bytes
+        )
+        h2d_inflight_depth = _resolve_decoupled_dimension(
+            DECOUPLED_H2D_DEPTH_ENV, qd
+        )
+        source_capacity = _resolve_decoupled_dimension(
+            DECOUPLED_SOURCE_CAPACITY_ENV, h2d_inflight_depth
+        )
+        return _read_file_preplanned_gpu(
+            path,
+            role=role,
+            device=device,
+            source_qd=source_qd,
+            source_block_bytes=source_block_bytes,
+            h2d_copy_bytes=h2d_copy_bytes,
+            h2d_inflight_depth=h2d_inflight_depth,
+            source_capacity=source_capacity,
+            diagnostics=diagnostics,
+        )
     if selected_transport_arm in ("dispatcher", "static_e27"):
         adapter_kwargs = dict(
             role=role,
@@ -5136,6 +5630,7 @@ class GoldenSession:
         # Capture the transport arm in request evidence.  Missing external
         # bookkeeping does not gate execution; an invalid runtime selector does.
         self.qd_transport_arm = golden_qd_transport_arm()
+        self.transport_block_bytes = resolve_golden_direct_block_bytes()
         self.clip_residency = resolve_clip_residency(request.clip_residency)
         # Snapshot the authoritative identity at request construction so a
         # caller cannot mutate extra_data between setup and CLIP load.
@@ -5239,6 +5734,8 @@ class GoldenSession:
             "attention_backend": request.attention_backend,
             "attention_backend_configured": request.attention_backend or "auto",
             "qd_transport_arm": self.qd_transport_arm,
+            "transport_block_bytes": self.transport_block_bytes,
+            "transport_staging_slots": 8,
             "clip_residency": self.clip_residency,
             "clip_residency_requested": self.clip_residency,
             "clip_residency_effective": self.clip_residency,
@@ -5271,7 +5768,10 @@ class GoldenSession:
             transport_module = importlib.import_module(
                 "comfymodal_runtime.golden_qd_transport"
             )
-            self.transport_resources = transport_module.GoldenTransferResources.create()
+            self.transport_resources = transport_module.GoldenTransferResources.create(
+                slot_count=8,
+                slot_bytes=self.transport_block_bytes,
+            )
             resource_telemetry = self.transport_resources.telemetry()
             self.recorder.event(
                 "golden_transfer_resources_created", **resource_telemetry
@@ -8222,7 +8722,7 @@ async def golden_clip_load(session: GoldenSession) -> Any:
                         path,
                         role=role,
                         qd=contract.qd,
-                        block_bytes=contract.block_bytes,
+                        block_bytes=_session_transport_block_bytes(session),
                         **_transport_read_options(session),
                     )
             transports.append(transport)
@@ -9712,7 +10212,7 @@ async def golden_unet_load(session: GoldenSession) -> Any:
                     unet_path,
                     role="unet",
                     qd=contract.qd,
-                    block_bytes=contract.block_bytes,
+                    block_bytes=_session_transport_block_bytes(session),
                     **_transport_read_options(session),
                 )
         views = {
@@ -10366,7 +10866,7 @@ async def golden_vae_load(session: GoldenSession) -> Any:
                 session.model_paths["vae"],
                 role="vae",
                 qd=contract.qd,
-                block_bytes=contract.block_bytes,
+                block_bytes=_session_transport_block_bytes(session),
                 **_transport_read_options(session),
             )
         transport_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
@@ -11537,6 +12037,11 @@ __all__ = [
     "GOLDEN_SAMPLING_DIAGNOSTICS_ENV",
     "GOLDEN_STAGE_DIAGNOSTICS_ENV",
     "GOLDEN_QD_TRANSPORT_ENV",
+    "DECOUPLED_SOURCE_QD_ENV",
+    "DECOUPLED_SOURCE_BLOCK_BYTES_ENV",
+    "DECOUPLED_H2D_COPY_BYTES_ENV",
+    "DECOUPLED_H2D_DEPTH_ENV",
+    "DECOUPLED_SOURCE_CAPACITY_ENV",
     "CLIP_FP32_CAST_ONCE_ENV",
     "CLIP_RESIDENCY_MODES",
     "DURABLE_COMMIT_BLOCKING_NOTE",

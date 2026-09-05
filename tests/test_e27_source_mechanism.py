@@ -111,6 +111,101 @@ def test_true_concurrent_qd4_has_actual_syscall_events_and_occupancy():
     assert report["SOURCE_TOTAL_WALL_MS"] == 22 / 1e6
 
 
+def test_same_marker_is_an_o1_noop_without_traversing_event_history():
+    t = _telemetry(expected=(0, 4), regions=((0, 4), (4, 4), (4, 4), (4, 4)))
+    marker = "test.fixture.physical_syscall"
+    t.mark_physical_syscall_provenance(marker)
+    _read(t, 0, 0, 1)
+
+    class NoIteration(list):
+        def __iter__(self):
+            raise AssertionError("same-marker update traversed event history")
+
+    with t._lock:
+        t._events = NoIteration(t._events)
+    t.mark_physical_syscall_provenance(marker)
+    assert list.__getitem__(t._events, 0).physical_provenance == marker
+
+
+def test_marker_changes_are_explicit_and_preserve_each_event_provenance():
+    t = _telemetry(expected=(0, 8), regions=((0, 8), (8, 8), (8, 8), (8, 8)))
+    first = "test.fixture.first"
+    second = "test.fixture.second"
+    t.mark_physical_syscall_provenance(first)
+    call = t.syscall_enter(0, 0, 4, destination_offset=0, timestamp_ns=1)
+
+    with pytest.raises(RuntimeError, match="allow_change=True"):
+        t.mark_physical_syscall_provenance(second)
+    t.mark_physical_syscall_provenance(second, allow_change=True)
+    t.syscall_exit(call, 4, timestamp_ns=2)
+    _read(t, 0, 4, 3)
+
+    assert [event.physical_provenance for event in t.events] == [first, second]
+    assert t.report()["physical_syscall_provenance"] == second
+
+
+def test_concurrent_readers_observe_consistent_marker_and_event_snapshots():
+    t = _telemetry(expected=(0, 16))
+    marker = "test.fixture.physical_syscall"
+    t.mark_physical_syscall_provenance(marker)
+    errors = []
+    start = threading.Barrier(9)
+
+    def writer(producer):
+        try:
+            start.wait()
+            for offset in range(producer * 4, producer * 4 + 4):
+                _read(t, producer, offset, offset + 1)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            start.wait()
+            for _ in range(20):
+                snapshot = t.events
+                assert all(event.physical_provenance == marker for event in snapshot)
+                report = t.report()
+                assert all(event["physical_provenance"] == marker for event in report["events"])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(producer,)) for producer in range(4)]
+    threads.extend(threading.Thread(target=reader) for _ in range(5))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(t.events) == 16
+    assert all(event.physical_provenance == marker for event in t.events)
+
+
+def test_fixed_marker_tracking_preserves_byte_source_proof_compatibility():
+    t = _telemetry()
+    marker = "test.fixture.physical_syscall"
+    calls = []
+    for producer in range(4):
+        t.mark_physical_syscall_provenance(marker)
+        calls.append(
+            t.syscall_enter(
+                producer, producer * 4, 4,
+                destination_offset=producer * 4,
+                timestamp_ns=producer + 1,
+            )
+        )
+    for producer, call in enumerate(calls):
+        t.syscall_exit(call, 4, timestamp_ns=20 + producer)
+    _finish(t)
+
+    result = evaluate_e27_source_mechanism(t)
+    assert result["proven"] is True
+    assert result["predicates"]["coverage_exact"] is True
+    assert result["predicates"]["source_h2d_bytes_reconciled"] is True
+    assert result["report"]["source_returned_bytes"] == 16
+
+
 def test_serial_four_workers_does_not_claim_qd4():
     t = _telemetry()
     for producer in range(4):
@@ -230,6 +325,27 @@ def test_report_summaries_cannot_replace_checkpoint_history():
     report["dispatcher_control"]["h2d_completed_bytes"] = 0
     result = evaluate_e27_source_mechanism(report)
     assert result["proven"] is True
+
+
+def test_e27_rejects_source_read_with_wrong_destination_correspondence():
+    report = copy.deepcopy(_valid_evaluator_report())
+    report["actual_source_events"][0]["destination_offset"] += 1
+    result = evaluate_e27_source_mechanism(report)
+    assert result["proven"] is False
+    assert result["predicates"]["coverage_exact"] is False
+
+
+def test_e27_proof_no_is_explicit_when_source_bytes_are_valid_but_h2d_bytes_do_not_reconcile():
+    report = copy.deepcopy(_valid_evaluator_report())
+    # Source coverage remains exact; the mechanism proof must still reject an
+    # H2D projection that does not carry exactly those physical bytes.
+    report["h2d_events"][0]["bytes"] += 1
+    result = evaluate_e27_source_mechanism(report)
+    assert report["topology"]["coverage_exact"] is True
+    assert result["proven"] is False
+    assert result["E27_SOURCE_MECHANISM_PROVEN"] == "NO"
+    assert "h2d_reconciliation_complete" in result["failed_predicates"]
+    assert "source_h2d_bytes_reconciled" in result["failed_predicates"]
 
 
 @pytest.mark.parametrize("mutate", [

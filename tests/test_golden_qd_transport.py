@@ -75,6 +75,32 @@ def test_qd4_defaults_and_explicit_validation():
         TransportConfig(block_bytes=0)
 
 
+def test_direct_geometry_selector_is_allowlisted(monkeypatch):
+    assert gs.resolve_golden_direct_block_bytes(32 * 1024 * 1024) == 32 * 1024 * 1024
+    assert gs.resolve_golden_direct_block_bytes(256 * 1024 * 1024) == 256 * 1024 * 1024
+    assert gs.resolve_golden_direct_block_bytes(512 * 1024 * 1024) == 512 * 1024 * 1024
+    assert gs.resolve_golden_direct_block_bytes(1024 * 1024 * 1024) == 1024 * 1024 * 1024
+    monkeypatch.setenv(gs.GOLDEN_DIRECT_BLOCK_BYTES_ENV, str(128 * 1024 * 1024))
+    assert gs.resolve_golden_direct_block_bytes() == 128 * 1024 * 1024
+    with pytest.raises(ValueError, match="unsupported"):
+        gs.resolve_golden_direct_block_bytes(96 * 1024 * 1024)
+
+
+def test_request_resources_keep_one_arena_and_configured_slot_geometry():
+    resources = qd.GoldenTransferResources(
+        object(),
+        [object()] * 8,
+        object(),
+        [(object(), object()) for _ in range(8)],
+        (object(), object()),
+        slot_count=8,
+        slot_bytes=256 * 1024 * 1024,
+    )
+    assert resources.arena_bytes == 2 * 1024 * 1024 * 1024
+    assert resources.physical_pinned_alloc_count == 1
+    assert resources.slot_bytes == 256 * 1024 * 1024
+
+
 def test_selector_is_explicit_and_independent_of_diagnostics(monkeypatch):
     monkeypatch.setenv("COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS", "not-an-arm")
     monkeypatch.setenv("COMFYMODAL_GOLDEN_QD_TRANSPORT", "dispatcher")
@@ -83,6 +109,31 @@ def test_selector_is_explicit_and_independent_of_diagnostics(monkeypatch):
     assert create_transport("test", config=small_config(), backend=FakeBackend()).arm == "static_e27"
     with pytest.raises(ValueError):
         normalize_transport_arm("r41")
+
+
+def test_decoupled_dimensions_are_independently_resolved(monkeypatch):
+    monkeypatch.setenv(gs.DECOUPLED_SOURCE_QD_ENV, "8")
+    monkeypatch.setenv(gs.DECOUPLED_SOURCE_BLOCK_BYTES_ENV, "64")
+    monkeypatch.setenv(gs.DECOUPLED_H2D_COPY_BYTES_ENV, "32")
+    monkeypatch.setenv(gs.DECOUPLED_H2D_DEPTH_ENV, "2")
+    monkeypatch.setenv(gs.DECOUPLED_SOURCE_CAPACITY_ENV, "3")
+
+    assert gs.golden_qd_transport_arm("decoupled") == "decoupled"
+    assert gs._resolve_decoupled_dimension(gs.DECOUPLED_SOURCE_QD_ENV, 1) == 8
+    assert gs._resolve_decoupled_dimension(gs.DECOUPLED_SOURCE_BLOCK_BYTES_ENV, 1) == 64
+    assert gs._resolve_decoupled_dimension(gs.DECOUPLED_H2D_COPY_BYTES_ENV, 1) == 32
+    assert gs._resolve_decoupled_dimension(gs.DECOUPLED_H2D_DEPTH_ENV, 1) == 2
+    assert gs._resolve_decoupled_dimension(gs.DECOUPLED_SOURCE_CAPACITY_ENV, 1) == 3
+
+    config = TransportConfig(
+        source_qd=8,
+        source_block_bytes=64,
+        h2d_copy_bytes=32,
+        h2d_inflight_depth=2,
+        source_capacity=3,
+    )
+    assert (config.source_qd, config.source_block_bytes, config.h2d_copy_bytes) == (8, 64, 32)
+    assert (config.h2d_inflight_depth, config.source_capacity) == (2, 3)
 
 
 def test_static_e27_regions_are_four_fixed_contiguous_regions_for_odd_lengths():
@@ -532,6 +583,30 @@ def test_source_qd_four_is_time_weighted_independently_of_slow_h2d():
         telemetry["source_qd_timeline"],
     )
     assert telemetry["target_qd_occupancy_fraction"] == telemetry["fraction_time_at_target_source_qd"]
+
+
+def test_non_aggregating_transport_submits_single_32m_units_without_scheduler_entry():
+    transport = GoldenQDTransport(
+        small_config(
+            block_bytes=8,
+            h2d_target_bytes=8,
+            aggregation_enabled=False,
+        ),
+        FakeBackend(),
+    )
+
+    result = transport.execute(
+        [SourceRange(i * 8, 8, i * 8, i) for i in range(4)],
+        FakeSource(b"x" * 32).read,
+    )
+
+    telemetry = result.telemetry
+    assert telemetry["aggregation_enabled"] is False
+    assert telemetry["aggregation_scheduler_enter_count"] == 0
+    assert telemetry["aggregation_wait_count"] == 0
+    assert telemetry["aggregated_submission_count"] == 0
+    assert telemetry["aggregation_fallback_count"] == 0
+    assert telemetry["h2d_submission_sizes"] == [8, 8, 8, 8]
 
 
 def test_source_qd_interval_closes_when_reader_raises():

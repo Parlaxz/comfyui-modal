@@ -1,0 +1,30 @@
+Baseline freeze record (before deployment, 2026-09-03 ~10:25 local):
+worktree: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+branch: TESTING2
+HEAD: 23b42d23f222a23a70479f486bec05c763b10c48 (matches campaign base exactly)
+git status --short at freeze: only untracked files (??), zero tracked modifications:
+?? EXPERIMENT_EVIDENCE_golden_p1_133afac7c9004337_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_25606a90ca244cf9_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_2e4d4cdeffde4b3a_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_48f7057bc7e3487b_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8020d1eccaeb40e2_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_ce6827c491ae47be_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f2787dfec45943ae_2026-09-03.md
+?? RX9P_G_FAILED_SMOKE_REPAIR_AUDIT_2026-09-01.md
+?? RX9P_M_PROFILER_E27_AND_LOGGING_REPAIR_2026-09-02.md
+git diff --stat at freeze: empty. git diff at freeze: empty.
+unetClipExperimentsSeptember did not exist at freeze (Test-Path False).
+PNG SHA policy recorded exactly: profile config golden_p1 expected_output_sha =
+8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e; skill doc reference =
+454dbda2939f4abadabd8ca6c524d3a615f384ce19873faf5adaf4693c1848da. Bundle semantics retained (warning-only on mismatch).
+
+Post-cohort tree state (after remote execution stopped):
+M comfymodal_runtime/full_trace_report.py
+M comfymodal_runtime/golden_serial.py
+M comfymodal_runtime/modal_app.py
+M comfymodal_runtime/sampling_deep_profile.py
+?? comfymodal_runtime/golden_human_report.py (untracked, new file by concurrent lane)
+?? EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md (this cohort's run-1 evidence, auto-generated)
+Contamination window (file mtimes): 10:32:54-10:34:02 local, i.e. after run-1 completed (10:28:55)
+and before the second invocation. Neither the deployment (10:26:29) nor run-1 (10:28:02-10:28:55)
+is affected by these later local edits; the deployed remote code is immutable.

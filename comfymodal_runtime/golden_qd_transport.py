@@ -7,12 +7,34 @@ return.  CUDA is optional: importing this module does not import torch.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, cast
+
+try:
+    from .preplanned_extent_transport import (
+        ExtentState,
+        ExtentTransportError,
+        PlannedExtent,
+        PlannedRead,
+        PreplannedExtentTransport,
+        plan_preplanned_extents,
+        validate_preplanned_extents,
+    )
+except ImportError:
+    from comfymodal_runtime.preplanned_extent_transport import (
+        ExtentState,
+        ExtentTransportError,
+        PlannedExtent,
+        PlannedRead,
+        PreplannedExtentTransport,
+        plan_preplanned_extents,
+        validate_preplanned_extents,
+    )
 
 try:
     from .e27_source_mechanism import (
@@ -32,11 +54,27 @@ DISPATCHER_ARM = "dispatcher"
 CONTROL_ARM = DISPATCHER_ARM
 STATIC_E27_ARM = "static_e27"
 TEST_ARM = STATIC_E27_ARM
+DECOUPLED_ARM = "decoupled"
 STATIC_E27_PRODUCERS = 4
 DEFAULT_QUEUE_DEPTH = 4
 DEFAULT_BLOCK_BYTES = 32 * 1024 * 1024
 DEFAULT_STAGING_SLOTS = 8
 REQUEST_ARENA_BYTES = DEFAULT_STAGING_SLOTS * DEFAULT_BLOCK_BYTES
+H2D_TARGET_BYTES_BY_ROLE = {
+    "clip": 64 * 1024 * 1024,
+    "unet": 128 * 1024 * 1024,
+    "vae": 32 * 1024 * 1024,
+}
+
+
+def resolve_h2d_target_bytes(role: str) -> int:
+    normalized = str(role).strip().lower()
+    if normalized.startswith("clip"):
+        normalized = "clip"
+    try:
+        return H2D_TARGET_BYTES_BY_ROLE[normalized]
+    except KeyError as exc:
+        raise ValueError(f"unsupported H2D target role: {role!r}") from exc
 
 
 @dataclass
@@ -64,9 +102,24 @@ class GoldenTransferResources:
     slot_bytes = DEFAULT_BLOCK_BYTES
     arena_bytes = REQUEST_ARENA_BYTES
 
-    def __init__(self, arena: Any, views: Sequence[Any], stream: Any, events: Sequence[tuple[Any, Any]], span_events: tuple[Any, Any]) -> None:
-        if len(views) != self.slot_count or len(events) != self.slot_count:
-            raise ValueError("request transport resources require exactly eight slots and event pairs")
+    def __init__(
+        self,
+        arena: Any,
+        views: Sequence[Any],
+        stream: Any,
+        events: Sequence[tuple[Any, Any]],
+        span_events: tuple[Any, Any],
+        *,
+        slot_count: int = DEFAULT_STAGING_SLOTS,
+        slot_bytes: int = DEFAULT_BLOCK_BYTES,
+    ) -> None:
+        if len(views) != slot_count or len(events) != slot_count:
+            raise ValueError("request transport resources require matching slots and event pairs")
+        if slot_count < 1 or slot_bytes < 1:
+            raise ValueError("request transport resource dimensions must be positive")
+        self.slot_count = int(slot_count)
+        self.slot_bytes = int(slot_bytes)
+        self.arena_bytes = self.slot_count * self.slot_bytes
         self.arena = arena
         self.views = tuple(views)
         self.slot_indices = tuple(range(self.slot_count))
@@ -87,17 +140,41 @@ class GoldenTransferResources:
         self._span_started = False
         self._span_finished = False
         self.gpu_copy_active_sum_ms = 0.0
+        self._gpu_copy_timing_samples = 0
         self.gpu_copy_count = 0
         self.gpu_copy_bytes = 0
+        self.request_cumulative_gpu_copy_count = 0
+        self.request_cumulative_gpu_copy_bytes = 0
         self.gpu_copy_stream_span_ms: float | None = None
         self.gpu_copy_active_union_ms = 0.0
         self.gpu_copy_idle_inside_stream_span_ms = 0.0
         self.event_rerecord_count = 0
         self.h2d_submit_count = 0
         self.h2d_completion_count = 0
+        self.request_cumulative_h2d_submit_count = 0
+        self.request_cumulative_h2d_completion_count = 0
+
+    def reset_operation_metrics(self) -> None:
+        self._span_started = False
+        self._span_finished = False
+        self.gpu_copy_active_sum_ms = 0.0
+        self._gpu_copy_timing_samples = 0
+        self.gpu_copy_count = 0
+        self.gpu_copy_bytes = 0
+        self.gpu_copy_stream_span_ms = None
+        self.gpu_copy_active_union_ms = 0.0
+        self.gpu_copy_idle_inside_stream_span_ms = 0.0
+        self.h2d_submit_count = 0
+        self.h2d_completion_count = 0
 
     @classmethod
-    def create(cls, device: str | None = None) -> "GoldenTransferResources":
+    def create(
+        cls,
+        device: str | None = None,
+        *,
+        slot_count: int = DEFAULT_STAGING_SLOTS,
+        slot_bytes: int = DEFAULT_BLOCK_BYTES,
+    ) -> "GoldenTransferResources":
         try:
             import torch
         except ImportError as exc:
@@ -107,10 +184,11 @@ class GoldenTransferResources:
         dev = device or f"cuda:{torch.cuda.current_device()}"
         # Exactly one physical pinned allocation.  All slot objects below are
         # stable views into this allocation, never additional allocations.
-        arena = torch.empty(cls.arena_bytes, dtype=torch.uint8, pin_memory=True)
+        arena_bytes = int(slot_count) * int(slot_bytes)
+        arena = torch.empty(arena_bytes, dtype=torch.uint8, pin_memory=True)
         views = tuple(
-            arena[index * cls.slot_bytes : (index + 1) * cls.slot_bytes]
-            for index in range(cls.slot_count)
+            arena[index * slot_bytes : (index + 1) * slot_bytes]
+            for index in range(slot_count)
         )
         stream = torch.cuda.Stream(device=dev)
         events = tuple(
@@ -118,13 +196,17 @@ class GoldenTransferResources:
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
             )
-            for _ in range(cls.slot_count)
+            for _ in range(slot_count)
         )
         span_events = (
             torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True),
         )
-        return cls(arena, views, stream, events, span_events)
+        return cls(
+            arena, views, stream, events, span_events,
+            slot_count=slot_count,
+            slot_bytes=slot_bytes,
+        )
 
     @property
     def event_object_count(self) -> int:
@@ -137,14 +219,21 @@ class GoldenTransferResources:
     def new_pool(self, capacity_class: str) -> "StagingPool":
         if self.closed:
             raise TransportError("request transport resources are closed")
+        if self._poisoned:
+            raise PoolPoisonedError("request transport resources are poisoned")
         return StagingPool(
             self.slot_count, self.slot_bytes, capacity_class,
             buffers=self.views,
+            backing_buffer=self.arena,
         )
 
     def transport_enter(self) -> None:
         if self.closed:
             raise TransportError("request transport resources are closed")
+        if self._poisoned:
+            raise PoolPoisonedError("request transport resources are poisoned")
+        if self._active_transports == 0:
+            self.reset_operation_metrics()
         self._active_transports += 1
         self.transport_use_count += 1
         self.transport_physical_pinned_alloc_count = 1 if self.transport_use_count == 1 else 0
@@ -203,6 +292,7 @@ class GoldenTransferResources:
             raise TransportError("request H2D completion ticket is not recordable")
         record_start(self.h2d_stream)
         self.h2d_submit_count += 1
+        self.request_cumulative_h2d_submit_count += 1
         record_end(self.h2d_stream)
 
     def harvest_ticket(self, ticket: CompletionTicket) -> None:
@@ -211,13 +301,17 @@ class GoldenTransferResources:
         if not ticket.completion:
             ticket.completion = True
             self.h2d_completion_count += 1
+            self.request_cumulative_h2d_completion_count += 1
         if not ticket.timing_consumed:
             elapsed = _event_elapsed_ms(ticket.start_event, ticket.end_event)
             if elapsed is not None:
                 self.gpu_copy_active_sum_ms += elapsed
+                self._gpu_copy_timing_samples += 1
             ticket.timing_consumed = True
             self.gpu_copy_count += 1
             self.gpu_copy_bytes += ticket.byte_count
+            self.request_cumulative_gpu_copy_count += 1
+            self.request_cumulative_gpu_copy_bytes += ticket.byte_count
 
     def return_ticket(self, ticket: CompletionTicket) -> None:
         if not ticket.completion or not ticket.timing_consumed:
@@ -227,26 +321,56 @@ class GoldenTransferResources:
         self._active_tickets.pop(ticket.slot_index, None)
 
     def telemetry(self) -> dict[str, Any]:
+        timing_available = (
+            self.gpu_copy_count == 0
+            or self._gpu_copy_timing_samples == self.gpu_copy_count
+        )
+        active_sum = self.gpu_copy_active_sum_ms if timing_available else None
+        union_available = bool(self._span_finished and timing_available)
+        active_union = self.gpu_copy_active_sum_ms if union_available else None
+        idle_inside_span = (
+            self.gpu_copy_idle_inside_stream_span_ms
+            if union_available else None
+        )
         return {
             "arena_bytes": self.arena_bytes,
             "slot_count": self.slot_count,
             "slot_bytes": self.slot_bytes,
             "request_physical_pinned_alloc_count": self.physical_pinned_alloc_count,
+            "pinned_arena_physical_allocation_count": self.physical_pinned_alloc_count,
+            "pinned_arena_physical_allocation_bytes": self.arena_bytes,
+            "logical_slot_count": self.slot_count,
+            "logical_slot_bytes": self.slot_bytes,
             "transport_physical_pinned_alloc_count": (
                 1 if self.transport_use_count == 1 else 0
             ),
             "created_vs_reused": "CREATED" if self.transport_use_count <= 1 else "REUSED",
             "dedicated_h2d_stream_count": 1,
+            "cuda_h2d_stream_object_count": 1,
             "event_object_count": self.event_object_count,
+            "cuda_start_event_object_count": self.slot_count,
+            "cuda_end_event_object_count": self.slot_count,
             "event_rerecord_count": self.event_rerecord_count,
+            "cuda_event_rerecord_count": self.event_rerecord_count,
+            "fresh_cuda_event_per_copy_count": 0,
             "h2d_submit_count": self.h2d_submit_count,
             "h2d_completion_count": self.h2d_completion_count,
-            "GPU_COPY_ACTIVE_SUM_MS": self.gpu_copy_active_sum_ms,
+            "GPU_COPY_ACTIVE_SUM_MS": active_sum,
             "GPU_COPY_STREAM_SPAN_MS": self.gpu_copy_stream_span_ms,
-            "GPU_COPY_ACTIVE_UNION_MS": self.gpu_copy_active_union_ms,
-            "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": self.gpu_copy_idle_inside_stream_span_ms,
+            "GPU_COPY_ACTIVE_UNION_MS": active_union,
+            "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": idle_inside_span,
+            "GPU_COPY_TIMING_AVAILABLE": timing_available,
+            "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP": True,
+            "GPU_COPY_ACTIVE_UNION_PROOF": (
+                "all H2D copies are ordered on one dedicated stream; therefore "
+                "their measured active-time union equals their measured active-time sum"
+            ),
             "GPU_COPY_COUNT": self.gpu_copy_count,
             "GPU_COPY_BYTES": self.gpu_copy_bytes,
+            "REQUEST_CUMULATIVE_H2D_SUBMIT_COUNT": self.request_cumulative_h2d_submit_count,
+            "REQUEST_CUMULATIVE_H2D_COMPLETION_COUNT": self.request_cumulative_h2d_completion_count,
+            "REQUEST_CUMULATIVE_GPU_COPY_COUNT": self.request_cumulative_gpu_copy_count,
+            "REQUEST_CUMULATIVE_GPU_COPY_BYTES": self.request_cumulative_gpu_copy_bytes,
         }
 
     def close(self) -> None:
@@ -317,10 +441,10 @@ def normalize_transport_arm(value: str | None = None) -> str:
         selected = CONTROL_ARM
     elif selected == "test":
         selected = TEST_ARM
-    if selected not in (LEGACY_ARM, DISPATCHER_ARM, STATIC_E27_ARM):
+    if selected not in (LEGACY_ARM, DISPATCHER_ARM, STATIC_E27_ARM, DECOUPLED_ARM):
         raise ValueError(
             f"unknown Golden QD transport arm {selected!r}; "
-            "expected legacy, dispatcher, or static_e27"
+            "expected legacy, dispatcher, static_e27, or decoupled"
         )
     return selected
 
@@ -334,8 +458,8 @@ def static_e27_regions(total: int, producer_count: int = STATIC_E27_PRODUCERS) -
     """
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         raise ValueError("total must be a non-negative integer")
-    if producer_count != STATIC_E27_PRODUCERS:
-        raise ValueError("static E27 transport requires exactly four producers")
+    if isinstance(producer_count, bool) or not isinstance(producer_count, int) or producer_count < 1:
+        raise ValueError("static E27 transport requires at least one producer")
     width = (total + producer_count - 1) // producer_count if total else 0
     return tuple(
         (min(i * width, total), min((i + 1) * width, total))
@@ -370,8 +494,38 @@ class TransportConfig:
     cancellation_poll_limit: int = 1024
     cleanup_timeout: float = 1.0
     capacity_class: str = "qd4-32m"
+    h2d_target_bytes: int | None = None
+    aggregation_enabled: bool = True
+    source_qd: int | None = None
+    source_block_bytes: int | None = None
+    h2d_copy_bytes: int | None = None
+    h2d_inflight_depth: int | None = None
+    source_capacity: int | None = None
 
     def __post_init__(self) -> None:
+        independent = any(
+            value is not None
+            for value in (
+                self.source_qd,
+                self.source_block_bytes,
+                self.h2d_copy_bytes,
+                self.h2d_inflight_depth,
+                self.source_capacity,
+            )
+        )
+        source_qd = self.queue_depth if self.source_qd is None else self.source_qd
+        source_block_bytes = self.block_bytes if self.source_block_bytes is None else self.source_block_bytes
+        h2d_copy_bytes = (
+            self.h2d_target_bytes if self.h2d_copy_bytes is None and self.h2d_target_bytes is not None
+            else self.block_bytes if self.h2d_copy_bytes is None else self.h2d_copy_bytes
+        )
+        h2d_inflight_depth = self.queue_depth if self.h2d_inflight_depth is None else self.h2d_inflight_depth
+        source_capacity = self.staging_slots if self.source_capacity is None else self.source_capacity
+        object.__setattr__(self, "source_qd", source_qd)
+        object.__setattr__(self, "source_block_bytes", source_block_bytes)
+        object.__setattr__(self, "h2d_copy_bytes", h2d_copy_bytes)
+        object.__setattr__(self, "h2d_inflight_depth", h2d_inflight_depth)
+        object.__setattr__(self, "source_capacity", source_capacity)
         ready_capacity = self.staging_slots if self.ready_queue_capacity is None else self.ready_queue_capacity
         object.__setattr__(self, "ready_queue_capacity", ready_capacity)
         values = {
@@ -382,16 +536,29 @@ class TransportConfig:
             "read_retries": self.read_retries,
             "producer_workers": self.producer_workers,
             "cancellation_poll_limit": self.cancellation_poll_limit,
+            "source_qd": source_qd,
+            "source_block_bytes": source_block_bytes,
+            "h2d_copy_bytes": h2d_copy_bytes,
+            "h2d_inflight_depth": h2d_inflight_depth,
+            "source_capacity": source_capacity,
         }
         for name, value in values.items():
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.cleanup_timeout, (int, float)) or self.cleanup_timeout <= 0:
             raise ValueError("cleanup_timeout must be positive")
-        if self.queue_depth > self.staging_slots:
+        if not independent and self.queue_depth > self.staging_slots:
             raise ValueError("queue_depth cannot exceed staging_slots")
         if not isinstance(self.capacity_class, str) or not self.capacity_class:
             raise ValueError("capacity_class must be a non-empty string")
+        if not isinstance(self.aggregation_enabled, bool):
+            raise ValueError("aggregation_enabled must be a bool")
+        if self.h2d_target_bytes is not None and (
+            not isinstance(self.h2d_target_bytes, int)
+            or isinstance(self.h2d_target_bytes, bool)
+            or self.h2d_target_bytes < 1
+        ):
+            raise ValueError("h2d_target_bytes must be positive")
 
 
 @dataclass(frozen=True)
@@ -516,6 +683,8 @@ class StageLease:
         generation: int,
         declared_range: SourceRange | None,
         producer_id: int | None = None,
+        preferred_slot_index: int | None = None,
+        preferred_slot_honored: bool | None = None,
     ) -> None:
         self._pool = pool
         self.slot_index = slot.index
@@ -527,6 +696,8 @@ class StageLease:
         self._producer_retired = False
         self.producer_id = producer_id
         self._producer_identity: int | None = producer_id
+        self.preferred_slot_index = preferred_slot_index
+        self.preferred_slot_honored = preferred_slot_honored
 
     @property
     def state(self) -> SlotState:
@@ -598,6 +769,41 @@ def _buffer_slice(buffer: Any, nbytes: int, offset: int = 0) -> Any:
             raise LeaseError("staging buffer is not sliceable as uint8 storage") from exc
 
 
+def _buffer_is_backing_range(buffer: Any, backing: Any, offset: int, length: int) -> bool:
+    """Prove that one slot is the expected byte range of the shared arena."""
+    if backing is None:
+        return False
+    try:
+        import torch
+        if isinstance(buffer, torch.Tensor) and isinstance(backing, torch.Tensor):
+            return bool(
+                buffer.dtype == getattr(torch, "uint8")
+                and backing.dtype == getattr(torch, "uint8")
+                and buffer.dim() == 1
+                and backing.dim() == 1
+                and buffer.numel() == length
+                and backing.numel() >= offset + length
+                and buffer.data_ptr() == backing.data_ptr() + offset
+            )
+    except (ImportError, AttributeError, TypeError, ValueError, RuntimeError):
+        pass
+    try:
+        view = memoryview(buffer)
+        arena = memoryview(backing)
+        if view.nbytes != length or arena.nbytes < offset + length:
+            return False
+        if view.obj is not arena.obj:
+            return False
+        # A writable buffer lets us prove the slice offset as well as the
+        # common underlying object.  Read-only buffers cannot be safely used
+        # as staging storage, so rejecting them is the honest fallback.
+        address = ctypes.addressof(ctypes.c_char.from_buffer(view))
+        arena_address = ctypes.addressof(ctypes.c_char.from_buffer(arena))
+        return address == arena_address + offset
+    except (TypeError, ValueError, BufferError):
+        return False
+
+
 def _write_buffer(buffer: Any, data: memoryview) -> None:
     try:
         buffer[: len(data)] = data
@@ -628,6 +834,7 @@ class StagingPool:
         *,
         buffers: Sequence[Any] | None = None,
         buffer_factory: Callable[[int], Any] | None = None,
+        backing_buffer: Any = None,
     ) -> None:
         if (
             not isinstance(slots, int) or isinstance(slots, bool) or slots < 1
@@ -641,6 +848,7 @@ class StagingPool:
             raise ValueError("provide buffers or buffer_factory, not both")
         self.block_bytes = block_bytes
         self.capacity_class = capacity_class
+        self.backing_buffer = backing_buffer
         self._meta = threading.RLock()
         self._available = threading.Condition(self._meta)
         self._slots = [
@@ -682,6 +890,7 @@ class StagingPool:
         *,
         declared_range: SourceRange | None = None,
         producer_id: int | None = None,
+        preferred_slot_index: int | None = None,
     ) -> StageLease:
         requested = self.capacity_class if capacity_class is None else capacity_class
         if requested != self.capacity_class:
@@ -692,6 +901,12 @@ class StagingPool:
             or producer_id < 0
         ):
             raise LeaseError("producer_id must be a non-negative integer")
+        if preferred_slot_index is not None and (
+            not isinstance(preferred_slot_index, int)
+            or isinstance(preferred_slot_index, bool)
+            or not 0 <= preferred_slot_index < len(self._slots)
+        ):
+            raise LeaseError("preferred slot index is invalid")
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._available:
             while True:
@@ -699,12 +914,18 @@ class StagingPool:
                     raise PoolPoisonedError(self._poison_reason or "staging pool is poisoned")
                 if self._cancelled:
                     raise CancellationError("staging pool acquisition was cancelled")
-                for slot in self._slots:
+                candidates = self._slots
+                if preferred_slot_index is not None:
+                    preferred = self._slots[preferred_slot_index]
+                    candidates = [preferred] + [slot for slot in self._slots if slot is not preferred]
+                for slot in candidates:
                     if slot.state == SlotState.FREE:
                         slot.generation += 1
                         slot.state = SlotState.FILLING
                         lease = StageLease(
-                            self, slot, slot.generation, declared_range, producer_id
+                            self, slot, slot.generation, declared_range, producer_id,
+                            preferred_slot_index,
+                            preferred_slot_index is None or slot.index == preferred_slot_index,
                         )
                         slot.lease = lease
                         return lease
@@ -807,6 +1028,31 @@ class StagingPool:
                 pass
             return _buffer_slice(slot.buffer, nbytes)
 
+    def _buffer_for_dispatch_group(self, leases: Sequence[StageLease], nbytes: int) -> Any:
+        if not leases:
+            raise LeaseError("H2D group requires at least one lease")
+        with self._meta:
+            slots = [self._validate_locked(lease) for lease in leases]
+            if any(slot.state != SlotState.IN_FLIGHT or not lease._producer_retired for slot, lease in zip(slots, leases)):
+                raise LeaseError("dispatcher may access only retired in-flight leases")
+            indices = [slot.index for slot in slots]
+            if indices != list(range(indices[0], indices[0] + len(indices))):
+                raise LeaseError("H2D group slots are not physically consecutive")
+            if self.backing_buffer is None:
+                raise LeaseError("H2D group has no proven contiguous backing storage")
+            start = indices[0] * self.block_bytes
+            try:
+                import torch
+                if (
+                    isinstance(self.backing_buffer, torch.Tensor)
+                    and self.backing_buffer.dtype == getattr(torch, "uint8")
+                    and self.backing_buffer.dim() == 1
+                ):
+                    return self.backing_buffer[start : start + nbytes]
+            except (ImportError, TypeError, ValueError, RuntimeError):
+                pass
+            return _buffer_slice(self.backing_buffer, nbytes, start)
+
     def _return_completed(self, lease: StageLease) -> None:
         with self._available:
             slot = self._validate_locked(lease)
@@ -861,6 +1107,18 @@ class _Telemetry:
     h2d_completed_bytes: int = 0
     h2d_submitted_count: int = 0
     h2d_completed_count: int = 0
+    h2d_submission_sizes: list[int] | None = None
+    aggregated_submission_count: int = 0
+    non_aggregated_submission_count: int = 0
+    tail_submission_count: int = 0
+    aggregation_fallback_count: int = 0
+    aggregation_fallback_reasons: dict[str, int] | None = None
+    aggregation_enabled: bool | None = None
+    aggregation_wait_count: int = 0
+    aggregation_scheduler_enter_count: int = 0
+    h2d_target_bytes: int | None = None
+    source_block_count: int = 0
+    source_block_bytes: int = DEFAULT_BLOCK_BYTES
     parse_count: int = 0
     source_open_count: int = 0
     duplicate_read_count: int = 0
@@ -937,6 +1195,8 @@ class _Telemetry:
             self.late_submission_unresolved_count = 0
             self.event_cancel_count = 0
             self.h2d_latencies_ns = []
+            self.h2d_submission_sizes = []
+            self.aggregation_fallback_reasons = {}
             self.qd_samples = []
             self.source_qd_depth_samples = []
             self.source_qd_timeline = []
@@ -946,10 +1206,17 @@ class _Telemetry:
             # Destination order is an optional observation, not a correctness
             # counter. Diagnostics-off must not report that it was observed.
             self.producer_destination_offset_monotonic = None
+        self.h2d_submission_sizes = []
+        self.aggregation_fallback_reasons = {}
         self.source_qd_depth = 0 if self.diagnostics_enabled else None
         self.producer_read_bytes = {}
         self.producer_read_counts = {}
         self.producer_last_source_offset = {}
+
+    def note_aggregation_fallback(self, reason: str) -> None:
+        self.aggregation_fallback_count += 1
+        if self.aggregation_fallback_reasons is not None:
+            self.aggregation_fallback_reasons[reason] = self.aggregation_fallback_reasons.get(reason, 0) + 1
 
     def source_read(
         self,
@@ -1048,6 +1315,10 @@ class _Telemetry:
                 else (self.final_drain_end_ns or end or self.final_drain_start_ns) - self.final_drain_start_ns
             )
             qd = list(self.qd_samples) if self.qd_samples is not None else None
+            submission_sizes = (
+                list(self.h2d_submission_sizes)
+                if self.h2d_submission_sizes is not None else None
+            )
             source_qd = (
                 list(self.source_qd_depth_samples)
                 if self.source_qd_depth_samples is not None else None
@@ -1089,6 +1360,19 @@ class _Telemetry:
                 self.actual_source.to_dict() if self.actual_source is not None else None
             )
             resource_report = dict(self.transport_resources or {})
+            resource_active_sum = resource_report.get(
+                "GPU_COPY_ACTIVE_SUM_MS", self.gpu_copy_active_sum_ms
+            )
+            resource_stream_span = resource_report.get(
+                "GPU_COPY_STREAM_SPAN_MS", self.gpu_copy_stream_span_ms
+            )
+            resource_active_union = resource_report.get(
+                "GPU_COPY_ACTIVE_UNION_MS", self.gpu_copy_active_union_ms
+            )
+            resource_idle_inside_span = resource_report.get(
+                "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS",
+                self.gpu_copy_idle_inside_stream_span_ms,
+            )
             return {
                 "timing_scope": {
                     "total_entry_to_return_wall_ms": "TOTAL",
@@ -1115,6 +1399,44 @@ class _Telemetry:
                 "h2d_completed_bytes": self.h2d_completed_bytes,
                 "h2d_submitted_count": self.h2d_submitted_count,
                 "h2d_completed_count": self.h2d_completed_count,
+                "h2d_submission_count": self.h2d_submitted_count,
+                "H2D_SUBMISSION_COUNT": self.h2d_submitted_count,
+                "H2D_SUBMISSIONS": self.h2d_submitted_count,
+                "h2d_submission_sizes": submission_sizes,
+                "h2d_submission_size_distribution": submission_sizes,
+                "H2D_SUBMISSION_SIZES": submission_sizes,
+                "h2d_target_bytes": self.h2d_target_bytes,
+                "aggregation_enabled": self.aggregation_enabled,
+                "aggregation_wait_count": self.aggregation_wait_count,
+                "aggregation_scheduler_enter_count": self.aggregation_scheduler_enter_count,
+                "h2d_min_submission_bytes": min(submission_sizes) if submission_sizes else None,
+                "h2d_max_submission_bytes": max(submission_sizes) if submission_sizes else None,
+                "h2d_mean_submission_bytes": (
+                    sum(submission_sizes) / len(submission_sizes)
+                    if submission_sizes else None
+                ),
+                "aggregated_submission_count": self.aggregated_submission_count,
+                "non_aggregated_submission_count": self.non_aggregated_submission_count,
+                "tail_submission_count": self.tail_submission_count,
+                "aggregation_fallback_count": self.aggregation_fallback_count,
+                "aggregation_fallback_reasons": dict(self.aggregation_fallback_reasons or {}),
+                "source_block_count": self.source_block_count,
+                "source_block_bytes": self.source_block_bytes,
+                "H2D_TARGET_BYTES": self.h2d_target_bytes,
+                "AGGREGATION_ENABLED": self.aggregation_enabled,
+                "AGGREGATION_WAIT_COUNT": self.aggregation_wait_count,
+                "AGGREGATION_SCHEDULER_ENTER_COUNT": self.aggregation_scheduler_enter_count,
+                "H2D_MIN_SUBMISSION_BYTES": min(submission_sizes) if submission_sizes else None,
+                "H2D_MAX_SUBMISSION_BYTES": max(submission_sizes) if submission_sizes else None,
+                "H2D_MEAN_SUBMISSION_BYTES": (
+                    sum(submission_sizes) / len(submission_sizes)
+                    if submission_sizes else None
+                ),
+                "AGGREGATED_SUBMISSION_COUNT": self.aggregated_submission_count,
+                "NON_AGGREGATED_SUBMISSION_COUNT": self.non_aggregated_submission_count,
+                "TAIL_SUBMISSION_COUNT": self.tail_submission_count,
+                "AGGREGATION_FALLBACK_COUNT": self.aggregation_fallback_count,
+                "AGGREGATION_FALLBACK_REASONS": dict(self.aggregation_fallback_reasons or {}),
                 # These are source-reader metrics.  Keep the old names as
                 # compatibility aliases, but do not confuse them with H2D
                 # dispatcher depth below.
@@ -1225,12 +1547,33 @@ class _Telemetry:
                     actual_source_report.get("POST_SOURCE_H2D_TAIL_MS")
                     if actual_source_report is not None else None
                 ),
-                "GPU_COPY_ACTIVE_SUM_MS": self.gpu_copy_active_sum_ms,
-                "GPU_COPY_STREAM_SPAN_MS": self.gpu_copy_stream_span_ms,
-                "GPU_COPY_ACTIVE_UNION_MS": self.gpu_copy_active_union_ms,
-                "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": self.gpu_copy_idle_inside_stream_span_ms,
+                "GPU_COPY_ACTIVE_SUM_MS": resource_active_sum,
+                "GPU_COPY_STREAM_SPAN_MS": resource_stream_span,
+                "GPU_COPY_ACTIVE_UNION_MS": resource_active_union,
+                "GPU_COPY_IDLE_INSIDE_STREAM_SPAN_MS": resource_idle_inside_span,
                 "GPU_COPY_COUNT": self.gpu_copy_count,
                 "GPU_COPY_BYTES": self.gpu_copy_bytes,
+                "REQUEST_CUMULATIVE_H2D_SUBMIT_COUNT": resource_report.get(
+                    "REQUEST_CUMULATIVE_H2D_SUBMIT_COUNT"
+                ),
+                "REQUEST_CUMULATIVE_H2D_COMPLETION_COUNT": resource_report.get(
+                    "REQUEST_CUMULATIVE_H2D_COMPLETION_COUNT"
+                ),
+                "REQUEST_CUMULATIVE_GPU_COPY_COUNT": resource_report.get(
+                    "REQUEST_CUMULATIVE_GPU_COPY_COUNT"
+                ),
+                "REQUEST_CUMULATIVE_GPU_COPY_BYTES": resource_report.get(
+                    "REQUEST_CUMULATIVE_GPU_COPY_BYTES"
+                ),
+                "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP": (
+                    resource_report.get(
+                        "GPU_COPY_ACTIVE_UNION_PROVEN_SINGLE_STREAM_NON_OVERLAP"
+                    )
+                    if self.transport_resources is not None else None
+                ),
+                "GPU_COPY_ACTIVE_UNION_PROOF": resource_report.get(
+                    "GPU_COPY_ACTIVE_UNION_PROOF"
+                ) if self.transport_resources is not None else None,
                 "event_object_count": self.event_object_count,
                 "event_rerecord_count": self.event_rerecord_count,
                 "request_physical_pinned_alloc_count": self.request_physical_pinned_alloc_count,
@@ -1239,6 +1582,10 @@ class _Telemetry:
                 "arena_bytes": resource_report.get("arena_bytes"),
                 "slot_count": resource_report.get("slot_count"),
                 "slot_bytes": resource_report.get("slot_bytes"),
+                "pinned_arena_physical_allocation_count": resource_report.get("pinned_arena_physical_allocation_count"),
+                "pinned_arena_physical_allocation_bytes": resource_report.get("pinned_arena_physical_allocation_bytes"),
+                "logical_slot_count": resource_report.get("logical_slot_count"),
+                "logical_slot_bytes": resource_report.get("logical_slot_bytes"),
                 "request_physical_pinned_alloc_count": resource_report.get(
                     "request_physical_pinned_alloc_count"
                 ),
@@ -1253,6 +1600,11 @@ class _Telemetry:
                 "event_rerecord_count": resource_report.get("event_rerecord_count"),
                 "h2d_submit_count": resource_report.get("h2d_submit_count"),
                 "h2d_completion_count": resource_report.get("h2d_completion_count"),
+                "cuda_h2d_stream_object_count": resource_report.get("cuda_h2d_stream_object_count"),
+                "cuda_start_event_object_count": resource_report.get("cuda_start_event_object_count"),
+                "cuda_end_event_object_count": resource_report.get("cuda_end_event_object_count"),
+                "cuda_event_rerecord_count": resource_report.get("cuda_event_rerecord_count"),
+                "fresh_cuda_event_per_copy_count": resource_report.get("fresh_cuda_event_per_copy_count"),
                 "quiescence_evidence": (
                     actual_source_report.get("quiescence_evidence")
                     if actual_source_report is not None else None
@@ -1309,10 +1661,23 @@ class TransportResult:
         }
 
 
+@dataclass
+class _DispatchSubmission:
+    leases: tuple[StageLease, ...]
+    records: tuple[ReadyRecord, ...]
+    ticket: CompletionTicket | None = None
+    submit_ns: int | None = None
+    tail: bool = False
+
+    @property
+    def byte_count(self) -> int:
+        return sum(record.nbytes for record in self.records)
+
+
 class TransportDispatcher:
     """One owner for H2D submit, event lifecycle, reaping, and slot return."""
 
-    def __init__(self, pool: StagingPool, backend: TransportBackend, config: TransportConfig, telemetry: _Telemetry, destination_size: int | None = None) -> None:
+    def __init__(self, pool: StagingPool, backend: TransportBackend, config: TransportConfig, telemetry: _Telemetry, destination_size: int | None = None, aggregation_ranges: Sequence[SourceRange] | None = None) -> None:
         self.pool, self.backend, self.config, self.telemetry = pool, backend, config, telemetry
         self.destination_size = destination_size
         self._queue: list[tuple[StageLease, ReadyRecord]] = []
@@ -1320,11 +1685,11 @@ class TransportDispatcher:
         # A ready item is removed from _queue before the backend call.  Keep
         # that handoff visible until the event is registered so bounded drain
         # cannot mistake the gap for quiescence and lose the lease/event.
-        self._handoff: dict[int, tuple[StageLease, ReadyRecord]] = {}
-        self._uncertain_handoffs: dict[int, tuple[StageLease, ReadyRecord]] = {}
-        self._late_submissions: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
+        self._handoff: dict[int, _DispatchSubmission] = {}
+        self._uncertain_handoffs: dict[int, _DispatchSubmission] = {}
+        self._late_submissions: dict[int, _DispatchSubmission] = {}
         self._unresolved_late_submission_keys: set[int] = set()
-        self._in_flight: dict[int, tuple[StageLease, ReadyRecord, Any, int | None]] = {}
+        self._in_flight: dict[int, _DispatchSubmission] = {}
         self._actual_h2d_tokens: dict[int, int] = {}
         self._completed_records: list[ReadyRecord] = []
         self._dispatcher_error: BaseException | None = None
@@ -1337,6 +1702,15 @@ class TransportDispatcher:
         self._cancelled = False
         self._cleanup_deadline: float | None = None
         self._thread: threading.Thread | None = None
+        self._next_group_id = 0
+        self._submitted_keys: set[tuple[int, int, int, str | int | None]] = set()
+        self._aggregation_order = tuple(
+            (item.source_offset, item.target_offset, item.length, item.record_id)
+            for item in sorted(aggregation_ranges or (), key=lambda item: (item.source_offset, item.target_offset))
+        )
+        self._aggregation_index = {
+            key: index for index, key in enumerate(self._aggregation_order)
+        }
 
     @property
     def dispatcher_error(self) -> BaseException | None:
@@ -1445,7 +1819,10 @@ class TransportDispatcher:
             if self.telemetry.diagnostics_enabled:
                 assert self.telemetry.qd_samples is not None
                 self.telemetry.qd_samples.append(len(active))
-        for key, (lease, record, ticket, submit_ns) in active:
+        for key, submission in active:
+            ticket = submission.ticket
+            if ticket is None:
+                raise TransportError("H2D submission has no completion ticket")
             try:
                 raw_status = self.backend.poll_event(ticket.end_event)
                 status = EventStatus(raw_status)
@@ -1454,9 +1831,10 @@ class TransportDispatcher:
                     with self._queue_condition:
                         current = self._in_flight.pop(key, None)
                         self._queue_condition.notify_all()
-                    if current is None or lease._returned:
+                    if current is None or any(lease._returned for lease in submission.leases):
                         continue
-                    self.pool._poison(lease, "H2D poll was uncertain")
+                    for lease in submission.leases:
+                        self.pool._poison(lease, "H2D poll was uncertain")
                 raise TransportError("H2D poll failed; staging pool poisoned") from exc
             if status == EventStatus.PENDING:
                 continue
@@ -1468,31 +1846,34 @@ class TransportDispatcher:
                 with self._queue_condition:
                     current = self._in_flight.pop(key, None)
                     self._queue_condition.notify_all()
-                if current is None or lease._returned:
+                if current is None or any(lease._returned for lease in submission.leases):
                     continue
                 if status == EventStatus.COMPLETE:
                     # The completion event is the proof that the submitted
                     # copy finished.  Count it before pool bookkeeping so a
                     # cleanup race cannot make telemetry claim it did not.
-                    self.telemetry.h2d_completed_bytes += record.nbytes
+                    self.telemetry.h2d_completed_bytes += submission.byte_count
                     self.telemetry.h2d_completed_count += 1
                     self._record_h2d_complete(key, ticket)
-                    self.pool._return_completed(lease)
+                    for lease in submission.leases:
+                        self.pool._return_completed(lease)
                     release_ticket = getattr(self.backend, "release_ticket", None)
                     if callable(release_ticket):
                         release_ticket(ticket)
                     with self._queue_condition:
-                        self._completed_records.append(record)
+                        self._completed_records.extend(submission.records)
                     if self.telemetry.diagnostics_enabled:
-                        assert submit_ns is not None
+                        assert submission.submit_ns is not None
                         assert self.telemetry.h2d_latencies_ns is not None
-                        self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submit_ns)
+                        self.telemetry.h2d_latencies_ns.append(time.monotonic_ns() - submission.submit_ns)
                 elif status == EventStatus.UNCERTAIN:
-                    self.pool._poison(lease, "uncertain H2D completion")
+                    for lease in submission.leases:
+                        self.pool._poison(lease, "uncertain H2D completion")
                     self.telemetry.completion_classification = "uncertain"
                     raise TransportError("uncertain H2D completion; staging pool poisoned")
                 else:
-                    self.pool._poison(lease, "H2D event failed")
+                    for lease in submission.leases:
+                        self.pool._poison(lease, "H2D event failed")
                     self.telemetry.completion_classification = "failed"
                     raise TransportError("H2D completion event failed; staging pool poisoned")
         if self.telemetry.diagnostics_enabled:
@@ -1523,7 +1904,10 @@ class TransportDispatcher:
         # is held by _run.
         with self._queue_condition:
             active = list(self._in_flight.items()) + list(self._late_submissions.items())
-        for key, (lease, record, ticket, _submit_ns) in active:
+        for key, submission in active:
+            ticket = submission.ticket
+            if ticket is None:
+                continue
             with self._queue_condition:
                 is_late_submission = key in self._late_submissions
             try:
@@ -1561,16 +1945,17 @@ class TransportDispatcher:
                     continue
                 if proven:
                     try:
-                        self.telemetry.h2d_completed_bytes += record.nbytes
+                        self.telemetry.h2d_completed_bytes += submission.byte_count
                         self.telemetry.h2d_completed_count += 1
                         self._record_h2d_complete(key, ticket)
-                        if not lease._returned:
-                            self.pool._return_completed(lease)
+                        for lease in submission.leases:
+                            if not lease._returned:
+                                self.pool._return_completed(lease)
                         release_ticket = getattr(self.backend, "release_ticket", None)
                         if callable(release_ticket):
                             release_ticket(ticket)
                         with self._queue_condition:
-                            self._completed_records.append(record)
+                            self._completed_records.extend(submission.records)
                             self._in_flight.pop(key, None)
                             if key in self._late_submissions:
                                 self._late_submissions.pop(key, None)
@@ -1588,7 +1973,8 @@ class TransportDispatcher:
                     # is no longer an unresolved event either.  In particular
                     # do not leave a late submission in the ownership map
                     # forever merely because its copy failed after abort.
-                    self.pool._poison(lease, "cancelled H2D completion failed", expected_abort=True)
+                    for lease in submission.leases:
+                        self.pool._poison(lease, "cancelled H2D completion failed", expected_abort=True)
                     with self._queue_condition:
                         self._in_flight.pop(key, None)
                         self._late_submissions.pop(key, None)
@@ -1599,7 +1985,8 @@ class TransportDispatcher:
                     )
                     self._note_cleanup(TransportError("cancelled H2D completion failed"))
                 else:
-                    self.pool._poison(lease, "cancelled H2D completion was not proven", expected_abort=True)
+                    for lease in submission.leases:
+                        self.pool._poison(lease, "cancelled H2D completion was not proven", expected_abort=True)
                     if is_late_submission and key not in self._unresolved_late_submission_keys:
                         self._unresolved_late_submission_keys.add(key)
                         if self.telemetry.diagnostics_enabled:
@@ -1621,13 +2008,167 @@ class TransportDispatcher:
         self._return_queued()
         with self._lease_cleanup_lock:
             with self._queue_condition:
-                handoff = list(self._handoff.values())
+                handoff = list(self._handoff.items())
                 self._handoff.clear()
-                self._uncertain_handoffs.update({item[0].slot_index: item for item in handoff})
+                self._uncertain_handoffs.update(dict(handoff))
                 self._queue_condition.notify_all()
-            for lease, _record in handoff:
-                self.pool._poison(lease, "cancelled dispatcher handoff was not completed", expected_abort=True)
+            for _key, item in handoff:
+                for lease in item.leases:
+                    self.pool._poison(lease, "cancelled dispatcher handoff was not completed", expected_abort=True)
         self._cancel_in_flight(deadline)
+
+    @staticmethod
+    def _record_key(record: ReadyRecord) -> tuple[int, int, int, str | int | None]:
+        return (record.source_offset, record.destination_offset, record.nbytes, record.record_id)
+
+    def _take_submission(self) -> tuple[int, _DispatchSubmission] | None:
+        with self._queue_condition:
+            if not self._queue:
+                return None
+            forced_tail = False
+            if not self._aggregation_order:
+                chosen = [self._queue[0]]
+            else:
+                self.telemetry.aggregation_scheduler_enter_count += 1
+                available = {
+                    self._record_key(record): (index, lease, record)
+                    for index, (lease, record) in enumerate(self._queue)
+                }
+                pending = [
+                    key for key in self._aggregation_order
+                    if key not in self._submitted_keys
+                ]
+                key = next((key for key in pending if key in available), None)
+                if key is None:
+                    candidates = [
+                        self._record_key(record)
+                        for _index, (_lease, record) in enumerate(self._queue)
+                        if self._record_key(record) not in self._submitted_keys
+                    ]
+                    if not candidates:
+                        return None
+                    key = min(
+                        candidates,
+                        key=lambda item: self._aggregation_index.get(
+                            item, len(self._aggregation_order)
+                        ),
+                    )
+                first_index = available[key][0]
+                first_order = self._aggregation_index.get(key)
+                chosen = [self._queue[first_index]]
+                if first_order is not None:
+                    for next_key in self._aggregation_order[first_order + 1:]:
+                        if next_key in self._submitted_keys or next_key not in available:
+                            break
+                        candidate = self._queue[available[next_key][0]]
+                        if (
+                            self.config.h2d_target_bytes is not None
+                            and sum(item[1].nbytes for item in chosen) + candidate[1].nbytes
+                            > self.config.h2d_target_bytes
+                        ):
+                            break
+                        chosen.append(candidate)
+
+                    first_record = chosen[0][1]
+                    eligible = (
+                        len(chosen) == 1
+                        and self.config.h2d_target_bytes is not None
+                        and self.config.h2d_target_bytes > self.config.block_bytes
+                        and first_record.nbytes == self.config.block_bytes
+                        and first_record.destination_offset % self.config.block_bytes == 0
+                        and first_order + 1 < len(self._aggregation_order)
+                    )
+                    if eligible:
+                        next_key = self._aggregation_order[first_order + 1]
+                        next_missing = (
+                            next_key not in available
+                            and next_key not in self._submitted_keys
+                        )
+                        if next_missing and not self._stop:
+                            # The producer may still publish the next
+                            # canonical extent.  Keep every queued item in
+                            # place and let publish/quiesce wake the loop.
+                            # A full ready queue would otherwise block that
+                            # producer forever, so use an explicit singleton
+                            # fallback in that bounded case.
+                            if len(self._queue) < int(self.config.ready_queue_capacity):
+                                self.telemetry.aggregation_wait_count += 1
+                                return None
+                            self.telemetry.note_aggregation_fallback(
+                                "canonical_extent_not_ready_queue_full"
+                            )
+                        forced_tail = next_missing and self._stop
+
+            candidate_submission = _DispatchSubmission(
+                tuple(item[0] for item in chosen),
+                tuple(item[1] for item in chosen),
+            )
+            if len(chosen) > 1:
+                reason = self._group_reason(candidate_submission)
+                if reason is not None:
+                    self.telemetry.note_aggregation_fallback(reason)
+                    # Only remove the canonical first item.  The remaining
+                    # queue entries retain their publication order.
+                    chosen = [chosen[0]]
+                    forced_tail = False
+            chosen_keys = {self._record_key(record) for _lease, record in chosen}
+            self._queue[:] = [
+                item for item in self._queue
+                if self._record_key(item[1]) not in chosen_keys
+            ]
+            self._submitted_keys.update(chosen_keys)
+            self._next_group_id += 1
+            submission = _DispatchSubmission(
+                tuple(item[0] for item in chosen),
+                tuple(item[1] for item in chosen),
+                tail=forced_tail,
+            )
+            self._handoff[self._next_group_id] = submission
+            if self.telemetry.diagnostics_enabled:
+                self.telemetry.ready_depth = len(self._queue)
+            self._queue_condition.notify_all()
+            return self._next_group_id, submission
+
+    def _group_reason(self, submission: _DispatchSubmission) -> str | None:
+        if len(submission.records) == 1:
+            return None
+        if self.config.h2d_target_bytes is None:
+            return "h2d_target_not_configured"
+        if submission.byte_count > self.config.h2d_target_bytes:
+            return "h2d_target_exceeded"
+        if any(record.nbytes != self.config.block_bytes for record in submission.records):
+            return "partial_extent"
+        for left, right in zip(submission.records, submission.records[1:]):
+            if left.source_offset + left.nbytes != right.source_offset:
+                return "source_extents_not_contiguous"
+            if left.destination_offset + left.nbytes != right.destination_offset:
+                return "destination_extents_not_contiguous"
+        indices = [lease.slot_index for lease in submission.leases]
+        if indices != list(range(indices[0], indices[0] + len(indices))):
+            return "physical_slots_not_consecutive"
+        if self.pool.backing_buffer is None:
+            return "physical_storage_not_contiguous"
+        if any(
+            lease.preferred_slot_index is not None and not lease.preferred_slot_honored
+            for lease in submission.leases
+        ):
+            return "canonical_slot_assignment_failed"
+        with self.pool._meta:
+            for lease in submission.leases:
+                try:
+                    slot = self.pool._validate_locked(lease)
+                except LeaseError:
+                    return "lease_ownership_invalid"
+                if slot.state != SlotState.READY or not lease._producer_retired:
+                    return "lease_ownership_invalid"
+                if not _buffer_is_backing_range(
+                    slot.buffer,
+                    self.pool.backing_buffer,
+                    slot.index * self.pool.block_bytes,
+                    self.pool.block_bytes,
+                ):
+                    return "physical_storage_not_contiguous"
+        return None
 
     def _run(self) -> None:
         try:
@@ -1640,29 +2181,33 @@ class TransportDispatcher:
                     return
                 with self._queue_condition:
                     cancelled = self._cancelled
-                    item = None
-                    if not cancelled and self._queue and len(self._in_flight) < self.config.queue_depth:
-                        item = self._queue.pop(0)
-                        self._handoff[item[0].slot_index] = item
-                        if self.telemetry.diagnostics_enabled:
-                            self.telemetry.ready_depth = len(self._queue)
-                        self._queue_condition.notify_all()
-                    done = self._stop and item is None and not self._queue and not self._in_flight and not self._late_submissions
+                    can_take = not cancelled and self._queue and len(self._in_flight) < self.config.queue_depth
+                    done = self._stop and not can_take and not self._queue and not self._in_flight and not self._late_submissions
                 if cancelled:
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 if done:
                     return
-                if item is None:
+                if not can_take:
                     with self._queue_condition:
                         self._queue_condition.wait(0.001)
                     continue
-                lease, record = item
+                taken = self._take_submission()
+                if taken is None:
+                    continue
+                group_id, submission = taken
+                lease = submission.leases[0]
+                record = submission.records[0]
                 ticket: CompletionTicket | None = None
                 try:
                     with self._lease_cleanup_lock:
-                        self.pool._mark_in_flight(lease)
-                        source = self.pool._buffer_for_dispatch(lease, record.nbytes)
+                        for member in submission.leases:
+                            self.pool._mark_in_flight(member)
+                        source = (
+                            self.pool._buffer_for_dispatch_group(submission.leases, submission.byte_count)
+                            if len(submission.leases) > 1
+                            else self.pool._buffer_for_dispatch(lease, record.nbytes)
+                        )
                     submit_ns = time.monotonic_ns()
                     actual_h2d_token = None
                     if self.telemetry.actual_source is not None:
@@ -1670,7 +2215,7 @@ class TransportDispatcher:
                         # telemetry timestamp represents entry to the backend
                         # operation, not the point at which it returns.
                         actual_h2d_token = self.telemetry.actual_source.record_h2d_submit(
-                            record.nbytes, timestamp_ns=submit_ns
+                            submission.byte_count, timestamp_ns=submit_ns
                         )
                     submit_ticket = getattr(self.backend, "submit_h2d_ticket", None)
                     if callable(submit_ticket):
@@ -1683,49 +2228,56 @@ class TransportDispatcher:
                         event = self.backend.submit_h2d(source, record.destination_offset)
                         if event is not None:
                             ticket = CompletionTicket(
-                                lease.slot_index, lease.generation, None, event, record.nbytes
+                                lease.slot_index, lease.generation, None, event, submission.byte_count
                             )
                     if ticket is None:
                         raise TransportError("backend returned no completion event")
                     # The backend accepted the copy.  Count it before the
                     # handoff bookkeeping so a bounded-drain race cannot
                     # under-report a real submission.
-                    self.telemetry.h2d_submitted_bytes += record.nbytes
+                    self.telemetry.h2d_submitted_bytes += submission.byte_count
                     self.telemetry.h2d_submitted_count += 1
+                    if self.telemetry.h2d_submission_sizes is not None:
+                        self.telemetry.h2d_submission_sizes.append(submission.byte_count)
+                    if len(submission.records) > 1:
+                        self.telemetry.aggregated_submission_count += 1
+                    else:
+                        self.telemetry.non_aggregated_submission_count += 1
+                        if submission.tail or record.nbytes < self.config.block_bytes:
+                            self.telemetry.tail_submission_count += 1
                     if actual_h2d_token is not None:
                         # Do not associate the token until a completion event
                         # exists.  A failed/no-event submit remains incomplete
                         # in the core telemetry and can never be reported as a
                         # completed H2D.
-                        self._actual_h2d_tokens[lease.slot_index] = actual_h2d_token
+                        self._actual_h2d_tokens[group_id] = actual_h2d_token
                 except BaseException as exc:
                     if self._cancelled:
                         self._cleanup_cancelled(self._cleanup_deadline)
                         return
                     with self._lease_cleanup_lock:
-                        self.pool._poison(lease, "H2D submission did not produce a completion event")
+                        for member in submission.leases:
+                            self.pool._poison(member, "H2D submission did not produce a completion event")
                     self._set_dispatcher_error(exc)
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 with self._lease_cleanup_lock:
                     with self._queue_condition:
-                        handoff = self._handoff.get(lease.slot_index)
-                        uncertain = self._uncertain_handoffs.pop(lease.slot_index, None)
-                        if handoff is item:
-                            self._handoff.pop(lease.slot_index, None)
-                            self._in_flight[lease.slot_index] = (
-                                lease, record, ticket,
-                                submit_ns if self.telemetry.diagnostics_enabled else None,
-                            )
+                        handoff = self._handoff.get(group_id)
+                        uncertain = self._uncertain_handoffs.pop(group_id, None)
+                        registered = _DispatchSubmission(
+                            submission.leases, submission.records, ticket,
+                            submit_ns if self.telemetry.diagnostics_enabled else None,
+                        )
+                        if handoff is not None and handoff.leases == submission.leases:
+                            self._handoff.pop(group_id, None)
+                            self._in_flight[group_id] = registered
                             registration_error = None
-                        elif uncertain is item and self._cancelled:
+                        elif uncertain is not None and uncertain.leases == submission.leases and self._cancelled:
                             # The backend accepted the copy after bounded
                             # cancellation detached the handoff.  It is now a
                             # first-class event, not an ignorable late return.
-                            self._late_submissions[lease.slot_index] = (
-                                lease, record, ticket,
-                                submit_ns if self.telemetry.diagnostics_enabled else None,
-                            )
+                            self._late_submissions[group_id] = registered
                             if self.telemetry.diagnostics_enabled:
                                 assert self.telemetry.late_submission_count is not None
                                 self.telemetry.late_submission_count += 1
@@ -1740,7 +2292,8 @@ class TransportDispatcher:
                         self._queue_condition.notify_all()
                 if registration_error is not None:
                     with self._lease_cleanup_lock:
-                        self.pool._poison(lease, str(registration_error))
+                        for member in submission.leases:
+                            self.pool._poison(member, str(registration_error))
                     self._set_dispatcher_error(registration_error)
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
@@ -1777,10 +2330,10 @@ class TransportDispatcher:
             with self._queue_condition:
                 queued = self._queue[:]
                 active = list(self._in_flight.values()) + list(self._late_submissions.values())
-                handoff = list(self._handoff.values())
+                handoff = list(self._handoff.items())
                 self._queue.clear()
                 self._handoff.clear()
-                self._uncertain_handoffs.update({item[0].slot_index: item for item in handoff})
+                self._uncertain_handoffs.update(dict(handoff))
                 self._stop = True
                 self._cancelled = True
                 self._cleanup_deadline = (
@@ -1796,10 +2349,12 @@ class TransportDispatcher:
                     self.pool._return_ready(lease)
                 except BaseException as exc:
                     self._note_cleanup(exc)
-            for lease, _record in handoff:
-                self.pool._poison(lease, "bounded drain could not complete dispatcher handoff", expected_abort=True)
-            for lease, _record, _event, _submit_ns in active:
-                self.pool._poison(lease, "bounded drain could not prove H2D completion", expected_abort=True)
+            for _key, item in handoff:
+                for lease in item.leases:
+                    self.pool._poison(lease, "bounded drain could not complete dispatcher handoff", expected_abort=True)
+            for item in active:
+                for lease in item.leases:
+                    self.pool._poison(lease, "bounded drain could not prove H2D completion", expected_abort=True)
             for key in self._late_submissions:
                 if key not in self._unresolved_late_submission_keys:
                     self._unresolved_late_submission_keys.add(key)
@@ -1873,11 +2428,13 @@ class GoldenQDTransport:
         *,
         declared_range: SourceRange | None = None,
         producer_id: int | None = None,
+        preferred_slot_index: int | None = None,
     ) -> StageLease:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         try:
             return self.pool.acquire(
-                timeout=timeout, declared_range=declared_range, producer_id=producer_id
+                timeout=timeout, declared_range=declared_range, producer_id=producer_id,
+                preferred_slot_index=preferred_slot_index,
             )
         finally:
             waited = (
@@ -1896,12 +2453,15 @@ class GoldenQDTransport:
                     else min(self.telemetry.min_free_slots, free)
                 )
 
-    def start(self, *, destination_size: int | None = None) -> None:
+    def start(self, *, destination_size: int | None = None, aggregation_ranges: Sequence[SourceRange] | None = None) -> None:
         if self.backend is None:
             raise ValueError("dispatcher arm requires an explicitly supplied backend")
         if self.dispatcher is not None:
             raise TransportError("transport already started")
-        self.dispatcher = TransportDispatcher(self.pool, self.backend, self.config, self.telemetry, destination_size)
+        self.dispatcher = TransportDispatcher(
+            self.pool, self.backend, self.config, self.telemetry, destination_size,
+            aggregation_ranges,
+        )
         self.dispatcher.start()
 
     def publish(self, lease: StageLease, record: ReadyRecord) -> None:
@@ -2031,7 +2591,7 @@ class GoldenQDTransport:
 
     @staticmethod
     def _static_e27_work(
-        ranges: Sequence[SourceRange], block_bytes: int
+        ranges: Sequence[SourceRange], block_bytes: int, producer_count: int
     ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[SourceRange, ...], ...]]:
         """Plan four fixed source regions and their block-clamped work.
 
@@ -2040,9 +2600,11 @@ class GoldenQDTransport:
         source span once, and lets each producer walk only its own region.
         Intersections preserve destination mapping and record identity.
         """
+        if producer_count < 1:
+            raise ValueError("static E27 transport requires at least one producer")
         if not ranges:
-            regions = static_e27_regions(0)
-            return regions, tuple(() for _ in range(STATIC_E27_PRODUCERS))
+            regions = static_e27_regions(0, producer_count)
+            return regions, tuple(() for _ in range(producer_count))
         ordered = sorted(ranges, key=lambda item: item.source_offset)
         source_start = ordered[0].source_offset
         cursor = source_start
@@ -2057,9 +2619,9 @@ class GoldenQDTransport:
             cursor += item.length
             destination_cursor += item.length
         total = cursor - source_start
-        regions = static_e27_regions(total)
+        regions = static_e27_regions(total, producer_count)
         work_specs: list[list[tuple[int, SourceRange, int, int]]] = [
-            [] for _ in range(STATIC_E27_PRODUCERS)
+            [] for _ in range(producer_count)
         ]
         item_index = 0
         for producer_id, (relative_start, relative_end) in enumerate(regions):
@@ -2084,7 +2646,7 @@ class GoldenQDTransport:
                 chunk_counts[original_index] = chunk_counts.get(original_index, 0) + 1
         used_ids = {item.record_id for item in ordered if item.record_id is not None}
         generated_ids: set[str | int] = set()
-        work: list[list[SourceRange]] = [[] for _ in range(STATIC_E27_PRODUCERS)]
+        work: list[list[SourceRange]] = [[] for _ in range(producer_count)]
         chunk_indices: dict[int, int] = {}
         for producer_id, producer_items in enumerate(work_specs):
             for original_index, item, absolute, chunk_end in producer_items:
@@ -2125,7 +2687,9 @@ class GoldenQDTransport:
         if self.arm != STATIC_E27_ARM:
             raise ReconciliationError("static E27 plan requested for non-static arm")
         source_ranges = self._record_ranges(ranges, destination_size)
-        return self._static_e27_work(source_ranges, self.config.block_bytes)
+        return self._static_e27_work(
+            source_ranges, self.config.block_bytes, self.config.producer_workers
+        )
 
     @staticmethod
     def _read_exact(reader: Callable[[int, int], bytes], item: SourceRange, retries: int, telemetry: _Telemetry, producer_id: int = 0) -> bytes:
@@ -2376,12 +2940,14 @@ class GoldenQDTransport:
         exact_destination_size = destination_size if destination_size is not None else output_size
         source_ranges = self._record_ranges(ranges, exact_destination_size)
         planned_ranges = source_ranges
-        self.telemetry.producer_ids = tuple(
-            range(STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else self.config.producer_workers)
-        )
+        self.telemetry.h2d_target_bytes = self.config.h2d_target_bytes
+        self.telemetry.aggregation_enabled = self.config.aggregation_enabled
+        self.telemetry.source_block_bytes = self.config.block_bytes
+        producer_count = self.config.producer_workers
+        self.telemetry.producer_ids = tuple(range(producer_count))
         if self.arm == STATIC_E27_ARM:
             self._static_regions, self._static_work = self._static_e27_work(
-                source_ranges, self.config.block_bytes
+                source_ranges, self.config.block_bytes, producer_count
             )
             planned_ranges = [item for producer_items in self._static_work for item in producer_items]
             self.telemetry.static_regions = [
@@ -2394,15 +2960,14 @@ class GoldenQDTransport:
                 }
                 for producer_id, (start, end) in enumerate(self._static_regions)
             ]
+        self.telemetry.source_block_count = len(planned_ranges)
         if parse_count < 0:
             raise ValueError("parse_count must be non-negative")
         self.telemetry.parse_count = parse_count
         self.telemetry.owner, self.telemetry.adoption = owner, adoption
         self.telemetry.owner_count, self.telemetry.adoption_result = owner_count, adoption_result
         self._owner_lifetime = owner
-        source_qd = STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else min(
-            self.config.queue_depth, self.config.producer_workers
-        )
+        source_qd = min(self.config.queue_depth, producer_count)
         self.telemetry.configure_source_qd(source_qd)
         if self.telemetry.diagnostics_enabled:
             self.telemetry.source_start_ns = time.monotonic_ns()
@@ -2433,7 +2998,7 @@ class GoldenQDTransport:
             source_end = max((item.source_offset + item.length for item in source_ranges), default=source_start)
             self.telemetry.actual_source = ActualSourceTelemetry(
                 arm=self.arm,
-                producer_count=STATIC_E27_PRODUCERS,
+                producer_count=producer_count,
                 regions=self.telemetry.static_regions or (),
                 expected_ranges=((source_start, source_end),) if source_end > source_start else (),
                 expected_destination_ranges=tuple(
@@ -2451,7 +3016,10 @@ class GoldenQDTransport:
         self.telemetry.source_read_mode = "direct_readinto" if direct_readinto else "legacy_bytes"
         self.telemetry.source_open_count += 1
         try:
-            self.start(destination_size=exact_destination_size)
+            self.start(
+                destination_size=exact_destination_size,
+                aggregation_ranges=planned_ranges if self.config.aggregation_enabled else None,
+            )
         except BaseException as exc:
             close_errors = self._close_source()
             if close_errors:
@@ -2495,7 +3063,18 @@ class GoldenQDTransport:
                             index += 1
                     lease: StageLease | None = None
                     try:
-                        lease = self.acquire(declared_range=item, producer_id=producer_id)
+                        preferred_slot = (
+                            (item.target_offset // self.config.block_bytes) % self.config.staging_slots
+                            if self.config.aggregation_enabled
+                            and item.length == self.config.block_bytes
+                            and item.target_offset % self.config.block_bytes == 0
+                            else None
+                        )
+                        lease = self.acquire(
+                            declared_range=item,
+                            producer_id=producer_id,
+                            preferred_slot_index=preferred_slot,
+                        )
                         if self.telemetry.diagnostics_enabled:
                             self.telemetry.source_read_begin()
                         try:
@@ -2552,7 +3131,6 @@ class GoldenQDTransport:
                 with self._active_lock:
                     self._active_producers -= 1
 
-        producer_count = STATIC_E27_PRODUCERS if self.arm == STATIC_E27_ARM else self.config.producer_workers
         threads = [
             threading.Thread(
                 target=worker,
@@ -3054,12 +3632,13 @@ def _read_destination(destination: Any, size: int) -> bytes:
 
 
 __all__ = [
-    "BackingAdoption", "BackingOwner", "CancellationError", "CompletionTicket", "CudaTransferBackend", "DEFAULT_BLOCK_BYTES",
+    "BackingAdoption", "BackingOwner", "CancellationError", "CompletionTicket", "CudaTransferBackend", "DECOUPLED_ARM", "DEFAULT_BLOCK_BYTES",
     "DEFAULT_QUEUE_DEPTH", "DEFAULT_STAGING_SLOTS", "REQUEST_ARENA_BYTES", "DISPATCHER_ARM", "CONTROL_ARM", "STATIC_E27_ARM", "TEST_ARM",
     "STATIC_E27_PRODUCERS", "EventStatus", "FakeBackend", "FakeEvent", "FakeSource", "GoldenQDTransport", "GoldenTransferResources", "LEGACY_ARM", "LeaseError", "LegacyTransport", "OutputViewSpec",
     "PoolPoisonedError", "QDTransport", "ReadyRecord", "ReconciliationError", "SlotState", "SourceRange",
     "StageLease", "StagingPool", "PinnedRangeReader", "TransportBackend", "TransportConfig", "TransportDispatcher", "TransportError",
     "evaluate_e27_source_mechanism",
-    "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm", "static_e27_regions", "static_segments",
-    "prove_backing_survives_stage_release",
+    "TransportFailure", "TransportResult", "create_transport", "map_output_views", "normalize_transport_arm", "resolve_h2d_target_bytes", "static_e27_regions", "static_segments",
+    "prove_backing_survives_stage_release", "ExtentState", "ExtentTransportError", "PlannedExtent", "PlannedRead",
+    "PreplannedExtentTransport", "plan_preplanned_extents", "validate_preplanned_extents",
 ]

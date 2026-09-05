@@ -3494,6 +3494,19 @@ def _emit_golden_diagnostics_config(
         transport_resolved = normalize_transport_arm(transport_configured)
     except Exception:
         transport_resolved = "invalid"
+    decoupled_dimension_fields = []
+    for dimension_name in (
+        "COMFYMODAL_GOLDEN_SOURCE_QD",
+        "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES",
+        "COMFYMODAL_GOLDEN_H2D_COPY_BYTES",
+        "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH",
+        "COMFYMODAL_GOLDEN_SOURCE_CAPACITY",
+    ):
+        raw_dimension = os.environ.get(dimension_name, "")
+        decoupled_dimension_fields.extend((
+            f"{dimension_name.lower()}={_golden_profiler_one_line(raw_dimension or 'default')}",
+            f"{dimension_name.lower()}_provenance={'environment' if raw_dimension.strip() else 'default'}",
+        ))
     sage = _golden_sage_provenance(api) if api is not None else {
         "sage_runtime_mode_configured": os.environ.get(
             "COMFYMODAL_SAGE_RUNTIME_MODE", "auto"
@@ -3511,6 +3524,7 @@ def _emit_golden_diagnostics_config(
         f"transport_configured={_golden_profiler_one_line(transport_configured)} "
         f"transport_resolved={_golden_profiler_one_line(transport_resolved)} "
         f"static_e27_arm={int(transport_resolved == 'static_e27')} "
+        + " ".join(decoupled_dimension_fields) + " "
         f"attention_backend_configured={_golden_profiler_one_line(attention_configured)} "
         f"attention_backend_resolved={_golden_profiler_one_line(attention_resolved)} "
         + " ".join(
@@ -4458,6 +4472,28 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
+        ),
+        "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES", "33554432"
+        ),
+        # Decoupled transport dimensions are request/deployment inputs, not
+        # derived from one another.  Forward each raw value through the same
+        # canonical class-environment bridge; an empty value intentionally
+        # preserves the reader's documented default resolution.
+        "COMFYMODAL_GOLDEN_SOURCE_QD": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_QD", ""
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES", ""
+        ),
+        "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_H2D_COPY_BYTES", ""
+        ),
+        "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": os.environ.get(
+            "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH", ""
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_CAPACITY", ""
         ),
         # RA1 sampler decomposition diagnostics must cross Modal's class-env
         # boundary; otherwise the profile can be correct at deploy time while

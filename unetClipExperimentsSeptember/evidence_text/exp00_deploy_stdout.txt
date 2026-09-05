@@ -1,0 +1,18 @@
+[v2ctl.deploy] profile=golden_p1 deploy_fingerprint=a21a57b6aafb0863a539a7027fb98c70250438e566bf7d9cd85ef73ce64d2fd0
+[v2ctl.deploy] command=modal deploy -m comfymodal_runtime.modal_app --name sept-unetclip-00-baseline
+[custom_nodes.publish] decision=skip_exact reason=exact_match generation=0abfd8430bce schema=2 policy=1
+[v2ctl.golden.pre-deploy]
+EXPERIMENT_ID=e34904fdd7d74fee963356728c5c8cec
+MODAL_WORKSPACE=ws_eaef96004dac
+MODAL_ENVIRONMENT=(default)
+PUBLISHER_APP=comfyui-custom-nodes-publisher
+PUBLISHER_EXISTS=YES
+PUBLISHER_FUNCTION_EXISTS=YES
+PUBLISHER_VERSION=8
+LOCAL_CONTENT_GENERATION=0abfd8430bce434dece36a645e8643d2a8091a59b4d069aff49c4876a17d8196
+REMOTE_CONTENT_GENERATION=0abfd8430bce434dece36a645e8643d2a8091a59b4d069aff49c4876a17d8196
+PUBLICATION_DECISION=skip_exact
+DEPLOY_LOCK=CLEAR
+READY_FOR_CONSUMER_DEPLOY=YES
+[v2ctl.deploy] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260903-102629_a21a57b6.json
+[v2ctl.deploy] deployment_receipt=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\receipt_1_a21a57b6aafb0863a539a7027fb98c70250438e566bf7d9cd85ef73ce64d2fd0.json

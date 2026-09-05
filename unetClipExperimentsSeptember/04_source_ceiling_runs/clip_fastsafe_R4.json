@@ -1,0 +1,87 @@
+{
+  "FILE_TO_CUDA_WALL_MS": 1539.873,
+  "arm": "fastsafe",
+  "attempt_id": "clip_fastsafe_R4",
+  "byte_validation": {
+    "checks": [
+      {
+        "bytes": 777912320,
+        "device_sha16": "eabe5625fc0575bf",
+        "key": "model.embed_tokens.weight",
+        "ok": true,
+        "source_sha16": "eabe5625fc0575bf"
+      },
+      {
+        "bytes": 5120,
+        "device_sha16": "5812f00704f74996",
+        "key": "model.layers.0.input_layernorm.weight",
+        "ok": true,
+        "source_sha16": "5812f00704f74996"
+      },
+      {
+        "bytes": 5242880,
+        "device_sha16": "779c6f0d454d2ffd",
+        "key": "model.layers.9.self_attn.v_proj.weight",
+        "ok": true,
+        "source_sha16": "779c6f0d454d2ffd"
+      },
+      {
+        "bytes": 5120,
+        "device_sha16": "2e185da56e34e546",
+        "key": "model.norm.weight",
+        "ok": true,
+        "source_sha16": "2e185da56e34e546"
+      }
+    ],
+    "ok": true
+  },
+  "campaign_index": 8,
+  "classification": "ELIGIBLE",
+  "file_size_bytes": 8044982048,
+  "fixed_config": {
+    "bbuf_size_kb": 524288,
+    "disable_cache": true,
+    "loader": "fastsafetensors.SafeTensorsFileLoader",
+    "max_copy_block_size": 67108864,
+    "nogds": true,
+    "threads": 8,
+    "use_buf_register": false
+  },
+  "fixed_config_expected": {
+    "bbuf_size_kb": 524288,
+    "disable_cache": true,
+    "loader": "fastsafetensors.SafeTensorsFileLoader",
+    "max_copy_block_size": 67108864,
+    "nogds": true,
+    "threads": 8,
+    "use_buf_register": false
+  },
+  "identity": {
+    "container_session_id": "ta-01M1PHPNKRFVE56QRQ4QEJQKFR",
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-v2C7hQYVNqlPjiTAGPuwOh",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "model_construction": false,
+  "model_name": "qwen_3_4b.safetensors",
+  "oracle_wall_ms": 3744.4503,
+  "ownership": {
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 47417881788416
+  },
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_bytes": 8044936192,
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "status": "ok",
+  "tensor_count": 398,
+  "timing_scope": "copy_files_to_device entry -> required torch.cuda.synchronize return; header/add_filenames and post-ready validation excluded"
+}

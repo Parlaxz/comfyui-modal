@@ -53,7 +53,8 @@ _MANIFEST_PATH_RE = re.compile(
 
 def _is_golden_config(config: "ResolvedConfig") -> bool:
     """Return whether this request uses the dedicated Golden harness."""
-    return str(getattr(config, "profile_name", "") or "") == "golden_p1"
+    profile = str(getattr(config, "profile_name", "") or "").strip().lower()
+    return profile == "golden_p1" or profile.startswith("golden_p1_direct")
 
 
 def _normalize_logged_path(raw: str) -> Path:

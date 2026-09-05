@@ -1,0 +1,27 @@
+{
+  "arm": "qd1",
+  "attempt_id": "clip_b256_qd1_R4",
+  "campaign_index": 103,
+  "classification": "DNF",
+  "error": "RuntimeError:static_e27_qd_must_be_2_4_or_8",
+  "identity": {
+    "container_session_id": "ta-01M1PTCWY1MMGMFS8T0GQM3A7R",
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-wB4OigJuYJ6uLNwDQHOiFD",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "model_construction": false,
+  "model_name": "qwen_3_4b.safetensors",
+  "oracle_wall_ms": 1496.6961,
+  "path_resolution": "fixed_read_only_models_mount",
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "status": "error"
+}

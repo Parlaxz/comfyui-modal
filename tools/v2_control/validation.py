@@ -36,6 +36,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+
+def _is_golden_profile(config: Any) -> bool:
+    profile = str(getattr(config, "profile_name", "") or "").strip().lower()
+    return profile == "golden_p1" or profile.startswith("golden_p1_direct")
+
 from .backend import detect_crash_loop
 from .errors import GateError
 from .experiment_evidence import (
@@ -627,7 +632,7 @@ class StructuralValidator(ValidatorPlugin):
         # through the equally fail-closed Golden contract instead of allowing
         # a generic external run projection to stand in for the cohort.
         if (
-            str(getattr(config, "profile_name", "") or "") == "golden_p1"
+            _is_golden_profile(config)
             and getattr(getattr(record, "artifacts", None), "campaign_manifest", None) is not None
         ):
             return GoldenCohortValidator().validate(record, config)
@@ -741,7 +746,7 @@ class ExpectedOutputShaValidator(ValidatorPlugin):
         if record.output_sha is None:
             return ["output SHA unavailable: backend produced no output_sha line"]
         if record.output_sha != expected:
-            if str(getattr(config, "profile_name", "") or "") == "golden_p1":
+            if _is_golden_profile(config):
                 LOG.warning(
                     "Golden output SHA mismatch is warning-only: expected=%s observed=%s",
                     expected,
@@ -1197,7 +1202,7 @@ class GoldenCohortValidator(ValidatorPlugin):
         return value if isinstance(value, dict) else None
 
     def validate(self, record: RunRecord, config: Any) -> list[str]:
-        if str(getattr(config, "profile_name", "") or "") != "golden_p1":
+        if not _is_golden_profile(config):
             return []
 
         failures: list[str] = []
@@ -2473,7 +2478,7 @@ def _assert_canonical_backend_identity(
     Golden, however, an omitted or contradictory identity is unsafe: the
     backend must not get a chance to select its restore-only default.
     """
-    if str(getattr(config, "profile_name", "") or "") != "golden_p1":
+    if not _is_golden_profile(config):
         return
 
     target = getattr(config, "target", None)

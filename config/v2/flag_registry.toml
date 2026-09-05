@@ -675,8 +675,74 @@ default = "legacy"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "golden-p1"
-enum_values = ["legacy", "dispatcher", "static_e27"]
+enum_values = ["legacy", "dispatcher", "static_e27", "decoupled"]
 description = "Golden QD4 transport arm for the isolated RA9C comparison."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_QD"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source-reader queue depth, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES"
+type = "int"
+default = "33554432"
+min = 1
+max = 1073741824
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source-read block size in bytes, 1..1073741824."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_H2D_COPY_BYTES"
+type = "int"
+default = "33554432"
+min = 1
+max = 1073741824
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden host-to-device copy extent in bytes, 1..1073741824."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden in-flight H2D extent depth, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_CAPACITY"
+type = "int"
+default = "8"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source staging capacity, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES"
+type = "int"
+default = "33554432"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+min = 33554432
+max = 1073741824
+description = "Golden direct-source geometry; runtime accepts only 32, 64, 128, 256, 512, or 1024 MiB."
 
 [[flag]]
 name = "COMFYMODAL_V2_GPU_FAST_RETURN"

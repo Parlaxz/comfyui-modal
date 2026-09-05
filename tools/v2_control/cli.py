@@ -84,6 +84,13 @@ GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def is_golden_profile_name(profile: object) -> bool:
+    value = str(profile or "").strip().lower()
+    return value == GOLDEN_P1_PROFILE or value.startswith("golden_p1_direct")
+
+
 DEFAULT_MODAL_ENVIRONMENT = "(default)"
 PUBLISHER_FUNCTION_NAME = "sync_custom_nodes_to_volume"
 PUBLISHER_PREFLIGHT_FIELDS = (
@@ -307,7 +314,7 @@ def _reject_golden_identity_args(args, *, public: bool = False) -> int | None:
     refusal rather than silently changing the target.
     """
     profile = str(getattr(args, "profile", "") or "")
-    is_golden = profile == GOLDEN_P1_PROFILE
+    is_golden = is_golden_profile_name(profile)
     raw_app = getattr(args, "app", None)
     if raw_app:
         try:
@@ -481,7 +488,7 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     mode.  Returns None when no selector applies (plain production run).
     """
     try:
-        if config.profile_name == GOLDEN_P1_PROFILE:
+        if is_golden_profile_name(config.profile_name):
             return GOLDEN_P1_SELECTOR
         env = {f.name: f.value for f in config.flags}
         if config.profile_name == E37_CLEAN_LANE_PROFILE or any(
@@ -520,7 +527,7 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
     """
     # The dedicated Golden harness is selected by the canonical positional
     # selector; keep the resolved environment and expected-output contract.
-    if config.profile_name == GOLDEN_P1_PROFILE:
+    if is_golden_profile_name(config.profile_name):
         expected_sha = str(config.workload.expected_output_sha or "").strip()
         args = [
             "--run-count",
@@ -615,7 +622,7 @@ def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
         )
         mode = str(env.get("V2_BENCHMARK_MODE", "") or "e28_single").strip()
         if (
-            config.profile_name == GOLDEN_P1_PROFILE
+            is_golden_profile_name(config.profile_name)
             and (mode_flag is None or getattr(mode_flag, "source", "") == "default")
         ):
             return GOLDEN_P1_MODE
@@ -649,13 +656,13 @@ def _reject_golden_mode_override(
     profile = str(getattr(config, "profile_name", "") or "")
     mode_flag = config.flag("V2_BENCHMARK_MODE")
     effective_mode = _benchmark_mode(config)
-    if profile != GOLDEN_P1_PROFILE and effective_mode == GOLDEN_P1_MODE:
+    if not is_golden_profile_name(profile) and effective_mode == GOLDEN_P1_MODE:
         raise GateError(
             f"{command} refuses V2_BENCHMARK_MODE={GOLDEN_P1_MODE} for "
             f"non-Golden profile {profile or '(missing)'}; only "
             f"{GOLDEN_P1_PROFILE} may use that mode"
         )
-    if profile != GOLDEN_P1_PROFILE:
+    if not is_golden_profile_name(profile):
         return
     if mode_flag is None or mode_flag.source not in {"cli", "inherit", "set"}:
         return
@@ -689,7 +696,7 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
     profile = str(getattr(config, "profile_name", "") or "")
     target = getattr(config, "target", None)
     method = str(getattr(target, "method", "") or "").strip()
-    if profile == GOLDEN_P1_PROFILE:
+    if is_golden_profile_name(profile):
         if method != GOLDEN_P1_METHOD:
             raise GateError(
                 f"{command} refuses golden_p1 target.method={method or '(missing)'}; "
@@ -2165,7 +2172,7 @@ def cmd_golden(args, repo_root: Path) -> int:
         )
         return 2
     requested_profile = getattr(args, "profile", "production")
-    if requested_profile not in ("production", GOLDEN_P1_PROFILE):
+    if requested_profile != "production" and not is_golden_profile_name(requested_profile):
         print(
             f"ERROR: `golden` commands use profile {GOLDEN_P1_PROFILE!r}; "
             f"received --profile {requested_profile!r}",
@@ -2185,7 +2192,8 @@ def cmd_golden(args, repo_root: Path) -> int:
                 file=sys.stderr,
             )
             return 2
-    args.profile = GOLDEN_P1_PROFILE
+    if requested_profile == "production":
+        args.profile = GOLDEN_P1_PROFILE
     args.golden_public = True
     if args.golden_command == "run":
         if args.run_count not in (None, 1):
@@ -2829,7 +2837,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl deploy")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if config.profile_name == GOLDEN_P1_PROFILE else None
+            if is_golden_profile_name(config.profile_name) else None
         )
         unregistered_explicit = [
             flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
@@ -2843,7 +2851,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
                 file=sys.stderr,
             )
         invocation_id = _new_invocation_id()
-        native_golden = config.profile_name == GOLDEN_P1_PROFILE
+        native_golden = is_golden_profile_name(config.profile_name)
         spec = (
             backend_registry.native_deploy()
             if native_golden else backend_registry.deploy_only()
@@ -3137,10 +3145,10 @@ def cmd_run(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl run")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if config.profile_name == GOLDEN_P1_PROFILE else None
+            if is_golden_profile_name(config.profile_name) else None
         )
         bound_receipt = None
-        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+        if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
                               if workspace_binding is not None else {})
             _, bound_receipt = _bound_deployment_receipt(
@@ -3149,7 +3157,14 @@ def cmd_run(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="run")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
+                ack_drift = bool(getattr(args, "acknowledge_volume_drift", False))
+                if ack_drift:
+                    print(
+                        "[v2ctl.run] WARNING: operator acknowledged volume drift; "
+                        "skipping exact-content publisher preflight gate",
+                        file=sys.stderr,
+                    )
+                run_publisher_preflight(repo_root, workspace_binding, require_ready=not ack_drift)
         # Run-only: refuse unregistered and deploy-required explicit changes.
         resolver.check_run_safety(
             config, run_only=True,
@@ -3222,6 +3237,8 @@ def cmd_run(args, repo_root: Path) -> int:
             env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] = val_mod._bound_run_fingerprint(
                 fingerprints, bound_receipt
             )
+        if bool(getattr(args, "acknowledge_volume_drift", False)):
+            env["COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT"] = "1"
         # Forward the canonical selector as the BAT's first positional arg so
         # the run BAT enters its validation mode (e.g. E28_VALIDATION) instead
         # of falling into the snapshot_restore_only probe branch.
@@ -3368,10 +3385,10 @@ def cmd_gate(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl gate")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if config.profile_name == GOLDEN_P1_PROFILE else None
+            if is_golden_profile_name(config.profile_name) else None
         )
         bound_receipt = None
-        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+        if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
                               if workspace_binding is not None else {})
             _, bound_receipt = _bound_deployment_receipt(
@@ -3431,12 +3448,12 @@ def cmd_gate(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
-        if config.profile_name == GOLDEN_P1_PROFILE:
+        if is_golden_profile_name(config.profile_name):
             validator.register(val_mod.GoldenCohortValidator())
         # Golden has its own dedicated durability/seriality ledger contract;
         # the generic E29 run-plan ledger is not emitted by
         # run_golden_serial_stream.
-        if config.profile_name != GOLDEN_P1_PROFILE:
+        if not is_golden_profile_name(config.profile_name):
             validator.register(val_mod.CanonicalLedgerValidator())
         e31_validator = val_mod.E31ForensicsValidator()
         if e31_validator.applies(config):
@@ -3506,10 +3523,10 @@ def cmd_confirm(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl confirm")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if config.profile_name == GOLDEN_P1_PROFILE else None
+            if is_golden_profile_name(config.profile_name) else None
         )
         bound_receipt = None
-        if config.profile_name == GOLDEN_P1_PROFILE and not getattr(args, "dry_run", False):
+        if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
                               if workspace_binding is not None else {})
             _, bound_receipt = _bound_deployment_receipt(
@@ -3549,7 +3566,7 @@ def cmd_confirm(args, repo_root: Path) -> int:
         validator = val_mod.Validator()
         validator.register(val_mod.StructuralValidator())
         validator.register(val_mod.ExpectedOutputShaValidator())
-        if config.profile_name == GOLDEN_P1_PROFILE:
+        if is_golden_profile_name(config.profile_name):
             validator.register(val_mod.GoldenCohortValidator())
         # Confirm must enforce the same canonical ledger contract as gate;
         # otherwise an E37 gate could pass while confirmation silently drops
@@ -3557,7 +3574,7 @@ def cmd_confirm(args, repo_root: Path) -> int:
         # Golden has its own dedicated durability/seriality ledger contract;
         # the generic E29 run-plan ledger is not emitted by
         # run_golden_serial_stream.
-        if config.profile_name != GOLDEN_P1_PROFILE:
+        if not is_golden_profile_name(config.profile_name):
             validator.register(val_mod.CanonicalLedgerValidator())
         e31_validator = val_mod.E31ForensicsValidator()
         if e31_validator.applies(config):
@@ -3611,7 +3628,7 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         _reject_golden_mode_override(config, command="v2ctl source-probe")
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if config.profile_name == GOLDEN_P1_PROFILE else None
+            if is_golden_profile_name(config.profile_name) else None
         )
         if getattr(args, "dry_run", False):
             print("[v2ctl.dry-run] no invocation performed; source probe skipped")
@@ -3624,7 +3641,7 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         class_name = config.target.class_name
         gpu = config.resources.gpu
         bound_receipt = None
-        if config.profile_name == GOLDEN_P1_PROFILE:
+        if is_golden_profile_name(config.profile_name):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
                               if workspace_binding is not None else {})
             _, bound_receipt = _bound_deployment_receipt(
@@ -3909,6 +3926,15 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
             child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                                help="resolve and print, invoke nothing")
+            if name == "run":
+                child.add_argument(
+                    "--acknowledge-volume-drift",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="run despite local/Volume content-generation drift; "
+                    "deliberately skips the exact-content publisher preflight gate "
+                    "(operator accepts a stale shared Volume read)",
+                )
         child.set_defaults(func=cmd_golden)
 
     p = sub.add_parser("source-probe")

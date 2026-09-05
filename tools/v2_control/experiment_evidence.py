@@ -406,7 +406,7 @@ def sage_runtime_identity(config: Any, *sources: Any) -> dict[str, str]:
 def is_experiment_profile(config: Any) -> bool:
     """Identify Golden/RX control-plane experiments without a second runner."""
     profile = str(getattr(config, "profile_name", "") or "").strip().lower()
-    return profile == "golden_p1" or profile.startswith(("rx", "ra"))
+    return profile == "golden_p1" or profile.startswith(("golden_p1_direct", "rx", "ra"))
 
 
 def _jsonable(value: Any) -> Any:
@@ -983,12 +983,11 @@ def finalize_experiment_evidence(
         for explicit in (gate_manifest, confirmation_manifest, *extra_paths):
             if explicit:
                 paths.append(Path(explicit))
-        # Persisted v2ctl state is the authoritative local control-plane
-        # evidence.  Include it wholesale; it is already ignored and callers
-        # must be able to audit every gate/receipt/confirmation path.
-        state_root = root / ".v2ctl"
-        if state_root.is_dir():
-            paths.extend(p for p in state_root.rglob("*") if p.is_file())
+        # The invocation-bound manifests and explicitly supplied gate or
+        # confirmation paths above are the control-plane evidence for this
+        # result.  Do not recursively copy all persisted v2ctl state: its
+        # historical artifact references can duplicate gigabytes of data into
+        # every evidence bundle.
         profile_name = str(frozen.get("profile", "") or "")
         for config_path in (
             root / "config" / "v2" / "flag_registry.toml",

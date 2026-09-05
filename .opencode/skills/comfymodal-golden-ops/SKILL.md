@@ -87,6 +87,8 @@ python tools/v2ctl.py --profile golden_p1 --app <experimental-app> source-probe
 
 python tools/v2ctl.py golden run --app <experimental-app>
 
+python tools/v2ctl.py golden run --app <experimental-app> --acknowledge-volume-drift
+
 python tools/v2ctl.py gate --profile golden_p1 --app <experimental-app>
 
 python tools/v2ctl.py --profile golden_p1 --app <experimental-app> confirm --from <gate-manifest> --runs 5
@@ -104,6 +106,15 @@ Do not directly use:
 - multi-request backend invocations
 
 If the public Golden interface breaks, fix the public interface instead of bypassing it.
+
+`--acknowledge-volume-drift` deliberately skips only the exact-content
+publisher preflight gate (`require_ready`) on `golden run`. The run still
+binds the immutable deployment receipt, still requires source-probe evidence,
+and records `COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT=1` in the run
+manifest. Use it only when the operator explicitly accepts that the shared
+custom-nodes Volume may not match the local tree (e.g. another authorized lane
+is writing publishable files mid-cohort). It never overrides the deployment
+fingerprint, the receipt, or the output contract.
 
 ## Normal experiment procedure
 
