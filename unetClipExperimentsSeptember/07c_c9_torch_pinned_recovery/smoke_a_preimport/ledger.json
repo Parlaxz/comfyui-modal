@@ -1,0 +1,76 @@
+{
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "arm": "source_only",
+  "attempts": [
+    {
+      "artifact": "unetClipExperimentsSeptember\\07c_c9_torch_pinned_recovery\\smoke_a_preimport\\runs\\20260905T054931_2e4786b4_c9_o01_unet_qd8.json",
+      "attempt_id": "20260905T054931_2e4786b4_c9_o01_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 1,
+      "cell_id": "unet_qd8",
+      "finished_at": "2026-09-05T05:49:38.956149+00:00",
+      "finished_monotonic_ns": 229204562000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 1,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T054931_2e4786b4",
+      "started_at": "2026-09-05T05:49:31.958396+00:00",
+      "started_monotonic_ns": 229197562000000,
+      "status": "COMPLETE",
+      "wall_ms": 7000.0
+    },
+    {
+      "artifact": "unetClipExperimentsSeptember\\07c_c9_torch_pinned_recovery\\smoke_a_preimport\\runs\\20260905T054931_2e4786b4_c9_o02_unet_qd8.json",
+      "attempt_id": "20260905T054931_2e4786b4_c9_o02_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 2,
+      "cell_id": "unet_qd8",
+      "finished_at": "2026-09-05T05:49:46.639323+00:00",
+      "finished_monotonic_ns": 229212250000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 2,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T054931_2e4786b4",
+      "started_at": "2026-09-05T05:49:38.961152+00:00",
+      "started_monotonic_ns": 229204562000000,
+      "status": "COMPLETE",
+      "wall_ms": 7688.0
+    }
+  ],
+  "experiment": "c9_recovery",
+  "geometry": {
+    "block_bytes": 33554432,
+    "expected_attempts_per_run": 2,
+    "models": {
+      "unet": "z_image_turbo_bf16.safetensors"
+    },
+    "observations_per_model_qd": 2,
+    "qd_values": [
+      8
+    ],
+    "roles": [
+      "unet"
+    ]
+  },
+  "runs": [
+    {
+      "attempt_ids": [
+        "20260905T054931_2e4786b4_c9_o01_unet_qd8",
+        "20260905T054931_2e4786b4_c9_o02_unet_qd8"
+      ],
+      "completed_attempts": 2,
+      "expected_attempts": 2,
+      "finished_at": "2026-09-05T05:49:46.644326+00:00",
+      "run_id": "20260905T054931_2e4786b4",
+      "started_at": "2026-09-05T05:49:31.367047+00:00",
+      "status": "COMPLETE"
+    }
+  ],
+  "status": "COMPLETE",
+  "updated_at": "2026-09-05T05:49:46.644326+00:00",
+  "version": 1
+}

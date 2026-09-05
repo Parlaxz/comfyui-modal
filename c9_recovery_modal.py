@@ -2,13 +2,11 @@
 
 This is intentionally separate from Golden and from the historical E04
 campaign.  It reads only the safetensors payload from the read-only models
-Volume and never imports torch or attaches an accelerator.
+Volume, using Torch pinned host buffers and no H2D/model work.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import platform
 import stat
@@ -24,8 +22,10 @@ SOURCE_ROLES = ("clip", "unet")
 MODELS = {"clip": "qwen_3_4b.safetensors", "unet": "z_image_turbo_bf16.safetensors"}
 MODELS_ROOT = "/root/models"
 MODELS_VOLUME_NAME = "comfyui-models"
-DECLARED_CPU = 4
+DECLARED_CPU = 12
 DECLARED_MEMORY_MB = 8192
+DECLARED_GPU = "rtx-pro-6000"
+SMOKE_TIMEOUT_SECONDS = 300
 APP_NAME = os.environ.get(
     "COMFYMODAL_C9_RECOVERY_APP_NAME", "sept-unetclip-c9-recovery-source-only"
 )
@@ -34,8 +34,16 @@ _ROOT = Path(__file__).resolve().parent
 
 try:
     _image = (
-        modal.Image.debian_slim(python_version="3.11")
+        modal.Image.from_registry(
+            "nvidia/cuda:13.0.0-devel-ubuntu24.04", add_python="3.11"
+        )
         .entrypoint([])
+        .run_commands(
+            "python -m pip install --upgrade --force-reinstall "
+            "torch torchvision torchaudio "
+            "--index-url https://download.pytorch.org/whl/cu130",
+            gpu="a10g",
+        )
         .add_local_python_source("comfymodal_runtime", copy=True)
         .add_local_file(str(_ROOT / "c9_recovery_modal.py"), "/root/c9_recovery_modal.py", copy=True)
     )
@@ -134,23 +142,13 @@ def _identity(path: Path, evidence: Mapping[str, Any]) -> dict[str, Any]:
         info = {"path": str(path), "error": f"{type(exc).__name__}:{exc}"}
     data_start = int(evidence.get("data_start") or 0)
     payload_bytes = int(evidence.get("payload_bytes") or 0)
-    block_digests = [
-        {
-            "offset": item.get("source_offset"),
-            "bytes": item.get("returned_bytes"),
-            "sha256": item.get("sha256"),
-        }
-        for worker in evidence.get("workers", [])
-        for item in worker.get("block_digests", [])
-    ]
-    manifest = json.dumps(sorted(block_digests, key=lambda item: int(item["offset"])), sort_keys=True, separators=(",", ":")).encode()
     return {
         "file_identity": info,
         "payload_identity": {
             "data_start": data_start,
             "payload_bytes": payload_bytes,
-            "block_digest_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
-            "hash_scope": "all measured payload blocks; no second payload scan",
+            "integrity_verification": "not performed",
+            "hash_scope": "no payload hashing in the measured source loop",
         },
         "filesystem_identity": _filesystem_identity(path),
     }
@@ -161,22 +159,47 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
     result["experiment"] = "c9_recovery"
     result["source_block_bytes"] = SOURCE_BLOCK_BYTES
     result["source_qd"] = qd
-    result["gpu_attachment"] = {"attached": False, "requested": False, "reason": "source_only"}
+    result["gpu_attachment"] = {
+        "attached": True,
+        "requested": True,
+        "gpu": DECLARED_GPU,
+        "reason": "CUDA-enabled Torch environment; source loop performs no CUDA work",
+    }
+    result.setdefault("identity", {})["gpu"] = DECLARED_GPU
+    result["identity"]["accelerator"] = "cuda"
     result["execution_contract"] = {
         "source_only": True,
-        "torch_imported": False,
+        "torch_imported": result.get("torch_imported") is True,
         "cuda_used": False,
+        "cuda_available": result.get("cuda_available"),
         "h2d_used": False,
         "model_construction": False,
         "dispatcher_participation": False,
         "filesystem_mount": MODELS_ROOT,
         "mount_read_only": True,
-        "fd_topology": "one read-only file descriptor per worker; positioned reads",
+        "fd_topology": "one shared read-only file descriptor; positioned reads",
         "range_geometry": "static contiguous disjoint payload ranges",
         "workers_per_lane": 1,
         "block_bytes": SOURCE_BLOCK_BYTES,
         "qd_values": list(SOURCE_QD_VALUES),
+        "hashing_in_timed_loop": False,
+        "allocation_in_timed_loop": False,
+        "telemetry_in_timed_loop": False,
+        "timing_boundary": result.get("timing_boundary"),
+        "buffer_type": "pytorch_pinned_host",
+        "buffer_allocations": "one reusable Torch tensor per worker",
     }
+    result["fd_topology"] = result.get("fd_topology") or {
+        "mode": "one_shared_fd", "open_count": 1, "shared_by_workers": True,
+        "close_after_all_workers": True,
+    }
+    result["buffer_type"] = result.get("buffer_type")
+    result["buffer_allocations"] = result.get("buffer_allocations")
+    result["hashing_in_timed_loop"] = result.get("hashing_in_timed_loop") is True
+    result["allocation_in_timed_loop"] = result.get("allocation_in_timed_loop") is True
+    result["telemetry_in_timed_loop"] = result.get("telemetry_in_timed_loop") is True
+    result["timing_boundary"] = result.get("timing_boundary") or {}
+    result["SOURCE_WALL_MS"] = result.get("C9_TOTAL_WALL_MS")
     raw_events = list(result.get("physical_syscall_telemetry") or [])
     reads = []
     for event in raw_events:
@@ -193,12 +216,24 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
             "syscall_end_ns": event.get("syscall_exit_monotonic_ns"),
             "error": event.get("error"),
         })
-    result["physical_reads"] = reads
+    compact_reads = []
+    for item in result.get("read_size_evidence") or reads:
+        compact_reads.append({
+            "worker_id": int(item.get("worker_id", item.get("producer_id", -1))),
+            "region_id": item.get("region_id"),
+            "offset": int(item.get("offset", item.get("source_offset", 0))),
+            "source_offset": int(item.get("source_offset", item.get("offset", 0))),
+            "requested_bytes": int(item.get("requested_bytes", 0)),
+            "returned_bytes": int(item.get("returned_bytes", 0)),
+            "retry_number": int(item.get("retry_number", 0)),
+        })
+    result["physical_reads"] = reads if raw_events else []
+    result["read_size_evidence"] = compact_reads
     result["active_reader_transitions"] = list(result.get("source_qd_timeline") or [])
     raw = result.get("actual_source") or {}
     result["qd_telemetry"] = {
-        "max_achieved_qd": raw.get("max_actual_source_inflight"),
-        "time_weighted_achieved_qd": raw.get("time_weighted_mean_qd"),
+        "max_achieved_qd": raw.get("max_actual_source_inflight") or result.get("achieved_source_qd_max"),
+        "time_weighted_achieved_qd": raw.get("time_weighted_mean_qd") or result.get("achieved_source_qd_mean"),
         "time_at_qd_ms": raw.get("time_at_qd_ms") or raw.get("milliseconds_at_qd"),
         "active_interval_start_ns": raw.get("source_active_interval_start_ns"),
         "active_interval_end_ns": raw.get("source_active_interval_end_ns"),
@@ -206,20 +241,32 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
     result["max_achieved_qd"] = result["qd_telemetry"]["max_achieved_qd"]
     result["time_weighted_achieved_qd"] = result["qd_telemetry"]["time_weighted_achieved_qd"]
     result["time_at_qd_ms"] = result["qd_telemetry"]["time_at_qd_ms"]
-    requested = sum(item["requested_bytes"] for item in reads)
-    returned = sum(item["returned_bytes"] for item in reads)
+    evidence_reads = result["read_size_evidence"]
+    requested = int(result.get("source_requested_bytes") or sum(
+        int(item["requested_bytes"]) for item in evidence_reads
+    ))
+    returned = int(result.get("source_returned_bytes") or sum(
+        int(item["returned_bytes"]) for item in evidence_reads
+    ))
     result["byte_reconciliation"] = {
         "expected_payload_bytes": result.get("payload_bytes"),
         "requested_bytes": requested,
         "returned_bytes": returned,
-        "read_count": len(reads),
+        "read_count": int(result.get("source_read_count") or len(evidence_reads)),
         "returned_equals_expected": returned == int(result.get("payload_bytes") or 0),
-        "offsets_recorded_per_physical_read": True,
+        "offsets_recorded_per_physical_read": result.get("read_evidence_complete") is True,
     }
     by_id = {int(row.get("producer_id")): dict(row) for row in result.get("workers", [])}
     reads_by_worker: dict[int, list[dict[str, Any]]] = {}
-    for read in reads:
+    for read in evidence_reads:
         reads_by_worker.setdefault(int(read["worker_id"]), []).append(read)
+    buffer_rows = {
+        int(row.get("worker_id", index)): row
+        for index, row in enumerate(
+            ((result.get("pinned_host_evidence") or {}).get("buffers") or [])
+        )
+        if isinstance(row, dict)
+    }
     workers = []
     for region in result.get("regions", []):
         worker_id = int(region["producer_id"])
@@ -235,8 +282,13 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
             "worker_terminated_ns": end,
             "worker_wall_ms": (float(end - start) / 1_000_000.0) if start is not None and end is not None else None,
             "source_bytes": int(row.get("source_bytes", 0)),
-            "source_requested_bytes": sum(item["requested_bytes"] for item in reads_by_worker.get(worker_id, [])),
-            "source_read_count": int(row.get("source_read_count", 0)),
+            "source_requested_bytes": int(row.get(
+                "source_requested_bytes",
+                sum(item["requested_bytes"] for item in reads_by_worker.get(worker_id, [])),
+            )),
+            "source_read_count": int(row.get("source_read_count", len(reads_by_worker.get(worker_id, [])))),
+            "buffer": buffer_rows.get(worker_id),
+            "is_pinned": (buffer_rows.get(worker_id) or {}).get("is_pinned") is True,
             "status": "ok" if row else "missing",
         })
     result["workers"] = workers
@@ -254,19 +306,32 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
         "hostname": platform.node(),
         "single_use_container": True,
     }
+    oracle_cpu = dict(
+        ((result.get("identity") or {}).get("cpu_allocation") or {})
+        or (result.get("cpu_allocation") or {})
+    )
+    observed_runtime_shape_cpu = oracle_cpu.get(
+        "observed_runtime_shape_cpu_request",
+        oracle_cpu.get("cpu_request"),
+    )
     result["cpu_allocation"] = {
-        **dict(result.get("cpu_allocation") or {}),
+        **oracle_cpu,
         "declared_modal_function_cpu": DECLARED_CPU,
         "declared_memory_mb": DECLARED_MEMORY_MB,
+        "requested_cpu": DECLARED_CPU,
+        "observed_cpu": observed_runtime_shape_cpu,
     }
+    result["cpu_requested"] = DECLARED_CPU
+    result["cpu_observed"] = observed_runtime_shape_cpu
     return result
 
 
 @app.function(
     image=_image,
+    gpu=DECLARED_GPU,
     cpu=DECLARED_CPU,
     memory=DECLARED_MEMORY_MB,
-    timeout=3600,
+    timeout=SMOKE_TIMEOUT_SECONDS,
     retries=0,
     min_containers=0,
     single_use_containers=True,
@@ -277,6 +342,7 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
         "COMFYMODAL_V2_CPU_REQUEST": str(DECLARED_CPU),
         "COMFYMODAL_V2_MEMORY_REQUEST": str(DECLARED_MEMORY_MB),
         "COMFYMODAL_V2_MEMORY_MB": str(DECLARED_MEMORY_MB),
+        "COMFYMODAL_V2_GPU": DECLARED_GPU,
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUTF8": "1",
     },
@@ -301,7 +367,45 @@ def run_c9_recovery(role: str, model_name: str, qd: int, attempt_id: str = "") -
         attempt_id=str(attempt_id),
     )
     result = _normalize_evidence(result, role, model_name, qd)
+    if result.get("status") != "ok":
+        # Preserve the oracle's actionable failure.  Do not replace an
+        # allocation/pinning/read error with a misleading postcondition error.
+        return result
     fixed = result.get("fixed_config") or {}
     if fixed.get("source_block_bytes") != SOURCE_BLOCK_BYTES:
         raise RuntimeError("c9_block_bytes_not_enforced")
+    return result
+
+
+@app.function(
+    image=_image,
+    gpu=DECLARED_GPU,
+    cpu=DECLARED_CPU,
+    memory=DECLARED_MEMORY_MB,
+    timeout=SMOKE_TIMEOUT_SECONDS,
+    retries=0,
+    min_containers=0,
+    single_use_containers=True,
+    env={
+        "COMFYMODAL_C9_RECOVERY": "1",
+        "COMFYMODAL_E04_DECLARED_CPU": str(DECLARED_CPU),
+        "COMFYMODAL_V2_CPU_REQUEST": str(DECLARED_CPU),
+        "COMFYMODAL_V2_MEMORY_REQUEST": str(DECLARED_MEMORY_MB),
+        "COMFYMODAL_V2_MEMORY_MB": str(DECLARED_MEMORY_MB),
+        "COMFYMODAL_V2_GPU": DECLARED_GPU,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    },
+)
+def run_c9_capability_smoke(worker_count: int = 1) -> dict[str, Any]:
+    """Smoke 0: check Torch/CUDA/pinned buffers without reading a model."""
+    from comfymodal_runtime.source_ceiling_oracle import run_c9_capability_smoke as probe
+
+    result = probe(worker_count=int(worker_count))
+    result.update({
+        "cpu_requested": DECLARED_CPU,
+        "memory_requested_mb": DECLARED_MEMORY_MB,
+        "gpu_requested": DECLARED_GPU,
+        "single_use_container": True,
+    })
     return result

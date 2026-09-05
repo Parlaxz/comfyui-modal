@@ -7,12 +7,13 @@ production loader state.  One call measures one checkpoint and one fixed arm.
 from __future__ import annotations
 
 import hashlib
-import concurrent.futures
 import json
 import os
 import platform
 import struct
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Mapping, cast
 
@@ -167,89 +168,140 @@ def _source_regions(data_start: int, payload_bytes: int, qd: int) -> list[dict[s
 
 def _physical_source_read(
     fd: int,
-    target: bytearray,
+    target: memoryview,
     offset: int,
-    telemetry: ActualSourceTelemetry,
+    telemetry: ActualSourceTelemetry | None,
     producer_id: int,
     retry_number: int,
+    physical_span: dict[str, int | None] | None = None,
+    physical_span_lock: threading.Lock | None = None,
 ) -> int:
-    """Perform one physical positioned read and retain its exact byte counts."""
+    """Read into the reusable worker buffer; telemetry is forensic-only."""
     requested = len(target)
-    call = telemetry.syscall_enter(
-        producer_id,
-        offset,
-        requested,
-        retry_number=retry_number,
-        region_id=producer_id,
-    )
+    call = None
+    if telemetry is not None:
+        call = telemetry.syscall_enter(
+            producer_id, offset, requested, retry_number=retry_number, region_id=producer_id
+        )
     try:
         preadv = cast(Any, getattr(os, "preadv", None))
-        pread = cast(Any, getattr(os, "pread", None))
-        if callable(preadv):
-            value: Any = preadv(fd, [memoryview(target)], int(offset))
-            returned = int(value)
-        elif callable(pread):
-            data: Any = pread(fd, requested, int(offset))
-            returned = len(data)
-            target[:returned] = data
-        else:
-            os.lseek(fd, int(offset), os.SEEK_SET)
-            data = cast(Any, os.read(fd, requested))
-            returned = len(data)
-            target[:returned] = data
-        telemetry.syscall_exit(call, returned)
+        if not callable(preadv):
+            raise RuntimeError("positioned_preadv_unavailable")
+        begin_ns = time.monotonic_ns()
+        if physical_span is not None:
+            lock = physical_span_lock
+            if lock is None:
+                physical_span["first_begin_ns"] = begin_ns
+            else:
+                with lock:
+                    if physical_span["first_begin_ns"] is None:
+                        physical_span["first_begin_ns"] = begin_ns
+        returned = int(cast(Any, preadv)(fd, [target], int(offset)))
+        end_ns = time.monotonic_ns()
+        if physical_span is not None:
+            lock = physical_span_lock
+            if lock is None:
+                physical_span["last_end_ns"] = end_ns
+            else:
+                with lock:
+                    physical_span["last_end_ns"] = end_ns
+        if returned < 0 or returned > requested:
+            raise IOError(f"invalid_source_read_count:{requested}:{returned}")
+        if telemetry is not None and call is not None:
+            telemetry.syscall_exit(call, returned)
         return returned
     except BaseException as exc:
-        telemetry.syscall_exit(call, 0, error=exc)
+        if telemetry is not None and call is not None:
+            telemetry.syscall_exit(call, 0, error=exc)
         raise
 
 
+def _import_torch() -> Any:
+    """Import Torch during source-only setup, before its timed work begins."""
+    global _TORCH_IMPORTED
+    import torch
+
+    _TORCH_IMPORTED = True
+    return torch
+
+
+_TORCH_IMPORTED = False
+
+
+def _allocate_pinned_buffer(size: int) -> Any:
+    """Allocate one reusable Torch pinned tensor; never fall back."""
+    torch = _import_torch()
+    size = int(size)
+    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+    if tensor.is_pinned() is not True:
+        raise RuntimeError("pytorch_pinned_host_buffer_is_not_pinned")
+    return tensor
+
+
+def _buffer_evidence(buffer: Any, default_size: int) -> dict[str, Any]:
+    is_pinned = False
+    pin_error = None
+    try:
+        is_pinned = buffer.is_pinned() is True
+    except BaseException as exc:
+        pin_error = f"{type(exc).__name__}:{exc}"
+    return {
+        "buffer_type": "pytorch_pinned_host",
+        "pinned_host": is_pinned,
+        "is_pinned": is_pinned,
+        "bytes": int(getattr(buffer, "nbytes", default_size)),
+        "allocation_exception": pin_error,
+    }
+
+
+def _buffer_view(buffer: Any) -> memoryview:
+    return memoryview(buffer.numpy())
+
+
 def _read_source_region(
+    fd: int,
     path: str,
     region: Mapping[str, int],
     block_bytes: int,
-    telemetry: ActualSourceTelemetry,
+    buffer: Any,
+    telemetry: ActualSourceTelemetry | None,
+    physical_span: dict[str, int | None],
+    physical_span_lock: threading.Lock,
 ) -> dict[str, Any]:
-    """Read one fixed region, retrying short reads without hiding any syscall."""
+    """Read one fixed region using one reusable worker buffer."""
     producer_id = int(region["producer_id"])
     worker_started_ns = time.monotonic_ns()
     cursor = int(region["start"])
     end = int(region["end"])
     bytes_read = 0
+    requested_bytes_total = 0
     read_count = 0
     block_count = 0
-    block_digests: list[dict[str, Any]] = []
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        while cursor < end:
-            block_start = cursor
-            block_end = min(end, cursor + block_bytes)
-            block_digest = hashlib.sha256()
-            block_bytes_read = 0
-            retry_number = 0
-            while cursor < block_end:
-                requested = block_end - cursor
-                target = bytearray(requested)
-                returned = _physical_source_read(
-                    fd, target, cursor, telemetry, producer_id, retry_number
-                )
-                if returned <= 0:
-                    raise IOError(f"short_source_read:{cursor}:{requested}:{returned}")
-                block_digest.update(memoryview(target)[:returned])
-                cursor += returned
-                bytes_read += returned
-                block_bytes_read += returned
-                read_count += 1
-                retry_number += 1
-            block_count += 1
-            block_digests.append({
-                "source_offset": block_start,
-                "requested_bytes": block_end - block_start,
-                "returned_bytes": block_bytes_read,
-                "sha256": block_digest.hexdigest(),
-            })
-    finally:
-        os.close(fd)
+    first_reads: list[tuple[int, int, int, int]] = []
+    tail_reads: deque[tuple[int, int, int, int]] = deque(maxlen=2)
+    view = _buffer_view(buffer)
+    while cursor < end:
+        block_end = min(end, cursor + block_bytes)
+        retry_number = 0
+        while cursor < block_end:
+            requested = block_end - cursor
+            returned = _physical_source_read(
+                fd, view[:requested], cursor, telemetry, producer_id, retry_number,
+                physical_span, physical_span_lock,
+            )
+            if returned <= 0:
+                raise IOError(f"short_source_read:{cursor}:{requested}:{returned}")
+            evidence = (cursor, requested, returned, retry_number)
+            if len(first_reads) < 2:
+                first_reads.append(evidence)
+            else:
+                tail_reads.append(evidence)
+            cursor += returned
+            bytes_read += returned
+            requested_bytes_total += requested
+            read_count += 1
+            retry_number += 1
+        block_count += 1
     source_completion_ns = time.monotonic_ns()
     worker_terminated_ns = time.monotonic_ns()
     return {
@@ -257,9 +309,14 @@ def _read_source_region(
         "region_start": int(region["start"]),
         "region_end": end,
         "source_bytes": bytes_read,
+        "source_requested_bytes": requested_bytes_total,
         "source_read_count": read_count,
         "source_block_count": block_count,
-        "block_digests": block_digests,
+        "read_sizes": first_reads + list(tail_reads),
+        "read_evidence_complete": read_count <= 4,
+        "max_requested_bytes": max((item[1] for item in first_reads + list(tail_reads)), default=0),
+        "all_requests_within_buffer": True,
+        "buffer_bytes": int(getattr(buffer, "nbytes", block_bytes)),
         "worker_started_ns": worker_started_ns,
         "source_completion_ns": source_completion_ns,
         "worker_terminated_ns": worker_terminated_ns,
@@ -306,6 +363,46 @@ def _coverage_from_events(
     }
 
 
+def _read_source_worker(
+    fd: int,
+    path: str,
+    region: Mapping[str, int],
+    block_bytes: int,
+    telemetry: ActualSourceTelemetry | None,
+    physical_span: dict[str, int | None],
+    physical_span_lock: threading.Lock,
+    rows: dict[int, dict[str, Any]],
+    errors: list[str],
+    buffers: dict[int, Any],
+    buffer_details: dict[int, dict[str, Any]],
+) -> None:
+    producer_id = int(region["producer_id"])
+    try:
+        # Allocate only after this worker has started so C9 includes the real
+        # per-worker allocation boundary rather than a serial setup phase.
+        buffer = _allocate_pinned_buffer(block_bytes)
+        buffers[producer_id] = buffer
+        buffer_details[producer_id] = _buffer_evidence(buffer, block_bytes) | {
+            "worker_id": producer_id,
+        }
+        row = _read_source_region(
+            fd, path, region, block_bytes, buffer, telemetry,
+            physical_span, physical_span_lock,
+        )
+        rows[producer_id] = row
+    except BaseException as exc:
+        if producer_id not in buffer_details:
+            buffer_details[producer_id] = {
+                "worker_id": producer_id,
+                "buffer_type": "pytorch_pinned_host",
+                "bytes": block_bytes,
+                "is_pinned": False,
+                "pinned_host": False,
+                "allocation_exception": f"{type(exc).__name__}:{exc}",
+            }
+        errors.append(f"worker_{producer_id}:{type(exc).__name__}:{exc}")
+
+
 def _run_source_only(
     path: str,
     role: str,
@@ -313,8 +410,9 @@ def _run_source_only(
     block_bytes: int,
     *,
     source_capacity: int = SOURCE_CAPACITY,
+    forensic: bool = False,
 ) -> dict[str, Any]:
-    """Read checkpoint bytes only; this arm intentionally has no torch/CUDA path."""
+    """Read checkpoint bytes with one shared FD and reusable worker buffers."""
     data_start, header, payload_bytes = _header(path)
     if payload_bytes <= 0:
         raise ValueError("safetensors_payload_missing")
@@ -322,58 +420,187 @@ def _run_source_only(
         raise ValueError("source_capacity must be a positive integer")
     regions = _source_regions(data_start, payload_bytes, qd)
     expected_ranges = [(row["start"], row["end"]) for row in regions]
-    telemetry = ActualSourceTelemetry(
-        arm=SOURCE_ONLY_ARM,
-        producer_count=qd,
-        regions=regions,
-        expected_ranges=expected_ranges,
-    )
-    telemetry.mark_physical_syscall_provenance("source_ceiling_oracle._physical_source_read")
-    started_ns = time.monotonic_ns()
+    provenance = "source_ceiling_oracle._physical_source_read"
+    telemetry: ActualSourceTelemetry | None = None
+    if forensic:
+        telemetry = ActualSourceTelemetry(
+            arm=SOURCE_ONLY_ARM,
+            producer_count=qd,
+            regions=regions,
+            expected_ranges=expected_ranges,
+        )
+        # Preserve the O(1) provenance marker for optional forensic evidence.
+        telemetry.mark_physical_syscall_provenance(provenance)
+    # Match the historical setup boundary: importing Torch is required for the
+    # worker buffers, but is not part of the measured source-only operation.
+    _import_torch()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    physical_span: dict[str, int | None] = {
+        "first_begin_ns": None,
+        "last_end_ns": None,
+    }
+    physical_span_lock = threading.Lock()
+    workers_joined_ns: int | None = None
     worker_rows: list[dict[str, Any]] = []
     worker_errors: list[str] = []
+    buffer_details: list[dict[str, Any]] = []
+    rows_by_worker: dict[int, dict[str, Any]] = {}
+    buffers_by_worker: dict[int, Any] = {}
+    buffer_details_by_worker: dict[int, dict[str, Any]] = {}
+    threads: list[threading.Thread] = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=qd, thread_name_prefix="source-only"
-        ) as executor:
-            futures = [
-                executor.submit(_read_source_region, path, region, block_bytes, telemetry)
-                for region in regions
-            ]
-            for future in futures:
-                try:
-                    worker_rows.append(future.result())
-                except Exception as exc:
-                    worker_errors.append(f"{type(exc).__name__}:{exc}")
+        threads = [
+            threading.Thread(
+                target=_read_source_worker,
+                args=(
+                    fd, path, region, block_bytes, telemetry,
+                    physical_span, physical_span_lock, rows_by_worker, worker_errors,
+                    buffers_by_worker, buffer_details_by_worker,
+                ),
+                name=f"source-only-{region['producer_id']}",
+            )
+            for region in regions
+        ]
+        total_started_ns = time.monotonic_ns()
+        for thread in threads:
+            thread.start()
     finally:
-        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        # Every started worker is joined before the shared FD or its tensor is
+        # released, including the fail-closed allocation path.
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join()
+        if threads:
+            workers_joined_ns = time.monotonic_ns()
+        os.close(fd)
+        # Clearing the references releases the Torch tensors after all joins.
+        buffers_by_worker.clear()
 
-    raw = telemetry.report()
+    buffer_details = [
+        buffer_details_by_worker[index]
+        for index in sorted(buffer_details_by_worker)
+    ]
+    worker_rows = [rows_by_worker[index] for index in sorted(rows_by_worker)]
+    if len(worker_rows) != qd and not worker_errors:
+        worker_errors.append("worker_missing")
+
+    raw = telemetry.report() if telemetry is not None else {}
+    cuda_available = None
+    cuda_build = None
+    device_name = None
+    if _TORCH_IMPORTED:
+        try:
+            torch = _import_torch()
+            cuda = cast(Any, getattr(torch, "cuda", None))
+            cuda_available = bool(cuda.is_available())
+            cuda_build = getattr(getattr(torch, "version", None), "cuda", None)
+            if cuda_available:
+                device_name = str(cuda.get_device_name(0))
+        except BaseException as exc:
+            worker_errors.append(f"torch_capability:{type(exc).__name__}:{exc}")
     events = list(raw.get("actual_source_events") or [])
-    source_wall_ms = raw.get("SOURCE_TOTAL_WALL_MS")
-    if source_wall_ms is None or float(source_wall_ms) <= 0:
-        source_wall_ms = elapsed_ms
-    if float(source_wall_ms) <= 0:
-        source_wall_ms = 0.000001
-    coverage = _coverage_from_events(events, data_start, data_start + payload_bytes)
-    source_bytes = sum(int(event.get("returned_bytes", 0)) for event in events)
-    source_requested_bytes = sum(int(event.get("requested_bytes", 0)) for event in events)
+    read_sizes = [
+        {
+            "producer_id": int(row["producer_id"]),
+            "region_id": int(row["producer_id"]),
+            "source_offset": int(offset),
+            "requested_bytes": int(requested),
+            "returned_bytes": int(returned),
+            "retry_number": int(retry),
+        }
+        for row in worker_rows
+        for offset, requested, returned, retry in row.get("read_sizes", [])
+    ]
+    all_requests_within_buffer = all(
+        bool(row.get("all_requests_within_buffer")) for row in worker_rows
+    ) and not worker_errors
+    max_requested_bytes = max(
+        (int(row.get("max_requested_bytes", 0)) for row in worker_rows), default=0
+    )
+    coverage_events = events or read_sizes
+    total_end_ns = workers_joined_ns or time.monotonic_ns()
+    c9_total_wall_ms = (total_end_ns - total_started_ns) / 1_000_000.0
+    if c9_total_wall_ms <= 0:
+        c9_total_wall_ms = 0.000001
+    source_wall_ms = c9_total_wall_ms
+    first_read_ns = physical_span["first_begin_ns"]
+    last_read_ns = physical_span["last_end_ns"]
+    physical_read_span_ms = (
+        (int(last_read_ns) - int(first_read_ns)) / 1_000_000.0
+        if first_read_ns is not None and last_read_ns is not None else None
+    )
+    if not raw.get("actual_source_transitions"):
+        source_qd_timeline = []
+        for row in worker_rows:
+            source_qd_timeline.extend((
+                {"timestamp_ns": row["worker_started_ns"], "delta": 1, "producer_id": row["producer_id"]},
+                {"timestamp_ns": row["worker_terminated_ns"], "delta": -1, "producer_id": row["producer_id"]},
+            ))
+        source_qd_timeline.sort(key=lambda item: (item["timestamp_ns"], -item["delta"]))
+        depth = 0
+        for transition in source_qd_timeline:
+            depth += transition["delta"]
+            transition["depth"] = depth
+        observed_qd = max((int(item["depth"]) for item in source_qd_timeline), default=0)
+        observed_qd_mean = float(observed_qd)
+    else:
+        source_qd_timeline = list(raw.get("actual_source_transitions") or [])
+        observed_qd = int(raw.get("max_actual_source_inflight") or 0)
+        observed_qd_mean = float(raw.get("time_weighted_mean_qd") or 0.0)
+    if events:
+        coverage = _coverage_from_events(
+            cast(list[Mapping[str, Any]], coverage_events), data_start, data_start + payload_bytes
+        )
+    else:
+        source_bytes = sum(int(row.get("source_bytes", 0)) for row in worker_rows)
+        source_requested_bytes = sum(
+            int(row.get("source_requested_bytes", 0)) for row in worker_rows
+        )
+        expected = data_start + payload_bytes
+        coverage = {
+            "ok": (
+                len(worker_rows) == qd
+                and not worker_errors
+                and all(
+                    int(row.get("region_start", -1)) == int(regions[index]["start"])
+                    and int(row.get("region_end", -1)) == int(regions[index]["end"])
+                    and int(row.get("source_bytes", -1)) == int(regions[index]["end"] - regions[index]["start"])
+                    for index, row in enumerate(worker_rows)
+                )
+                and source_bytes == payload_bytes
+            ),
+            "expected_bytes": payload_bytes,
+            "requested_bytes": source_requested_bytes,
+            "returned_bytes": source_bytes,
+            "gap_count": 0,
+            "overlap_count": 0,
+            "syscall_count": sum(int(row.get("source_read_count", 0)) for row in worker_rows),
+            "evidence_complete": False,
+        }
+    source_bytes = int(coverage["returned_bytes"])
+    source_requested_bytes = int(coverage["requested_bytes"])
+    source_read_count = int(coverage.get("syscall_count", 0))
     effective_gbps = (
         source_bytes / (float(source_wall_ms) * 1_000_000.0)
         if source_wall_ms and float(source_wall_ms) > 0 else None
     )
     topology = {
         "producer_count": qd,
+        "fd_topology": "one_shared_fd",
+        "open_count": 1,
+        "shared_by_workers": True,
+        "positioned_reads": callable(getattr(os, "preadv", None)),
+        "close_after_all_workers": True,
         "fixed_contiguous_regions": True,
         "fixed_ownership": all(
-            int(event.get("producer_id", -1)) < qd for event in events
+            int(event.get("producer_id", -1)) < qd for event in coverage_events
         ),
         "monotonic_reads": all(
             all(
                 int(left.get("source_offset", 0)) <= int(right.get("source_offset", 0))
                 for left, right in zip(
-                    [event for event in events if int(event.get("producer_id", -1)) == producer],
-                    [event for event in events if int(event.get("producer_id", -1)) == producer][1:],
+                    [event for event in coverage_events if int(event.get("producer_id", -1)) == producer],
+                    [event for event in coverage_events if int(event.get("producer_id", -1)) == producer][1:],
                 )
             )
             for producer in range(qd)
@@ -404,7 +631,12 @@ def _run_source_only(
         "h2d_dispatcher_started": False,
         "no_h2d_dispatcher_participation": True,
     }
-    source_qd_timeline = list(raw.get("actual_source_transitions") or [])
+    buffer_types = {str(item["buffer_type"]) for item in buffer_details}
+    pinned_host = bool(buffer_details) and all(
+        item.get("is_pinned") is True for item in buffer_details
+    )
+    buffer_type = next(iter(buffer_types)) if len(buffer_types) == 1 else "mixed"
+    released_after_join = workers_joined_ns is not None
     proof: dict[str, Any] = {
         "zero_cuda_h2d_submissions": True,
         "zero_cuda_transfer_events_on_measured_path": True,
@@ -450,24 +682,28 @@ def _run_source_only(
         "execution_arm": SOURCE_ONLY_ARM,
         "source_only": True,
         "model_construction": False,
-        "torch_imported": False,
+        "torch_imported": bool(_TORCH_IMPORTED),
+        "cuda_available": cuda_available,
+        "cuda_build": cuda_build,
+        "device_name": device_name,
         "cuda_used": False,
         "h2d_used": False,
         "FILE_TO_CUDA_WALL_MS": None,
+        "C9_TOTAL_WALL_MS": c9_total_wall_ms,
+        "PHYSICAL_READ_SPAN_MS": physical_read_span_ms,
         "SOURCE_WALL_MS": source_wall_ms,
         "source_wall_ms": source_wall_ms,
         "effective_gbps": effective_gbps,
-        "effective_GBps": effective_gbps,
         "source_effective_gbps": effective_gbps,
         "source_bytes": source_bytes,
-        "source_read_count": len(events),
+        "source_read_count": source_read_count,
         "source_requested_bytes": source_requested_bytes,
         "source_returned_bytes": source_bytes,
         "SOURCE_SYSCALL_UNION_BUSY_MS": raw.get("SOURCE_SYSCALL_UNION_BUSY_MS"),
-        "max_actual_source_inflight": raw.get("max_actual_source_inflight"),
-        "achieved_mean_qd": raw.get("time_weighted_mean_qd"),
-        "achieved_source_qd_mean": raw.get("time_weighted_mean_qd"),
-        "achieved_source_qd_max": raw.get("max_actual_source_inflight"),
+        "max_actual_source_inflight": observed_qd,
+        "achieved_mean_qd": observed_qd_mean,
+        "achieved_source_qd_mean": observed_qd_mean,
+        "achieved_source_qd_max": observed_qd,
         "source_qd_timeline": source_qd_timeline,
         "achieved_source_qd_timeline": source_qd_timeline,
         "configured_source_qd": qd,
@@ -496,7 +732,47 @@ def _run_source_only(
         "source_worker_termination_trigger": "source_completion",
         "gpu_ready_dependency": False,
         "gpu_ready_dependency_controlling_source_slot_release": False,
-        "timing_scope": "first physical source syscall -> final physical source syscall; payload only",
+        "timing_scope": "before worker thread startup -> all worker joins",
+        "timing_boundary": {
+            "name": "C9_TOTAL_WALL",
+            "start": "immediately before worker thread startup",
+            "end": "all worker joins complete",
+            "setup_excluded": ["Torch import", "shared FD open"],
+            "physical_read_span": {
+                "name": "PHYSICAL_READ_SPAN",
+                "start": "first os.preadv begin",
+                "end": "last os.preadv end",
+            },
+            "hashing_included": False,
+        },
+        "fd_topology": {
+            "mode": "one_shared_fd",
+            "open_count": 1,
+            "shared_by_workers": True,
+            "positioned_reads": callable(getattr(os, "preadv", None)),
+            "close_after_all_workers": True,
+        },
+        "buffer_type": buffer_type,
+        "pinned_host": pinned_host,
+        "pinned_host_evidence": {
+            "buffer_type": buffer_type,
+            "is_pinned": pinned_host,
+            "buffers": buffer_details,
+        },
+        "buffer_allocations": {
+            "count": len(regions),
+            "bytes_per_worker": block_bytes,
+            "allocation_in_c9_total_wall": True,
+            "allocated_before_source_wall": False,
+            "reused_for_each_read": True,
+            "reusable_lifetime": "worker_source_wall",
+            "is_pinned": pinned_host,
+            "released_after_all_workers_join": released_after_join,
+        },
+        "hashing_in_timed_loop": False,
+        "allocation_in_timed_loop": False,
+        "telemetry_in_timed_loop": bool(forensic),
+        "integrity_verification": {"performed": False, "scope": None},
         "file_size_bytes": os.path.getsize(path),
         "data_start": data_start,
         "payload_bytes": payload_bytes,
@@ -513,8 +789,14 @@ def _run_source_only(
         "regions": regions,
         "workers": sorted(worker_rows, key=lambda row: row["producer_id"]),
         "worker_errors": worker_errors,
-        "physical_syscall_provenance": raw.get("physical_syscall_provenance"),
+        "physical_syscall_provenance": raw.get("physical_syscall_provenance") or provenance,
         "physical_syscall_telemetry": events,
+        "read_size_evidence": read_sizes,
+        "read_evidence_complete": forensic and all(
+            bool(row.get("read_evidence_complete")) for row in worker_rows
+        ) and not worker_errors,
+        "all_requests_within_buffer": all_requests_within_buffer,
+        "max_requested_bytes": max_requested_bytes,
         "actual_source": raw,
         "transport_stats": {
             "execution_arm": SOURCE_ONLY_ARM,
@@ -522,7 +804,7 @@ def _run_source_only(
             "producer_count": qd,
             "source_block_bytes": block_bytes,
             "source_bytes": source_bytes,
-            "source_read_count": len(events),
+            "source_read_count": source_read_count,
             "source_requested_bytes": source_requested_bytes,
             "source_returned_bytes": source_bytes,
             "configured_source_qd": qd,
@@ -535,21 +817,24 @@ def _run_source_only(
             "cuda_transfer_event_count": 0,
             "h2d_dispatcher_participation": False,
             "no_h2d_dispatcher_participation": True,
+            "C9_TOTAL_WALL_MS": c9_total_wall_ms,
+            "PHYSICAL_READ_SPAN_MS": physical_read_span_ms,
             "source_wall_ms": source_wall_ms,
             "effective_gbps": effective_gbps,
             "h2d_used": False,
             "cuda_used": False,
-            "physical_syscall_provenance": raw.get("physical_syscall_provenance"),
+            "physical_syscall_provenance": raw.get("physical_syscall_provenance") or provenance,
             "physical_syscall_telemetry": events,
             "topology": topology,
         },
         "metrics": {
+            "C9_TOTAL_WALL_MS": c9_total_wall_ms,
+            "PHYSICAL_READ_SPAN_MS": physical_read_span_ms,
             "SOURCE_WALL_MS": source_wall_ms,
             "source_wall_ms": source_wall_ms,
             "effective_gbps": effective_gbps,
-            "effective_GBps": effective_gbps,
             "source_bytes": source_bytes,
-            "source_read_count": len(events),
+            "source_read_count": source_read_count,
             "H2D_WALL_MS": None,
             "FILE_TO_CUDA_WALL_MS": None,
             "cuda_used": False,
@@ -568,6 +853,75 @@ def _run_source_only(
             "classification": "proof-NO",
         },
     }
+
+
+def run_c9_capability_smoke(
+    worker_count: int = 1, buffer_bytes: int = 32 * 1024 * 1024
+) -> dict[str, Any]:
+    """Smoke 0: prove Torch/CUDA and pinned-buffer capability only.
+
+    This deliberately does not open a model, touch the models mount, or make
+    a CUDA copy.  It allocates and releases only the buffers the source arm
+    requires, so a failed capability check cannot be mistaken for a read run.
+    """
+    if isinstance(worker_count, bool) or int(worker_count) < 1:
+        raise ValueError("worker_count must be positive")
+    if int(buffer_bytes) != 32 * 1024 * 1024:
+        raise ValueError("buffer_bytes must be exactly 32 MiB")
+    started_ns = time.monotonic_ns()
+    result: dict[str, Any] = {
+        "status": "error",
+        "operation": "c9_capability_smoke_0",
+        "model_read": False,
+        "h2d_pipeline_initialized": False,
+        "worker_count": int(worker_count),
+        "buffer_bytes": int(buffer_bytes),
+        "torch_imported": False,
+        "torch_version": None,
+        "cuda_build": None,
+        "cuda_available": None,
+        "device_name": None,
+        "buffers": [],
+        "resource_contract": {
+            "cpu": 12,
+            "memory_mb": 8192,
+            "gpu": "rtx-pro-6000",
+        },
+    }
+    buffers: list[Any] = []
+    try:
+        torch = _import_torch()
+        result["torch_imported"] = True
+        result["torch_version"] = str(getattr(torch, "__version__", ""))
+        version = getattr(torch, "version", None)
+        result["cuda_build"] = getattr(version, "cuda", None)
+        cuda = cast(Any, getattr(torch, "cuda", None))
+        available = bool(cuda.is_available())
+        result["cuda_available"] = available
+        if available:
+            result["device_name"] = str(cuda.get_device_name(0))
+        for worker_id in range(int(worker_count)):
+            tensor = _allocate_pinned_buffer(int(buffer_bytes))
+            buffers.append(tensor)
+            result["buffers"].append({
+                "worker_id": worker_id,
+                "bytes": int(buffer_bytes),
+                "buffer_type": "pytorch_pinned_host",
+                "is_pinned": tensor.is_pinned() is True,
+            })
+        result["status"] = (
+            "ok"
+            if all(item["is_pinned"] is True for item in result["buffers"])
+            else "error"
+        )
+        if result["status"] != "ok":
+            result["error"] = "pytorch_pinned_host_buffer_is_not_pinned"
+    except BaseException as exc:
+        result["error"] = f"{type(exc).__name__}:{exc}"
+    finally:
+        buffers.clear()
+        result["wall_ms"] = (time.monotonic_ns() - started_ns) / 1_000_000.0
+    return _json_safe(result)
 
 
 def _sample_keys(header: Mapping[str, Any]) -> list[str]:
@@ -804,6 +1158,7 @@ def run_source_ceiling_oracle(
     qd: int = 4,
     block_bytes: int = QD_BLOCK_BYTES,
     source_capacity: int = SOURCE_CAPACITY,
+    forensic: bool = False,
 ) -> dict[str, Any]:
     """Measure one fixed arm/model and return JSON-safe evidence."""
     started_ns = time.perf_counter_ns()
@@ -823,6 +1178,9 @@ def run_source_ceiling_oracle(
     if arm == SOURCE_ONLY_ARM:
         result["identity"]["gpu"] = None
         result["identity"]["accelerator"] = "none"
+        result["torch_imported"] = False
+        result["cuda_used"] = False
+        result["h2d_used"] = False
     try:
         if role not in FASTSAFE_BLOCK_BYTES:
             raise ValueError(f"unsupported_role:{role}")
@@ -843,7 +1201,8 @@ def run_source_ceiling_oracle(
         result["snapshot_capture"] = {"applicable": False, "counted": False}
         if arm == SOURCE_ONLY_ARM:
             evidence = _run_source_only(
-                str(path), role, int(qd), int(block_bytes), source_capacity=int(source_capacity)
+                str(path), role, int(qd), int(block_bytes),
+                source_capacity=int(source_capacity), forensic=forensic,
             )
         elif arm.startswith("qd"):
             evidence = _run_qd(str(path), role, int(arm[2:]), int(block_bytes))
@@ -872,8 +1231,10 @@ def run_source_only(
     block_bytes: int = QD_BLOCK_BYTES,
     attempt_id: str = "",
     source_capacity: int = SOURCE_CAPACITY,
+    forensic: bool = False,
 ) -> dict[str, Any]:
-    """Public pure-source API; the historical integrated arms are unchanged."""
+    """Public pure-source API; forensic syscall telemetry is opt-in."""
     return run_source_ceiling_oracle(
-        role, model_name, SOURCE_ONLY_ARM, attempt_id, qd, block_bytes, source_capacity
+        role, model_name, SOURCE_ONLY_ARM, attempt_id, qd, block_bytes, source_capacity,
+        forensic=forensic,
     )

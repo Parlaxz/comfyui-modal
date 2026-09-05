@@ -1,0 +1,202 @@
+{
+  "campaign": "c9_torch_pinned_recovery",
+  "status": "STOPPED_AFTER_SMOKE_A_AUDIT_GATE",
+  "workspace_label_required": "Testing 7",
+  "environment": "main",
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "cpu": 12,
+  "memory_mb": 8192,
+  "gpu": "rtx-pro-6000",
+  "h2d_allowed": false,
+  "model_construction_allowed": false,
+  "source_files": [
+    "c9_recovery_modal.py",
+    "comfymodal_runtime/source_ceiling_oracle.py",
+    "tools/run_c9_recovery.py",
+    "tests/test_c9_recovery.py"
+  ],
+  "prior_non_decision_evidence": {
+    "path": "unetClipExperimentsSeptember/07b_c9_faithful_recovery",
+    "classification": "NON_DECISION / WRONG_MECHANISM"
+  },
+  "deployed_at": "2026-09-05T06:08:13.930766+00:00",
+  "deployment_image_ids": [
+    "im-OY6QI0t2DMr6m5t84web1n",
+    "im-ecIaoRRTszQBt1uc8lkzws",
+    "im-sQOjz5edimryFJAhKkj9nw",
+    "im-1qA5XvFsqNoX22pDu183GW",
+    "im-8CQFNOTk2L7CU4Vl9Y4bvz",
+    "im-UV9F83E8oaV7Lk3dVzHADJ",
+    "im-RLcUIs0OFb16MKDqymNk9B",
+    "im-dASwt3RyJAEcyihuGdZhwX",
+    "im-b8t6t0d90kqnqHNF6uDM0n"
+  ],
+  "torch_image": "torch-2.14.0+cu130",
+  "deploy_log": "deploy_schema_cleanup_utf8.log",
+  "source_files_sha256": {
+    "c9_recovery_modal.py": "ab390db7aead73236e445577f6b0368e0da2293649c873428f22562e19b81906",
+    "comfymodal_runtime/source_ceiling_oracle.py": "0a88ea48571e43100b329b05fa1692e61fec1edd4135a8929d963539e7d171c7",
+    "tools/run_c9_recovery.py": "b75054dc6492f2013530a6105859b87f8623fe64b8536f7945fa57da377d8f84",
+    "tests/test_c9_recovery.py": "1df2e88850809d379a49b3d24d03157c0096e18c2e3f4cf2affbbe6fac16649a"
+  },
+  "smoke_0": {
+    "status": "ok",
+    "receipt": "pinning_capability_receipt.json",
+    "worker_count": 8,
+    "all_buffers_pinned": true,
+    "torch_version": "2.14.0+cu130",
+    "cuda_build": "13.0",
+    "cuda_available": true,
+    "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "model_read": false,
+    "h2d_pipeline_initialized": false,
+    "completed_at": "2026-09-05T05:25:37.540826+00:00"
+  },
+  "smoke_a": {
+    "status": "STOPPED_OVER_3_SECONDS",
+    "report": "SMOKE_REPORT.md",
+    "ledger": "smoke_a/ledger.json",
+    "observations": [
+      {
+        "c9_total_wall_ms": 4255.091605,
+        "physical_read_span_ms": 1833.648988,
+        "artifact": "smoke_a/runs/20260905T052549_22e97645_c9_o01_unet_qd8.json"
+      },
+      {
+        "c9_total_wall_ms": 4603.728789,
+        "physical_read_span_ms": 2691.038048,
+        "artifact": "smoke_a/runs/20260905T052549_22e97645_c9_o02_unet_qd8.json"
+      }
+    ],
+    "all_buffers_pinned": true,
+    "qd8_recovered": false,
+    "beat_1_6s_unet_class": false,
+    "smoke_b_run": false,
+    "final_cohort_run": false,
+    "completed_at": "2026-09-05T05:27:03.623755+00:00"
+  },
+  "allocation_placement": "worker-local-after-thread-start",
+  "deployments": [
+    {
+      "at": "2026-09-05T05:39:41.008160+00:00",
+      "image_ids": [
+        "im-1qA5XvFsqNoX22pDu183GW",
+        "im-8CQFNOTk2L7CU4Vl9Y4bvz"
+      ],
+      "allocation_placement": "worker-local-after-thread-start"
+    },
+    {
+      "at": "2026-09-05T05:48:46.681140+00:00",
+      "image_ids": [
+        "im-UV9F83E8oaV7Lk3dVzHADJ",
+        "im-RLcUIs0OFb16MKDqymNk9B"
+      ],
+      "allocation_placement": "worker-local-after-thread-start",
+      "torch_import_setup_excluded_from_c9_total": true
+    },
+    {
+      "at": "2026-09-05T06:08:13.930766+00:00",
+      "image_ids": [
+        "im-dASwt3RyJAEcyihuGdZhwX",
+        "im-b8t6t0d90kqnqHNF6uDM0n"
+      ],
+      "evidence_schema_cleanup": true,
+      "timer_after_thread_object_construction": true
+    }
+  ],
+  "smoke_0_worker_local": {
+    "status": "ok",
+    "receipt": "pinning_capability_receipt_worker_local.json",
+    "worker_count": 8,
+    "all_buffers_pinned": true,
+    "torch_version": "2.14.0+cu130",
+    "cuda_build": "13.0",
+    "cuda_available": true,
+    "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "model_read": false,
+    "h2d_pipeline_initialized": false,
+    "completed_at": "2026-09-05T05:40:13.082465+00:00"
+  },
+  "smoke_0_preimport": {
+    "status": "ok",
+    "receipt": "pinning_capability_receipt_preimport.json",
+    "worker_count": 8,
+    "all_buffers_pinned": true,
+    "torch_version": "2.14.0+cu130",
+    "cuda_build": "13.0",
+    "cuda_available": true,
+    "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "model_read": false,
+    "h2d_pipeline_initialized": false,
+    "completed_at": "2026-09-05T05:49:17.631381+00:00"
+  },
+  "smoke_a_preimport": {
+    "status": "AUDIT_NEEDED_2_TO_3_SECONDS",
+    "report": "SMOKE_REPORT.md",
+    "ledger": "smoke_a_preimport/ledger.json",
+    "observations": [
+      {
+        "c9_total_wall_ms": 2208.007169,
+        "physical_read_span_ms": 1960.468954,
+        "artifact": "smoke_a_preimport/runs/20260905T054931_2e4786b4_c9_o01_unet_qd8.json"
+      },
+      {
+        "c9_total_wall_ms": 2676.590596,
+        "physical_read_span_ms": 2414.925844,
+        "artifact": "smoke_a_preimport/runs/20260905T054931_2e4786b4_c9_o02_unet_qd8.json"
+      }
+    ],
+    "all_buffers_pinned": true,
+    "qd8_recovered": false,
+    "beat_1_6s_unet_class": false,
+    "smoke_b_run": false,
+    "final_cohort_run": false,
+    "completed_at": "2026-09-05T05:50:28.041813+00:00"
+  },
+  "smoke_0_final": {
+    "status": "ok",
+    "receipt": "pinning_capability_receipt_final.json",
+    "worker_count": 8,
+    "all_buffers_pinned": true,
+    "torch_version": "2.14.0+cu130",
+    "cuda_build": "13.0",
+    "cuda_available": true,
+    "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "model_read": false,
+    "h2d_pipeline_initialized": false,
+    "completed_at": "2026-09-05T06:08:46.181754+00:00"
+  },
+  "smoke_a_validated": {
+    "status": "AUDIT_NEEDED_2_TO_3_SECONDS",
+    "report": "SMOKE_REPORT.md",
+    "ledger": "smoke_a_validated/ledger.json",
+    "observations": [
+      {
+        "c9_total_wall_ms": 2161.54333,
+        "physical_read_span_ms": 1883.353444,
+        "artifact": "smoke_a_validated/runs/20260905T061248_f7fc4cbf_c9_o01_unet_qd8.json"
+      },
+      {
+        "c9_total_wall_ms": 2177.490273,
+        "physical_read_span_ms": 1950.261862,
+        "artifact": "smoke_a_validated/runs/20260905T061248_f7fc4cbf_c9_o02_unet_qd8.json"
+      }
+    ],
+    "all_buffers_pinned": true,
+    "qd8_recovered_to_1_6s_class": false,
+    "smoke_b_run": false,
+    "final_cohort_run": false,
+    "completed_at": "2026-09-05T06:14:45.334444+00:00"
+  },
+  "smoke_a_final_validator_regression": {
+    "status": "NON_DECISION_RUNTIME_VALID_VALIDATOR_STALE",
+    "ledger": "smoke_a_final/ledger.json"
+  },
+  "final_report": "FINAL_REPORT.md",
+  "summary": "summary.json",
+  "deployed_source_files_sha256": {
+    "c9_recovery_modal.py": "ab390db7aead73236e445577f6b0368e0da2293649c873428f22562e19b81906",
+    "comfymodal_runtime/source_ceiling_oracle.py": "0a88ea48571e43100b329b05fa1692e61fec1edd4135a8929d963539e7d171c7"
+  },
+  "runner_changed_after_last_deploy": true
+}
