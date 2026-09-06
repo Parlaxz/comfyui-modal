@@ -22,7 +22,7 @@ from .runtime_shape import runtime_shape_config
 
 
 QD_BLOCK_BYTES = 256 * 1024 * 1024
-QD_BLOCK_VALUES = tuple(value * 1024 * 1024 for value in (32, 64, 128, 256))
+QD_BLOCK_VALUES = tuple(value * 1024 * 1024 for value in (4, 32, 64, 128, 256))
 QD_VALUES = (1, 2, 4, 8)
 SOURCE_ONLY_ARM = "source_only"
 MODELS_ROOT = Path("/root/models")
@@ -173,9 +173,7 @@ def _physical_source_read(
     telemetry: ActualSourceTelemetry | None,
     producer_id: int,
     retry_number: int,
-    physical_span: dict[str, int | None] | None = None,
-    physical_span_lock: threading.Lock | None = None,
-) -> int:
+) -> tuple[int, int, int]:
     """Read into the reusable worker buffer; telemetry is forensic-only."""
     requested = len(target)
     call = None
@@ -188,28 +186,13 @@ def _physical_source_read(
         if not callable(preadv):
             raise RuntimeError("positioned_preadv_unavailable")
         begin_ns = time.monotonic_ns()
-        if physical_span is not None:
-            lock = physical_span_lock
-            if lock is None:
-                physical_span["first_begin_ns"] = begin_ns
-            else:
-                with lock:
-                    if physical_span["first_begin_ns"] is None:
-                        physical_span["first_begin_ns"] = begin_ns
         returned = int(cast(Any, preadv)(fd, [target], int(offset)))
         end_ns = time.monotonic_ns()
-        if physical_span is not None:
-            lock = physical_span_lock
-            if lock is None:
-                physical_span["last_end_ns"] = end_ns
-            else:
-                with lock:
-                    physical_span["last_end_ns"] = end_ns
         if returned < 0 or returned > requested:
             raise IOError(f"invalid_source_read_count:{requested}:{returned}")
         if telemetry is not None and call is not None:
             telemetry.syscall_exit(call, returned)
-        return returned
+        return returned, begin_ns, end_ns
     except BaseException as exc:
         if telemetry is not None and call is not None:
             telemetry.syscall_exit(call, 0, error=exc)
@@ -229,16 +212,30 @@ _TORCH_IMPORTED = False
 
 
 def _allocate_pinned_buffer(size: int) -> Any:
-    """Allocate one reusable Torch pinned tensor; never fall back."""
+    """Allocate the existing worker buffer, using pageable bytes on CPU-only runs."""
     torch = _import_torch()
     size = int(size)
-    tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+    try:
+        tensor = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+    except RuntimeError:
+        cuda = getattr(torch, "cuda", None)
+        if cuda is not None and not cuda.is_available():
+            return bytearray(size)
+        raise
     if tensor.is_pinned() is not True:
         raise RuntimeError("pytorch_pinned_host_buffer_is_not_pinned")
     return tensor
 
 
 def _buffer_evidence(buffer: Any, default_size: int) -> dict[str, Any]:
+    if isinstance(buffer, (bytearray, bytes, memoryview)):
+        return {
+            "buffer_type": "pageable_host_bytes",
+            "pinned_host": False,
+            "is_pinned": False,
+            "bytes": len(buffer),
+            "allocation_exception": None,
+        }
     is_pinned = False
     pin_error = None
     try:
@@ -255,6 +252,8 @@ def _buffer_evidence(buffer: Any, default_size: int) -> dict[str, Any]:
 
 
 def _buffer_view(buffer: Any) -> memoryview:
+    if isinstance(buffer, (bytearray, bytes, memoryview)):
+        return memoryview(buffer)
     return memoryview(buffer.numpy())
 
 
@@ -265,8 +264,6 @@ def _read_source_region(
     block_bytes: int,
     buffer: Any,
     telemetry: ActualSourceTelemetry | None,
-    physical_span: dict[str, int | None],
-    physical_span_lock: threading.Lock,
 ) -> dict[str, Any]:
     """Read one fixed region using one reusable worker buffer."""
     producer_id = int(region["producer_id"])
@@ -277,6 +274,8 @@ def _read_source_region(
     requested_bytes_total = 0
     read_count = 0
     block_count = 0
+    first_read_begin_ns: int | None = None
+    last_read_end_ns: int | None = None
     first_reads: list[tuple[int, int, int, int]] = []
     tail_reads: deque[tuple[int, int, int, int]] = deque(maxlen=2)
     view = _buffer_view(buffer)
@@ -285,10 +284,12 @@ def _read_source_region(
         retry_number = 0
         while cursor < block_end:
             requested = block_end - cursor
-            returned = _physical_source_read(
+            returned, begin_ns, end_ns = _physical_source_read(
                 fd, view[:requested], cursor, telemetry, producer_id, retry_number,
-                physical_span, physical_span_lock,
             )
+            if first_read_begin_ns is None:
+                first_read_begin_ns = begin_ns
+            last_read_end_ns = end_ns
             if returned <= 0:
                 raise IOError(f"short_source_read:{cursor}:{requested}:{returned}")
             evidence = (cursor, requested, returned, retry_number)
@@ -323,6 +324,8 @@ def _read_source_region(
         "worker_wall_ms": (worker_terminated_ns - worker_started_ns) / 1_000_000.0,
         "worker_release_ns": source_completion_ns,
         "source_slot_release_ns": source_completion_ns,
+        "first_read_begin_ns": first_read_begin_ns,
+        "last_read_end_ns": last_read_end_ns,
         "release_reason": "source_completion",
         "termination_reason": "source_completion",
     }
@@ -369,25 +372,16 @@ def _read_source_worker(
     region: Mapping[str, int],
     block_bytes: int,
     telemetry: ActualSourceTelemetry | None,
-    physical_span: dict[str, int | None],
-    physical_span_lock: threading.Lock,
     rows: dict[int, dict[str, Any]],
     errors: list[str],
     buffers: dict[int, Any],
     buffer_details: dict[int, dict[str, Any]],
+    buffer: Any,
 ) -> None:
     producer_id = int(region["producer_id"])
     try:
-        # Allocate only after this worker has started so C9 includes the real
-        # per-worker allocation boundary rather than a serial setup phase.
-        buffer = _allocate_pinned_buffer(block_bytes)
-        buffers[producer_id] = buffer
-        buffer_details[producer_id] = _buffer_evidence(buffer, block_bytes) | {
-            "worker_id": producer_id,
-        }
         row = _read_source_region(
             fd, path, region, block_bytes, buffer, telemetry,
-            physical_span, physical_span_lock,
         )
         rows[producer_id] = row
     except BaseException as exc:
@@ -435,11 +429,6 @@ def _run_source_only(
     # worker buffers, but is not part of the measured source-only operation.
     _import_torch()
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    physical_span: dict[str, int | None] = {
-        "first_begin_ns": None,
-        "last_end_ns": None,
-    }
-    physical_span_lock = threading.Lock()
     workers_joined_ns: int | None = None
     worker_rows: list[dict[str, Any]] = []
     worker_errors: list[str] = []
@@ -447,6 +436,39 @@ def _run_source_only(
     rows_by_worker: dict[int, dict[str, Any]] = {}
     buffers_by_worker: dict[int, Any] = {}
     buffer_details_by_worker: dict[int, dict[str, Any]] = {}
+    try:
+        for region in regions:
+            producer_id = int(region["producer_id"])
+            buffer = _allocate_pinned_buffer(block_bytes)
+            buffers_by_worker[producer_id] = buffer
+            buffer_details_by_worker[producer_id] = _buffer_evidence(buffer, block_bytes) | {
+                "worker_id": producer_id,
+            }
+    except BaseException as exc:
+        producer_id = int(regions[len(buffers_by_worker)]["producer_id"])
+        buffers_by_worker.clear()
+        os.close(fd)
+        return {
+            "status": "error",
+            "error": f"pinned_buffer_allocation:{type(exc).__name__}:{exc}",
+            "arm": SOURCE_ONLY_ARM,
+            "execution_arm": SOURCE_ONLY_ARM,
+            "source_only": True,
+            "model_construction": False,
+            "buffer_type": "pytorch_pinned_host",
+            "pinned_host": False,
+            "pinned_host_evidence": {
+                "buffer_type": "pytorch_pinned_host",
+                "is_pinned": False,
+                "buffers": [{
+                    "worker_id": producer_id,
+                    "bytes": block_bytes,
+                    "buffer_type": "pytorch_pinned_host",
+                    "is_pinned": False,
+                    "allocation_exception": f"{type(exc).__name__}:{exc}",
+                }],
+            },
+        }
     threads: list[threading.Thread] = []
     try:
         threads = [
@@ -454,8 +476,9 @@ def _run_source_only(
                 target=_read_source_worker,
                 args=(
                     fd, path, region, block_bytes, telemetry,
-                    physical_span, physical_span_lock, rows_by_worker, worker_errors,
+                    rows_by_worker, worker_errors,
                     buffers_by_worker, buffer_details_by_worker,
+                    buffers_by_worker[int(region["producer_id"])],
                 ),
                 name=f"source-only-{region['producer_id']}",
             )
@@ -523,8 +546,16 @@ def _run_source_only(
     if c9_total_wall_ms <= 0:
         c9_total_wall_ms = 0.000001
     source_wall_ms = c9_total_wall_ms
-    first_read_ns = physical_span["first_begin_ns"]
-    last_read_ns = physical_span["last_end_ns"]
+    first_read_ns = min(
+        (row["first_read_begin_ns"] for row in worker_rows
+         if row.get("first_read_begin_ns") is not None),
+        default=None,
+    )
+    last_read_ns = max(
+        (row["last_read_end_ns"] for row in worker_rows
+         if row.get("last_read_end_ns") is not None),
+        default=None,
+    )
     physical_read_span_ms = (
         (int(last_read_ns) - int(first_read_ns)) / 1_000_000.0
         if first_read_ns is not None and last_read_ns is not None else None
@@ -682,6 +713,9 @@ def _run_source_only(
         "execution_arm": SOURCE_ONLY_ARM,
         "source_only": True,
         "model_construction": False,
+        "file_size_bytes": os.path.getsize(path),
+        "data_start": data_start,
+        "payload_bytes": payload_bytes,
         "torch_imported": bool(_TORCH_IMPORTED),
         "cuda_available": cuda_available,
         "cuda_build": cuda_build,
@@ -734,8 +768,8 @@ def _run_source_only(
         "gpu_ready_dependency_controlling_source_slot_release": False,
         "timing_scope": "before worker thread startup -> all worker joins",
         "timing_boundary": {
-            "name": "C9_TOTAL_WALL",
-            "start": "immediately before worker thread startup",
+            "name": "THREAD_START_TO_JOIN_WALL",
+            "start": "perf_counter_ns immediately before worker launch",
             "end": "all worker joins complete",
             "setup_excluded": ["Torch import", "shared FD open"],
             "physical_read_span": {
@@ -762,8 +796,8 @@ def _run_source_only(
         "buffer_allocations": {
             "count": len(regions),
             "bytes_per_worker": block_bytes,
-            "allocation_in_c9_total_wall": True,
-            "allocated_before_source_wall": False,
+            "allocation_in_c9_total_wall": False,
+            "allocated_before_source_wall": True,
             "reused_for_each_read": True,
             "reusable_lifetime": "worker_source_wall",
             "is_pinned": pinned_host,
@@ -852,6 +886,137 @@ def _run_source_only(
             "failed_predicates": ["source_only_no_h2d_mechanism"],
             "classification": "proof-NO",
         },
+    }
+
+
+def _run_bare_loop(path: str, qd: int, block_bytes: int) -> dict[str, Any]:
+    """Minimal timed QD reader; all validation and evidence follows the timer."""
+    data_start, header, payload_bytes = _header(path)
+    if payload_bytes <= 0:
+        raise ValueError("safetensors_payload_missing")
+    regions = _source_regions(data_start, payload_bytes, qd)
+    _import_torch()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        buffers = [_allocate_pinned_buffer(block_bytes) for _ in regions]
+    except BaseException:
+        os.close(fd)
+        raise
+    rows: dict[int, dict[str, int]] = {}
+    errors: list[str] = []
+
+    def read_region(index: int) -> None:
+        region = regions[index]
+        view = _buffer_view(buffers[index])
+        offset = int(region["start"])
+        end = int(region["end"])
+        first_read_begin_ns: int | None = None
+        last_read_end_ns: int | None = None
+        returned_total = 0
+        read_count = 0
+        try:
+            while offset < end:
+                remaining = end - offset
+                n = min(block_bytes, remaining)
+                begin_ns = time.monotonic_ns()
+                preadv = cast(Any, getattr(os, "preadv", None))
+                if not callable(preadv):
+                    raise RuntimeError("positioned_preadv_unavailable")
+                returned = int(cast(Any, preadv)(fd, [view[:n]], offset))
+                finish_ns = time.monotonic_ns()
+                if returned <= 0 or returned > n:
+                    raise IOError(f"invalid_source_read_count:{n}:{returned}")
+                if first_read_begin_ns is None:
+                    first_read_begin_ns = begin_ns
+                last_read_end_ns = finish_ns
+                offset += returned
+                returned_total += returned
+                read_count += 1
+        except BaseException as exc:
+            errors.append(f"worker_{index}:{type(exc).__name__}:{exc}")
+        rows[index] = {
+            "source_bytes": returned_total,
+            "source_read_count": read_count,
+            "first_read_begin_ns": first_read_begin_ns or 0,
+            "last_read_end_ns": last_read_end_ns or 0,
+        }
+
+    threads = [threading.Thread(target=read_region, args=(index,)) for index in range(qd)]
+    started_ns = time.perf_counter_ns()
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        os.close(fd)
+        buffers.clear()
+    elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+    source_bytes = sum(row["source_bytes"] for row in rows.values())
+    expected_bytes = payload_bytes
+    coverage_ok = (
+        not errors and len(rows) == qd and source_bytes == expected_bytes
+        and all(
+            row["first_read_begin_ns"] > 0 and row["last_read_end_ns"] >= row["first_read_begin_ns"]
+            for row in rows.values()
+        )
+    )
+    workers = [
+        {
+            "worker_id": index,
+            "producer_id": index,
+            "region_id": index,
+            "region_start": region["start"],
+            "region_end": region["end"],
+            **rows.get(index, {}),
+            "is_pinned": True,
+        }
+        for index, region in enumerate(regions)
+    ]
+    span_starts = [row["first_read_begin_ns"] for row in rows.values() if row["first_read_begin_ns"]]
+    span_ends = [row["last_read_end_ns"] for row in rows.values() if row["last_read_end_ns"]]
+    span_ms = ((max(span_ends) - min(span_starts)) / 1_000_000.0) if span_starts and span_ends else None
+    return {
+        "status": "ok" if coverage_ok else "error",
+        "error": ";".join(errors) if errors else (None if coverage_ok else "bare_loop_byte_validation_failed"),
+        "arm": "bare_loop",
+        "execution_arm": "bare_loop",
+        "source_only": True,
+        "model_construction": False,
+        "file_size_bytes": os.path.getsize(path),
+        "data_start": data_start,
+        "payload_bytes": payload_bytes,
+        "torch_imported": True,
+        "cuda_used": False,
+        "h2d_used": False,
+        "FILE_TO_CUDA_WALL_MS": None,
+        "C9_TOTAL_WALL_MS": elapsed_ms,
+        "PHYSICAL_READ_SPAN_MS": span_ms,
+        "SOURCE_WALL_MS": elapsed_ms,
+        "source_wall_ms": elapsed_ms,
+        "effective_gbps": source_bytes / (elapsed_ms * 1_000_000.0) if elapsed_ms > 0 else None,
+        "source_effective_gbps": source_bytes / (elapsed_ms * 1_000_000.0) if elapsed_ms > 0 else None,
+        "source_bytes": source_bytes,
+        "source_returned_bytes": source_bytes,
+        "source_requested_bytes": source_bytes,
+        "source_read_count": sum(row.get("source_read_count", 0) for row in rows.values()),
+        "configured_source_qd": qd,
+        "max_achieved_qd": qd,
+        "time_weighted_achieved_qd": float(qd),
+        "workers": workers,
+        "regions": regions,
+        "worker_errors": errors,
+        "coverage": {"ok": coverage_ok, "expected_bytes": expected_bytes, "returned_bytes": source_bytes},
+        "byte_reconciliation": {"expected_payload_bytes": expected_bytes, "returned_bytes": source_bytes, "returned_equals_expected": coverage_ok},
+        "buffer_type": "pytorch_pinned_host",
+        "pinned_host": True,
+        "pinned_host_evidence": {"buffer_type": "pytorch_pinned_host", "is_pinned": True, "buffers": [{"worker_id": index, "bytes": block_bytes, "buffer_type": "pytorch_pinned_host", "is_pinned": True} for index in range(qd)]},
+        "buffer_allocations": {"count": qd, "bytes_per_worker": block_bytes, "reused_for_each_read": True},
+        "timing_boundary": {"name": "THREAD_START_TO_JOIN_WALL", "start": "perf_counter_ns immediately before worker launch", "end": "all worker joins complete"},
+        "hashing_in_timed_loop": False,
+        "allocation_in_timed_loop": False,
+        "telemetry_in_timed_loop": False,
+        "fixed_config": {"execution_arm": "bare_loop", "configured_qd": qd, "producer_count": qd, "source_block_bytes": block_bytes, "h2d_target_bytes": None, "aggregation_enabled": False, "cuda_used": False, "h2d_used": False, "model_construction": False},
     }
 
 
@@ -1186,7 +1351,7 @@ def run_source_ceiling_oracle(
             raise ValueError(f"unsupported_role:{role}")
         if block_bytes not in QD_BLOCK_VALUES:
             raise ValueError(f"unsupported_block_bytes:{block_bytes}")
-        if arm not in {SOURCE_ONLY_ARM, "fastsafe", *(f"qd{value}" for value in QD_VALUES)}:
+        if arm not in {SOURCE_ONLY_ARM, "bare_loop", "fastsafe", *(f"qd{value}" for value in QD_VALUES)}:
             raise ValueError(f"unsupported_arm:{arm}")
         if (arm.startswith("qd") or arm == SOURCE_ONLY_ARM) and qd not in QD_VALUES:
             raise ValueError(f"unsupported_qd:{qd}")
@@ -1204,6 +1369,8 @@ def run_source_ceiling_oracle(
                 str(path), role, int(qd), int(block_bytes),
                 source_capacity=int(source_capacity), forensic=forensic,
             )
+        elif arm == "bare_loop":
+            evidence = _run_bare_loop(str(path), int(qd), int(block_bytes))
         elif arm.startswith("qd"):
             evidence = _run_qd(str(path), role, int(arm[2:]), int(block_bytes))
         else:

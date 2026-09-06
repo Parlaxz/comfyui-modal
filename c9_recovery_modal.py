@@ -347,7 +347,9 @@ def _normalize_evidence(result: dict[str, Any], role: str, model_name: str, qd: 
         "PYTHONUTF8": "1",
     },
 )
-def run_c9_recovery(role: str, model_name: str, qd: int, attempt_id: str = "") -> dict[str, Any]:
+def run_c9_recovery(
+    role: str, model_name: str, qd: int, attempt_id: str = "", arm: str = "source_only"
+) -> dict[str, Any]:
     role = str(role).strip().lower()
     model_name = str(model_name).strip()
     qd = int(qd)
@@ -357,15 +359,21 @@ def run_c9_recovery(role: str, model_name: str, qd: int, attempt_id: str = "") -
         raise ValueError(f"unsupported_qd:{qd}")
     if model_name != MODELS[role]:
         raise ValueError(f"unsupported_model:{role}:{model_name}")
-    from comfymodal_runtime.source_ceiling_oracle import run_source_only
-
-    result = run_source_only(
-        role,
-        model_name,
-        qd=qd,
-        block_bytes=SOURCE_BLOCK_BYTES,
-        attempt_id=str(attempt_id),
+    from comfymodal_runtime.source_ceiling_oracle import (
+        run_source_ceiling_oracle,
+        run_source_only,
     )
+
+    if str(arm).strip().lower() == "bare_loop":
+        result = run_source_ceiling_oracle(
+            role, model_name, "bare_loop", str(attempt_id), qd, SOURCE_BLOCK_BYTES
+        )
+    elif str(arm).strip().lower() == "source_only":
+        result = run_source_only(
+            role, model_name, qd=qd, block_bytes=SOURCE_BLOCK_BYTES, attempt_id=str(attempt_id)
+        )
+    else:
+        raise ValueError(f"unsupported_arm:{arm}")
     result = _normalize_evidence(result, role, model_name, qd)
     if result.get("status") != "ok":
         # Preserve the oracle's actionable failure.  Do not replace an

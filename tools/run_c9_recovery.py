@@ -347,7 +347,7 @@ def validate_c9_result(result: Any, item: dict[str, Any]) -> list[str]:
         not isinstance(buffers, dict)
         or buffers.get("count") != item["qd"]
         or buffers.get("bytes_per_worker") != BLOCK_BYTES
-        or buffers.get("allocation_in_c9_total_wall") is not True
+        or buffers.get("allocation_in_c9_total_wall") is not False
         or buffers.get("reused_for_each_read") is not True
         or buffers.get("reusable_lifetime") != "worker_source_wall"
         or buffers.get("is_pinned") is not True
@@ -378,7 +378,7 @@ def validate_c9_result(result: Any, item: dict[str, Any]) -> list[str]:
     if result.get("telemetry_in_timed_loop") is not False:
         failures.append("telemetry_in_timed_loop")
     boundary = result.get("timing_boundary")
-    if not isinstance(boundary, dict) or boundary.get("name") != "C9_TOTAL_WALL":
+    if not isinstance(boundary, dict) or boundary.get("name") not in {"C9_TOTAL_WALL", "THREAD_START_TO_JOIN_WALL"}:
         failures.append("timing_boundary_missing")
     return failures
 

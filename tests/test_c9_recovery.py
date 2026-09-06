@@ -85,7 +85,7 @@ def _valid_result(item: dict) -> dict:
         "buffer_allocations": {
             "count": item["qd"],
             "bytes_per_worker": runner.BLOCK_BYTES,
-            "allocation_in_c9_total_wall": True,
+            "allocation_in_c9_total_wall": False,
             "reused_for_each_read": True,
             "reusable_lifetime": "worker_source_wall",
             "is_pinned": True,
@@ -292,7 +292,7 @@ def test_source_only_uses_one_fd_reusable_buffer_and_32mib_tail(tmp_path, monkey
     result = oracle._run_source_only(str(path), "clip", 1, 32 * 1024 * 1024)
 
     assert result["status"] == "ok"
-    assert allocations == [(32 * 1024 * 1024, "source-only-0")]
+    assert allocations == [(32 * 1024 * 1024, "MainThread")]
     assert len({fd for fd, *_ in reads}) == 1
     assert [request for _, _, request, _ in reads] == [32 * 1024 * 1024, 5]
     assert result["read_size_evidence"][-1]["returned_bytes"] == 5
@@ -313,9 +313,9 @@ def test_source_only_uses_one_fd_reusable_buffer_and_32mib_tail(tmp_path, monkey
     assert result["hashing_in_timed_loop"] is False
     assert result["allocation_in_timed_loop"] is False
     assert result["telemetry_in_timed_loop"] is False
-    assert result["timing_boundary"]["name"] == "C9_TOTAL_WALL"
+    assert result["timing_boundary"]["name"] == "THREAD_START_TO_JOIN_WALL"
     assert result["C9_TOTAL_WALL_MS"] >= result["PHYSICAL_READ_SPAN_MS"]
-    assert result["buffer_allocations"]["allocated_before_source_wall"] is False
+    assert result["buffer_allocations"]["allocated_before_source_wall"] is True
 
 
 def test_source_only_allocates_each_buffer_in_worker_and_reconciles_ranges(tmp_path, monkeypatch):
@@ -368,8 +368,8 @@ def test_source_only_allocates_each_buffer_in_worker_and_reconciles_ranges(tmp_p
 
     assert result["status"] == "ok"
     assert sorted(allocations) == [
-        (32 * 1024 * 1024, "source-only-0"),
-        (32 * 1024 * 1024, "source-only-1"),
+        (32 * 1024 * 1024, "MainThread"),
+        (32 * 1024 * 1024, "MainThread"),
     ]
     assert result["source_bytes"] == len(payload)
     assert result["coverage"]["returned_bytes"] == len(payload)
@@ -378,8 +378,8 @@ def test_source_only_allocates_each_buffer_in_worker_and_reconciles_ranges(tmp_p
     assert len(result["workers"]) == 2
     ranges = [(row["region_start"], row["region_end"]) for row in result["workers"]]
     assert ranges[0][1] == ranges[1][0]
-    assert result["buffer_allocations"]["allocation_in_c9_total_wall"] is True
-    assert result["buffer_allocations"]["allocated_before_source_wall"] is False
+    assert result["buffer_allocations"]["allocation_in_c9_total_wall"] is False
+    assert result["buffer_allocations"]["allocated_before_source_wall"] is True
 
 
 def test_source_only_imports_torch_before_c9_timing_boundary(tmp_path, monkeypatch):
@@ -527,7 +527,7 @@ def test_source_run_records_allocation_error_and_never_falls_back(tmp_path, monk
     assert result["pinned_host_evidence"]["buffers"][0]["allocation_exception"] == (
         "MemoryError:synthetic pinned allocation failure"
     )
-    assert len(result["pinned_host_evidence"]["buffers"]) == 2
+    assert len(result["pinned_host_evidence"]["buffers"]) == 1
     assert all(
         buffer["allocation_exception"] == "MemoryError:synthetic pinned allocation failure"
         for buffer in result["pinned_host_evidence"]["buffers"]

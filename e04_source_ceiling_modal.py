@@ -14,13 +14,14 @@ _APP_NAME = os.environ.get(
 )
 _MODELS_ROOT = "/root/models"
 _VOLUME_NAME = os.environ.get("COMFYMODAL_MODELS_VOLUME", "comfyui-models")
-_DECLARED_MODAL_CPU = 4
+_DECLARED_MODAL_CPU = 12
 
 try:
     # This deliberately uses a small stdlib image: the arm performs only
     # positioned reads from the mounted checkpoint files.
     _image = (
         modal.Image.debian_slim(python_version="3.11")
+        .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
         .entrypoint([])
     )
     _image = _image.add_local_python_source("comfymodal_runtime", copy=True)
@@ -40,6 +41,7 @@ app = modal.App(_APP_NAME, image=_image, include_source=False)
 
 @app.function(
     image=_image,
+    gpu=None,
     cpu=_DECLARED_MODAL_CPU,
     memory=8192,
     timeout=3600,
