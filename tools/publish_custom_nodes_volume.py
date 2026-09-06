@@ -101,14 +101,8 @@ def main() -> int:
                 publisher_app_name=CUSTOM_NODES_PUBLISHER_APP_NAME,
             )
 
-        lock = DeployLock(Path(_REPO_ROOT) / ".v2ctl" / "deploy.lock")
-        lock.acquire(
-            owner="publish_custom_nodes_volume",
-            target=CUSTOM_NODES_VOLUME_NAME,
-            profile="custom_nodes_publication",
-        )
-        try:
-            decision = asyncio.run(publish_or_skip(
+        def run_publication():
+            return asyncio.run(publish_or_skip(
                 cn_root,
                 volume_name=CUSTOM_NODES_VOLUME_NAME,
                 publisher=publish,
@@ -116,8 +110,20 @@ def main() -> int:
                     volume_name, workspace=workspace
                 ),
             ))
-        finally:
-            lock.release()
+
+        if os.environ.get("V2CTL_DEPLOY_LOCK_HELD") == "1":
+            decision = run_publication()
+        else:
+            lock = DeployLock(Path(_REPO_ROOT) / ".v2ctl" / "deploy.lock")
+            lock.acquire(
+                owner="publish_custom_nodes_volume",
+                target=CUSTOM_NODES_VOLUME_NAME,
+                profile="custom_nodes_publication",
+            )
+            try:
+                decision = run_publication()
+            finally:
+                lock.release()
         identity = decision.identity
         result = decision.result if isinstance(decision.result, dict) else {}
         remote_status = result.get("status", "")

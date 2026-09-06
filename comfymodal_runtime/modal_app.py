@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 import copy
+import shutil
 from types import MappingProxyType
 
 import dataclasses
@@ -294,6 +295,221 @@ RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "c
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
+_RESTORE_CLIP_PROBE_SOURCE_ENV = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
+_RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH = os.path.join(
+    "text_encoders", "qwen_3_4b.safetensors"
+)
+_RESTORE_CLIP_PROBE_LOCAL_PATH = "/tmp/comfymodal_restore_clip_probe/qwen_3_4b.safetensors"
+_RESTORE_CLIP_PROBE_SOURCE_MODES = frozenset({"models_volume", "local_cache"})
+
+
+def _restore_clip_probe_source_mode(value: str | None = None) -> str:
+    mode = str(
+        os.environ.get(_RESTORE_CLIP_PROBE_SOURCE_ENV, "models_volume")
+        if value is None else value
+    ).strip().lower()
+    if mode not in _RESTORE_CLIP_PROBE_SOURCE_MODES:
+        raise RuntimeError(
+            f"invalid restore CLIP probe source mode: {mode or '<empty>'}"
+        )
+    return mode
+
+
+def _restore_clip_probe_volume_path() -> str:
+    return os.path.join(MODELS_PATH, _RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH)
+
+
+def _prepare_restore_clip_probe_source(
+    source_mode: str | None = None,
+    *,
+    source_path: str | None = None,
+    staged_path: str | None = None,
+) -> dict[str, Any]:
+    mode = _restore_clip_probe_source_mode(source_mode)
+    source_path = source_path or _restore_clip_probe_volume_path()
+    if mode == "models_volume":
+        return {
+            "source_mode": mode,
+            "source_path": source_path,
+            "path": source_path,
+            "staging_status": "not_required",
+            "staged": False,
+        }
+
+    staged_path = staged_path or _RESTORE_CLIP_PROBE_LOCAL_PATH
+    evidence: dict[str, Any] = {
+        "source_mode": mode,
+        "source_path": source_path,
+        "staged_path": staged_path,
+        "path": staged_path,
+        "staging_status": "error",
+        "staged": False,
+    }
+    temp_path = f"{staged_path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        source_stat = os.stat(source_path)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError("source is not a regular file")
+        expected_bytes = int(source_stat.st_size)
+        parent = os.path.dirname(staged_path)
+        if not parent:
+            raise RuntimeError("staged path has no parent")
+        os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(source_path, temp_path)
+        if int(os.stat(source_path).st_size) != expected_bytes:
+            raise RuntimeError("source size changed during staging")
+        os.replace(temp_path, staged_path)
+        staged_bytes = int(os.stat(staged_path).st_size)
+        if staged_bytes != expected_bytes:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"staged size mismatch: expected={expected_bytes} actual={staged_bytes}"
+            )
+        evidence.update({
+            "source_size_bytes": expected_bytes,
+            "staged_size_bytes": staged_bytes,
+            "staging_status": "ready",
+            "staged": True,
+        })
+        return evidence
+    except Exception as exc:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        evidence["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        raise RuntimeError(
+            f"restore CLIP probe local source staging failed: {evidence['error']}"
+        ) from exc
+
+
+def _validate_restore_clip_probe_staging(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(evidence, Mapping) or evidence.get("source_mode") != "local_cache":
+        raise RuntimeError("restore CLIP probe local staging evidence is missing")
+    staged_path = str(evidence.get("staged_path") or evidence.get("path") or "")
+    expected_bytes = evidence.get("source_size_bytes")
+    if evidence.get("staging_status") != "ready" or not staged_path:
+        raise RuntimeError("restore CLIP probe local staging is not ready")
+    if not isinstance(expected_bytes, int) or expected_bytes < 0:
+        raise RuntimeError("restore CLIP probe local staging size evidence is missing")
+    try:
+        staged_stat = os.stat(staged_path)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            raise RuntimeError("staged source is not a regular file")
+        staged_bytes = int(staged_stat.st_size)
+    except Exception as exc:
+        raise RuntimeError(
+            f"restore CLIP probe staged source is unavailable: {type(exc).__name__}"
+        ) from exc
+    if staged_bytes != expected_bytes:
+        raise RuntimeError(
+            f"restore CLIP probe staged size mismatch: expected={expected_bytes} actual={staged_bytes}"
+        )
+    validated = dict(evidence)
+    validated.update({
+        "staged_size_bytes": staged_bytes,
+        "staging_validation": "ready",
+    })
+    return validated
+
+
+def _resolve_restore_clip_probe_source(
+    source_mode: str | None = None,
+    staging_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    mode = _restore_clip_probe_source_mode(source_mode)
+    if mode == "models_volume":
+        return _prepare_restore_clip_probe_source(mode)
+    if staging_evidence is None:
+        raise RuntimeError("restore CLIP probe local source was not staged during startup")
+    return _validate_restore_clip_probe_staging(staging_evidence)
+
+
+def _run_restore_clip_qd2_probe(path: str, state: dict[str, Any]) -> None:
+    block_size = 128 * 1024 * 1024
+    workers = 2
+    ready = threading.Barrier(workers + 1)
+    go = threading.Barrier(workers + 1)
+    results = [{"bytes": 0, "error": None} for _ in range(workers)]
+    fd: int | None = None
+    try:
+        expected = os.stat(path).st_size
+        fd = os.open(path, os.O_RDONLY)
+        state.update({"status": "starting", "path": path, "expected_bytes": expected})
+
+        def worker(index: int, offset: int, count: int) -> None:
+            try:
+                buffer = bytearray(min(block_size, count))
+                ready.wait()
+                go.wait()
+                remaining, position, total = count, offset, 0
+                view = memoryview(buffer)
+                while remaining:
+                    request = min(remaining, block_size)
+                    amount = os.preadv(fd, [view[:request]], position)
+                    if amount <= 0:
+                        raise OSError("short positioned read")
+                    remaining -= amount
+                    position += amount
+                    total += amount
+                results[index]["bytes"] = total
+            except Exception as exc:
+                results[index]["error"] = repr(exc)
+
+        base, remainder = divmod(expected, workers)
+        threads = []
+        offset = 0
+        for index in range(workers):
+            count = base + (1 if index < remainder else 0)
+            thread = threading.Thread(
+                target=worker,
+                args=(index, offset, count),
+                daemon=False,
+                name="restore_clip_qd2_worker",
+            )
+            thread.start()
+            threads.append(thread)
+            offset += count
+        ready.wait()
+        start_ns = time.monotonic_ns()
+        state.update({
+            "status": "running",
+            "probe_start_mono_ns": start_ns,
+            "probe_start_unix_s": time.time(),
+            "qd": workers,
+            "block_size_mib": 128,
+            "fd_policy": "shared",
+            "read_mode": "positioned",
+        })
+        go.wait()
+        for thread in threads:
+            thread.join()
+        end_ns = time.monotonic_ns()
+        total = sum(item["bytes"] for item in results)
+        errors = [item["error"] for item in results if item["error"]]
+        state.update({
+            "status": "error" if errors else "complete",
+            "probe_end_mono_ns": end_ns,
+            "probe_end_unix_s": time.time(),
+            "wall_ms": (end_ns - start_ns) / 1_000_000,
+            "bytes": total,
+            "byte_reconciled": total == expected and not errors,
+            "errors": errors,
+        })
+    except Exception as exc:
+        state.update({"status": "error", "error": repr(exc),
+                      "probe_end_unix_s": time.time()})
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 # Deployment-scoped runtime-state file that carries the authoritative
 # RestorePlan plus the atomically-written schema-v2 ``snapshot_seed`` payload
 # (written together by ``RestorePlanPublisher.publish_with_metrics*`` on the
@@ -4473,6 +4689,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
         ),
+        "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
+            "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH", "0"
+        ),
         "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES": os.environ.get(
             "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES", "33554432"
         ),
@@ -4746,6 +4965,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_CLIP_QD_ARTIFACT": os.environ.get(
             "COMFYMODAL_V2_CLIP_QD_ARTIFACT", ""
+        ),
+        "COMFYMODAL_RESTORE_CLIP_READ_PROBE": os.environ.get(
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE", "0"
+        ),
+        _RESTORE_CLIP_PROBE_SOURCE_ENV: os.environ.get(
+            _RESTORE_CLIP_PROBE_SOURCE_ENV, "models_volume"
         ),
         "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
             "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
@@ -10949,6 +11174,7 @@ class ModalRuntimeEntrypoint:
                 profile_active=_golden_serial_active,
             )
             state = self.bootstrap.startup(snapshot=True, trace=trace)
+            self._restore_clip_probe_staging = _prepare_restore_clip_probe_source()
 
             # [v2.generation_identity] bootstrap diagnostic
             _boot_cn_gen = str(state.custom_node_generation or "")
@@ -12245,6 +12471,37 @@ class ModalRuntimeEntrypoint:
         remote_python_resume_mono_ns: int = time.monotonic_ns()
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        _restore_perf_start = time.perf_counter()
+        _restore_clip_probe_source_info = _resolve_restore_clip_probe_source(
+            staging_evidence=getattr(self, "_restore_clip_probe_staging", None),
+        )
+        _restore_clip_probe_state: dict[str, Any] = {
+            "enabled": env_flag("COMFYMODAL_RESTORE_CLIP_READ_PROBE"),
+            "status": "disabled",
+            "launch_boundary": "inside_modal_runtime_restore_after_resume",
+            "joined_by_restore": False,
+            "source_mode": _restore_clip_probe_source_info["source_mode"],
+            "source_path": _restore_clip_probe_source_info["source_path"],
+            "path": _restore_clip_probe_source_info["path"],
+            "staging": _restore_clip_probe_source_info,
+            "staging_status": _restore_clip_probe_source_info.get("staging_status"),
+            "staged_path": _restore_clip_probe_source_info.get("staged_path"),
+            "source_size_bytes": _restore_clip_probe_source_info.get("source_size_bytes"),
+            "staged_size_bytes": _restore_clip_probe_source_info.get("staged_size_bytes"),
+            "staging_validation": _restore_clip_probe_source_info.get("staging_validation"),
+        }
+        self._restore_clip_probe_state = _restore_clip_probe_state
+        if _restore_clip_probe_state["enabled"]:
+            _restore_clip_probe_path = _restore_clip_probe_source_info["path"]
+            _restore_clip_probe_thread = threading.Thread(
+                target=_run_restore_clip_qd2_probe,
+                args=(_restore_clip_probe_path, _restore_clip_probe_state),
+                daemon=False,
+                name="restore_clip_qd2_probe",
+            )
+            _restore_clip_probe_thread.start()
+            _restore_clip_probe_state["thread_started"] = True
+        # Diagnostic modules can be imported while the image is built, before
         # Diagnostic modules can be imported while the image is built, before
         # Modal applies the deployed runtime environment.  Keep this after the
         # authoritative resume boundary so it cannot contaminate scheduling
@@ -12532,7 +12789,6 @@ class ModalRuntimeEntrypoint:
         _restore_status: str = "unknown"
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
-        _restore_perf_start = time.perf_counter()
         # [v2.restore_deep] leaf-segment stamp store (bounded, additive) ──
         # Captures monotonic_ns stamps around the currently-unattributed leaf
         # segments of the restore critical path; consumed once at the
@@ -12886,6 +13142,11 @@ class ModalRuntimeEntrypoint:
                 _restore_end_mono_ns = time.monotonic_ns()
                 err_timing: dict[str, Any] = {
                     "restore_total_ms": restore_total_ms,
+                    "restore_wall_ms_excluding_scheduling": round(
+                        (_restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000,
+                        3,
+                    ),
+                    "restore_timing_boundary": "restore_method_entry_to_restore_return",
                     "restore_session_id": restore_session_id,
                     "restored_instance_id": restored_instance_id,
                     "container_session_id": self.container_session_id,
@@ -12900,6 +13161,7 @@ class ModalRuntimeEntrypoint:
                     "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
                     "restore_method_end_mono_ns": _restore_end_mono_ns,
                     "restore_method_status": "error",
+                    "restore_clip_probe": _restore_clip_probe_state,
                 }
                 # Bootstrap records these maps as it reaches each existing
                 # restore boundary. Keep partial results when a later
@@ -13026,6 +13288,15 @@ class ModalRuntimeEntrypoint:
                         _rt["restore_method_start_wall_unix_ns"] = restore_method_start_wall_ns
                     if _rt.get("restore_method_start_mono_ns") is None:
                         _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
+                    _rt.setdefault("restore_clip_probe", _restore_clip_probe_state)
+                    _rt.setdefault(
+                        "restore_wall_ms_excluding_scheduling",
+                        round((_restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000, 3),
+                    )
+                    _rt.setdefault(
+                        "restore_timing_boundary",
+                        "restore_method_entry_to_restore_return",
+                    )
                     _LATEST_LIFECYCLE_TIMING = _rt
             raise
         # Plan C: CPU snapshot model activation (Variant C)
@@ -14095,6 +14366,11 @@ class ModalRuntimeEntrypoint:
                 )
                 restore_timing_local.update({
                     "restore_total_ms": restore_total_ms_local,
+                    "restore_wall_ms_excluding_scheduling": round(
+                        (restore_end_mono_ns_local - restore_method_start_mono_ns) / 1_000_000,
+                        3,
+                    ),
+                    "restore_timing_boundary": "restore_method_entry_to_restore_return",
                     "restore_session_id": restore_session_id,
                     "restored_instance_id": restored_instance_id,
                     "post_restore_nonce": post_restore_nonce,
@@ -14113,6 +14389,7 @@ class ModalRuntimeEntrypoint:
                     "snapshot_callback_age_at_restore_ms": _snapshot_callback_age_at_restore_ms,
                     "snapshot_startup_callback_return_wall_unix_ns": _callback_return.get("wall_unix_ns"),
                     "snapshot_startup_callback_return_mono_ns": _callback_return.get("monotonic_ns"),
+                    "restore_clip_probe": _restore_clip_probe_state,
                 })
                 if state.stage_durations:
                     for _stage, _dur_ms in state.stage_durations.items():
@@ -18775,6 +19052,8 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB",
             "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY",
             "COMFYMODAL_V2_CLIP_QD_ARTIFACT",
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE",
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE",
         )
         env = {key: os.environ.get(key, "") for key in keys}
         env["MODAL_CLOUD_PROVIDER"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
@@ -22273,6 +22552,7 @@ class ModalRuntimeEntrypoint:
             golden_serial_execute,
             normalize_attention_backend,
             resolve_clip_residency,
+            prepare_cpu_clip_prefetch,
         )
         from .output_durability import resolve_output_durability
 
@@ -22293,6 +22573,7 @@ class ModalRuntimeEntrypoint:
         golden_call_end_mono_ns: int | None = None
         golden_trace_config: dict[str, Any] = {}
         golden_trace_summary: dict[str, Any] = {}
+        cpu_prefetch_ticket = None
         _full_trace_claimed = False
         _full_trace_op_id = ""
         _restore_trace_contract = getattr(
@@ -22432,6 +22713,15 @@ class ModalRuntimeEntrypoint:
                 raise RuntimeError("golden_node_class_mappings_invalid")
             self._assert_golden_execution_isolated()
 
+            # The experiment arm is explicit at both request and deployment
+            # boundaries.  Its plan is frozen here, after request/path/
+            # isolation validation, and before any GPU/DynamicVRAM work.
+            cpu_prefetch_raw = request.get("cpu_qd2_prefetch", False)
+            if not isinstance(cpu_prefetch_raw, bool):
+                raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
+            if cpu_prefetch_raw and request.get("instant_tensor"):
+                raise ValueError("golden_cpu_qd2_prefetch_instant_tensor_conflict")
+
             def _golden_snapshot_proof_supplier() -> dict[str, list[Any]]:
                 """Passive snapshot-proof supplier built ONLY from real,
                 currently-present instance surfaces.  Never mutates anything
@@ -22542,6 +22832,29 @@ class ModalRuntimeEntrypoint:
                         status="error", reason=_full_trace_failure_reason,
                     )
 
+            golden_extra_data = dict(extra_data_raw)
+            golden_extra_data.update(
+                {
+                    key: value
+                    for key, value in identity_telemetry.items()
+                    if key.startswith("sage_runtime_mode_")
+                    or key == "attention_backend_configured"
+                }
+            )
+            if resolve_clip_residency() == "fp32_cast_once":
+                golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
+                    prompt, extra_data_raw,
+                )
+            golden_request = GoldenRequest(
+                request_id=normalized_request_id,
+                prompt=dict(prompt),
+                extra_data=golden_extra_data,
+                attention_backend=attention_backend,
+                cpu_qd2_prefetch=cpu_prefetch_raw,
+            )
+            if cpu_prefetch_raw:
+                cpu_prefetch_ticket = prepare_cpu_clip_prefetch(golden_request)
+
             # Golden bypasses the normal ComfyUI request entrypoints, so it
             # must perform the deferred GPU reattachment check itself.  Use
             # only the API restored for this runtime; silently loading another
@@ -22555,19 +22868,10 @@ class ModalRuntimeEntrypoint:
             if not callable(ensure_gpu_ready):
                 raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
             ensure_gpu_ready()
-
-            golden_extra_data = dict(extra_data_raw)
-            golden_extra_data.update(
-                {
-                    key: value
-                    for key, value in identity_telemetry.items()
-                    if key.startswith("sage_runtime_mode_")
-                    or key == "attention_backend_configured"
-                }
-            )
-            if resolve_clip_residency() == "fp32_cast_once":
-                golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
-                    prompt, extra_data_raw,
+            if cpu_prefetch_ticket is not None:
+                cpu_prefetch_ticket.event(
+                    "GPU_READINESS_COMPLETE",
+                    bytes_prefetched_at_gpu_ready=cpu_prefetch_ticket.bytes_available,
                 )
 
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
@@ -22583,6 +22887,8 @@ class ModalRuntimeEntrypoint:
             except Exception as exc:
                 if _full_trace_claimed:
                     raise RuntimeError(f"golden_activation_failed:{exc}") from exc
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.close(cancel=True)
                 yield {
                     "type": "error",
                     "request_id": normalized_request_id,
@@ -22599,6 +22905,8 @@ class ModalRuntimeEntrypoint:
             ):
                 if _full_trace_claimed:
                     raise RuntimeError("golden_dynamic_vram_gate_required")
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.close(cancel=True)
                 yield {
                     "type": "error",
                     "request_id": normalized_request_id,
@@ -22607,12 +22915,12 @@ class ModalRuntimeEntrypoint:
                 }
                 return
 
-            golden_request = GoldenRequest(
-                request_id=normalized_request_id,
-                prompt=dict(prompt),
-                extra_data=golden_extra_data,
-                attention_backend=attention_backend,
-            )
+            if cpu_prefetch_ticket is not None:
+                cpu_prefetch_ticket.event(
+                    "DYNAMICVRAM_ACCEPTED",
+                    activation=dict(activation_evidence),
+                    bytes_prefetched_at_dynamic_vram_ready=cpu_prefetch_ticket.bytes_available,
+                )
             self._golden_execution_active = True
             golden_call_start_wall_ns = time.time_ns()
             golden_call_start_mono_ns = time.monotonic_ns()
@@ -22648,6 +22956,7 @@ class ModalRuntimeEntrypoint:
                         node_classes=node_classes,
                         snapshot_proof=_golden_snapshot_proof_supplier,
                         restore_metadata=restore_metadata,
+                        cpu_prefetch_ticket=cpu_prefetch_ticket,
                     )
             finally:
                 golden_call_end_wall_ns = time.time_ns()
@@ -22663,6 +22972,11 @@ class ModalRuntimeEntrypoint:
                         )
                 self._golden_execution_active = False
         except BaseException as exc:
+            if cpu_prefetch_ticket is not None:
+                try:
+                    cpu_prefetch_ticket.close(cancel=True)
+                except BaseException:
+                    pass
             rid = request_id_raw if isinstance(request_id_raw, str) else ""
             error_event: dict[str, Any] = {
                 "type": "error",

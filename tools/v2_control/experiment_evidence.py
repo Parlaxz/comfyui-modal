@@ -38,6 +38,34 @@ _OMIT_EVENTS_BYTES = 256 * 1024
 # above 128 KiB is copied and SHA-256 inventoried, but not parsed or embedded.
 _MAX_PATH_PROJECTION_BYTES = 128 * 1024
 _GOLDEN_P1_BACKENDS = frozenset({"pytorch", "sage", "comfy_kitchen"})
+GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+
+
+def golden_cpu_qd2_prefetch_requested(config: Any) -> bool:
+    """Return the registered run-only Golden arm from resolved config."""
+    flag = None
+    lookup = getattr(config, "flag", None)
+    if callable(lookup):
+        flag = lookup(GOLDEN_CPU_QD2_PREFETCH_FLAG)
+    if flag is None:
+        for candidate in getattr(config, "flags", ()) or ():
+            if getattr(candidate, "name", "") == GOLDEN_CPU_QD2_PREFETCH_FLAG:
+                flag = candidate
+                break
+    raw = str(_value(flag, "value", default="0") or "0").strip().lower()
+    if raw not in {"0", "1"}:
+        raise ValueError(
+            f"invalid Golden CPU QD2 selector: {raw or '(empty)'}"
+        )
+    return raw == "1"
+
+
+def golden_arm_identity(config: Any) -> dict[str, Any]:
+    selected = golden_cpu_qd2_prefetch_requested(config)
+    return {
+        "golden_arm": "cpu_qd2_prefetch" if selected else "control",
+        "cpu_qd2_prefetch": selected,
+    }
 
 
 def _golden_p1_observed_value(
@@ -620,6 +648,26 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     exact = True
     mismatches: list[str] = []
     missing: list[str] = []
+    arm_values = _nested_values(all_data, {"golden_arm"})
+    qd2_values = _nested_values(all_data, {"cpu_qd2_prefetch"})
+    for value in qd2_values:
+        arm_values.append("cpu_qd2_prefetch" if value in {"1", "true", "yes", "on"} else "control")
+    arm_values = list(dict.fromkeys(arm_values))
+    observed_arm = (
+        arm_values[0] if len(arm_values) == 1 else ("mixed" if arm_values else "")
+    )
+    expected_arm = str(identity.get("golden_arm", "") or "").strip().lower()
+    if expected_arm:
+        if not observed_arm:
+            missing.append(f"{manifest_path}: golden_arm")
+        elif observed_arm == "mixed":
+            exact = False
+            mismatches.append("golden_arm: mixed observed request arms")
+        elif observed_arm != expected_arm:
+            exact = False
+            mismatches.append(
+                f"golden_arm: expected {expected_arm}, observed {observed_arm}"
+            )
 
     # A readable JSON object is not sufficient evidence by itself.  Keep
     # malformed/partial cohorts visible as INCOMPLETE rather than allowing the
@@ -845,6 +893,8 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         "attention_backend": configured_backend_value,
         "attention_backend_configured": configured_backend_value,
         "attention_backend_resolved": resolved_backend_value,
+        "golden_arm": observed_arm,
+        "cpu_qd2_prefetch": observed_arm == "cpu_qd2_prefetch",
         "configured_sage_runtime_mode": configured_sage_value,
         "resolved_sage_runtime_mode": resolved_sage_value,
         "sage_runtime_mode_configured": configured_sage_value,

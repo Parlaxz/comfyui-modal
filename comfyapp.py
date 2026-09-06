@@ -20464,6 +20464,8 @@ class _ComfyAPIMixin:
             __stages["restore_end_mono_ns"] = time.perf_counter_ns()
             self._last_restore_timing = {
                 "restore_total_ms": self._profile_ms(restore_start),
+                "restore_wall_ms_excluding_scheduling": self._profile_ms(restore_start),
+                "restore_timing_boundary": "restore_method_entry_to_restore_return",
                 "restore_start_unix_s": restore_start,
                 "restore_end_unix_s": _minimal_restore_end,
                 "restore_method_start_wall_unix_ns": int(restore_start_wall_s * 1_000_000_000),
@@ -22136,6 +22138,8 @@ class _ComfyAPIMixin:
         _restore_end = time.time()
         self._last_restore_timing = {
             "restore_total_ms": self._profile_ms(restore_start),
+            "restore_wall_ms_excluding_scheduling": self._profile_ms(restore_start),
+            "restore_timing_boundary": "restore_method_entry_to_restore_return",
             "restore_start_unix_s": restore_start,
             "restore_end_unix_s": _restore_end,
             "warmup_status": warmup_status,

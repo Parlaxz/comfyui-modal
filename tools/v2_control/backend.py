@@ -37,7 +37,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from .environment import EnvironmentBuilder
 from .errors import BackendError, ProvenanceError
@@ -236,7 +236,7 @@ class ArtifactSet:
     profile: str | None = None
     profile_config_fingerprint: str | None = None
     attention_backend: str | None = None
-    experiment_identity: dict[str, str] = field(default_factory=dict)
+    experiment_identity: dict[str, Any] = field(default_factory=dict)
     provenance_validation_status: str = "not_checked"
 
 
@@ -260,7 +260,7 @@ class BackendResult:
     provenance_validation_status: str = "not_checked"
     crash_loop: dict | None = None
     attention_backend: str | None = None
-    experiment_identity: dict[str, str] = field(default_factory=dict)
+    experiment_identity: dict[str, Any] = field(default_factory=dict)
 
     def ok(self) -> bool:
         return self.exit_code == 0
@@ -1346,6 +1346,41 @@ class BackendRunner:
                 "Golden attention backend mismatch: "
                 f"expected {expected_backend!r}, observed {sorted(observed_backends)}"
             )
+        expected_qd2 = False
+        try:
+            flag = config.flag("COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH")
+            expected_qd2 = str(getattr(flag, "value", flag) if flag is not None else "0") == "1"
+        except Exception:
+            pass
+        expected_arm = "cpu_qd2_prefetch" if expected_qd2 else "control"
+        observed_arms: set[str] = set()
+        for data in (manifest_data, summary_data, attempt_data):
+            if data.get("golden_arm") not in (None, ""):
+                observed_arms.add(str(data["golden_arm"]).strip().lower())
+            if "cpu_qd2_prefetch" in data:
+                raw_qd2 = data["cpu_qd2_prefetch"]
+                qd2_selected = (
+                    raw_qd2 is True
+                    or str(raw_qd2).strip().lower() in {"1", "true", "yes", "on"}
+                )
+                observed_arms.add(
+                    "cpu_qd2_prefetch" if qd2_selected else "control"
+                )
+            nested_attempts = data.get("attempts")
+            if isinstance(nested_attempts, list):
+                for nested in nested_attempts:
+                    if isinstance(nested, dict) and nested.get("golden_arm") not in (None, ""):
+                        observed_arms.add(str(nested["golden_arm"]).strip().lower())
+        if len(observed_arms) > 1:
+            raise ProvenanceError(
+                "Golden cohort contains mixed request arms: "
+                + ", ".join(sorted(observed_arms))
+            )
+        if observed_arms and observed_arms != {expected_arm}:
+            raise ProvenanceError(
+                f"Golden request arm mismatch: expected {expected_arm!r}, "
+                f"observed {sorted(observed_arms)}"
+            )
         from .experiment_evidence import sage_runtime_identity
 
         sage_identity = sage_runtime_identity(
@@ -1389,6 +1424,8 @@ class BackendRunner:
                 "profile": expected_profile_value,
                 "profile_config_fingerprint": expected_profile_config_fingerprint or "",
                 "attention_backend": next(iter(observed_backends), expected_backend),
+                "golden_arm": next(iter(observed_arms), expected_arm),
+                "cpu_qd2_prefetch": expected_qd2,
                 **sage_identity,
             },
             provenance_validation_status="validated",

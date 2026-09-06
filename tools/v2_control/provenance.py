@@ -72,6 +72,8 @@ class Provenance:
     v2ctl_invocation_id: str = ""
     profile_config_fingerprint: str = ""
     request_id: str = ""
+    golden_arm: str = ""
+    cpu_qd2_prefetch: bool = False
     artifact_path: str = ""
     # Optional integrity metadata.  It is populated by
     # write_provenance_sibling after the artifact's final bytes exist; it is
@@ -97,6 +99,8 @@ class Provenance:
             "v2ctl_invocation_id": self.v2ctl_invocation_id,
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "request_id": self.request_id,
+            "golden_arm": self.golden_arm,
+            "cpu_qd2_prefetch": self.cpu_qd2_prefetch,
             "artifact_path": self.artifact_path,
             "artifact_sha256": self.artifact_sha256,
         }
@@ -124,6 +128,8 @@ class Provenance:
             v2ctl_invocation_id=str(data.get("v2ctl_invocation_id", "") or ""),
             profile_config_fingerprint=str(data.get("profile_config_fingerprint", "") or ""),
             request_id=str(data.get("request_id", "") or ""),
+            golden_arm=str(data.get("golden_arm", "") or ""),
+            cpu_qd2_prefetch=bool(data.get("cpu_qd2_prefetch", False)),
             artifact_path=str(data.get("artifact_path", "") or ""),
             artifact_sha256=(str(data["artifact_sha256"]) if data.get("artifact_sha256") else None),
         )
@@ -179,6 +185,12 @@ def build_provenance(
     # even if the caller's redaction missed it (key OR value based)
     requested_env = {str(k): _redacted(str(k), str(v)) for k, v in (env or {}).items()}
     effective_env = {str(k): _redacted(str(k), str(v)) for k, v in (env or {}).items()}
+    golden_profile = str(getattr(config, "profile_name", "") or "").lower().startswith("golden_p1")
+    cpu_qd2_prefetch = golden_profile and any(
+        str(getattr(flag, "name", "")) == "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+        and str(getattr(flag, "value", "0")) == "1"
+        for flag in (getattr(config, "flags", []) or [])
+    )
 
     return Provenance(
         profile=str(getattr(config, "profile_name", "") or ""),
@@ -197,6 +209,8 @@ def build_provenance(
         v2ctl_invocation_id=str(invocation_id or ""),
         profile_config_fingerprint=str(profile_config_fingerprint or ""),
         request_id=str(request_id or ""),
+        golden_arm=("cpu_qd2_prefetch" if cpu_qd2_prefetch else "control") if golden_profile else "",
+        cpu_qd2_prefetch=cpu_qd2_prefetch,
     )
 
 

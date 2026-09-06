@@ -46,6 +46,7 @@ from . import provenance as prov_mod
 from . import deployment_receipt as receipt_mod
 from .experiment_evidence import (
     finalize_experiment_evidence,
+    golden_arm_identity,
     is_experiment_profile,
     resolved_attention_backend,
     sage_runtime_identity,
@@ -81,6 +82,8 @@ GOLDEN_P1_SELECTOR = "golden_p1"
 GOLDEN_P1_METHOD = "run_golden_serial_stream"
 GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
+GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+GOLDEN_CPU_QD2_DEPLOY_FLAG = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
 FULL_RUN_METHOD = "run_plan_stream"
 PROTECTED_GOLDEN_APP = "stable-modal-comfy-v2-golden-p1"
 _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -89,6 +92,55 @@ _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 def is_golden_profile_name(profile: object) -> bool:
     value = str(profile or "").strip().lower()
     return value == GOLDEN_P1_PROFILE or value.startswith("golden_p1_direct")
+
+
+def _golden_cpu_qd2_prefetch_requested(config: config_mod.ResolvedConfig) -> bool:
+    """Resolve the registered run-only Golden arm, never ambient process env."""
+    flag = config.flag(GOLDEN_CPU_QD2_PREFETCH_FLAG)
+    raw = str(getattr(flag, "value", "0") if flag is not None else "0").strip().lower()
+    if raw not in {"0", "1"}:
+        raise GateError(
+            f"{GOLDEN_CPU_QD2_PREFETCH_FLAG} must resolve to 0 or 1; got {raw!r}"
+        )
+    return raw == "1"
+
+
+def _require_golden_cpu_qd2_deploy_gate(
+    config: config_mod.ResolvedConfig,
+    deployment_receipt: object | None = None,
+) -> None:
+    """Bind the run-only arm to the immutable deploy-baked gate."""
+    requested = _golden_cpu_qd2_prefetch_requested(config)
+    trusted: dict[str, str] = {}
+    if deployment_receipt is not None:
+        raw = (
+            deployment_receipt.get("effective_environment", {})
+            if isinstance(deployment_receipt, Mapping)
+            else getattr(deployment_receipt, "effective_environment", {})
+        )
+        if isinstance(raw, dict):
+            trusted = {str(key): str(value).strip().lower() for key, value in raw.items()}
+    deploy_flag = config.flag(GOLDEN_CPU_QD2_DEPLOY_FLAG)
+    gate = trusted.get(
+        GOLDEN_CPU_QD2_DEPLOY_FLAG,
+        str(getattr(deploy_flag, "value", "0") if deploy_flag is not None else "0")
+        .strip()
+        .lower(),
+    )
+    instant_tensor = any(
+        "instanttensor" in name.lower() and value in {"1", "true", "yes", "on"}
+        for name, value in trusted.items()
+    )
+    if instant_tensor:
+        raise GateError(
+            "Golden control/QD2 arms refuse InstantTensor; select a deployment "
+            "without an InstantTensor flag"
+        )
+    if requested and gate not in {"1", "true", "yes", "on"}:
+        raise GateError(
+            f"{GOLDEN_CPU_QD2_PREFETCH_FLAG}=1 requires the deployed "
+            f"{GOLDEN_CPU_QD2_DEPLOY_FLAG}=1 gate"
+        )
 
 
 DEFAULT_MODAL_ENVIRONMENT = "(default)"
@@ -550,6 +602,8 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
             # Resolve before dispatch, including the accepted PyTorch default;
             # omission would leave backend identity implicit in the command.
             args += ["--attention-backend", resolved_attention_backend(config)]
+        if _golden_cpu_qd2_prefetch_requested(config):
+            args += ["--golden-p1-cpu-qd2-prefetch"]
         # The registry default is e28_single, whose BAT branch invokes the
         # ordinary run_plan_stream path.  Project the effective Golden mode
         # explicitly so the request reaches the serial-Golden branch.  The
@@ -1854,6 +1908,15 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         getattr(result, "experiment_identity", {}),
         getattr(result.artifacts, "experiment_identity", {}),
     )
+    arm_identity = golden_arm_identity(config) if is_golden_profile_name(config.profile_name) else {}
+    result_identity = {
+        **arm_identity,
+        **(
+            getattr(result, "experiment_identity", {})
+            or getattr(result.artifacts, "experiment_identity", {})
+            or {}
+        ),
+    }
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
@@ -1876,21 +1939,13 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "profile_config_fingerprint": profile_fp,
         "request_id": result.request_id,
         "provenance_validation_status": result.provenance_validation_status,
+        **arm_identity,
         **sage_identity,
         "attention_backend": (
             getattr(result, "attention_backend", None)
             or getattr(result.artifacts, "attention_backend", None)
         ),
-        "experiment_identity": dict(
-            {
-                **(
-                    getattr(result, "experiment_identity", {})
-                    or getattr(result.artifacts, "experiment_identity", {})
-                    or {}
-                ),
-                **sage_identity,
-            }
-        ),
+        "experiment_identity": {**result_identity, **sage_identity},
         "workload": {
             "fresh_required": config.workload.fresh_required,
             "conditioning_cache": config.workload.conditioning_cache,
@@ -1922,16 +1977,8 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
                 getattr(result, "attention_backend", None)
                 or getattr(result.artifacts, "attention_backend", None)
             ),
-            "experiment_identity": dict(
-                {
-                    **(
-                        getattr(result, "experiment_identity", {})
-                        or getattr(result.artifacts, "experiment_identity", {})
-                        or {}
-                    ),
-                    **sage_identity,
-                }
-            ),
+            **arm_identity,
+            "experiment_identity": {**result_identity, **sage_identity},
             "provenance_validation_status": result.artifacts.provenance_validation_status,
         },
     }
@@ -2835,9 +2882,14 @@ def cmd_deploy(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl deploy")
         _reject_golden_mode_override(config, command="v2ctl deploy")
+        explicit_workspace = any(
+            getattr(args, name, None)
+            for name in ("workspace_id", "workspace", "environment")
+        )
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) else None
+            if is_golden_profile_name(config.profile_name) or explicit_workspace
+            else None
         )
         unregistered_explicit = [
             flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
@@ -2863,6 +2915,10 @@ def cmd_deploy(args, repo_root: Path) -> int:
                                 backend_extra={**spec.deploy_only_env,
                                                **_identity_env_for_command("deploy", config),
                                                **_canonical_metadata_env(config, fingerprints, invocation_id)})
+        # The legacy batch invokes publish_custom_nodes_volume.py as a child.
+        # Tell that child the outer v2ctl deploy lock is already held so it
+        # does not attempt a nested acquisition of the same lock.
+        env["V2CTL_DEPLOY_LOCK_HELD"] = "1"
         if native_golden:
             env = _native_golden_deploy_env(env)
         if native_golden:
@@ -3170,6 +3226,7 @@ def cmd_run(args, repo_root: Path) -> int:
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
         )
+        _require_golden_cpu_qd2_deploy_gate(config, bound_receipt)
         _require_no_deploy_in_flight(repo_root)
         requested_target = {
             "app": config.target.app,
@@ -3402,6 +3459,7 @@ def cmd_gate(args, repo_root: Path) -> int:
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
         )
+        _require_golden_cpu_qd2_deploy_gate(config, bound_receipt)
         _require_no_deploy_in_flight(repo_root)
         requested_target = {
             "app": config.target.app,
@@ -3540,6 +3598,7 @@ def cmd_confirm(args, repo_root: Path) -> int:
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
         )
+        _require_golden_cpu_qd2_deploy_gate(config, bound_receipt)
         _require_no_deploy_in_flight(repo_root)
         _require_full_run_mode(config, command="v2ctl confirm")
         enforce_runtime_overrides(config,
@@ -3626,9 +3685,14 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl source-probe")
         _reject_golden_mode_override(config, command="v2ctl source-probe")
+        explicit_workspace = any(
+            getattr(args, name, None)
+            for name in ("workspace_id", "workspace", "environment")
+        )
         workspace_binding = (
             _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) else None
+            if is_golden_profile_name(config.profile_name) or explicit_workspace
+            else None
         )
         if getattr(args, "dry_run", False):
             print("[v2ctl.dry-run] no invocation performed; source probe skipped")

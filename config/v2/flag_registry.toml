@@ -616,6 +616,25 @@ change_requires = "deploy"
 owner = "e30"
 description = "Speculative CLIP hydration during restore."
 
+[[flag]]
+name = "COMFYMODAL_RESTORE_CLIP_READ_PROBE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "restore-contention"
+description = "Opt-in non-blocking shared-FD QD2/128 MiB CLIP read launched inside restore for contention experiments."
+
+[[flag]]
+name = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
+type = "enum"
+default = "models_volume"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "restore-contention"
+enum_values = ["models_volume", "local_cache"]
+description = "Source for the restore CLIP read probe; local_cache stages the exact text encoder before snapshot capture."
+
 # ── E30 CLIP genuine-QD reader (deploy-baked; consumed at restore/lane start) ──
 
 [[flag]]
@@ -967,6 +986,15 @@ owner = "golden-p1"
 description = "P1 serial-Golden dynamic-VRAM path: hydrate model payloads directly into GPU memory during restore instead of the CPU-snapshot defaults. Deploy-baked via modal_app _runtime_env(); a changed value requires a redeploy."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Explicit deploy gate for the opt-in request-level CPU raw full-CLIP QD2 prefetch experiment; disabled by default and never combined with InstantTensor."
+
+[[flag]]
 name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
 type = "bool"
 default = "1"
@@ -986,6 +1014,15 @@ change_requires = "run"
 owner = "golden-p1"
 enum_values = ["pytorch", "sage", "comfy_kitchen"]
 description = "Optional public Golden request attention backend selector; omitted requests retain the existing PyTorch default."
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+description = "Explicit run-only Golden CPU QD2 request-arm selector; the deployed COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH gate must already be enabled and InstantTensor is forbidden."
 
 [[flag]]
 name = "V2_BENCHMARK_RUNS"

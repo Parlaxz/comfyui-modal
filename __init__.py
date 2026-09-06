@@ -12,6 +12,7 @@ import logging
 import subprocess
 import time
 import sqlite3
+import inspect
 from collections import namedtuple
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,7 +34,9 @@ from comfymodal_runtime.publication_policy import (
     resolve_custom_nodes_root as _resolve_custom_nodes_root_policy,
     is_excluded_path as _is_excluded_publication_path,
     is_publishable_top_level_node as _is_publishable_top_level_node,
+    CUSTOM_NODES_VOLUME_NAME as _CUSTOM_NODES_VOLUME_NAME,
 )
+from tools.v2_control.custom_nodes import publish_or_skip
 
 _local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
@@ -3295,13 +3298,16 @@ def _build_custom_nodes_archive(cn_root: str) -> bytes:
 
 
 async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:
-    fingerprint = _build_custom_node_fingerprint(cn_root)
-    archive_data = _build_custom_nodes_archive(cn_root)
-    result = await sync_custom_nodes(archive_data, workspace=workspace)
+    result = await _publish_custom_nodes_or_skip(cn_root, workspace)
 
     if result.get("status") != "ok":
         return result
 
+    publication = result.get("publication", {})
+    if not publication.get("verified_publication"):
+        return result
+
+    fingerprint = _build_custom_node_fingerprint(cn_root)
     result["deploy"] = _ensure_modal_deploy_current(workspace, fingerprint)
 
     try:
@@ -3317,6 +3323,72 @@ async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> 
         result.setdefault("message", "Custom nodes synced to Modal.")
 
     return result
+
+
+async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
+    """Publish custom nodes through the receipt/full-content control plane.
+
+    The publisher callback remains the existing Modal client operation, but
+    archive construction is owned by ``publish_or_skip`` so exact receipt
+    matches and trusted receipt-only recovery never package or upload content.
+    """
+    async def publisher(archive_data: bytes) -> Any:
+        result = sync_custom_nodes(archive_data, workspace=workspace)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    try:
+        decision = await publish_or_skip(
+            cn_root,
+            volume_name=_CUSTOM_NODES_VOLUME_NAME,
+            publisher=publisher,
+            workspace=workspace,
+        )
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Custom node publication failed: {exc}",
+            "publication": {
+                "action": "publish",
+                "reason": "publication_exception",
+                "verified_publication": False,
+            },
+        }
+
+    try:
+        identity = decision.identity
+        verified_publication = (
+            decision.action == "published" and decision.reason == "published_verified"
+        )
+        trusted_existing_publication = decision.action in {"skip", "recovered"}
+        remote_result = decision.result if isinstance(decision.result, dict) else {}
+        result = dict(remote_result)
+        result["status"] = "ok" if verified_publication or trusted_existing_publication else "error"
+        result["publication"] = {
+            "action": decision.action,
+            "reason": decision.reason,
+            "content_generation": identity.content_generation,
+            "file_count": identity.file_count,
+            "total_bytes": identity.total_bytes,
+            "manifest_digest": identity.manifest_digest,
+            "verified_publication": verified_publication,
+        }
+        if trusted_existing_publication:
+            result.setdefault("message", "Custom nodes already published; no deploy or refresh needed.")
+        elif result["status"] != "ok":
+            result.setdefault("message", f"Custom node publication failed: {decision.reason}")
+        return result
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Custom node publication returned an invalid decision: {exc}",
+            "publication": {
+                "action": "publish",
+                "reason": "invalid_publication_decision",
+                "verified_publication": False,
+            },
+        }
 
 
 def _manifest_entry_from_install(url: str, folder: str, filename: str) -> dict:
@@ -3479,12 +3551,8 @@ async def _run_workspace_swap_job(swap_id: str, workspace: dict, plan: dict):
 
         with _swap_jobs_lock:
             _swap_jobs[swap_id]["phase"] = "syncing_custom_nodes"
-            _swap_jobs[swap_id]["sync_message"] = "Packaging custom nodes..."
-        archive_data = _build_custom_nodes_archive(cn_root)
-
-        with _swap_jobs_lock:
-            _swap_jobs[swap_id]["sync_message"] = "Uploading custom nodes to Modal volume..."
-        cn_result = await sync_custom_nodes(archive_data, workspace=workspace)
+            _swap_jobs[swap_id]["sync_message"] = "Checking custom-node publication..."
+        cn_result = await _publish_custom_nodes_or_skip(cn_root, workspace)
 
         if cn_result.get("status") != "ok":
             with _swap_jobs_lock:
@@ -3495,32 +3563,35 @@ async def _run_workspace_swap_job(swap_id: str, workspace: dict, plan: dict):
                 }
             return
 
-        with _swap_jobs_lock:
-            _swap_jobs[swap_id]["sync_message"] = "Checking if redeploy is needed..."
-        deploy_decision = _ensure_modal_deploy_current(workspace, cn_fingerprint)
-        cn_result["deploy"] = deploy_decision
-        if deploy_decision.get("started"):
+        if cn_result.get("publication", {}).get("verified_publication"):
             with _swap_jobs_lock:
-                _swap_jobs[swap_id]["sync_message"] = f"Redeploying workspace ({deploy_decision['reason']})..."
-            while _deploy_status.get("state") == "deploying":
+                _swap_jobs[swap_id]["sync_message"] = "Checking if redeploy is needed..."
+            deploy_decision = _ensure_modal_deploy_current(workspace, cn_fingerprint)
+            cn_result["deploy"] = deploy_decision
+            if deploy_decision.get("started"):
+                with _swap_jobs_lock:
+                    _swap_jobs[swap_id]["sync_message"] = f"Redeploying workspace ({deploy_decision['reason']})..."
+                while _deploy_status.get("state") == "deploying":
+                    _refresh_swap_deploy_log(swap_id)
+                    await asyncio.sleep(3)
                 _refresh_swap_deploy_log(swap_id)
-                await asyncio.sleep(3)
-            _refresh_swap_deploy_log(swap_id)
 
-        with _swap_jobs_lock:
-            _swap_jobs[swap_id]["sync_message"] = "Refreshing running container..."
-        try:
-            refresh_result = await resync_runtime("custom_nodes", workspace=workspace)
-            cn_result["refresh"] = refresh_result
-        except Exception as e:
-            cn_result["refresh_error"] = str(e)
-            cn_result.setdefault("message", (
-                "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process "
-                "could not be refreshed automatically. "
-                "Try again after the container sleeps, or redeploy if the node is still missing."
-            ))
+            with _swap_jobs_lock:
+                _swap_jobs[swap_id]["sync_message"] = "Refreshing running container..."
+            try:
+                refresh_result = await resync_runtime("custom_nodes", workspace=workspace)
+                cn_result["refresh"] = refresh_result
+            except Exception as e:
+                cn_result["refresh_error"] = str(e)
+                cn_result.setdefault("message", (
+                    "Custom nodes synced to Modal Volume, but the running Modal ComfyUI process "
+                    "could not be refreshed automatically. "
+                    "Try again after the container sleeps, or redeploy if the node is still missing."
+                ))
+            else:
+                cn_result.setdefault("message", "Custom nodes synced to Modal.")
         else:
-            cn_result.setdefault("message", "Custom nodes synced to Modal.")
+            cn_result.setdefault("message", "Custom nodes already published; no deploy or refresh needed.")
         if cn_result.get("status") != "ok":
             with _swap_jobs_lock:
                 _swap_jobs[swap_id] = {

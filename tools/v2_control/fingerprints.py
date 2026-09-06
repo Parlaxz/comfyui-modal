@@ -236,7 +236,7 @@ class FingerprintEngine:
         *,
         invocation_id: str = "",
         request_id: str = "",
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Return the resolved identity carried by a Golden/RX invocation.
 
         The attention selector is included even when its resolved value is the
@@ -255,6 +255,12 @@ class FingerprintEngine:
             if getattr(flag, "name", "") == "COMFYMODAL_SAGE_RUNTIME_MODE":
                 configured_sage = str(getattr(flag, "value", "auto") or "auto").strip().lower()
                 break
+        qd2 = any(
+            getattr(flag, "name", "") == "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+            and str(getattr(flag, "value", "0") or "0").strip() == "1"
+            for flag in list(getattr(self._config, "flags", ()) or ())
+        )
+        golden_profile = str(getattr(self._config, "profile_name", "") or "").lower().startswith("golden_p1")
         return {
             "profile": str(getattr(self._config, "profile_name", "") or ""),
             "v2ctl_invocation_id": str(invocation_id or ""),
@@ -265,6 +271,8 @@ class FingerprintEngine:
             "attention_backend": backend,
             "attention_backend_configured": backend,
             "attention_backend_resolved": backend,
+            "golden_arm": ("cpu_qd2_prefetch" if qd2 else "control") if golden_profile else "",
+            "cpu_qd2_prefetch": qd2 if golden_profile else False,
             "configured_sage_runtime_mode": configured_sage,
             "resolved_sage_runtime_mode": "",
             "sage_runtime_mode_configured": configured_sage,

@@ -46,6 +46,7 @@ from .errors import GateError
 from .experiment_evidence import (
     configured_sage_runtime_mode,
     finalize_experiment_evidence,
+    golden_arm_identity,
     is_experiment_profile,
     resolved_attention_backend,
     resolved_sage_runtime_mode,
@@ -178,6 +179,8 @@ class RunRecord:
     provenance_validation_status: str = ""
     backend_exit_code: int | None = None
     attention_backend: str = ""
+    golden_arm: str = ""
+    cpu_qd2_prefetch: bool = False
     experiment_identity: dict[str, Any] = field(default_factory=dict)
     backend_command: str = ""
 
@@ -200,6 +203,8 @@ class RunRecord:
             "profile_config_fingerprint": self.profile_config_fingerprint,
             "provenance_validation_status": self.provenance_validation_status,
             "attention_backend": self.attention_backend,
+            "golden_arm": self.golden_arm,
+            "cpu_qd2_prefetch": self.cpu_qd2_prefetch,
             "experiment_identity": dict(self.experiment_identity),
             "backend_command": self.backend_command,
         }
@@ -266,6 +271,7 @@ def _experiment_identity(
         ),
         "attention_backend_configured": attention_configured,
         "attention_backend_resolved": attention_resolved,
+        **(golden_arm_identity(config) if _is_golden_profile(config) else {}),
     })
     if record is not None:
         identity.setdefault("v2ctl_invocation_id", record.v2ctl_invocation_id)
@@ -1472,6 +1478,51 @@ class GoldenCohortValidator(ValidatorPlugin):
             failures.append("Golden attention backend does not match resolved experiment identity")
         elif expected_invocation and not observed_backends:
             failures.append("Golden attention backend evidence is missing")
+
+        expected_arm = str(record.golden_arm or "control").strip().lower()
+        observed_arms: set[str] = set()
+        if record.golden_arm:
+            observed_arms.add(expected_arm)
+
+        def collect_arm(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("golden_arm") not in (None, ""):
+                    observed_arms.add(str(value["golden_arm"]).strip().lower())
+                if "cpu_qd2_prefetch" in value:
+                    raw_qd2 = value["cpu_qd2_prefetch"]
+                    observed_arms.add(
+                        "cpu_qd2_prefetch"
+                        if raw_qd2 is True
+                        or str(raw_qd2).strip().lower() in {"1", "true", "yes", "on"}
+                        else "control"
+                    )
+                for child in value.values():
+                    collect_arm(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_arm(child)
+
+        for data in (manifest, summary, attempt):
+            collect_arm(data)
+        if len(observed_arms) > 1:
+            failures.append("Golden cohort contains mixed request arms")
+        elif observed_arms and observed_arms != {expected_arm}:
+            failures.append("Golden request arm does not match resolved experiment identity")
+
+        def contains_instant_tensor(value: Any) -> bool:
+            if isinstance(value, dict):
+                return any(
+                    (str(key).lower() == "instant_tensor" or "instanttensor" in str(key).lower())
+                    and child is True
+                    or contains_instant_tensor(child)
+                    for key, child in value.items()
+                )
+            if isinstance(value, list):
+                return any(contains_instant_tensor(child) for child in value)
+            return False
+
+        if any(contains_instant_tensor(data) for data in (manifest, summary, attempt)):
+            failures.append("Golden control/QD2 arm cannot mix InstantTensor")
         return failures
 
 
@@ -2333,6 +2384,13 @@ def build_run_record_from_result(
     }
     if isinstance(artifact_identity, dict):
         experiment_identity.update(artifact_identity)
+    arm_identity = golden_arm_identity(config) if _is_golden_profile(config) else {}
+    if isinstance(artifact_identity, dict):
+        arm_identity.update({
+            key: artifact_identity[key]
+            for key in ("golden_arm", "cpu_qd2_prefetch")
+            if key in artifact_identity
+        })
     return RunRecord(
         run_fingerprint=run_fingerprint,
         deploy_fingerprint=deploy_fingerprint,
@@ -2355,6 +2413,8 @@ def build_run_record_from_result(
             getattr(artifacts, "provenance_validation_status", "") or ""
         ),
         attention_backend=str(telemetry.get("attention_backend") or attention_backend),
+        golden_arm=str(arm_identity.get("golden_arm", "") or ""),
+        cpu_qd2_prefetch=bool(arm_identity.get("cpu_qd2_prefetch", False)),
         experiment_identity=experiment_identity,
         backend_command=str(getattr(result, "command", "") or ""),
     )

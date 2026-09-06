@@ -576,6 +576,17 @@ GOLDEN_ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_serial_golden_v1"
 GOLDEN_P1_DEFAULT_RUN_COUNT = int(os.environ.get("V2_GOLDEN_P1_RUN_COUNT", "5") or 5)
 GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA"
+GOLDEN_CPU_QD2_ARM = "cpu_qd2_prefetch"
+GOLDEN_CONTROL_ARM = "control"
+GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+
+
+def _golden_cpu_qd2_prefetch_from_resolved_env() -> bool:
+    """Read only the sanitized, registry-resolved run selector."""
+    raw = os.environ.get(GOLDEN_CPU_QD2_PREFETCH_FLAG, "0").strip().lower()
+    if raw not in {"0", "1", "false", "true", "off", "on", "no", "yes"}:
+        raise ValueError("golden_cpu_qd2_prefetch_selector_invalid")
+    return raw in {"1", "true", "on", "yes"}
 GOLDEN_P1_REQUIRED_FLAGS: dict[str, Any] = {
     "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": True,
     "core_model_patcher_is_dynamic": True,
@@ -10468,6 +10479,7 @@ def _golden_p1_request_payload(
     index: int,
     attention_backend: str | None = None,
     invocation_id: str | None = None,
+    cpu_qd2_prefetch: bool = False,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -10477,6 +10489,7 @@ def _golden_p1_request_payload(
         index=index,
         attention_backend=attention_backend,
         invocation_id=invocation_id,
+        cpu_qd2_prefetch=cpu_qd2_prefetch,
     )
 
 
@@ -11525,6 +11538,7 @@ async def _run_golden_p1(
     expected_flags: dict[str, Any] | None,
     force: bool,
     attention_backend: str | None = None,
+    cpu_qd2_prefetch: bool = False,
 ) -> dict[str, Any]:
     """Strictly serial Golden P1 cohort over ``run_golden_serial_stream``.
 
@@ -11540,6 +11554,8 @@ async def _run_golden_p1(
         or gap_seconds <= 0
     ):
         raise ValueError("golden-p1 gap_seconds must be greater than zero")
+    if not isinstance(cpu_qd2_prefetch, bool):
+        raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
     os.environ["COMFYMODAL_V2_GPU"] = gpu
@@ -11570,6 +11586,7 @@ async def _run_golden_p1(
                 "golden attention backend must be one of: "
                 + ", ".join(GOLDEN_ATTENTION_BACKENDS)
             )
+    golden_arm = GOLDEN_CPU_QD2_ARM if cpu_qd2_prefetch else GOLDEN_CONTROL_ARM
     # Sage effective-input provenance: the runtime policy observed before
     # resolution.  For a clean Golden auto run this remains auto; an env
     # override that flips it to baked_cuda must be surfaced.
@@ -11651,6 +11668,8 @@ async def _run_golden_p1(
             "request_id": req_id,
             "mode": GOLDEN_P1_MODE,
             "method": GOLDEN_P1_REMOTE_METHOD,
+            "golden_arm": golden_arm,
+            "cpu_qd2_prefetch": cpu_qd2_prefetch,
             # RX9P-H: immutable invocation+request binding + frozen provenance
             "attention_backend_configured": attention_backend,
             "attention_backend_resolved": "missing",
@@ -11692,6 +11711,7 @@ async def _run_golden_p1(
                 index=index,
                 attention_backend=attention_backend,
                 invocation_id=invocation_id,
+                cpu_qd2_prefetch=cpu_qd2_prefetch,
             )
             # Strict serial: exactly one stream in flight; consumed through its
             # terminal result before anything else happens.
@@ -11960,6 +11980,8 @@ async def _run_golden_p1(
         # resolved from runtime evidence (never copied).
         "attention_backend_configured": provenance["attention_backend_configured"],
         "attention_backend_resolved": provenance["attention_backend_resolved"],
+        "golden_arm": golden_arm,
+        "cpu_qd2_prefetch": cpu_qd2_prefetch,
         # RX9P-H Sage 4-field identity — truthful instrumentation.
         "sage_runtime_mode_configured": provenance["sage_runtime_mode_configured"],
         "sage_runtime_mode_effective_input": provenance["sage_runtime_mode_effective_input"],
@@ -11997,6 +12019,8 @@ async def _run_golden_p1(
             "run_index": r["run_index"],
             "v2ctl_invocation_id": invocation_id,
             "request_id": r["request_id"],
+            "golden_arm": r.get("golden_arm", golden_arm),
+            "cpu_qd2_prefetch": bool(r.get("cpu_qd2_prefetch", cpu_qd2_prefetch)),
             # RX9P-H: immutable pair + provenance propagated to summary index
             "attention_backend_configured": r.get("attention_backend_configured", "missing"),
             "attention_backend_resolved": r.get("attention_backend_resolved", "missing"),
@@ -12171,6 +12195,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             expected_flags=golden_p1_expected_flags,
             force=golden_p1_force,
             attention_backend=golden_p1_attention_backend,
+            cpu_qd2_prefetch=_golden_cpu_qd2_prefetch_from_resolved_env(),
         )
         return
 
@@ -13071,7 +13096,16 @@ if __name__ == "__main__":
         help="Explicit public Golden attention backend request field: "
              "pytorch or sage. Omitted keeps the existing PyTorch default.",
     )
+    _parser.add_argument(
+        "--golden-p1-cpu-qd2-prefetch",
+        action="store_true",
+        default=False,
+        help="Explicit Golden CPU QD2 request arm; v2ctl supplies this only "
+             "from the registered run-only selector.",
+    )
     _args = _parser.parse_args()
+    if _args.golden_p1_cpu_qd2_prefetch:
+        os.environ[GOLDEN_CPU_QD2_PREFETCH_FLAG] = "1"
 
     # Special benchmark modes are mutually exclusive — including the new
     # golden-p1 lane.  Fail fast before any guard or Modal work.
