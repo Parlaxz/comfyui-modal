@@ -243,12 +243,12 @@ class FingerprintEngine:
         accepted PyTorch default, so changing it cannot reuse a cohort or run
         fingerprint accidentally.
         """
-        backend = "pytorch"
+        backend = "sage"
         for flag in list(getattr(self._config, "flags", ()) or ()) + list(
             getattr(self._config, "unregistered", ()) or ()
         ):
             if getattr(flag, "name", "") == "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND":
-                backend = str(getattr(flag, "value", "pytorch") or "pytorch").strip().lower()
+                backend = str(getattr(flag, "value", "sage") or "sage").strip().lower()
                 break
         configured_sage = "auto"
         for flag in list(getattr(self._config, "flags", ()) or ()):
@@ -261,6 +261,12 @@ class FingerprintEngine:
             for flag in list(getattr(self._config, "flags", ()) or ())
         )
         golden_profile = str(getattr(self._config, "profile_name", "") or "").lower().startswith("golden_p1")
+        golden_mode = (
+            "parallel"
+            if str(getattr(self._config, "profile_name", "") or "").lower()
+            == "golden_p1_parallel"
+            else "serial"
+        )
         return {
             "profile": str(getattr(self._config, "profile_name", "") or ""),
             "v2ctl_invocation_id": str(invocation_id or ""),
@@ -271,6 +277,7 @@ class FingerprintEngine:
             "attention_backend": backend,
             "attention_backend_configured": backend,
             "attention_backend_resolved": backend,
+            "golden_mode": golden_mode if golden_profile else "",
             "golden_arm": ("cpu_qd2_prefetch" if qd2 else "control") if golden_profile else "",
             "cpu_qd2_prefetch": qd2 if golden_profile else False,
             "configured_sage_runtime_mode": configured_sage,

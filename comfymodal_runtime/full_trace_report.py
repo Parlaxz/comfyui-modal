@@ -4270,6 +4270,7 @@ _BOUNDARY_DISPLAY_NAMES = {
 # second parser.  These names mirror golden_serial.STAGE_ORDER, but are kept
 # local so that offline report generation remains stdlib-only.
 _GOLDEN_ROOT_NAME = "golden_serial_execute"
+_GOLDEN_ROOT_NAMES = ("golden_serial_execute", "golden_parallel_execute")
 _GOLDEN_STAGE_NAMES = (
     "golden_restore",
     "golden_request_setup",
@@ -4563,8 +4564,12 @@ def _build_golden_profile(
     trace_truncated: bool,
     raw_trace_nonempty: bool,
 ) -> dict[str, Any]:
-    """Analyze one and only one claimed Golden serial root call."""
-    roots = _golden_named_calls(calls, _GOLDEN_ROOT_NAME)
+    """Analyze one and only one claimed Golden root call."""
+    roots = [
+        call for root_name in _GOLDEN_ROOT_NAMES
+        for call in _golden_named_calls(calls, root_name)
+    ]
+    root_name = _basename(roots[0].get("name")) if len(roots) == 1 else _GOLDEN_ROOT_NAME
     configured_torch_enabled = trace_config.get("torch_enabled")
     if isinstance(configured_torch_enabled, bool):
         # An explicit setting is authoritative, including false.  A trace
@@ -4581,13 +4586,13 @@ def _build_golden_profile(
     complete = True
     root: dict[str, Any] | None = None
     if len(roots) == 0:
-        complete, reason = False, "missing golden_serial_execute root call"
+        complete, reason = False, f"missing {root_name} root call"
     elif len(roots) != 1:
-        complete, reason = False, f"ambiguous golden_serial_execute root call: found {len(roots)}"
+        complete, reason = False, f"ambiguous Golden root call: found {len(roots)}"
     else:
         root = roots[0]
         if not bool(root.get("complete")) or _golden_span(root.get("start_us"), root.get("end_us")) is None:
-            complete, reason = False, "incomplete golden_serial_execute root call"
+            complete, reason = False, f"incomplete {root_name} root call"
         elif not raw_trace_nonempty:
             complete, reason = False, "raw VizTracer trace is empty"
         elif trace_truncated:

@@ -516,6 +516,25 @@ def test_evidence_classification_fails_closed_for_identity_and_schema_gaps(tmp_p
     assert any("missing-summary\\summary.json" in item or "missing-summary/summary.json" in item for item in cohorts["missing-summary"]["missing"])
 
 
+def test_evidence_classification_rejects_required_expected_sha_mismatch(tmp_path: Path):
+    root = tmp_path / "artifacts" / "phase_p1_serial_golden_v1"
+    cohort = _cohort(root, "sha-mismatch", invocation="inv-sha")
+    attempt = json.loads((cohort / "attempt_0.json").read_text(encoding="utf-8"))
+    attempt["validation"]["observed_output_shas"] = ["b" * 64]
+    (cohort / "attempt_0.json").write_text(json.dumps(attempt), encoding="utf-8")
+
+    result = finalize_experiment_evidence(
+        tmp_path,
+        identity={"profile": "golden_p1", "v2ctl_invocation_id": "inv-sha"},
+        verdict="ACCEPT",
+        result=_owner(cohort),
+    )
+
+    indexed = _cohort_index(result)["sha-mismatch"]
+    assert indexed["exact"] == "MISMATCH"
+    assert any("output SHA mismatch" in item for item in indexed["mismatch"])
+
+
 def test_redact_covers_nested_json_and_quoted_assignment_secrets():
     text = (
         '{"nested": {"api_key": "REAL-SECRET", '

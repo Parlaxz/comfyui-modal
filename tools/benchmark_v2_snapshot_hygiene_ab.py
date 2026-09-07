@@ -41,6 +41,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from comfymodal_runtime.statistics import PERCENTILE_METHOD, percentile as _canonical_percentile
+
 ENV_FLAG = "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE"
 TRUTHY = {"1", "true", "yes", "on"}
 UNAVAILABLE = "unavailable"
@@ -991,16 +993,8 @@ def load_arm_runs(
 
 
 def _percentile(sorted_values: list[float], p: float) -> float | None:
-    """Nearest-rank percentile of an already-sorted (ascending) list."""
-    n = len(sorted_values)
-    if n == 0:
-        return None
-    if p <= 0:
-        return sorted_values[0]
-    if p >= 100:
-        return sorted_values[-1]
-    k = max(1, int((p / 100.0) * n + 0.5))
-    return sorted_values[min(k, n) - 1]
+    """Compatibility wrapper around the canonical percentile helper."""
+    return _canonical_percentile(sorted_values, p)
 
 
 def compute_arm_stats(runs: list[dict[str, Any]], metric_key: str) -> dict[str, Any]:
@@ -1031,6 +1025,7 @@ def compute_arm_stats(runs: list[dict[str, Any]], metric_key: str) -> dict[str, 
         "p90": None,
         "median_meaningful": median_meaningful,
         "p90_meaningful": p90_meaningful,
+        "percentile_method": PERCENTILE_METHOD,
     }
     if n == 0:
         return stats
@@ -1697,7 +1692,8 @@ def render_report(analysis: dict[str, Any]) -> str:
     # ── Primary metrics ──
     lines.append("## Primary metrics")
     lines.append("")
-    lines.append("> median only when n>=2; p90 only when n>=5.")
+    lines.append("> median only when n>=2; p90 only when n>=5; percentile method: "
+                 "linear interpolation.")
     lines.append("")
     lines.append(
         "> `non_scheduling_ms` is the Batch-C3 primary: COMMAND -> RESPONSE minus scheduling "
@@ -1792,7 +1788,8 @@ def render_report(analysis: dict[str, Any]) -> str:
     # ── Secondary metrics ──
     lines.append("## Secondary metrics")
     lines.append("")
-    lines.append("> median only when n>=2; p90 only when n>=5.")
+    lines.append("> median only when n>=2; p90 only when n>=5; percentile method: "
+                 "linear interpolation.")
     lines.append("")
     secondary = analysis["secondary"]
     for label in ("A", "B"):

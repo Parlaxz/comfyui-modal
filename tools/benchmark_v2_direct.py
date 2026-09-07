@@ -572,8 +572,11 @@ RESTORE_ONLY_RESTORING_BANNER = "Restoring Function from memory snapshot."
 # is labeled ONLY from remote/container identity evidence — never inferred.
 GOLDEN_P1_MODE = "golden_p1_serial"
 GOLDEN_P1_REMOTE_METHOD = "run_golden_serial_stream"
+GOLDEN_PARALLEL_MODE = "golden_p1_parallel"
+GOLDEN_PARALLEL_REMOTE_METHOD = "run_golden_parallel_stream"
 GOLDEN_ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_serial_golden_v1"
+GOLDEN_PARALLEL_DEFAULT_ARTIFACTS_DIRNAME = "phase_p1_parallel_golden_v1"
 GOLDEN_P1_DEFAULT_RUN_COUNT = int(os.environ.get("V2_GOLDEN_P1_RUN_COUNT", "5") or 5)
 GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA"
 GOLDEN_CPU_QD2_ARM = "cpu_qd2_prefetch"
@@ -10489,6 +10492,7 @@ def _golden_p1_request_payload(
     invocation_id: str | None = None,
     cpu_qd2_prefetch: bool = False,
     deep_trace: bool = False,
+    golden_mode: str = "serial",
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -10500,6 +10504,7 @@ def _golden_p1_request_payload(
         invocation_id=invocation_id,
         cpu_qd2_prefetch=cpu_qd2_prefetch,
         deep_trace=deep_trace,
+        golden_mode=golden_mode,
     )
 
 
@@ -10603,24 +10608,40 @@ def _golden_p1_is_terminal_result(event: Any) -> bool:
     return str(event_type or "").strip().lower() in {"result", "terminal_result"}
 
 
-async def _golden_p1_consume_stream(handle: Any, payload: dict[str, Any]) -> list[Any]:
-    """Call the remote ``run_golden_serial_stream`` method via the existing
+async def _golden_p1_consume_stream(
+    handle: Any,
+    payload: dict[str, Any],
+    remote_method: str = GOLDEN_P1_REMOTE_METHOD,
+) -> list[Any]:
+    """Call the selected Golden stream method via the existing
     app/class handle and stop at its terminal result.  Mirrors the established
     ``run_plan_stream.remote_gen.aio(...)`` transport pattern."""
-    fn = getattr(handle, GOLDEN_P1_REMOTE_METHOD, None)
+    fn = getattr(handle, remote_method, None)
     if fn is None:
         raise RuntimeError(
-            f"remote method {GOLDEN_P1_REMOTE_METHOD!r} not present on the "
+            f"remote method {remote_method!r} not present on the "
             "resolved class handle"
         )
     remote_gen = getattr(fn, "remote_gen", None)
     stream: Any
     if remote_gen is not None and callable(getattr(remote_gen, "aio", None)):
         stream = remote_gen.aio(payload)
+    elif remote_gen is not None and callable(
+        getattr(getattr(remote_gen, "remote_gen", None), "aio", None)
+    ):
+        # Older/alternate Modal class-handle adapters can expose the generator
+        # as a nested Function proxy.  Never call that proxy directly; unwrap
+        # its own MethodWithAio generator surface instead.
+        stream = remote_gen.remote_gen.aio(payload)
     elif callable(getattr(fn, "aio", None)):
         stream = fn.aio(payload)
     else:
-        stream = fn(payload)
+        raise RuntimeError(
+            f"remote method {remote_method!r} does not expose a supported "
+            "Modal generator invocation: "
+            f"fn_type={type(fn).__name__} "
+            f"remote_gen_type={type(remote_gen).__name__ if remote_gen is not None else 'None'}"
+        )
     events: list[Any] = []
     if hasattr(stream, "__aiter__"):
         ait = stream.__aiter__()
@@ -11030,6 +11051,7 @@ def _golden_p1_validate_attempt(
     *,
     expected_output_sha: str,
     expected_flags: dict[str, Any] | None,
+    require_seriality: bool = True,
 ) -> tuple[bool, list[str], dict[str, Any]]:
     """Fail-closed per-attempt validation.  Every required evidence class
     must be present AND correct; absence is a failure, never a pass."""
@@ -11190,29 +11212,30 @@ def _golden_p1_validate_attempt(
         if not td_ok:
             failures.append("true_durable evidence missing or false")
 
-    if not scan["seriality"]:
-        failures.append("seriality telemetry absent (required; fail-closed)")
-    else:
-        seriality_values = [v for _i, _p, v in scan["seriality"]]
-        invalid_seriality = [
-            value for value in seriality_values
-            if not isinstance(value, dict)
-            or value.get("ok") is not True
-            or value.get("violations") != []
-            or (
-                "count" in value
-                and (
-                    isinstance(value.get("count"), bool)
-                    or not isinstance(value.get("count"), (int, float))
-                    or value.get("count") != 0
+    if require_seriality:
+        if not scan["seriality"]:
+            failures.append("seriality telemetry absent (required; fail-closed)")
+        else:
+            seriality_values = [v for _i, _p, v in scan["seriality"]]
+            invalid_seriality = [
+                value for value in seriality_values
+                if not isinstance(value, dict)
+                or value.get("ok") is not True
+                or value.get("violations") != []
+                or (
+                    "count" in value
+                    and (
+                        isinstance(value.get("count"), bool)
+                        or not isinstance(value.get("count"), (int, float))
+                        or value.get("count") != 0
+                    )
                 )
-            )
-        ]
-        if invalid_seriality:
-            failures.append(
-                "seriality proof invalid: expected ok=True, violations=[], "
-                f"count=0; observed={invalid_seriality!r}"
-            )
+            ]
+            if invalid_seriality:
+                failures.append(
+                    "seriality proof invalid: expected ok=True, violations=[], "
+                    f"count=0; observed={invalid_seriality!r}"
+                )
 
     if not _golden_p1_teardown_completed(scan["teardown"]):
         failures.append("completed teardown telemetry absent")
@@ -11315,6 +11338,7 @@ def _golden_p1_validate_attempt(
     elif len(strict_sha_values) != 1:
         failures.append(f"observed output SHA ambiguous: {strict_sha_values}")
     elif strict_sha_values[0] != expected_output_sha.lower():
+        details["output_sha_match"] = False
         warning = None
         for _idx, _path, candidate in scan.get("output_sha_warnings", []):
             if not isinstance(candidate, dict):
@@ -11334,12 +11358,17 @@ def _golden_p1_validate_attempt(
                 break
         if warning is None:
             failures.append(
-                "output SHA mismatch without explicit warning evidence: "
+                "output SHA mismatch: "
                 f"observed={sorted(set(strict_shas))} expected={expected_output_sha}"
             )
         else:
             details["output_sha_warning"] = warning
-            details["output_sha_match"] = False
+            # Warning evidence preserves the raw runtime explanation, but it
+            # cannot turn a required expected-SHA mismatch into a strict pass.
+            failures.append(
+                "output SHA mismatch despite explicit warning evidence: "
+                f"observed={sorted(set(strict_shas))} expected={expected_output_sha}"
+            )
     else:
         details["output_sha_match"] = True
     details["observed_output_shas"] = sorted({v for _i, _p, v in scan["output_shas"]})
@@ -11533,6 +11562,22 @@ def _golden_p1_request_pairing(
     return True, "paired", observed
 
 
+def _resolve_golden_p1_mode(selector: str | None = None) -> str:
+    """Resolve the explicit Golden profile/mode selector before dispatch."""
+    requested = str(selector or "").strip().lower()
+    if requested not in {"", "serial", "parallel"}:
+        raise ValueError("golden mode must be serial or parallel")
+    profile = os.environ.get("COMFYMODAL_V2CTL_PROFILE", "").strip().lower()
+    env_mode = os.environ.get("V2_BENCHMARK_MODE", "").strip().lower()
+    parallel_profile = profile == "golden_p1_parallel"
+    parallel_env = env_mode == GOLDEN_PARALLEL_MODE
+    if requested == "serial" and (parallel_profile or parallel_env):
+        raise ValueError("serial Golden selector conflicts with golden_p1_parallel")
+    if requested == "parallel" or parallel_profile or parallel_env:
+        return "parallel"
+    return "serial"
+
+
 async def _run_golden_p1(
     workspace: dict[str, Any],
     transport: ModalTransport,
@@ -11550,14 +11595,23 @@ async def _run_golden_p1(
     attention_backend: str | None = None,
     cpu_qd2_prefetch: bool = False,
     deep_trace: bool = False,
+    golden_mode: str | None = None,
 ) -> dict[str, Any]:
-    """Strictly serial Golden P1 cohort over ``run_golden_serial_stream``.
+    """Run one explicitly selected Golden P1 cohort.
 
-    One request in flight at all times; exact attempt order preserved with a
-    configurable gap between attempts.  Writes immutable per-attempt raw
-    event JSON + telemetry JSON plus summary.json/manifest.json under the
-    cohort directory.  Raises when fewer than *run_count* attempts validate.
+    Serial mode retains its one-request-in-flight contract.  Parallel mode
+    selects the dedicated parallel remote method and records the mode in every
+    artifact; it does not inherit the seriality gate.  Both modes preserve
+    immutable per-attempt raw event JSON plus summary/manifest artifacts.
     """
+    golden_mode = _resolve_golden_p1_mode(golden_mode)
+    parallel = golden_mode == "parallel"
+    cohort_mode = GOLDEN_PARALLEL_MODE if parallel else GOLDEN_P1_MODE
+    remote_method = GOLDEN_PARALLEL_REMOTE_METHOD if parallel else GOLDEN_P1_REMOTE_METHOD
+    default_artifacts_dirname = (
+        GOLDEN_PARALLEL_DEFAULT_ARTIFACTS_DIRNAME
+        if parallel else GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME
+    )
     if (
         isinstance(gap_seconds, bool)
         or not isinstance(gap_seconds, (int, float))
@@ -11611,7 +11665,7 @@ async def _run_golden_p1(
     started_iso = datetime.now(timezone.utc).isoformat()
     print(
         f"[v2.golden_p1] mode=start run_count={run_count} gap={gap_seconds}s "
-        f"app={app_name} method={GOLDEN_P1_REMOTE_METHOD}",
+        f"golden_mode={golden_mode} app={app_name} method={remote_method}",
         flush=True,
     )
 
@@ -11624,7 +11678,7 @@ async def _run_golden_p1(
 
     base_dir = (
         Path(artifacts_dir) if artifacts_dir
-        else ROOT / "artifacts" / GOLDEN_P1_DEFAULT_ARTIFACTS_DIRNAME
+        else ROOT / "artifacts" / default_artifacts_dirname
     )
     cid = cohort_id or (
         f"cohort_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}_"
@@ -11679,8 +11733,9 @@ async def _run_golden_p1(
             "run_index": index,
             "v2ctl_invocation_id": invocation_id,
             "request_id": req_id,
-            "mode": GOLDEN_P1_MODE,
-            "method": GOLDEN_P1_REMOTE_METHOD,
+            "mode": cohort_mode,
+            "method": remote_method,
+            "golden_mode": golden_mode,
             "golden_arm": golden_arm,
             "cpu_qd2_prefetch": cpu_qd2_prefetch,
             "deep_trace": deep_trace,
@@ -11727,10 +11782,11 @@ async def _run_golden_p1(
                 invocation_id=invocation_id,
                 cpu_qd2_prefetch=cpu_qd2_prefetch,
                 deep_trace=deep_trace,
+                golden_mode=golden_mode,
             )
-            # Strict serial: exactly one stream in flight; consumed through its
-            # terminal result before anything else happens.
-            events = await _golden_p1_consume_stream(handle, payload)
+            # The selected remote stream is consumed through its terminal
+            # result before dispatching the next attempt.
+            events = await _golden_p1_consume_stream(handle, payload, remote_method)
             artifact["event_count"] = len(events)
             artifact["golden_telemetry"] = _golden_p1_extract_telemetry(events)
             paired, pairing_status, pairing_evidence = _golden_p1_request_pairing(
@@ -11749,6 +11805,7 @@ async def _run_golden_p1(
                 scan,
                 expected_output_sha=expected_output_sha,
                 expected_flags=expected_flags,
+                require_seriality=not parallel,
             )
             artifact["validation"] = details
             artifact["failures"] = failures
@@ -11983,8 +12040,9 @@ async def _run_golden_p1(
     # RX9P-H: immutable pair — never re-read env, never rewrite observed.
     # Summary and manifest use the single captured invocation_id authority.
     summary: dict[str, Any] = {
-        "mode": GOLDEN_P1_MODE,
-        "method": GOLDEN_P1_REMOTE_METHOD,
+        "mode": cohort_mode,
+        "method": remote_method,
+        "golden_mode": golden_mode,
         "target": {"app_name": app_name, "class_name": class_name, "gpu": gpu},
         "profile": os.environ.get("COMFYMODAL_V2CTL_PROFILE", ""),
         "profile_config_fingerprint": os.environ.get(
@@ -12026,7 +12084,7 @@ async def _run_golden_p1(
             "requested_seconds": float(gap_seconds),
             "all_met": all(gap["met"] for gap in gaps),
         },
-        "strict_serial": True,
+        "strict_serial": not parallel,
         "started_utc": started_iso,
         "completed_utc": completed_iso,
         "cohort_dir": str(cohort_dir),
@@ -12115,7 +12173,8 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
                 golden_p1_expected_output_sha: str = "",
                 golden_p1_expected_flags: dict[str, Any] | None = None,
                 golden_p1_force: bool = False,
-                golden_p1_attention_backend: str | None = None) -> None:
+                golden_p1_attention_backend: str | None = None,
+                golden_p1_mode: str | None = None) -> None:
     os.environ.setdefault("COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE", "1")
     os.environ["COMFYMODAL_V2_APP_NAME"] = APP_NAME
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = CLASS_NAME
@@ -12193,6 +12252,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     # build / node-registry preload), so it dispatches before the registry
     # preload and returns without touching any other benchmark mode.
     if golden_p1:
+        _gp_golden_mode = _resolve_golden_p1_mode(golden_p1_mode)
         _gp_workspace = _load_workspace()
         _gp_runs = GOLDEN_P1_DEFAULT_RUN_COUNT if run_count is None else int(run_count)
         _gp_gap = GAP_SECONDS if gap_seconds is None else float(gap_seconds)
@@ -12212,6 +12272,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             attention_backend=golden_p1_attention_backend,
             cpu_qd2_prefetch=_golden_cpu_qd2_prefetch_from_resolved_env(),
             deep_trace=_golden_deep_trace_from_resolved_env(),
+            golden_mode=_gp_golden_mode,
         )
         return
 
@@ -13068,6 +13129,15 @@ if __name__ == "__main__":
              "Opt-in; mutually exclusive with every other special mode.",
     )
     _parser.add_argument(
+        "--golden-mode", "--golden-p1-mode",
+        dest="golden_p1_mode",
+        choices=("serial", "parallel"),
+        default=None,
+        help="Explicit Golden profile selector: serial (default) or parallel. "
+             "Parallel selects run_golden_parallel_stream and records "
+             "golden_mode=parallel.",
+    )
+    _parser.add_argument(
         "--golden-p1-artifacts-dir",
         default=None,
         metavar="DIR",
@@ -13662,6 +13732,7 @@ if __name__ == "__main__":
                 golden_p1_expected_flags=_gp_expected_flags,
                 golden_p1_force=bool(_args.golden_p1_force),
                 golden_p1_attention_backend=_args.attention_backend,
+                golden_p1_mode=_args.golden_p1_mode,
             )
         finally:
             # Process/loop teardown: join any remaining persistence drains with

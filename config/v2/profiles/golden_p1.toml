@@ -22,7 +22,7 @@ scaledown_window = 4
 [workload]
 fresh_required = true
 conditioning_cache = "forced_miss"
-expected_output_sha = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
+expected_output_sha = "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d"
 # v2ctl gate is one structural generation; the frozen final cohort uses
 # `v2ctl confirm --runs 5`, with single-use containers for each run.
 run_count = 1
@@ -53,6 +53,7 @@ COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
 # Golden deliberately keeps the runtime selector on its auto policy instead of
 # inheriting production's baked_cuda default.
 COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
+COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "sage"
 
 # Modal memory snapshots remain enabled by the runtime default.  The
 # COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT control is not in the v2ctl flag

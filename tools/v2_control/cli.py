@@ -81,6 +81,9 @@ GOLDEN_P1_PROFILE = "golden_p1"
 GOLDEN_P1_SELECTOR = "golden_p1"
 GOLDEN_P1_METHOD = "run_golden_serial_stream"
 GOLDEN_P1_MODE = "golden_p1_serial"
+GOLDEN_PARALLEL_PROFILE = "golden_p1_parallel"
+GOLDEN_PARALLEL_METHOD = "run_golden_parallel_stream"
+GOLDEN_PARALLEL_MODE = "golden_p1_parallel"
 GOLDEN_ATTENTION_BACKEND_FLAG = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
 GOLDEN_CPU_QD2_DEPLOY_FLAG = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
@@ -91,7 +94,28 @@ _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 def is_golden_profile_name(profile: object) -> bool:
     value = str(profile or "").strip().lower()
-    return value == GOLDEN_P1_PROFILE or value.startswith("golden_p1_direct")
+    return value in {GOLDEN_P1_PROFILE, GOLDEN_PARALLEL_PROFILE} or value.startswith("golden_p1_direct")
+
+
+def golden_profile_mode(profile: object) -> str:
+    value = str(profile or "").strip().lower()
+    return "parallel" if value == GOLDEN_PARALLEL_PROFILE else "serial"
+
+
+def golden_method_for_profile(profile: object) -> str:
+    return (
+        GOLDEN_PARALLEL_METHOD
+        if golden_profile_mode(profile) == "parallel"
+        else GOLDEN_P1_METHOD
+    )
+
+
+def golden_harness_mode_for_profile(profile: object) -> str:
+    return (
+        GOLDEN_PARALLEL_MODE
+        if golden_profile_mode(profile) == "parallel"
+        else GOLDEN_P1_MODE
+    )
 
 
 def _golden_cpu_qd2_prefetch_requested(config: config_mod.ResolvedConfig) -> bool:
@@ -575,7 +599,11 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     """
     try:
         if is_golden_profile_name(config.profile_name):
-            return GOLDEN_P1_SELECTOR
+            return (
+                "golden_p1_parallel"
+                if golden_profile_mode(config.profile_name) == "parallel"
+                else GOLDEN_P1_SELECTOR
+            )
         env = {f.name: f.value for f in config.flags}
         if config.profile_name == E37_CLEAN_LANE_PROFILE or any(
             str(env.get(name, "0")).lower() in ("1", "true", "yes", "on")
@@ -630,8 +658,9 @@ def _validation_backend_args(config: config_mod.ResolvedConfig) -> tuple[list[st
             if callable(flag_lookup)
             else None
         )
-        # Keep the historical request shape byte-compatible when the selector
-        # is omitted: Golden's remote adapter already defaults to PyTorch.
+        # Resolve the profile/request default before dispatch so the sampler
+        # receives an explicit backend rather than relying on an implicit
+        # PyTorch fallback.
         if attention_flag is not None:
             # Resolve before dispatch, including the accepted PyTorch default;
             # omission would leave backend identity implicit in the command.
@@ -713,7 +742,7 @@ def _benchmark_mode(config: config_mod.ResolvedConfig) -> str:
             is_golden_profile_name(config.profile_name)
             and (mode_flag is None or getattr(mode_flag, "source", "") == "default")
         ):
-            return GOLDEN_P1_MODE
+            return golden_harness_mode_for_profile(config.profile_name)
         return mode or "e28_single"
     except Exception:
         return "e28_single"
@@ -744,21 +773,23 @@ def _reject_golden_mode_override(
     profile = str(getattr(config, "profile_name", "") or "")
     mode_flag = config.flag("V2_BENCHMARK_MODE")
     effective_mode = _benchmark_mode(config)
-    if not is_golden_profile_name(profile) and effective_mode == GOLDEN_P1_MODE:
+    expected_mode = golden_harness_mode_for_profile(profile)
+    if not is_golden_profile_name(profile) and effective_mode in {
+        GOLDEN_P1_MODE, GOLDEN_PARALLEL_MODE,
+    }:
         raise GateError(
-            f"{command} refuses V2_BENCHMARK_MODE={GOLDEN_P1_MODE} for "
-            f"non-Golden profile {profile or '(missing)'}; only "
-            f"{GOLDEN_P1_PROFILE} may use that mode"
+            f"{command} refuses V2_BENCHMARK_MODE={effective_mode} for "
+            f"non-Golden profile {profile or '(missing)'}; only Golden profiles may use it"
         )
     if not is_golden_profile_name(profile):
         return
     if mode_flag is None or mode_flag.source not in {"cli", "inherit", "set"}:
         return
     mode = str(mode_flag.value or "").strip()
-    if mode != GOLDEN_P1_MODE:
+    if mode != expected_mode:
         raise GateError(
             f"{command} refuses explicit V2_BENCHMARK_MODE={mode or '(empty)'} "
-            f"for {GOLDEN_P1_PROFILE}; only {GOLDEN_P1_MODE} is allowed"
+            f"for {profile}; only {expected_mode} is allowed"
         )
 
 
@@ -785,10 +816,11 @@ def _require_full_run_mode(config: config_mod.ResolvedConfig, *, command: str) -
     target = getattr(config, "target", None)
     method = str(getattr(target, "method", "") or "").strip()
     if is_golden_profile_name(profile):
-        if method != GOLDEN_P1_METHOD:
+        expected_method = golden_method_for_profile(profile)
+        if method != expected_method:
             raise GateError(
-                f"{command} refuses golden_p1 target.method={method or '(missing)'}; "
-                f"golden_p1 requires {GOLDEN_P1_METHOD}"
+                f"{command} refuses {profile} target.method={method or '(missing)'}; "
+                f"{profile} requires {expected_method}"
             )
     elif method != FULL_RUN_METHOD:
         raise GateError(
@@ -2196,7 +2228,7 @@ def cmd_golden_status(args, repo_root: Path) -> int:
 
         out = {
             "schema_version": SCHEMA_VERSION,
-            "profile": GOLDEN_P1_PROFILE,
+            "profile": config.profile_name,
             "target": {
                 "app": config.target.app,
                 "class": config.target.class_name,

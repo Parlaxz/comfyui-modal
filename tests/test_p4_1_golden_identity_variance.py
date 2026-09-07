@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tools import golden_observability as go
 
 
@@ -41,9 +43,9 @@ def test_stats_keep_raw_observations_and_all_variance_fields():
     stats = go.compute_stats([1, 2, 3, 4, 5])
     assert stats["raw_observations"] == [1.0, 2.0, 3.0, 4.0, 5.0]
     assert stats["min"] == 1.0 and stats["max"] == 5.0
-    assert stats["median"] == 3.0 and stats["mean"] == 3.0 and stats["p90"] == 5.0
+    assert stats["median"] == 3.0 and stats["mean"] == 3.0 and stats["p90"] == pytest.approx(4.6)
     assert stats["stdev"] > 0 and stats["cv"] > 0 and stats["range"] == 4.0
-    assert "nearest_rank" in stats["method"]
+    assert "linear_interpolation" in stats["method"]
     assert "no trimming" in stats["method"]
 
 

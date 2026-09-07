@@ -172,7 +172,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
     assert config.workload.conditioning_cache == "forced_miss"
     assert (
         config.workload.expected_output_sha
-        == "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
+        == "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d"
     )
     assert config.flag("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT") is None
 
@@ -192,9 +192,9 @@ def test_golden_p1_uses_serial_mode_and_accepts_only_explicit_canonical_selector
         "--run-count",
         "1",
         "--golden-p1-expected-output-sha",
-        "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e",
+        "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d",
         "--attention-backend",
-        "pytorch",
+        "sage",
     ]
     assert env == {
         "V2_BENCHMARK_MODE": "golden_p1_serial"
@@ -216,17 +216,17 @@ def test_golden_attention_backend_is_run_only_and_resolved_by_default():
     config = _config("golden_p1")
     flag = config.flag(ATTENTION_BACKEND_FLAG)
     assert flag is not None
-    assert flag.value == "pytorch"
-    assert flag.source == "default"
+    assert flag.value == "sage"
+    assert flag.source == "profile:golden_p1"
     assert flag.change_requires == "run"
     args, _env = cli._validation_backend_args(config)
-    assert args[-2:] == ["--attention-backend", "pytorch"]
+    assert args[-2:] == ["--attention-backend", "sage"]
 
     source = {"prompt": {"1": {}}, "extra_data": {}, "modal_options": {}}
     payload = _golden_p1_request_payload(
         source, request_id="r-default", index=0,
     )
-    assert "attention_backend" not in payload
+    assert payload["attention_backend"] == "sage"
 
 
 def test_golden_attention_backend_sage_propagates_to_top_level_payload():

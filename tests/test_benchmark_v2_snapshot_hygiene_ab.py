@@ -261,6 +261,13 @@ def test_multiple_samples_medians_and_confirmed():
     assert analysis["overall"]["direction"] == "B faster"
 
 
+def test_p90_uses_linear_interpolation_and_records_method():
+    runs = [_run(f"r{i}", "A", 1000.0 + i) for i in range(5)]
+    stats = ab.compute_arm_stats(_extract(runs, "A"), "application_restore_ms")
+    assert stats["p90"] == pytest.approx(1003.6)
+    assert stats["percentile_method"] == "linear_interpolation"
+
+
 def test_scheduling_difference_does_not_contaminate():
     a_runs = [_run(f"a{i}", "A", 8500.0, cmd_response=15000.0, sched=5000.0) for i in range(3)]
     b_runs = [_run(f"b{i}", "B", 8500.0, cmd_response=10500.0, sched=500.0) for i in range(3)]

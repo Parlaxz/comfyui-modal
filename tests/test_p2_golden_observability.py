@@ -425,7 +425,7 @@ def test_five_run_stats_are_exactly_valid_runs_and_untrimmed():
     assert cohort.valid and len(cohort.valid_attempts) == 5
     stats = go.compute_stats([1, 2, 3, 4, 5])
     assert stats["n"] == 5
-    assert stats["p90"] == 5
+    assert stats["p90"] == pytest.approx(4.6)
     assert stats["min"] == 1 and stats["max"] == 5 and stats["range"] == 4
     assert stats["stdev"] == pytest.approx(math.sqrt(2.5))
     assert "no trimming" in stats["method"]

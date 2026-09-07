@@ -1507,7 +1507,7 @@ def validate_attempt(
 validate_golden_attempt = validate_attempt
 
 
-P90_METHOD = "nearest_rank(ceil(0.90*n)); n=5=>rank5"
+P90_METHOD = "linear_interpolation((n-1)*0.90)"
 STATS_METHOD = P90_METHOD + "; stdev=sample; no trimming"
 
 
@@ -1515,11 +1515,12 @@ def _percentile_p90(values: Sequence[float]) -> float:
     ordered = sorted(float(v) for v in values)
     if not ordered:
         raise ValueError("p90 requires values")
-    # Explicit n=5 method: nearest rank, ceil(0.90*n).  Thus a five-run p90
-    # is the fifth (maximum) observation, matching the existing variance
-    # reports and avoiding an invented interpolation between runs.
-    rank = max(1, math.ceil(0.90 * len(ordered)))
-    return ordered[rank - 1]
+    position = (len(ordered) - 1) * 0.90
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
 def compute_stats(values: Sequence[float]) -> dict[str, Any]:

@@ -152,14 +152,41 @@ REM when not already defined so a v2ctl-resolved environment is never
 REM overwritten after resolution.  Explicit V2_BENCHMARK_MODE branches below
 REM keep precedence, preserving every existing mode.
 set "V2_GOLDEN_P1_ACTIVE=0"
+set "V2_GOLDEN_P1_PARALLEL_ACTIVE=0"
 if /i "%~1"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "%~1"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="true" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="yes" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="on" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "%~1"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
+if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
+if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
 if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
+    if "!V2_GOLDEN_P1_PARALLEL_ACTIVE!"=="1" (
+        if defined COMFYMODAL_V2CTL_PROFILE if /i not "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" (
+            echo === ERROR: parallel Golden selector requires COMFYMODAL_V2CTL_PROFILE=golden_p1_parallel ===
+            exit /b 1
+        )
+        if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" (
+            echo === ERROR: golden_p1_parallel requires V2_BENCHMARK_MODE=golden_p1_parallel ===
+            exit /b 1
+        )
+        set "V2_BENCHMARK_MODE=golden_p1_parallel"
+        echo [v2.golden_p1_parallel] run_selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
+        if not defined COMFYMODAL_V2_APP_NAME (
+            echo === ERROR: golden_p1_parallel requires an experimental COMFYMODAL_V2_APP_NAME ===
+            exit /b 1
+        )
+        if /i "!COMFYMODAL_V2_APP_NAME!"=="stable-modal-comfy-v2-golden-p1" (
+            echo === ERROR: golden_p1_parallel refuses protected production app stable-modal-comfy-v2-golden-p1 ===
+            exit /b 1
+        )
+    ) else (
     echo [v2.golden_p1] run_selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
     REM Golden must never inherit the run-only restore fallback.  Abort before
     REM credentials are loaded or any benchmark/Modal work is attempted.
@@ -177,6 +204,7 @@ if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     )
     if not defined V2_BENCHMARK_MODE set "V2_BENCHMARK_MODE=golden_p1_serial"
     echo [v2.golden_p1] app_identity_source=resolved_experimental_target
+    )
 )
 if not defined COMFYMODAL_V2_APP_NAME set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-restore-only-shadow"
 set "COMFYMODAL_V2_CLASS_NAME=ModalRuntimeEntrypointV2"
@@ -544,6 +572,20 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     set "COMFYMODAL_V2_ENV_PROFILE=inherit"
     python tools\benchmark_v2_direct.py --snapshot-restore-only %*
 ) else if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
+    if "!V2_GOLDEN_P1_PARALLEL_ACTIVE!"=="1" (
+        echo === Running V2 golden_p1 parallel-Golden generation - explicit opt-in ===
+        set "V2_GOLDEN_ARGS=%*"
+        if /i "%~1"=="golden_p1_parallel" (
+            if "%~2"=="" (
+                set "V2_GOLDEN_ARGS="
+            ) else (
+                call set "V2_GOLDEN_ARGS=%%V2_GOLDEN_ARGS:* =%%"
+            )
+        )
+        python tools\benchmark_v2_direct.py --golden-p1 --golden-mode parallel !V2_GOLDEN_ARGS!
+        set "BENCHMARK_EXIT_CODE=!errorlevel!"
+        exit /b !BENCHMARK_EXIT_CODE!
+    ) else (
     echo === Running V2 golden_p1 serial-Golden generation - explicit opt-in ===
     REM Keep the original argument string and remove only a leading selector.
     REM CALL's second expansion applies the substring operation after the
@@ -559,6 +601,7 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     python tools\benchmark_v2_direct.py --golden-p1 !V2_GOLDEN_ARGS!
     set "BENCHMARK_EXIT_CODE=!errorlevel!"
     exit /b !BENCHMARK_EXIT_CODE!
+    )
 ) else (
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===

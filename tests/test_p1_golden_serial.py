@@ -52,7 +52,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "comfymodal_runtime" / "gold
 
 # Reconciled Phase 2 gate contract constants (distinct by design).
 CANONICAL_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
-EXPECTED_OUTPUT_SHA256 = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
+EXPECTED_OUTPUT_SHA256 = "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d"
 
 
 def _load_module():
@@ -1291,6 +1291,132 @@ def test_serial_runner_awaits_async_node_before_next_starts():
 
     asyncio.run(main())
     assert recorder.events.index("slow_async:end") < recorder.events.index("next:start")
+
+
+@pytest.mark.parametrize("return_kind", ["sync", "async", "future"])
+def test_sampler_total_boundary_covers_sync_async_and_future_results(return_kind):
+    class SamplerTarget:
+        FUNCTION = "go"
+        RETURN_TYPES = ("LATENT",)
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {}, "optional": {}}
+
+        def go(self):
+            if return_kind == "async":
+                async def finish():
+                    await asyncio.sleep(0)
+                    return ("latent",)
+                return finish()
+            if return_kind == "future":
+                future = asyncio.get_running_loop().create_future()
+                asyncio.get_running_loop().call_soon(future.set_result, ("latent",))
+                return future
+            return ("latent",)
+
+    runner = gs.GoldenSerialRunner(
+        {"sampler": {"class_type": "SamplerTarget", "inputs": {}}},
+        node_classes={"SamplerTarget": SamplerTarget},
+    )
+    rec = gs.GoldenTelemetryRecorder()
+    runner.set_sampler_target("sampler", "SamplerTarget")
+    runner.set_sampler_total_observer(
+        lambda name, mono, wall, **fields: rec.record_sampler_total_event(
+            name, mono, wall, **fields
+        )
+    )
+    runner.begin_scope({"sampling"})
+
+    try:
+        asyncio.run(runner.run_closure("sampler", include_target=True))
+    finally:
+        runner.end_scope()
+    events = rec.events
+    assert [event["name"] for event in events] == [
+        gs.EVENT_SAMPLER_TOTAL_START,
+        gs.EVENT_SAMPLER_TOTAL_END,
+    ]
+    assert rec.sampler_total_wall_ms is not None
+    assert rec.sampler_total_boundary_status == "observed"
+    assert runner.cache["sampler"].outputs == [["latent"]]
+
+
+def test_sampler_total_exception_has_no_fabricated_total_wall():
+    class FailingSampler:
+        FUNCTION = "go"
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {}, "optional": {}}
+
+        def go(self):
+            raise ValueError("sampler failed")
+
+    runner = gs.GoldenSerialRunner(
+        {"sampler": {"class_type": "FailingSampler", "inputs": {}}},
+        node_classes={"FailingSampler": FailingSampler},
+    )
+    rec = gs.GoldenTelemetryRecorder()
+    runner.set_sampler_target("sampler", "FailingSampler")
+    runner.set_sampler_total_observer(
+        lambda name, mono, wall, **fields: rec.record_sampler_total_event(
+            name, mono, wall, **fields
+        )
+    )
+    runner.begin_scope({"sampling"})
+    with pytest.raises(ValueError, match="sampler failed"):
+        try:
+            asyncio.run(runner.run_closure("sampler", include_target=True))
+        finally:
+            runner.end_scope()
+    assert [event["name"] for event in rec.events] == [
+        gs.EVENT_SAMPLER_TOTAL_START,
+        gs.EVENT_SAMPLER_TOTAL_END,
+    ]
+    assert rec.sampler_total_wall_ms is None
+    assert rec.sampler_total_boundary_status == "exception"
+    assert rec.events[-1]["fields"]["result_ready"] is False
+
+
+def test_sampler_total_missing_boundary_does_not_fallback():
+    rec = gs.GoldenTelemetryRecorder()
+    rec.record_sampler_total_event(
+        gs.EVENT_SAMPLER_TOTAL_END,
+        200,
+        300,
+        status="complete",
+        result_ready=True,
+    )
+    assert rec.sampler_total_wall_ms is None
+    assert rec.sampler_total_boundary_status == "missing"
+    assert rec.events[-1]["fields"]["sampler_total_wall_ms"] is None
+
+
+def test_sampler_total_reconciles_inside_enclosing_sampling_stage():
+    class Clock:
+        value = 0
+
+        def tick(self):
+            self.value += 1_000_000
+            return self.value
+
+    clock = Clock()
+    rec = gs.GoldenTelemetryRecorder(monotonic=clock.tick, wall=clock.tick)
+    rec.begin_stage("golden_sampling")
+    rec.record_sampler_total_event(gs.EVENT_SAMPLER_TOTAL_START, 1_500_000, 1_500_000)
+    rec.record_sampler_total_event(
+        gs.EVENT_SAMPLER_TOTAL_END,
+        2_500_000,
+        2_500_000,
+        status="complete",
+        result_ready=True,
+    )
+    rec.end_stage("golden_sampling", ready=True)
+    payload = rec.to_json_dict()
+    assert payload["sampler_total_reconciliation"]["ok"] is True
+    assert payload["sampler_total_reconciliation"]["enclosing_stage"] == "golden_sampling"
+    assert payload["sampler_total_wall_ms"] == 1.0
 
 
 def test_heavy_node_outside_assigned_stage_fails_closed():

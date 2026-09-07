@@ -3164,67 +3164,6 @@ def _upload_full_trace_bundle(
         return None
 
 
-def _verify_full_trace_bundle_readback(
-    profile_volume: Any,
-    remote_bundle_path: str,
-    expected_size: int,
-    expected_sha256: str,
-) -> None:
-    """Verify the committed bundle through a fresh named-Volume handle.
-
-    ``profile_volume`` is the write-side handle, which may be a
-    ``ModalMountedStateVolume`` wrapper.  Readback deliberately uses the raw
-    Modal Volume returned by a new ``from_name`` lookup so a stale mounted
-    handle cannot turn an invisible upload into a ready artifact.
-
-    Readback is mandatory.  A raw named-Volume handle without ``read_file`` or
-    an unavailable Modal module cannot prove that the committed bundle is
-    visible, so it fails closed rather than allowing a false ready artifact.
-    Any missing, malformed, or mismatched stream also raises.
-    """
-    _raw_write_volume = getattr(profile_volume, "_modal_volume", None)
-    if _raw_write_volume is None:
-        _raw_write_volume = profile_volume
-    if _modal is None:
-        raise RuntimeError("Modal unavailable for named profile Volume readback")
-    if not callable(getattr(_raw_write_volume, "read_file", None)):
-        raise RuntimeError("raw named profile Volume read_file unavailable")
-
-    _volume_type = getattr(_modal, "Volume", None)
-    _from_name = getattr(_volume_type, "from_name", None)
-    if not callable(_from_name):
-        raise RuntimeError("named profile Volume resolver unavailable")
-    _read_volume = _from_name(PROFILE_VOLUME_NAME, create_if_missing=False)
-    if _read_volume is None:
-        raise RuntimeError("named profile Volume unavailable for readback")
-    _read_file = getattr(_read_volume, "read_file", None)
-    if not callable(_read_file):
-        raise RuntimeError("named profile Volume read_file unavailable")
-
-    _hasher = hashlib.sha256()
-    _read_size = 0
-    try:
-        _chunks = _read_file(remote_bundle_path)
-        for _chunk in _chunks:
-            if not isinstance(_chunk, (bytes, bytearray, memoryview)):
-                raise TypeError("named profile Volume returned a non-byte chunk")
-            _chunk_bytes = bytes(_chunk)
-            _read_size += len(_chunk_bytes)
-            _hasher.update(_chunk_bytes)
-    except Exception as _exc:
-        raise RuntimeError(
-            f"named profile Volume bundle readback failed: {type(_exc).__name__}"
-        ) from _exc
-
-    _read_sha256 = _hasher.hexdigest()
-    if _read_size != expected_size or _read_sha256 != expected_sha256:
-        raise RuntimeError(
-            "named profile Volume bundle readback mismatch: "
-            f"size={_read_size}/{expected_size} "
-            f"sha256={_read_sha256}/{expected_sha256}"
-        )
-
-
 def _finalize_full_trace(
     session: Any,
     profile_volume: Any,
@@ -3240,11 +3179,13 @@ def _finalize_full_trace(
       4. Stop resource sampler
       5. Stop VizTracer
       6. Write sanitized runtime summary
-      7. Generate report (not traced)
-      8. Package bundle (not traced)
-      9. Persist bundle and descriptor to profile Volume, commit once, and
-         verify the bundle through a fresh named-Volume readback
-     10. Attach ``full_trace_artifact`` with exact descriptor fields
+      7. Package raw bundle (not traced)
+      8. Persist the raw bundle and minimal descriptor to profile Volume,
+         committing once
+      9. Attach ``full_trace_artifact`` with descriptor fields
+
+    Rich report generation and named-Volume readback are offline concerns and
+    are intentionally absent from request-critical finalization.
 
     Never captures a milestone after ``stop_tracing()``.
 
@@ -3263,10 +3204,10 @@ def _finalize_full_trace(
     _viztracer_status: str = "absent"
     _torch_profiler_status: str = "absent"
     _resource_sampler_status: str = "absent"
-    _report_status: str = "absent"
-    _trace_truncated: bool = False
-    _trace_entry_count: int = 0
-    _trace_entry_capacity: int = 0
+    _stage_timings_ms: dict[str, float] = {}
+    _trace_truncated: bool | None = None
+    _trace_entry_count: int | None = None
+    _trace_entry_capacity: int | None = None
     try:
         # Wrap raw Modal Volume for atomic write+commit persistence
         # ── 1. Final milestone (BEFORE stop_tracing) ──
@@ -3274,13 +3215,23 @@ def _finalize_full_trace(
         # ── 2. Close semantic operations ──
         _close_semantic_ops(session)
         # ── 3+4+5: stop_tracing handles Torch, resource sampler, VizTracer ──
+        _stop_started = time.perf_counter()
         _stop_result = session.stop_tracing()
+        _stage_timings_ms["stop_tracing_ms"] = round(
+            (time.perf_counter() - _stop_started) * 1000, 3
+        )
         if isinstance(_stop_result, dict):
             _v = _stop_result.get("viztracer", {})
             if isinstance(_v, dict):
                 _viztracer_status = "ok" if _v.get("saved") else "error"
-                _trace_entry_count = _v.get("entry_count", 0)
-                _trace_entry_capacity = _v.get("entry_capacity", 0)
+                _trace_entry_count = _v.get("entry_count")
+                _trace_entry_capacity = _v.get("entry_capacity")
+                for _timing_name in ("stop_ms", "save_ms", "gzip_ms", "total_ms"):
+                    _timing_value = _v.get(_timing_name)
+                    if isinstance(_timing_value, (int, float)):
+                        _stage_timings_ms[f"viztracer_{_timing_name}"] = float(
+                            _timing_value
+                        )
             _t = _stop_result.get("torch_profiler", {})
             if isinstance(_t, dict) and _t.get("exported"):
                 _torch_profiler_status = "ok"
@@ -3352,45 +3303,12 @@ def _finalize_full_trace(
                 f"trace_id={_trace_id} error_type=SummaryWriteError",
                 flush=True,
             )
-        # ── 7. Generate report (not traced) ──
-        _report_ok = False
-        try:
-            from .full_trace_report import generate_full_trace_report as _gen_report
-            _report = _gen_report(session.base_dir)
-            if isinstance(_report, dict):
-                # The offline parser is authoritative for the persisted trace
-                # descriptor.  Keep live VizTracer values only when a parsed
-                # value is unavailable or malformed.
-                _parsed_count = _report.get("trace_entry_count")
-                if isinstance(_parsed_count, int) and not isinstance(_parsed_count, bool):
-                    _trace_entry_count = _parsed_count
-                _parsed_capacity = _report.get("trace_entry_capacity")
-                if isinstance(_parsed_capacity, int) and not isinstance(_parsed_capacity, bool):
-                    _trace_entry_capacity = _parsed_capacity
-                _parsed_truncated = _report.get("trace_truncated")
-                if isinstance(_parsed_truncated, bool):
-                    _trace_truncated = _parsed_truncated
-                if _report.get("status") != "error":
-                    _report_ok = True
-                    _report_status = "ok"
-                else:
-                    _report_status = "error"
-            else:
-                _report_status = "error"
-        except Exception as _report_exc:
-            _report_status = "error"
-            print(
-                f"[v2.full_trace] stage=report status=error "
-                f"error_type={type(_report_exc).__name__} trace_id={_trace_id}",
-                flush=True,
-            )
-            print(
-                f"[v2.full_trace_artifact] status=error "
-                f"trace_id={_trace_id} error_type=ReportError",
-                flush=True,
-            )
-        # ── 8. Package bundle (not traced) ──
+        # ── 7. Package raw bundle (not traced) ──
+        _bundle_started = time.perf_counter()
         _bundle = _build_full_trace_bundle(session)
+        _stage_timings_ms["bundle_ms"] = round(
+            (time.perf_counter() - _bundle_started) * 1000, 3
+        )
         if _bundle is None:
             print(
                 f"[v2.full_trace] stage=bundle status=error "
@@ -3436,9 +3354,13 @@ def _finalize_full_trace(
         _remote_dir = f"v2-full-trace/{_utc_date}/{_trace_id}"
         _remote_bundle_path = f"{_remote_dir}/bundle.tar.gz"
         _remote_descriptor_path = f"{_remote_dir}/artifact.json"
+        _upload_started = time.perf_counter()
         _uploaded = _upload_full_trace_bundle(
             profile_volume, _trace_id, _tar_bytes, _sha256,
             remote_bundle_path=_remote_bundle_path,
+        )
+        _stage_timings_ms["upload_ms"] = round(
+            (time.perf_counter() - _upload_started) * 1000, 3
         )
         if _uploaded is None:
             print(
@@ -3467,13 +3389,33 @@ def _finalize_full_trace(
             "remote_descriptor_path": _remote_descriptor_path,
             "bundle_size_bytes": _bundle_size,
             "bundle_sha256": _sha256,
-            "report_status": _report_status,
+            "report_status": "deferred_offline",
             "viztracer_status": _viztracer_status,
             "torch_profiler_status": _torch_profiler_status,
             "resource_sampler_status": _resource_sampler_status,
             "trace_truncated": _trace_truncated,
             "trace_entry_count": _trace_entry_count,
             "trace_entry_capacity": _trace_entry_capacity,
+            "request_id": request_id,
+            "request_id_hash": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+            "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+            "deployment_hash": str(_V2_DEPLOYMENT_COMBINED_HASH or ""),
+            "identity": {
+                "container_session_id": str(
+                    getattr(session, "_container_session_id", "") or ""
+                ),
+                "restored_instance_id": str(
+                    getattr(session, "_restored_instance_id", "") or ""
+                ),
+                "restore_session_id": str(
+                    getattr(session, "_restore_session_id", "") or ""
+                ),
+                "modal_task_id": str(getattr(session, "_modal_task_id", "") or ""),
+                "image_id": str(getattr(session, "_image_id", "") or ""),
+                "cloud": str(getattr(session, "_cloud", "") or ""),
+                "region": str(getattr(session, "_region", "") or ""),
+            },
+            "finalization_timings_ms": dict(_stage_timings_ms),
             "finalize_ms": _finalize_ms,
         }
         _descriptor_bytes = json.dumps(_descriptor, separators=(",", ":")).encode("utf-8")
@@ -3515,34 +3457,6 @@ def _finalize_full_trace(
                 "error_type": "CommitError",
                 "error": "profile volume commit failed",
             }
-        # The commit above is the sole commit.  Only a fresh raw named-Volume
-        # handle can prove that the committed path is visible outside this
-        # container's mounted handle.
-        try:
-            _verify_full_trace_bundle_readback(
-                profile_volume,
-                _remote_bundle_path,
-                _bundle_size,
-                _sha256,
-            )
-        except Exception as _readback_exc:
-            print(
-                f"[v2.full_trace] stage=readback status=error "
-                f"error_type=ReadbackError trace_id={_trace_id} "
-                f"detail={str(_readback_exc)[:160]}",
-                flush=True,
-            )
-            print(
-                f"[v2.full_trace_artifact] status=error "
-                f"trace_id={_trace_id} error_type=ReadbackError",
-                flush=True,
-            )
-            return {
-                "status": "error",
-                "trace_id": _trace_id,
-                "error_type": "ReadbackError",
-                "error": "profile volume bundle readback failed",
-            }
         print(
             f"[v2.full_trace_artifact] status=ready "
             f"trace_id={_trace_id} "
@@ -3559,6 +3473,7 @@ def _finalize_full_trace(
             "trace_id": _trace_id,
             "error_type": _error_type,
             "error": f"finalization failed: {_error_type}",
+            "finalization_timings_ms": dict(_stage_timings_ms),
             "finalize_ms": _finalize_ms,
         }
         print(
@@ -4393,6 +4308,7 @@ def _snapshot_target_fingerprint(
         "run_plan_stream": {"method": True, "is_generator": True},
         "run_prompt_stream": {"method": True, "is_generator": True},
         "run_golden_serial_stream": {"method": True, "is_generator": True},
+        "run_golden_parallel_stream": {"method": True, "is_generator": True},
         "read_output_asset": {"method": True, "is_generator": False},
         "run_checkpoint_stream": {"method": True, "is_generator": True},
     }
@@ -4685,6 +4601,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # reach the deployed runtime.
         "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        ),
+        # Golden attention is a request-bound selector.  The profile value is
+        # carried into the container and consumed when constructing the actual
+        # GoldenRequest; it is not evidence-only metadata.
+        "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "sage"
         ),
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
@@ -22488,7 +22410,38 @@ class ModalRuntimeEntrypoint:
                     )
             yield _deferred_commit_event
 
+    async def run_golden_parallel_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run the distinct Golden parallel control path.
+
+        Adapter validation, volume handling, identity projection, and terminal
+        result shaping stay shared with the frozen serial adapter.  The mode
+        marker selects ``golden_parallel_execute`` at the final orchestration
+        seam; no serial loader or sampler implementation is duplicated.
+        """
+        if not isinstance(request, Mapping):
+            yield {
+                "type": "error",
+                "request_id": "",
+                "message": "golden_request_must_be_mapping",
+            }
+            return
+        parallel_request = dict(request)
+        parallel_request["golden_mode"] = "parallel"
+        async for event in self._run_golden_stream_impl(parallel_request):
+            yield event
+
     async def run_golden_serial_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run the frozen serial Golden adapter through the shared Python seam."""
+        async for event in self._run_golden_stream_impl(request):
+            yield event
+
+    async def _run_golden_stream_impl(
         self,
         request: Mapping[str, Any],
     ) -> AsyncIterator[dict[str, Any]]:
@@ -22512,6 +22465,7 @@ class ModalRuntimeEntrypoint:
             resolve_clip_residency,
             prepare_cpu_clip_prefetch,
         )
+        from .golden_parallel import golden_parallel_execute
         from .output_durability import resolve_output_durability
 
         # Direct Golden bypasses run_plan_stream, where this synchronization
@@ -22553,10 +22507,16 @@ class ModalRuntimeEntrypoint:
             if not isinstance(request_id_raw, str) or not request_id_raw.strip():
                 raise ValueError("golden_request_id_required_nonempty_string")
             output_policy = resolve_output_durability()
-            attention_backend = (
-                normalize_attention_backend(request["attention_backend"])
-                if "attention_backend" in request
-                else None
+            requested_mode = str(request.get("golden_mode", "serial")).strip().lower()
+            if requested_mode not in {"serial", "parallel"}:
+                raise ValueError("golden_mode_invalid")
+            # The resolved value is placed on GoldenRequest below.  This is a
+            # real request selector, not an evidence-only environment marker.
+            attention_backend = normalize_attention_backend(
+                request.get(
+                    "attention_backend",
+                    os.environ.get("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "sage"),
+                )
             )
             _deep_trace_level = normalize_deep_trace_level(request.get("deep_trace", False))
             _full_trace_request_requested = _deep_trace_level != "off"
@@ -22581,6 +22541,7 @@ class ModalRuntimeEntrypoint:
             identity_telemetry["attention_backend_configured"] = (
                 attention_backend or "auto"
             )
+            identity_telemetry["golden_mode"] = requested_mode
             identity_telemetry["deep_trace_level_requested"] = _deep_trace_level
             identity_telemetry["deep_trace_level_effective"] = "off"
             identity_telemetry["output_durability_mode"] = output_policy.mode
@@ -22661,7 +22622,12 @@ class ModalRuntimeEntrypoint:
                 or stage != "golden_durable_commit"
             ]
             golden_trace_config = {
-                "golden_profile_contract": _GOLDEN_TRACE_PROFILE_CONTRACT,
+                "golden_profile_contract": (
+                    _GOLDEN_TRACE_PROFILE_CONTRACT
+                    if requested_mode == "serial"
+                    else "direct_golden_parallel"
+                ),
+                "golden_mode": requested_mode,
                 "golden_profile_require_canonical_stages": True,
                 "output_durability_mode": output_policy.mode,
                 "required_canonical_stages": _required_canonical_stages,
@@ -22833,7 +22799,7 @@ class ModalRuntimeEntrypoint:
                     key: value
                     for key, value in identity_telemetry.items()
                     if key.startswith("sage_runtime_mode_")
-                    or key == "attention_backend_configured"
+                    or key in {"attention_backend_configured", "golden_mode"}
                 }
             )
             if resolve_clip_residency() == "fp32_cast_once":
@@ -22944,7 +22910,12 @@ class ModalRuntimeEntrypoint:
                     else nullcontext()
                 )
                 with _golden_trace_scope:
-                    result = await golden_serial_execute(
+                    execute_golden = (
+                        golden_parallel_execute
+                        if requested_mode == "parallel"
+                        else golden_serial_execute
+                    )
+                    result = await execute_golden(
                         golden_request,
                         volume=volume,
                         volume_mount_root=volume_mount_root,
@@ -23143,7 +23114,7 @@ class ModalRuntimeEntrypoint:
                 key: value
                 for key, value in identity_telemetry.items()
                 if key.startswith("sage_runtime_mode_")
-                or key in {"attention_backend_configured"}
+                or key in {"attention_backend_configured", "golden_mode"}
             }
         )
         result_data["full_trace_diagnostic"] = {
@@ -23420,6 +23391,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
         "run_golden_serial_stream",
+        "run_golden_parallel_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
         "run_numa_experiment",
@@ -23440,6 +23412,7 @@ def _build_decorated_v2_class() -> type:
         "startup", "restore", "exit",
         "read_output_asset",
         "run_golden_serial_stream",
+        "run_golden_parallel_stream",
         "run_env_probe", "run_entry_probe",
         "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
@@ -23543,6 +23516,11 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_golden_serial_stream",
         _modal.method(is_generator=True)(cls.run_golden_serial_stream),
+    )
+    setattr(
+        cls,
+        "run_golden_parallel_stream",
+        _modal.method(is_generator=True)(cls.run_golden_parallel_stream),
     )
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))

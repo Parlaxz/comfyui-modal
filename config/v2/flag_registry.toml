@@ -1026,12 +1026,12 @@ description = "P1 serial-Golden workflow SHA equality guard; hash computation an
 [[flag]]
 name = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
 type = "enum"
-default = "pytorch"
+default = "sage"
 consumed_at = "harness"
 change_requires = "run"
 owner = "golden-p1"
 enum_values = ["pytorch", "sage", "comfy_kitchen"]
-description = "Optional public Golden request attention backend selector; omitted requests retain the existing PyTorch default."
+description = "Public Golden request attention backend selector; omitted Golden requests resolve explicitly to Sage."
 
 [[flag]]
 name = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
@@ -1112,7 +1112,7 @@ default = "e28_single"
 consumed_at = "harness"
 change_requires = "run"
 owner = "v2-core"
-enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "golden_p1_serial", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
+enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "golden_p1_serial", "golden_p1_parallel", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
 description = "Benchmark harness mode selector. Default e28_single = ONE full run_plan_stream generation (the tracer/validation path). snapshot_restore_only (the restore-only PROBE that never generates) is an explicit opt-in ONLY; v2ctl gate/run must never silently fall into it."
 
 [[flag]]

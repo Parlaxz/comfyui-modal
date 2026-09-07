@@ -80,6 +80,9 @@ def test_two_real_workers_preadv_exact_coverage_and_cleanup(tmp_path, monkeypatc
     assert telemetry["worker_count"] == 2
     assert telemetry["worker_extents"] == {"0": 1, "1": 1}
     assert telemetry["worker_bytes"] == {"0": 4, "1": 4}
+    assert telemetry["ready_bytes_total"] == len(payload)
+    assert telemetry["contiguous_prefix_bytes"] == len(payload)
+    assert telemetry["ready_extent_count"] == 2
     assert telemetry["source_provenance"] == "actual_os_preadv"
     assert telemetry["syscall_count"] == len(calls) == 2
     assert telemetry["syscall_bytes"] == len(payload)
@@ -113,6 +116,68 @@ def test_out_of_order_extent_readiness_never_exposes_gap(tmp_path, monkeypatch):
     assert result == [payload]
     assert ticket.telemetry()["contiguous_prefix_bytes"] == len(payload)
     ticket.close()
+
+
+def test_lifecycle_events_snapshot_source_state_before_later_completion(tmp_path):
+    _path, layout, _payload = _fixture(tmp_path)
+    ticket = gs.CpuRawPrefetchTicket(layout)
+
+    # H2D_START is deliberately emitted before the source completion marker.
+    # The later final-state counters must not be projected backward into it.
+    ticket.mark_h2d_start()
+    with ticket._condition:
+        ticket._bytes_read = layout.total_data_bytes
+        ticket._bytes_available = layout.total_data_bytes
+        ticket._contiguous_prefix_bytes = layout.total_data_bytes
+        ticket._ready_intervals = [(0, layout.total_data_bytes)]
+        ticket._worker_bytes = {0: layout.total_data_bytes, 1: 0}
+        ticket._worker_extents = {0: 1, 1: 0}
+        ticket._complete = True
+    ticket.event("CPU_PREFETCH_SOURCE_COMPLETE")
+
+    events = ticket.events
+    h2d = next(event for event in events if event["name"] == "H2D_START")
+    complete = next(event for event in events if event["name"] == "CPU_PREFETCH_SOURCE_COMPLETE")
+    h2d_source = h2d["fields"]["source_snapshot"]
+    complete_source = complete["fields"]["source_snapshot"]
+
+    assert events.index(h2d) < events.index(complete)
+    assert h2d["monotonic_ns"] <= complete["monotonic_ns"]
+    assert h2d_source["source_complete"] is False
+    assert h2d_source["ready_bytes_total"] == 0
+    assert h2d_source["contiguous_prefix_bytes"] == 0
+    assert h2d_source["ready_extent_count"] == 0
+    assert complete_source["source_complete"] is True
+    assert complete_source["ready_bytes_total"] == layout.total_data_bytes
+    assert complete_source["source_complete_monotonic_ns"] == complete["monotonic_ns"]
+
+    telemetry = ticket.telemetry()
+    assert telemetry["ready_bytes_total"] == layout.total_data_bytes
+    assert telemetry["ready_bytes_total_at_h2d_start"] == 0
+    assert telemetry["contiguous_prefix_bytes_at_h2d_start"] == 0
+
+
+def test_event_source_snapshot_is_not_mutated_by_event_or_counter_mutation(tmp_path):
+    _path, layout, _payload = _fixture(tmp_path)
+    ticket = gs.CpuRawPrefetchTicket(layout)
+    ticket.mark_h2d_start()
+    first = next(event for event in ticket.events if event["name"] == "H2D_START")
+    original = json.loads(json.dumps(first["fields"]["source_snapshot"]))
+
+    # Mutating both the ticket and a caller-owned events copy cannot alter the
+    # source state captured with the original lifecycle event.
+    first["fields"]["source_snapshot"]["worker_bytes"]["0"] = 999
+    with ticket._condition:
+        ticket._bytes_read = layout.total_data_bytes
+        ticket._contiguous_prefix_bytes = layout.total_data_bytes
+        ticket._ready_intervals = [(0, layout.total_data_bytes)]
+        ticket._worker_bytes = {0: layout.total_data_bytes, 1: 0}
+    current = next(event for event in ticket.events if event["name"] == "H2D_START")
+
+    assert original["ready_bytes_total"] == 0
+    assert original["worker_bytes"] == {"0": 0, "1": 0}
+    assert current["fields"]["source_snapshot"]["ready_bytes_total"] == 0
+    assert current["fields"]["source_snapshot"]["worker_bytes"] == {"0": 0, "1": 0}
 
 
 def test_short_read_retries_are_exact_and_proven(tmp_path, monkeypatch):

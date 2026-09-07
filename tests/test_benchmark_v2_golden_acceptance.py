@@ -174,7 +174,7 @@ def test_terminal_golden_flags_are_scanned_and_optional_extra_expectations_match
     assert valid, failures
 
 
-def test_golden_output_sha_mismatch_is_valid_only_with_explicit_warning():
+def test_golden_output_sha_mismatch_fails_even_with_explicit_warning():
     scan = _scan()
     scan["output_shas"] = [(0, "result.output_sha", MISMATCH_SHA)]
     scan["output_sha_warnings"] = [(
@@ -185,8 +185,8 @@ def test_golden_output_sha_mismatch_is_valid_only_with_explicit_warning():
 
     valid, failures, details = _validate(scan)
 
-    assert valid, failures
-    assert failures == []
+    assert not valid
+    assert any("output SHA mismatch" in failure for failure in failures)
     assert details["output_sha_match"] is False
     assert details["output_sha_warning"] == {
         "expected": SHA,
@@ -196,7 +196,7 @@ def test_golden_output_sha_mismatch_is_valid_only_with_explicit_warning():
     scan["output_sha_warnings"] = []
     valid, failures, _details = _validate(scan)
     assert not valid
-    assert any("without explicit warning evidence" in failure for failure in failures)
+    assert any("output SHA mismatch" in failure for failure in failures)
 
 
 def test_golden_output_sha_malformed_or_missing_remains_invalid():

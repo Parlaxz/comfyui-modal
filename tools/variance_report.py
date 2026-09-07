@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from comfymodal_runtime.statistics import PERCENTILE_METHOD, percentile as _canonical_percentile
+
 # Sentinel used everywhere a metric is genuinely absent.
 UNAVAILABLE = "unavailable"
 
@@ -55,19 +57,8 @@ def _num(value: Any) -> float | None:
 
 
 def percentile(sorted_values: list[float], p: float) -> float | None:
-    """Nearest-rank percentile of an already-sorted (ascending) list.
-
-    ``p`` is in [0, 100].  Returns ``None`` for an empty list.
-    """
-    n = len(sorted_values)
-    if n == 0:
-        return None
-    if p <= 0:
-        return sorted_values[0]
-    if p >= 100:
-        return sorted_values[-1]
-    k = max(1, int((p / 100.0) * n + 0.5))
-    return sorted_values[min(k, n) - 1]
+    """Compatibility wrapper around the canonical percentile helper."""
+    return _canonical_percentile(sorted_values, p)
 
 
 def compute_stats(values: Iterable[float]) -> dict[str, Any]:
@@ -86,6 +77,7 @@ def compute_stats(values: Iterable[float]) -> dict[str, Any]:
             "p95": UNAVAILABLE,
             "max": UNAVAILABLE,
             "min": UNAVAILABLE,
+            "percentile_method": PERCENTILE_METHOD,
         }
     return {
         "count": len(vals),
@@ -95,6 +87,7 @@ def compute_stats(values: Iterable[float]) -> dict[str, Any]:
         "p95": round(percentile(vals, 95) or 0.0, 3),
         "max": round(vals[-1], 3),
         "min": round(vals[0], 3),
+        "percentile_method": PERCENTILE_METHOD,
     }
 
 
@@ -924,7 +917,14 @@ def build_summary(records: list[dict[str, Any]], *, meta: dict[str, Any] | None 
 
 
 def _render_stats_table(title: str, rows: dict[str, dict[str, Any]]) -> str:
-    lines = [f"### {title}", "", "| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |",
+    methods = sorted({
+        str(stats.get("percentile_method"))
+        for stats in rows.values()
+        if isinstance(stats, dict) and stats.get("percentile_method")
+    })
+    method_note = ", ".join(methods) if methods else PERCENTILE_METHOD
+    lines = [f"### {title}", "", f"Percentile method: `{method_note}`.", "",
+             "| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |",
              "|---|---:|---:|---:|---:|---:|"]
     for label, stats in rows.items():
         if not isinstance(stats, dict):
@@ -1154,7 +1154,8 @@ def compute_stats_extended(values: Iterable[float]) -> dict[str, Any]:
     if not vals:
         return {"count": 0, "median": UNAVAILABLE, "mad": UNAVAILABLE,
                 "p90": UNAVAILABLE, "p95": UNAVAILABLE, "max": UNAVAILABLE,
-                "mean": UNAVAILABLE, "min": UNAVAILABLE}
+                "mean": UNAVAILABLE, "min": UNAVAILABLE,
+                "percentile_method": PERCENTILE_METHOD}
     return {
         "count": len(vals),
         "median": round(statistics.median(vals), 3),
@@ -1164,6 +1165,7 @@ def compute_stats_extended(values: Iterable[float]) -> dict[str, Any]:
         "max": round(vals[-1], 3),
         "mean": round(statistics.mean(vals), 3),
         "min": round(vals[0], 3),
+        "percentile_method": PERCENTILE_METHOD,
     }
 
 

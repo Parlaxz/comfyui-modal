@@ -298,7 +298,7 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_type"], "UploadError")
 
-    def test_finalize_verifies_bundle_through_fresh_named_volume_readback(self) -> None:
+    def test_finalize_does_not_read_back_bundle_through_named_volume(self) -> None:
         session = MagicMock()
         session.trace_id = "trace-readback-ok"
         session.base_dir = self._session_dir
@@ -320,13 +320,11 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "ready")
-        resolver.assert_called_once_with(
-            "comfymodal-v2-profiles", create_if_missing=False,
-        )
-        self.assertEqual(write_volume.read_paths, [result["remote_bundle_path"]])
+        resolver.assert_not_called()
+        self.assertEqual(write_volume.read_paths, [])
         self.assertEqual(write_volume.commit_count, 1)
 
-    def test_finalize_fails_closed_when_fresh_named_volume_readback_is_missing(self) -> None:
+    def test_finalize_does_not_fail_when_named_volume_readback_is_missing(self) -> None:
         session = MagicMock()
         session.trace_id = "trace-readback-missing"
         session.base_dir = self._session_dir
@@ -348,15 +346,9 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
                 session, write_volume, "request-readback-missing",
             )
 
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["error_type"], "ReadbackError")
-        resolver.assert_called_once_with(
-            "comfymodal-v2-profiles", create_if_missing=False,
-        )
-        self.assertEqual(
-            missing_named_volume.read_paths,
-            [path for path in write_volume._files if path.endswith("/bundle.tar.gz")],
-        )
+        self.assertEqual(result["status"], "ready")
+        resolver.assert_not_called()
+        self.assertEqual(missing_named_volume.read_paths, [])
         self.assertEqual(write_volume.commit_count, 1)
 
     def test_finalizer_retains_golden_contract_scalars(self) -> None:
@@ -448,12 +440,14 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
             "remote_descriptor_path", "bundle_size_bytes", "bundle_sha256",
             "report_status", "viztracer_status", "torch_profiler_status",
             "resource_sampler_status", "trace_truncated", "trace_entry_count",
-            "trace_entry_capacity", "finalize_ms",
+            "trace_entry_capacity", "request_id", "deployment_hash", "identity",
+            "finalization_timings_ms", "finalize_ms",
         ]
         for field in required_fields:
             self.assertIn(field, result, f"Missing descriptor field: {field}")
+        self.assertEqual(result["request_id"], "req-42")
 
-    def test_descriptor_preserves_report_trace_truncated(self) -> None:
+    def test_descriptor_defers_rich_report_parsing_to_offline_tooling(self) -> None:
         session = MagicMock()
         session.trace_id = "trace-truncated"
         session.base_dir = self._session_dir
@@ -462,22 +456,18 @@ class FullTraceLifecycleHelpersTest(unittest.TestCase):
         session._torch_profiler = None
         session._torch_profiler_active = False
         profile_volume = _FakeProfileVolume()
-        with _successful_named_volume_readback(profile_volume), \
-             patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), patch(
+        with patch.object(modal_app, "_V2_FULL_TRACE_ENABLED", True), patch(
             "comfymodal_runtime.full_trace_report.generate_full_trace_report",
-            return_value={
-                "status": "ready",
-                "trace_truncated": True,
-                "trace_entry_count": 17,
-                "trace_entry_capacity": 99,
-            },
-        ):
+            side_effect=AssertionError("rich report parsing is offline-only"),
+        ) as report:
             result = modal_app._finalize_full_trace(
                 session, profile_volume, "req-truncated",
             )
-        self.assertTrue(result["trace_truncated"])
-        self.assertEqual(result["trace_entry_count"], 17)
-        self.assertEqual(result["trace_entry_capacity"], 99)
+        self.assertIsNone(result["trace_truncated"])
+        self.assertEqual(result["report_status"], "deferred_offline")
+        self.assertIsNone(result["trace_entry_count"])
+        self.assertIsNone(result["trace_entry_capacity"])
+        report.assert_not_called()
 
     def test_semantic_request_interval_never_fabricates_a_golden_root(self) -> None:
         (self._session_dir / "raw" / "session_events.jsonl").write_text(

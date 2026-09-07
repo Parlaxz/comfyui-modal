@@ -243,7 +243,7 @@ def _value(source: Any, *names: str, default: Any = "") -> Any:
 
 
 def resolved_attention_backend(config: Any) -> str:
-    """Return the backend resolved before dispatch, defaulting to PyTorch."""
+    """Return the backend resolved before dispatch, defaulting explicitly to Sage."""
     flag = None
     lookup = getattr(config, "flag", None)
     if callable(lookup):
@@ -253,7 +253,7 @@ def resolved_attention_backend(config: Any) -> str:
             if getattr(candidate, "name", "") == "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND":
                 flag = candidate
                 break
-    value = str(_value(flag, "value", default="pytorch") or "pytorch").strip().lower()
+    value = str(_value(flag, "value", default="sage") or "sage").strip().lower()
     if value not in {"pytorch", "sage", "comfy_kitchen"}:
         raise ValueError(f"invalid Golden attention backend: {value or '(empty)'}")
     return value
@@ -434,7 +434,7 @@ def sage_runtime_identity(config: Any, *sources: Any) -> dict[str, str]:
 def is_experiment_profile(config: Any) -> bool:
     """Identify Golden/RX control-plane experiments without a second runner."""
     profile = str(getattr(config, "profile_name", "") or "").strip().lower()
-    return profile == "golden_p1" or profile.startswith(("golden_p1_direct", "rx", "ra"))
+    return profile in {"golden_p1", "golden_p1_parallel"} or profile.startswith(("golden_p1_direct", "rx", "ra"))
 
 
 def _jsonable(value: Any) -> Any:
@@ -726,14 +726,15 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
             exact = False
             mismatches.append(f"{key}: expected {expected}, observed {observed}")
     # RX9P-H: attention backend frozen with separate provenance — fail closed.
-    # Configured must be pytorch (Golden control), resolved must be observed pytorch (not missing, not mixed, not copied).
+    # Configured must be the selected Golden backend, and resolved must be
+    # observed at runtime (not missing, mixed, or merely copied).
     expected_attention_configured = str(identity.get("attention_backend_configured") or identity.get("attention_backend") or "").strip().lower()
     expected_attention_resolved = str(identity.get("attention_backend_resolved") or identity.get("attention_backend") or "").strip().lower()
-    # If identity provides no explicit attention expectation but profile is golden, default to pytorch.
-    if not expected_attention_configured and str(identity.get("profile", "") or "").strip().lower() == "golden_p1":
-        expected_attention_configured = "pytorch"
-    if not expected_attention_resolved and str(identity.get("profile", "") or "").strip().lower() == "golden_p1":
-        expected_attention_resolved = "pytorch"
+    # Omitted Golden profile identity resolves to the canonical Sage arm.
+    if not expected_attention_configured and str(identity.get("profile", "") or "").strip().lower() in {"golden_p1", "golden_p1_parallel"}:
+        expected_attention_configured = "sage"
+    if not expected_attention_resolved and str(identity.get("profile", "") or "").strip().lower() in {"golden_p1", "golden_p1_parallel"}:
+        expected_attention_resolved = "sage"
     if expected_attention_configured:
         if not configured_backend_value:
             missing.append(f"{manifest_path}: attention_backend_configured")
@@ -754,7 +755,8 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         elif resolved_backend_value != expected_attention_resolved:
             exact = False
             mismatches.append(f"attention_backend_resolved: expected {expected_attention_resolved}, observed {resolved_backend_value}")
-    # Configured and resolved must agree for golden_p1 (both pytorch), and resolved must not be mere copy.
+    # Configured and resolved must agree for Golden, and resolved must not be
+    # a mere copy of an absent request selector.
     if configured_backend_value and resolved_backend_value and configured_backend_value != resolved_backend_value:
         exact = False
         mismatches.append(f"attention_backend: configured {configured_backend_value} != resolved {resolved_backend_value}")
@@ -875,6 +877,18 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     if failed_attempts and not missing:
         exact = False
         mismatches.append("failed attempt present")
+    expected_output_sha = str(_value(manifest, "expected_output_sha", default="") or "").strip().lower()
+    observed_output_shas = _output_sha_values(all_data)
+    if expected_output_sha and observed_output_shas:
+        observed_output_sha_set = {value.strip().lower() for value in observed_output_shas}
+        if observed_output_sha_set != {expected_output_sha}:
+            exact = False
+            mismatches.append(
+                "output SHA mismatch: "
+                f"expected {expected_output_sha}, observed {sorted(observed_output_sha_set)}"
+            )
+    elif expected_output_sha and not observed_output_shas:
+        missing.append(f"{manifest_path}: observed output SHA")
     return {
         "cohort": path.name,
         "arm": _value(manifest, "arm", "variant", default=""),
@@ -901,8 +915,8 @@ def _compact_cohort(path: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
         "sage_runtime_mode_effective_input": effective_sage_value,
         "sage_runtime_mode_resolution_source": sage_resolution_value,
         "sage_runtime_mode_resolved": resolved_sage_value,
-        "expected_output_sha": _value(manifest, "expected_output_sha", default=""),
-        "observed_output_sha": _output_sha_values(all_data)[:1],
+        "expected_output_sha": expected_output_sha,
+        "observed_output_sha": observed_output_shas[:1],
         "exact": "EXACT" if exact and not missing else ("INCOMPLETE" if missing else "MISMATCH"),
         "mismatch": mismatches,
         "missing": missing,

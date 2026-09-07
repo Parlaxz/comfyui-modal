@@ -62,6 +62,8 @@ import types
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Iterable, Mapping, Optional
 
+_canonical_percentile = importlib.import_module("comfymodal_runtime.statistics").percentile
+
 import torch
 
 # Loaded through the stdlib import mechanism so the Golden module remains
@@ -84,7 +86,7 @@ EXPECTED_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab
 # SHA-256 of the current canonical OUTPUT PNG bytes (NOT a workflow hash).
 # The observed content hash remains authoritative; a configured expectation
 # mismatch is recorded as a warning and does not prevent durability proof.
-EXPECTED_OUTPUT_PNG_SHA256 = "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e"
+EXPECTED_OUTPUT_PNG_SHA256 = "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d"
 CANONICAL_CLIP_NAME = "qwen_3_4b.safetensors"
 CANONICAL_CLIP_TYPE = "lumina2"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
@@ -445,6 +447,8 @@ EVENT_ASSET_WRITE_DONE = "ASSET_WRITE_DONE"
 EVENT_VOLUME_COMMIT_START = "VOLUME_COMMIT_START"
 EVENT_VOLUME_COMMIT_COMPLETE = "VOLUME_COMMIT_COMPLETE"
 EVENT_DURABLE_RESULT_MARKER_PUBLICATION = "DURABLE_RESULT_MARKER_PUBLICATION"
+EVENT_SAMPLER_TOTAL_START = "SAMPLER_TOTAL_START"
+EVENT_SAMPLER_TOTAL_END = "SAMPLER_TOTAL_END"
 
 # These are deliberately wall-clock subspans of the one authoritative durable
 # commit stage.  Modal exposes Volume.commit as one blocking operation; there
@@ -1113,6 +1117,13 @@ class GoldenTelemetryRecorder:
         # stage intervals, which are the authoritative stage walls.
         self.node_timing_records: list[dict[str, Any]] = []
         self.cpu_prefetch_telemetry: dict[str, Any] = {}
+        # Authoritative complete sampler wall.  This is populated only by the
+        # direct runner target boundary; diagnostic/profile spans never fill it.
+        self.sampler_total_wall_ms: Optional[float] = None
+        self.sampler_total_start_monotonic_ns: Optional[int] = None
+        self.sampler_total_end_monotonic_ns: Optional[int] = None
+        self.sampler_total_boundary_status = "missing"
+        self.sampler_total_contract: dict[str, Any] = {}
 
     def record_external_restore(self, metadata: Optional[dict]) -> None:
         """Record adapter-observed restore boundaries without timing them here."""
@@ -1234,16 +1245,81 @@ class GoldenTelemetryRecorder:
     # -- child detail events -------------------------------------------------
 
     def event(self, name: str, **fields: Any) -> None:
+        self.event_at(name, self._monotonic(), self._wall(), **fields)
+
+    def event_at(self, name: str, monotonic_ns: int, wall_ns: int, **fields: Any) -> None:
+        """Append an event using marks captured by the authoritative owner."""
         self._events.append(
             {
                 "name": name,
-                "monotonic_ns": self._monotonic(),
-                "wall_ns": self._wall(),
+                "monotonic_ns": int(monotonic_ns),
+                "wall_ns": int(wall_ns),
                 # Raw events are snapshots.  In particular, a later marker or
                 # caller mutation must not rewrite an already-emitted timing
                 # decomposition.
                 "fields": copy.deepcopy(fields),
             }
+        )
+
+    def record_sampler_total_event(
+        self,
+        name: str,
+        monotonic_ns: int,
+        wall_ns: int,
+        **fields: Any,
+    ) -> None:
+        """Persist direct-runner sampler boundary evidence without fallback."""
+        name = str(name)
+        if name == EVENT_SAMPLER_TOTAL_START:
+            if self.sampler_total_start_monotonic_ns is not None:
+                raise RuntimeError("sampler_total_start_already_recorded")
+            self.sampler_total_start_monotonic_ns = int(monotonic_ns)
+            self.sampler_total_boundary_status = "started"
+            contract = fields.get("contract")
+            if isinstance(contract, Mapping):
+                self.sampler_total_contract = copy.deepcopy(dict(contract))
+            self.event_at(name, monotonic_ns, wall_ns, **fields)
+            return
+        if name != EVENT_SAMPLER_TOTAL_END:
+            self.event_at(name, monotonic_ns, wall_ns, **fields)
+            return
+
+        result_ready = bool(fields.get("result_ready", False))
+        complete = (
+            result_ready
+            and self.sampler_total_start_monotonic_ns is not None
+            and int(monotonic_ns) >= self.sampler_total_start_monotonic_ns
+            and str(fields.get("status", "")) == "complete"
+        )
+        self.sampler_total_end_monotonic_ns = int(monotonic_ns)
+        self.sampler_total_boundary_status = (
+            "observed"
+            if complete
+            else (
+                "missing"
+                if self.sampler_total_start_monotonic_ns is None
+                else str(fields.get("status", "incomplete"))
+            )
+        )
+        if complete:
+            self.sampler_total_wall_ms = round(
+                (int(monotonic_ns) - self.sampler_total_start_monotonic_ns) / 1_000_000,
+                3,
+            )
+            fields["sampler_total_wall_ms"] = self.sampler_total_wall_ms
+        else:
+            # An exception or malformed/missing boundary is evidence of an
+            # incomplete measurement, never a request to substitute a span.
+            self.sampler_total_wall_ms = None
+            fields["sampler_total_wall_ms"] = None
+        fields.setdefault("authority", "GoldenSerialRunner.sampler_target_result_ready")
+        fields.setdefault("scope", "TOTAL" if complete else "UNKNOWN")
+        self.event_at(name, monotonic_ns, wall_ns, **fields)
+
+    def update_sampler_total_contract(self, **updates: Any) -> None:
+        """Attach later-observed non-boundary metadata without moving marks."""
+        self.sampler_total_contract.update(
+            _bounded_telemetry_value(updates)
         )
 
     def adopt_raw_events(self, events: Iterable[Mapping[str, Any]]) -> None:
@@ -1336,7 +1412,7 @@ class GoldenTelemetryRecorder:
 
     @property
     def events(self) -> list[dict]:
-        return list(self._events)
+        return copy.deepcopy(self._events)
 
     # -- seriality reconciliation -------------------------------------------
 
@@ -1356,6 +1432,42 @@ class GoldenTelemetryRecorder:
 
     def to_json_dict(self) -> dict:
         reconcile = self.reconcile_seriality()
+        sampling_stage = self._intervals.get("golden_sampling")
+        sampler_total_reconciliation = {
+            "enclosing_stage": "golden_sampling",
+            "ok": False,
+            "residual_ms": None,
+            "reason": "authoritative_sampler_total_missing",
+        }
+        if (
+            sampling_stage is not None
+            and sampling_stage.end_monotonic_ns is not None
+            and self.sampler_total_wall_ms is not None
+            and self.sampler_total_start_monotonic_ns is not None
+            and self.sampler_total_end_monotonic_ns is not None
+        ):
+            stage_wall_ns = max(
+                0,
+                int(sampling_stage.end_monotonic_ns)
+                - int(sampling_stage.entry_monotonic_ns),
+            )
+            enclosed = (
+                int(sampling_stage.entry_monotonic_ns)
+                <= int(self.sampler_total_start_monotonic_ns)
+                <= int(self.sampler_total_end_monotonic_ns)
+                <= int(sampling_stage.end_monotonic_ns)
+            )
+            sampler_total_reconciliation = {
+                "enclosing_stage": "golden_sampling",
+                "ok": bool(enclosed),
+                "residual_ms": round(
+                    max(0, stage_wall_ns - int(self.sampler_total_end_monotonic_ns)
+                        + int(self.sampler_total_start_monotonic_ns))
+                    / 1_000_000,
+                    3,
+                ),
+                "reason": None if enclosed else "sampler_total_outside_enclosing_stage",
+            }
         payload = {
             "schema": "golden_p1_telemetry_v1",
             "true_durable_marked": self._true_durable_marked,
@@ -1369,6 +1481,18 @@ class GoldenTelemetryRecorder:
             "clip_residency_telemetry": copy.deepcopy(self.clip_residency_telemetry),
             "clip_forward_conversion": dict(self.clip_forward_conversion),
             "cpu_prefetch": copy.deepcopy(self.cpu_prefetch_telemetry),
+            "sampler_total_wall_ms": self.sampler_total_wall_ms,
+            "sampler_total_reconciliation": sampler_total_reconciliation,
+            "sampler_total": {
+                "wall_ms": self.sampler_total_wall_ms,
+                "start_monotonic_ns": self.sampler_total_start_monotonic_ns,
+                "end_monotonic_ns": self.sampler_total_end_monotonic_ns,
+                "boundary_status": self.sampler_total_boundary_status,
+                "contract": copy.deepcopy(self.sampler_total_contract),
+                "reconciliation": sampler_total_reconciliation,
+                "authority": "GoldenSerialRunner.sampler_target_result_ready",
+                "scope": "TOTAL" if self.sampler_total_wall_ms is not None else "UNKNOWN",
+            },
             "external_restore": dict(self._external_restore),
             "seriality": reconcile,
             "stages": [
@@ -1384,7 +1508,7 @@ class GoldenTelemetryRecorder:
                 }
                 for iv in self._intervals.values()
             ],
-            "events": list(self._events),
+            "events": copy.deepcopy(self._events),
         }
         if self.clip_forward_timing:
             payload["clip_forward_timing"] = copy.deepcopy(self.clip_forward_timing)
@@ -1748,15 +1872,11 @@ def aggregate_timing_intervals(
 
 def _percentile(values: Iterable[int], fraction: float) -> Optional[int]:
     """Return an interpolated percentile from an already bounded sample."""
-    ordered = sorted(max(0, int(value)) for value in values)
+    ordered = [max(0, int(value)) for value in values]
     if not ordered:
         return None
-    position = (len(ordered) - 1) * float(fraction)
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    if lower == upper:
-        return ordered[lower]
-    return int(round(ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)))
+    value = _canonical_percentile(ordered, float(fraction) * 100.0)
+    return int(round(value)) if value is not None else None
 
 
 def _read_duration_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -3158,6 +3278,11 @@ class CpuRawPrefetchTicket:
         self._thresholds_emitted: set[int] = set()
         self._source_lifecycle_count = 0
         self._source_complete_event_emitted = False
+        # These belong to the source lifecycle, rather than to the final
+        # telemetry projection.  They are populated at SOURCE_COMPLETE event
+        # emission so an earlier event can never acquire them retroactively.
+        self._source_complete_monotonic_ns: Optional[int] = None
+        self._source_complete_wall_ns: Optional[int] = None
         self._h2d_started = False
         self._h2d_start_ns: Optional[int] = None
         self._h2d_end_ns: Optional[int] = None
@@ -3221,18 +3346,89 @@ class CpuRawPrefetchTicket:
             raise ValueError(f"cpu_prefetch_memory_phase_invalid:{phase}")
 
     def event(self, name: str, **fields: Any) -> None:
+        """Append an event with an event-time source snapshot.
+
+        The source counters continue changing while QD2 workers run.  Keeping
+        the counters only in ``telemetry()`` therefore permits a report to
+        accidentally describe an earlier lifecycle event using final-state
+        values.  Capture the source state while making the event instead.
+        """
+        event_monotonic_ns = time.monotonic_ns()
+        event_wall_ns = time.time_ns()
+        condition = getattr(self, "_condition", None)
+        if condition is None:
+            source_snapshot = {
+                "monotonic_ns": int(event_monotonic_ns),
+                "wall_ns": int(event_wall_ns),
+                "ready_bytes_total": int(getattr(self, "_bytes_read", 0)),
+                "contiguous_prefix_bytes": int(getattr(self, "_contiguous_prefix_bytes", 0)),
+                "ready_extent_count": len(getattr(self, "_ready_intervals", ())),
+                "worker_bytes": {
+                    str(key): int(value)
+                    for key, value in getattr(self, "_worker_bytes", {}).items()
+                },
+                "worker_extents": {
+                    str(key): int(value)
+                    for key, value in getattr(self, "_worker_extents", {}).items()
+                },
+                "source_complete": bool(getattr(self, "_complete", False)),
+                "source_complete_monotonic_ns": getattr(
+                    self, "_source_complete_monotonic_ns", None
+                ),
+                "source_complete_wall_ns": getattr(self, "_source_complete_wall_ns", None),
+            }
+        else:
+            with condition:
+                if (
+                    str(name) == "CPU_PREFETCH_SOURCE_COMPLETE"
+                    and bool(getattr(self, "_complete", False))
+                    and getattr(self, "_source_complete_monotonic_ns", None) is None
+                ):
+                    self._source_complete_monotonic_ns = int(event_monotonic_ns)
+                    self._source_complete_wall_ns = int(event_wall_ns)
+                source_snapshot = {
+                    "monotonic_ns": int(event_monotonic_ns),
+                    "wall_ns": int(event_wall_ns),
+                    "ready_bytes_total": int(self._bytes_read),
+                    "contiguous_prefix_bytes": int(self._contiguous_prefix_bytes),
+                    "ready_extent_count": len(self._ready_intervals),
+                    "worker_bytes": {
+                        str(key): int(value) for key, value in self._worker_bytes.items()
+                    },
+                    "worker_extents": {
+                        str(key): int(value) for key, value in self._worker_extents.items()
+                    },
+                    "source_complete": bool(self._complete),
+                    "source_complete_monotonic_ns": self._source_complete_monotonic_ns,
+                    "source_complete_wall_ns": self._source_complete_wall_ns,
+                }
+        event_fields = copy.deepcopy(fields)
+        # The generated snapshot is authoritative even if a caller happens to
+        # use the same keyword.  Deep copies keep later counter mutation out of
+        # the already-emitted event.
+        event_fields["source_snapshot"] = copy.deepcopy(source_snapshot)
         with self._event_lock:
             self._events.append({
                 "name": str(name),
-                "monotonic_ns": time.monotonic_ns(),
-                "wall_ns": time.time_ns(),
-                "fields": copy.deepcopy(fields),
+                "monotonic_ns": int(event_monotonic_ns),
+                "wall_ns": int(event_wall_ns),
+                "fields": event_fields,
             })
 
     @property
     def events(self) -> list[dict[str, Any]]:
         with self._event_lock:
-            return list(self._events)
+            return copy.deepcopy(self._events)
+
+    def _event_source_snapshot(self, name: str) -> dict[str, Any] | None:
+        """Return an immutable copy of one event's source-time observation."""
+        for event in self.events:
+            if event.get("name") != name:
+                continue
+            fields = event.get("fields")
+            snapshot = fields.get("source_snapshot") if isinstance(fields, Mapping) else None
+            return copy.deepcopy(snapshot) if isinstance(snapshot, Mapping) else None
+        return None
 
     @property
     def bytes_available(self) -> int:
@@ -3613,8 +3809,15 @@ class CpuRawPrefetchTicket:
             bytes_available = int(self._bytes_available)
             bytes_read = int(self._bytes_read)
             source_complete = bool(self._complete)
+            source_complete_monotonic_ns = self._source_complete_monotonic_ns
+            source_complete_wall_ns = self._source_complete_wall_ns
             failed = self._failed
             cancelled = bool(self._cancelled)
+        clip_demand_snapshot = self._event_source_snapshot("CPU_PREFETCH_CLIP_DEMAND")
+        h2d_snapshot = self._event_source_snapshot("H2D_START")
+        h2d_event = next(
+            (event for event in self.events if event.get("name") == "H2D_START"), None
+        )
         post_h2d_observations: list[tuple[int, str]] = []
         for snapshot in (self._memory_post_h2d, self._memory_close):
             if not isinstance(snapshot, Mapping):
@@ -3639,9 +3842,14 @@ class CpuRawPrefetchTicket:
             "cpu_backing_bytes": int(self.layout.total_data_bytes),
             "bytes_read": bytes_read,
             "bytes_prefetched": bytes_available,
+            # ``bytes_prefetched`` is the historical contiguous-prefix field.
+            # Keep it, but expose the distinct total of published/ready
+            # extents explicitly so reports cannot infer one from the other.
+            "ready_bytes_total": bytes_read,
             "read_calls": int(self._read_calls),
             "total_bytes": bytes_read,
             "contiguous_prefix_bytes": int(self._contiguous_prefix_bytes),
+            "ready_extent_count": len(self._ready_intervals),
             "worker_count": 2,
             "source_owner_count": 1,
             "source_lifecycle_count": int(self._source_lifecycle_count),
@@ -3668,6 +3876,8 @@ class CpuRawPrefetchTicket:
             },
             "source_complete": source_complete,
             "source_completed": source_complete,
+            "source_complete_monotonic_ns": source_complete_monotonic_ns,
+            "source_complete_wall_ns": source_complete_wall_ns,
             "source_failed": failed is not None,
             "cancelled": cancelled,
             "source_before_h2d_legal": next(
@@ -3676,22 +3886,54 @@ class CpuRawPrefetchTicket:
                 None,
             ),
             "bytes_prefetched_at_clip_demand": self._bytes_prefetched_at_clip_demand,
+            "ready_bytes_total_at_clip_demand": (
+                clip_demand_snapshot.get("ready_bytes_total")
+                if clip_demand_snapshot is not None else None
+            ),
+            "contiguous_prefix_bytes_at_clip_demand": (
+                clip_demand_snapshot.get("contiguous_prefix_bytes")
+                if clip_demand_snapshot is not None else None
+            ),
+            "ready_extent_count_at_clip_demand": (
+                clip_demand_snapshot.get("ready_extent_count")
+                if clip_demand_snapshot is not None else None
+            ),
             "bytes_read_at_clip_demand": next(
                 (event["fields"].get("bytes_read_at_clip_demand")
                  for event in self.events if event["name"] == "CPU_PREFETCH_CLIP_DEMAND"), None
             ),
             "source_completed_at_clip_demand": self._source_completed_at_clip_demand,
             "bytes_prefetched_at_h2d_start": (
-                next((event["fields"].get("bytes_prefetched_at_h2d_start")
-                      for event in self.events if event["name"] == "H2D_START"), None)
+                h2d_event.get("fields", {}).get("bytes_prefetched_at_h2d_start")
+                if h2d_event is not None else None
             ),
             "bytes_read_at_h2d_start": (
-                next((event["fields"].get("bytes_read_at_h2d_start")
-                      for event in self.events if event["name"] == "H2D_START"), None)
+                h2d_event.get("fields", {}).get("bytes_read_at_h2d_start")
+                if h2d_event is not None else None
             ),
             "source_completed_before_h2d": (
-                next((event["fields"].get("source_completed_before_h2d")
-                       for event in self.events if event["name"] == "H2D_START"), None)
+                h2d_event.get("fields", {}).get("source_completed_before_h2d")
+                if h2d_event is not None else None
+            ),
+            "ready_bytes_total_at_h2d_start": (
+                h2d_snapshot.get("ready_bytes_total")
+                if h2d_snapshot is not None else None
+            ),
+            "contiguous_prefix_bytes_at_h2d_start": (
+                h2d_snapshot.get("contiguous_prefix_bytes")
+                if h2d_snapshot is not None else None
+            ),
+            "ready_extent_count_at_h2d_start": (
+                h2d_snapshot.get("ready_extent_count")
+                if h2d_snapshot is not None else None
+            ),
+            "source_complete_monotonic_ns_at_h2d_start": (
+                h2d_snapshot.get("source_complete_monotonic_ns")
+                if h2d_snapshot is not None else None
+            ),
+            "source_complete_wall_ns_at_h2d_start": (
+                h2d_snapshot.get("source_complete_wall_ns")
+                if h2d_snapshot is not None else None
             ),
             "dynamic_vram_to_h2d_start_wall_ns": next(
                 (event["fields"].get("dynamic_vram_to_h2d_start_wall_ns")
@@ -6590,6 +6832,7 @@ class GoldenFinalResult:
     height: int = 0
     output_node_id: str = ""
     image_data: str = ""
+    golden_mode: str = "serial"
 
     def __post_init__(self) -> None:
         # Keep manually constructed historical strict results compatible while
@@ -6626,6 +6869,12 @@ class GoldenSession:
     ):
         self.request = request
         self.contract = contract or GoldenWorkflowContract()
+        raw_golden_mode = "serial"
+        if isinstance(request.extra_data, Mapping):
+            raw_golden_mode = str(request.extra_data.get("golden_mode", "serial")).strip().lower()
+        if raw_golden_mode not in {"serial", "parallel"}:
+            raise ValueError("golden_mode_invalid")
+        self.golden_mode = raw_golden_mode
         # Capture the transport arm in request evidence.  Missing external
         # bookkeeping does not gate execution; an invalid runtime selector does.
         self.qd_transport_arm = golden_qd_transport_arm()
@@ -6735,6 +6984,7 @@ class GoldenSession:
         self.restore_baseline: dict = {}
         self.run_identity = {
             "request_id": str(request.request_id),
+            "golden_mode": self.golden_mode,
             "workflow_sha256": canonical_workflow_sha256(request.prompt),
             "attention_backend": request.attention_backend,
             "attention_backend_configured": request.attention_backend or "auto",
@@ -6902,6 +7152,7 @@ class GoldenSession:
             height=height,
             output_node_id=output_node_id,
             image_data=image_data,
+            golden_mode=self.golden_mode,
         )
 
 
@@ -6997,6 +7248,14 @@ class GoldenSerialRunner:
         self.sampler_target_class: Optional[str] = None
         self.sampler_call_start: Optional[int] = None
         self.sampler_call_end: Optional[int] = None
+        # Complete direct-target boundary: starts immediately before the first
+        # target FUNCTION call and ends after result normalization/cache
+        # readiness.  This is intentionally distinct from sampler_call_* and
+        # from optional diagnostic/profile spans.
+        self.sampler_total_start: Optional[int] = None
+        self.sampler_total_end: Optional[int] = None
+        self.sampler_total_result_ready = False
+        self.sampler_total_observer: Optional[Callable[..., Any]] = None
 
     def _observe_tasks(self) -> None:
         """Record tasks not present when this runner was constructed."""
@@ -7041,10 +7300,27 @@ class GoldenSerialRunner:
         self.sampler_target_class = str(class_type)
         self.sampler_call_start = None
         self.sampler_call_end = None
+        self.sampler_total_start = None
+        self.sampler_total_end = None
+        self.sampler_total_result_ready = False
 
     def set_trace_recorder(self, recorder: Any) -> None:
         """Bind the request-local recorder used by FULL-TRACE node hooks."""
         self.trace_recorder = recorder
+
+    def set_sampler_total_observer(self, observer: Optional[Callable[..., Any]]) -> None:
+        """Bind an observation-only sink for the direct sampler target boundary."""
+        self.sampler_total_observer = observer
+
+    def _sampler_total_event(self, name: str, monotonic_ns: int, **fields: Any) -> None:
+        observer = self.sampler_total_observer
+        if not callable(observer):
+            return
+        try:
+            observer(name, int(monotonic_ns), int(time.time_ns()), **fields)
+        except BaseException:
+            # Telemetry must not change sampler execution or its result.
+            pass
 
     def executed_summary(self) -> list:
         return [(item["node_id"], item["class_type"], item["stage_class"]) for item in self.executed]
@@ -7262,37 +7538,71 @@ class GoldenSerialRunner:
         else:
             raise RuntimeError(f"lazy_status_never_satisfied:{unique_id}")
 
-        # INPUT_IS_LIST: call once with full lists; otherwise slice per index.
-        input_is_list = getattr(obj, "INPUT_IS_LIST", False)
-        results: list = []
-        if input_is_list:
-            results.append(await self._call_node(unique_id, obj, input_data_all))
-        elif len(input_data_all) == 0:
-            results.append(await self._call_node(unique_id, obj, {}))
-        else:
-            max_len = max(len(v) for v in input_data_all.values())
-
-            def slice_dict(d: dict, i: int) -> dict:
-                return {k: v[i if len(v) > i else -1] for k, v in d.items()}
-
-            for i in range(max_len):
-                results.append(await self._call_node(unique_id, obj, slice_dict(input_data_all, i)))
-
-        # Resolve any async/task results IMMEDIATELY before advancing.
-        resolved = []
-        for r in results:
-            if isinstance(r, list):
-                resolved.append([await self._resolve(x) for x in r])
-            else:
-                resolved.append(await self._resolve(r))
-
-        output, ui, _has_subgraph = self._outputs_from_returns(resolved, class_def)
-        if ui:
-            self.ui_outputs[unique_id] = ui
-        self.cache[unique_id] = _CacheEntry(outputs=output, ui=ui)
-        self.executed.append(
-            {"node_id": unique_id, "class_type": class_type, "stage_class": stage_class}
+        sampler_target = (
+            self.sampler_target_id is not None
+            and str(unique_id) == self.sampler_target_id
+            and (
+                self.sampler_target_class is None
+                or str(class_type) == self.sampler_target_class
+            )
         )
+        if sampler_target:
+            self.sampler_total_start = time.monotonic_ns()
+            self.sampler_total_end = None
+            self.sampler_total_result_ready = False
+            self._sampler_total_event(
+                EVENT_SAMPLER_TOTAL_START,
+                self.sampler_total_start,
+                node_id=str(unique_id),
+                sampler_class=str(class_type),
+                authority="GoldenSerialRunner.sampler_target_result_ready",
+            )
+        try:
+            # INPUT_IS_LIST: call once with full lists; otherwise slice per index.
+            input_is_list = getattr(obj, "INPUT_IS_LIST", False)
+            results: list = []
+            if input_is_list:
+                results.append(await self._call_node(unique_id, obj, input_data_all))
+            elif len(input_data_all) == 0:
+                results.append(await self._call_node(unique_id, obj, {}))
+            else:
+                max_len = max(len(v) for v in input_data_all.values())
+
+                def slice_dict(d: dict, i: int) -> dict:
+                    return {k: v[i if len(v) > i else -1] for k, v in d.items()}
+
+                for i in range(max_len):
+                    results.append(await self._call_node(unique_id, obj, slice_dict(input_data_all, i)))
+
+            # Resolve any async/task results IMMEDIATELY before advancing.
+            resolved = []
+            for r in results:
+                if isinstance(r, list):
+                    resolved.append([await self._resolve(x) for x in r])
+                else:
+                    resolved.append(await self._resolve(r))
+
+            output, ui, _has_subgraph = self._outputs_from_returns(resolved, class_def)
+            if ui:
+                self.ui_outputs[unique_id] = ui
+            self.cache[unique_id] = _CacheEntry(outputs=output, ui=ui)
+            self.executed.append(
+                {"node_id": unique_id, "class_type": class_type, "stage_class": stage_class}
+            )
+            if sampler_target:
+                self.sampler_total_result_ready = bool(output)
+        finally:
+            if sampler_target:
+                self.sampler_total_end = time.monotonic_ns()
+                self._sampler_total_event(
+                    EVENT_SAMPLER_TOTAL_END,
+                    self.sampler_total_end,
+                    node_id=str(unique_id),
+                    sampler_class=str(class_type),
+                    status=("complete" if self.sampler_total_result_ready else "exception"),
+                    result_ready=bool(self.sampler_total_result_ready),
+                    direct_runner_result_resolution=True,
+                )
         self._observe_tasks()
 
     async def _resolve(self, value: Any) -> Any:
@@ -11469,6 +11779,62 @@ async def golden_sampler_prepare(session: GoldenSession) -> dict:
         raise
 
 
+def _sampler_contract_evidence(
+    session: GoldenSession,
+    requested_attention_backend: Optional[str],
+) -> dict[str, Any]:
+    """Capture sampler inputs/configuration without rewriting the prompt."""
+    node_map = session.node_map
+    prompt = getattr(session.request, "prompt", {})
+    node = prompt.get(node_map.sampler_id, {}) if isinstance(prompt, Mapping) else {}
+    inputs = node.get("inputs", {}) if isinstance(node, Mapping) else {}
+    if not isinstance(inputs, Mapping):
+        inputs = {}
+
+    def input_value(*names: str) -> Any:
+        for name in names:
+            if name in inputs:
+                value = inputs[name]
+                if _is_link(value):
+                    linked = getattr(session.runner, "cache", {}).get(str(value[0]))
+                    outputs = getattr(linked, "outputs", None)
+                    socket = int(value[1])
+                    if outputs is not None and socket < len(outputs):
+                        return outputs[socket]
+                return value
+        return None
+
+    run_identity = getattr(session, "run_identity", {})
+    run_identity = run_identity if isinstance(run_identity, Mapping) else {}
+    class_type = node.get("class_type", session.contract.sampler_class_type)
+    steps = input_value("steps")
+    sampler_name = input_value("sampler_name", "sampler")
+    cfg = input_value("cfg", "guidance", "cfg_scale")
+    precision = input_value("precision", "dtype", "unet_dtype")
+    if precision is None:
+        precision = run_identity.get("precision", run_identity.get("compute_dtype"))
+    return _bounded_telemetry_value({
+        "sampler_class": str(class_type),
+        "sampler_class_type": str(class_type),
+        "requested_steps": steps,
+        "steps": steps,
+        "scheduler": input_value("scheduler"),
+        "sampler_name": sampler_name,
+        "sampler": sampler_name,
+        "cfg": cfg,
+        "cfg_scale": cfg,
+        "precision": precision,
+        "residency": getattr(session, "clip_residency", None),
+        "clip_residency": getattr(session, "clip_residency", None),
+        "attention_backend_requested": requested_attention_backend,
+        "attention_backend": requested_attention_backend,
+        "attention_backend_configured": run_identity.get(
+            "attention_backend_configured", requested_attention_backend or "auto"
+        ),
+        "evaluation_count": None,
+    })
+
+
 async def golden_sampling(session: GoldenSession) -> Any:
     """Execute the exact canonical sampler node through the serial runner,
     preserving all workflow inputs (RES4LYF/CacheDiT/model wrappers/scheduler/
@@ -11500,38 +11866,63 @@ async def golden_sampling(session: GoldenSession) -> Any:
                 node_map.sampler_id,
                 session.contract.sampler_class_type,
             )
+        sampler_contract = _sampler_contract_evidence(
+            session, requested_attention_backend
+        )
+        set_sampler_total_observer = getattr(runner, "set_sampler_total_observer", None)
+        if callable(set_sampler_total_observer):
+            def _record_sampler_total_event(
+                name: str,
+                monotonic_ns: int,
+                wall_ns: int,
+                **fields: Any,
+            ) -> None:
+                fields = dict(fields)
+                fields.setdefault("contract", sampler_contract)
+                if name == EVENT_SAMPLER_TOTAL_END:
+                    evaluation_count = None
+                    if diagnostics is not None:
+                        evaluation_count = diagnostics.model_forward_count or diagnostics.callback_count
+                    fields["evaluation_count"] = evaluation_count or None
+                    contract = dict(sampler_contract)
+                    contract["evaluation_count"] = evaluation_count or None
+                    fields["contract"] = contract
+                rec.record_sampler_total_event(name, monotonic_ns, wall_ns, **fields)
+
+            set_sampler_total_observer(_record_sampler_total_event)
         attention_patcher = _sampler_bound_patcher(session)
         if diagnostics is not None:
             diagnostics.begin(session)
             diagnostics.install_model_hooks(session.patcher)
             runner.sampling_diagnostics = diagnostics
-        try:
-            runtime_executor = importlib.import_module("comfymodal_runtime.runtime_executor")
-            _sampling_wrapper_installed = runtime_executor.ensure_sampling_timing_wrapper(
-                session.patcher
-            )
-            rec.event(
-                "sampling_wrapper_install",
-                installed=bool(_sampling_wrapper_installed),
-                patcher_type=type(session.patcher).__name__,
-                source="golden_sampling_runner",
-            )
-        except Exception as exc:
-            rec.event(
-                "sampling_wrapper_install",
-                installed=False,
-                patcher_type=type(session.patcher).__name__,
-                source="golden_sampling_runner",
-                error=type(exc).__name__,
-            )
+        if session.request.deep_trace:
             try:
-                print(
-                    "[v2.sampling_deep_profile] event=runner_install_failed "
-                    f"error={type(exc).__name__}",
-                    flush=True,
+                runtime_executor = importlib.import_module("comfymodal_runtime.runtime_executor")
+                _sampling_wrapper_installed = runtime_executor.ensure_sampling_timing_wrapper(
+                    session.patcher
                 )
-            except Exception:
-                pass
+                rec.event(
+                    "sampling_wrapper_install",
+                    installed=bool(_sampling_wrapper_installed),
+                    patcher_type=type(session.patcher).__name__,
+                    source="golden_sampling_runner",
+                )
+            except Exception as exc:
+                rec.event(
+                    "sampling_wrapper_install",
+                    installed=False,
+                    patcher_type=type(session.patcher).__name__,
+                    source="golden_sampling_runner",
+                    error=type(exc).__name__,
+                )
+                try:
+                    print(
+                        "[v2.sampling_deep_profile] event=runner_install_failed "
+                        f"error={type(exc).__name__}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         # GoldenSerialRunner calls the node method directly, so ComfyUI's
         # SAMPLER_SAMPLE wrapper can be installed successfully while never
         # seeing this invocation.  In that canonical path, bridge the same
@@ -11558,7 +11949,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
                     "comfymodal_runtime.sampling_deep_profile"
                 )
                 profile_level = deep_profile_sdp.resolve_profile_level()
-                if profile_level in {"steps", "blocks"}:
+                if session.request.deep_trace and profile_level in {"steps", "blocks"}:
                     model_preload = importlib.import_module("comfymodal_runtime.model_preload")
                     deep_profile_trace = model_preload._ACTIVE_REQUEST_TRACE.get()
                     if deep_profile_trace is None:
@@ -11828,6 +12219,14 @@ async def golden_sampling(session: GoldenSession) -> Any:
                     requested_attention_backend,
                     attention_scope_state,
                 )
+            if rec.sampler_total_start_monotonic_ns is not None:
+                rec.update_sampler_total_contract(
+                    attention_backend_effective=(
+                        _observed_attention_backend(rec.events)
+                        if requested_attention_backend is not None
+                        else "existing_patcher_override"
+                    )
+                )
         finally:
             # The sampling scope is closed by the inner finally above.  Keep
             # this outer finally as the diagnostics/lifecycle boundary, but do
@@ -11854,7 +12253,14 @@ async def golden_sampling(session: GoldenSession) -> Any:
                 diagnostics._event("diagnostics_read_failed", error=type(diag_exc).__name__)
             finally:
                 diagnostics.cleanup()
-        rec.end_stage("golden_sampling", ready=True, sampling_nodes=len(sampler_classes))
+        rec.end_stage(
+            "golden_sampling",
+            ready=True,
+            sampling_nodes=len(sampler_classes),
+            sampler_total_wall_ms=rec.sampler_total_wall_ms,
+            sampler_total_boundary_status=rec.sampler_total_boundary_status,
+            sampler_total_contract=copy.deepcopy(rec.sampler_total_contract),
+        )
         _attach_golden_sampling_decomposition(
             rec,
             sampling_start_event=sampling_start_event,

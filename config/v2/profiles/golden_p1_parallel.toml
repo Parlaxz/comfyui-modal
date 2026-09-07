@@ -1,0 +1,15 @@
+# v2ctl profile: Golden parallel foundation.  It has a separate target method
+# and deployment app identity; runtime evidence carries golden_mode=parallel.
+schema_version = 1
+name = "golden_p1_parallel"
+extends = "golden_p1"
+owner = "golden-p1-parallel"
+
+[target]
+app = "batch-r0-golden-parallel-ops"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+V2_BENCHMARK_MODE = "golden_p1_parallel"
+COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "sage"

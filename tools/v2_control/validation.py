@@ -39,7 +39,23 @@ from typing import Any, Protocol
 
 def _is_golden_profile(config: Any) -> bool:
     profile = str(getattr(config, "profile_name", "") or "").strip().lower()
-    return profile == "golden_p1" or profile.startswith("golden_p1_direct")
+    return profile in {"golden_p1", "golden_p1_parallel"} or profile.startswith("golden_p1_direct")
+
+
+def _golden_contract(config: Any) -> tuple[str, str, str, bool]:
+    """Return mode, method, evidence mode, and seriality requirement."""
+    profile = str(getattr(config, "profile_name", "") or "").strip().lower()
+    target = getattr(config, "target", None)
+    method = str(getattr(target, "method", "") or "").strip()
+    parallel = profile == "golden_p1_parallel" or method == "run_golden_parallel_stream"
+    if parallel:
+        return (
+            "golden_p1_parallel",
+            "run_golden_parallel_stream",
+            "parallel",
+            False,
+        )
+    return ("golden_p1_serial", "run_golden_serial_stream", "serial", True)
 
 from .backend import detect_crash_loop
 from .errors import GateError
@@ -1288,10 +1304,13 @@ class GoldenCohortValidator(ValidatorPlugin):
             "gpu": str(getattr(resources, "gpu", "") or ""),
         }
         observed_target = manifest.get("target")
-        if manifest.get("mode") != "golden_p1_serial":
-            failures.append("Golden cohort mode is not golden_p1_serial")
-        if manifest.get("method") != "run_golden_serial_stream":
-            failures.append("Golden cohort method is not run_golden_serial_stream")
+        expected_mode, expected_method, expected_golden_mode, require_seriality = _golden_contract(config)
+        if manifest.get("mode") != expected_mode:
+            failures.append(f"Golden cohort mode is not {expected_mode}")
+        if manifest.get("method") != expected_method:
+            failures.append(f"Golden cohort method is not {expected_method}")
+        if expected_golden_mode == "parallel" and manifest.get("golden_mode") != "parallel":
+            failures.append("Golden cohort golden_mode is not parallel")
         if not isinstance(observed_target, dict) or any(
             observed_target.get(key) != value for key, value in expected_target.items()
         ):
@@ -1331,8 +1350,10 @@ class GoldenCohortValidator(ValidatorPlugin):
             failures.append("effective provenance missing request_id")
         elif record.request_id != request_id:
             failures.append("Golden attempt request ID does not match v2ctl binding")
-        if attempt.get("mode") != "golden_p1_serial" or attempt.get("method") != "run_golden_serial_stream":
+        if attempt.get("mode") != expected_mode or attempt.get("method") != expected_method:
             failures.append("Golden attempt method/mode proof is missing")
+        if expected_golden_mode == "parallel" and attempt.get("golden_mode") != "parallel":
+            failures.append("Golden attempt golden_mode proof is missing")
         if attempt.get("valid") is not True or attempt.get("dnf") is not False:
             failures.append("Golden attempt did not validate")
         if attempt.get("failures") != []:
@@ -1414,9 +1435,10 @@ class GoldenCohortValidator(ValidatorPlugin):
                     failures.append("Golden durable-result proof is missing")
                 if telemetry.get("reopen_verified") is not True:
                     failures.append("Golden durable reopen proof is missing")
-        seriality = attempt.get("seriality") or (telemetry or {}).get("seriality")
-        if not isinstance(seriality, dict) or seriality.get("ok") is not True or seriality.get("count") != 0:
-            failures.append("Golden strict-seriality proof is missing or failed")
+        if require_seriality:
+            seriality = attempt.get("seriality") or (telemetry or {}).get("seriality")
+            if not isinstance(seriality, dict) or seriality.get("ok") is not True or seriality.get("count") != 0:
+                failures.append("Golden strict-seriality proof is missing or failed")
 
         # The Golden writer hashes all immutable sibling artifacts.  Verify
         # those hashes here so a valid flag in a modified attempt cannot pass.

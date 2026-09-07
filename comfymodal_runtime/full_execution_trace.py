@@ -2423,11 +2423,21 @@ class FullExecutionTraceSession:
         )
 
         if _was_active and _profiler is not None:
+            _torch_stop_started = time.perf_counter()
+            _torch_exit_ms = 0.0
+            _torch_save_ms = 0.0
+            _torch_gzip_ms = 0.0
             try:
+                _phase_started = time.perf_counter()
                 _profiler.__exit__(None, None, None)
+                _torch_exit_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
                 trace_path = self._base_dir / "raw" / "torch_trace.json"
+                _phase_started = time.perf_counter()
                 _profiler.export_chrome_trace(str(trace_path))
+                _torch_save_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
+                _phase_started = time.perf_counter()
                 self._gzip_file(trace_path)
+                _torch_gzip_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
                 trace_path.unlink(missing_ok=True)
                 self._write_event("torch_profiler_stopped", {
                     "exported": True,
@@ -2435,6 +2445,10 @@ class FullExecutionTraceSession:
                     "start_thread_id": _start_thread_id,
                     "stop_thread_id": _stop_thread_id,
                     "same_thread": _same_thread,
+                    "stop_ms": _torch_exit_ms,
+                    "save_ms": _torch_save_ms,
+                    "gzip_ms": _torch_gzip_ms,
+                    "total_ms": round((time.perf_counter() - _torch_stop_started) * 1000, 3),
                 })
             except Exception as exc:
                 log.warning("Torch profiler export error")
@@ -2499,29 +2513,52 @@ class FullExecutionTraceSession:
         # ── 3. Stop & save VizTracer ───────────────────────────────────────────────
         viz_result: dict[str, Any] = {}
         if self._viztracer is not None:
+            _viz_stop_started = time.perf_counter()
+            _viz_stop_ms = 0.0
+            _viz_save_ms = 0.0
+            _viz_gzip_ms = 0.0
             try:
                 _entry_capacity = getattr(self._viztracer, "tracer_entries", 0) or 0
+                _phase_started = time.perf_counter()
                 self._viztracer.stop()
+                _viz_stop_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
                 _entry_count = getattr(self._viztracer, "data", None)
                 if _entry_count is None:
-                    try:
-                        _entry_count = len(self._viztracer.parse())
-                    except Exception:
-                        _entry_count = 0
+                    # Parsing the saved trace here makes finalization scale with
+                    # the full profiler output.  The cheap live data length is
+                    # sufficient when available; otherwise leave the count
+                    # unknown rather than turning a diagnostic into a request
+                    # critical read/parse.
+                    _entry_count = None
                 else:
                     _entry_count = len(_entry_count) if hasattr(_entry_count, "__len__") else 0
                 viz_path = self._base_dir / "raw" / "viztracer.json"
+                _phase_started = time.perf_counter()
                 self._viztracer.save(str(viz_path))
+                _viz_save_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
+                _phase_started = time.perf_counter()
                 self._gzip_file(viz_path)
+                _viz_gzip_ms = round((time.perf_counter() - _phase_started) * 1000, 3)
                 viz_path.unlink(missing_ok=True)
                 viz_result = {
                     "saved": True,
                     "path": str(viz_path.with_name("viztracer.json.gz")),
                     "entry_count": _entry_count,
                     "entry_capacity": _entry_capacity,
+                    "stop_ms": _viz_stop_ms,
+                    "save_ms": _viz_save_ms,
+                    "gzip_ms": _viz_gzip_ms,
+                    "total_ms": round((time.perf_counter() - _viz_stop_started) * 1000, 3),
                 }
             except Exception as exc:
-                viz_result = {"saved": False, "error_type": type(exc).__name__}
+                viz_result = {
+                    "saved": False,
+                    "error_type": type(exc).__name__,
+                    "stop_ms": _viz_stop_ms,
+                    "save_ms": _viz_save_ms,
+                    "gzip_ms": _viz_gzip_ms,
+                    "total_ms": round((time.perf_counter() - _viz_stop_started) * 1000, 3),
+                }
                 log.warning("VizTracer save error")
                 print(
                     f"[v2.full_trace] stage=stop_viztracer "

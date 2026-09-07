@@ -62,14 +62,32 @@ REM establishes the profile's deploy-baked dynamic-VRAM flag.  The flag is
 REM set ONLY when not already defined so a v2ctl-resolved child environment
 REM (profile golden_p1) is never overwritten after resolution.
 set "V2_GOLDEN_P1_ACTIVE=0"
+set "V2_GOLDEN_P1_PARALLEL_ACTIVE=0"
 if /i "%~1"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "%~1"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="1" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
+if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
+if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
 if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
-    if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_serial" (
-        echo === ERROR: golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial ===
-        exit /b 1
+    if "!V2_GOLDEN_P1_PARALLEL_ACTIVE!"=="1" (
+        if defined COMFYMODAL_V2CTL_PROFILE if /i not "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" (
+            echo === ERROR: parallel Golden selector requires COMFYMODAL_V2CTL_PROFILE=golden_p1_parallel ===
+            exit /b 1
+        )
+        if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" (
+            echo === ERROR: golden_p1_parallel requires V2_BENCHMARK_MODE=golden_p1_parallel ===
+            exit /b 1
+        )
+        set "V2_BENCHMARK_MODE=golden_p1_parallel"
+    ) else (
+        if defined V2_BENCHMARK_MODE if /i not "!V2_BENCHMARK_MODE!"=="golden_p1_serial" (
+            echo === ERROR: golden_p1 requires V2_BENCHMARK_MODE=golden_p1_serial ===
+            exit /b 1
+        )
+        set "V2_BENCHMARK_MODE=golden_p1_serial"
     )
-    set "V2_BENCHMARK_MODE=golden_p1_serial"
     if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
     echo [v2.golden_p1] selector=ACTIVE golden_enable_dynamic_vram=!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!
     REM Golden R0 is isolated. Reject missing/protected identity before any

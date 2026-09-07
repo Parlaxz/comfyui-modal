@@ -1723,6 +1723,31 @@ class TestStopTracing(unittest.TestCase):
         self.assertIn("elapsed_seconds", summary)
         self.assertEqual(summary["final_state"], "trace_stopped")
 
+    def test_viztracer_stop_keeps_finalization_parse_free(self):
+        """A missing live data count must not trigger a full trace parse."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+        tracer = MagicMock()
+        tracer.tracer_entries = 123
+        tracer.data = None
+        tracer.parse.side_effect = AssertionError("parse is offline-only")
+        tracer.save.side_effect = lambda path: Path(path).write_text(
+            '{"traceEvents": []}', encoding="utf-8"
+        )
+        session._viztracer = tracer
+
+        result = session.stop_tracing()
+
+        tracer.parse.assert_not_called()
+        viz = result["viztracer"]
+        self.assertIsNone(viz["entry_count"])
+        self.assertEqual(viz["entry_capacity"], 123)
+        for field in ("stop_ms", "save_ms", "gzip_ms", "total_ms"):
+            self.assertIn(field, viz)
+            self.assertGreaterEqual(viz[field], 0)
+
     def test_stop_double_call(self):
         session = self._make_session()
         session.start_restore()

@@ -38,6 +38,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from comfymodal_runtime.statistics import PERCENTILE_METHOD, percentile as _canonical_percentile
+
 
 def _num(value: Any) -> float | None:
     if isinstance(value, bool):
@@ -48,23 +50,20 @@ def _num(value: Any) -> float | None:
 
 
 def percentile(values: list[float], pct: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    idx = int(pct / 100.0 * len(ordered) + 0.999999)
-    idx = min(len(ordered) - 1, max(0, idx - 1))
-    return ordered[idx]
+    return _canonical_percentile(values, pct)
 
 
-def _stats(values: list[float]) -> dict[str, float | None]:
+def _stats(values: list[float]) -> dict[str, Any]:
     if not values:
-        return {"min": None, "p50": None, "p90": None, "max": None, "n": 0}
+        return {"min": None, "p50": None, "p90": None, "max": None, "n": 0,
+                "percentile_method": PERCENTILE_METHOD}
     return {
         "min": round(min(values), 1),
         "p50": round(percentile(values, 50.0) or 0.0, 1),
         "p90": round(percentile(values, 90.0) or 0.0, 1),
         "max": round(max(values), 1),
         "n": len(values),
+        "percentile_method": PERCENTILE_METHOD,
     }
 
 

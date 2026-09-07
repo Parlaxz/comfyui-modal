@@ -54,7 +54,7 @@ _MANIFEST_PATH_RE = re.compile(
 def _is_golden_config(config: "ResolvedConfig") -> bool:
     """Return whether this request uses the dedicated Golden harness."""
     profile = str(getattr(config, "profile_name", "") or "").strip().lower()
-    return profile == "golden_p1" or profile.startswith("golden_p1_direct")
+    return profile in {"golden_p1", "golden_p1_parallel"} or profile.startswith("golden_p1_direct")
 
 
 def _normalize_logged_path(raw: str) -> Path:
@@ -1174,8 +1174,20 @@ class BackendRunner:
         if not cohort_dir.is_absolute():
             cohort_dir = self._repo_root / cohort_dir
         cohort_dir = cohort_dir.resolve()
+        expected_profile_value = expected_profile or "golden_p1"
+        target = getattr(config, "target", None)
+        parallel = (
+            expected_profile_value.strip().lower() == "golden_p1_parallel"
+            or str(getattr(target, "method", "") or "").strip()
+            == "run_golden_parallel_stream"
+        )
+        expected_mode = "golden_p1_parallel" if parallel else "golden_p1_serial"
+        expected_method = (
+            "run_golden_parallel_stream" if parallel else "run_golden_serial_stream"
+        )
         expected_root = (
-            self._repo_root / "artifacts" / "phase_p1_serial_golden_v1"
+            self._repo_root / "artifacts" /
+            ("phase_p1_parallel_golden_v1" if parallel else "phase_p1_serial_golden_v1")
         ).resolve()
         try:
             cohort_dir.relative_to(expected_root)
@@ -1214,7 +1226,6 @@ class BackendRunner:
                 f"expected {expected_invocation!r}, observed {observed_invocation or '(missing)'} "
                 f"at {manifest}"
             )
-        expected_profile_value = expected_profile or "golden_p1"
         observed_profile = manifest_value("profile", "profile_name")
         if observed_profile != expected_profile_value:
             raise ProvenanceError(
@@ -1232,7 +1243,6 @@ class BackendRunner:
                     f"observed {observed_profile_fp or '(missing)'}"
                 )
 
-        target = getattr(config, "target", None)
         expected_target = {
             "app_name": str(getattr(target, "app", "") or ""),
             "class_name": str(getattr(target, "class_name", "") or ""),
@@ -1240,8 +1250,9 @@ class BackendRunner:
         }
         observed_target = manifest_data.get("target")
         if (
-            manifest_data.get("mode") != "golden_p1_serial"
-            or manifest_data.get("method") != "run_golden_serial_stream"
+            manifest_data.get("mode") != expected_mode
+            or manifest_data.get("method") != expected_method
+            or (parallel and manifest_data.get("golden_mode") != "parallel")
             or not isinstance(observed_target, dict)
             or any(observed_target.get(key) != value for key, value in expected_target.items())
         ):
