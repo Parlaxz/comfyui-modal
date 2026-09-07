@@ -126,8 +126,23 @@ _CLIP_TOKENIZER_KEYS = {"spiece_model", "tekken_model", "tokenizer_json"}
 # not a process/global ComfyUI attention switch.
 ATTENTION_BACKENDS = ("pytorch", "sage", "comfy_kitchen")
 
+
+def normalize_deep_trace_level(value: Any) -> str:
+    """Normalize the request-only deep profiling selector."""
+    if isinstance(value, bool):
+        return "full" if value else "off"
+    if not isinstance(value, str):
+        raise ValueError("golden_deep_trace_must_be_bool_or_string")
+    level = value.strip().lower()
+    if level in {"", "off", "none", "0", "false"}:
+        return "off"
+    if level in {"full", "trace", "1", "true", "on"}:
+        return "full"
+    raise ValueError("golden_deep_trace_level_invalid")
+
 GOLDEN_QD = 4
 GOLDEN_BLOCK_BYTES = 32 * 1024 * 1024
+CPU_QD2_SOURCE_EXTENT_BYTES = 128 * 1024 * 1024
 DECOUPLED_SOURCE_QD_ENV = "COMFYMODAL_GOLDEN_SOURCE_QD"
 DECOUPLED_SOURCE_BLOCK_BYTES_ENV = "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES"
 DECOUPLED_H2D_COPY_BYTES_ENV = "COMFYMODAL_GOLDEN_H2D_COPY_BYTES"
@@ -560,6 +575,7 @@ class GoldenRequest:
     # source path; this arm is never combined with InstantTensor or another
     # source owner.
     cpu_qd2_prefetch: bool = False
+    deep_trace: bool = False
 
     def __post_init__(self) -> None:
         if self.attention_backend is not None:
@@ -571,11 +587,16 @@ class GoldenRequest:
         object.__setattr__(self, "clip_residency", resolve_clip_residency(self.clip_residency))
         if not isinstance(self.cpu_qd2_prefetch, bool):
             raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
+        object.__setattr__(self, "deep_trace", normalize_deep_trace_level(self.deep_trace) == "full")
 
     @property
     def clip_residency_mode(self) -> str:
         """Compatibility spelling for callers that name the field ``mode``."""
         return str(self.clip_residency)
+
+    @property
+    def deep_trace_level(self) -> str:
+        return "full" if self.deep_trace else "off"
 
 
 class AttentionBackendValidationError(RuntimeError):
@@ -1430,9 +1451,14 @@ def stage_diagnostics_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+_GOLDEN_DEEP_TRACE_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "golden_deep_trace_active", default=False
+)
+
+
 def _full_trace_active() -> bool:
-    """Return whether the adapter's full-trace session is enabled."""
-    return os.environ.get("COMFYMODAL_V2_FULL_TRACE") == "1"
+    """Return whether the current Golden request selected deep tracing."""
+    return bool(_GOLDEN_DEEP_TRACE_ACTIVE.get())
 
 
 def _golden_trace_span(name: str) -> ContextManager[Any]:
@@ -1492,8 +1518,14 @@ def _trace_golden_serial_root(func: Callable) -> Callable:
     """
     @functools.wraps(func)
     async def traced(*args: Any, **kwargs: Any) -> Any:
-        with _golden_trace_span("golden_serial_execute"):
-            return await func(*args, **kwargs)
+        request = args[0] if args else kwargs.get("request")
+        active = bool(getattr(request, "deep_trace", False))
+        token = _GOLDEN_DEEP_TRACE_ACTIVE.set(active)
+        try:
+            with _golden_trace_span("golden_serial_execute"):
+                return await func(*args, **kwargs)
+        finally:
+            _GOLDEN_DEEP_TRACE_ACTIVE.reset(token)
 
     return traced
 
@@ -3039,9 +3071,14 @@ class FrozenClipSourceLayout:
     regions: tuple[tuple[tuple[int, int], ...], ...]
     qd: int
     block_bytes: int
+    # CPU source extent geometry is intentionally separate from the existing
+    # pinned-slot/H2D geometry.
+    h2d_block_bytes: int = GOLDEN_BLOCK_BYTES
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", os.path.abspath(str(self.path)))
+        if int(self.block_bytes) <= 0 or int(self.h2d_block_bytes) <= 0:
+            raise ValueError("cpu_prefetch_block_bytes_invalid")
         object.__setattr__(self, "header", _freeze_source_metadata(dict(self.header)))
         object.__setattr__(
             self,
@@ -3066,21 +3103,36 @@ class FrozenClipSourceLayout:
 
 
 class CpuRawPrefetchTicket:
-    """One request-local full raw backing with one source-reader lifecycle.
+    """Request-local QD2 source: two positioned ``preadv`` workers.
 
-    The backing is deliberately raw bytes, not a state dict.  Readers wait on
-    the condition variable for the requested range and copy directly into the
-    existing pinned staging slot.  Physical syscall/E27 provenance is not
-    claimed by this experiment arm.
+    Workers own disjoint logical extents and publish an extent only after the
+    complete extent has landed in the one ordinary-RAM backing.  Consumers use
+    the exact published interval set, rather than a scalar prefix, so an
+    out-of-order worker can never expose a partial or unowned range.
     """
 
-    source_kind = "cpu_raw_bytearray_prefetch"
-    source_provenance = "application_file_read_not_physical_syscall_proven"
+    source_kind = "cpu_raw_qd2_preadv_prefetch"
+    source_provenance = "unproven_until_observed"
+    source_owner_count = 1
+    worker_count = 2
 
     def __init__(self, layout: FrozenClipSourceLayout):
         self.layout = layout
+        self._events: list[dict[str, Any]] = []
+        self._event_lock = threading.Lock()
+        self._memory_before = _host_memory_visibility()
+        self._allocation_start_ns = time.perf_counter_ns()
+        self.event(
+            "CPU_BACKING_ALLOCATION_START",
+            cpu_backing_bytes=int(layout.total_data_bytes),
+            rss_before_allocation=self._memory_before,
+        )
         self._raw: Optional[bytearray] = bytearray(layout.total_data_bytes)
+        self._allocation_end_ns = time.perf_counter_ns()
+        self._memory_after_allocation = _host_memory_visibility()
+        self._allocation_wall_ns = max(0, self._allocation_end_ns - self._allocation_start_ns)
         self._condition = threading.Condition()
+        self._threads: list[threading.Thread] = []
         self._thread: Optional[threading.Thread] = None
         self._started = False
         self._complete = False
@@ -3089,7 +3141,23 @@ class CpuRawPrefetchTicket:
         self._read_calls = 0
         self._bytes_read = 0
         self._bytes_available = 0
+        self._contiguous_prefix_bytes = 0
+        self._ready_intervals: list[tuple[int, int]] = []
+        self._logical_extent_records: list[dict[str, Any]] = []
+        self._syscall_records: list[dict[str, Any]] = []
+        self._syscall_count = 0
+        self._short_read_retries = 0
+        self._worker_bytes = {0: 0, 1: 0}
+        self._worker_extents = {0: 0, 1: 0}
+        self._worker_started_ns: dict[int, int] = {}
+        self._worker_ended_ns: dict[int, int] = {}
+        self._worker_started_wall_ns: dict[int, int] = {}
+        self._worker_ended_wall_ns: dict[int, int] = {}
+        self._worker_errors: dict[int, str] = {}
+        self._first_extent_published = False
+        self._thresholds_emitted: set[int] = set()
         self._source_lifecycle_count = 0
+        self._source_complete_event_emitted = False
         self._h2d_started = False
         self._h2d_start_ns: Optional[int] = None
         self._h2d_end_ns: Optional[int] = None
@@ -3104,9 +3172,6 @@ class CpuRawPrefetchTicket:
         self._source_completed_at_clip_demand: Optional[bool] = None
         self._clip_demand_wait_ns = 0
         self._clip_demand_wait_count = 0
-        self._events: list[dict[str, Any]] = []
-        self._event_lock = threading.Lock()
-        self._memory_before = _host_memory_visibility()
         self._available_before = _cpu_prefetch_memory_visibility()
         self._cgroup_before = _cpu_prefetch_cgroup_memory()
         self._page_faults_before = _process_page_faults()
@@ -3123,6 +3188,13 @@ class CpuRawPrefetchTicket:
         self._cgroup_close: Optional[dict[str, Any]] = None
         self._page_faults_close: Optional[dict[str, Any]] = None
         self._raw_released = False
+
+        self.event(
+            "CPU_BACKING_ALLOCATION_END",
+            cpu_backing_bytes=int(layout.total_data_bytes),
+            rss_after_allocation=self._memory_after_allocation,
+            allocation_wall_ns=int(self._allocation_wall_ns),
+        )
 
     def _capture_memory_visibility(self, phase: str) -> None:
         """Capture counters at a lifecycle boundary without inventing gaps."""
@@ -3167,93 +3239,194 @@ class CpuRawPrefetchTicket:
         with self._condition:
             return int(self._bytes_available)
 
+    @property
+    def source_lifecycle_count(self) -> int:
+        return int(self._source_lifecycle_count)
+
     def start(self) -> None:
+        startup_error: Optional[RuntimeError] = None
         with self._condition:
             if self._started:
                 raise RuntimeError("cpu_prefetch_started_twice")
-            self._started = True
-            self._source_lifecycle_count += 1
+            preadv = getattr(os, "preadv", None)
+            if not callable(preadv):
+                startup_error = RuntimeError("cpu_prefetch_preadv_unavailable")
+            elif len(self.layout.regions) != 2 or any(not region for region in self.layout.regions):
+                startup_error = RuntimeError("cpu_prefetch_requires_two_nonempty_workers")
+            if startup_error is None:
+                self._started = True
+                self._source_lifecycle_count += 1
+                self._worker_bytes = {0: 0, 1: 0}
+            else:
+                self._failed = startup_error
+        if startup_error is not None:
+            self._release_raw_backing()
+            raise startup_error
         self.event("CPU_PREFETCH_START", source_kind=self.source_kind,
                    source_provenance=self.source_provenance,
-                   cpu_backing_bytes=self.layout.total_data_bytes)
-        self._thread = threading.Thread(
-            target=self._read_source_once,
-            daemon=True,
-            name="golden-cpu-prefetch",
-        )
-        with _GOLDEN_THREAD_LOCK:
-            _GOLDEN_THREADS.add(self._thread)
-        self._thread.start()
+                   cpu_backing_bytes=self.layout.total_data_bytes,
+                   worker_count=2,
+                   logical_extent_bytes=CPU_QD2_SOURCE_EXTENT_BYTES)
+        for worker_id in range(2):
+            thread = threading.Thread(
+                target=self._read_worker,
+                args=(worker_id,),
+                daemon=True,
+                name=f"golden-cpu-prefetch-{worker_id}",
+            )
+            self._threads.append(thread)
+            with _GOLDEN_THREAD_LOCK:
+                _GOLDEN_THREADS.add(thread)
+        self._thread = self._threads[0]
+        for thread in self._threads:
+            thread.start()
 
-    def _read_source_once(self) -> None:
+    def _preadv_exact(self, fd: int, worker_id: int, extent_id: int, abs_offset: int, rel_offset: int, length: int, target: memoryview) -> int:
+        """Read one extent completely using only observed ``os.preadv`` calls."""
+        preadv = getattr(os, "preadv", None)
+        if not callable(preadv):
+            raise RuntimeError("cpu_prefetch_preadv_unavailable")
+        total = 0
+        retry = 0
+        while total < length:
+            requested = length - total
+            syscall = {
+                "worker_id": int(worker_id),
+                "extent_id": int(extent_id),
+                "offset": int(abs_offset) + total,
+                "destination_offset": int(rel_offset) + total,
+                "requested_bytes": int(requested),
+                "retry_number": int(retry),
+                "method": "os.preadv",
+            }
+            try:
+                returned = int(preadv(int(fd), [target[total:]], int(abs_offset) + total))
+            except BaseException as exc:
+                syscall.update({"returned_bytes": 0, "error": f"{type(exc).__name__}: {exc}"})
+                with self._condition:
+                    self._syscall_records.append(syscall)
+                    self._syscall_count += 1
+                raise
+            syscall["returned_bytes"] = returned
+            syscall["bytes"] = returned
+            with self._condition:
+                self._syscall_records.append(syscall)
+                self._syscall_count += 1
+            if returned <= 0:
+                raise RuntimeError(f"cpu_prefetch_short_read:{abs_offset + total}:{returned}")
+            if returned > requested:
+                raise RuntimeError(f"cpu_prefetch_oversized_read:{returned}>{requested}")
+            total += returned
+            if total < length:
+                retry += 1
+                with self._condition:
+                    self._short_read_retries += 1
+        return total
+
+    def _publish_extent(self, worker_id: int, extent_id: int, abs_start: int, length: int, started_ns: int, ended_ns: int) -> None:
+        rel_start = int(abs_start) - int(self.layout.data_start)
+        rel_end = rel_start + int(length)
+        with self._condition:
+            if rel_start < 0 or rel_end > self.layout.total_data_bytes:
+                raise RuntimeError("cpu_prefetch_extent_out_of_bounds")
+            if any(rel_start < end and rel_end > start for start, end in self._ready_intervals):
+                raise RuntimeError("cpu_prefetch_duplicate_or_overlap")
+            self._ready_intervals.append((rel_start, rel_end))
+            self._ready_intervals.sort()
+            self._bytes_read += int(length)
+            self._worker_bytes[worker_id] += int(length)
+            self._worker_extents[worker_id] += 1
+            self._logical_extent_records.append({
+                "extent_id": int(extent_id), "worker_id": int(worker_id),
+                "offset": int(abs_start), "end_offset": int(abs_start) + int(length),
+                "destination_offset": rel_start, "bytes": int(length),
+                "source_start_ns": int(started_ns), "source_end_ns": int(ended_ns),
+                "status": "written",
+            })
+            merged: list[tuple[int, int]] = []
+            for start, end in self._ready_intervals:
+                if merged and start <= merged[-1][1]:
+                    if start < merged[-1][1]:
+                        raise RuntimeError("cpu_prefetch_ready_interval_overlap")
+                    merged[-1] = (merged[-1][0], end)
+                else:
+                    merged.append((start, end))
+            self._contiguous_prefix_bytes = merged[0][1] if merged and merged[0][0] == 0 else 0
+            while self._contiguous_prefix_bytes < self.layout.total_data_bytes:
+                next_end = next((end for start, end in merged if start == self._contiguous_prefix_bytes), None)
+                if next_end is None:
+                    break
+                self._contiguous_prefix_bytes = next_end
+            self._bytes_available = self._contiguous_prefix_bytes
+            if not self._first_extent_published:
+                self._first_extent_published = True
+                first = True
+            else:
+                first = False
+            self._condition.notify_all()
+            published_bytes = int(self._bytes_read)
+        if first:
+            self.event("CPU_PREFETCH_FIRST_EXTENT", extent_id=int(extent_id), worker_id=int(worker_id), offset=int(abs_start), bytes=int(length))
+            self.event("CPU_PREFETCH_FIRST_CHUNK", extent_id=int(extent_id), worker_id=int(worker_id), offset=int(abs_start), bytes=int(length))
+        total = int(self.layout.total_data_bytes)
+        for pct in (25, 50, 75, 100):
+            threshold = (total * pct + 99) // 100
+            with self._condition:
+                emit_threshold = published_bytes >= threshold and pct not in self._thresholds_emitted
+                if emit_threshold:
+                    self._thresholds_emitted.add(pct)
+            if emit_threshold:
+                self.event(f"CPU_PREFETCH_SOURCE_{pct}", percent=pct, bytes_prefetched=published_bytes, total_bytes=total)
+
+    def _read_worker(self, worker_id: int) -> None:
+        started_ns = time.perf_counter_ns()
+        started_wall_ns = time.time_ns()
+        with self._condition:
+            self._worker_started_ns[worker_id] = started_ns
+            self._worker_started_wall_ns[worker_id] = started_wall_ns
+        self.event(f"CPU_PREFETCH_SOURCE_WORKER_{worker_id}_START", worker_id=worker_id, start_ns=started_ns, wall_ns=started_wall_ns)
+        fd: Optional[int] = None
         try:
-            expected = int(self.layout.total_data_bytes)
-            with open(self.layout.path, "rb") as handle:
-                handle.seek(int(self.layout.data_start))
-                offset = 0
-                threshold_bytes = {
-                    pct: (expected * pct + 99) // 100
-                    for pct in (25, 50, 75, 100)
-                }
-                emitted_thresholds: set[int] = set()
-                first_chunk = True
-                # The transport block is the source backlog bound.  Never hand
-                # readinto the whole backing: later ranges must become visible
-                # as each bounded source chunk lands.
-                chunk_bytes = max(1, int(self.layout.block_bytes))
-                while offset < expected:
-                    with self._condition:
-                        if self._cancelled:
-                            raise RuntimeError("cpu_prefetch_cancelled")
-                        if self._raw is None:
-                            raise RuntimeError("cpu_prefetch_raw_backing_released")
-                        target = memoryview(self._raw)[offset : offset + min(chunk_bytes, expected - offset)]
-                    got = handle.readinto(target)
-                    self._read_calls += 1
-                    if got is None or int(got) <= 0:
-                        raise RuntimeError(
-                            f"cpu_prefetch_short_read:{offset}!={expected}"
-                        )
-                    got = int(got)
-                    if got > len(target):
-                        raise RuntimeError(f"cpu_prefetch_oversized_read:{got}>{len(target)}")
-                    with self._condition:
-                        if self._cancelled:
-                            raise RuntimeError("cpu_prefetch_cancelled")
-                        offset += got
-                        self._bytes_read = offset
-                        # Reads are strictly sequential, so this is the
-                        # contiguous prefix available to range consumers.
-                        self._bytes_available = offset
-                        if offset == expected:
-                            self._complete = True
-                        self._condition.notify_all()
-                    if first_chunk:
-                        first_chunk = False
-                        self.event("CPU_PREFETCH_FIRST_CHUNK", bytes=got, offset=0)
-                    for pct in (25, 50, 75, 100):
-                        if pct not in emitted_thresholds and offset >= threshold_bytes[pct]:
-                            emitted_thresholds.add(pct)
-                            self.event(
-                                f"CPU_PREFETCH_SOURCE_{pct}",
-                                percent=pct,
-                                bytes_prefetched=offset,
-                                total_bytes=expected,
-                            )
-            if offset != expected:
-                raise RuntimeError(f"cpu_prefetch_short_read:{offset}!={expected}")
-            self.event("CPU_PREFETCH_SOURCE_COMPLETE", bytes=int(offset),
-                       read_calls=int(self._read_calls))
+            fd = os.open(self.layout.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            for extent_id, (abs_start, length) in enumerate(self.layout.regions[worker_id], start=sum(len(r) for r in self.layout.regions[:worker_id])):
+                with self._condition:
+                    if self._cancelled:
+                        raise RuntimeError("cpu_prefetch_cancelled")
+                    if self._raw is None:
+                        raise RuntimeError("cpu_prefetch_raw_backing_released")
+                    rel_start = int(abs_start) - int(self.layout.data_start)
+                    target = memoryview(self._raw)[rel_start:rel_start + int(length)]
+                extent_start_ns = time.perf_counter_ns()
+                got = self._preadv_exact(fd, worker_id, extent_id, int(abs_start), rel_start, int(length), target)
+                extent_end_ns = time.perf_counter_ns()
+                with self._condition:
+                    self._read_calls = self._syscall_count
+                if got != int(length):
+                    raise RuntimeError(f"cpu_prefetch_short_read:{got}!={length}")
+                self._publish_extent(worker_id, extent_id, int(abs_start), int(length), extent_start_ns, extent_end_ns)
         except BaseException as exc:
             with self._condition:
-                self._failed = exc
+                self._worker_errors[worker_id] = f"{type(exc).__name__}: {exc}"
+                if self._failed is None:
+                    self._failed = exc
                 self._condition.notify_all()
-            self.event("CPU_PREFETCH_FAILED", error=f"{type(exc).__name__}: {exc}")
+            self.event("CPU_PREFETCH_FAILED", worker_id=worker_id, error=f"{type(exc).__name__}: {exc}")
         finally:
-            self._capture_memory_visibility("source_completion")
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            ended_ns = time.perf_counter_ns()
+            ended_wall_ns = time.time_ns()
+            with self._condition:
+                self._worker_ended_ns[worker_id] = ended_ns
+                self._worker_ended_wall_ns[worker_id] = ended_wall_ns
+                self._condition.notify_all()
+            self.event(f"CPU_PREFETCH_SOURCE_WORKER_{worker_id}_END", worker_id=worker_id, end_ns=ended_ns, wall_ns=ended_wall_ns, worker_wall_ns=max(0, ended_ns - started_ns), error=self._worker_errors.get(worker_id))
             with _GOLDEN_THREAD_LOCK:
-                if self._thread is not None:
-                    _GOLDEN_THREADS.discard(self._thread)
+                thread = threading.current_thread()
+                _GOLDEN_THREADS.discard(thread)
 
     def read_range(self, relative_start: int, length: int) -> memoryview:
         start = int(relative_start)
@@ -3264,7 +3437,7 @@ class CpuRawPrefetchTicket:
         waited = False
         with self._condition:
             end = start + length
-            while self._bytes_available < end and self._failed is None and not self._cancelled:
+            while not self._range_ready_locked(start, end) and self._failed is None and not self._cancelled:
                 waited = True
                 self._condition.wait()
             elapsed = max(0, time.monotonic_ns() - wait_started)
@@ -3278,11 +3451,24 @@ class CpuRawPrefetchTicket:
                 raise RuntimeError("cpu_prefetch_source_failed") from self._failed
             if self._cancelled:
                 raise RuntimeError("cpu_prefetch_cancelled")
-            if self._bytes_available < end:
+            if not self._range_ready_locked(start, end):
                 raise RuntimeError("cpu_prefetch_source_incomplete")
             if self._raw is None:
                 raise RuntimeError("cpu_prefetch_raw_backing_released")
             return memoryview(self._raw)[start : start + length]
+
+    def _range_ready_locked(self, start: int, end: int) -> bool:
+        if start == end:
+            return True
+        cursor = start
+        for interval_start, interval_end in sorted(self._ready_intervals):
+            if interval_start > cursor:
+                return False
+            if interval_end > cursor:
+                cursor = interval_end
+            if cursor >= end:
+                return True
+        return cursor >= end
 
     def mark_clip_demand(self) -> None:
         """Record the normal CLIP-demand boundary before transport starts."""
@@ -3294,10 +3480,12 @@ class CpuRawPrefetchTicket:
             self._bytes_prefetched_at_clip_demand = int(self._bytes_available)
             self._source_completed_at_clip_demand = bool(self._complete)
             bytes_prefetched = self._bytes_prefetched_at_clip_demand
+            bytes_read = int(self._bytes_read)
             source_completed = self._source_completed_at_clip_demand
         self.event(
             "CPU_PREFETCH_CLIP_DEMAND",
             bytes_prefetched_at_clip_demand=bytes_prefetched,
+            bytes_read_at_clip_demand=bytes_read,
             source_completed_at_clip_demand=source_completed,
         )
 
@@ -3308,12 +3496,22 @@ class CpuRawPrefetchTicket:
             self._h2d_started = True
             self._h2d_start_ns = time.monotonic_ns()
             bytes_prefetched = int(self._bytes_available)
+            bytes_read = int(self._bytes_read)
             source_completed = bool(self._complete)
+        prior_events = self.events
+        dynamic = next((event for event in reversed(prior_events) if event["name"] == "DYNAMICVRAM_ACCEPTED"), None)
+        demand = next((event for event in reversed(prior_events) if event["name"] == "CPU_PREFETCH_CLIP_DEMAND"), None)
+        dynamic_fields = dynamic.get("fields", {}) if dynamic else {}
+        demand_fields = demand.get("fields", {}) if demand else {}
         self.event("H2D_START", source_kind=self.source_kind,
                    bytes_prefetched_at_h2d_start=bytes_prefetched,
-                   bytes_read_at_h2d_start=bytes_prefetched,
+                   bytes_read_at_h2d_start=bytes_read,
                    source_completed_before_h2d=source_completed,
-                   source_before_h2d_legal=source_completed)
+                   source_before_h2d_legal=source_completed,
+                   dynamic_vram_to_h2d_start_wall_ns=(time.time_ns() - dynamic["wall_ns"] if dynamic else None),
+                   dynamic_vram_to_h2d_bytes_read=int(bytes_read) - int(dynamic_fields.get("bytes_read_at_dynamic_vram_ready", bytes_read)) if dynamic else None,
+                   clip_demand_to_h2d_start_wall_ns=(time.time_ns() - demand["wall_ns"] if demand else None),
+                   clip_demand_to_h2d_bytes_read=int(bytes_read) - int(demand_fields.get("bytes_read_at_clip_demand", bytes_read)) if demand else None)
 
     def mark_h2d_complete(self, *, h2d_bytes: int) -> None:
         with self._condition:
@@ -3321,12 +3519,13 @@ class CpuRawPrefetchTicket:
             self._h2d_end_ns = time.monotonic_ns()
             self._h2d_bytes = int(h2d_bytes)
             bytes_prefetched = int(self._bytes_available)
+            bytes_read = int(self._bytes_read)
             source_completed = bool(self._complete)
         self._capture_memory_visibility("post_h2d")
         self.event("H2D_COMPLETE_CLIP_GPU_READY", source_kind=self.source_kind,
                    h2d_bytes=int(h2d_bytes),
                    bytes_prefetched_at_h2d_complete=bytes_prefetched,
-                   bytes_read_at_h2d_complete=bytes_prefetched,
+                   bytes_read_at_h2d_complete=bytes_read,
                    source_completed_at_h2d_complete=source_completed)
 
     def mark_clip_gpu_ready(self, *, adoption_proven: bool, storage_proven: bool) -> None:
@@ -3363,13 +3562,30 @@ class CpuRawPrefetchTicket:
             with self._condition:
                 self._cancelled = True
                 self._condition.notify_all()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join()
-        if thread is not None and thread.is_alive():
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join()
+        if any(thread.is_alive() for thread in self._threads):
             raise RuntimeError("cpu_prefetch_worker_still_alive")
+        with self._condition:
+            if not cancel and self._failed is None:
+                expected = [(int(start) - self.layout.data_start, int(start) - self.layout.data_start + int(length)) for region in self.layout.regions for start, length in region]
+                ok, reason = partition_coverage(expected, self.layout.total_data_bytes)
+                actual = list(self._ready_intervals)
+                if not ok or sorted(actual) != sorted(expected) or self._bytes_read != self.layout.total_data_bytes or len(self._worker_ended_ns) != 2:
+                    self._failed = RuntimeError(f"cpu_prefetch_coverage:{reason}")
+                elif self._syscall_count <= 0 or any(record.get("method") != "os.preadv" for record in self._syscall_records):
+                    self._failed = RuntimeError("cpu_prefetch_preadv_provenance_missing")
+                else:
+                    self._complete = True
+                    self._bytes_available = self._contiguous_prefix_bytes
         if self._failed is not None and not cancel:
+            self._release_raw_backing()
             raise RuntimeError("cpu_prefetch_source_failed") from self._failed
+        if self._complete and not self._source_complete_event_emitted:
+            self._source_complete_event_emitted = True
+            self._capture_memory_visibility("source_completion")
+            self.event("CPU_PREFETCH_SOURCE_COMPLETE", bytes=int(self._bytes_read), read_calls=int(self._read_calls), syscall_count=int(self._syscall_count), short_read_retries=int(self._short_read_retries), source_provenance="actual_os_preadv")
 
     def close(self, *, cancel: bool = False) -> None:
         error: Optional[BaseException] = None
@@ -3378,14 +3594,19 @@ class CpuRawPrefetchTicket:
         except BaseException as exc:
             error = exc
         finally:
-            if not self._raw_released:
-                self._raw = None
-                self._raw_released = True
-                self.event("CPU_RAW_BACKING_RELEASE", cpu_backing_bytes=self.layout.total_data_bytes,
-                           raw_backing_released=True)
+            self._release_raw_backing()
             self._capture_memory_visibility("close")
         if error is not None:
             raise error
+
+    def _release_raw_backing(self) -> None:
+        with self._condition:
+            if self._raw_released:
+                return
+            self._raw = None
+            self._raw_released = True
+        self.event("CPU_RAW_BACKING_RELEASE", cpu_backing_bytes=self.layout.total_data_bytes,
+                   raw_backing_released=True)
 
     def telemetry(self) -> dict[str, Any]:
         with self._condition:
@@ -3411,7 +3632,7 @@ class CpuRawPrefetchTicket:
         return {
             "enabled": True,
             "source_kind": self.source_kind,
-            "source_provenance": self.source_provenance,
+            "source_provenance": "actual_os_preadv" if self._complete else self.source_provenance,
             "path": self.layout.path,
             "qd": int(self.layout.qd),
             "block_bytes": int(self.layout.block_bytes),
@@ -3419,7 +3640,32 @@ class CpuRawPrefetchTicket:
             "bytes_read": bytes_read,
             "bytes_prefetched": bytes_available,
             "read_calls": int(self._read_calls),
+            "total_bytes": bytes_read,
+            "contiguous_prefix_bytes": int(self._contiguous_prefix_bytes),
+            "worker_count": 2,
+            "source_owner_count": 1,
             "source_lifecycle_count": int(self._source_lifecycle_count),
+            "logical_extent_bytes": int(CPU_QD2_SOURCE_EXTENT_BYTES),
+            "logical_extent_count": sum(len(r) for r in self.layout.regions),
+            "worker_bytes": {str(k): int(v) for k, v in self._worker_bytes.items()},
+            "worker_extents": {str(k): int(v) for k, v in self._worker_extents.items()},
+            "worker_start_ns": {str(k): v for k, v in self._worker_started_ns.items()},
+            "worker_end_ns": {str(k): v for k, v in self._worker_ended_ns.items()},
+            "worker_wall_ns": {str(k): max(0, self._worker_ended_ns[k] - self._worker_started_ns[k]) for k in self._worker_ended_ns if k in self._worker_started_ns},
+            "worker_start_wall_ns": {str(k): v for k, v in self._worker_started_wall_ns.items()},
+            "worker_end_wall_ns": {str(k): v for k, v in self._worker_ended_wall_ns.items()},
+            "logical_extent_records": copy.deepcopy(self._logical_extent_records),
+            "syscall_records": copy.deepcopy(self._syscall_records),
+            "syscall_count": int(self._syscall_count),
+            "syscall_bytes": sum(int(record.get("returned_bytes", 0)) for record in self._syscall_records),
+            "short_read_retries": int(self._short_read_retries),
+            "ready_intervals": list(self._ready_intervals),
+            "coverage": {
+                "ok": bool(self._complete),
+                "ranges": list(self._ready_intervals),
+                "expected_bytes": int(self.layout.total_data_bytes),
+                "covered_bytes": int(self._bytes_read),
+            },
             "source_complete": source_complete,
             "source_completed": source_complete,
             "source_failed": failed is not None,
@@ -3430,6 +3676,10 @@ class CpuRawPrefetchTicket:
                 None,
             ),
             "bytes_prefetched_at_clip_demand": self._bytes_prefetched_at_clip_demand,
+            "bytes_read_at_clip_demand": next(
+                (event["fields"].get("bytes_read_at_clip_demand")
+                 for event in self.events if event["name"] == "CPU_PREFETCH_CLIP_DEMAND"), None
+            ),
             "source_completed_at_clip_demand": self._source_completed_at_clip_demand,
             "bytes_prefetched_at_h2d_start": (
                 next((event["fields"].get("bytes_prefetched_at_h2d_start")
@@ -3441,7 +3691,23 @@ class CpuRawPrefetchTicket:
             ),
             "source_completed_before_h2d": (
                 next((event["fields"].get("source_completed_before_h2d")
-                      for event in self.events if event["name"] == "H2D_START"), None)
+                       for event in self.events if event["name"] == "H2D_START"), None)
+            ),
+            "dynamic_vram_to_h2d_start_wall_ns": next(
+                (event["fields"].get("dynamic_vram_to_h2d_start_wall_ns")
+                 for event in self.events if event["name"] == "H2D_START"), None
+            ),
+            "dynamic_vram_to_h2d_bytes_read": next(
+                (event["fields"].get("dynamic_vram_to_h2d_bytes_read")
+                 for event in self.events if event["name"] == "H2D_START"), None
+            ),
+            "clip_demand_to_h2d_start_wall_ns": next(
+                (event["fields"].get("clip_demand_to_h2d_start_wall_ns")
+                 for event in self.events if event["name"] == "H2D_START"), None
+            ),
+            "clip_demand_to_h2d_bytes_read": next(
+                (event["fields"].get("clip_demand_to_h2d_bytes_read")
+                 for event in self.events if event["name"] == "H2D_START"), None
             ),
             "h2d_started": bool(self._h2d_started),
             "h2d_complete": bool(self._h2d_complete),
@@ -3462,6 +3728,7 @@ class CpuRawPrefetchTicket:
             "raw_backing_released": bool(self._raw_released),
             "memory": {
                 "before": self._memory_before,
+                "after_allocation": self._memory_after_allocation,
                 "after": self._memory_after,
                 "source_completion": self._memory_after,
                 "post_h2d": self._memory_post_h2d,
@@ -3494,6 +3761,13 @@ class CpuRawPrefetchTicket:
                 },
                 "temporary_full_size_allocations": None,
                 "duplicate_full_size_cpu_copy": False,
+                "cpu_backing_allocation": {
+                    "start_ns": int(self._allocation_start_ns),
+                    "end_ns": int(self._allocation_end_ns),
+                    "wall_ns": int(self._allocation_wall_ns),
+                    "rss_before_allocation": self._memory_before,
+                    "rss_after_allocation": self._memory_after_allocation,
+                },
             },
         }
 
@@ -3516,6 +3790,8 @@ def prepare_cpu_clip_prefetch(
         raise RuntimeError("cpu_qd2_prefetch_clip_residency_conflict")
     if not cpu_qd2_prefetch_deploy_enabled():
         raise RuntimeError("cpu_qd2_prefetch_deploy_gate_required")
+    if not callable(getattr(os, "preadv", None)):
+        raise RuntimeError("cpu_prefetch_preadv_unavailable")
     if isinstance(request.extra_data, Mapping) and request.extra_data.get("instant_tensor"):
         raise RuntimeError("cpu_qd2_prefetch_instant_tensor_conflict")
     contract = contract or GoldenWorkflowContract()
@@ -3528,7 +3804,11 @@ def prepare_cpu_clip_prefetch(
     if parsed.get("status") != "ok":
         raise RuntimeError(f"cpu_prefetch_header_invalid:{parsed.get('reason')}")
     tensor_map = build_header_tensor_map(parsed["header"])
-    block_bytes = int(contract.block_bytes)
+    # This experiment's source geometry is intentionally independent of the
+    # pinned/H2D geometry: exactly 128 MiB logical extents, split contiguously
+    # between exactly two source workers.
+    block_bytes = CPU_QD2_SOURCE_EXTENT_BYTES
+    h2d_block_bytes = int(contract.block_bytes)
     qd = 2
     regions = plan_source_regions(parsed["data_start"], parsed["total_data_bytes"], block_bytes, qd)
     layout = FrozenClipSourceLayout(
@@ -3541,6 +3821,7 @@ def prepare_cpu_clip_prefetch(
         regions=tuple(tuple(region) for region in regions),
         qd=qd,
         block_bytes=block_bytes,
+        h2d_block_bytes=h2d_block_bytes,
     )
     ticket = CpuRawPrefetchTicket(layout)
     ticket.event("RUN_GOLDEN_SERIAL_STREAM_ENTRY", source_kind=ticket.source_kind)
@@ -5313,7 +5594,7 @@ def read_file_qd_gpu(
             raise RuntimeError("cpu_prefetch_ticket_invalid")
         selected_transport_arm = "legacy"
         qd = int(cpu_prefetch_ticket.layout.qd)
-        block_bytes = int(cpu_prefetch_ticket.layout.block_bytes)
+        block_bytes = int(cpu_prefetch_ticket.layout.h2d_block_bytes)
     else:
         selected_transport_arm = golden_qd_transport_arm(transport_arm)
     if transport_resources is not None and cpu_prefetch_ticket is None:
@@ -5392,7 +5673,7 @@ def read_file_qd_gpu(
         else build_header_tensor_map(header)
     )
     regions = (
-        [list(region) for region in cpu_prefetch_ticket.layout.regions]
+        [list(region) for region in plan_source_regions(data_start, total, block_bytes, qd)]
         if cpu_prefetch_ticket is not None
         else plan_source_regions(data_start, total, block_bytes, qd)
     )
@@ -5583,6 +5864,10 @@ def read_file_qd_gpu(
             t.start()
         for t in threads:
             t.join()
+        if cpu_prefetch_ticket is not None:
+            # H2D consumers cover every planned extent, but the source owner
+            # still owns the authoritative completion/provenance proof.
+            cpu_prefetch_ticket.join()
         state.workers_joined = True
         worker_join_wall_ns = (
             max(0, time.perf_counter_ns() - int(t_wall0))
@@ -5645,6 +5930,23 @@ def read_file_qd_gpu(
             if cpu_prefetch_ticket is not None
             else source.get("read_bytes", stats["bytes_read"])
         )
+        if cpu_prefetch_ticket is not None:
+            source_proof = cpu_prefetch_ticket.telemetry()
+            stats.update({
+                "source_provenance": source_proof["source_provenance"],
+                "physical_syscall_provenance": source_proof["source_provenance"],
+                "e27_claim": "NOT_CLAIMED",
+                "source_owner_count": source_proof["source_owner_count"],
+                "source_lifecycle_count": source_proof["source_lifecycle_count"],
+                "worker_count": source_proof["worker_count"],
+                "logical_extent_bytes": source_proof["logical_extent_bytes"],
+                "logical_extent_count": source_proof["logical_extent_count"],
+                "source_syscall_count": source_proof["syscall_count"],
+                "source_short_read_retries": source_proof["short_read_retries"],
+                "source_syscall_records": source_proof["syscall_records"],
+                "source_logical_extent_records": source_proof["logical_extent_records"],
+                "source_ready_intervals": source_proof["ready_intervals"],
+            })
         stats["h2d_submitted_bytes"] = sum(int(r.get("h2d_submitted_bytes", 0)) for r in state.records)
         stats["h2d_completed_bytes"] = sum(int(r.get("h2d_completed_bytes", 0)) for r in state.records)
         stats["buffer_pool_wait_ms"] = (
@@ -6450,6 +6752,9 @@ class GoldenSession:
             "cpu_qd2_prefetch_source_kind": (
                 cpu_prefetch_ticket.source_kind if cpu_prefetch_ticket is not None else "control"
             ),
+            "deep_trace_level_requested": request.deep_trace_level,
+            "deep_trace_level_effective": request.deep_trace_level,
+            "deep_trace_requested": bool(request.deep_trace),
         }
         if isinstance(request.extra_data, Mapping):
             self.run_identity.update(
@@ -12824,6 +13129,7 @@ __all__ = [
     "GOLDEN_STAGE_DIAGNOSTICS_ENV",
     "GOLDEN_QD_TRANSPORT_ENV",
     "CPU_QD2_PREFETCH_ENV",
+    "CPU_QD2_SOURCE_EXTENT_BYTES",
     "DECOUPLED_SOURCE_QD_ENV",
     "DECOUPLED_SOURCE_BLOCK_BYTES_ENV",
     "DECOUPLED_H2D_COPY_BYTES_ENV",
@@ -12886,6 +13192,7 @@ __all__ = [
     "parse_safetensors_header",
     "page_fault_delta",
     "normalize_attention_backend",
+    "normalize_deep_trace_level",
     "partition_coverage",
     "plan_source_regions",
     "read_file_qd_gpu",

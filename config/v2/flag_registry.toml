@@ -850,10 +850,19 @@ description = "Run each request in a fresh single-use container."
 name = "COMFYMODAL_V2_FULL_TRACE"
 type = "bool"
 default = "0"
-consumed_at = "restore"
+consumed_at = "module_import"
 change_requires = "deploy"
 owner = "e29"
-description = "Full execution trace."
+description = "Deploy-baked deep-trace capability; session/sampler/VizTracer/torch profiling is request-only and never started by restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_DEEP_TRACE"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+description = "Request-only Golden deep trace selector; default off. The deploy-baked COMFYMODAL_V2_FULL_TRACE capability is not started during restore."
 
 [[flag]]
 name = "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS"
@@ -927,6 +936,15 @@ consumed_at = "restore"
 change_requires = "deploy"
 owner = "v2-core"
 description = "Container memory request in MiB."
+
+[[flag]]
+name = "COMFYMODAL_V2_MEMORY_REQUEST"
+type = "int"
+default = "8192"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Canonical runtime-shape memory request in MiB; must agree with COMFYMODAL_V2_MEMORY_MB when both are present."
 
 [[flag]]
 name = "COMFYMODAL_V2_CPU_REQUEST"

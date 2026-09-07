@@ -6967,6 +6967,12 @@ def _assert_valid_local_custom_nodes_root(path: str) -> None:
 # MODAL_IMAGE_ID.  Use this to skip local-only build-time setup.
 _INSIDE_MODAL_CONTAINER = bool(os.environ.get("MODAL_IMAGE_ID")) or os.path.isdir("/pkg/modal")
 
+# The publisher bootstrap is a control-plane operation, not a GPU runtime
+# deployment.  Its deploy process opts into the lightweight image before this
+# module constructs the canonical accelerator DAG.  No ordinary deploy sets
+# this selector.
+_PUBLISHER_ONLY = os.environ.get("COMFYMODAL_PUBLISHER_ONLY", "").strip() == "1"
+
 # Resolved at deploy time to copy local custom nodes into the image.
 _COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
 if not _INSIDE_MODAL_CONTAINER:
@@ -8332,60 +8338,70 @@ if not _INSIDE_MODAL_CONTAINER:
         'PYEOF\n'
     )
 
-# Canonical accelerator/native boundary.  These installs intentionally happen
-# after the complete third-party environment: SageAttention's build imports
-# torch/triton and fastsafetensors is required by the later direct-GPU loader.
-# There is no runtime/image descendant that is allowed to add these packages.
-_THIRD_PARTY_DEPENDENCY_IMAGE = _image_base.run_commands(
-    "python -m pip install --disable-pip-version-check --no-input "
-    "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.31'",
-    gpu="a10g",
-).run_commands(
-    "python -X utf8 -c \"import importlib, importlib.metadata; "
-    "version = importlib.metadata.version('comfy-kitchen'); "
-    "assert version == '0.2.31', f'expected comfy-kitchen==0.2.31, got {version}'; "
-    "kitchen = importlib.import_module('comfy_kitchen'); "
-    "assert callable(getattr(kitchen, 'int8_attention', None)), "
-    "'comfy_kitchen.int8_attention is unavailable'; "
-    "available = getattr(kitchen, 'int8_attention_is_available', None); "
-    "assert callable(available), "
-    "'comfy_kitchen.int8_attention_is_available is unavailable'; "
-    "assert available(), 'comfy_kitchen INT8 attention is unavailable'; "
-    "print(f'comfy-kitchen {version}: int8_attention available')\"",
-    gpu="a10g",
-)
-_ACCELERATOR_NATIVE_IMAGE = _THIRD_PARTY_DEPENDENCY_IMAGE.pip_install(
-    "fastsafetensors==0.3.3",
-)
-if env_flag("COMFYMODAL_V2_C9QD_EXTRAS"):
-    # Explicit diagnostic/benchmark opt-in; never part of the normal image.
-    _ACCELERATOR_NATIVE_IMAGE = _ACCELERATOR_NATIVE_IMAGE.pip_install(
-        "runai-model-streamer==0.16.1",
+def _build_canonical_accelerator_images(base: Any) -> tuple[Any, Any]:
+    """Build the canonical third-party and native accelerator image layers."""
+    # Canonical accelerator/native boundary.  These installs intentionally
+    # happen after the complete third-party environment: SageAttention's
+    # build imports torch/triton and fastsafetensors is required by the later
+    # direct-GPU loader.  There is no runtime/image descendant that is allowed
+    # to add these packages.
+    third_party = base.run_commands(
+        "python -m pip install --disable-pip-version-check --no-input "
+        "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.31'",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import importlib, importlib.metadata; "
+        "version = importlib.metadata.version('comfy-kitchen'); "
+        "assert version == '0.2.31', f'expected comfy-kitchen==0.2.31, got {version}'; "
+        "kitchen = importlib.import_module('comfy_kitchen'); "
+        "assert callable(getattr(kitchen, 'int8_attention', None)), "
+        "'comfy_kitchen.int8_attention is unavailable'; "
+        "available = getattr(kitchen, 'int8_attention_is_available', None); "
+        "assert callable(available), "
+        "'comfy_kitchen.int8_attention_is_available is unavailable'; "
+        "assert available(), 'comfy_kitchen INT8 attention is unavailable'; "
+        "print(f'comfy-kitchen {version}: int8_attention available')\"",
+        gpu="a10g",
     )
-_ACCELERATOR_NATIVE_IMAGE = _ACCELERATOR_NATIVE_IMAGE.run_commands(
-    "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=1 "
-    "python -m pip install --upgrade --force-reinstall "
-    "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
-    "--no-build-isolation --no-deps",
-    gpu="a10g",
-).run_commands(
-    "python -X utf8 -c \"import pathlib, site; "
-    "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
-    "files = list(pathlib.Path(site_root).joinpath('sageattention').rglob('*.so')); "
-    "print([f.name for f in files]); "
-    "assert any('_fused' in f.name for f in files), 'sageattention._fused was not built'; "
-    "assert any('_qattn_sm89' in f.name for f in files), "
-    "'SageAttention v2.2.0 native _qattn_sm89 family was not built'\"",
-    gpu="a10g",
-).run_commands(
-    "python -X utf8 -c \"import sageattention._fused; "
-    "from sageattention import sageattn; "
-    "assert callable(sageattn), 'public sageattn dispatcher is not callable'; "
-    "print('sageattention._fused and sageattention.sageattn ok')\"",
-    gpu="a10g",
-)
-# Compatibility marker retained for source-level build diagnostics:
-# print('sageattention._fused ok')
+    accelerator = third_party.pip_install("fastsafetensors==0.3.3")
+    if env_flag("COMFYMODAL_V2_C9QD_EXTRAS"):
+        # Explicit diagnostic/benchmark opt-in; never part of the normal image.
+        accelerator = accelerator.pip_install("runai-model-streamer==0.16.1")
+    accelerator = accelerator.run_commands(
+        "CXX_APPEND_FLAGS=-std=c++20 NVCC_APPEND_FLAGS=-std=c++20 "
+        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
+        "python -m pip install --upgrade --force-reinstall "
+        "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
+        "--no-build-isolation --no-deps",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import pathlib, site; "
+        "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
+        "files = list(pathlib.Path(site_root).joinpath('sageattention').rglob('*.so')); "
+        "print([f.name for f in files]); "
+        "assert any('_fused' in f.name for f in files), 'sageattention._fused was not built'; "
+        "assert any('_qattn_sm89' in f.name for f in files), "
+        "'SageAttention v2.2.0 native _qattn_sm89 family was not built'\"",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import sageattention._fused; "
+        "from sageattention import sageattn; "
+        "assert callable(sageattn), 'public sageattn dispatcher is not callable'; "
+        "print('sageattention._fused and sageattention.sageattn ok')\"",
+        gpu="a10g",
+    )
+    return third_party, accelerator
+
+
+if _PUBLISHER_ONLY:
+    # Do not even construct the accelerator image DAG for the publisher
+    # bootstrap; in particular this keeps SageAttention out of that deploy.
+    _THIRD_PARTY_DEPENDENCY_IMAGE = _image_base
+    _ACCELERATOR_NATIVE_IMAGE = _image_base
+else:
+    _THIRD_PARTY_DEPENDENCY_IMAGE, _ACCELERATOR_NATIVE_IMAGE = (
+        _build_canonical_accelerator_images(_image_base)
+    )
 
 
 def _add_explicit_diagnostic_dependencies(img: Any) -> Any:
@@ -8395,9 +8411,10 @@ def _add_explicit_diagnostic_dependencies(img: Any) -> Any:
     return img
 
 
-_ACCELERATOR_NATIVE_IMAGE = _add_explicit_diagnostic_dependencies(
-    _ACCELERATOR_NATIVE_IMAGE
-)
+if not _PUBLISHER_ONLY:
+    _ACCELERATOR_NATIVE_IMAGE = _add_explicit_diagnostic_dependencies(
+        _ACCELERATOR_NATIVE_IMAGE
+    )
 
 # Build-time configuration is isolated from both dependency and source
 # identities.  Modal requires env/build operations before local Python source;
@@ -8777,18 +8794,28 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
     )
 
 
-CANONICAL_IMAGE_PLAN = build_canonical_image_plan()
-image = CANONICAL_IMAGE_PLAN.final_image
-
-publisher_image = _add_comfymodal_local_python_sources(
-    modal.Image.debian_slim(python_version="3.11")
-).add_local_file(
-    _CANONICAL_PLAN_METADATA_HOST_PATH,
-    _CANONICAL_PLAN_METADATA_IMAGE_PATH,
-    copy=True,
-).env({
-    _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
-})
+if _PUBLISHER_ONLY:
+    # The publisher only needs Python/tar handling plus the existing volume;
+    # canonical image identities and accelerator metadata are GPU-deploy
+    # concerns and are deliberately not created for this control-plane path.
+    CANONICAL_IMAGE_PLAN = None
+    publisher_image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ).env({"COMFYMODAL_PUBLISHER_ONLY": "1"})
+    image = publisher_image
+else:
+    CANONICAL_IMAGE_PLAN = build_canonical_image_plan()
+    image = CANONICAL_IMAGE_PLAN.final_image
+    publisher_image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ).add_local_file(
+        _CANONICAL_PLAN_METADATA_HOST_PATH,
+        _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        copy=True,
+    ).env({
+        _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        "COMFYMODAL_PUBLISHER_ONLY": "1",
+    })
 
 download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")

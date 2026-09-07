@@ -113,7 +113,8 @@ _SANITIZE_FLAG_PATTERNS: tuple[str, ...] = (
 
 # ── State machine ────────────────────────────────────────────────────────────────────
 _VALID_TRANSITIONS: dict[str, set[str]] = {
-    "created": {"restore_tracing", "failed"},
+    "created": {"restore_tracing", "request_ready", "failed"},
+    "request_ready": {"request_claimed", "failed"},
     "restore_tracing": {"restore_complete", "failed"},
     "restore_complete": {"request_claimed", "failed"},
     "request_claimed": {"request_tracing", "failed"},
@@ -1275,16 +1276,19 @@ class FullExecutionTraceSession:
 
     Lifecycle states (exact):
         created → restore_tracing → restore_complete → request_claimed
-                                              ↓              ↓
-                                             failed         failed
-                                      request_tracing → trace_stopped
-                                             ↓               ↓
-                                           failed          failed
+             ↓                                      ↓              ↓
+        request_ready → request_claimed            failed         failed
+                              ↓
+                       request_tracing → trace_stopped
+                              ↓               ↓
+                            failed          failed
 
     Thread-safe state transitions.  Invalid/repeated transitions are recorded
     in ``session_events.jsonl`` but never raised.
 
-    Module is fully inert when ``COMFYMODAL_V2_FULL_TRACE != '1'``.
+    Module is fully inert when ``COMFYMODAL_V2_FULL_TRACE != '1'``.  Golden
+    request-only sessions use ``start_request_only``; restore does not create
+    them.
     """
 
     _instance: Optional[FullExecutionTraceSession] = None
@@ -1725,6 +1729,82 @@ class FullExecutionTraceSession:
             "tracer_entries": entries,
             "max_stack_depth": stack,
         })
+
+    def start_request_only(self, request_id: str) -> bool:
+        """Start deep tracing lazily for one request, never during restore.
+
+        Golden deep tracing is a run selector.  The session directory and all
+        samplers/tracers are created only after the request has been validated;
+        restore therefore remains lightweight and cannot claim restore capture.
+        """
+        if not self._transition("request_ready"):
+            return False
+        if not self._transition("request_claimed"):
+            return False
+        self._claimed = True
+        self._claimed_request_id = str(request_id)
+        self._write_event("request_claimed", {
+            "request_id": str(request_id),
+            "request_id_hash": _stable_hash(str(request_id)),
+            "request_only": True,
+        })
+        if not self._transition("request_tracing"):
+            return False
+        # Start the resource/VizTracer machinery at the request boundary, not
+        # in restore.  start_restore's setup is intentionally reused only for
+        # these request-owned components.
+        self._start_request_tracing_components()
+        self._handoff_request_thread_tracing()
+        self._write_event("request_trace_started", {"request_id": str(request_id)})
+        return True
+
+    def _start_request_tracing_components(self) -> None:
+        """Initialize request tracing components without restore state claims."""
+        entries = _env_int_chain(_ENV_ENTRIES, _LEGACY_ENV_ENTRIES, default=_DEFAULT_VIZTRACER_ENTRIES)
+        stack = _env_int("COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH", _DEFAULT_MAX_STACK_DEPTH)
+        try:
+            self._resource_sampler = ContainerResourceSampler(
+                str(self._base_dir),
+                interval_ms=_env_int_chain(
+                    _ENV_RESOURCE_INTERVAL, _LEGACY_ENV_RESOURCE_INTERVAL,
+                    default=_DEFAULT_RESOURCE_INTERVAL_MS,
+                ),
+                session_phase="request_tracing",
+            )
+            self._resource_sampler.start()
+        except Exception as exc:
+            self._resource_sampler = None
+            self._write_event("request_resource_sampler_error", {"error_type": type(exc).__name__})
+        try:
+            inc = _resolve_trace_include_paths()
+            from viztracer import VizTracer as _VT
+            self._viztracer_version = (
+                getattr(_VT, "__version__", None)
+                or getattr(_VT, "VERSION", None)
+                or "unknown"
+            )
+            kwargs: dict[str, Any] = {
+                "tracer_entries": entries,
+                "max_stack_depth": stack,
+                "output_file": str(self._base_dir / "raw" / "viztracer.json"),
+                "register_global": True,
+                "log_async": True,
+                "pid_suffix": False,
+            }
+            if inc["resolved"]:
+                kwargs["include_files"] = inc["resolved"]
+            else:
+                kwargs["exclude_files"] = inc["excluded"]
+            try:
+                self._viztracer = _VT(**kwargs)
+            except TypeError:
+                self._viztracer = _VT(tracer_entries=entries, max_stack_depth=stack)
+            self._viztracer.start()
+            self._update_trace_config_viz_version()
+        except ImportError:
+            self._write_event("request_viztracer_unavailable", {})
+        except Exception as exc:
+            self._write_event("request_viztracer_error", {"error_type": type(exc).__name__})
 
     def set_restore_complete(self) -> None:
         """Mark the restore phase as complete.

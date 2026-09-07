@@ -15,7 +15,7 @@ method = "run_golden_serial_stream"
 [resources]
 gpu = "rtx-pro-6000"
 cpu = 4
-memory_mb = 8192
+memory_mb = 16384
 min_containers = 0
 scaledown_window = 4
 
@@ -45,6 +45,9 @@ COMFYMODAL_V2_CPU_MODEL_SNAPSHOT = "0"
 COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS = "1"
 COMFYMODAL_V2_VAE_SNAPSHOT = "0"
 COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
+COMFYMODAL_V2_MEMORY_MB = "16384"
+COMFYMODAL_V2_MEMORY_REQUEST = "16384"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "16384"
 COMFYMODAL_V2_SNAPSHOT_MANIFEST = "1"
 COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
 # Golden deliberately keeps the runtime selector on its auto policy instead of
@@ -57,11 +60,12 @@ COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
 
 # ── golden_p1 deploy-baked flag (registry: change_requires=deploy) ──────
 COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
+COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH = "1"
 COMFYMODAL_SAMPLING_DEEP_PROFILE = "blocks"
 COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "0"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
-# RX9P-M diagnostic profile: the profiler and physical E27 source evidence
-# must be armed in the deployed environment, before restore begins.
+# Deep profiling capability is baked into the image/environment, but the
+# request selector starts it lazily; restore remains lightweight-only.
 COMFYMODAL_V2_FULL_TRACE = "1"
 COMFYMODAL_V2_E27_FORENSICS = "1"
 COMFYMODAL_GOLDEN_QD_TRANSPORT = "static_e27"

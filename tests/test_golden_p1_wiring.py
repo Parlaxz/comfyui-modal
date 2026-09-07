@@ -410,6 +410,15 @@ def test_golden_p1_profile_differs_from_production_in_deploy_fingerprint():
     assert production.deploy_fingerprint() != golden.deploy_fingerprint()
 
 
+def test_golden_p1_resolves_canonical_16g_memory_for_resource_and_baseline():
+    config = _config("golden_p1")
+    assert config.resources.memory_mb == 16384
+    memory = config.flag("COMFYMODAL_V2_MEMORY_MB")
+    baseline = config.flag("COMFYMODAL_V2_BASELINE_MEMORY_REQUEST")
+    assert memory is not None and memory.value == "16384"
+    assert baseline is not None and baseline.value == "16384"
+
+
 # ── Run-safety contract unchanged ─────────────────────────────────────────
 
 

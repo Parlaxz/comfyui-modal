@@ -778,25 +778,15 @@ class FullTraceV2GapsTest(unittest.TestCase):
             result = modal_app._reference_image()
         self.assertIs(result, image)
 
-    # ── Static source ordering: restore trace before residency log ──────
+    # ── Restore must not create deep-trace state ─────────────────────────
 
-    def test_restore_trace_attempt_before_residency_log_in_source(self) -> None:
-        """In restore(), _FT.create_if_enabled (full-trace session) appears
-        before the [v2.residency_config] print statement, ensuring the trace
-        session is created before any residency-adjacent log or sampling."""
+    def test_restore_does_not_create_full_trace_session_in_source(self) -> None:
+        """Deep tracing is request-only and restore remains lightweight."""
         import inspect
         from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
         source = inspect.getsource(ModalRuntimeEntrypoint.restore)
-        ft_idx = source.find("_FT.create_if_enabled(")
-        res_idx = source.find("[v2.residency_config]")
-        self.assertGreater(ft_idx, 0, "_FT.create_if_enabled must appear in restore()")
-        self.assertGreater(res_idx, 0, "[v2.residency_config] must appear in restore()")
-        self.assertLess(
-            ft_idx, res_idx,
-            "_FT.create_if_enabled must appear before [v2.residency_config] "
-            "in the restore() source, so the full-trace session is created "
-            "before any residency log/operation",
-        )
+        self.assertNotIn("create_if_enabled", source)
+        self.assertIn("request-only", source)
 
     # ── Ready/error artifact logs and descriptor fields ─────────────────
 

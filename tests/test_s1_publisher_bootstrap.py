@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import ast
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tools.v2_control import backend, cli
+from tools.v2_control.environment import EnvironmentBuilder
 from comfymodal_runtime.publication_policy import CUSTOM_NODES_PUBLISHER_APP_NAME
 
 
@@ -122,9 +124,41 @@ def test_publisher_bootstrap_uses_active_env_lock_and_version_order(monkeypatch)
     assert backend_event[1] == ["modal", "deploy", "-m", "comfyapp"]
     assert backend_event[2] == ["--name", CUSTOM_NODES_PUBLISHER_APP_NAME]
     assert backend_event[3]["MODAL_TOKEN_ID"] == "active-id"
+    assert backend_event[3]["COMFYMODAL_PUBLISHER_ONLY"] == "1"
     assert "V2_BENCHMARK_MODE" not in backend_event[3]
     assert events[3] == ("version", CUSTOM_NODES_PUBLISHER_APP_NAME)
     assert events[4] == "lock.release"
+
+
+def test_normal_environment_does_not_inherit_publisher_only_selector(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_PUBLISHER_ONLY", "1")
+    config = SimpleNamespace(flags=[], unregistered=[])
+
+    env = EnvironmentBuilder().build(config, host_env=os.environ)
+
+    # The selector is an invocation-local backend extra, never an ambient
+    # config/profile value that a normal deploy can inherit.
+    assert "COMFYMODAL_PUBLISHER_ONLY" not in env
+
+
+def test_comfyapp_publisher_bootstrap_selects_lightweight_image_without_sync_bypass():
+    source = (REPO_ROOT / "comfyapp.py").read_text(encoding="utf-8-sig")
+    assert '_PUBLISHER_ONLY = os.environ.get("COMFYMODAL_PUBLISHER_ONLY", "").strip() == "1"' in source
+    assert "CANONICAL_IMAGE_PLAN = None" in source
+    assert "image = publisher_image" in source
+    sync_start = source.index("def sync_custom_nodes_to_volume(")
+    sync_body = source[sync_start:source.find("\ndef ", sync_start + 10)]
+    decorator_start = source.rfind("@app.function(", 0, sync_start)
+    decorator = source[decorator_start:sync_start]
+    assert "image=publisher_image" in decorator
+    assert "custom_nodes_vol.commit()" in sync_body
+
+    cli_source = (REPO_ROOT / "tools" / "v2_control" / "cli.py").read_text(encoding="utf-8")
+    publisher_block = cli_source[cli_source.index("def cmd_publisher_bootstrap("):]
+    deploy_block = cli_source[cli_source.index("def cmd_deploy("):]
+    deploy_block = deploy_block[:deploy_block.index("def cmd_deploy_run(")]
+    assert '"COMFYMODAL_PUBLISHER_ONLY": "1"' in publisher_block
+    assert "COMFYMODAL_PUBLISHER_ONLY" not in deploy_block
 
 
 def test_sync_custom_nodes_propagates_explicit_publisher_app(monkeypatch):
@@ -245,12 +279,15 @@ def test_publisher_image_carries_canonical_plan_metadata(tmp_path):
     )
     publisher_assignment = next(
         node
-        for node in tree.body
+        for node in ast.walk(tree)
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Name) and target.id == "publisher_image"
             for target in node.targets
         )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "env"
     )
 
     class FakeIdentity:

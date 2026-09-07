@@ -169,7 +169,9 @@ class ProtectedPolicy:
                     "COMFYMODAL_V2_MEMORY_MB",
                     "COMFYMODAL_V2_CPU_REQUEST",
                     "COMFYMODAL_V2_RESTORE_ONLY_APP_NAME",
-                    # Harness internals
+                    # Harness internals; publisher-only is injected solely by
+                    # the trusted publisher-bootstrap backend extra.
+                    "COMFYMODAL_PUBLISHER_ONLY",
                     "COMFYMODAL_COMMAND_START_UNIX_MS",
                     "COMFYMODAL_DEPLOY_TIMEOUT_SECONDS",
                     # v2ctl provenance namespace

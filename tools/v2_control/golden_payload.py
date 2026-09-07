@@ -31,9 +31,12 @@ def _golden_p1_request_payload(
     attention_backend: str | None = None,
     invocation_id: str | None = None,
     cpu_qd2_prefetch: bool = False,
+    deep_trace: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
+    if not isinstance(deep_trace, bool):
+        raise ValueError("golden_deep_trace_must_be_bool")
     if cpu_qd2_prefetch and _contains_true_selector(source, "instant_tensor"):
         raise ValueError("golden_cpu_qd2_prefetch_instant_tensor_conflict")
     payload = {
@@ -61,6 +64,9 @@ def _golden_p1_request_payload(
     if cpu_qd2_prefetch:
         payload["cpu_qd2_prefetch"] = True
         payload["request_origin_info"]["golden_arm"] = "cpu_qd2_prefetch"
+    if deep_trace:
+        payload["deep_trace"] = True
+        payload["request_origin_info"]["golden_deep_trace"] = True
     if invocation_id:
         payload["request_origin_info"]["v2ctl_invocation_id"] = str(invocation_id)
     return payload

@@ -579,6 +579,7 @@ GOLDEN_P1_EXPECTED_OUTPUT_SHA_ENV = "COMFYMODAL_V2_GOLDEN_P1_EXPECTED_OUTPUT_SHA
 GOLDEN_CPU_QD2_ARM = "cpu_qd2_prefetch"
 GOLDEN_CONTROL_ARM = "control"
 GOLDEN_CPU_QD2_PREFETCH_FLAG = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+GOLDEN_DEEP_TRACE_FLAG = "COMFYMODAL_V2_GOLDEN_DEEP_TRACE"
 
 
 def _golden_cpu_qd2_prefetch_from_resolved_env() -> bool:
@@ -586,6 +587,13 @@ def _golden_cpu_qd2_prefetch_from_resolved_env() -> bool:
     raw = os.environ.get(GOLDEN_CPU_QD2_PREFETCH_FLAG, "0").strip().lower()
     if raw not in {"0", "1", "false", "true", "off", "on", "no", "yes"}:
         raise ValueError("golden_cpu_qd2_prefetch_selector_invalid")
+    return raw in {"1", "true", "on", "yes"}
+
+
+def _golden_deep_trace_from_resolved_env() -> bool:
+    raw = os.environ.get(GOLDEN_DEEP_TRACE_FLAG, "0").strip().lower()
+    if raw not in {"0", "1", "false", "true", "off", "on", "no", "yes"}:
+        raise ValueError("golden_deep_trace_selector_invalid")
     return raw in {"1", "true", "on", "yes"}
 GOLDEN_P1_REQUIRED_FLAGS: dict[str, Any] = {
     "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": True,
@@ -10480,6 +10488,7 @@ def _golden_p1_request_payload(
     attention_backend: str | None = None,
     invocation_id: str | None = None,
     cpu_qd2_prefetch: bool = False,
+    deep_trace: bool = False,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -10490,6 +10499,7 @@ def _golden_p1_request_payload(
         attention_backend=attention_backend,
         invocation_id=invocation_id,
         cpu_qd2_prefetch=cpu_qd2_prefetch,
+        deep_trace=deep_trace,
     )
 
 
@@ -11539,6 +11549,7 @@ async def _run_golden_p1(
     force: bool,
     attention_backend: str | None = None,
     cpu_qd2_prefetch: bool = False,
+    deep_trace: bool = False,
 ) -> dict[str, Any]:
     """Strictly serial Golden P1 cohort over ``run_golden_serial_stream``.
 
@@ -11556,6 +11567,8 @@ async def _run_golden_p1(
         raise ValueError("golden-p1 gap_seconds must be greater than zero")
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
+    if not isinstance(deep_trace, bool):
+        raise ValueError("golden_deep_trace_must_be_bool")
     os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
     os.environ["COMFYMODAL_V2_CLASS_NAME"] = class_name
     os.environ["COMFYMODAL_V2_GPU"] = gpu
@@ -11670,6 +11683,7 @@ async def _run_golden_p1(
             "method": GOLDEN_P1_REMOTE_METHOD,
             "golden_arm": golden_arm,
             "cpu_qd2_prefetch": cpu_qd2_prefetch,
+            "deep_trace": deep_trace,
             # RX9P-H: immutable invocation+request binding + frozen provenance
             "attention_backend_configured": attention_backend,
             "attention_backend_resolved": "missing",
@@ -11712,6 +11726,7 @@ async def _run_golden_p1(
                 attention_backend=attention_backend,
                 invocation_id=invocation_id,
                 cpu_qd2_prefetch=cpu_qd2_prefetch,
+                deep_trace=deep_trace,
             )
             # Strict serial: exactly one stream in flight; consumed through its
             # terminal result before anything else happens.
@@ -12196,6 +12211,7 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
             force=golden_p1_force,
             attention_backend=golden_p1_attention_backend,
             cpu_qd2_prefetch=_golden_cpu_qd2_prefetch_from_resolved_env(),
+            deep_trace=_golden_deep_trace_from_resolved_env(),
         )
         return
 

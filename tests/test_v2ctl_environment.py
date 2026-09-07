@@ -212,6 +212,7 @@ def test_build_is_deterministic():
         "MODAL_ENVIRONMENT",
         "MODAL_CLIENT_ID",
         "MODAL_AUTH",
+        "COMFYMODAL_PUBLISHER_ONLY",
         "COMFYMODAL_V2_APP_NAME",
         "COMFYMODAL_V2_CLASS_NAME",
         "COMFYMODAL_V2_GPU",

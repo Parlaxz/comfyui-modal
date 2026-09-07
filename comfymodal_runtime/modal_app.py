@@ -751,8 +751,8 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
 )
 
 # ── V2 full-trace lifecycle gate ──────────────────────────────────────
-# Inert when COMFYMODAL_V2_FULL_TRACE != '1'.  The full-trace session
-# is created at restore entry and finalized after the first request.
+# Capability gate for request-only deep tracing.  Restore never creates the
+# session; a Golden request creates and finalizes it within its own run.
 _V2_FULL_TRACE_ENABLED: bool = observability_gate(
     "COMFYMODAL_V2_FULL_TRACE", "full_trace",
 )
@@ -12409,59 +12409,16 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
-        # The full-trace selector is a deploy-time restore contract.  Create
-        # the session before the first timestamp or restore helper so a late
-        # request override cannot manufacture restore coverage.
-        _full_trace_requested_at_restore = _golden_full_trace_requested()
-        self._full_trace_requested_at_restore = _full_trace_requested_at_restore
+        # Deep profiling is request-only.  Restore deliberately creates no
+        # FullExecutionTraceSession, resource sampler, VizTracer, or torch
+        # profiler; a deep request starts those lazily at its own boundary.
+        _full_trace_requested_at_restore = False
+        self._full_trace_requested_at_restore = False
         self._full_trace_session = None
         self._full_trace_activation_status = "disabled"
-        self._full_trace_activation_reason = (
-            "gate_not_set" if not _full_trace_requested_at_restore else ""
-        )
+        self._full_trace_activation_reason = "request_only_not_started"
         _full_trace_started = False
         _full_trace_error: str | None = None
-        if _full_trace_requested_at_restore:
-            try:
-                from .full_execution_trace import FullExecutionTraceSession as _FT
-
-                _FT.reset_instance()
-                _ft = _FT.create_if_enabled(
-                    container_session_id=(
-                        getattr(self, "container_session_id", "")
-                        or _V2_CONTAINER_SESSION_ID
-                    ),
-                )
-                self._full_trace_session = _ft
-                if _ft is None:
-                    self._full_trace_activation_status = "error"
-                    self._full_trace_activation_reason = "session_not_created"
-                    _full_trace_error = "session_not_created"
-                    _emit_golden_profiler_lifecycle(
-                        "session_create", request_id="", status="error",
-                        reason="session_not_created",
-                    )
-                else:
-                    self._full_trace_activation_status = "created"
-                    _emit_golden_profiler_lifecycle(
-                        "session_create", request_id="", status="ok",
-                        reason="restore_entry",
-                    )
-                    _ft.start_restore()
-                    _full_trace_started = True
-                    _emit_golden_profiler_lifecycle(
-                        "restore_trace_start", request_id="", status="ok",
-                        reason="restore_entry",
-                    )
-            except Exception as _ft_start_exc:
-                _full_trace_error = type(_ft_start_exc).__name__
-                self._full_trace_activation_status = "error"
-                self._full_trace_activation_reason = _full_trace_error
-                self._full_trace_session = None
-                _emit_golden_profiler_lifecycle(
-                    "session_create", request_id="", status="error",
-                    reason=_full_trace_error,
-                )
         # ── Remote resume / restore method boundary timestamps ──────────
         # Captured at the TRUE first executable line of restore() so the
         # Modal-scheduling-before-Python-resumes gap (submission → this
@@ -22551,6 +22508,7 @@ class ModalRuntimeEntrypoint:
             STAGE_ORDER,
             golden_serial_execute,
             normalize_attention_backend,
+            normalize_deep_trace_level,
             resolve_clip_residency,
             prepare_cpu_clip_prefetch,
         )
@@ -22576,18 +22534,11 @@ class ModalRuntimeEntrypoint:
         cpu_prefetch_ticket = None
         _full_trace_claimed = False
         _full_trace_op_id = ""
-        _restore_trace_contract = getattr(
-            self, "_full_trace_requested_at_restore", None
-        )
-        # Compatibility for direct local harnesses that inject a prepared
-        # trace session instead of invoking restore(); real restored instances
-        # always carry the explicit boolean set at restore entry.
-        _full_trace_requested_at_restore = (
-            _golden_full_trace_requested()
-            and getattr(self, "_full_trace_session", None) is not None
-            if _restore_trace_contract is None
-            else bool(_restore_trace_contract)
-        )
+        _full_trace_request_requested = False
+        # Restore is never a deep-trace boundary.  Keep this field for result
+        # schema compatibility, but it is always false for a request-owned
+        # session.
+        _full_trace_requested_at_restore = False
         _full_trace_session_available = bool(
             _full_trace_requested_at_restore
             and getattr(self, "_full_trace_session", None) is not None
@@ -22607,6 +22558,8 @@ class ModalRuntimeEntrypoint:
                 if "attention_backend" in request
                 else None
             )
+            _deep_trace_level = normalize_deep_trace_level(request.get("deep_trace", False))
+            _full_trace_request_requested = _deep_trace_level != "off"
             prompt = request.get("prompt")
             if not isinstance(prompt, Mapping) or not prompt:
                 raise ValueError("golden_prompt_mapping_required")
@@ -22628,6 +22581,8 @@ class ModalRuntimeEntrypoint:
             identity_telemetry["attention_backend_configured"] = (
                 attention_backend or "auto"
             )
+            identity_telemetry["deep_trace_level_requested"] = _deep_trace_level
+            identity_telemetry["deep_trace_level_effective"] = "off"
             identity_telemetry["output_durability_mode"] = output_policy.mode
             identity_telemetry["durability_requested"] = output_policy.durability_requested
             identity_telemetry.update(
@@ -22654,6 +22609,43 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_telemetry_path_traversal_blocked")
             golden_dir.mkdir(parents=True, exist_ok=True)
 
+            # Request-only deep capability.  No trace session or profiler is
+            # created by restore; this is the earliest validated Golden
+            # boundary, before readiness and model work.
+            if _full_trace_request_requested:
+                try:
+                    from .full_execution_trace import FullExecutionTraceSession as _FT
+                    _FT.reset_instance()
+                    _ft = _FT.create_if_enabled(
+                        container_session_id=(getattr(self, "container_session_id", "") or _V2_CONTAINER_SESSION_ID),
+                    )
+                    self._full_trace_session = _ft
+                    if _ft is None or not _ft.start_request_only(request_id_raw.strip()):
+                        _full_trace_failure_reason = "deep_trace_capability_unavailable"
+                        self._full_trace_session = None
+                    else:
+                        self._full_trace_activation_status = "request_created"
+                        _full_trace_session_available = True
+                        identity_telemetry["deep_trace_level_effective"] = "full"
+                        _emit_golden_profiler_lifecycle(
+                            "session_create", request_id=request_id_raw.strip(),
+                            status="ok", reason="request_boundary",
+                        )
+                        _full_trace_claimed = True
+                        _full_trace_op_id = _ft.operation_start(
+                            "golden_request_execution",
+                            semantic_key=request_id_raw.strip(),
+                            request_id=request_id_raw.strip(),
+                        ) or ""
+                        _emit_golden_profiler_lifecycle(
+                            "request_trace_start", request_id=request_id_raw.strip(),
+                            status="ok" if _full_trace_op_id else "error",
+                            reason="request_boundary",
+                        )
+                except BaseException as _ft_request_exc:
+                    _full_trace_failure_reason = type(_ft_request_exc).__name__
+                    self._full_trace_session = None
+
             contract_raw = request.get("contract")
             if contract_raw is not None:
                 raise ValueError("golden_contract_override_not_allowed")
@@ -22674,6 +22666,9 @@ class ModalRuntimeEntrypoint:
                 "output_durability_mode": output_policy.mode,
                 "required_canonical_stages": _required_canonical_stages,
                 "canonical_stage_order": _canonical_stage_order,
+                "deep_trace_requested": bool(_full_trace_request_requested),
+                "deep_trace_level_requested": _deep_trace_level,
+                "deep_trace_level_effective": "full" if _full_trace_claimed else "off",
             }
             golden_trace_summary = {
                 key: value for key, value in golden_trace_config.items()
@@ -22745,7 +22740,7 @@ class ModalRuntimeEntrypoint:
                 }
                 return
 
-            if _full_trace_requested_at_restore and _full_trace_session_available:
+            if _full_trace_request_requested and _full_trace_session_available:
                 _ft_config = getattr(self, "_full_trace_session", None)
                 _update_trace_config = getattr(
                     _ft_config, "update_trace_config", None
@@ -22851,6 +22846,7 @@ class ModalRuntimeEntrypoint:
                 extra_data=golden_extra_data,
                 attention_backend=attention_backend,
                 cpu_qd2_prefetch=cpu_prefetch_raw,
+                deep_trace=_full_trace_request_requested,
             )
             if cpu_prefetch_raw:
                 cpu_prefetch_ticket = prepare_cpu_clip_prefetch(golden_request)
@@ -22920,6 +22916,7 @@ class ModalRuntimeEntrypoint:
                     "DYNAMICVRAM_ACCEPTED",
                     activation=dict(activation_evidence),
                     bytes_prefetched_at_dynamic_vram_ready=cpu_prefetch_ticket.bytes_available,
+                    bytes_read_at_dynamic_vram_ready=cpu_prefetch_ticket.telemetry().get("total_bytes", 0),
                 )
             self._golden_execution_active = True
             golden_call_start_wall_ns = time.time_ns()
@@ -23059,7 +23056,7 @@ class ModalRuntimeEntrypoint:
                     }
                 error_event["full_trace_artifact"] = _error_artifact
                 _full_trace_claimed = False
-            elif _golden_full_trace_requested():
+            elif _full_trace_request_requested:
                 error_event["full_trace_diagnostic"] = {
                     "requested": True,
                     "requested_at_restore": _full_trace_requested_at_restore,
@@ -23150,16 +23147,16 @@ class ModalRuntimeEntrypoint:
             }
         )
         result_data["full_trace_diagnostic"] = {
-            "requested": bool(_golden_full_trace_requested()),
+            "requested": bool(_full_trace_request_requested),
             "requested_at_restore": _full_trace_requested_at_restore,
             "session_created": _full_trace_session_available,
             "claimed": _full_trace_claimed,
             "status": "claimed" if _full_trace_claimed else (
-                "unavailable" if _golden_full_trace_requested() else "disabled"
+                "unavailable" if _full_trace_request_requested else "disabled"
             ),
             "reason": "" if _full_trace_claimed else (
                 _full_trace_failure_reason
-                or ("trace_not_enabled_at_restore" if _golden_full_trace_requested() else "gate_not_set")
+                or ("request_trace_not_started" if _full_trace_request_requested else "gate_not_set")
             ),
         }
         result_data["full_trace_requested"] = result_data["full_trace_diagnostic"]["requested"]

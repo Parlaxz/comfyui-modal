@@ -343,7 +343,11 @@ def read_deployment_receipt(path: Path) -> DeploymentReceipt:
 
 
 def latest_deployment_receipt(
-    repo_root: Path, *, profile: str | None = None, target: Mapping[str, str] | None = None
+    repo_root: Path,
+    *,
+    profile: str | None = None,
+    target: Mapping[str, str] | None = None,
+    workspace_id: str | None = None,
 ) -> tuple[Path, DeploymentReceipt] | None:
     directory = Path(repo_root) / ".v2ctl" / "deployments"
     if not directory.is_dir():
@@ -372,6 +376,13 @@ def latest_deployment_receipt(
                 or any(metadata_target.get(k) != str(v) for k, v in target.items())
             ):
                 continue
+            if workspace_id is not None:
+                metadata_identity = metadata.get("deployment_identity")
+                if (
+                    not isinstance(metadata_identity, Mapping)
+                    or metadata_identity.get("modal_workspace") != workspace_id
+                ):
+                    continue
         try:
             receipt = read_deployment_receipt(path)
         except GateError:

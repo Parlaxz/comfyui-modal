@@ -527,6 +527,40 @@ def _print_backend_diagnostic(result: backend_mod.BackendResult,
     print("[v2ctl.deploy] END backend diagnostics", file=sys.stderr)
 
 
+def _persist_full_backend_diagnostic(
+    result: backend_mod.BackendResult,
+    env: dict[str, str],
+    repo_root: Path,
+    invocation_id: str,
+) -> tuple[Path, Path] | None:
+    """Preserve complete failed-deploy streams before bounded presentation."""
+    directory = repo_root / ".v2ctl" / "deployment_diagnostics"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stem = f"deploy_{stamp}_{invocation_id[:12]}"
+        stdout_path = directory / f"{stem}.stdout.log"
+        stderr_path = directory / f"{stem}.stderr.log"
+        stdout_path.write_text(
+            _redact_backend_diagnostic(result.stdout, env), encoding="utf-8"
+        )
+        stderr_path.write_text(
+            _redact_backend_diagnostic(result.stderr, env), encoding="utf-8"
+        )
+        print(
+            f"[v2ctl.deploy] full_diagnostics stdout={stdout_path} "
+            f"stderr={stderr_path}",
+            file=sys.stderr,
+        )
+        return stdout_path, stderr_path
+    except OSError as exc:
+        print(
+            f"[v2ctl.deploy] WARNING: could not persist full diagnostics: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
     """Derive the canonical backend selector argument from the resolved
     config environment.
@@ -1074,7 +1108,7 @@ def _publisher_function_exists(
         import modal
 
         client = modal.Client.from_credentials(binding.token_id, binding.token_secret)
-        modal.Function.from_name(
+        function = modal.Function.from_name(
             app_name,
             function_name,
             client=client,
@@ -1083,6 +1117,9 @@ def _publisher_function_exists(
                 else binding.environment
             ),
         )
+        hydrate = getattr(function, "hydrate", None)
+        if callable(hydrate):
+            hydrate()
         return True
     except Exception as exc:
         # A not-found response is absence.  Authentication, transport, and
@@ -1344,7 +1381,10 @@ def _bound_deployment_receipt(
 ) -> tuple[Path, receipt_mod.DeploymentReceipt]:
     """Load the immutable Golden authority and perform host admission checks."""
     selected = receipt_mod.latest_deployment_receipt(
-        repo_root, profile=config.profile_name, target=_receipt_target(config)
+        repo_root,
+        profile=config.profile_name,
+        target=_receipt_target(config),
+        workspace_id=(workspace_binding.workspace_id if workspace_binding else None),
     )
     if selected is None:
         raise GateError(f"{command} requires an immutable deployment receipt")
@@ -2219,7 +2259,12 @@ def cmd_golden(args, repo_root: Path) -> int:
         )
         return 2
     requested_profile = getattr(args, "profile", "production")
-    if requested_profile != "production" and not is_golden_profile_name(requested_profile):
+    publisher_bootstrap = args.golden_command == "publisher-bootstrap"
+    if (
+        requested_profile != "production"
+        and not is_golden_profile_name(requested_profile)
+        and not publisher_bootstrap
+    ):
         print(
             f"ERROR: `golden` commands use profile {GOLDEN_P1_PROFILE!r}; "
             f"received --profile {requested_profile!r}",
@@ -2239,7 +2284,7 @@ def cmd_golden(args, repo_root: Path) -> int:
                 file=sys.stderr,
             )
             return 2
-    if requested_profile == "production":
+    if requested_profile == "production" and not publisher_bootstrap:
         args.profile = GOLDEN_P1_PROFILE
     args.golden_public = True
     if args.golden_command == "run":
@@ -2774,6 +2819,11 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             backend_extra={
                 **_identity_env_for_command("deploy", config),
                 **_canonical_metadata_env(config, fingerprints, invocation_id),
+                # Publisher bootstrap imports comfyapp only to publish the
+                # shared custom-node Volume.  Select its lightweight image
+                # without making this control-plane selector part of normal
+                # Golden/production deploy configuration.
+                "COMFYMODAL_PUBLISHER_ONLY": "1",
             },
         )
         env = _native_golden_deploy_env(env)
@@ -2805,10 +2855,23 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 preflight = run_publisher_preflight(repo_root, workspace_binding)
                 pre_version = preflight.get("PUBLISHER_VERSION_BEFORE")
-                if preflight.get("PUBLICATION_DECISION") == "invalid":
+                if (
+                    preflight.get("PUBLICATION_DECISION") == "invalid"
+                    and not (
+                        preflight.get("PUBLISHER_EXISTS") is True
+                        and preflight.get("PUBLISHER_FUNCTION_EXISTS") is True
+                        and type(pre_version) is int
+                    )
+                ):
                     raise GateError(
                         "publisher bootstrap preflight is unknown/invalid; "
                         "refusing to bootstrap on uncertain lookup state"
+                    )
+                if preflight.get("PUBLICATION_DECISION") == "invalid":
+                    print(
+                        "[v2ctl.publisher-bootstrap] publisher authority is known "
+                        "but content generation is absent; redeploying publisher "
+                        "before the separate publication proof"
                     )
             else:
                 pre_version = _app_version_number(publisher_app_name)
@@ -3056,6 +3119,9 @@ def cmd_deploy(args, repo_root: Path) -> int:
             )
             print(f"[v2ctl.deploy] exit={result.exit_code} manifest={manifest}")
             if not result.ok():
+                _persist_full_backend_diagnostic(
+                    result, env, repo_root, invocation_id
+                )
                 _print_backend_diagnostic(result, env)
                 # A failed deploy must NEVER leave a "deployed" manifest behind:
                 # remove it so gate/run cannot treat a broken deployment as valid.
@@ -3714,7 +3780,16 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="source-probe")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
+                publisher_state = run_publisher_preflight(
+                    repo_root, workspace_binding, require_ready=False
+                )
+                if not publisher_state.get("READY_FOR_CONSUMER_DEPLOY"):
+                    print(
+                        "[v2ctl.source-probe] WARNING: publisher content drift is "
+                        "recorded separately; continuing with immutable receipt "
+                        "and remote source identity probe",
+                        file=sys.stderr,
+                    )
         deploy_fp = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         expected_source = (
             bound_receipt.source_probe.get("expected") if bound_receipt is not None else None
