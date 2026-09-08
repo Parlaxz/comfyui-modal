@@ -4608,6 +4608,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "sage"
         ),
+        # This is the request-arm selector consumed by the V2 harness.  Keep
+        # it distinct from the deploy gate below; the cosmetic/deploy flag
+        # must never select a Golden request arm on its own.
+        "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH", "0"
+        ),
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
         ),
