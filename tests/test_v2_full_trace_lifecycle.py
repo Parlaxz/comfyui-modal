@@ -857,16 +857,19 @@ class FullTraceV2GapsTest(unittest.TestCase):
             )
 
     def test_direct_golden_trace_wiring_is_before_gpu_readiness(self) -> None:
-        source = inspect.getsource(modal_app.ModalRuntimeEntrypoint.run_golden_serial_stream)
+        source = inspect.getsource(modal_app.ModalRuntimeEntrypoint._run_golden_stream_impl)
         containment = source.index("golden_request_id_invalid")
         claim = source.index("claim_first_request(normalized_request_id)")
+        prefetch = source.index("prepare_cpu_clip_prefetch(golden_request)")
         readiness = source.index("ensure_gpu_ready()")
         dynamic_vram = source.index("activate_golden_dynamic_vram()")
-        golden_await = source.index("result = await golden_serial_execute(")
+        golden_await = source.index("result = await execute_golden(")
         self.assertLess(containment, claim)
-        self.assertLess(claim, readiness)
-        self.assertLess(readiness, dynamic_vram)
-        self.assertLess(dynamic_vram, golden_await)
+        self.assertLess(claim, dynamic_vram)
+        self.assertLess(dynamic_vram, prefetch)
+        self.assertLess(prefetch, readiness)
+        self.assertLess(prefetch, golden_await)
+        self.assertLess(readiness, golden_await)
         self.assertNotIn("PromptExecutor", source)
 
     def test_direct_golden_trace_has_terminal_success_and_error_lifecycles(self) -> None:

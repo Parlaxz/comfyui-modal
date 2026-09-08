@@ -22820,28 +22820,6 @@ class ModalRuntimeEntrypoint:
                 cpu_qd2_prefetch=cpu_prefetch_raw,
                 deep_trace=_full_trace_request_requested,
             )
-            if cpu_prefetch_raw:
-                cpu_prefetch_ticket = prepare_cpu_clip_prefetch(golden_request)
-
-            # Golden bypasses the normal ComfyUI request entrypoints, so it
-            # must perform the deferred GPU reattachment check itself.  Use
-            # only the API restored for this runtime; silently loading another
-            # API here could execute against an unprepared CPU-mode runtime.
-            legacy_api = getattr(self, "_legacy_api", None)
-            if legacy_api is None:
-                raise RuntimeError("golden_legacy_api_unavailable")
-            ensure_gpu_ready = getattr(
-                legacy_api, "_ensure_gpu_ready_for_request", None
-            )
-            if not callable(ensure_gpu_ready):
-                raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
-            ensure_gpu_ready()
-            if cpu_prefetch_ticket is not None:
-                cpu_prefetch_ticket.event(
-                    "GPU_READINESS_COMPLETE",
-                    bytes_prefetched_at_gpu_ready=cpu_prefetch_ticket.bytes_available,
-                )
-
             # ── Golden DynamicVRAM activation seam (official-equivalent) ──
             # Exactly one call per request; the callee is idempotent per
             # process (a repeat returns already_activated=True).  When the
@@ -22882,6 +22860,28 @@ class ModalRuntimeEntrypoint:
                     "golden_activation": activation_evidence,
                 }
                 return
+
+            if cpu_prefetch_raw:
+                cpu_prefetch_ticket = prepare_cpu_clip_prefetch(golden_request)
+
+            # Golden bypasses the normal ComfyUI request entrypoints, so it
+            # must perform the deferred GPU reattachment check itself.  Use
+            # only the API restored for this runtime; silently loading another
+            # API here could execute against an unprepared CPU-mode runtime.
+            legacy_api = getattr(self, "_legacy_api", None)
+            if legacy_api is None:
+                raise RuntimeError("golden_legacy_api_unavailable")
+            ensure_gpu_ready = getattr(
+                legacy_api, "_ensure_gpu_ready_for_request", None
+            )
+            if not callable(ensure_gpu_ready):
+                raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
+            ensure_gpu_ready()
+            if cpu_prefetch_ticket is not None:
+                cpu_prefetch_ticket.event(
+                    "GPU_READINESS_COMPLETE",
+                    bytes_prefetched_at_gpu_ready=cpu_prefetch_ticket.bytes_available,
+                )
 
             if cpu_prefetch_ticket is not None:
                 cpu_prefetch_ticket.event(
