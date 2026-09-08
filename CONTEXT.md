@@ -21,3 +21,16 @@
 - **Bound field**: A field card made available to the Playground because the workflow-creation wizard bound it; the Playground does not create new fields.
 - **Workflow-type layout profile**: The saved arrangement rules for a workflow type, including field order, Advanced membership, and row grouping. Layout changes autosave through the workflow configuration.
 - **Workflow comparison set**: The workflows selected together in Experiment mode for comparative runs; this is distinct from the removed preset concept.
+- **Output panel**: The unique Playground result surface on the right; it is not a movable field card.
+- **Prompt anchor**: The fixed, top-positioned Prompt field card in the Playground.
+- **Movable bound field**: Any bound field other than the Output panel and Prompt anchor; it can be placed in Advanced, reordered, or grouped into a row.
+- **Workflow settings**: The wrapper-level settings surface where each field’s allowed options are filtered, such as limiting a workflow to selected UNets; these filters do not prevent the field from being an experiment axis.
+- **Allowed-options filter**: A workflow-specific restriction that limits a field to one or more values from the available set. It is a compatibility/choice filter, not an experiment lock.
+- **Advanced field**: An extra control that was already set up for a workflow in workflow creation; the Playground displays and arranges it but does not invent it.
+- **Number field**: A reusable numeric control whose value is either an integer or a float; experiment actions such as random, increment, and decrement apply to both kinds.
+- **Workflow picker**: The folder/search UI for selecting saved Studio workflows in the Playground or managing them in the Workflows tab.
+- **Field building block**: A coded, reusable control implementation tied one-to-one to a basic workflow input kind, such as integer, float, dropdown, or model. Its allowed parameters are defined by the product, not customized per field by users.
+- **Field parameters**: Fixed rules supplied by a building block for a specific field instance, such as allowing negative integers for Seed or requiring non-negative integers for Width and Height.
+- **Canonical input dictionary**: The code-owned mapping from a supported workflow input name to its building block and fixed rules; the wizard exposes these supported inputs rather than choosing or customizing their types.
+- **Common experiment variable**: A canonical field present and compatible in every workflow selected for an experiment; only common variables can be axes.
+- **Workflow-specific experiment variable**: A field present in only some selected workflows; it appears in a separate area and can be set, but cannot be an axis.
