@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 from .errors import GateError
 
-RECEIPT_SCHEMA_VERSION = 1
+RECEIPT_SCHEMA_VERSION = 2
 RECEIPT_PREFIX = "receipt_"
 SOURCE_PROBE_SCHEMA_VERSION = 1
 
@@ -98,6 +98,7 @@ class DeploymentReceipt:
     effective_config: dict[str, Any] = field(default_factory=dict)
     integrity_digest: str = ""
     receipt_path: str = ""
+    modal_destination: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -121,6 +122,7 @@ class DeploymentReceipt:
             "s4_identity": dict(self.s4_identity),
             "effective_config": dict(self.effective_config),
             "receipt_path": self.receipt_path,
+            "modal_destination": dict(self.modal_destination),
         }
         data["integrity_digest"] = self.integrity_digest or _integrity_digest(data)
         return data
@@ -174,6 +176,7 @@ class DeploymentReceipt:
             effective_config=nested("effective_config"),
             integrity_digest=integrity,
             receipt_path=str(raw.get("receipt_path") or ""),
+            modal_destination=nested("modal_destination"),
         )
         result.validate()
         expected = _integrity_digest(result._payload())
@@ -203,6 +206,7 @@ class DeploymentReceipt:
             "s4_identity": dict(self.s4_identity),
             "effective_config": dict(self.effective_config),
             "receipt_path": self.receipt_path,
+            "modal_destination": dict(self.modal_destination),
         }
         return data
 
@@ -211,6 +215,19 @@ class DeploymentReceipt:
             raise GateError("deployment receipt is missing required identity")
         if not all(self.target.get(name) for name in ("app", "class", "method")):
             raise GateError("deployment receipt target identity is incomplete")
+        strict = bool(self.manifest_path or self.effective_config or self.s4_identity)
+        if strict:
+            required_destination = {"workspace_id", "workspace_label", "environment", "source"}
+            if (set(self.modal_destination) != required_destination or any(
+                not isinstance(self.modal_destination.get(name), str)
+                or not self.modal_destination.get(name, "").strip()
+                for name in required_destination
+            )):
+                raise GateError("deployment receipt modal destination is missing or malformed")
+            if self.modal_destination and self.modal_destination.get("source") != "config/v2/modal_target.toml":
+                raise GateError("deployment receipt modal destination source is invalid")
+            if any("token" in key.lower() or "secret" in key.lower() for key in self.modal_destination):
+                raise GateError("deployment receipt modal destination contains credentials")
         if self.modal_app and self.modal_app != self.target["app"]:
             raise GateError("deployment receipt Modal app disagrees with target")
         if type(self.deployment_version) is not int or self.deployment_version < 0:
@@ -227,7 +244,6 @@ class DeploymentReceipt:
             if isinstance(deploy_flags, Mapping) else None,
         )
 
-        strict = bool(self.manifest_path or self.effective_config or self.s4_identity)
         if strict:
             identity = self.deployment_identity
             if identity.get("app") != self.target["app"]:
@@ -377,11 +393,14 @@ def latest_deployment_receipt(
             ):
                 continue
             if workspace_id is not None:
-                metadata_identity = metadata.get("deployment_identity")
-                if (
-                    not isinstance(metadata_identity, Mapping)
-                    or metadata_identity.get("modal_workspace") != workspace_id
-                ):
+                metadata_destination = metadata.get("modal_destination")
+                if isinstance(metadata_destination, Mapping):
+                    registered_workspace_id = metadata_destination.get("workspace_id")
+                else:
+                    # Legacy records are intentionally not usable as a
+                    # canonical destination authority.
+                    registered_workspace_id = None
+                if registered_workspace_id != workspace_id:
                     continue
         try:
             receipt = read_deployment_receipt(path)
@@ -451,6 +470,7 @@ def write_source_probe_evidence(
         "target": dict(receipt.target),
         "deployment_version": receipt.deployment_version,
         "deploy_fingerprint": receipt.deploy_fingerprint,
+        "modal_destination": dict(receipt.modal_destination),
         "expected": report.get("expected"),
         "remote_summary": report.get("remote_summary"),
         "classification": report.get("classification"),
@@ -490,6 +510,7 @@ def require_source_probe_evidence(repo_root: Path, receipt: DeploymentReceipt) -
         ("target", receipt.target),
         ("deployment_version", receipt.deployment_version),
         ("deploy_fingerprint", receipt.deploy_fingerprint),
+        ("modal_destination", receipt.modal_destination),
     ):
         if raw.get(name) != expected:
             raise GateError(f"source-probe evidence {name} does not match receipt")

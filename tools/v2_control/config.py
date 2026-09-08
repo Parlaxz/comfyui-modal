@@ -123,6 +123,9 @@ class ResolvedConfig:
     unregistered: list[ResolvedFlag]  # explicit-but-unregistered, sorted
     runtime_override_policy: str
     git: GitState
+    # Set by v2ctl before fingerprinting/remote work.  Kept optional for old
+    # local test doubles and non-remote config inspection.
+    modal_destination: object | None = None
 
     def flag(self, name: str) -> ResolvedFlag | None:
         """Return the effective flag (registered first, then unregistered)."""
@@ -168,6 +171,12 @@ class ResolvedConfig:
                 "dirty": self.git.dirty,
                 "dirty_hashes": dict(sorted(self.git.dirty_hashes.items())),
             },
+            "modal_destination": (
+                dict(getattr(self.modal_destination, "public"))
+                if self.modal_destination is not None
+                and isinstance(getattr(self.modal_destination, "public", None), Mapping)
+                else (dict(self.modal_destination) if isinstance(self.modal_destination, Mapping) else {})
+            ),
         }
 
 

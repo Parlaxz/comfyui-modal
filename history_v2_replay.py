@@ -845,16 +845,19 @@ def _resolve_replay_workspace(plan: ExecutionPlan) -> dict[str, Any] | None:
         from pathlib import Path
 
         from modal_workspaces import (
-            get_active_workspace,
             get_workspace,
             load_workspace_registry,
+            resolve_workspace_registry_path,
+            resolve_modal_destination,
         )
 
-        registry_file = Path(__file__).resolve().parent / ".modal_workspaces.json"
+        registry_file = resolve_workspace_registry_path(Path(__file__).resolve().parent)
         registry = load_workspace_registry(registry_file)
-        if not workspace_id:
-            active = get_active_workspace(registry)
-            workspace_id = str((active or {}).get("id", "") or "")
+        destination = resolve_modal_destination(Path(__file__).resolve().parent)
+        configured_id = str(destination.get("workspace_id", "") or "")
+        if workspace_id and workspace_id != configured_id:
+            return None
+        workspace_id = configured_id
         if not workspace_id:
             return None
         return get_workspace(registry, workspace_id)

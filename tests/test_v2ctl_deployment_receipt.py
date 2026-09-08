@@ -231,6 +231,12 @@ def test_bound_source_and_health_flow_preserves_receipt_manifest_integrity(
             "manifest_path": str(deployment_manifest),
             "manifest_digest": manifest_digest(deployment_manifest),
             "receipt_path": str(stored_receipt_path),
+            "modal_destination": {
+                "workspace_id": "ws-six",
+                "workspace_label": "Testing 6",
+                "environment": "(default)",
+                "source": "config/v2/modal_target.toml",
+            },
         }
     )
     stored_path = write_deployment_receipt(tmp_path, receipt)

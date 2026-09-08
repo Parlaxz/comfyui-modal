@@ -23,10 +23,10 @@ NO generation and NO sampling — the probe method is read-only.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -251,6 +251,12 @@ def call_remote_source_probe(
     Returns the probe dict.  Raises RuntimeError on transport/lookup failure.
     """
     import asyncio
+    if "id" not in workspace and workspace.get("workspace_id"):
+        workspace = {
+            **workspace,
+            "id": workspace["workspace_id"],
+            "label": workspace.get("workspace_label", ""),
+        }
 
     # The CLI may run without the repo root on sys.path; add it so the
     # transport package imports (mirrors tools/benchmark_v2_direct.py).
@@ -277,7 +283,27 @@ def call_remote_source_probe(
             return fn(request_id="v2-source-identity-probe")
         return fn(request_id="v2-source-identity-probe")
 
-    result = asyncio.run(asyncio.to_thread(_do))
+    @contextmanager
+    def _destination_environment():
+        original = dict(os.environ)
+        try:
+            for name in list(os.environ):
+                if name.startswith("MODAL_") or name in {"COMFYMODAL_ENVIRONMENT", "COMFYMODAL_V2_ENVIRONMENT", "COMFYMODAL_MODAL_PROFILE"}:
+                    os.environ.pop(name, None)
+            os.environ["MODAL_TOKEN_ID"] = str(workspace.get("token_id") or "")
+            os.environ["MODAL_TOKEN_SECRET"] = str(workspace.get("token_secret") or "")
+            environment = str(workspace.get("environment") or "(default)")
+            if environment != "(default)":
+                os.environ["MODAL_ENVIRONMENT"] = environment
+                os.environ["COMFYMODAL_ENVIRONMENT"] = environment
+                os.environ["COMFYMODAL_V2_ENVIRONMENT"] = environment
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    with _destination_environment():
+        result = asyncio.run(asyncio.to_thread(_do))
     if asyncio.iscoroutine(result):
         result = asyncio.run(result)
     if not isinstance(result, dict):
@@ -311,27 +337,16 @@ def run_source_probe(
 
 
 def _load_workspace(repo_root: Path) -> dict[str, Any]:
-    """Load the ACTIVE Modal workspace credentials (mirrors the benchmark).
-
-    Hard guard: ONLY the workspace whose id equals ``active_workspace_id``
-    in ``.modal_workspaces.json`` is ever returned.  A different workspace
-    (e.g. a stale profile pointing at testing3 while the active workspace is
-    testing6) is refused with a clear error — it must be impossible to probe
-    or deploy against a non-active workspace.
-    """
-    workspaces_path = repo_root / ".modal_workspaces.json"
-    if not workspaces_path.exists():
-        raise RuntimeError(f"Modal workspace file missing: {workspaces_path}")
-    data = json.loads(workspaces_path.read_text(encoding="utf-8"))
-    active_id = data.get("active_workspace_id")
-    for workspace in data.get("workspaces", []):
-        if workspace.get("id") == active_id:
-            if not workspace.get("token_id") or not workspace.get("token_secret"):
-                raise RuntimeError("active Modal workspace has no credentials")
-            os.environ["MODAL_TOKEN_ID"] = str(workspace["token_id"])
-            os.environ["MODAL_TOKEN_SECRET"] = str(workspace["token_secret"])
-            return workspace
-    raise RuntimeError(
-        f"active Modal workspace {active_id!r} was not found in "
-        f"{workspaces_path}; refusing to probe a non-active workspace"
-    )
+    """Compatibility loader for the immutable config-owned destination."""
+    try:
+        import modal_workspaces
+        destination = modal_workspaces.resolve_modal_destination(repo_root)
+        return {
+            "id": destination["workspace_id"],
+            "label": destination["workspace_label"],
+            "environment": destination["environment"],
+            "token_id": destination["token_id"],
+            "token_secret": destination["token_secret"],
+        }
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimeError(f"Modal destination cannot be resolved: {exc}") from exc

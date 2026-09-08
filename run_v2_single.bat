@@ -397,14 +397,20 @@ if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
     )
 )
 
-set "IDX=0"
-for /f "usebackq delims=" %%a in (`python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[]) if w.get('id')==aid),None);tid=ws and ws.get('token_id') or '';ts=ws and ws.get('token_secret') or '';sys.exit(1) if not(aid and ws and tid and ts) else None;print(tid);print(ts)"`) do (
-    if !IDX! equ 0 set "MODAL_TOKEN_ID=%%a"
-    if !IDX! equ 1 set "MODAL_TOKEN_SECRET=%%a"
-    set /a IDX+=1
+if not defined MODAL_TOKEN_ID (
+    echo === ERROR: v2ctl frozen MODAL_TOKEN_ID missing; refusing remote operation ===
+    exit /b 1
 )
-if !IDX! lss 2 (
-    echo === ERROR: Could not load active workspace credentials ===
+if not defined MODAL_TOKEN_SECRET (
+    echo === ERROR: v2ctl frozen MODAL_TOKEN_SECRET missing; refusing remote operation ===
+    exit /b 1
+)
+if not defined MODAL_WORKSPACE_ID (
+    echo === ERROR: v2ctl frozen MODAL_WORKSPACE_ID missing; refusing remote operation ===
+    exit /b 1
+)
+if not defined MODAL_WORKSPACE_LABEL (
+    echo === ERROR: v2ctl frozen MODAL_WORKSPACE_LABEL missing; refusing remote operation ===
     exit /b 1
 )
 

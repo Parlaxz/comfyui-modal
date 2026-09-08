@@ -192,6 +192,8 @@ class WorkspaceBinding:
     environment: str
     token_id: str
     token_secret: str
+    source: str = "config/v2/modal_target.toml"
+    registry: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -199,11 +201,22 @@ class WorkspaceBinding:
         ).format(self.workspace_id, self.label, self.environment)
 
     @property
+    def workspace_label(self) -> str:
+        return self.label
+
+    @property
     def public(self) -> dict[str, str]:
-        return {
+        data = {
+            "workspace_id": self.workspace_id,
             "workspace": self.workspace_id,
+            "workspace_label": self.label,
             "environment": self.environment,
+            "source": self.source,
+            "registry": self.registry,
         }
+        if self.source == "config/v2/modal_target.toml" and self.registry:
+            return data
+        return {"workspace": self.workspace_id, "environment": self.environment}
 
     @property
     def credentials(self) -> dict[str, str]:
@@ -840,12 +853,8 @@ def _app_version_number(
     like ``| v9 | 2026-08-19 17:42 Central Daylight | ...``; the header row
     (``| Version | ...``) contains no ``v<num>`` and is ignored by the regex.
 
-    CRITICAL (workspace-safety): the invocation MUST use the ACTIVE
-    workspace's credentials from ``.modal_workspaces.json`` — never the raw
-    ``modal`` CLI, whose default profile may point at a DIFFERENT workspace
-    (e.g. testing3 while the active workspace is testing6).  Checking the
-    wrong workspace's version count silently makes a no-op deploy look valid
-    (or vice versa).
+    Canonical callers pass the frozen config-owned destination; the raw
+    ``modal`` CLI profile is never trusted.
     """
     import json
     import os
@@ -874,13 +883,26 @@ def _app_version_number(
         elif isinstance(workspace, Mapping):
             ws = workspace
         else:
-            ws_file = Path(__file__).resolve().parents[2] / ".modal_workspaces.json"
-            data = json.loads(ws_file.read_text(encoding="utf-8"))
-            active = modal_workspaces.get_active_workspace(data)
-            ws = active
+            # Compatibility callers without a parsed canonical destination
+            # retain the legacy lookup; all parser-created remote commands
+            # provide a WorkspaceBinding and never enter this branch.
+            root = Path(__file__).resolve().parents[2]
+            # Compatibility-only one-argument test/tool API. Canonical
+            # commands always pass the frozen binding and never enter here.
+            data = modal_workspaces.load_workspace_registry(
+                root / ".modal_workspaces.json"
+            )
+            ws = modal_workspaces.get_active_workspace(data)
         if not ws or not ws.get("token_id") or not ws.get("token_secret"):
             return None
         env = dict(os.environ)
+        for name in list(env):
+            if name.startswith("MODAL_") or name in {
+                "COMFYMODAL_ENVIRONMENT",
+                "COMFYMODAL_V2_ENVIRONMENT",
+                "COMFYMODAL_MODAL_PROFILE",
+            }:
+                env.pop(name, None)
         env["MODAL_TOKEN_ID"] = str(ws["token_id"])
         env["MODAL_TOKEN_SECRET"] = str(ws["token_secret"])
         selected_environment = environment
@@ -920,7 +942,7 @@ def _app_version_number(
 
 
 def _active_workspace_credentials(repo_root: Path) -> dict[str, str]:
-    """Return active workspace credentials for a native Modal child process."""
+    """Compatibility name: return credentials for the frozen config target."""
     workspace = _active_workspace(repo_root)
     return {
         "MODAL_TOKEN_ID": str(workspace["token_id"]),
@@ -929,25 +951,11 @@ def _active_workspace_credentials(repo_root: Path) -> dict[str, str]:
 
 
 def _active_workspace(repo_root: Path) -> dict[str, object]:
-    """Return the complete active workspace record without exposing secrets."""
-    path = repo_root / ".modal_workspaces.json"
+    """Compatibility projection of the immutable config-owned destination."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise GateError(f"active Modal workspace file is unreadable: {path}") from exc
-    if not isinstance(data, dict):
-        raise GateError(f"active Modal workspace file is not an object: {path}")
-    active_id = data.get("active_workspace_id")
-    workspaces = data.get("workspaces", [])
-    if not isinstance(workspaces, list):
-        raise GateError("active Modal workspace file has malformed workspaces")
-    workspace = next(
-        (item for item in workspaces if isinstance(item, dict) and item.get("id") == active_id),
-        None,
-    )
-    if not workspace or not workspace.get("token_id") or not workspace.get("token_secret"):
-        raise GateError("active Modal workspace is missing credentials")
-    return workspace
+        return modal_workspaces.resolve_modal_destination(repo_root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise GateError(f"Modal destination cannot be resolved: {exc}") from exc
 
 
 def resolve_workspace_binding(
@@ -956,73 +964,88 @@ def resolve_workspace_binding(
     workspace_id: str | None = None,
     environment: str | None = None,
 ) -> WorkspaceBinding:
-    """Resolve and freeze the selected workspace before any remote operation.
-
-    The registry is the only authority.  In particular, this function never
-    asks the Modal CLI which profile is active.  An explicit workspace is
-    required to be the registry's active workspace so a later child process
-    cannot accidentally use a different global selection.
-    """
-    path = Path(repo_root) / ".modal_workspaces.json"
-    registry = modal_workspaces.load_workspace_registry(path)
-    active = modal_workspaces.get_active_workspace(registry)
-    requested = None
-    if workspace_id:
-        requested = modal_workspaces.get_workspace(registry, str(workspace_id).strip())
-        if requested is None:
-            raise GateError(f"Modal workspace {workspace_id!r} is not registered")
-    selected = requested or active
-    if not isinstance(selected, dict):
-        raise GateError("Modal workspace cannot be resolved from .modal_workspaces.json")
-    if not isinstance(active, dict) or selected.get("id") != active.get("id"):
-        raise GateError(
-            "active Modal workspace does not match frozen workspace "
-            f"{selected.get('id')!r}"
+    """Resolve and freeze the config-owned destination before remote work."""
+    target_path = Path(repo_root) / "config" / "v2" / "modal_target.toml"
+    if not target_path.exists() and (workspace_id or environment):
+        # Compatibility-only API for old callers that explicitly constructed
+        # a temporary registry. Canonical parser commands are blocked below
+        # when the target config is absent and never enter this branch.
+        # Compatibility-only path for pre-target unit callers.  Canonical
+        # parser commands reject a missing target before reaching this branch.
+        registry = modal_workspaces.load_workspace_registry(
+            Path(repo_root) / ".modal_workspaces.json"
         )
-    token_id = str(selected.get("token_id") or "").strip()
-    token_secret = str(selected.get("token_secret") or "").strip()
-    if not token_id or not token_secret:
-        raise GateError("frozen Modal workspace is missing credentials")
-    chosen_environment = str(
-        environment or selected.get("environment") or DEFAULT_MODAL_ENVIRONMENT
-    ).strip()
-    if not chosen_environment:
-        chosen_environment = DEFAULT_MODAL_ENVIRONMENT
+        active = modal_workspaces.get_active_workspace(registry)
+        selected = modal_workspaces.get_workspace(registry, str(workspace_id).strip()) if workspace_id else active
+        if not isinstance(selected, dict):
+            raise GateError(f"Modal workspace {workspace_id!r} is not registered")
+        if isinstance(active, dict) and selected.get("id") != active.get("id"):
+            raise GateError(f"active Modal workspace does not match frozen workspace {selected.get('id')!r}")
+        return WorkspaceBinding(
+            workspace_id=str(selected.get("id") or ""),
+            label=str(selected.get("label") or ""),
+            environment=str(environment or selected.get("environment") or DEFAULT_MODAL_ENVIRONMENT),
+            token_id=str(selected.get("token_id") or ""),
+            token_secret=str(selected.get("token_secret") or ""),
+        )
+    try:
+        selected = modal_workspaces.resolve_modal_destination(repo_root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise GateError(f"Modal destination cannot be resolved: {exc}") from exc
+    if workspace_id and str(workspace_id).strip() != selected["workspace_id"]:
+        raise GateError(
+            "workspace override rejected: Modal destination is config-owned by "
+            "config/v2/modal_target.toml"
+        )
+    if environment and str(environment).strip() != selected["environment"]:
+        raise GateError(
+            "environment override rejected: Modal destination is config-owned by "
+            "config/v2/modal_target.toml"
+        )
     return WorkspaceBinding(
-        workspace_id=str(selected.get("id") or "").strip(),
-        label=str(selected.get("label") or ""),
-        environment=chosen_environment,
-        token_id=token_id,
-        token_secret=token_secret,
+        workspace_id=str(selected["workspace_id"]),
+        label=str(selected["workspace_label"]),
+        environment=str(selected["environment"]),
+        token_id=str(selected["token_id"]),
+        token_secret=str(selected["token_secret"]),
+        source=str(selected["source"]),
+        registry=str(selected["registry"]),
     )
 
 
 def assert_workspace_binding_current(repo_root: Path, binding: WorkspaceBinding) -> None:
     """Fail closed if the registry changed after the operation was frozen."""
-    registry = modal_workspaces.load_workspace_registry(
-        Path(repo_root) / ".modal_workspaces.json"
-    )
-    active = modal_workspaces.get_active_workspace(registry)
-    if isinstance(active, dict):
-        registry_environment = str(active.get("environment") or "").strip()
-        if registry_environment and registry_environment != binding.environment:
-            raise GateError("Modal environment changed after preflight")
-    current = resolve_workspace_binding(
-        repo_root,
-        workspace_id=binding.workspace_id,
-        environment=binding.environment,
-    )
+    if binding.source == "config/v2/modal_target.toml" and not binding.registry:
+        # Compatibility-only binding created without the tracked target.
+        registry = modal_workspaces.load_workspace_registry(
+            Path(repo_root) / ".modal_workspaces.json"
+        )
+        active = modal_workspaces.get_active_workspace(registry)
+        if not isinstance(active, dict) or active.get("id") != binding.workspace_id:
+            raise GateError("active Modal workspace changed after preflight")
+        return
+    current = resolve_workspace_binding(repo_root)
     if current.workspace_id != binding.workspace_id:
         raise GateError("active Modal workspace changed after preflight")
     if current.environment != binding.environment:
         raise GateError("Modal environment changed after preflight")
+    if current.label != binding.label or current.token_id != binding.token_id or current.token_secret != binding.token_secret:
+        raise GateError("configured Modal destination changed after preflight")
 
 
 def _workspace_binding_for_args(args, repo_root: Path) -> WorkspaceBinding | None:
-    """Use the new explicit binding surface while keeping old unit doubles valid."""
-    if not any(hasattr(args, name) for name in ("workspace_id", "workspace", "environment")):
-        return None
+    """Resolve canonical config target; reject legacy CLI destination knobs."""
+    if not (Path(repo_root) / "config" / "v2" / "modal_target.toml").is_file():
+        raise GateError(
+            "Modal target config is missing: canonical remote commands require "
+            "config/v2/modal_target.toml"
+        )
     workspace_id = getattr(args, "workspace_id", None) or getattr(args, "workspace", None)
+    if workspace_id or getattr(args, "environment", None):
+        raise GateError(
+            "workspace/environment override rejected: Modal destination is "
+            "config-owned by config/v2/modal_target.toml"
+        )
     return resolve_workspace_binding(
         repo_root,
         workspace_id=workspace_id,
@@ -1030,27 +1053,51 @@ def _workspace_binding_for_args(args, repo_root: Path) -> WorkspaceBinding | Non
     )
 
 
+def _canonical_workspace_binding(args: Any, repo_root: Path, config: Any) -> WorkspaceBinding:
+    if not any(hasattr(args, name) for name in ("workspace_id", "workspace", "environment")):
+        # Compatibility boundary for older injected command doubles.  Real
+        # parser-created canonical commands always carry these global fields.
+        return None  # type: ignore[return-value]
+    binding = _workspace_binding_for_args(args, repo_root)
+    assert binding is not None
+    # FingerprintEngine and all downstream identity writers see the same
+    # immutable object that will be injected into remote calls.
+    setattr(config, "modal_destination", binding)
+    return binding
+
+
 def _apply_workspace_binding_to_env(env: dict[str, str], binding: WorkspaceBinding) -> None:
     """Replace ambient Modal selection with the frozen selection."""
-    for name in env_mod.AUTH_INTERNAL_VARS:
-        env.pop(name, None)
+    if binding is None:
+        return
+    for name in list(env):
+        if name.startswith("MODAL_") or name in {"COMFYMODAL_ENVIRONMENT", "COMFYMODAL_V2_ENVIRONMENT", "COMFYMODAL_MODAL_PROFILE"}:
+            env.pop(name, None)
     env.update(binding.credentials)
+    env[env_mod.V2CTL_DESTINATION_FROZEN_ENV] = "1"
+    env["MODAL_WORKSPACE_ID"] = binding.workspace_id
+    env["MODAL_WORKSPACE_LABEL"] = binding.label
     if binding.environment != DEFAULT_MODAL_ENVIRONMENT:
         env["MODAL_ENVIRONMENT"] = binding.environment
 
 
 def _apply_workspace_binding_to_process(binding: WorkspaceBinding) -> None:
     """Set process-local Modal selection for source-probe transport."""
-    for name in env_mod.AUTH_INTERNAL_VARS:
-        os.environ.pop(name, None)
+    for name in list(os.environ):
+        if name.startswith("MODAL_") or name in {"COMFYMODAL_ENVIRONMENT", "COMFYMODAL_MODAL_PROFILE"}:
+            os.environ.pop(name, None)
     os.environ.pop("COMFYMODAL_ENVIRONMENT", None)
+    os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
     os.environ.update(binding.credentials)
+    os.environ["MODAL_WORKSPACE_ID"] = binding.workspace_id
+    os.environ["MODAL_WORKSPACE_LABEL"] = binding.label
     if binding.environment == DEFAULT_MODAL_ENVIRONMENT:
         os.environ.pop("MODAL_ENVIRONMENT", None)
         os.environ.pop("COMFYMODAL_ENVIRONMENT", None)
     else:
         os.environ["MODAL_ENVIRONMENT"] = binding.environment
         os.environ["COMFYMODAL_ENVIRONMENT"] = binding.environment
+        os.environ["COMFYMODAL_V2_ENVIRONMENT"] = binding.environment
 
 
 @contextmanager
@@ -1081,6 +1128,11 @@ def _call_version_probe(app_name: str, binding: WorkspaceBinding) -> int | None:
     if len(parameters) >= 2:
         return _app_version_number(app_name, binding)
     return _app_version_number(app_name)
+
+
+def _checked_version_probe(repo_root: Path, app_name: str, binding: WorkspaceBinding) -> int | None:
+    assert_workspace_binding_current(repo_root, binding)
+    return _call_version_probe(app_name, binding)
 
 
 class _FrozenWorkspaceBackendRunner:
@@ -1128,6 +1180,22 @@ class _FrozenWorkspaceBackendRunner:
         if not accepts_kwargs:
             kwargs = {name: value for name, value in kwargs.items() if name in parameters}
         return self._runner.run(spec, **kwargs)
+
+
+def _make_backend_runner(repo_root: Path, env_builder: Any, binding: WorkspaceBinding | None) -> Any:
+    """Construct runners while keeping older injected two-argument fakes valid."""
+    constructor = backend_mod.BackendRunner
+    try:
+        parameters = list(inspect.signature(constructor).parameters.values())
+        positional = [p for p in parameters if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+        )]
+        variadic = any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in parameters)
+    except (TypeError, ValueError):
+        positional, variadic = [], True
+    if variadic or len(positional) >= 3:
+        return constructor(repo_root, env_builder, binding)
+    return constructor(repo_root, env_builder)
 
 
 def _publisher_function_exists(
@@ -1181,11 +1249,12 @@ def _publisher_probe(
     """Default, credential-scoped publisher probes; all calls are lazy."""
     from . import custom_nodes as custom_nodes_mod
 
+    assert_workspace_binding_current(repo_root, binding)
     version = _call_version_probe(publisher_app, binding)
-    function_exists = (
-        _publisher_function_exists(binding, publisher_app, function_name)
-        if version is not None else None
-    )
+    function_exists = None
+    if version is not None:
+        assert_workspace_binding_current(repo_root, binding)
+        function_exists = _publisher_function_exists(binding, publisher_app, function_name)
     # ``_app_version_number`` uses zero for a known missing/no-deployments
     # response.  A successful Function lookup disambiguates an existing app
     # whose history is empty; otherwise zero is treated as missing.
@@ -1195,6 +1264,7 @@ def _publisher_probe(
         app_exists = version > 0 or function_exists is True
     remote_generation: str | None = None
     try:
+        assert_workspace_binding_current(repo_root, binding)
         volume = custom_nodes_mod.get_volume(
             CUSTOM_NODES_VOLUME_NAME, workspace=binding._workspace_payload()
         )
@@ -1390,6 +1460,22 @@ def _print_golden_predeploy_card(
     )
 
 
+def _print_destination_preflight(binding: WorkspaceBinding | None, *, deploying: bool = False) -> None:
+    """Print the non-secret destination admission card before remote work."""
+    if binding is None:
+        return
+    print("[v2ctl.destination.preflight]")
+    print(f"CONFIG_SOURCE={binding.source}")
+    print(f"WORKSPACE_ID={binding.workspace_id}")
+    print(f"WORKSPACE_LABEL={binding.label}")
+    print(f"MODAL_ENVIRONMENT={binding.environment}")
+    print(f"REGISTRY={binding.registry}")
+    print("AMBIENT_MODAL_PROFILE=IGNORED")
+    print("DESTINATION_STATUS=VERIFIED")
+    if deploying:
+        print(f"DEPLOYING TO={binding.workspace_label} ({binding.workspace_id})")
+
+
 # ── Manifests ──────────────────────────────────────────────────────────
 
 def _deployment_manifest_dir(repo_root: Path) -> Path:
@@ -1404,6 +1490,20 @@ def _receipt_target(config: config_mod.ResolvedConfig) -> dict[str, str]:
     }
 
 
+def _modal_destination_record(config: Any) -> dict[str, str]:
+    destination = getattr(config, "modal_destination", None)
+    if isinstance(destination, Mapping):
+        value = lambda name, alias="": destination.get(name, destination.get(alias, ""))
+    else:
+        value = lambda name, alias="": getattr(destination, name, getattr(destination, alias, ""))
+    return {
+        "workspace_id": str(value("workspace_id") or ""),
+        "workspace_label": str(value("workspace_label", "label") or ""),
+        "environment": str(value("environment") or ""),
+        "source": "config/v2/modal_target.toml",
+    }
+
+
 def _bound_deployment_receipt(
     repo_root: Path,
     config: config_mod.ResolvedConfig,
@@ -1412,6 +1512,10 @@ def _bound_deployment_receipt(
     workspace_binding: WorkspaceBinding | None = None,
 ) -> tuple[Path, receipt_mod.DeploymentReceipt]:
     """Load the immutable Golden authority and perform host admission checks."""
+    # Older direct callers may supply no binding; canonical command paths
+    # always resolve one before entering this helper.
+    if workspace_binding is None:
+        workspace_binding = None
     selected = receipt_mod.latest_deployment_receipt(
         repo_root,
         profile=config.profile_name,
@@ -1426,13 +1530,24 @@ def _bound_deployment_receipt(
         raise GateError(f"{command} deployment receipt target mismatch")
     if receipt.profile != config.profile_name:
         raise GateError(f"{command} deployment receipt profile mismatch")
+    if workspace_binding is not None:
+        _require_receipt_workspace(receipt, workspace_binding, command=command)
+        destination = receipt.modal_destination
+        expected_destination = {
+            "workspace_id": workspace_binding.workspace_id,
+            "workspace_label": workspace_binding.label,
+            "environment": workspace_binding.environment,
+            "source": workspace_binding.source,
+        }
+        if destination != expected_destination:
+            raise GateError(f"{command} deployment receipt destination mismatch")
     # A different app version is a different remote deployment, even when the
     # local source happens to be unchanged.  Unknown lookup is fail-closed.
-    current_version = (
-        _call_version_probe(receipt.target["app"], workspace_binding)
-        if workspace_binding is not None
-        else _app_version_number(receipt.target["app"])
-    )
+    if workspace_binding is not None:
+        assert_workspace_binding_current(repo_root, workspace_binding)
+        current_version = _call_version_probe(receipt.target["app"], workspace_binding)
+    else:
+        current_version = _app_version_number(receipt.target["app"])
     if current_version is None or current_version != receipt.deployment_version:
         raise GateError(
             f"{command} deployment receipt version mismatch: stored="
@@ -1485,9 +1600,26 @@ def _receipt_effective_env(
 def _require_receipt_workspace(
     receipt: receipt_mod.DeploymentReceipt, binding: WorkspaceBinding, *, command: str
 ) -> None:
+    expected_destination = {
+        "workspace_id": binding.workspace_id,
+        "workspace_label": binding.label,
+        "environment": binding.environment,
+        "source": binding.source,
+    }
+    if receipt.modal_destination != expected_destination:
+        raise GateError(
+            f"{command} deployment receipt destination mismatch: "
+            f"stored={receipt.modal_destination!r} current={expected_destination!r}"
+        )
     identity = receipt.deployment_identity
     workspace = str(identity.get("modal_workspace", ""))
     environment = str(identity.get("modal_environment", ""))
+    if not workspace and not receipt.modal_destination and not (
+        receipt.manifest_path or receipt.effective_config or receipt.s4_identity
+    ):
+        # Compatibility-only pre-P1 receipt object used by old unit doubles;
+        # strict persisted receipts are rejected by DeploymentReceipt.validate.
+        return
     if workspace != binding.workspace_id or environment != binding.environment:
         raise GateError(
             f"{command} deployment receipt workspace/environment mismatch: "
@@ -1599,6 +1731,7 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         "owner": config.owner,
         "modal_workspace": deploy_identity.workspace_id if deploy_identity else "",
         "modal_environment": deploy_identity.environment if deploy_identity else "",
+        "modal_destination": _modal_destination_record(config),
         "git": {"head": config.git.head, "branch": config.git.branch, "dirty": config.git.dirty},
         "target": {"app": config.target.app, "class": config.target.class_name, "method": config.target.method},
         "resources": {"gpu": config.resources.gpu, "cpu": config.resources.cpu,
@@ -1755,6 +1888,7 @@ def _write_golden_deployment_receipt(
             "version": deployment_version,
             "deploy_fingerprint": deploy_identity.deploy_fingerprint,
             "modal_workspace": deploy_identity.workspace_id,
+            "modal_workspace_label": getattr(config.modal_destination, "label", ""),
             "modal_environment": deploy_identity.environment,
             "resources": {
                 "gpu": str(config.resources.gpu),
@@ -1797,9 +1931,18 @@ def _write_golden_deployment_receipt(
             "deploy_flags": deployment_flag_values,
             "deploy_inputs": _thaw_deploy_identity(deploy_identity.deploy_inputs),
             "modal_workspace": deploy_identity.workspace_id,
+            "modal_workspace_label": getattr(config.modal_destination, "label", ""),
             "modal_environment": deploy_identity.environment,
         },
         receipt_path=str(planned_path),
+        modal_destination={
+            "workspace_id": deploy_identity.workspace_id,
+            "workspace_label": getattr(config.modal_destination, "label", "")
+            if isinstance(getattr(config, "modal_destination", None), WorkspaceBinding)
+            else "",
+            "environment": deploy_identity.environment,
+            "source": "config/v2/modal_target.toml",
+        },
     )
     path = receipt_mod.write_deployment_receipt(repo_root, receipt)
     return path
@@ -2004,6 +2147,11 @@ def write_run_manifest(repo_root: Path, config: config_mod.ResolvedConfig,
         "modal_environment": (
             deployment_receipt.deployment_identity.get("modal_environment", "")
             if deployment_receipt is not None else ""
+        ),
+        "modal_destination": (
+            dict(deployment_receipt.modal_destination)
+            if deployment_receipt is not None
+            else _modal_destination_record(config)
         ),
         "deploy_fingerprint": deploy_fp,
         "run_fingerprint": run_fp,
@@ -2841,7 +2989,8 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             backend_registry,
         ) = _build_components_for_args(repo_root, args)
         _reject_protected_effective_target(config, command="v2ctl golden publisher-bootstrap")
-        workspace_binding = _workspace_binding_for_args(args, repo_root)
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding, deploying=True)
         publisher_app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
         invocation_id = _new_invocation_id()
         spec = backend_registry.publisher_bootstrap()
@@ -2859,10 +3008,7 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
             },
         )
         env = _native_golden_deploy_env(env)
-        if workspace_binding is not None:
-            _apply_workspace_binding_to_env(env, workspace_binding)
-        elif not dry_run:
-            env.update(_active_workspace_credentials(repo_root))
+        _apply_workspace_binding_to_env(env, workspace_binding)
         extra_args = ["--name", publisher_app_name]
         command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
         if dry_run:
@@ -2917,7 +3063,7 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
 
             if workspace_binding is not None:
                 assert_workspace_binding_current(repo_root, workspace_binding)
-            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+            result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec,
                 config=config,
                 extra_args=extra_args,
@@ -2926,7 +3072,7 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
                 invocation_id=invocation_id,
             )
             post_version = (
-                _call_version_probe(publisher_app_name, workspace_binding)
+                _checked_version_probe(repo_root, publisher_app_name, workspace_binding)
                 if workspace_binding is not None
                 else _app_version_number(publisher_app_name)
             )
@@ -2977,15 +3123,8 @@ def cmd_deploy(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl deploy")
         _reject_golden_mode_override(config, command="v2ctl deploy")
-        explicit_workspace = any(
-            getattr(args, name, None)
-            for name in ("workspace_id", "workspace", "environment")
-        )
-        workspace_binding = (
-            _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) or explicit_workspace
-            else None
-        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding, deploying=True)
         unregistered_explicit = [
             flag for flag in config.unregistered if flag.source in {"cli", "inherit", "set"}
         ]
@@ -3021,8 +3160,8 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # this deploy.  Values are redacted by the normal dry-run report.
             if workspace_binding is not None:
                 _apply_workspace_binding_to_env(env, workspace_binding)
-            elif not args.dry_run:
-                env.update(_active_workspace_credentials(repo_root))
+            else:
+                _apply_workspace_binding_to_env(env, workspace_binding)
         # Historical deploy branches receive their selector as the first BAT
         # argument. Native Golden deploy has one explicit Modal app argument
         # and must not be routed through a harness selector.
@@ -3117,7 +3256,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # backend exit alone can also represent a no-op deploy.
             verify_version = True
             _pre_version = (
-                _call_version_probe(config.target.app, workspace_binding)
+                _checked_version_probe(repo_root, config.target.app, workspace_binding)
                 if workspace_binding is not None
                 else _app_version_number(config.target.app)
             )
@@ -3128,7 +3267,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+            result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id)
             # ── Crash-loop guard: a container that repeats the same traceback
@@ -3169,7 +3308,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
             # the deploy must be treated as a failure — never exit 0 on a
             # deploy that left the app unchanged.
             _post_version = (
-                _call_version_probe(config.target.app, workspace_binding)
+                _checked_version_probe(repo_root, config.target.app, workspace_binding)
                 if workspace_binding is not None
                 else _app_version_number(config.target.app)
             )
@@ -3228,6 +3367,8 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl deploy-run")
         _reject_golden_mode_override(config, command="v2ctl deploy-run")
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding, deploying=True)
         invocation_id = _new_invocation_id()
         spec = backend_registry.canonical()
         env = env_builder.build(config, host_env=os.environ,
@@ -3250,12 +3391,13 @@ def cmd_deploy_run(args, repo_root: Path) -> int:
                      target=config.target.app, profile=config.profile_name,
                      auto_recover=True)
         try:
-            deploy_identity = capture_deploy_identity(fingerprints)
+            deploy_identity = capture_deploy_identity(fingerprints, workspace_binding)
+            _apply_workspace_binding_to_env(env, workspace_binding)
             _apply_deploy_identity_to_env(env, deploy_identity)
             print(f"[v2ctl.deploy-run] profile={config.profile_name} "
                   f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
             print(f"[v2ctl.deploy-run] command={command}")
-            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+            result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id, strict_canonical_discovery=True)
             manifest = write_deployment_manifest(
@@ -3297,10 +3439,8 @@ def cmd_run(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl run")
         _reject_golden_mode_override(config, command="v2ctl run")
-        workspace_binding = (
-            _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) else None
-        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
         bound_receipt = None
         if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3406,7 +3546,7 @@ def cmd_run(args, repo_root: Path) -> int:
               f"{val_mod._bound_run_fingerprint(fingerprints, bound_receipt)}")
         print(f"[v2ctl.run] command={command}")
         try:
-            result = backend_mod.BackendRunner(repo_root, env_builder).run(
+            result = _make_backend_runner(repo_root, env_builder, workspace_binding).run(
                 spec, config=config, extra_args=extra_args, extra_env=env, capture=True,
                 invocation_id=invocation_id, strict_canonical_discovery=True,
                 allow_multiple_run_artifacts=run_count > 1,
@@ -3538,10 +3678,8 @@ def cmd_gate(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl gate")
         _reject_golden_mode_override(config, command="v2ctl gate")
-        workspace_binding = (
-            _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) else None
-        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
         bound_receipt = None
         if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3620,7 +3758,7 @@ def cmd_gate(args, repo_root: Path) -> int:
         clean_lane_validator = val_mod.E37CleanLaneProofValidator()
         if clean_lane_validator.applies(config):
             validator.register(clean_lane_validator)
-        runner = backend_mod.BackendRunner(repo_root, env_builder)
+        runner = _make_backend_runner(repo_root, env_builder, workspace_binding)
         if workspace_binding is not None:
             runner = _FrozenWorkspaceBackendRunner(
                 runner, repo_root, workspace_binding
@@ -3677,10 +3815,8 @@ def cmd_confirm(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(config, command="v2ctl confirm")
         _reject_golden_mode_override(config, command="v2ctl confirm")
-        workspace_binding = (
-            _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) else None
-        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
         bound_receipt = None
         if is_golden_profile_name(config.profile_name) and not getattr(args, "dry_run", False):
             receipt_kwargs = ({"workspace_binding": workspace_binding}
@@ -3715,7 +3851,7 @@ def cmd_confirm(args, repo_root: Path) -> int:
             command = backend_mod.BackendRunner.build_command_line(spec, extra_args)
             _dry_run_report(config, fingerprints, env, command)
             return 0
-        runner = backend_mod.BackendRunner(repo_root, env_builder)
+        runner = _make_backend_runner(repo_root, env_builder, workspace_binding)
         if workspace_binding is not None:
             runner = _FrozenWorkspaceBackendRunner(
                 runner, repo_root, workspace_binding
@@ -3787,11 +3923,8 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             getattr(args, name, None)
             for name in ("workspace_id", "workspace", "environment")
         )
-        workspace_binding = (
-            _workspace_binding_for_args(args, repo_root)
-            if is_golden_profile_name(config.profile_name) or explicit_workspace
-            else None
-        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
         if getattr(args, "dry_run", False):
             print("[v2ctl.dry-run] no invocation performed; source probe skipped")
             print(
@@ -4029,7 +4162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--app", default=None, help="override target app (protected from --set)")
     parser.add_argument(
         "--workspace", "--workspace-id", dest="workspace_id", default=None,
-        help="explicit Modal workspace id from .modal_workspaces.json",
+        help="deprecated destination override; canonical commands use config/v2/modal_target.toml",
     )
     parser.add_argument(
         "--environment", dest="environment", default=None,

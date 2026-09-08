@@ -725,33 +725,31 @@ if "!V2_E10_BUCKET_FIRST_VALIDATION_ACTIVE!"=="1" (
     )
 )
 
-REM -- Workspace loading -------------------------------------------
-echo === Loading active workspace ===
-set "WS_FILE=%TEMP%\_ws_%RANDOM%.txt"
-python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[])if w.get('id')==aid),None);tid=ws and ws.get('token_id')or'';ts=ws and ws.get('token_secret')or'';label=ws and ws.get('label','')or'';open(sys.argv[1],'w').write('MODAL_TOKEN_ID='+tid+'\nMODAL_TOKEN_SECRET='+ts+'\nMODAL_WORKSPACE_LABEL='+label)" "%WS_FILE%"
-if errorlevel 1 (
-    echo === ERROR: Python workspace extraction failed ===
-    if defined WS_FILE if exist "%WS_FILE%" del /q "%WS_FILE%"
-    exit /b 1
-)
-for /f "usebackq tokens=1,* delims==" %%a in ("%WS_FILE%") do set "%%a=%%b"
-if defined WS_FILE if exist "%WS_FILE%" del /q "%WS_FILE%"
+REM -- Frozen destination loading ----------------------------------
+echo === Consuming frozen v2ctl destination ===
 if not defined MODAL_TOKEN_ID (
-    echo === ERROR: Could not load active workspace credentials ===
+    echo === ERROR: frozen MODAL_TOKEN_ID missing; refusing remote operation ===
     exit /b 1
 )
-echo === Active workspace: !MODAL_WORKSPACE_LABEL! ===
-
-REM -- Workspace guard (E29 root-cause fix) ----------------------------
-REM The modal CLI default profile may point at a DIFFERENT workspace than
-REM the active one (e.g. profile "default" -> testing3 while the active
-REM workspace is testing6).  Deploying/checking against the wrong workspace
-REM silently no-ops or reads the wrong app version.  HARD REFUSE: the
-REM workspace label must equal the active workspace's label from
-REM .modal_workspaces.json — any mismatch means the credentials did not
-REM take effect and the deploy must NOT proceed.
+if not defined MODAL_TOKEN_SECRET (
+    echo === ERROR: frozen MODAL_TOKEN_SECRET missing; refusing remote operation ===
+    exit /b 1
+)
+if not defined MODAL_WORKSPACE_ID (
+    echo === ERROR: frozen MODAL_WORKSPACE_ID missing; refusing remote operation ===
+    exit /b 1
+)
 if not defined MODAL_WORKSPACE_LABEL (
-    echo === ERROR: active workspace label missing; refusing to deploy ===
+    echo === ERROR: frozen MODAL_WORKSPACE_LABEL missing; refusing remote operation ===
+    exit /b 1
+)
+echo === Frozen destination: !MODAL_WORKSPACE_LABEL! (!MODAL_WORKSPACE_ID!) ===
+
+REM -- Frozen destination guard -------------------------------------
+REM v2ctl verified the configured workspace and label against the
+REM shared registry; this BAT consumes that immutable selection only.
+if not defined MODAL_WORKSPACE_LABEL (
+    echo === ERROR: frozen workspace label missing; refusing to deploy ===
     exit /b 1
 )
 

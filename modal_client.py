@@ -803,13 +803,18 @@ async def sync_custom_nodes(
     # write to a different publisher app.
     _ = app_name, publisher_app_name
     app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
+    environment_name = str(selected.get("environment") or "(default)")
+    if environment_name == "(default)":
+        environment_name = None
     if app_name is None:
         operation = lambda: _workspace_function(
-            "sync_custom_nodes_to_volume", selected
+            "sync_custom_nodes_to_volume", selected,
+            environment_name=environment_name,
         ).remote(archive_data)
     else:
         operation = lambda: _workspace_function(
-            "sync_custom_nodes_to_volume", selected, app_name=app_name
+            "sync_custom_nodes_to_volume", selected, app_name=app_name,
+            environment_name=environment_name,
         ).remote(archive_data)
     return await asyncio.to_thread(
         operation,

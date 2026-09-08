@@ -1066,7 +1066,8 @@ def _resolve_workspace_dict(workspace_id: str) -> Optional[dict]:
     try:
         from modal_workspaces import get_workspace, load_workspace_registry
 
-        workspace_file = Path(__file__).resolve().parent / ".modal_workspaces.json"
+        from modal_workspaces import resolve_workspace_registry_path
+        workspace_file = resolve_workspace_registry_path(Path(__file__).resolve().parent)
         registry = load_workspace_registry(workspace_file)
         return get_workspace(registry, workspace_id)
     except Exception:

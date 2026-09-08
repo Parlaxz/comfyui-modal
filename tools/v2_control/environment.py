@@ -4,9 +4,8 @@ Builds the child process environment for backend invocations from a
 controlled baseline:
 
 1. required host/tool variables (PATH, TEMP, ...) inherited from the host;
-2. Modal auth/internal variables inherited from the host (they come from
-   ``.modal_workspaces.json`` at the BAT layer and must never be overridden
-   by profiles / ``--set`` / ``--inherit``);
+2. Modal auth/internal variables are deliberately removed from the host;
+   canonical v2ctl injects the already-frozen destination explicitly;
 3. resolved config flags + explicit unregistered values (the EXPERIMENTAL
    ``COMFYMODAL_*`` / ``V2_*`` namespace);
 4. explicit backend extras (e.g. ``COMFYMODAL_DEPLOY_ONLY=1``).
@@ -54,8 +53,8 @@ REQUIRED_HOST_VARS = (
     "USERNAME",
 )
 
-# Modal auth / internal variables loaded by the BATs from .modal_workspaces.json.
-# Inherited from the host environment, redacted everywhere, never overridable.
+# Modal auth / internal variables injected only after v2ctl freezes the
+# config-owned destination. They are never inherited from the host.
 AUTH_INTERNAL_VARS = (
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -75,12 +74,14 @@ V2CTL_PROFILE_ENV = "COMFYMODAL_V2CTL_PROFILE"
 V2CTL_PROFILE_CONFIG_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"
 V2CTL_DEPLOY_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"
 V2CTL_RUN_FINGERPRINT_ENV = "COMFYMODAL_V2CTL_RUN_FINGERPRINT"
+V2CTL_DESTINATION_FROZEN_ENV = "COMFYMODAL_V2CTL_DESTINATION_FROZEN"
 V2CTL_RESERVED_ENV = (
     V2CTL_INVOCATION_ID_ENV,
     V2CTL_PROFILE_ENV,
     V2CTL_PROFILE_CONFIG_FINGERPRINT_ENV,
     V2CTL_DEPLOY_FINGERPRINT_ENV,
     V2CTL_RUN_FINGERPRINT_ENV,
+    V2CTL_DESTINATION_FROZEN_ENV,
 )
 
 # Secret-shaped names: redacted in display output and refused as overrides.
@@ -239,6 +240,9 @@ class EnvironmentBuilder:
         for name in REQUIRED_HOST_VARS:
             if name in host_env:
                 env[name] = str(host_env[name])
+        # Keep the historical projection for local diagnostics/provenance;
+        # BackendRunner removes these values at the final child boundary and
+        # replaces them only with a frozen destination.
         for name in AUTH_INTERNAL_VARS:
             if name in host_env:
                 env[name] = str(host_env[name])

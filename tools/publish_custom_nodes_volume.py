@@ -16,7 +16,6 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 from pathlib import Path
@@ -42,7 +41,9 @@ from tools.v2_control.custom_nodes import (
 )
 from tools.v2_control.locking import DeployLock
 
-_ACTIVE_WORKSPACES_FILE = os.path.join(_REPO_ROOT, ".modal_workspaces.json")
+import modal_workspaces
+
+_ACTIVE_WORKSPACES_FILE = str(modal_workspaces.resolve_workspace_registry_path(_REPO_ROOT))
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
@@ -66,20 +67,22 @@ def _resolve_custom_nodes_root() -> str:
 
 
 def _load_active_workspace() -> dict:
-    """Load the active workspace credentials (same source as the deploy .bat)."""
-    if not os.path.isfile(_ACTIVE_WORKSPACES_FILE):
-        raise RuntimeError(f"workspace file not found: {_ACTIVE_WORKSPACES_FILE}")
-    with open(_ACTIVE_WORKSPACES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    active_id = data.get("active_workspace_id")
-    if not active_id:
-        raise RuntimeError(".modal_workspaces.json has no active_workspace_id")
-    workspace = next((w for w in data.get("workspaces", []) if w.get("id") == active_id), None)
-    if not workspace:
-        raise RuntimeError(f"active workspace {active_id!r} not found in .modal_workspaces.json")
-    if not workspace.get("token_id") or not workspace.get("token_secret"):
-        raise RuntimeError(f"active workspace {active_id!r} is missing token_id/token_secret")
-    return workspace
+    """Return v2ctl's frozen destination, or resolve it for standalone use."""
+    if os.environ.get("COMFYMODAL_V2CTL_DESTINATION_FROZEN") == "1":
+        workspace_id = os.environ.get("MODAL_WORKSPACE_ID", "").strip()
+        label = os.environ.get("MODAL_WORKSPACE_LABEL", "").strip()
+        token_id = os.environ.get("MODAL_TOKEN_ID", "").strip()
+        token_secret = os.environ.get("MODAL_TOKEN_SECRET", "").strip()
+        if not all((workspace_id, label, token_id, token_secret)):
+            raise RuntimeError("frozen v2ctl destination is incomplete")
+        return {
+            "id": workspace_id,
+            "label": label,
+            "environment": os.environ.get("MODAL_ENVIRONMENT", "(default)"),
+            "token_id": token_id,
+            "token_secret": token_secret,
+        }
+    return modal_workspaces.resolve_modal_destination(_REPO_ROOT)
 
 
 def main() -> int:
@@ -87,10 +90,15 @@ def main() -> int:
         cn_root = _resolve_custom_nodes_root()
         workspace = _load_active_workspace()
 
-        # Mirror deploy_and_run_v2_single.bat: expose credentials via env for
-        # any downstream Modal SDK handle resolution.
+        # Downstream SDK helpers receive the explicit workspace record.  Clear
+        # ambient Modal profile/auth selection before any client is created.
+        for name in list(os.environ):
+            if name.startswith("MODAL_") or name in {"COMFYMODAL_ENVIRONMENT", "COMFYMODAL_MODAL_PROFILE"}:
+                os.environ.pop(name, None)
         os.environ["MODAL_TOKEN_ID"] = workspace["token_id"]
         os.environ["MODAL_TOKEN_SECRET"] = workspace["token_secret"]
+        if workspace.get("environment") != "(default)":
+            os.environ["MODAL_ENVIRONMENT"] = workspace["environment"]
 
         async def publish(data: bytes):
             # Imported lazily: pulls in the modal SDK + repo modules only when

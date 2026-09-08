@@ -81,6 +81,16 @@ class FingerprintEngine:
                 deploy_flags[flag.name] = effective_values[flag.name]
         for flag in list(config.unregistered or ()):
             deploy_flags[flag.name] = effective_values[flag.name]
+        destination = getattr(config, "modal_destination", None)
+        def destination_value(name: str, alias: str = "") -> str:
+            if isinstance(destination, dict):
+                return str(destination.get(name, destination.get(alias, "")) or "")
+            return str(getattr(destination, name, getattr(destination, alias, "")) or "")
+        destination_inputs = {
+            "workspace_id": destination_value("workspace_id"),
+            "workspace_label": destination_value("workspace_label", "label"),
+            "environment": destination_value("environment"),
+        }
         return {
             "git_head": str(git.head),
             # ``dirty`` is the overall worktree state used by doctor/reporting;
@@ -102,6 +112,7 @@ class FingerprintEngine:
             "profile": str(config.profile_name),
             "deploy_flags": deploy_flags,
             "runtime_override_policy": str(config.runtime_override_policy),
+            "modal_destination": destination_inputs,
         }
 
     def run_inputs(self) -> dict:
@@ -152,6 +163,7 @@ class FingerprintEngine:
             "runtime_override_policy": str(
                 getattr(config, "runtime_override_policy", "") or ""
             ),
+            "modal_destination": self.deploy_inputs()["modal_destination"],
         }
 
     def config_fingerprint(self) -> str:

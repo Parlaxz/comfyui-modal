@@ -427,7 +427,11 @@ def get_volume(
     client = modal.Client.from_credentials(
         str(workspace["token_id"]), str(workspace["token_secret"])
     )
-    return modal.Volume.from_name(volume_name, client=client)
+    kwargs: dict[str, Any] = {"client": client}
+    environment = str(workspace.get("environment") or "(default)").strip()
+    if environment != "(default)":
+        kwargs["environment_name"] = environment
+    return modal.Volume.from_name(volume_name, **kwargs)
 
 
 def read_receipt(volume: Any, *, volume_name: str, path: str = RECEIPT_PATH) -> PublicationReceipt:

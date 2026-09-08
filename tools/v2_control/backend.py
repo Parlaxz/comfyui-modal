@@ -464,9 +464,10 @@ def detect_crash_loop(output: str) -> dict[str, str] | None:
 class BackendRunner:
     """Runs a BackendSpec through subprocess with a sanitized child env."""
 
-    def __init__(self, repo_root: Path, env_builder: EnvironmentBuilder) -> None:
+    def __init__(self, repo_root: Path, env_builder: EnvironmentBuilder, destination: Any = None) -> None:
         self._repo_root = Path(repo_root)
         self._env_builder = env_builder
+        self._destination = destination
 
     @staticmethod
     def _iso_now() -> str:
@@ -507,6 +508,7 @@ class BackendRunner:
         canonical_identity: Mapping[str, str] | None = None,
         strict_canonical_discovery: bool = False,
         allow_multiple_run_artifacts: bool = False,
+        destination: Any = None,
     ) -> BackendResult:
         """Invoke the backend and return a BackendResult.
 
@@ -537,6 +539,61 @@ class BackendRunner:
             child_env.update(spec.deploy_only_env)
         if extra_env:
             child_env.update(extra_env)
+        # No Modal child may inherit an ambient profile or credential. A
+        # destination, when supplied, is injected below after this scrub.
+        for name in list(child_env):
+            if name.startswith("MODAL_") or name in {
+                "COMFYMODAL_ENVIRONMENT",
+                "COMFYMODAL_V2_ENVIRONMENT",
+                "COMFYMODAL_MODAL_PROFILE",
+                "COMFYMODAL_V2CTL_DESTINATION_FROZEN",
+            }:
+                child_env.pop(name, None)
+        frozen = destination or self._destination
+        native_modal = bool(
+            spec.executable
+            and spec.executable[0].casefold().rsplit("\\", 1)[-1]
+            in {"modal", "modal.exe"}
+        )
+        if native_modal and frozen is None:
+            raise BackendError(
+                "native Modal invocation requires a frozen config-owned destination"
+            )
+        if frozen is not None:
+            if hasattr(frozen, "workspace_id"):
+                try:
+                    from .cli import assert_workspace_binding_current
+                    assert_workspace_binding_current(self._repo_root, frozen)
+                except ImportError:
+                    pass
+            # Remove every Modal selector/profile variable, then inject only
+            # the operation's frozen credentials and environment.
+            token_id = getattr(frozen, "token_id", None)
+            token_secret = getattr(frozen, "token_secret", None)
+            if token_id is None and isinstance(frozen, Mapping):
+                token_id = frozen.get("token_id")
+                token_secret = frozen.get("token_secret")
+            if not token_id or not token_secret:
+                raise BackendError("canonical Modal destination is missing credentials")
+            child_env["MODAL_TOKEN_ID"] = str(token_id)
+            child_env["MODAL_TOKEN_SECRET"] = str(token_secret)
+            child_env["COMFYMODAL_V2CTL_DESTINATION_FROZEN"] = "1"
+            workspace_id = getattr(frozen, "workspace_id", None)
+            workspace_label = getattr(frozen, "label", None)
+            if workspace_id is None and isinstance(frozen, Mapping):
+                workspace_id = frozen.get("workspace_id") or frozen.get("id")
+            if workspace_label is None and isinstance(frozen, Mapping):
+                workspace_label = frozen.get("workspace_label") or frozen.get("label")
+            if workspace_id and workspace_label:
+                # The canonical BAT consumes these non-secret assertions; the
+                # Modal CLI itself does not use them as a selector.
+                child_env["MODAL_WORKSPACE_ID"] = str(workspace_id)
+                child_env["MODAL_WORKSPACE_LABEL"] = str(workspace_label)
+            environment = getattr(frozen, "environment", None)
+            if environment is None and isinstance(frozen, Mapping):
+                environment = frozen.get("environment")
+            if environment and str(environment) != "(default)":
+                child_env["MODAL_ENVIRONMENT"] = str(environment)
         # Reserved identity is injected LAST.  User extras, profiles, and the
         # ambient shell therefore cannot spoof canonical provenance.
         try:
