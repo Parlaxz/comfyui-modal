@@ -4013,6 +4013,40 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         led = report["classification"]
         print(f"[v2ctl.source-probe] ledger flag={led['ledger_flag']} "
               f"enabled={led['ledger_enabled']} record_event={led['ledger_record_event']}")
+        diagnostics = summary.get("diagnostics", {})
+        manifest_diag = diagnostics.get("baked_dependency_manifest", {})
+        print(
+            "[v2ctl.source-probe] baked_manifest "
+            f"path={manifest_diag.get('path', '')} "
+            f"exists={manifest_diag.get('exists', False)} "
+            f"readable={manifest_diag.get('readable', False)} "
+            f"overall_hash={str(manifest_diag.get('overall_dependency_hash', '') or '')[:16] or '(empty)'} "
+            f"dependency_nodes={manifest_diag.get('dependency_node_count', 0)} "
+            f"dependency_node_set_hash={str(manifest_diag.get('dependency_node_set_hash', '') or '')[:16] or '(empty)'}"
+        )
+        sage_diag = diagnostics.get("sage", {})
+        dispatcher = sage_diag.get("public_dispatcher", {})
+        print(
+            "[v2ctl.source-probe] sage "
+            f"extension_present={sage_diag.get('extension_present', False)} "
+            f"imported={sage_diag.get('imported', False)} "
+            f"dispatcher={dispatcher.get('symbol', '') or '(none)'} "
+            f"dispatcher_status={dispatcher.get('status', 'unknown')} "
+            f"status={sage_diag.get('status', 'unknown')} "
+            f"reason={sage_diag.get('reason', '')}"
+        )
+        join_diag = diagnostics.get("join_strings", {})
+        print(
+            "[v2ctl.source-probe] JoinStrings "
+            f"registered={join_diag.get('registered', 'unknown')} "
+            f"owner={join_diag.get('owner', 'unknown')} "
+            f"source={join_diag.get('source', 'unknown')} "
+            f"reason={join_diag.get('reason', '')}"
+        )
+        print(
+            f"[v2ctl.source-probe] diagnostics_verdict="
+            f"{led.get('diagnostics', {}).get('verdict', 'UNKNOWN')}"
+        )
         print(f"[v2ctl.source-probe] verdict={led['verdict']}")
         if led["verdict"] != "MATCH":
             print(f"[v2ctl.source-probe] RESULT=FAIL source_identity != expected local source",

@@ -3607,6 +3607,240 @@ def _golden_sage_provenance(api: Any) -> dict[str, str]:
         }
 
 
+def _source_probe_diagnostics(runtime: Any) -> dict[str, Any]:
+    """Collect read-only parity evidence without starting the request runner.
+
+    This intentionally observes the already-loaded runtime.  In particular it
+    does not call the Sage smoke test (which allocates CUDA tensors) and does
+    not register a node merely because its source package is present.
+    """
+    diagnostics: dict[str, Any] = {}
+    legacy = getattr(runtime, "_legacy_module", None) or sys.modules.get("comfyapp")
+
+    # The baked manifest is read through comfyapp's existing loader.  The
+    # direct bytes read is only for path/readability and an artifact digest.
+    manifest_path = str(
+        getattr(legacy, "BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH", "")
+        or "/opt/comfymodal/custom_node_deps_baked.json"
+    )
+    manifest: dict[str, Any] = {}
+    manifest_diag: dict[str, Any] = {
+        "path": manifest_path,
+        "exists": False,
+        "readable": False,
+        "schema_version": None,
+        "manifest_sha256": "",
+        "overall_dependency_hash": "",
+        "node_count": 0,
+        "dependency_node_count": 0,
+        "dependency_file_count": 0,
+        "node_set": [],
+        "node_set_hash": "",
+        "dependency_node_set": [],
+        "dependency_node_set_hash": "",
+        "status": "unknown",
+        "reason": "comfyapp_runtime_unavailable" if legacy is None else "",
+    }
+    try:
+        manifest_file = Path(manifest_path)
+        manifest_diag["exists"] = manifest_file.is_file()
+        if manifest_diag["exists"]:
+            raw = manifest_file.read_bytes()
+            manifest_diag["readable"] = True
+            manifest_diag["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            loader = getattr(legacy, "load_baked_custom_node_dependency_manifest", None)
+            loaded = loader() if callable(loader) else json.loads(raw.decode("utf-8"))
+            if isinstance(loaded, dict):
+                manifest = loaded
+                manifest_diag["reason"] = ""
+            else:
+                manifest_diag["reason"] = "manifest_loader_returned_non_mapping"
+        else:
+            manifest_diag["status"] = "missing"
+            manifest_diag["reason"] = "manifest_missing"
+    except Exception as exc:  # noqa: BLE001
+        manifest_diag["reason"] = f"manifest_read_failed:{type(exc).__name__}"
+
+    nodes = manifest.get("nodes") if isinstance(manifest.get("nodes"), dict) else {}
+    node_set = sorted(str(name) for name in nodes)
+    dependency_nodes_value = manifest.get("dependency_nodes")
+    if isinstance(dependency_nodes_value, (list, tuple, set)):
+        dependency_nodes = sorted(str(name) for name in dependency_nodes_value)
+    else:
+        dependency_nodes = sorted(
+            str(name)
+            for name, value in nodes.items()
+            if isinstance(value, dict) and value.get("dependency_files")
+        )
+    dependency_file_count = 0
+    for value in nodes.values():
+        if not isinstance(value, dict):
+            continue
+        dependency_files = value.get("dependency_files")
+        if isinstance(dependency_files, (dict, list, tuple, set)):
+            dependency_file_count += len(dependency_files)
+
+    def _set_hash(names: list[str]) -> str:
+        return hashlib.sha256(
+            json.dumps(names, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest() if names else ""
+
+    manifest_diag.update({
+        "schema_version": manifest.get("schema_version"),
+        "overall_dependency_hash": str(manifest.get("overall_dependency_hash") or ""),
+        "node_count": len(node_set),
+        "dependency_node_count": len(dependency_nodes),
+        "dependency_file_count": dependency_file_count,
+        "node_set": node_set,
+        "node_set_hash": _set_hash(node_set),
+        "dependency_node_set": dependency_nodes,
+        "dependency_node_set_hash": _set_hash(dependency_nodes),
+    })
+    if manifest_diag["readable"] and manifest:
+        required = (
+            manifest_diag["overall_dependency_hash"],
+            manifest_diag["dependency_node_set_hash"] or manifest_diag["node_set_hash"],
+        )
+        manifest_diag["status"] = "ok" if all(required) else "incomplete"
+        if not all(required):
+            manifest_diag["reason"] = "manifest_identity_incomplete"
+    elif manifest_diag["exists"] and not manifest_diag["readable"]:
+        manifest_diag["status"] = "unreadable"
+    elif manifest_diag["exists"]:
+        manifest_diag["status"] = "invalid"
+    diagnostics["baked_dependency_manifest"] = manifest_diag
+
+    # Sage evidence is deliberately import-only.  A callable public dispatcher
+    # is reported as available, not as executed or smoke-tested.
+    sage: dict[str, Any] = {
+        "site_packages_root": str(
+            getattr(legacy, "SAGEATTENTION_SITE_PACKAGES", "")
+            or "/usr/local/lib/python3.11/site-packages"
+        ),
+        "extension_present": False,
+        "expected_native_family": "",
+        "expected_native_family_present": False,
+        "extension_files": [],
+        "imported": False,
+        "public_dispatcher": {
+            "available": None,
+            "symbol": "",
+            "status": "unknown",
+        },
+        "runtime_mode": str(getattr(runtime, "_sage_runtime_mode", "") or "") or "unknown",
+        "runtime_reason": str(getattr(runtime, "_sage_runtime_reason", "") or "") or "unknown",
+        "status": "unknown",
+        "reason": "sage_policy_unavailable",
+    }
+    try:
+        from .sage_policy import (
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
+            list_sageattention_extension_files,
+            sageattention_artifact_identity,
+            select_public_sageattention_callable,
+        )
+
+        sage["expected_native_family"] = SAGEATTENTION_EXPECTED_NATIVE_FAMILY
+        root = sage["site_packages_root"]
+        extension_files = list_sageattention_extension_files(root)
+        sage["extension_files"] = [str(path) for path in extension_files]
+        sage["extension_present"] = bool(extension_files)
+        sage["expected_native_family_present"] = any(
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY in path.name for path in extension_files
+        )
+        artifact = sageattention_artifact_identity(root)
+        sage["extension_manifest_hash"] = str(artifact.get("extension_manifest_hash") or "")
+        if not extension_files:
+            sage["reason"] = "compiled-extensions-missing"
+            sage["status"] = "unavailable"
+        elif not sage["expected_native_family_present"]:
+            sage["reason"] = f"expected-native-family-missing:{SAGEATTENTION_EXPECTED_NATIVE_FAMILY}"
+            sage["status"] = "unavailable"
+        else:
+            try:
+                importlib.invalidate_caches()
+                importlib.import_module("sageattention._fused")
+                sage_module = importlib.import_module("sageattention")
+                sage["imported"] = True
+                symbol, callable_obj, _ = select_public_sageattention_callable(sage_module)
+                dispatcher = sage["public_dispatcher"]
+                dispatcher.update({
+                    "available": callable(callable_obj),
+                    "symbol": str(symbol or ""),
+                    "status": "available" if callable(callable_obj) else "unavailable",
+                })
+                if callable(callable_obj):
+                    sage["status"] = "available_not_smoke_tested"
+                    sage["reason"] = "public_dispatcher_imported_only"
+                else:
+                    sage["status"] = "unavailable"
+                    sage["reason"] = "public-sageattn-callable-missing"
+            except Exception as exc:  # noqa: BLE001
+                sage["reason"] = f"native-import-failed:{type(exc).__name__}"
+                sage["status"] = "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        sage["reason"] = f"sage-diagnostic-failed:{type(exc).__name__}"
+    diagnostics["sage"] = sage
+
+    # Only the live ComfyUI registry proves registration.  Source modules and
+    # class names alone are not treated as a registration claim.
+    join: dict[str, Any] = {
+        "registered": None,
+        "owner": "unknown",
+        "source": "unknown",
+        "source_module": "",
+        "source_file": "",
+        "classification": "unknown",
+        "reason": "nodes_registry_unavailable",
+    }
+    try:
+        nodes_module = sys.modules.get("nodes")
+        if nodes_module is None:
+            # Do not import ComfyUI's node loader from this read-only probe:
+            # absence of a live registry is explicitly unknown, not a reason
+            # to initialize custom nodes just to manufacture evidence.
+            raise RuntimeError("nodes_registry_not_loaded")
+        mappings = getattr(nodes_module, "NODE_CLASS_MAPPINGS", None)
+        if not isinstance(mappings, Mapping):
+            join["reason"] = "nodes_registry_unavailable"
+        elif "JoinStrings" not in mappings or mappings.get("JoinStrings") is None:
+            join.update({"registered": False, "classification": "missing", "reason": "not_registered"})
+        else:
+            cls = mappings["JoinStrings"]
+            module_name = str(getattr(cls, "__module__", "") or "")
+            join["registered"] = True
+            join["source_module"] = module_name
+            try:
+                join["source_file"] = str(inspect.getfile(cls))
+            except Exception:  # noqa: BLE001
+                pass
+            from .kjnodes_compat import JoinStrings as _CompatJoinStrings
+            source_blob = f"{module_name} {join['source_file']}".lower()
+            if cls is _CompatJoinStrings or module_name == "comfymodal_runtime.kjnodes_compat":
+                join.update({
+                    "owner": "comfyui-modal",
+                    "source": "compatibility_fallback",
+                    "classification": "compatibility_fallback",
+                    "reason": "live_registry_points_to_comfyui_modal_fallback",
+                })
+            elif "kjnodes" in source_blob or "kj-nodes" in source_blob:
+                join.update({
+                    "owner": "KJNodes",
+                    "source": "real_kjnodes",
+                    "classification": "real_kjnodes",
+                    "reason": "live_registry_points_to_real_kjnodes",
+                })
+            else:
+                join.update({
+                    "classification": "unknown",
+                    "reason": "live_registry_owner_unrecognized",
+                })
+    except Exception as exc:  # noqa: BLE001
+        join["reason"] = f"nodes_registry_probe_failed:{type(exc).__name__}"
+    diagnostics["join_strings"] = join
+    return diagnostics
+
+
 def _emit_golden_diagnostics_config(
     stage: str,
     *,
@@ -19110,6 +19344,14 @@ class ModalRuntimeEntrypoint:
         except Exception as exc:  # noqa: BLE001
             pkg_info["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
 
+        try:
+            _probe_diagnostics = _source_probe_diagnostics(self)
+        except Exception as exc:  # noqa: BLE001
+            _probe_diagnostics = {
+                "status": "unknown",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+
         return {
             "status": "ok",
             "request_id": str(request_id or ""),
@@ -19118,6 +19360,7 @@ class ModalRuntimeEntrypoint:
             "modules": module_info,
             "ledger": ledger_state,
             "safe_env": safe_env,
+            "diagnostics": _probe_diagnostics,
             "package": pkg_info,
             "probe_taken_at": int(_time.time()),
         }

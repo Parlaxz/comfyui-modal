@@ -474,6 +474,10 @@ def write_source_probe_evidence(
         "expected": report.get("expected"),
         "remote_summary": report.get("remote_summary"),
         "classification": report.get("classification"),
+        "diagnostics": (
+            report.get("remote_summary", {}).get("diagnostics", {})
+            if isinstance(report.get("remote_summary"), Mapping) else {}
+        ),
     }
     data["integrity_digest"] = _integrity_digest(data)
     if path.exists():

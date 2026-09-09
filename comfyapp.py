@@ -15180,8 +15180,16 @@ class _ComfyAPIMixin:
         """
         force_probe = bool(force_probe)
         strict = bool(strict)
+        golden_baked_selector = False
+        if not force_probe and not strict and _golden_sage_runtime_enabled():
+            golden_baked_selector = _resolve_sage_runtime_env_override() == "baked_cuda"
         # Sticky GÃ‡Ã¶ already selected earlier in this restore
-        if not force_probe and not strict and getattr(self, "_sage_runtime_mode", None) is not None:
+        if (
+            not force_probe
+            and not strict
+            and not golden_baked_selector
+            and getattr(self, "_sage_runtime_mode", None) is not None
+        ):
             return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
 
         # P2 GÃ‡Ã¶ runtime-configurable env override (file GÃ¥Ã† env GÃ¥Ã† module)

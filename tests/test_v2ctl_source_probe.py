@@ -207,6 +207,50 @@ def test_ledger_enabled_check(repo_root: Path) -> None:
     assert result["ledger_enabled"] is False
 
 
+def _diagnostics_fixture(*, join_registered: bool = True) -> dict:
+    return {
+        "baked_dependency_manifest": {
+            "path": "/opt/comfymodal/custom_node_deps_baked.json",
+            "exists": True,
+            "readable": True,
+            "overall_dependency_hash": "a" * 64,
+            "dependency_node_count": 2,
+            "dependency_node_set_hash": "b" * 64,
+            "status": "ok",
+        },
+        "sage": {
+            "extension_present": True,
+            "imported": True,
+            "public_dispatcher": {"available": True, "symbol": "sageattn", "status": "available"},
+            "status": "available_not_smoke_tested",
+            "reason": "public_dispatcher_imported_only",
+        },
+        "join_strings": {
+            "registered": join_registered,
+            "owner": "KJNodes" if join_registered else "unknown",
+            "source": "real_kjnodes" if join_registered else "unknown",
+            "classification": "real_kjnodes" if join_registered else "missing",
+            "reason": "live_registry_points_to_real_kjnodes" if join_registered else "not_registered",
+        },
+    }
+
+
+def test_diagnostic_classification_requires_live_join_registration() -> None:
+    assert sp.classify_diagnostics(_diagnostics_fixture())["verdict"] == "PASS"
+    failed = sp.classify_diagnostics(_diagnostics_fixture(join_registered=False))
+    assert failed["verdict"] == "FAIL"
+    assert "not_registered" in failed["reasons"]
+
+
+def test_summarize_probe_preserves_diagnostic_evidence(repo_root: Path) -> None:
+    remote = _remote_for(repo_root)
+    remote["diagnostics"] = _diagnostics_fixture()
+    summary = sp.summarize_probe(remote)
+    assert summary["diagnostics"]["baked_dependency_manifest"]["readable"] is True
+    assert summary["diagnostics"]["sage"]["public_dispatcher"]["symbol"] == "sageattn"
+    assert summary["diagnostics"]["join_strings"]["registered"] is True
+
+
 def test_deployment_manifest_states(tmp_path: Path, repo_root: Path) -> None:
     """Deploy manifest starts unverified; cmd_source_probe flips to verified."""
     from tools.v2_control.cli import write_deployment_manifest

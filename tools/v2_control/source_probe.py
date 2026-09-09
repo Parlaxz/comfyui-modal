@@ -196,7 +196,70 @@ def classify_source_probe(
         "ledger_flag": str(ledger.get("flag") or ""),
         "ledger_enabled": bool(ledger.get("enabled")),
         "ledger_record_event": bool(ledger.get("record_event")),
+        "diagnostics": classify_diagnostics(
+            probe.get("diagnostics", {}) if isinstance(probe, dict) else {}
+        ),
     }
+
+
+def classify_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    """Classify passive Golden parity diagnostics without changing source verdict.
+
+    ``UNKNOWN`` is intentional for older probes or a runtime that could not
+    expose a registry.  This is evidence classification, not a claim that
+    source presence implies runtime registration.
+    """
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return {"verdict": "UNKNOWN", "reason": "diagnostics_missing"}
+
+    manifest = diagnostics.get("baked_dependency_manifest")
+    sage = diagnostics.get("sage")
+    join = diagnostics.get("join_strings")
+    reasons: list[str] = []
+    states: list[str] = []
+
+    if not isinstance(manifest, dict):
+        states.append("UNKNOWN")
+        reasons.append("manifest_diagnostic_missing")
+    elif manifest.get("status") == "ok":
+        states.append("PASS")
+    else:
+        states.append("FAIL" if manifest.get("status") in {"missing", "unreadable", "invalid", "incomplete"} else "UNKNOWN")
+        reasons.append(str(manifest.get("reason") or "manifest_not_verified"))
+
+    if not isinstance(sage, dict):
+        states.append("UNKNOWN")
+        reasons.append("sage_diagnostic_missing")
+    elif sage.get("status") == "available_not_smoke_tested":
+        states.append("PASS")
+    elif sage.get("status") == "unavailable":
+        states.append("FAIL")
+        reasons.append(str(sage.get("reason") or "sage_unavailable"))
+    else:
+        states.append("UNKNOWN")
+        reasons.append(str(sage.get("reason") or "sage_status_unknown"))
+
+    if not isinstance(join, dict):
+        states.append("UNKNOWN")
+        reasons.append("join_strings_diagnostic_missing")
+    elif join.get("registered") is True and join.get("classification") in {
+        "compatibility_fallback", "real_kjnodes",
+    }:
+        states.append("PASS")
+    elif join.get("registered") is False:
+        states.append("FAIL")
+        reasons.append(str(join.get("reason") or "join_strings_not_registered"))
+    else:
+        states.append("UNKNOWN")
+        reasons.append(str(join.get("reason") or "join_strings_owner_unknown"))
+
+    if "FAIL" in states:
+        verdict = "FAIL"
+    elif states and all(state == "PASS" for state in states):
+        verdict = "PASS"
+    else:
+        verdict = "UNKNOWN"
+    return {"verdict": verdict, "states": states, "reasons": reasons}
 
 
 def summarize_probe(probe: dict[str, Any]) -> dict[str, Any]:
@@ -225,6 +288,7 @@ def summarize_probe(probe: dict[str, Any]) -> dict[str, Any]:
     identity = probe.get("identity", {}) if isinstance(probe, dict) else {}
     py = probe.get("python", {}) if isinstance(probe, dict) else {}
     pkg = probe.get("package", {}) if isinstance(probe, dict) else {}
+    diagnostics = probe.get("diagnostics", {}) if isinstance(probe, dict) else {}
     return {
         "app_name": str(identity.get("app_name") or ""),
         "class_name": str(identity.get("class_name") or ""),
@@ -240,6 +304,7 @@ def summarize_probe(probe: dict[str, Any]) -> dict[str, Any]:
         "comfymodal_runtime_file": str(pkg.get("comfymodal_runtime_file") or ""),
         "comfymodal_runtime_path": [str(p) for p in (pkg.get("comfymodal_runtime_path") or [])],
         "safe_env": _redact_env(probe.get("safe_env") or {}) if isinstance(probe, dict) else {},
+        "diagnostics": diagnostics if isinstance(diagnostics, dict) else {},
     }
 
 

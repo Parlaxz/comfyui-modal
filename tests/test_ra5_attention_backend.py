@@ -467,6 +467,28 @@ def test_golden_restore_callback_clears_stale_mode_and_uses_baked_env_without_pr
     assert calls == ["apply"]
 
 
+def test_golden_baked_selector_overrides_stale_snapshot_mode_without_cuda():
+    api = SimpleNamespace(
+        _sage_runtime_mode="triton_fallback",
+        _sage_runtime_reason="snapshot",
+        _verify_baked_sageattention_runtime=lambda: (_ for _ in ()).throw(
+            AssertionError("baked selector must not probe")
+        ),
+    )
+    with patch.dict(
+        "os.environ",
+        {
+            "COMFYMODAL_V2CTL_PROFILE": "golden_p1",
+            "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+        },
+        clear=False,
+    ):
+        assert _ComfyAPIMixin._select_sage_runtime_mode(api) == (
+            "baked_cuda",
+            "runtime_override",
+        )
+
+
 def test_v2_restore_sage_callbacks_use_permissive_policy_not_ra5_strict_mode():
     calls = []
     api = SimpleNamespace(
