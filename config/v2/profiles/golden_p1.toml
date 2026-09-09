@@ -64,6 +64,7 @@ COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM = "1"
 COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH = "1"
 COMFYMODAL_SAMPLING_DEEP_PROFILE = "blocks"
 COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "0"
+COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION = "1"
 COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
 # Deep profiling capability is baked into the image/environment, but the
 # request selector starts it lazily; restore remains lightweight-only.

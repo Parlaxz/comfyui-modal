@@ -205,6 +205,15 @@ owner = "golden-ops"
 description = "Optional Golden CLIP/VAE/QD stage diagnostics, including E31 forward evidence. Default OFF; deploy-baked for structurally classified experiment requests."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Suppress the stock RES4LYF beta sampler's module-local gc.collect during Golden sampling. Default OFF; deploy-baked for the experimental request path."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

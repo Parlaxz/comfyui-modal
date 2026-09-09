@@ -43,6 +43,7 @@ import copy
 import contextlib
 import contextvars
 import dataclasses
+import gc as _stdlib_gc
 import hashlib
 import importlib
 import inspect
@@ -105,6 +106,10 @@ GOLDEN_STAGE_DIAGNOSTICS_ENV = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
 GOLDEN_QD_TRANSPORT_ENV = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
 CPU_QD2_PREFETCH_ENV = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
 GOLDEN_DIRECT_BLOCK_BYTES_ENV = "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES"
+# Experimental, request-boundary-only suppression of the stock RES4LYF beta
+# sampler's module-local ``gc.collect``.  It is opt-in so ordinary Golden
+# controls and non-Golden execution remain unchanged.
+GOLDEN_RES4LYF_GC_SUPPRESSION_ENV = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
 GOLDEN_DIRECT_BLOCK_BYTES = {
     32 * 1024 * 1024,
     64 * 1024 * 1024,
@@ -413,6 +418,221 @@ def _set_ra9h_telemetry(session: Any, **updates: Any) -> None:
         recorder.clip_residency_telemetry = copy.deepcopy(telemetry)
         if isinstance(run_identity, dict):
             recorder.run_identity = dict(run_identity)
+
+
+_GOLDEN_RES4LYF_GC_LOCK = threading.Lock()
+_RES4LYF_SAMPLERS_MODULE_NAME = "RES4LYF.beta.samplers"
+_RES4LYF_SAMPLERS_PATH_SUFFIX = ("RES4LYF", "beta", "samplers.py")
+
+
+def res4lyf_gc_suppression_enabled() -> bool:
+    """Return the explicit deployment flag for the Golden-only experiment."""
+    raw = os.environ.get(GOLDEN_RES4LYF_GC_SUPPRESSION_ENV, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_res4lyf_gc_suppression(
+    session: Any = None,
+    *,
+    status: str,
+    **updates: Any,
+) -> None:
+    """Best-effort bounded telemetry for the experimental shim.
+
+    This helper intentionally catches every telemetry failure.  The sampler
+    result and its exception are never made dependent on observability.
+    """
+    try:
+        recorder = getattr(session, "recorder", None)
+        if recorder is None:
+            return
+        record = getattr(recorder, "res4lyf_gc_suppression", None)
+        if not isinstance(record, dict):
+            record = {}
+        record.update(_bounded_telemetry_value({"status": status, **updates}))
+        recorder.res4lyf_gc_suppression = record
+        run_identity = getattr(session, "run_identity", None)
+        if isinstance(run_identity, dict):
+            run_identity.update({
+                "res4lyf_gc_suppression_status": status,
+                "res4lyf_gc_module_name": record.get("module_name"),
+                "res4lyf_gc_intercepted_collect_count": record.get(
+                    "intercepted_collect_count", 0
+                ),
+                "res4lyf_gc_suppression_wall_ms": record.get("suppression_wall_ms"),
+                "res4lyf_gc_restoration_state": record.get("restoration_state"),
+            })
+            recorder.run_identity = dict(run_identity)
+        recorder.event("golden_res4lyf_gc_suppression", **dict(record))
+    except BaseException:
+        pass
+
+
+def _resolve_active_res4lyf_samplers_module(
+    runner: Any,
+    sampler_node_id: str,
+) -> tuple[Any, Any]:
+    """Resolve the loaded module owning the active sampler class.
+
+    The module is obtained from the actual registered node class/function;
+    this deliberately does not import ``RES4LYF`` or look up a replacement
+    module by name.  Every identity/path/binding check is required before a
+    module-local binding can be changed.
+    """
+    try:
+        prompt = runner.prompt
+        node = prompt[sampler_node_id]
+        class_type = node["class_type"]
+        class_def = runner._classes()[class_type]
+        function_name = getattr(class_def, "FUNCTION", None)
+        function = getattr(class_def, function_name, None) if function_name else None
+        module = inspect.getmodule(function) if callable(function) else None
+    except BaseException as exc:
+        raise RuntimeError(
+            f"res4lyf_gc_suppression_module_unidentifiable:{type(exc).__name__}"
+        ) from exc
+    if module is None or getattr(module, "__name__", None) != _RES4LYF_SAMPLERS_MODULE_NAME:
+        raise RuntimeError("res4lyf_gc_suppression_module_path_mismatch")
+    if sys.modules.get(_RES4LYF_SAMPLERS_MODULE_NAME) is not module:
+        raise RuntimeError("res4lyf_gc_suppression_module_not_active")
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str):
+        raise RuntimeError("res4lyf_gc_suppression_source_path_missing")
+    path_parts = tuple(
+        part.lower()
+        for part in os.path.normpath(os.path.realpath(module_file)).replace("\\", "/").split("/")
+        if part
+    )
+    if len(path_parts) < len(_RES4LYF_SAMPLERS_PATH_SUFFIX) or path_parts[-3:] != tuple(
+        part.lower() for part in _RES4LYF_SAMPLERS_PATH_SUFFIX
+    ):
+        raise RuntimeError("res4lyf_gc_suppression_source_path_mismatch")
+    module_dict = vars(module)
+    if "gc" not in module_dict:
+        raise RuntimeError("res4lyf_gc_suppression_gc_binding_missing")
+    original_gc = module_dict["gc"]
+    if original_gc is not _stdlib_gc or not callable(getattr(original_gc, "collect", None)):
+        raise RuntimeError("res4lyf_gc_suppression_gc_binding_invalid")
+    return module, original_gc
+
+
+class _NoOpCollectGCProxy:
+    """Delegate the module-local ``gc`` surface except for ``collect``."""
+
+    def __init__(self, original: Any):
+        self._original = original
+        self.intercepted_collect_count = 0
+
+    def collect(self, *args: Any, **kwargs: Any) -> int:
+        self.intercepted_collect_count += 1
+        return 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+
+def _restore_res4lyf_gc_binding(module: Any, original_gc: Any) -> None:
+    """Restore the exact module-local binding saved by the suppression scope."""
+    vars(module)["gc"] = original_gc
+
+
+@contextlib.contextmanager
+def res4lyf_gc_suppression_scope(
+    runner: Any,
+    sampler_node_id: str,
+    *,
+    session: Any,
+):
+    """Suppress only RES4LYF.beta.samplers' ``gc.collect`` for one closure.
+
+    The process-global module binding is protected with a non-blocking lock.
+    An overlapping request fails closed rather than blocking an event loop or
+    leaking this shim into another request.
+    """
+    if not _GOLDEN_RES4LYF_GC_LOCK.acquire(blocking=False):
+        _record_res4lyf_gc_suppression(
+            session,
+            status="fail_closed",
+            module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+            fail_closed_reason="overlapping_golden_sampler_invocation",
+            intercepted_collect_count=0,
+            suppression_wall_ms=0.0,
+            restoration_state="not_applied",
+        )
+        raise RuntimeError("res4lyf_gc_suppression_overlap")
+
+    module = None
+    original_gc = None
+    proxy = None
+    body_error = None
+    restoration_error = None
+    started_ns = None
+    try:
+        try:
+            module, original_gc = _resolve_active_res4lyf_samplers_module(
+                runner, sampler_node_id
+            )
+            proxy = _NoOpCollectGCProxy(original_gc)
+            vars(module)["gc"] = proxy
+            started_ns = time.monotonic_ns()
+            _record_res4lyf_gc_suppression(
+                session,
+                status="applied",
+                module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+                module_path=os.path.realpath(str(module.__file__)),
+                intercepted_collect_count=0,
+                suppression_wall_ms=None,
+                restoration_state="pending",
+            )
+        except BaseException as exc:
+            _record_res4lyf_gc_suppression(
+                session,
+                status="fail_closed",
+                module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+                fail_closed_reason=f"{type(exc).__name__}: {exc}",
+                intercepted_collect_count=0,
+                suppression_wall_ms=0.0,
+                restoration_state="not_applied",
+            )
+            raise
+
+        try:
+            yield proxy
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            ended_ns = time.monotonic_ns()
+            try:
+                # Restore the exact saved binding, including after an exception.
+                _restore_res4lyf_gc_binding(module, original_gc)
+                restoration_state = "restored"
+            except BaseException as exc:
+                restoration_error = exc
+                restoration_state = "restore_failed"
+            _record_res4lyf_gc_suppression(
+                session,
+                status="applied",
+                module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+                intercepted_collect_count=int(proxy.intercepted_collect_count),
+                suppression_wall_ms=round(
+                    max(0, ended_ns - int(started_ns or ended_ns)) / 1_000_000, 4
+                ),
+                restoration_state=restoration_state,
+                restoration_error=(
+                    f"{type(restoration_error).__name__}: {restoration_error}"
+                    if restoration_error is not None else None
+                ),
+            )
+            if restoration_error is not None:
+                if body_error is not None:
+                    raise restoration_error from body_error
+                raise restoration_error
+    finally:
+        try:
+            _GOLDEN_RES4LYF_GC_LOCK.release()
+        except BaseException:
+            pass
 
 # z_image_turbo_bf16 NextDiT intended parameter/buffer count (R42 evidence).
 EXPECTED_UNET_TENSOR_COUNT = 453
@@ -1124,6 +1344,13 @@ class GoldenTelemetryRecorder:
         self.sampler_total_end_monotonic_ns: Optional[int] = None
         self.sampler_total_boundary_status = "missing"
         self.sampler_total_contract: dict[str, Any] = {}
+        self.res4lyf_gc_suppression: dict[str, Any] = {
+            "status": "not_run",
+            "module_name": _RES4LYF_SAMPLERS_MODULE_NAME,
+            "intercepted_collect_count": 0,
+            "suppression_wall_ms": None,
+            "restoration_state": "not_run",
+        }
 
     def record_external_restore(self, metadata: Optional[dict]) -> None:
         """Record adapter-observed restore boundaries without timing them here."""
@@ -1482,6 +1709,7 @@ class GoldenTelemetryRecorder:
             "clip_forward_conversion": dict(self.clip_forward_conversion),
             "cpu_prefetch": copy.deepcopy(self.cpu_prefetch_telemetry),
             "sampler_total_wall_ms": self.sampler_total_wall_ms,
+            "res4lyf_gc_suppression": copy.deepcopy(self.res4lyf_gc_suppression),
             "sampler_total_reconciliation": sampler_total_reconciliation,
             "sampler_total": {
                 "wall_ms": self.sampler_total_wall_ms,
@@ -11857,6 +12085,21 @@ async def golden_sampling(session: GoldenSession) -> Any:
     )
     session.sampling_diagnostics = diagnostics
     rec.sampling_diagnostics = diagnostics
+    golden_serial_mode = str(getattr(session, "golden_mode", "serial")).lower() == "serial"
+    gc_suppression_enabled = golden_serial_mode and res4lyf_gc_suppression_enabled()
+    if not gc_suppression_enabled:
+        _record_res4lyf_gc_suppression(
+            session,
+            status="skipped",
+            module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+            skip_reason=(
+                "feature_flag_disabled"
+                if golden_serial_mode else "golden_mode_not_serial"
+            ),
+            intercepted_collect_count=0,
+            suppression_wall_ms=0.0,
+            restoration_state="not_applied",
+        )
     try:
         runner = session.runner
         node_map = session.node_map
@@ -12048,17 +12291,33 @@ async def golden_sampling(session: GoldenSession) -> Any:
                         # Preserve the historical omission/no-override route:
                         # KJNodes or another already-installed sampler-bound
                         # override remains authoritative for this run.
-                        executed = await runner.run_closure(
-                            node_map.sampler_id, include_target=True
-                        )
+                        if gc_suppression_enabled:
+                            with res4lyf_gc_suppression_scope(
+                                runner, node_map.sampler_id, session=session
+                            ):
+                                executed = await runner.run_closure(
+                                    node_map.sampler_id, include_target=True
+                                )
+                        else:
+                            executed = await runner.run_closure(
+                                node_map.sampler_id, include_target=True
+                            )
                     else:
                         with attention_backend_scope(
                             attention_patcher,
                             requested_attention_backend,
                         ) as attention_scope_state:
-                            executed = await runner.run_closure(
-                                node_map.sampler_id, include_target=True
-                            )
+                            if gc_suppression_enabled:
+                                with res4lyf_gc_suppression_scope(
+                                    runner, node_map.sampler_id, session=session
+                                ):
+                                    executed = await runner.run_closure(
+                                        node_map.sampler_id, include_target=True
+                                    )
+                            else:
+                                executed = await runner.run_closure(
+                                    node_map.sampler_id, include_target=True
+                                )
                 finally:
                     # The runner timestamps only the target node's actual
                     # FUNCTION call, including an async await.  Never use the
@@ -13534,6 +13793,7 @@ __all__ = [
     "GOLDEN_SAMPLING_DIAGNOSTICS_ENV",
     "GOLDEN_STAGE_DIAGNOSTICS_ENV",
     "GOLDEN_QD_TRANSPORT_ENV",
+    "GOLDEN_RES4LYF_GC_SUPPRESSION_ENV",
     "CPU_QD2_PREFETCH_ENV",
     "CPU_QD2_SOURCE_EXTENT_BYTES",
     "DECOUPLED_SOURCE_QD_ENV",
@@ -13594,6 +13854,8 @@ __all__ = [
     "golden_unet_load",
     "golden_vae_decode",
     "golden_vae_load",
+    "res4lyf_gc_suppression_enabled",
+    "res4lyf_gc_suppression_scope",
     "make_zero_copy_view",
     "parse_safetensors_header",
     "page_fault_delta",
