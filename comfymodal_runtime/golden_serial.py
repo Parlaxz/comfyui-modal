@@ -425,6 +425,11 @@ _RES4LYF_SAMPLERS_MODULE_NAME = "RES4LYF.beta.samplers"
 _RES4LYF_SAMPLERS_PATH_SUFFIX = ("RES4LYF", "beta", "samplers.py")
 
 
+def _bounded_res4lyf_identity(value: Any) -> str:
+    """Format resolver identity details without allowing unbounded metadata."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")[:256]
+
+
 def res4lyf_gc_suppression_enabled() -> bool:
     """Return the explicit deployment flag for the Golden-only experiment."""
     raw = os.environ.get(GOLDEN_RES4LYF_GC_SUPPRESSION_ENV, "")
@@ -474,27 +479,39 @@ def _resolve_active_res4lyf_samplers_module(
 ) -> tuple[Any, Any]:
     """Resolve the loaded module owning the active sampler class.
 
-    The module is obtained from the actual registered node class/function;
+    The module is obtained only from the exact registered class module name;
     this deliberately does not import ``RES4LYF`` or look up a replacement
-    module by name.  Every identity/path/binding check is required before a
-    module-local binding can be changed.
+    module by alias/search.  Every identity/path/binding check is required
+    before a module-local binding can be changed.
     """
     try:
         prompt = runner.prompt
         node = prompt[sampler_node_id]
         class_type = node["class_type"]
-        class_def = runner._classes()[class_type]
-        function_name = getattr(class_def, "FUNCTION", None)
-        function = getattr(class_def, function_name, None) if function_name else None
-        module = inspect.getmodule(function) if callable(function) else None
+        registered_class = runner._classes()[class_type]
     except BaseException as exc:
         raise RuntimeError(
             f"res4lyf_gc_suppression_module_unidentifiable:{type(exc).__name__}"
         ) from exc
-    if module is None or getattr(module, "__name__", None) != _RES4LYF_SAMPLERS_MODULE_NAME:
-        raise RuntimeError("res4lyf_gc_suppression_module_path_mismatch")
-    if sys.modules.get(_RES4LYF_SAMPLERS_MODULE_NAME) is not module:
+
+    registered_class_module = getattr(registered_class, "__module__", None)
+    if registered_class_module != _RES4LYF_SAMPLERS_MODULE_NAME:
+        raise RuntimeError(
+            "res4lyf_gc_suppression_class_module_mismatch:"
+            f"class_type={_bounded_res4lyf_identity(class_type)}"
+            f";registered_class_module={_bounded_res4lyf_identity(registered_class_module)}"
+        )
+    try:
+        module = sys.modules[_RES4LYF_SAMPLERS_MODULE_NAME]
+    except KeyError as exc:
+        raise RuntimeError("res4lyf_gc_suppression_module_not_active") from exc
+    if module is None:
         raise RuntimeError("res4lyf_gc_suppression_module_not_active")
+    if getattr(module, "__name__", None) != _RES4LYF_SAMPLERS_MODULE_NAME:
+        raise RuntimeError(
+            "res4lyf_gc_suppression_module_path_mismatch:"
+            f"active_module_name={_bounded_res4lyf_identity(getattr(module, '__name__', None))}"
+        )
     module_file = getattr(module, "__file__", None)
     if not isinstance(module_file, str):
         raise RuntimeError("res4lyf_gc_suppression_source_path_missing")
@@ -506,8 +523,22 @@ def _resolve_active_res4lyf_samplers_module(
     if len(path_parts) < len(_RES4LYF_SAMPLERS_PATH_SUFFIX) or path_parts[-3:] != tuple(
         part.lower() for part in _RES4LYF_SAMPLERS_PATH_SUFFIX
     ):
-        raise RuntimeError("res4lyf_gc_suppression_source_path_mismatch")
+        raise RuntimeError(
+            "res4lyf_gc_suppression_source_path_mismatch:"
+            f"module_file={_bounded_res4lyf_identity(module_file)}"
+        )
     module_dict = vars(module)
+    registered_module_class = module_dict.get(CANONICAL_SAMPLER_CLASS)
+    if registered_module_class is not registered_class:
+        raise RuntimeError(
+            "res4lyf_gc_suppression_class_binding_mismatch:"
+            f"registered_class={_bounded_res4lyf_identity(getattr(registered_class, '__module__', None))}."
+            f"{_bounded_res4lyf_identity(getattr(registered_class, '__qualname__', getattr(registered_class, '__name__', None)))}"
+            f";module_name={_bounded_res4lyf_identity(getattr(module, '__name__', None))}"
+            f";module_file={_bounded_res4lyf_identity(module_file)}"
+            f";module_class={_bounded_res4lyf_identity(getattr(registered_module_class, '__module__', None))}."
+            f"{_bounded_res4lyf_identity(getattr(registered_module_class, '__qualname__', getattr(registered_module_class, '__name__', None)))}"
+        )
     if "gc" not in module_dict:
         raise RuntimeError("res4lyf_gc_suppression_gc_binding_missing")
     original_gc = module_dict["gc"]

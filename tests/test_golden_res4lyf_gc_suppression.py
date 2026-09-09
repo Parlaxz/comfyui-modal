@@ -42,7 +42,12 @@ def _fake_runner(*, module_name="RES4LYF.beta.samplers", module_file=None, gc_bi
         return "ok"
 
     main.__module__ = module_name
-    sampler_class = type("ClownsharKSampler_Beta", (), {"FUNCTION": "main", "main": main})
+    sampler_class = type(
+        "ClownsharKSampler_Beta",
+        (),
+        {"__module__": module_name, "FUNCTION": "main", "main": main},
+    )
+    active.ClownsharKSampler_Beta = sampler_class
     sys.modules[module_name] = active
     runner = SimpleNamespace(
         prompt={"sampler": {"class_type": "ClownsharKSampler_Beta"}},
@@ -118,7 +123,7 @@ def test_restoration_failure_replaces_body_error_and_releases_lock(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, error",
     [
-        ({"module_name": "not.res4lyf.samplers"}, "module_path_mismatch"),
+        ({"module_name": "not.res4lyf.samplers"}, "class_module_mismatch"),
         ({"module_file": os.path.join("x", "RES4LYF", "samplers.py")}, "source_path_mismatch"),
         ({"gc_binding": object()}, "gc_binding_invalid"),
     ],
@@ -137,6 +142,26 @@ def test_wrong_or_unidentifiable_paths_fail_closed_without_mutation(monkeypatch,
     record = session.recorder.res4lyf_gc_suppression
     assert record["status"] == "fail_closed"
     assert record["restoration_state"] == "not_applied"
+
+
+def test_registered_class_must_match_module_class_identity(monkeypatch):
+    runner, active = _fake_runner()
+    monkeypatch.setitem(sys.modules, active.__name__, active)
+    active.ClownsharKSampler_Beta = type(
+        "ClownsharKSampler_Beta",
+        (),
+        {"__module__": active.__name__, "FUNCTION": "main"},
+    )
+    session = _session()
+
+    with pytest.raises(RuntimeError, match="class_binding_mismatch"):
+        with gs.res4lyf_gc_suppression_scope(runner, "sampler", session=session):
+            pytest.fail("class identity mismatch must not yield")
+
+    assert active.gc is gc
+    record = session.recorder.res4lyf_gc_suppression
+    assert record["status"] == "fail_closed"
+    assert "class_binding_mismatch" in record["fail_closed_reason"]
 
 
 def test_missing_module_local_gc_binding_fails_closed(monkeypatch):
