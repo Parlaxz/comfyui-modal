@@ -424,6 +424,25 @@ class TestGoldenNamespace:
         args = SimpleNamespace(
             profile="golden_p1", app=None, gpu=None, memory_mb=None, cpu=None,
             owner=None, set=[], inherit=[], json=True,
+            workspace_id=None, workspace=None, environment=None,
+        )
+        components = cli._build_components_for_args(REPO_ROOT, args)
+        config, fingerprints = components[3], components[4]
+        destination = SimpleNamespace(
+            workspace_id="workspace-from-config",
+            workspace_label="configured-workspace",
+            environment="main",
+        )
+        config.modal_destination = destination
+        expected_fingerprint = fingerprints.deploy_fingerprint()
+        config.modal_destination = None
+        monkeypatch.setattr(cli, "_build_components_for_args", lambda _root, _args: components)
+        monkeypatch.setattr(
+            cli,
+            "_canonical_workspace_binding",
+            lambda _args, _root, bound_config: (
+                setattr(bound_config, "modal_destination", destination) or destination
+            ),
         )
         assert cli.cmd_golden_status(args, REPO_ROOT) == 1
         data = json.loads(capsys.readouterr().out)
@@ -432,6 +451,7 @@ class TestGoldenNamespace:
         assert data["deployment_fingerprint_match"] is False
         assert data["runtime_health_status"] == "unverified"
         assert data["source_identity_status"] == "unverified"
+        assert data["deployment_fingerprint_current"] == expected_fingerprint
 
     def test_golden_status_is_not_ready_while_next_request_guarded(
         self, monkeypatch, tmp_path, capsys

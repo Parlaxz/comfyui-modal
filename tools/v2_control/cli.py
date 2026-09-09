@@ -2305,6 +2305,7 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         )
         manifest_path = str(manifest_path_obj) if manifest_path_obj else None
 
+        _canonical_workspace_binding(args, repo_root, config)
         current_fingerprint = fingerprints.deploy_fingerprint()
         stored_fingerprint = manifest.get("deploy_fingerprint") if manifest else None
         manifest_target_match = bool(
