@@ -6,6 +6,8 @@ import io
 import hashlib
 import asyncio
 import json
+import os
+import stat
 import sys
 import tarfile
 import tempfile
@@ -341,11 +343,40 @@ def test_receipt_read_transient_error_is_not_missing_receipt():
         __import__("asyncio").run(read())
 
 
-def test_syncable_node_without_semantic_files_is_rejected(tmp_path):
+def test_excluded_only_node_is_skipped_and_valid_sibling_remains(tmp_path, caplog):
     node = tmp_path / "node-a"
     node.mkdir()
     (node / "README.md").write_text("excluded metadata", encoding="utf-8")
-    with pytest.raises(ValueError, match="no included semantic files"):
+    sibling = tmp_path / "node-b"
+    sibling.mkdir()
+    (sibling / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="comfymodal_runtime.publication_policy"):
+        _identity, _archive, files = prepare_publication(tmp_path)
+
+    assert [item.path for item in files] == ["node-b/main.py"]
+    assert (
+        "[v2.custom_node_publish] name=node-a status=skipped "
+        "reason=no_publishable_files"
+    ) in caplog.text
+
+
+def test_malformed_nonempty_node_still_fails(tmp_path, monkeypatch):
+    node = tmp_path / "node-a"
+    node.mkdir()
+    (node / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+    malformed = node / "special.py"
+    malformed.write_text("not a special file on this host\n", encoding="utf-8")
+    real_lstat = Path.lstat
+
+    def fake_lstat(path):
+        if path == malformed:
+            return os.stat_result((stat.S_IFCHR, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+
+    with pytest.raises(ValueError, match="special file"):
         collect_semantic_files(tmp_path)
 
 

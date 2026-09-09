@@ -10,11 +10,15 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
 from pathlib import Path
 from typing import Iterator
+
+
+_log = logging.getLogger(__name__)
 
 
 # Directory names are matched at every depth.  Keep this set intentionally
@@ -371,9 +375,11 @@ def iter_publication_files(root: str | Path) -> Iterator[Path]:
                 included_count += 1
                 yield path
         if included_count == 0:
-            raise ValueError(
-                f"syncable custom-node {node_name!r} contains no included semantic files"
+            _log.warning(
+                "[v2.custom_node_publish] name=%s status=skipped reason=no_publishable_files",
+                node_name,
             )
+            continue
 
 
 def canonical_publication_bytes(path: str | Path, data: bytes) -> bytes:

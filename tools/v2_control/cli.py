@@ -44,6 +44,7 @@ from . import runtime_overrides as ro_mod
 from . import validation as val_mod
 from . import provenance as prov_mod
 from . import deployment_receipt as receipt_mod
+from . import golden_guard as golden_guard_mod
 from .experiment_evidence import (
     finalize_experiment_evidence,
     golden_arm_identity,
@@ -4086,6 +4087,93 @@ def cmd_runtime_flags(args, repo_root: Path) -> int:
     return 2
 
 
+def cmd_guard(args, repo_root: Path) -> int:
+    """Run compact local Golden guardrails; never performs an implicit run."""
+    sub = args.guard_command
+    try:
+        if sub == "paths":
+            report = golden_guard_mod.canonical_paths(repo_root)
+            baseline_file = getattr(args, "baseline_file", None)
+            if baseline_file:
+                snapshot = golden_guard_mod.capture_git_snapshot(repo_root)
+                golden_guard_mod.save_git_snapshot(baseline_file, snapshot)
+                report["baseline_file"] = str(Path(baseline_file).resolve())
+                report["baseline"] = snapshot.as_dict()
+            bootstrap = getattr(args, "bootstrap", None)
+            if bootstrap:
+                report["bootstrap"] = golden_guard_mod.bootstrap_worktree(repo_root, bootstrap)
+        elif sub == "preflight":
+            selected_profile = getattr(args, "profile", golden_guard_mod.DEFAULT_PROFILE)
+            # The shared root parser defaults to production for legacy v2ctl
+            # commands; the guard namespace is Golden-only.
+            if selected_profile == "production":
+                selected_profile = golden_guard_mod.DEFAULT_PROFILE
+            report = golden_guard_mod.preflight(
+                repo_root,
+                profile=selected_profile,
+                app=getattr(args, "app", "") or "",
+                baseline_file=getattr(args, "baseline_file", None),
+                min_free_gb=getattr(args, "min_free_gb", golden_guard_mod.DEFAULT_DISK_FREE_GB),
+                telemetry_path=getattr(args, "telemetry_path", None),
+                require_evidence=bool(getattr(args, "require_evidence", False)),
+                expected_flags=getattr(args, "expected_flag", []),
+                required_events=getattr(args, "required_event", []),
+            )
+        elif sub in {"safe-deploy", "safe-source-probe"}:
+            operation = "deploy" if sub == "safe-deploy" else "source-probe"
+            app = getattr(args, "app", None)
+            if not app:
+                print(f"ERROR: {sub} requires --app <experimental-app>", file=sys.stderr)
+                return 2
+            if getattr(args, "dry_run", False):
+                result = golden_guard_mod.SafeOperationResult(
+                    operation, golden_guard_mod.supported_command(repo_root, operation, app),
+                    False, None, False, 0.0, golden_guard_mod.NOT_SENT,
+                    stderr="dry-run: no supported operation sent",
+                )
+                report = {"result": result.as_dict()}
+                print(json.dumps(report, indent=2, sort_keys=True))
+                return 0
+            disk = golden_guard_mod.disk_check(
+                repo_root,
+                min_free_gb=getattr(args, "min_free_gb", golden_guard_mod.DEFAULT_DISK_FREE_GB),
+            )
+            occupancy = golden_guard_mod.worktree_occupancy(repo_root)
+            if not disk.ok or occupancy["occupied"]:
+                result = golden_guard_mod.SafeOperationResult(
+                    operation, golden_guard_mod.supported_command(repo_root, operation, app),
+                    False, None, False, 0.0, golden_guard_mod.NOT_SENT,
+                    stderr=("host disk guard refused operation" if not disk.ok
+                            else "worktree occupancy guard refused operation"),
+                )
+                report = {"disk": disk.as_dict(), "occupancy": occupancy, "result": result.as_dict()}
+                if getattr(args, "json", False):
+                    print(json.dumps(report, indent=2, sort_keys=True))
+                else:
+                    print(f"outcome={result.outcome}\ndisk={disk.as_dict()}")
+                return 1
+            result = golden_guard_mod.run_safe_operation(
+                repo_root, operation, app,
+                timeout=getattr(args, "timeout", None),
+                retries=getattr(args, "retries", 0),
+            )
+            report = {"disk": disk.as_dict(), "occupancy": occupancy, "result": result.as_dict()}
+        else:
+            return 2
+    except (OSError, ValueError, V2CtlError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    if sub == "preflight":
+        return 0 if report.get("ok") else 1
+    if sub in {"safe-deploy", "safe-source-probe"}:
+        return 0 if report["result"]["outcome"] == golden_guard_mod.VALID else 1
+    return 0
+
+
 def cmd_lock(args, repo_root: Path) -> int:
     lock = locking_mod.DeployLock(repo_root / ".v2ctl" / "deploy.lock")
     sub = args.lock_command
@@ -4243,6 +4331,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("source-probe")
     p.set_defaults(func=cmd_source_probe)
+
+    p = sub.add_parser(
+        "guard",
+        help="compact local Golden paths/preflight/safe-operation guardrails",
+    )
+    gguard = p.add_subparsers(dest="guard_command", required=True)
+    paths = gguard.add_parser("paths", help="show canonical roots; optionally save a git baseline")
+    paths.add_argument("--baseline-file", default=None, metavar="PATH",
+                       help="write a small pre-experiment git baseline JSON")
+    paths.add_argument("--bootstrap", default=None, metavar="PATH",
+                       help="explicitly create a detached worktree and copy only small local inputs")
+    paths.set_defaults(func=cmd_guard)
+    pre = gguard.add_parser("preflight", help="report identity, dirty diff, disk, nodes, and evidence")
+    pre.add_argument("--profile", default=argparse.SUPPRESS, help="Golden profile (default: golden_p1)")
+    pre.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
+    pre.add_argument("--baseline-file", default=None, metavar="PATH")
+    pre.add_argument("--min-free-gb", type=float, default=golden_guard_mod.DEFAULT_DISK_FREE_GB)
+    pre.add_argument("--telemetry-path", default=None, metavar="PATH")
+    pre.add_argument("--require-evidence", action="store_true",
+                     help="make missing deployment/source-probe evidence a failure")
+    pre.add_argument("--expected-flag", action="append", default=[], metavar="NAME=VALUE",
+                     help="require a persisted effective flag value (repeatable)")
+    pre.add_argument("--required-event", action="append", default=[], metavar="FAMILY",
+                     help="require a telemetry event family (repeatable)")
+    pre.set_defaults(func=cmd_guard)
+    for name, help_text in (
+        ("safe-deploy", "run supported golden deploy with finite timeout/retry policy"),
+        ("safe-source-probe", "run supported golden source-probe with finite timeout/retry policy"),
+    ):
+        safe = gguard.add_parser(name, help=help_text)
+        safe.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
+        safe.add_argument("--timeout", type=float, default=None,
+                          help="finite subprocess timeout (deploy/probe default 1800s)")
+        safe.add_argument("--retries", type=int, default=0,
+                          help="bounded retries (maximum 3); lock/status/doctor inspection runs before each retry")
+        safe.add_argument("--min-free-gb", type=float, default=golden_guard_mod.DEFAULT_DISK_FREE_GB)
+        safe.set_defaults(func=cmd_guard)
 
     p = sub.add_parser("runtime-flags")
     rsub = p.add_subparsers(dest="runtime_command", required=True)
