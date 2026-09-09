@@ -49,7 +49,7 @@ def test_golden_and_production_sage_runtime_modes_are_explicit_and_distinct():
     golden = _config("golden_p1").flag(SAGE_RUNTIME_MODE_FLAG)
     production = _config("production").flag(SAGE_RUNTIME_MODE_FLAG)
     assert golden is not None
-    assert golden.value == "auto"
+    assert golden.value == "baked_cuda"
     assert golden.source == "profile:golden_p1"
     assert production is not None
     assert production.value == "baked_cuda"
@@ -58,7 +58,7 @@ def test_golden_and_production_sage_runtime_modes_are_explicit_and_distinct():
 
 def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path):
     config = _config("golden_p1")
-    # configured is auto (policy), resolved must be observed (not auto); use triton_fallback as valid execution
+    # configured is baked_cuda; resolved is still the runtime observation.
     result = backend_mod.BackendResult(
         exit_code=0,
         stdout="",
@@ -77,9 +77,9 @@ def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path)
         tmp_path, config, cli.build_components(ROOT, "golden_p1")[4], {}, result, None,
     )
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    assert manifest["configured_sage_runtime_mode"] == "auto"
+    assert manifest["configured_sage_runtime_mode"] == "baked_cuda"
     assert manifest["resolved_sage_runtime_mode"] == "triton_fallback"
-    assert manifest["experiment_identity"]["configured_sage_runtime_mode"] == "auto"
+    assert manifest["experiment_identity"]["configured_sage_runtime_mode"] == "baked_cuda"
     assert manifest["experiment_identity"]["resolved_sage_runtime_mode"] == "triton_fallback"
     # resolved must never be auto for completed execution
     assert manifest["resolved_sage_runtime_mode"] != "auto"
@@ -101,7 +101,7 @@ def test_run_manifest_carries_configured_and_resolved_sage_modes(tmp_path: Path)
         tmp_path, config, cli.build_components(ROOT, "golden_p1")[4], {}, empty_result, None,
     )
     empty_manifest = json.loads(empty_path.read_text(encoding="utf-8"))
-    assert empty_manifest["configured_sage_runtime_mode"] == "auto"
+    assert empty_manifest["configured_sage_runtime_mode"] == "baked_cuda"
     assert empty_manifest["resolved_sage_runtime_mode"] == ""
 
 
@@ -151,7 +151,7 @@ def test_golden_p1_explicitly_uses_model_free_single_use_snapshot_contract():
         "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
         "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
         FLAG: "1",
-        SAGE_RUNTIME_MODE_FLAG: "auto",
+        SAGE_RUNTIME_MODE_FLAG: "baked_cuda",
         HASH_CHECK_FLAG: "1",
     }
     effective = {}

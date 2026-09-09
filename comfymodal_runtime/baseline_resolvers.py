@@ -115,7 +115,13 @@ def _resolve_sage_runtime_env_override(
     read_file=None,
 ) -> str:
     if is_golden:
-        return "auto"
+        # Golden's deploy-baked environment is authoritative.  In particular,
+        # do not let a snapshot-era runtime file reintroduce ``auto`` and its
+        # blocked-import fallback.
+        configured = os.environ.get(
+            "COMFYMODAL_SAGE_RUNTIME_MODE", SAGE_RUNTIME_MODE
+        ).strip().lower()
+        return configured if configured in {"auto", "baked_cuda", "triton_fallback"} else "auto"
     baseline = production_baseline_value("SAGE_RUNTIME_MODE")
     if not is_golden and baseline is not None:
         return baseline

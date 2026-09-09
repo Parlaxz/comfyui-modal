@@ -18,8 +18,7 @@ from .baseline_resolvers import production_baseline_value
 SAGE_MODES = {"auto", "baked_cuda", "triton_fallback"}
 SAGE_RESOLVED_MODES = {"baked_cuda", "triton_fallback"}
 
-# The production image is intentionally pinned to the known-good dispatcher.
-# Golden deployments opt out of this baseline and use the auto policy.
+# The image is intentionally pinned to the known-good dispatcher.
 SAGE_RUNTIME_BASELINE = "baked_cuda"
 PRODUCTION_BASELINE_SAGE_MODE = SAGE_RUNTIME_BASELINE
 PRODUCTION_BASELINE_PROBE = False
@@ -53,14 +52,22 @@ def resolve_sage_runtime_mode(
     The result is ``(resolved, reason, effective_input, resolution_source)``.
     Production's explicit baseline is checked before mutable runtime inputs,
     so a stale volume file or inherited environment cannot change production.
-    Golden deliberately forces ``auto`` and ignores the production baseline.
+    Golden ignores the production baseline but honors its deploy environment;
+    this keeps the profile's baked dispatcher from being replaced by a stale
+    snapshot-time runtime decision.
     """
     file_mode = _optional_sage_mode(file_value)
     env_mode = _optional_sage_mode(env_value)
     baseline_mode = _optional_sage_mode(baseline_value)
 
     if golden_flag:
-        return "auto", "golden-policy-forces-auto", "auto", "golden_env"
+        golden_mode = env_mode or "auto"
+        return (
+            golden_mode,
+            "golden-deploy-environment" if env_mode else "golden-default",
+            golden_mode,
+            "golden_env",
+        )
 
     if baseline_mode in SAGE_RESOLVED_MODES:
         if file_mode is not None or env_mode is not None:

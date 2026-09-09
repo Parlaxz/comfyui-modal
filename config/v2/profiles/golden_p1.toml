@@ -50,9 +50,9 @@ COMFYMODAL_V2_MEMORY_REQUEST = "16384"
 COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "16384"
 COMFYMODAL_V2_SNAPSHOT_MANIFEST = "1"
 COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE = "0"
-# Golden deliberately keeps the runtime selector on its auto policy instead of
-# inheriting production's baked_cuda default.
-COMFYMODAL_SAGE_RUNTIME_MODE = "auto"
+# Golden uses the image-baked SageAttention dispatcher.  This avoids probing
+# against the snapshot-time import blocker and caching its fallback result.
+COMFYMODAL_SAGE_RUNTIME_MODE = "baked_cuda"
 COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "sage"
 
 # Modal memory snapshots remain enabled by the runtime default.  The

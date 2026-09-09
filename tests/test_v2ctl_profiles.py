@@ -58,7 +58,7 @@ def test_load_production(real_profiles):
 def test_golden_p1_resolves_canonical_memory_and_keeps_golden_environment(real_profiles):
     profile = real_profiles.resolve("golden_p1")
     assert profile.resources["memory_mb"] == 8192
-    assert profile.environment["COMFYMODAL_SAGE_RUNTIME_MODE"] == "auto"
+    assert profile.environment["COMFYMODAL_SAGE_RUNTIME_MODE"] == "baked_cuda"
     assert profile.environment["COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"] == "1"
 
 

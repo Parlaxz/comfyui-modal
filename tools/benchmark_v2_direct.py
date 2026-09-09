@@ -11654,9 +11654,8 @@ async def _run_golden_p1(
                 + ", ".join(GOLDEN_ATTENTION_BACKENDS)
             )
     golden_arm = GOLDEN_CPU_QD2_ARM if cpu_qd2_prefetch else GOLDEN_CONTROL_ARM
-    # Sage effective-input provenance: the runtime policy observed before
-    # resolution.  For a clean Golden auto run this remains auto; an env
-    # override that flips it to baked_cuda must be surfaced.
+    # Sage effective-input provenance: the deploy-baked Golden policy observed
+    # before resolution.  Any explicit env override must be surfaced.
     _sage_effective_input = str(
         os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", "auto") or "auto"
     ).strip().lower()

@@ -507,12 +507,13 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
     @pytest.mark.fast_unit
     def test_golden_sage_policy_ignores_inherited_production_baseline(self):
         result = self._import_resolve_sage()(
-            file_value="baked_cuda",
+            file_value="auto",
             env_value="baked_cuda",
             baseline_value="baked_cuda",
             golden_flag=True,
         )
-        self.assertEqual(result[0], "auto")
+        self.assertEqual(result[0], "baked_cuda")
+        self.assertEqual(result[2], "baked_cuda")
         self.assertEqual(result[3], "golden_env")
 
     # ── Production baseline flags ────────────────────────────────────

@@ -1,8 +1,11 @@
+import os
 import unittest
+from unittest.mock import patch
 import pytest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from comfymodal_runtime.baseline_resolvers import _resolve_sage_runtime_env_override
 from comfymodal_runtime.sage_policy import (
     build_sage_runtime_identity,
     choose_sage_runtime_mode,
@@ -14,6 +17,17 @@ from comfymodal_runtime.sage_policy import (
 
 
 class SageAttentionRestorePolicyTests(unittest.TestCase):
+    @pytest.mark.fast_unit
+    def test_golden_deploy_baked_mode_ignores_stale_runtime_file(self):
+        with patch.dict(os.environ, {"COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda"}):
+            mode = _resolve_sage_runtime_env_override(
+                is_golden=True,
+                runtime_config_dir="/stale/runtime",
+                file_exists=lambda _path: True,
+                read_file=lambda _path: "auto",
+            )
+        self.assertEqual(mode, "baked_cuda")
+
     def test_list_sageattention_extension_files_finds_any_compiled_extension(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp) / "sageattention"

@@ -86,6 +86,9 @@ from comfymodal_runtime.runtime_shape import (
     log_effective_runtime_shape,
     runtime_shape_config,
 )
+from comfymodal_runtime.kjnodes_compat import (
+    register_join_strings_fallback as _register_join_strings_fallback,
+)
 
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
@@ -1531,15 +1534,15 @@ def _golden_sage_runtime_enabled() -> bool:
     )
 
 
-_SAGE_GOLDEN_DEPLOYMENT = _golden_sage_runtime_enabled()
-# The image's baked_cuda default is retained for production, but must not win
-# over golden_p1's auto policy when the module is imported before late_config
-# can replace the image environment.
-SAGE_RUNTIME_MODE = (
-    "auto"
-    if _SAGE_GOLDEN_DEPLOYMENT and _SAGE_RUNTIME_MODE_CONFIGURED == "baked_cuda"
-    else _SAGE_RUNTIME_MODE_CONFIGURED
-)
+def _register_golden_kjnodes_join_strings_fallback(nodes_module) -> bool:
+    """Restore KJNodes JoinStrings through the existing Golden runtime gate."""
+    return _register_join_strings_fallback(
+        nodes_module, golden_enabled=_golden_sage_runtime_enabled()
+    )
+
+
+# Keep the deploy-baked selector intact for Golden as well as production.
+SAGE_RUNTIME_MODE = _SAGE_RUNTIME_MODE_CONFIGURED
 
 # P3 GÃ‡Ã¶ Restore direct CLIP policy.
 #   auto           GÃ‡Ã¶ (default) load_and_encode unless CLIP already cached or no CLIP in profile
@@ -18098,6 +18101,7 @@ class _ComfyAPIMixin:
             except Exception:
                 pass
             self._snapshot_backend_init = False
+        _register_golden_kjnodes_join_strings_fallback(nodes)
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 
