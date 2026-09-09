@@ -2510,6 +2510,7 @@ def cmd_doctor(args, repo_root: Path) -> int:
         )
         _reject_protected_effective_target(selected_config, command="v2ctl doctor")
         _reject_golden_mode_override(selected_config, command="v2ctl doctor")
+        _canonical_workspace_binding(args, repo_root, selected_config)
         out.append(f"profile={selected_config.profile_name}")
         out.append(f"target.app={selected_config.target.app}")
         out.append(f"target.class={selected_config.target.class_name}")

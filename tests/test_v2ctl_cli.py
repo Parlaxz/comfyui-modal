@@ -1138,3 +1138,62 @@ class TestDoctor:
         assert "backend.deploy_and_run_v2_single.exists=1" in r.stdout
         assert "registry.flags=" in r.stdout
         assert "profiles=" in r.stdout
+
+    def test_doctor_uses_destination_bound_fingerprint(
+        self, monkeypatch, capsys
+    ) -> None:
+        sys.path.insert(0, str(REPO_ROOT))
+        from tools.v2_control import cli
+
+        args = SimpleNamespace(
+            profile="golden_p1", app="golden-experimental", gpu=None,
+            memory_mb=None, cpu=None, owner=None, set=[], inherit=[],
+            workspace_id=None, workspace=None, environment=None,
+        )
+        components = cli._build_components_for_args(REPO_ROOT, args)
+        config, fingerprints = components[3], components[4]
+        destination = SimpleNamespace(
+            workspace_id="workspace-from-config",
+            workspace_label="configured-workspace",
+            environment="main",
+        )
+        config.modal_destination = destination
+        expected_fingerprint = fingerprints.deploy_fingerprint()
+        config.modal_destination = None
+        target = {
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        }
+
+        monkeypatch.setattr(cli, "_build_components_for_args", lambda _root, _args: components)
+        monkeypatch.setattr(
+            cli,
+            "_canonical_workspace_binding",
+            lambda _args, _root, bound_config: (
+                setattr(bound_config, "modal_destination", destination) or destination
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "latest_deployment_manifest",
+            lambda _root, **_kwargs: {
+                "profile": "golden_p1",
+                "deploy_fingerprint": expected_fingerprint,
+                "target": target,
+            },
+        )
+
+        monkeypatch.setattr(
+            cli.locking_mod, "DeployLock",
+            lambda _path: SimpleNamespace(status=lambda: None),
+        )
+        monkeypatch.setattr(
+            cli.ro_mod, "RuntimeOverrideInventory",
+            lambda **_kwargs: SimpleNamespace(list_local=lambda: []),
+        )
+
+        assert cli.cmd_doctor(args, REPO_ROOT) == 0
+        output = capsys.readouterr().out
+        assert f"deployment.fingerprint.current={expected_fingerprint}" in output
+        assert "deployment.fingerprint.match=1" in output
