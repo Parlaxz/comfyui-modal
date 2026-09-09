@@ -371,6 +371,7 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
     """The Golden DynamicVRAM gate crosses both runtime observation boundaries."""
 
     _GATE_ENV = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+    _GC_SUPPRESSION_ENV = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
 
     def test_runtime_env_projects_sampling_deep_profile(self):
         env_name = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
@@ -394,6 +395,13 @@ class TestGoldenGateRuntimePropagation(unittest.TestCase):
             self.assertEqual(modal_app._runtime_env()[env_name], "legacy")
             os.environ[env_name] = "dispatcher"
             self.assertEqual(modal_app._runtime_env()[env_name], "dispatcher")
+
+    def test_runtime_env_projects_res4lyf_gc_suppression(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(self._GC_SUPPRESSION_ENV, None)
+            self.assertEqual(modal_app._runtime_env()[self._GC_SUPPRESSION_ENV], "0")
+            os.environ[self._GC_SUPPRESSION_ENV] = "1"
+            self.assertEqual(modal_app._runtime_env()[self._GC_SUPPRESSION_ENV], "1")
 
     def test_runtime_env_projects_all_decoupled_transport_dimensions(self):
         values = {

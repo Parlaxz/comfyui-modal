@@ -4648,6 +4648,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_SAMPLING_DEEP_PROFILE": os.environ.get(
             "COMFYMODAL_SAMPLING_DEEP_PROFILE", "off"
         ),
+        "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION": os.environ.get(
+            "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION", "0"
+        ),
         # Preserve the v2ctl profile selector beside the Golden gate so the
         # container can make the same profile decision as the deploy process.
         "COMFYMODAL_V2CTL_PROFILE": os.environ.get(
