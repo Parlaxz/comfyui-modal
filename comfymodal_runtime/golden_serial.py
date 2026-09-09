@@ -436,6 +436,23 @@ def res4lyf_gc_suppression_enabled() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_res4lyf_loader_module_key(value: Any) -> str:
+    """Normalize loader separators without resolving or importing a module."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().replace("\\", "/").rstrip("/")
+
+
+def _is_res4lyf_samplers_module_key(value: Any) -> bool:
+    """Accept the stock key, or an absolute loader path ending in that key."""
+    normalized = _normalize_res4lyf_loader_module_key(value)
+    if normalized == _RES4LYF_SAMPLERS_MODULE_NAME:
+        return True
+    if not normalized.endswith("/" + _RES4LYF_SAMPLERS_MODULE_NAME):
+        return False
+    return posixpath.isabs(normalized) or ntpath.isabs(str(value).strip())
+
+
 def _record_res4lyf_gc_suppression(
     session: Any = None,
     *,
@@ -454,6 +471,7 @@ def _record_res4lyf_gc_suppression(
         record = getattr(recorder, "res4lyf_gc_suppression", None)
         if not isinstance(record, dict):
             record = {}
+        record["expected_target"] = _RES4LYF_SAMPLERS_MODULE_NAME
         record.update(_bounded_telemetry_value({"status": status, **updates}))
         recorder.res4lyf_gc_suppression = record
         run_identity = getattr(session, "run_identity", None)
@@ -461,6 +479,7 @@ def _record_res4lyf_gc_suppression(
             run_identity.update({
                 "res4lyf_gc_suppression_status": status,
                 "res4lyf_gc_module_name": record.get("module_name"),
+                "res4lyf_gc_expected_target": record.get("expected_target"),
                 "res4lyf_gc_intercepted_collect_count": record.get(
                     "intercepted_collect_count", 0
                 ),
@@ -495,19 +514,22 @@ def _resolve_active_res4lyf_samplers_module(
         ) from exc
 
     registered_class_module = getattr(registered_class, "__module__", None)
-    if registered_class_module != _RES4LYF_SAMPLERS_MODULE_NAME:
+    if (
+        not isinstance(registered_class_module, str)
+        or not _is_res4lyf_samplers_module_key(registered_class_module)
+    ):
         raise RuntimeError(
             "res4lyf_gc_suppression_class_module_mismatch:"
             f"class_type={_bounded_res4lyf_identity(class_type)}"
             f";registered_class_module={_bounded_res4lyf_identity(registered_class_module)}"
         )
     try:
-        module = sys.modules[_RES4LYF_SAMPLERS_MODULE_NAME]
+        module = sys.modules[registered_class_module]
     except KeyError as exc:
         raise RuntimeError("res4lyf_gc_suppression_module_not_active") from exc
     if module is None:
         raise RuntimeError("res4lyf_gc_suppression_module_not_active")
-    if getattr(module, "__name__", None) != _RES4LYF_SAMPLERS_MODULE_NAME:
+    if getattr(module, "__name__", None) != registered_class_module:
         raise RuntimeError(
             "res4lyf_gc_suppression_module_path_mismatch:"
             f"active_module_name={_bounded_res4lyf_identity(getattr(module, '__name__', None))}"
@@ -609,8 +631,9 @@ def res4lyf_gc_suppression_scope(
             _record_res4lyf_gc_suppression(
                 session,
                 status="applied",
-                module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
-                module_path=os.path.realpath(str(module.__file__)),
+                expected_target=_RES4LYF_SAMPLERS_MODULE_NAME,
+                module_name=_bounded_res4lyf_identity(getattr(module, "__name__", None)),
+                module_path=_bounded_res4lyf_identity(os.path.realpath(str(module.__file__))),
                 intercepted_collect_count=0,
                 suppression_wall_ms=None,
                 restoration_state="pending",
@@ -619,6 +642,7 @@ def res4lyf_gc_suppression_scope(
             _record_res4lyf_gc_suppression(
                 session,
                 status="fail_closed",
+                expected_target=_RES4LYF_SAMPLERS_MODULE_NAME,
                 module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
                 fail_closed_reason=f"{type(exc).__name__}: {exc}",
                 intercepted_collect_count=0,
@@ -644,7 +668,9 @@ def res4lyf_gc_suppression_scope(
             _record_res4lyf_gc_suppression(
                 session,
                 status="applied",
-                module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
+                expected_target=_RES4LYF_SAMPLERS_MODULE_NAME,
+                module_name=_bounded_res4lyf_identity(getattr(module, "__name__", None)),
+                module_path=_bounded_res4lyf_identity(os.path.realpath(str(module.__file__))),
                 intercepted_collect_count=int(proxy.intercepted_collect_count),
                 suppression_wall_ms=round(
                     max(0, ended_ns - int(started_ns or ended_ns)) / 1_000_000, 4
@@ -1378,6 +1404,7 @@ class GoldenTelemetryRecorder:
         self.res4lyf_gc_suppression: dict[str, Any] = {
             "status": "not_run",
             "module_name": _RES4LYF_SAMPLERS_MODULE_NAME,
+            "expected_target": _RES4LYF_SAMPLERS_MODULE_NAME,
             "intercepted_collect_count": 0,
             "suppression_wall_ms": None,
             "restoration_state": "not_run",

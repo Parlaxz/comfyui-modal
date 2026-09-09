@@ -77,6 +77,11 @@ def test_exact_binding_intercepts_collect_and_delegates_everything_else(monkeypa
     assert active.gc is gc
     record = session.recorder.res4lyf_gc_suppression
     assert record["status"] == "applied"
+    assert record["module_name"] == active.__name__
+    assert record["expected_target"] == "RES4LYF.beta.samplers"
+    assert record["module_path"].replace("\\", "/").endswith(
+        "/RES4LYF/beta/samplers.py"
+    )
     assert record["intercepted_collect_count"] == 1
     assert record["restoration_state"] == "restored"
     assert record["suppression_wall_ms"] >= 0
@@ -124,6 +129,14 @@ def test_restoration_failure_replaces_body_error_and_releases_lock(monkeypatch):
     "kwargs, error",
     [
         ({"module_name": "not.res4lyf.samplers"}, "class_module_mismatch"),
+        (
+            {"module_name": "/root/comfy/ComfyUI/custom_nodes/other.beta.samplers"},
+            "class_module_mismatch",
+        ),
+        (
+            {"module_name": "alias.RES4LYF.beta.samplers"},
+            "class_module_mismatch",
+        ),
         ({"module_file": os.path.join("x", "RES4LYF", "samplers.py")}, "source_path_mismatch"),
         ({"gc_binding": object()}, "gc_binding_invalid"),
     ],
@@ -142,6 +155,28 @@ def test_wrong_or_unidentifiable_paths_fail_closed_without_mutation(monkeypatch,
     record = session.recorder.res4lyf_gc_suppression
     assert record["status"] == "fail_closed"
     assert record["restoration_state"] == "not_applied"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "/root/comfy/ComfyUI/custom_nodes/RES4LYF.beta.samplers",
+        r"C:\root\comfy\ComfyUI\custom_nodes\RES4LYF.beta.samplers",
+    ],
+)
+def test_absolute_path_like_loader_module_key_is_resolved_exactly(monkeypatch, module_name):
+    runner, active = _fake_runner(module_name=module_name)
+    monkeypatch.setitem(sys.modules, module_name, active)
+    session = _session()
+
+    with gs.res4lyf_gc_suppression_scope(runner, "sampler", session=session):
+        assert active.gc.collect() == 0
+
+    record = session.recorder.res4lyf_gc_suppression
+    assert record["status"] == "applied"
+    assert record["module_name"] == module_name
+    assert record["expected_target"] == "RES4LYF.beta.samplers"
+    assert active.gc is gc
 
 
 def test_registered_class_must_match_module_class_identity(monkeypatch):
