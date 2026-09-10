@@ -86,10 +86,6 @@ from comfymodal_runtime.runtime_shape import (
     log_effective_runtime_shape,
     runtime_shape_config,
 )
-from comfymodal_runtime.kjnodes_compat import (
-    register_join_strings_fallback as _register_join_strings_fallback,
-)
-
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
 # optimizations.py never breaks the rest of comfyapp.py.
@@ -1531,13 +1527,6 @@ def _golden_sage_runtime_enabled() -> bool:
         .lower()
         in {"1", "true", "yes", "on"}
         or os.getenv("COMFYMODAL_V2CTL_PROFILE", "").strip().lower() == "golden_p1"
-    )
-
-
-def _register_golden_kjnodes_join_strings_fallback(nodes_module) -> bool:
-    """Restore KJNodes JoinStrings through the existing Golden runtime gate."""
-    return _register_join_strings_fallback(
-        nodes_module, golden_enabled=_golden_sage_runtime_enabled()
     )
 
 
@@ -18109,7 +18098,6 @@ class _ComfyAPIMixin:
             except Exception:
                 pass
             self._snapshot_backend_init = False
-        _register_golden_kjnodes_join_strings_fallback(nodes)
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 

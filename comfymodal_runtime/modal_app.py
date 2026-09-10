@@ -3814,16 +3814,8 @@ def _source_probe_diagnostics(runtime: Any) -> dict[str, Any]:
                 join["source_file"] = str(inspect.getfile(cls))
             except Exception:  # noqa: BLE001
                 pass
-            from .kjnodes_compat import JoinStrings as _CompatJoinStrings
             source_blob = f"{module_name} {join['source_file']}".lower()
-            if cls is _CompatJoinStrings or module_name == "comfymodal_runtime.kjnodes_compat":
-                join.update({
-                    "owner": "comfyui-modal",
-                    "source": "compatibility_fallback",
-                    "classification": "compatibility_fallback",
-                    "reason": "live_registry_points_to_comfyui_modal_fallback",
-                })
-            elif "kjnodes" in source_blob or "kj-nodes" in source_blob:
+            if "kjnodes" in source_blob or "kj-nodes" in source_blob:
                 join.update({
                     "owner": "KJNodes",
                     "source": "real_kjnodes",
