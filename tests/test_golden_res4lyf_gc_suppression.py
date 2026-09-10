@@ -247,7 +247,8 @@ def test_feature_flag_skip_is_observable_and_does_not_patch(monkeypatch):
     assert payload["res4lyf_gc_suppression"]["restoration_state"] == "not_applied"
 
 
-def test_golden_sampling_wraps_only_the_direct_sampler_closure(monkeypatch):
+@pytest.mark.parametrize("golden_mode", ["serial", "parallel"])
+def test_golden_sampling_wraps_only_the_direct_sampler_closure(monkeypatch, golden_mode):
     runner, active = _fake_runner()
     monkeypatch.setitem(sys.modules, active.__name__, active)
     monkeypatch.setenv(gs.GOLDEN_RES4LYF_GC_SUPPRESSION_ENV, "1")
@@ -298,10 +299,11 @@ def test_golden_sampling_wraps_only_the_direct_sampler_closure(monkeypatch):
         node_map=SimpleNamespace(sampler_id="sampler"),
         runner=actual_runner,
         patcher=SimpleNamespace(model_options={"transformer_options": {}}),
-        golden_mode="serial",
+        golden_mode=golden_mode,
     )
 
     assert asyncio.run(gs.golden_sampling(session)) == [["latent"]]
     assert active.gc is gc
+    assert session.recorder.res4lyf_gc_suppression["status"] == "applied"
     assert session.recorder.res4lyf_gc_suppression["intercepted_collect_count"] == 1
     assert session.recorder.res4lyf_gc_suppression["restoration_state"] == "restored"
