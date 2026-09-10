@@ -7626,6 +7626,11 @@ class GoldenSerialRunner:
     def _get_input_data(self, unique_id: str, class_def: Any) -> tuple[dict, dict]:
         inputs = self.prompt[unique_id]["inputs"]
         valid_inputs = class_def.INPUT_TYPES()
+        is_v3 = self._is_v3_class(class_def)
+        if is_v3:
+            from comfy_api.latest import _io
+
+            valid_inputs, _, _ = _io.get_finalized_class_inputs(valid_inputs, inputs)
         out: dict[str, list] = {}
         missing: dict[str, bool] = {}
         for x, value in inputs.items():
@@ -7640,19 +7645,54 @@ class GoldenSerialRunner:
                 out[x] = entry.outputs[socket]
             else:
                 out[x] = [value]
-        hidden = valid_inputs.get("hidden") or {}
-        for hname, htype in hidden.items():
-            if htype == "PROMPT":
-                out[hname] = [self.prompt]
-            elif htype == "DYNPROMPT":
-                out[hname] = [self.prompt]
-            elif htype == "EXTRA_PNGINFO":
-                out[hname] = [self.extra_data.get("extra_pnginfo")]
-            elif htype == "UNIQUE_ID":
-                out[hname] = [unique_id]
-            elif htype in ("AUTH_TOKEN_COMFY_ORG", "API_KEY_COMFY_ORG"):
-                out[hname] = [self.extra_data.get(str(htype).lower())]
+        if not is_v3:
+            hidden = valid_inputs.get("hidden") or {}
+            for hname, htype in hidden.items():
+                if htype == "PROMPT":
+                    out[hname] = [self.prompt]
+                elif htype == "DYNPROMPT":
+                    out[hname] = [self.prompt]
+                elif htype == "EXTRA_PNGINFO":
+                    out[hname] = [self.extra_data.get("extra_pnginfo")]
+                elif htype == "UNIQUE_ID":
+                    out[hname] = [unique_id]
+                elif htype in ("AUTH_TOKEN_COMFY_ORG", "API_KEY_COMFY_ORG"):
+                    out[hname] = [self.extra_data.get(str(htype).lower())]
         return out, missing
+
+    @staticmethod
+    def _is_v3_class(class_def: Any) -> bool:
+        from comfy_api.internal import _ComfyNodeInternal
+
+        return isinstance(class_def, type) and issubclass(class_def, _ComfyNodeInternal)
+
+    def _v3_data(self, unique_id: str, class_def: Any) -> dict:
+        """Build the same hidden execution context used by ComfyUI's executor."""
+        from comfy_api.latest import _io
+
+        _, hidden, v3_data = _io.get_finalized_class_inputs(
+            class_def.INPUT_TYPES(), self.prompt[unique_id]["inputs"]
+        )
+        hidden_inputs = {}
+        if hidden is not None:
+            if _io.Hidden.prompt.name in hidden:
+                hidden_inputs[_io.Hidden.prompt] = self.prompt
+            if _io.Hidden.dynprompt.name in hidden:
+                hidden_inputs[_io.Hidden.dynprompt] = self.extra_data.get("dynprompt")
+            if _io.Hidden.extra_pnginfo.name in hidden:
+                hidden_inputs[_io.Hidden.extra_pnginfo] = self.extra_data.get("extra_pnginfo")
+            if _io.Hidden.unique_id.name in hidden:
+                hidden_inputs[_io.Hidden.unique_id] = unique_id
+            if _io.Hidden.auth_token_comfy_org.name in hidden:
+                hidden_inputs[_io.Hidden.auth_token_comfy_org] = self.extra_data.get(
+                    "auth_token_comfy_org"
+                )
+            if _io.Hidden.api_key_comfy_org.name in hidden:
+                hidden_inputs[_io.Hidden.api_key_comfy_org] = self.extra_data.get(
+                    "api_key_comfy_org"
+                )
+        v3_data["hidden_inputs"] = hidden_inputs
+        return v3_data
 
     # -- lazy dependency support -------------------------------------------------
 
@@ -7917,7 +7957,19 @@ class GoldenSerialRunner:
             raise RuntimeError(f"golden_task_pending:{len(pending_tasks)}")
 
     async def _call_node(self, unique_id: str, obj: Any, inputs: dict) -> Any:
-        func = getattr(obj, obj.FUNCTION)
+        class_def = type(obj)
+        func_name = obj.FUNCTION
+        if self._is_v3_class(class_def):
+            from comfy_api.internal import make_locked_method_func
+            from comfy_api.latest import _io
+
+            v3_data = self._v3_data(unique_id, class_def)
+            class_def.VALIDATE_CLASS()
+            class_clone = class_def.PREPARE_CLASS_CLONE(v3_data)
+            func = make_locked_method_func(class_def, func_name, class_clone)
+            inputs = _io.build_nested_inputs(inputs, v3_data)
+        else:
+            func = getattr(obj, func_name)
         diagnostics = self.sampling_diagnostics
         if (
             diagnostics is not None

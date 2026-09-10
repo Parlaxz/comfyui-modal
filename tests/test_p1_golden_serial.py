@@ -2681,6 +2681,35 @@ def test_v3_nodeoutput_single_result_cached_socket_major_and_exact_handoff():
     assert [nid for nid, _c, _s in runner.executed_summary()] == ["producer", "consumer"]
 
 
+def test_v3_call_node_populates_hidden_prompt_context():
+    """V3 execution must prepare the native class clone before calling it."""
+    from comfy_api.latest import io
+
+    class V3PromptReader(io.ComfyNode):
+        @classmethod
+        def define_schema(cls):
+            return io.Schema(
+                node_id="ModalV3PromptReader",
+                inputs=[],
+                outputs=[io.String.Output()],
+                hidden=[io.Hidden.prompt],
+            )
+
+        @classmethod
+        def execute(cls):
+            return io.NodeOutput(cls.hidden.prompt["marker"])
+
+    prompt = {
+        "reader": {"class_type": "reader", "inputs": {}},
+        "marker": "golden-prompt-context",
+    }
+    runner = gs.GoldenSerialRunner(prompt, node_classes={"reader": V3PromptReader})
+
+    asyncio.run(runner.run_closure("reader", include_target=True))
+
+    assert runner.cache["reader"].outputs == [["golden-prompt-context"]]
+
+
 def test_v3_block_execution_fails_closed_without_caching_or_downstream():
     """block_execution must fail closed in the Golden serial runner: no cached
     output for the blocking node and no downstream execution."""
