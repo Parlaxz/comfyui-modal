@@ -3508,6 +3508,263 @@ class FrozenClipSourceLayout:
             raise ValueError(f"cpu_prefetch_layout_coverage:{reason}")
 
 
+def project_cpu_qd2_telemetry(
+    telemetry: Mapping[str, Any],
+    *,
+    events: Iterable[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Project named QD2 boundaries and derived invariants from raw evidence."""
+    raw_events = [event for event in events if isinstance(event, Mapping)]
+
+    def event_named(name: str) -> Optional[Mapping[str, Any]]:
+        return next((event for event in raw_events if event.get("name") == name), None)
+
+    def event_ns(name: str) -> Optional[int]:
+        event = event_named(name)
+        value = event.get("monotonic_ns") if event else None
+        return int(value) if isinstance(value, int) else None
+
+    def ranges(value: Any) -> list[tuple[int, int]]:
+        result: list[tuple[int, int]] = []
+        if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
+            return result
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                start, end = item
+                if (
+                    isinstance(start, int) and not isinstance(start, bool)
+                    and isinstance(end, int) and not isinstance(end, bool)
+                    and 0 <= start < end
+                ):
+                    result.append((int(start), int(end)))
+        return result
+
+    expected_raw = telemetry.get("expected_h2d_ranges")
+    expected = ranges(expected_raw)
+    expected_evidence = (
+        "missing" if "expected_h2d_ranges" not in telemetry
+        else "malformed" if not isinstance(expected_raw, (list, tuple))
+        or not expected_raw
+        or len(expected) != len(expected_raw)
+        or any(end <= start for start, end in expected)
+        else "observed"
+    )
+    copied_records = telemetry.get("h2d_completion_records")
+    copied: list[tuple[int, int]] = []
+    completion_evidence = (
+        "missing" if "h2d_completion_records" not in telemetry else "observed"
+    )
+    if completion_evidence == "observed" and not isinstance(copied_records, (list, tuple)):
+        completion_evidence = "malformed"
+        copied_records = ()
+    elif completion_evidence == "observed" and not copied_records:
+        completion_evidence = "malformed"
+    for record in copied_records or ():
+        if not isinstance(record, Mapping):
+            completion_evidence = "malformed"
+            continue
+        start = record.get("relative_start")
+        length = record.get("length")
+        if (
+            isinstance(start, int) and not isinstance(start, bool)
+            and isinstance(length, int) and not isinstance(length, bool)
+            and length > 0
+        ):
+            copied.append((int(start), int(start) + int(length)))
+        else:
+            completion_evidence = "malformed"
+    duplicate = any(
+        left_start < right_end and right_start < left_end
+        for index, (left_start, left_end) in enumerate(copied)
+        for right_start, right_end in copied[index + 1:]
+    )
+    missing: list[tuple[int, int]] = []
+    for start, end in expected:
+        cursor = start
+        for copied_start, copied_end in sorted(copied):
+            if copied_end <= cursor:
+                continue
+            if copied_start > cursor:
+                missing.append((cursor, min(copied_start, end)))
+            cursor = max(cursor, copied_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            missing.append((cursor, end))
+    covered = sum(max(0, end - start) for start, end in copied)
+    expected_bytes = sum(max(0, end - start) for start, end in expected)
+    exact = (
+        expected_evidence == "observed"
+        and completion_evidence == "observed"
+        and not duplicate
+        and not missing
+        and covered == expected_bytes
+    )
+
+    enqueue_records = [
+        record for record in telemetry.get("h2d_enqueue_records", ())
+        if isinstance(record, Mapping) and isinstance(record.get("monotonic_ns"), int)
+    ]
+    completion_records = [
+        record for record in telemetry.get("h2d_completion_records", ())
+        if isinstance(record, Mapping) and isinstance(record.get("monotonic_ns"), int)
+    ]
+    source_start = event_ns("CPU_PREFETCH_START")
+    first_extent = event_ns("CPU_PREFETCH_FIRST_EXTENT")
+    source_complete = event_ns("CPU_PREFETCH_SOURCE_COMPLETE")
+    load_ready = event_ns("CLIP_GPU_READY")
+    first_enqueue = (
+        min(int(record["monotonic_ns"]) for record in enqueue_records)
+        if enqueue_records else None
+    )
+    final_enqueue = (
+        max(int(record["monotonic_ns"]) for record in enqueue_records)
+        if enqueue_records else None
+    )
+    first_completion = (
+        min(int(record["monotonic_ns"]) for record in completion_records)
+        if completion_records else None
+    )
+    final_completion = (
+        max(int(record["monotonic_ns"]) for record in completion_records)
+        if completion_records else None
+    )
+    # Host-observed active time is the union of paired per-copy intervals.
+    # The first-enqueue/last-completion envelope is retained separately only
+    # as a diagnostic; it includes idle gaps between copies.
+    def timing_key(record: Mapping[str, Any]) -> Any:
+        if record.get("extent_id") is not None:
+            return ("extent", str(record.get("extent_id")))
+        return ("range", record.get("relative_start"), record.get("length"))
+
+    enqueue_by_key: dict[Any, Mapping[str, Any]] = {}
+    completion_by_key: dict[Any, Mapping[str, Any]] = {}
+    interval_evidence = "observed"
+    for record in enqueue_records:
+        key = timing_key(record)
+        if key in enqueue_by_key:
+            interval_evidence = "malformed"
+        enqueue_by_key[key] = record
+    for record in completion_records:
+        key = timing_key(record)
+        if key in completion_by_key:
+            interval_evidence = "malformed"
+        completion_by_key[key] = record
+    paired_intervals: list[tuple[int, int]] = []
+    if not enqueue_records or not completion_records:
+        interval_evidence = "missing"
+    elif set(enqueue_by_key) != set(completion_by_key):
+        interval_evidence = "malformed"
+    else:
+        for key in enqueue_by_key:
+            start = enqueue_by_key[key].get("monotonic_ns")
+            end = completion_by_key[key].get("monotonic_ns")
+            if not isinstance(start, int) or not isinstance(end, int) or end < start:
+                interval_evidence = "malformed"
+                continue
+            paired_intervals.append((int(start), int(end)))
+
+    def interval_union(intervals: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(intervals):
+            if end < start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def interval_intersection_ns(
+        intervals: Iterable[tuple[int, int]], start: int, end: Optional[int] = None
+    ) -> int:
+        total = 0
+        for interval_start, interval_end in intervals:
+            left = max(interval_start, start)
+            right = interval_end if end is None else min(interval_end, end)
+            total += max(0, right - left)
+        return total
+
+    h2d_union = interval_union(paired_intervals) if interval_evidence == "observed" else []
+    h2d_start = first_enqueue
+    h2d_end = final_completion
+    h2d_envelope = (
+        max(0, h2d_end - h2d_start)
+        if h2d_start is not None and h2d_end is not None else None
+    )
+    source_duration = (
+        max(0, source_complete - source_start)
+        if source_start is not None and source_complete is not None else None
+    )
+    h2d_active = sum(end - start for start, end in h2d_union) if h2d_union else None
+    overlap = (
+        interval_intersection_ns(h2d_union, source_start, source_complete)
+        if h2d_union and source_start is not None and source_complete is not None else None
+    )
+    exposed_after_source = (
+        interval_intersection_ns(h2d_union, source_complete)
+        if h2d_union and source_complete is not None else None
+    )
+    h2d_start_event = event_named("H2D_START")
+    h2d_fields = h2d_start_event.get("fields", {}) if h2d_start_event else {}
+    source_complete_before_h2d = h2d_fields.get("source_completed_before_h2d")
+    h2d_before_source_complete = (
+        first_enqueue < source_complete
+        if first_enqueue is not None and source_complete is not None
+        else (
+            not bool(source_complete_before_h2d)
+            if isinstance(source_complete_before_h2d, bool) else None
+        )
+    )
+    return {
+        "qd2_source_start_monotonic_ns": source_start,
+        "qd2_first_extent_ready_monotonic_ns": first_extent,
+        "qd2_first_h2d_enqueue_monotonic_ns": first_enqueue,
+        "qd2_first_h2d_completion_monotonic_ns": first_completion,
+        "qd2_source_completion_monotonic_ns": source_complete,
+        "qd2_final_h2d_enqueue_monotonic_ns": final_enqueue,
+        "qd2_final_h2d_completion_monotonic_ns": final_completion,
+        "qd2_load_ready_monotonic_ns": load_ready,
+        "qd2_total_source_bytes": (
+            (telemetry.get("coverage") or {}).get(
+                "expected_bytes", telemetry.get("cpu_backing_bytes", telemetry.get("total_bytes"))
+            )
+            if isinstance(telemetry.get("coverage") or {}, Mapping)
+            else telemetry.get("cpu_backing_bytes", telemetry.get("total_bytes"))
+        ),
+        "qd2_extent_count": telemetry.get("logical_extent_count"),
+        "qd2_exact_copied_coverage": {
+            "ok": bool(exact),
+            "status": "observed" if exact else (
+                f"expected_{expected_evidence}"
+                if expected_evidence != "observed" else f"completion_{completion_evidence}"
+            ),
+            "expected_bytes": int(expected_bytes),
+            "copied_bytes": int(covered),
+            "expected_count": len(expected),
+            "copied_count": len(copied),
+            "expected_ranges": [[start, end] for start, end in expected],
+            "copied_ranges": [[start, end] for start, end in copied],
+        },
+        "qd2_duplicate_range_status": "present" if duplicate else "none",
+        "qd2_missing_range_status": "present" if missing else "none",
+        "qd2_missing_ranges": [[start, end] for start, end in missing],
+        "qd2_bytes_ready_at_first_h2d": telemetry.get("ready_bytes_total_at_h2d_start"),
+        "qd2_extents_ready_at_first_h2d": telemetry.get("ready_extent_count_at_h2d_start"),
+        "qd2_h2d_before_source_complete": h2d_before_source_complete,
+        "qd2_source_duration_ns": source_duration,
+        "qd2_h2d_active_wall_ns": h2d_active,
+        "qd2_h2d_envelope_wall_ns": h2d_envelope,
+        "qd2_h2d_interval_evidence": interval_evidence,
+        "qd2_h2d_intervals": [[start, end] for start, end in h2d_union],
+        "qd2_source_h2d_overlap_wall_ns": overlap,
+        "qd2_exposed_h2d_after_source_completion_ns": exposed_after_source,
+        "qd2_no_outstanding_h2d_at_finalization": bool(
+            telemetry.get("h2d_finalized") and telemetry.get("h2d_outstanding") == 0
+        ),
+    }
+
+
 class CpuRawPrefetchTicket:
     """Request-local QD2 source: two positioned ``preadv`` workers.
 
@@ -3574,6 +3831,25 @@ class CpuRawPrefetchTicket:
         self._h2d_end_ns: Optional[int] = None
         self._h2d_bytes: Optional[int] = None
         self._h2d_complete = False
+        # Request-local H2D boundary evidence. The copy/event waits already
+        # exist for correctness; these records only name their boundaries for
+        # the normal Golden telemetry projection.
+        self._h2d_enqueues: list[dict[str, Any]] = []
+        self._h2d_completions: list[dict[str, Any]] = []
+        self._h2d_outstanding = 0
+        self._h2d_finalized = False
+        self._expected_h2d_ranges: list[tuple[int, int]] = [
+            (int(start) - int(layout.data_start),
+             int(start) - int(layout.data_start) + int(length))
+            for region in plan_source_regions(
+                layout.data_start,
+                layout.total_data_bytes,
+                layout.h2d_block_bytes,
+                layout.qd,
+            )
+            for start, length in region
+        ]
+        self._expected_h2d_count = len(self._expected_h2d_ranges)
         self._clip_gpu_ready_marked = False
         self._wait_ns = 0
         self._wait_count = 0
@@ -3860,6 +4136,53 @@ class CpuRawPrefetchTicket:
             if emit_threshold:
                 self.event(f"CPU_PREFETCH_SOURCE_{pct}", percent=pct, bytes_prefetched=published_bytes, total_bytes=total)
 
+    def _establish_source_completion_if_ready(self) -> None:
+        """Finalize source evidence at the end of the last source worker."""
+        emit = False
+        with self._condition:
+            if self._source_complete_event_emitted or self._complete or self._failed is not None:
+                return
+            if len(self._worker_ended_ns) != 2:
+                return
+            expected = [
+                (
+                    int(start) - int(self.layout.data_start),
+                    int(start) - int(self.layout.data_start) + int(length),
+                )
+                for region in self.layout.regions
+                for start, length in region
+            ]
+            actual = list(self._ready_intervals)
+            covered, reason = partition_coverage(expected, self.layout.total_data_bytes)
+            if (
+                not covered
+                or sorted(actual) != sorted(expected)
+                or self._bytes_read != self.layout.total_data_bytes
+            ):
+                self._failed = RuntimeError(f"cpu_prefetch_coverage:{reason}")
+            elif (
+                self._syscall_count <= 0
+                or len(self._syscall_records) != self._syscall_count
+                or any(record.get("method") != "os.preadv" for record in self._syscall_records)
+                or any(int(record.get("returned_bytes", 0)) <= 0 for record in self._syscall_records)
+            ):
+                self._failed = RuntimeError("cpu_prefetch_preadv_provenance_missing")
+            else:
+                self._complete = True
+                self._bytes_available = self._contiguous_prefix_bytes
+                self._source_complete_event_emitted = True
+                emit = True
+        if emit:
+            self._capture_memory_visibility("source_completion")
+            self.event(
+                "CPU_PREFETCH_SOURCE_COMPLETE",
+                bytes=int(self._bytes_read),
+                read_calls=int(self._read_calls),
+                syscall_count=int(self._syscall_count),
+                short_read_retries=int(self._short_read_retries),
+                source_provenance="actual_os_preadv",
+            )
+
     def _read_worker(self, worker_id: int) -> None:
         started_ns = time.perf_counter_ns()
         started_wall_ns = time.time_ns()
@@ -3906,6 +4229,9 @@ class CpuRawPrefetchTicket:
                 self._worker_ended_wall_ns[worker_id] = ended_wall_ns
                 self._condition.notify_all()
             self.event(f"CPU_PREFETCH_SOURCE_WORKER_{worker_id}_END", worker_id=worker_id, end_ns=ended_ns, wall_ns=ended_wall_ns, worker_wall_ns=max(0, ended_ns - started_ns), error=self._worker_errors.get(worker_id))
+            # The last worker owns the source-completion boundary.  This is
+            # deliberately before any caller-side join or GPU-consumer wait.
+            self._establish_source_completion_if_ready()
             with _GOLDEN_THREAD_LOCK:
                 thread = threading.current_thread()
                 _GOLDEN_THREADS.discard(thread)
@@ -3995,11 +4321,103 @@ class CpuRawPrefetchTicket:
                    clip_demand_to_h2d_start_wall_ns=(time.time_ns() - demand["wall_ns"] if demand else None),
                    clip_demand_to_h2d_bytes_read=int(bytes_read) - int(demand_fields.get("bytes_read_at_clip_demand", bytes_read)) if demand else None)
 
+    def set_expected_h2d_plan(self, ranges: Iterable[tuple[int, int]]) -> None:
+        """Bind and validate the request's actual H2D partition before workers run."""
+        try:
+            plan = [
+                (int(start), int(end))
+                for start, end in ranges
+            ]
+        except (TypeError, ValueError):
+            raise RuntimeError("cpu_prefetch_expected_h2d_plan_malformed") from None
+        canonical = [
+            (int(start) - int(self.layout.data_start),
+             int(start) - int(self.layout.data_start) + int(length))
+            for region in plan_source_regions(
+                self.layout.data_start,
+                self.layout.total_data_bytes,
+                self.layout.h2d_block_bytes,
+                self.layout.qd,
+            )
+            for start, length in region
+        ]
+        if (
+            not plan
+            or plan != canonical
+            or any(start < 0 or end <= start for start, end in plan)
+            or not partition_coverage(plan, self.layout.total_data_bytes)[0]
+        ):
+            raise RuntimeError("cpu_prefetch_expected_h2d_plan_invalid")
+        with self._condition:
+            if self._h2d_enqueues or self._h2d_completions:
+                raise RuntimeError("cpu_prefetch_expected_h2d_plan_too_late")
+            self._expected_h2d_ranges = list(plan)
+            self._expected_h2d_count = len(plan)
+
+    def mark_h2d_enqueue(
+        self, *, extent_id: Any, relative_start: int, length: int
+    ) -> None:
+        """Record one already-required H2D enqueue boundary."""
+        enqueue_ns = time.monotonic_ns()
+        with self._condition:
+            self._h2d_enqueues.append({
+                "extent_id": str(extent_id),
+                "relative_start": int(relative_start),
+                "length": int(length),
+                "monotonic_ns": int(enqueue_ns),
+            })
+            self._h2d_outstanding += 1
+            outstanding = int(self._h2d_outstanding)
+        self.event(
+            "CPU_PREFETCH_H2D_ENQUEUE",
+            extent_id=str(extent_id),
+            relative_start=int(relative_start),
+            bytes=int(length),
+            h2d_outstanding=outstanding,
+        )
+
+    def mark_h2d_copy_complete(
+        self, *, extent_id: Any, relative_start: int, length: int
+    ) -> None:
+        """Record completion immediately after an existing event wait."""
+        completion_ns = time.monotonic_ns()
+        with self._condition:
+            self._h2d_completions.append({
+                "extent_id": str(extent_id),
+                "relative_start": int(relative_start),
+                "length": int(length),
+                "monotonic_ns": int(completion_ns),
+            })
+            self._h2d_outstanding = max(0, self._h2d_outstanding - 1)
+            outstanding = int(self._h2d_outstanding)
+            completed_count = len(self._h2d_completions)
+            final = (
+                completed_count == self._expected_h2d_count
+                and self._h2d_outstanding == 0
+            )
+        self.event(
+            "CPU_PREFETCH_H2D_COMPLETE",
+            extent_id=str(extent_id),
+            relative_start=int(relative_start),
+            bytes=int(length),
+            h2d_outstanding=outstanding,
+            h2d_completed_count=completed_count,
+            h2d_expected_count=int(self._expected_h2d_count),
+            final=bool(final),
+        )
+
     def mark_h2d_complete(self, *, h2d_bytes: int) -> None:
         with self._condition:
+            if (
+                len(self._h2d_completions) != self._expected_h2d_count
+                or self._h2d_outstanding != 0
+            ):
+                raise RuntimeError("cpu_prefetch_h2d_completion_coverage")
             self._h2d_complete = True
             self._h2d_end_ns = time.monotonic_ns()
             self._h2d_bytes = int(h2d_bytes)
+            self._h2d_finalized = True
+            h2d_outstanding = int(self._h2d_outstanding)
             bytes_prefetched = int(self._bytes_available)
             bytes_read = int(self._bytes_read)
             source_completed = bool(self._complete)
@@ -4008,7 +4426,9 @@ class CpuRawPrefetchTicket:
                    h2d_bytes=int(h2d_bytes),
                    bytes_prefetched_at_h2d_complete=bytes_prefetched,
                    bytes_read_at_h2d_complete=bytes_read,
-                   source_completed_at_h2d_complete=source_completed)
+                   source_completed_at_h2d_complete=source_completed,
+                   h2d_outstanding_at_finalization=h2d_outstanding,
+                   no_outstanding_h2d_at_finalization=h2d_outstanding == 0)
 
     def mark_clip_gpu_ready(self, *, adoption_proven: bool, storage_proven: bool) -> None:
         """Record readiness after CLIP adoption and storage proof, not H2D alone."""
@@ -4050,24 +4470,11 @@ class CpuRawPrefetchTicket:
         if any(thread.is_alive() for thread in self._threads):
             raise RuntimeError("cpu_prefetch_worker_still_alive")
         with self._condition:
-            if not cancel and self._failed is None:
-                expected = [(int(start) - self.layout.data_start, int(start) - self.layout.data_start + int(length)) for region in self.layout.regions for start, length in region]
-                ok, reason = partition_coverage(expected, self.layout.total_data_bytes)
-                actual = list(self._ready_intervals)
-                if not ok or sorted(actual) != sorted(expected) or self._bytes_read != self.layout.total_data_bytes or len(self._worker_ended_ns) != 2:
-                    self._failed = RuntimeError(f"cpu_prefetch_coverage:{reason}")
-                elif self._syscall_count <= 0 or any(record.get("method") != "os.preadv" for record in self._syscall_records):
-                    self._failed = RuntimeError("cpu_prefetch_preadv_provenance_missing")
-                else:
-                    self._complete = True
-                    self._bytes_available = self._contiguous_prefix_bytes
-        if self._failed is not None and not cancel:
+            failed = self._failed
+            complete = self._complete
+        if (failed is not None or not complete) and not cancel:
             self._release_raw_backing()
-            raise RuntimeError("cpu_prefetch_source_failed") from self._failed
-        if self._complete and not self._source_complete_event_emitted:
-            self._source_complete_event_emitted = True
-            self._capture_memory_visibility("source_completion")
-            self.event("CPU_PREFETCH_SOURCE_COMPLETE", bytes=int(self._bytes_read), read_calls=int(self._read_calls), syscall_count=int(self._syscall_count), short_read_retries=int(self._short_read_retries), source_provenance="actual_os_preadv")
+            raise RuntimeError("cpu_prefetch_source_failed") from failed
 
     def close(self, *, cancel: bool = False) -> None:
         error: Optional[BaseException] = None
@@ -4118,7 +4525,7 @@ class CpuRawPrefetchTicket:
             max(post_h2d_observations, key=lambda item: item[0])
             if post_h2d_observations else (None, None)
         )
-        return {
+        report = {
             "enabled": True,
             "source_kind": self.source_kind,
             "source_provenance": "actual_os_preadv" if self._complete else self.source_provenance,
@@ -4297,7 +4704,18 @@ class CpuRawPrefetchTicket:
                     "rss_after_allocation": self._memory_after_allocation,
                 },
             },
+            "expected_h2d_ranges": [
+                [int(start), int(end)]
+                for start, end in self._expected_h2d_ranges
+            ],
+            "expected_h2d_count": int(self._expected_h2d_count),
+            "h2d_enqueue_records": copy.deepcopy(self._h2d_enqueues),
+            "h2d_completion_records": copy.deepcopy(self._h2d_completions),
+            "h2d_outstanding": int(self._h2d_outstanding),
+            "h2d_finalized": bool(self._h2d_finalized),
         }
+        report.update(project_cpu_qd2_telemetry(report, events=self.events))
+        return report
 
 
 def cpu_qd2_prefetch_deploy_enabled() -> bool:
@@ -4842,6 +5260,12 @@ def _qd_gpu_worker(
                         start_events[slot_index], end_event
                     )
                     state.add_h2d_gpu_event_ms(previous["h2d_gpu_event_ms"])
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.mark_h2d_copy_complete(
+                        extent_id=previous["extent_id"],
+                        relative_start=previous["relative_start"],
+                        length=previous["planned_len"],
+                    )
             rel = int(abs_start) - int(data_start)
             if rel < 0 or rel + int(ln) > int(gpu_buf.numel()):
                 raise RuntimeError(f"destination_slice_out_of_range:{rel}:{ln}")
@@ -4866,6 +5290,11 @@ def _qd_gpu_worker(
                 "planned_len": int(ln),
                 "read_len": int(got),
             }
+            if cpu_prefetch_ticket is not None:
+                record.update({
+                    "extent_id": f"{worker_id}:{index}",
+                    "relative_start": int(rel),
+                })
             if diagnostics_enabled:
                 record.update({
                     "source_start_ns": started,
@@ -4904,6 +5333,14 @@ def _qd_gpu_worker(
                 event.record()
                 if diagnostics_enabled:
                     record["h2d_enqueue_end_ns"] = time.perf_counter_ns()
+                if cpu_prefetch_ticket is not None:
+                    # The enqueue boundary is after both the copy submission
+                    # and its completion event have been successfully queued.
+                    cpu_prefetch_ticket.mark_h2d_enqueue(
+                        extent_id=record["extent_id"],
+                        relative_start=rel,
+                        length=ln,
+                    )
             except BaseException as exc:
                 record["error"] = f"h2d_failed:{type(exc).__name__}"
                 state.error(worker_id, exc)
@@ -6200,17 +6637,23 @@ def read_file_qd_gpu(
         if cpu_prefetch_ticket is not None
         else build_header_tensor_map(header)
     )
-    regions = (
-        [list(region) for region in plan_source_regions(data_start, total, block_bytes, qd)]
-        if cpu_prefetch_ticket is not None
-        else plan_source_regions(data_start, total, block_bytes, qd)
-    )
+    # CPU-prefetch source extents are 128 MiB, but the consumer H2D plan is
+    # the request's 32 MiB block plan.  Keep these geometries independent.
+    regions = plan_source_regions(data_start, total, block_bytes, qd)
     items = [item for region in regions for item in region]
     cov_ok, cov_reason = partition_coverage(
         [(off - data_start, off - data_start + ln) for off, ln in items], total
     )
     if not cov_ok:
         raise RuntimeError(f"coverage:{cov_reason}")
+    if cpu_prefetch_ticket is not None:
+        cpu_prefetch_ticket.set_expected_h2d_plan(
+            (
+                int(offset) - int(data_start),
+                int(offset) - int(data_start) + int(length),
+            )
+            for offset, length in items
+        )
     layout_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
 
     stats: dict = {
@@ -6419,6 +6862,12 @@ def read_file_qd_gpu(
                         start_events[int(record["worker_id"])][int(record["slot_index"])], event
                     )
                     state.add_h2d_gpu_event_ms(record["h2d_gpu_event_ms"])
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.mark_h2d_copy_complete(
+                        extent_id=record["extent_id"],
+                        relative_start=record["relative_start"],
+                        length=record["planned_len"],
+                    )
         state.events_waited = True
         final_drain_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
 
@@ -13935,6 +14384,7 @@ __all__ = [
     "GoldenVolumeHandle",
     "FrozenClipSourceLayout",
     "CpuRawPrefetchTicket",
+    "project_cpu_qd2_telemetry",
     "PendingDurability",
     "canonical_workflow_sha256",
     "golden_qd_transport_arm",
