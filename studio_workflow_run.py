@@ -326,6 +326,52 @@ def merge_workflow_controls(
     return {"values": merged, "errors": errors}
 
 
+# ── Legacy absorption bridge (abs-1) ─────────────────────────────────────
+
+
+def prepare_legacy_run_controls(
+    control_schema: dict[str, Any],
+    legacy_preset: dict[str, Any] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Translate legacy-keyed values, then merge+validate via the verified path.
+
+    Inputs: ``control_schema`` — the bundle's canonical control schema (from
+      ``resolve_workflow_run_bundle``); ``legacy_preset`` — a legacy preset
+      PAYLOAD (``values``/``model_choices`` keyed by old roles; a bare
+      values dict must be wrapped as ``{"values": ...}``); ``overrides`` —
+      optional legacy-keyed request overrides (translated, then win per
+      canonical key).
+    Outputs: ``{"values": merged_canonical, "errors": [...]}`` — the exact
+      shape ``merge_workflow_controls`` returns.  Translation is pure
+      (``studio_domain.legacy_adapters``: renames per role table, unknown
+      keys verbatim); validation stays STRICT (unknown controls error —
+      visible, never silently dropped).  Run contract order:
+      ``resolve_workflow_run_bundle`` → this → ``build_workflow_execution_plan``
+      / ``handle_workflow_run_async``.
+    """
+    from studio_domain.legacy_adapters import (
+        translate_model_choices,
+        translate_values,
+    )
+
+    payload = legacy_preset if isinstance(legacy_preset, dict) else {}
+    raw_values = payload.get("values")
+    raw_models = payload.get("model_choices")
+    canonical_preset = {
+        "values": translate_values(raw_values if isinstance(raw_values, dict) else {}),
+        "model_choices": translate_model_choices(
+            raw_models if isinstance(raw_models, dict) else {}
+        ),
+    }
+    translated_overrides = translate_values(
+        overrides if isinstance(overrides, dict) else {}
+    )
+    return merge_workflow_controls(
+        canonical_preset, translated_overrides, control_schema or {}
+    )
+
+
 # ── Prompt application ───────────────────────────────────────────────────
 
 

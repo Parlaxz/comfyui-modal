@@ -890,6 +890,27 @@ export async function installStudioMockApi(page, options = {}) {
     });
   }
 
+  /** GET /comfymodal/history-v2/feed — empty deterministic feed.
+   *
+   * The Studio shell/playground calls refreshRecentRuns during startup,
+   * which reads this endpoint. The mocked workflows specs never seed
+   * history-v2 data, so an empty (but well-shaped) envelope keeps the call
+   * handled without affecting any assertions. Shape mirrors the
+   * fake-backend envelope {status, items, next_cursor, limit, total,
+   * has_more}. Purely additive — no existing route semantics change.
+   */
+  async function listHistoryV2Feed(route, url) {
+    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    return _json({
+      status: "ok",
+      items: [],
+      next_cursor: null,
+      limit,
+      total: 0,
+      has_more: false,
+    });
+  }
+
   /** GET /comfymodal/assets/:asset_id — returns 1-pixel PNG */
   async function serveAsset(route, url) {
     return {
@@ -997,6 +1018,21 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({ status: "ok", state: "idle", message: "" });
   }
 
+  /** GET /comfymodal/workspaces — empty registry (Backend overview probe). */
+  async function listWorkspacesRegistry(route, url, body) {
+    return _json({ status: "ok", workspaces: [], active_workspace_id: null });
+  }
+
+  /** GET /comfymodal/auth/status — connected (Backend overview probe). */
+  async function serveAuthStatus(route, url, body) {
+    return _json({ status: "ok", connected: true });
+  }
+
+  /** GET /comfymodal/health — ready (Backend overview probe). */
+  async function serveHealth(route, url, body) {
+    return _json({ status: "ok", message: "Mock runtime ready" });
+  }
+
   /** Catch-all: 599 JSON for any unhandled /comfymodal/ request */
   async function catchAll(route, url, body) {
     return _error("unhandled mock endpoint", 599);
@@ -1037,6 +1073,9 @@ export async function installStudioMockApi(page, options = {}) {
     ["PATCH", "/comfymodal/run-history/:run_id/annotations", patchRunAnnotations],
     ["POST", "/comfymodal/run-history/:run_id/save", saveRunOutput],
 
+    // History V2 feed (empty deterministic envelope — see listHistoryV2Feed).
+    ["GET", "/comfymodal/history-v2/feed", listHistoryV2Feed],
+
     // Asset & output serving (1-pixel PNG)
     ["GET", "/comfymodal/assets/:asset_id", serveAsset],
     ["GET", "/comfymodal/studio/outputs/:filename", serveStudioOutput],
@@ -1053,6 +1092,9 @@ export async function installStudioMockApi(page, options = {}) {
     ["GET", "/comfymodal/profile/level", serveProfileLevel],
     ["POST", "/comfymodal/profile/level", saveProfileLevel],
     ["GET", "/comfymodal/deploy/status", serveDeployStatus],
+    ["GET", "/comfymodal/workspaces", listWorkspacesRegistry],
+    ["GET", "/comfymodal/auth/status", serveAuthStatus],
+    ["GET", "/comfymodal/health", serveHealth],
 
     // ComfyUI config endpoint — called during extension setup
     ["GET", "/api/comfymodal/config", serveConfig],

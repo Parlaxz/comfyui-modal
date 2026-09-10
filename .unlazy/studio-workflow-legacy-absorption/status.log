@@ -1,0 +1,13 @@
+2026-09-10T16:45:20.018Z dispatch abs-ready-1 opened: leaf-abs-1
+2026-09-10T16:46:08.820Z dispatch abs-ready-1 started leaf-abs-1 as ses_f73c9f99cffeCPORaurx6fumGy
+2026-09-10T16:46:09.007Z dispatch abs-ready-1 sealed
+leaf-abs-1 domain adapters dispatched in wave abs-ready-1
+2026-09-10T16:55:42.643Z dispatch abs-ready-1 returned leaf-abs-1
+leaf-abs-1 verified (adapter contracts green + authority review)
+leaf-abs-1 lease released
+2026-09-10T16:59:18.637Z dispatch abs-ready-2 opened: leaf-abs-2
+2026-09-10T17:00:01.665Z dispatch abs-ready-2 started leaf-abs-2 as ses_f73bd257efferfp3MmwzsYdkgj
+2026-09-10T17:00:01.738Z dispatch abs-ready-2 sealed
+leaf-abs-2 management UI migration dispatched in wave abs-ready-2
+2026-09-10T17:18:17.924Z dispatch abs-ready-2 returned leaf-abs-2
+BLOCKED: ComfyUI 8188 serves third-party nodes but loads zero comfyui-modal copies (no nodes/routes/web); six sibling copies present; needs user server recovery, no verification possible meanwhile

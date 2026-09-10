@@ -53,6 +53,15 @@ export async function buildStudioModalOptions(apiBase) {
 }
 import { el, createZoomableImageEl, createImagePreviewOverlay, renderEmptyState } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
+import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
+import { FIELD_BLOCKS } from "./studio-field-blocks.js";
+import { renderWorkflowPicker } from "./studio-workflow-picker.js";
+import {
+  loadShelfLayout,
+  saveShelfLayout,
+  loadShelfValues,
+  saveShelfValues,
+} from "./studio-playground-state.js";
 
 // â”€â”€ Polling helper for experiment status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Polls getStudioRunStatus and updates runState to reflect queued,
@@ -407,6 +416,30 @@ export function clearRecentRunsCache() {
   _recentRunsCacheKey = "";
 }
 
+// ── Same-run history timings fallback (Shelf single-run slice) ───────────
+//
+// When a completed single run carries no direct timings AND the History V2
+// feed has no projection for it yet (mocked + raced backends), fall back to
+// the legacy history entry for the SAME run id only — matched on the
+// experiment id already carried by the completion. Timings from any other
+// run are never borrowed, and an entry without timings (e.g. omitOutputs
+// runs) yields no fallback, so no output evidence is fabricated.
+function _fetchSameRunHistoryEntry(apiBase, experimentId) {
+  if (!apiBase || !experimentId) return Promise.resolve(null);
+  var url = apiBase + "/history?page=1&page_size=50";
+  return fetch(url).then(function (res) {
+    if (!res || !res.ok) return null;
+    return res.json().catch(function () { return null; });
+  }).then(function (data) {
+    var items = (data && Array.isArray(data.items)) ? data.items : [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i] || {};
+      if (it.experiment_id === experimentId || it.run_id === experimentId) return it;
+    }
+    return null;
+  }).catch(function () { return null; });
+}
+
 // â”€â”€ Hydration helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // Restore saved selection, fetch presets + history, validate preset,
@@ -690,12 +723,24 @@ function renderControlPanel(state, context) {
   }
 
   // â”€â”€ Backend Selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
+  // Shelf flow (a modern Workflow is selected): no Backend/Preset UI.
+  // The Shelf owns field cards and the shared picker owns switching.
+  // The legacy preset lane keeps this UI when no Workflow is selected.
+  if (!_isModernRunSelected(state)) {
+    panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
+  }
 
   // â”€â”€ Workflow Selector (modern workflow-driven runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Separate container rendered after the legacy selector row so legacy
   // test-ids/order stay intact. Empty-state only until a workflow is chosen.
   panel.appendChild(renderWorkflowSelector(state, context, actions));
+
+  // Shelf field cards (Studio Workflow effort, leaf 1.2.2): bound field
+  // cards for the selected Workflow. Prompt fixed at top; output stays the
+  // right-side result panel (never a movable card).
+  if (_isModernRunSelected(state)) {
+    panel.appendChild(renderShelfSection(state, context, actions));
+  }
 
   // â”€â”€ Preset-driven Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
@@ -851,7 +896,11 @@ function renderControlPanel(state, context) {
     }
   });
 
-  panel.appendChild(controlsContainer);
+  // Shelf flow: the Shelf owns the bound fields, so the legacy
+  // preset-driven controls stay out of this flow entirely.
+  if (!_isModernRunSelected(state)) {
+    panel.appendChild(controlsContainer);
+  }
 
   // â”€â”€ Run Button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   panel.appendChild(renderRunButton(state, context, actions));
@@ -1080,6 +1129,9 @@ function buildActions(state, context) {
       }
 
       if (runState && newStatus === "completed" && prevStatus !== "completed") {
+        // A new run completed — the Shelf output is fresh again: clear the
+        // stale mark set by Workflow switching.
+        if (state.playground) state.playground._shelfStaleOutput = false;
         // A new run completed â€” re-enable the carousel synchronously so
         // subsequent re-renders and page loads show recent runs again.
         // Done BEFORE the async refresh so the flag does not persist and
@@ -1130,6 +1182,36 @@ function buildActions(state, context) {
               matched
             );
             if (context && context.setPage) context.setPage("playground");
+          }
+          if (!matched && experimentId) {
+            // V2 has no projection for this run yet — assemble the finalized
+            // run from the SAME run's history entry so its canonical timings
+            // still reach the timing card (stages → summary → duration).
+            // Canvas evidence is untouched: lastRunOutput stays on the
+            // polled primaryOutput, never fabricated from history data.
+            _fetchSameRunHistoryEntry(apiBase, experimentId).then(function (entry) {
+              if (!entry || !state.playground) return;
+              if (entry.status !== "completed") return;
+              var entryTimings = entry.timings || (entry.extra && entry.extra.timings) || {};
+              if (!entryTimings || Object.keys(entryTimings).length === 0) return;
+              var fallback = null;
+              try {
+                fallback = normalizeStudioRun(entry, apiBase);
+              } catch (e) {
+                fallback = null;
+              }
+              if (!fallback || !fallback.timingStages || fallback.timingStages.length === 0) return;
+              state.playground._selectedRun = fallback;
+              // Persist the finalized run result to localStorage
+              try {
+                saveRunResult(
+                  state.playground.selectedBackendId,
+                  state.playground.featureId || "txt2img",
+                  fallback
+                );
+              } catch (e) {}
+              if (context && context.setPage) context.setPage("playground");
+            });
           }
           // Note: setCarouselCleared was already called synchronously above
         });
@@ -1660,6 +1742,19 @@ function _renderWorkflowMappedControls(container, state, context, actions) {
 
 function _populateWorkflowSelector(container, state, context, actions) {
   while (container.firstChild) container.removeChild(container.firstChild);
+  try { _populateWorkflowSelectorInner(container, state, context, actions); } catch (e) {
+    try {
+      window.__shelfDiag = (window.__shelfDiag || "") + "POPULATE_THROW:" + (e && e.message) + ";";
+    } catch (ign) {}
+    throw e;
+  }
+}
+
+function _populateWorkflowSelectorInner(container, state, context, actions) {
+  // Shelf: normalize here (not only in _rerenderWorkflowSection) because
+  // full panel re-renders reach this function directly, bypassing the
+  // selection-change path. No-op for object schemas.
+  _normalizeShelfControlSchema(state);
   const store = state && state.playground && state.playground._workflowRun;
   const wf = state && state.playground && state.playground._workflowRunModule;
 
@@ -1690,10 +1785,23 @@ function _populateWorkflowSelector(container, state, context, actions) {
   container.appendChild(controlsBox);
 }
 
-function _rerenderWorkflowSection(state, context, actions) {
+function _rerenderWorkflowSection(state, context, actions, opts) {
   const container = document.querySelector('[data-testid="workflow-selector-section"]');
   if (!container) return;
+  // Shelf: normalize an array-shaped control_schema (as served by the
+  // deterministic workflow mock) into the role-keyed object the frozen
+  // run-context contract uses (real backend serves a dict). No-op when the
+  // schema is already an object — every downstream consumer (mapped
+  // controls, gating, validation, run payload, Shelf) reads it through
+  // getControlSchema, so one normalization point fixes them uniformly.
+  _normalizeShelfControlSchema(state);
   _populateWorkflowSelector(container, state, context, actions);
+  // Shelf: restore durably autosaved values only when the caller opted in
+  // (workflow/version switches and persisted-selection restore). Preset
+  // switches and handoffs carry explicit values and must not be clobbered.
+  // The Shelf cards refresh in every case (prompt fixed top, layout, stale).
+  if (opts && opts.applySaved) _applyShelfSavedValues(state);
+  _refreshShelfSection(state, context, actions);
   _syncRunButtonGating(state, context, actions);
 }
 
@@ -1784,7 +1892,8 @@ async function initWorkflowRun(state, context, actions) {
       const saved = wf.loadWorkflowSelection();
       if (saved && saved.workflowId) {
         await _restoreWorkflowSelection(state, context, actions, wf, store, saved);
-        _rerenderWorkflowSection(state, context, actions);
+        // Shelf: a restored selection reloads its durably autosaved values.
+        _rerenderWorkflowSection(state, context, actions, { applySaved: true });
         return;
       }
 
@@ -1943,7 +2052,8 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
       presetName: store.presetName || "",
     });
   }
-  _rerenderWorkflowSection(state, context, actions);
+  // Shelf: a new Workflow loads its own durably autosaved field values.
+  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
 }
 
 async function _handleVersionChange(state, context, actions, versionId) {
@@ -1962,7 +2072,8 @@ async function _handleVersionChange(state, context, actions, versionId) {
       presetName: store.presetName || "",
     });
   }
-  _rerenderWorkflowSection(state, context, actions);
+  // Shelf: a new Version loads its own durably autosaved field values.
+  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
 }
 
 async function _handlePresetChange(state, context, actions, presetId) {
@@ -2107,6 +2218,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
     const ctxResult = await wf.loadRunContext(apiBase, store, store.workflowId, store.workflowVersionId);
     console.debug("[comfymodal workflow] run-context cold load took " + (performance.now() - _coldT0).toFixed(1) + "ms");
     ctrl.mark("validation_end");
+    _normalizeShelfControlSchema(state);
     if (!ctxResult.ok || !store.runContext) {
       ctrl.applyLocalError("Workflow context unavailable; reselect the workflow");
       if (btn) { btn.disabled = false; btn.textContent = "Run"; }
@@ -3545,7 +3657,9 @@ function renderNoteEditor(nr, actions, apiBase) {
 // â”€â”€ Right Workspace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function renderWorkspace(state, context) {
-  const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace" });
+  // Shelf: the right-side workspace is the single result panel (output
+  // canvas, progress, metadata, recent filmstrip) — never a movable card.
+  const workspace = el("div", { class: "comfymodal-studio-workspace", "data-testid": "workspace", "data-shelf-output-panel": "true" });
 
   // Feature tabs
   workspace.appendChild(renderFeatureTabs(state, context));
@@ -3602,6 +3716,16 @@ function renderCanvas(state, context) {
   });
 
   const outputUrl = state.playground && state.playground.lastRunOutput;
+  // Shelf: a Workflow switch marks the previous output stale until a new
+  // run completes. The right-side canvas dims and carries an explicit note.
+  if (outputUrl && state.playground && state.playground._shelfStaleOutput) {
+    canvas.classList.add("is-stale");
+    canvas.appendChild(el("p", {
+      "data-testid": "shelf-stale-note",
+      text: "Output from the previous Workflow — run to refresh.",
+      style: "font-size:var(--font-size-xs);color:#d9a441;margin:0 0 6px;",
+    }));
+  }
   if (currentSpec && currentSpec.isPlaceholder) {
     // Honest disabled placeholder for image-edit features
     const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice", style: "text-align:center;padding:40px 20px;" }, [
@@ -4346,4 +4470,815 @@ function renderFilmstrip(state, context) {
   }
 
   return carousel;
+}
+
+// ── Shelf Playground (Studio Workflow effort, leaf 1.2.2) ────────────────
+// Normalize an array-shaped run-context control_schema into the role-keyed
+// object form (see _rerenderWorkflowSection). No-op for object schemas.
+// When values were derived while the schema was an array they carry pure
+// index keys ("0".."N"); those are re-keyed to their entry roles and the
+// current preset's values win (they were bypassed while the schema was an
+// array). User edits always use real role keys and are never clobbered:
+// repair runs only when index-key pollution is present.
+function _normalizeShelfControlSchema(state) {
+  var store = state && state.playground && state.playground._workflowRun;
+  if (!store || !store.runContext) return;
+  var schema = store.runContext.control_schema;
+  if (!Array.isArray(schema)) return;
+  var obj = {};
+  schema.forEach(function (e) {
+    if (!e || typeof e !== "object") return;
+    var role = e.semantic_role || e.input_name;
+    if (role) obj[role] = e;
+  });
+  store.runContext.control_schema = obj;
+  var values = store.controlValues && typeof store.controlValues === "object" ? store.controlValues : {};
+  var polluted = Object.keys(values).some(function (k) {
+    return /^\d+$/.test(k) && !Object.prototype.hasOwnProperty.call(obj, k);
+  });
+  if (!polluted) return;
+  var repaired = {};
+  Object.keys(values).forEach(function (k) {
+    if (/^\d+$/.test(k) && !Object.prototype.hasOwnProperty.call(obj, k)) {
+      var entry = schema[Number(k)];
+      var role = entry && (entry.semantic_role || entry.input_name);
+      if (role && repaired[role] === undefined) repaired[role] = values[k];
+    } else {
+      repaired[k] = values[k];
+    }
+  });
+  if (store.presetId && Array.isArray(store.presets)) {
+    var preset = null;
+    for (var i = 0; i < store.presets.length; i++) {
+      if (String(store.presets[i].preset_id) === String(store.presetId)) { preset = store.presets[i]; break; }
+    }
+    var fromPreset = {};
+    if (preset) {
+      if (preset.values && typeof preset.values === "object") {
+        for (var vk in preset.values) {
+          if (Object.prototype.hasOwnProperty.call(preset.values, vk)) fromPreset[vk] = preset.values[vk];
+        }
+      }
+      if (preset.model_choices && typeof preset.model_choices === "object") {
+        for (var mk in preset.model_choices) {
+          if (Object.prototype.hasOwnProperty.call(preset.model_choices, mk)) fromPreset[mk] = preset.model_choices[mk];
+        }
+      }
+    }
+    Object.keys(fromPreset).forEach(function (r) {
+      if (Object.prototype.hasOwnProperty.call(obj, r)) repaired[r] = fromPreset[r];
+    });
+  }
+  store.controlValues = repaired;
+}
+
+// Left-sidebar bound field cards for the selected Workflow:
+// - Prompt card fixed at top (never draggable, never in Advanced); output
+//   stays the right-side result panel (never a movable card).
+// - Every other bound field: drag-handle reorder, Advanced placement,
+//   same-row grouping, autosaved workflow-type layout with a subtle
+//   autosaved indicator (no Save button).
+// - Workflow switching goes through the shared picker
+//   (web/studio-workflow-picker.js) with a reuse-values prompt; the old
+//   output is marked stale until a new run completes.
+// - Field renderers come from web/studio-field-blocks.js and role names
+//   from web/studio-bindable-inputs.js — no duplicated catalog here.
+// - Normal field values + layout autosave durably (studio-playground-state
+//   Shelf lane); experiment-only state lives in the separate local draft
+//   lane and never overwrites Workflow values.
+
+var _SHELF_TYPE = "t2i";
+var _SHELF_SAVE_DELAY_MS = 300;
+
+function _shelfStore(state) {
+  return (state && state.playground && state.playground._workflowRun) || null;
+}
+
+function _shelfModule(state) {
+  return (state && state.playground && state.playground._workflowRunModule) || null;
+}
+
+function _shelfReady(state) {
+  var store = _shelfStore(state);
+  var wf = _shelfModule(state);
+  if (!store || !wf || !store.workflowId || !store.workflowVersionId) return null;
+  if (!store.runContext || !store.runContext.mapping) return null;
+  return { store: store, wf: wf };
+}
+
+function _shelfEntries(state) {
+  var ready = _shelfReady(state);
+  if (!ready) return [];
+  var entries = ready.store.runContext.mapping.entries;
+  return Array.isArray(entries) ? entries.filter(function (e) {
+    if (!e || typeof e !== "object") return false;
+    var role = e.semantic_role || e.input_name || "";
+    if (!role || role === "output") return false;
+    return true;
+  }) : [];
+}
+
+function _shelfRoleOf(entry) {
+  return (entry && (entry.semantic_role || entry.input_name)) || "";
+}
+
+// Catalog-owned role name. Unknown schema roles fall back to the mapping
+// display_name (backend truth) — never a second hardcoded name table.
+function _shelfDisplayName(role, entry) {
+  var catalog = role && BINDABLE_INPUTS[role];
+  if (catalog) return catalog.name;
+  if (entry && entry.display_name) return String(entry.display_name);
+  return String(role || "");
+}
+
+// The Prompt card: catalog "prompt" first, then the positive-prompt schema
+// role, then the first multiline entry. Fixed at top, never draggable.
+function _shelfPromptRole(entries) {
+  var roles = entries.map(_shelfRoleOf);
+  if (roles.indexOf("prompt") !== -1) return "prompt";
+  if (roles.indexOf("positive_prompt") !== -1) return "positive_prompt";
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i] && (entries[i].control_kind === "multiline" || entries[i].multiline)) {
+      return _shelfRoleOf(entries[i]);
+    }
+  }
+  return "";
+}
+
+function _shelfEntryFor(entries, role) {
+  for (var i = 0; i < entries.length; i++) {
+    if (_shelfRoleOf(entries[i]) === role) return entries[i];
+  }
+  return null;
+}
+
+// Mapping control_kind → fixed field-block kind (studio-field-blocks.js).
+function _shelfBlockKind(entry) {
+  var kind = entry && entry.control_kind;
+  if (kind === "multiline") return "multiline";
+  if (kind === "integer") return "integer";
+  if (kind === "number" || kind === "float") return "float";
+  if (kind === "enum") return "dropdown";
+  if (kind === "file" || kind === "image" || kind === "model") return "model-picker";
+  if (entry && Array.isArray(entry.enum_options) && entry.enum_options.length) return "dropdown";
+  return "";
+}
+
+function _shelfRenderInput(role, entry, value, onChange) {
+  var kind = _shelfBlockKind(entry);
+  var testid = "shelf-input-" + role;
+  if (kind === "boolean") {
+    var cb = el("input", { type: "checkbox", class: "comfymodal-input", "data-testid": testid });
+    cb.checked = value === true || value === 1 || value === "1" || value === "true";
+    cb.addEventListener("change", function () { onChange(cb.checked); });
+    return cb;
+  }
+  var block = (kind && FIELD_BLOCKS[kind]) || null;
+  if (!block) {
+    var input = el("input", {
+      type: "text",
+      class: "comfymodal-input comfymodal-studio-text-input",
+      value: value !== undefined && value !== null ? String(value) : "",
+      "data-testid": testid,
+    });
+    input.addEventListener("input", function () { onChange(input.value); });
+    return input;
+  }
+  // Model/file roles without options stay read-only: the value comes from
+  // the preset/graph (upload is out of scope, same as the mapped controls).
+  if (kind === "model-picker") {
+    var opts = (entry && entry.enum_options) || [];
+    if (!opts.length) {
+      var ro = el("input", {
+        type: "text",
+        class: "comfymodal-input comfymodal-studio-text-input",
+        value: value !== undefined && value !== null ? String(value) : "",
+        disabled: true,
+        title: "File selection is out of scope — value preserved from preset/graph.",
+        "data-testid": testid,
+      });
+      return ro;
+    }
+    return block.render({ value: value, testid: testid, label: _shelfDisplayName(role, entry), models: opts, onChange: onChange });
+  }
+  var props = {
+    value: value,
+    testid: testid,
+    placeholder: "",
+    onChange: onChange,
+    rules: { minimum: entry.minimum, maximum: entry.maximum, step: entry.step },
+  };
+  if (kind === "dropdown") props.options = (entry && entry.enum_options) || [];
+  if (kind === "multiline") props.rows = 3;
+  return block.render(props);
+}
+
+// Merge the autosaved layout with the live role set: drop roles that no
+// longer exist, append new roles in schema order. Prompt is fixed and never
+// part of the order list.
+function _shelfLayoutFor(entries, promptRole) {
+  var roles = entries.map(_shelfRoleOf).filter(function (r) { return r && r !== promptRole; });
+  var saved = loadShelfLayout(_SHELF_TYPE) || { order: [], rows: {}, advanced: [] };
+  var order = (saved.order || []).filter(function (r) { return roles.indexOf(r) !== -1; });
+  roles.forEach(function (r) { if (order.indexOf(r) === -1) order.push(r); });
+  var rows = {};
+  var maxRow = -1;
+  order.forEach(function (r, i) {
+    var row = saved.rows && saved.rows[r] != null ? Number(saved.rows[r]) : i;
+    if (!Number.isFinite(row) || row < 0) row = i;
+    rows[r] = row;
+    if (row > maxRow) maxRow = row;
+  });
+  var advanced = (saved.advanced || []).filter(function (r) { return roles.indexOf(r) !== -1; });
+  return { order: order, rows: rows, advanced: advanced, maxRow: maxRow };
+}
+
+function _shelfPersistLayout(layout) {
+  saveShelfLayout(_SHELF_TYPE, { order: layout.order, rows: layout.rows, advanced: layout.advanced });
+  _paintShelfAutosaved();
+}
+
+function _paintShelfAutosaved() {
+  var when = new Date();
+  var label = "Autosaved";
+  try {
+    label = "Autosaved \u00b7 " + when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch (e) { /* label fallback above */ }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-testid="shelf-autosaved"]'), function (node) {
+    node.textContent = label;
+    node.title = "Field layout and values save automatically — no Save button needed.";
+  });
+  var pg = null;
+  try {
+    if (typeof window !== "undefined" && window.__studioApi && typeof window.__studioApi.getState === "function") {
+      pg = window.__studioApi.getState().playground;
+    }
+  } catch (e) { /* best-effort paint only */ }
+  if (pg) pg._shelfLastAutosave = when.toISOString();
+}
+
+function _flushShelfSave(state) {
+  var pg = state && state.playground;
+  if (!pg) return;
+  if (pg._shelfSaveTimer) {
+    clearTimeout(pg._shelfSaveTimer);
+    pg._shelfSaveTimer = null;
+  }
+  var ready = _shelfReady(state);
+  if (!ready) return;
+  saveShelfValues(ready.store.workflowId, ready.store.workflowVersionId, ready.store.controlValues || {});
+  _paintShelfAutosaved();
+}
+
+// Restore durably autosaved values for the current selection. Only
+// schema-known roles are applied, then re-validated — never invents keys.
+function _applyShelfSavedValues(state) {
+  var ready = _shelfReady(state);
+  if (!ready) return;
+  var saved = loadShelfValues(ready.store.workflowId, ready.store.workflowVersionId);
+  if (!saved || typeof saved !== "object" || !Object.keys(saved).length) return;
+  var schema = ready.wf.getControlSchema(ready.store);
+  var applied = false;
+  Object.keys(saved).forEach(function (role) {
+    if (Object.prototype.hasOwnProperty.call(schema, role)) {
+      ready.store.controlValues[role] = saved[role];
+      applied = true;
+    }
+  });
+  if (!applied) return;
+  var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
+  ready.store.setControlValues(validation.values);
+}
+
+// Commit one Shelf field edit: same store + validation + gating path as the
+// mapped controls, then debounce the durable values autosave. No re-render
+// (preserves input focus); the mapped input is synced in place.
+function commitShelfValue(state, context, actions, role, rawValue) {
+  var ready = _shelfReady(state);
+  if (!ready) return;
+  ready.store.setControlValue(role, rawValue);
+  var schema = ready.wf.getControlSchema(ready.store);
+  var validation = ready.wf.validateMappedValues(ready.store.controlValues || {}, schema);
+  ready.store.setControlValues(validation.values);
+  ready.store.setReasons((validation.errors || []).map(function (e) { return e.message; }));
+  _syncMappedShelfInput(role, ready.store.controlValues[role]);
+  _syncWorkflowGating(state, context, actions);
+  var pg = state.playground;
+  if (pg._shelfSaveTimer) clearTimeout(pg._shelfSaveTimer);
+  pg._shelfSaveTimer = setTimeout(function () {
+    pg._shelfSaveTimer = null;
+    _flushShelfSave(state);
+  }, _SHELF_SAVE_DELAY_MS);
+}
+
+// One-way DOM sync: keep the mapped control input for the same role showing
+// the Shelf-edited value (store stays the single source of truth).
+function _syncMappedShelfInput(role, value) {
+  try {
+    var node = document.querySelector('[data-testid="workflow-input-' + role + '"]');
+    if (!node || !node.isConnected) return;
+    var str = value !== undefined && value !== null ? String(value) : "";
+    if (node.tagName === "SELECT") {
+      for (var i = 0; i < node.options.length; i++) {
+        if (String(node.options[i].value) === str) { node.selectedIndex = i; break; }
+      }
+      return;
+    }
+    if (node.type === "checkbox") {
+      node.checked = value === true || value === 1 || value === "1" || value === "true";
+      return;
+    }
+    if (node.value !== str) node.value = str;
+  } catch (e) { /* best-effort only */ }
+}
+
+function _shelfFieldCard(state, context, actions, entries, role, layout, fixed) {
+  var entry = _shelfEntryFor(entries, role);
+  if (!entry) return null;
+  var ready = _shelfReady(state);
+  var current = (ready && ready.store.controlValues && typeof ready.store.controlValues === "object")
+    ? ready.store.controlValues : {};
+  var value = Object.prototype.hasOwnProperty.call(current, role) ? current[role] : undefined;
+
+  var card = el("div", {
+    class: "comfymodal-studio-shelf-card" + (fixed ? " is-prompt" : ""),
+    "data-testid": fixed ? "shelf-prompt-card" : "shelf-field-" + role,
+    "data-role": role,
+  });
+
+  var head = el("div", { class: "comfymodal-studio-shelf-card-head" });
+  if (!fixed) {
+    var grip = el("span", {
+      class: "comfymodal-studio-shelf-drag",
+      "data-testid": "shelf-drag-" + role,
+      text: "\u22ee\u22ee",
+      title: "Drag to reorder",
+    });
+    grip.setAttribute("draggable", "true");
+    grip.setAttribute("aria-label", "Drag to reorder " + _shelfDisplayName(role, entry));
+    grip.addEventListener("dragstart", function (ev) {
+      try {
+        ev.dataTransfer.setData("text/shelf-role", role);
+        ev.dataTransfer.effectAllowed = "move";
+      } catch (e) { /* clipboard-less DnD still works via drop target */ }
+      card.classList.add("is-dragging");
+    });
+    grip.addEventListener("dragend", function () {
+      card.classList.remove("is-dragging");
+      Array.prototype.forEach.call(document.querySelectorAll(".comfymodal-studio-shelf-card.is-drop-target"), function (n) {
+        n.classList.remove("is-drop-target");
+      });
+    });
+    head.appendChild(grip);
+  }
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-shelf-card-label",
+    text: _shelfDisplayName(role, entry),
+  }));
+  if (!fixed) {
+    var inAdvanced = layout.advanced.indexOf(role) !== -1;
+    var groupBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
+      "data-testid": "shelf-group-" + role,
+      text: "Same row",
+      title: "Group with the previous card in the same row",
+    });
+    groupBtn.setAttribute("aria-pressed", "false");
+    groupBtn.addEventListener("click", function () {
+      _shelfToggleGroup(state, context, actions, role);
+    });
+    head.appendChild(groupBtn);
+    var advBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn" + (inAdvanced ? " is-on" : ""),
+      "data-testid": "shelf-advanced-" + role,
+      text: "Advanced",
+      title: inAdvanced ? "Remove from Advanced" : "Move to Advanced",
+    });
+    advBtn.setAttribute("aria-pressed", inAdvanced ? "true" : "false");
+    advBtn.addEventListener("click", function () {
+      _shelfToggleAdvanced(state, context, actions, role);
+    });
+    head.appendChild(advBtn);
+  }
+  card.appendChild(head);
+
+  card.addEventListener("dragover", function (ev) {
+    if (fixed) return;
+    ev.preventDefault();
+    try { ev.dataTransfer.dropEffect = "move"; } catch (e) {}
+    card.classList.add("is-drop-target");
+  });
+  card.addEventListener("dragleave", function () {
+    card.classList.remove("is-drop-target");
+  });
+  card.addEventListener("drop", function (ev) {
+    if (fixed) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    var dragged = "";
+    try { dragged = ev.dataTransfer.getData("text/shelf-role"); } catch (e) {}
+    card.classList.remove("is-drop-target");
+    if (dragged && dragged !== role) _shelfMoveBefore(state, context, actions, dragged, role);
+  });
+
+  var body = el("div", { class: "comfymodal-studio-shelf-card-body" });
+  body.appendChild(_shelfRenderInput(role, entry, value, function (next) {
+    commitShelfValue(state, context, actions, role, next);
+  }));
+  card.appendChild(body);
+  return card;
+}
+
+function _shelfToggleAdvanced(state, context, actions, role) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!role || role === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var idx = layout.advanced.indexOf(role);
+  if (idx === -1) layout.advanced.push(role);
+  else layout.advanced.splice(idx, 1);
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _shelfToggleGroup(state, context, actions, role) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!role || role === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var visible = layout.order.filter(function (r) { return layout.advanced.indexOf(r) === -1; });
+  var pos = visible.indexOf(role);
+  if (pos <= 0) return;
+  var prev = visible[pos - 1];
+  if (layout.rows[role] === layout.rows[prev]) {
+    // Already grouped: assign a fresh row (ungroup).
+    layout.maxRow += 1;
+    layout.rows[role] = layout.maxRow;
+  } else {
+    layout.rows[role] = layout.rows[prev];
+  }
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function _shelfMoveBefore(state, context, actions, dragged, before, targetRow) {
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+  if (!dragged || !before || dragged === before || dragged === promptRole || before === promptRole) return;
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var order = layout.order.filter(function (r) { return r !== dragged; });
+  var at = order.indexOf(before);
+  if (at === -1) order.push(dragged);
+  else order.splice(at, 0, dragged);
+  layout.order = order;
+  if (targetRow != null && Number.isFinite(Number(targetRow))) {
+    layout.rows[dragged] = Number(targetRow);
+    if (Number(targetRow) > layout.maxRow) layout.maxRow = Number(targetRow);
+  }
+  _shelfPersistLayout(layout);
+  _refreshShelfSection(state, context, actions);
+}
+
+function renderShelfSection(state, context, actions) {
+  var section = el("div", {
+    class: "comfymodal-studio-shelf",
+    "data-testid": "shelf-section",
+  });
+  _populateShelfSection(section, state, context, actions);
+  return section;
+}
+
+function _populateShelfSection(section, state, context, actions) {
+  while (section.firstChild) section.removeChild(section.firstChild);
+  var store = _shelfStore(state);
+  if (!store || !store.workflowId) {
+    section.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      "data-testid": "shelf-empty",
+      text: "Select a Workflow and Version to see Shelf fields.",
+    }));
+    return;
+  }
+
+  var head = el("div", { class: "comfymodal-studio-shelf-head" });
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-shelf-workflow-name",
+    "data-testid": "shelf-workflow-name",
+    text: store.workflowName || store.workflowId,
+  }));
+  var switchBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
+    "data-testid": "shelf-workflow-switch",
+    text: "Change",
+    title: "Switch Workflow via the shared picker",
+  });
+  switchBtn.addEventListener("click", function () {
+    _openShelfPickerDialog(state, context, actions);
+  });
+  head.appendChild(switchBtn);
+  // Subtle autosaved indicator — layout and values persist automatically,
+  // so the Shelf never renders a Save button.
+  head.appendChild(el("span", {
+    class: "comfymodal-studio-shelf-autosaved",
+    "data-testid": "shelf-autosaved",
+    text: "Autosaved",
+    title: "Field layout and values save automatically — no Save button needed.",
+  }));
+  section.appendChild(head);
+
+  var ready = _shelfReady(state);
+  if (!ready) {
+    section.appendChild(el("p", {
+      class: "comfymodal-studio-control-note",
+      "data-testid": "shelf-unmapped",
+      text: "This Workflow version has no mapped fields yet.",
+    }));
+    return;
+  }
+  var entries = _shelfEntries(state);
+  var promptRole = _shelfPromptRole(entries);
+
+  if (promptRole) {
+    var promptCard = _shelfFieldCard(state, context, actions, entries, promptRole, null, true);
+    if (promptCard) section.appendChild(promptCard);
+  }
+
+  var layout = _shelfLayoutFor(entries, promptRole);
+  var fieldsBox = el("div", {
+    class: "comfymodal-studio-shelf-fields",
+    "data-testid": "shelf-fields",
+  });
+  var visible = layout.order.filter(function (r) { return layout.advanced.indexOf(r) === -1; });
+  var rowGroups = {};
+  visible.forEach(function (r) {
+    var row = layout.rows[r];
+    if (!rowGroups[row]) rowGroups[row] = [];
+    rowGroups[row].push(r);
+  });
+  Object.keys(rowGroups).map(Number).sort(function (a, b) { return a - b; }).forEach(function (row) {
+    var rowEl = el("div", {
+      class: "comfymodal-studio-shelf-row",
+      "data-testid": "shelf-row-" + row,
+      "data-row": String(row),
+    });
+    rowGroups[row].forEach(function (r) {
+      var card = _shelfFieldCard(state, context, actions, entries, r, layout, false);
+      if (card) {
+        card.addEventListener("dragover", function (ev) {
+          ev.preventDefault();
+          rowEl.classList.add("is-drop-target");
+        });
+        card.addEventListener("dragleave", function () {
+          rowEl.classList.remove("is-drop-target");
+        });
+        card.addEventListener("drop", function (ev) {
+          rowEl.classList.remove("is-drop-target");
+        });
+        rowEl.appendChild(card);
+      }
+      // Row-level drop appends the dragged card to the end of the row.
+      rowEl.addEventListener("dragover", function (ev) { ev.preventDefault(); });
+      rowEl.addEventListener("drop", function (ev) {
+        var dragged = "";
+        try { dragged = ev.dataTransfer.getData("text/shelf-role"); } catch (e) {}
+        if (!dragged) return;
+        var group = rowGroups[row] || [];
+        var last = group[group.length - 1];
+        if (dragged && dragged !== last) _shelfMoveBefore(state, context, actions, dragged, last, row);
+      });
+    });
+    fieldsBox.appendChild(rowEl);
+  });
+  section.appendChild(fieldsBox);
+
+  if (layout.advanced.length) {
+    var advWrap = el("div", { class: "comfymodal-studio-shelf-advanced-wrap" });
+    var advToggle = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn",
+      "data-testid": "shelf-advanced-toggle",
+      text: "Advanced (" + layout.advanced.length + ")",
+    });
+    advToggle.setAttribute("aria-expanded", "false");
+    var advBox = el("div", {
+      class: "comfymodal-studio-shelf-advanced",
+      "data-testid": "shelf-advanced-section",
+      hidden: true,
+    });
+    advToggle.addEventListener("click", function () {
+      var open = advBox.hidden;
+      advBox.hidden = !open;
+      advToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    advWrap.appendChild(advToggle);
+    layout.advanced.forEach(function (r) {
+      var card = _shelfFieldCard(state, context, actions, entries, r, layout, false);
+      if (card) advBox.appendChild(card);
+    });
+    advWrap.appendChild(advBox);
+    section.appendChild(advWrap);
+  }
+}
+
+// Re-populate the mounted Shelf section in place. When a Workflow was just
+// selected (no Shelf mounted yet), mount it after the workflow selector.
+function _refreshShelfSection(state, context, actions) {
+  _syncShelfLegacyVisibility(state);
+  var section = document.querySelector('[data-testid="shelf-section"]');
+  if (section && section.isConnected) {
+    _populateShelfSection(section, state, context, actions);
+    return;
+  }
+  if (!_isModernRunSelected(state)) return;
+  var panel = document.querySelector('[data-testid="control-panel"]');
+  var anchor = panel && panel.querySelector('[data-testid="workflow-selector-section"]');
+  if (!panel || !anchor) return;
+  var fresh = renderShelfSection(state, context, actions);
+  anchor.parentNode.insertBefore(fresh, anchor.nextSibling);
+}
+
+// Shelf flow owns the bound fields, so legacy Backend/Preset nodes mounted
+// by an earlier (pre-selection) panel render are removed once a modern
+// Workflow is selected. Full panel re-renders already skip them via the
+// renderControlPanel guards; this covers targeted selection updates that
+// never re-render the panel. Never re-adds: the legacy lane reappears only
+// through a full re-render with no Workflow selected.
+function _syncShelfLegacyVisibility(state) {
+  if (!_isModernRunSelected(state)) return;
+  var panel = document.querySelector('[data-testid="control-panel"]');
+  if (!panel || !panel.isConnected) return;
+  var backendSelect = panel.querySelector('[data-testid="backend-select"]');
+  if (backendSelect && backendSelect.isConnected) {
+    var group = backendSelect.closest(".comfymodal-studio-control-group");
+    if (group && group.isConnected) group.remove();
+    else backendSelect.remove();
+  }
+  var controls = panel.querySelector('[data-testid="controls-container"]');
+  if (controls && controls.isConnected) controls.remove();
+}
+
+// ── Shelf Workflow switching (shared picker + reuse prompt) ─────────────
+
+function _closeShelfDialog() {
+  var existing = document.querySelector('[data-testid="shelf-picker-dialog"]');
+  if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+  var reuse = document.querySelector('[data-testid="shelf-reuse-dialog"]');
+  if (reuse && reuse.parentNode) reuse.parentNode.removeChild(reuse);
+}
+
+function _openShelfPickerDialog(state, context, actions) {
+  _closeShelfDialog();
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var store = _shelfStore(state);
+  var currentId = store && store.workflowId ? String(store.workflowId) : "";
+
+  var overlay = el("div", {
+    class: "comfymodal-studio-shelf-dialog-overlay",
+    "data-testid": "shelf-picker-dialog",
+  });
+  var dialog = el("div", {
+    class: "comfymodal-studio-shelf-dialog",
+    role: "dialog",
+    "aria-label": "Switch Workflow",
+  });
+  dialog.appendChild(el("h4", {
+    class: "comfymodal-studio-block-heading",
+    text: "Switch Workflow",
+  }));
+  var closeBtn = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn",
+    "data-testid": "shelf-picker-close",
+    text: "Close",
+  });
+  closeBtn.addEventListener("click", _closeShelfDialog);
+  dialog.appendChild(closeBtn);
+  dialog.appendChild(renderWorkflowPicker({
+    apiBase: apiBase,
+    mode: "single",
+    selectedIds: currentId ? [currentId] : [],
+    confirmLabel: "Use workflow",
+    onConfirm: function (ids) {
+      var next = ids && ids.length ? String(ids[0]) : "";
+      _closeShelfDialog();
+      if (next && next !== currentId) _confirmShelfSwitch(state, context, actions, next);
+    },
+  }));
+  overlay.addEventListener("click", function (ev) {
+    if (ev.target === overlay) _closeShelfDialog();
+  });
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  try {
+    var onKey = function (ev) {
+      if (ev.key === "Escape") {
+        _closeShelfDialog();
+        document.removeEventListener("keydown", onKey);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+  } catch (e) { /* non-fatal */ }
+}
+
+async function _confirmShelfSwitch(state, context, actions, nextId) {
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var ready = _shelfReady(state);
+  var currentRoles = ready ? Object.keys(ready.wf.getControlSchema(ready.store)) : [];
+  var nextRoles = [];
+  try {
+    var mod = await import("./studio-backend-api.js");
+    var ctxRes = await mod.getWorkflowRunContext(apiBase, nextId);
+    var rawSchema = (ctxRes && ctxRes.control_schema) || {};
+    // Array-shaped (mock) or role-keyed (backend) — accept both.
+    nextRoles = Array.isArray(rawSchema)
+      ? rawSchema.map(function (e) { return (e && (e.semantic_role || e.input_name)) || ""; }).filter(Boolean)
+      : Object.keys(rawSchema);
+  } catch (e) { nextRoles = []; }
+  var matching = currentRoles.filter(function (r) { return nextRoles.indexOf(r) !== -1; });
+
+  var overlay = el("div", {
+    class: "comfymodal-studio-shelf-dialog-overlay",
+    "data-testid": "shelf-reuse-dialog",
+  });
+  var dialog = el("div", {
+    class: "comfymodal-studio-shelf-dialog",
+    role: "dialog",
+    "aria-label": "Reuse field values",
+  });
+  dialog.appendChild(el("p", {
+    text: matching.length
+      ? "Reuse " + matching.length + " matching field value(s) from the current Workflow?"
+      : "No matching fields — load the new Workflow defaults?",
+  }));
+  var yes = el("button", {
+    type: "button",
+    class: "comfymodal-primary-btn",
+    "data-testid": "shelf-reuse-yes",
+    text: "Reuse values",
+    style: "width:auto;",
+  });
+  var no = el("button", {
+    type: "button",
+    class: "comfymodal-secondary-btn",
+    "data-testid": "shelf-reuse-no",
+    text: matching.length ? "Use defaults" : "Continue",
+    style: "width:auto;",
+  });
+  yes.addEventListener("click", function () {
+    _closeShelfDialog();
+    _performShelfSwitch(state, context, actions, nextId, true);
+  });
+  no.addEventListener("click", function () {
+    _closeShelfDialog();
+    _performShelfSwitch(state, context, actions, nextId, false);
+  });
+  dialog.appendChild(yes);
+  dialog.appendChild(no);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+}
+
+async function _performShelfSwitch(state, context, actions, nextId, reuse) {
+  var pg = state && state.playground;
+  var wf = _shelfModule(state);
+  var store = _shelfStore(state);
+  if (!pg || !wf || !store || !nextId) return;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  // Flush pending autosaves so the outgoing Workflow keeps its edits.
+  _flushShelfSave(state);
+  var carried = {};
+  if (reuse) {
+    carried = Object.assign({}, store.controlValues || {});
+  }
+  var hadOutput = !!(pg.lastRunOutput || pg._selectedRun);
+  var result = await wf.selectWorkflow(apiBase, store, nextId);
+  await _loadWorkflowModelLibrary(state, apiBase);
+  if (result && result.ok) {
+    if (reuse) {
+      var schema = wf.getControlSchema(store);
+      Object.keys(carried).forEach(function (role) {
+        if (Object.prototype.hasOwnProperty.call(schema, role)) {
+          store.controlValues[role] = carried[role];
+        }
+      });
+      var validation = wf.validateMappedValues(store.controlValues || {}, schema);
+      store.setControlValues(validation.values);
+      saveShelfValues(store.workflowId, store.workflowVersionId, store.controlValues || {});
+    } else {
+      _applyShelfSavedValues(state);
+    }
+    wf.saveWorkflowSelection({
+      workflowId: store.workflowId,
+      workflowVersionId: store.workflowVersionId,
+      presetId: store.presetId,
+      workflowName: store.workflowName || "",
+      presetName: store.presetName || "",
+    });
+  }
+  // Old output stays visible but stale until a new run completes.
+  if (hadOutput) pg._shelfStaleOutput = true;
+  if (context && context.setPage) context.setPage("playground");
 }

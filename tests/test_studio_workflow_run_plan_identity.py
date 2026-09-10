@@ -50,7 +50,11 @@ if str(REPO_ROOT) not in sys.path:
 import canonical_execution
 import studio_workflow_run as swr
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan
-from studio_domain import WorkflowDomainService, derive_mapping_candidates
+from studio_domain import (
+    WorkflowDomainService,
+    WorkflowPresetValidationError,
+    derive_mapping_candidates,
+)
 from workflow_metadata import prompt_sha256
 
 # A subset of node classes used by the txt2img / clip-repair fixtures, stubbed
@@ -683,6 +687,58 @@ class StudioWorkflowRunPlanIdentityTests(unittest.TestCase):
 
         # deployment_identity preserved through the reconstruction here too.
         self.assertEqual(dict(plan.deployment_identity), dict(canonical.deployment_identity))
+
+    def test_workflow_wrapper_config_autosaves_as_one_durable_record(self):
+        """Normal wrapper content/layout survives restart; experiment state does not."""
+        graph = {"nodes": [{"id": 1, "class_type": "CLIPTextEncode"}]}
+        bindings = {
+            "prompt": {"node_id": "1", "input_name": "text"},
+            "seed": {"node_id": "2", "input_name": "seed"},
+            "model_unet": {"node_id": "3", "input_name": "ckpt_name"},
+            "vae": {"node_id": "4", "input_name": "vae_name"},
+            "clip": {"node_id": "5", "input_name": "clip_name"},
+        }
+        service = WorkflowDomainService(self.root)
+        workflow = service.create_workflow(
+            "Durable Wrapper",
+            workflow_type="t2i",
+            static_graph=graph,
+            bindings=bindings,
+            output_binding={"node_id": "6"},
+            saved_values={"prompt": "hello", "seed": 0},
+            layout_profile={"order": ["prompt", "seed"]},
+            allowed_options={"seed": [0, 1]},
+            require_complete=True,
+        )
+        saved = service.autosave_workflow(
+            workflow["workflow_id"],
+            {
+                "saved_values": {"prompt": "updated", "seed": 1},
+                "layout_profile": {"order": ["seed", "prompt"]},
+            },
+        )
+        self.assertEqual(saved["static_graph"], graph)
+        self.assertEqual(saved["saved_values"]["seed"], 1)
+        self.assertEqual(saved["layout_profile"]["order"][0], "seed")
+
+        restarted = WorkflowDomainService(self.root)
+        self.assertEqual(
+            restarted.get_workflow_config(workflow["workflow_id"]),
+            {
+                "workflow_type": "t2i",
+                "static_graph": graph,
+                "bindings": bindings,
+                "output_binding": {"node_id": "6"},
+                "saved_values": {"prompt": "updated", "seed": 1},
+                "layout_profile": {"order": ["seed", "prompt"]},
+                "allowed_options": {"seed": [0, 1]},
+            },
+        )
+        with self.assertRaises(WorkflowPresetValidationError) as ctx:
+            restarted.autosave_workflow(
+                workflow["workflow_id"], {"experiment_draft": {"axes": ["seed"]}}
+            )
+        self.assertIn("experiment-only", str(ctx.exception))
 
     # ── shared builder for the round-trip test ───────────────────────────
 

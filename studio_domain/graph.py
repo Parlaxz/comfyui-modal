@@ -351,3 +351,174 @@ def extract_dependency_metadata(capture: dict[str, Any]) -> dict[str, Any]:
         "model_stack": extract_model_stack(prompt),
         "node_classes": sorted(node_classes),
     }
+
+
+def is_ui_workflow_format(graph_json: Any) -> bool:
+    """True when graph_json is a ComfyUI UI-format workflow (nodes list).
+
+    UI exports (file import, canvas save) carry ``{"nodes": [...], "links":
+    [...]}``; API captures carry ``{node_id: {class_type, inputs}}``.
+    """
+    return (
+        isinstance(graph_json, dict)
+        and isinstance(graph_json.get("nodes"), list)
+    )
+
+
+_WIDGET_TYPE_NAMES = frozenset({
+    "INT", "FLOAT", "NUMBER", "STRING", "BOOLEAN", "COMBO", "ENUM",
+})
+
+
+def _is_widget_input(ui_entry: Any, type_name: str, options: dict[str, Any]) -> bool:
+    """Decide whether a node-def input is widget-backed.
+
+    The UI ``inputs`` array marks widget-backed slots explicitly with a
+    ``widget`` key; otherwise fall back to the type-spec heuristic (scalar /
+    combo specs are widgets, custom UPPERCASE slot types are links).
+    """
+    if isinstance(ui_entry, dict) and "widget" in ui_entry:
+        return True
+    if type_name in _WIDGET_TYPE_NAMES:
+        return True
+    if not isinstance(options, dict):
+        return False
+    return any(
+        key in options
+        for key in ("min", "max", "step", "multiline", "enum", "options")
+    )
+
+
+def ui_graph_to_api_prompt(
+    graph_json: Any,
+    *,
+    node_def_provider: Optional[Callable[[str], Optional[tuple[dict, dict]]]] = None,
+) -> dict[str, dict[str, Any]]:
+    """Convert a ComfyUI UI-format workflow to an API-format prompt.
+
+    Maps each UI node ``{id, type, inputs: [{name, link, widget?}],
+    widgets_values}`` to ``{node_id: {class_type, inputs}}`` using the same
+    positional widget semantics as the canvas (``comparison._ensure_api_format``
+    pattern): linked slots become ``[origin_id, origin_slot]`` connection
+    specs and consume no widget value; unconnected widget-backed inputs
+    consume ``widgets_values`` in node-def order. Pure-widget nodes (empty
+    UI ``inputs`` array, e.g. seed/sampler selectors) resolve through the
+    node-def input order, which requires the registry (or an injected
+    provider); without defs their values are unrecoverable and skipped.
+
+    Never raises on malformed graphs — unparseable nodes/links are skipped.
+    """
+    if not is_ui_workflow_format(graph_json):
+        return {}
+    nodes = graph_json.get("nodes") or []
+    links = graph_json.get("links") or []
+
+    # Index links by (target_id, target_slot) → (origin_id, origin_slot).
+    targets: dict[tuple[str, int], tuple[str, int]] = {}
+    if isinstance(links, list):
+        for link in links:
+            try:
+                if not isinstance(link, (list, tuple)) or len(link) < 5:
+                    continue
+                _lid, origin_id, origin_slot, target_id, target_slot = link[:5]
+                targets[(str(target_id), int(target_slot))] = (
+                    str(origin_id), int(origin_slot)
+                )
+            except (TypeError, ValueError):
+                continue
+
+    prompt: dict[str, dict[str, Any]] = {}
+    provider = node_def_provider or _probe_node_def
+    for node in nodes:
+        try:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("id")
+            class_type = node.get("type")
+            if node_id is None or not class_type:
+                continue
+            node_id_str = str(node_id)
+            class_type_str = str(class_type)
+
+            ui_inputs = node.get("inputs")
+            ui_by_name: dict[str, dict[str, Any]] = {}
+            ui_by_slot: dict[int, dict[str, Any]] = {}
+            if isinstance(ui_inputs, list):
+                for slot, entry in enumerate(ui_inputs):
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name")
+                    if isinstance(name, str) and name:
+                        ui_by_name[name] = entry
+                    ui_by_slot[slot] = entry
+
+            widgets_values = node.get("widgets_values")
+            widget_pool = list(widgets_values) if isinstance(widgets_values, list) else []
+            wi = 0
+
+            def _next_widget() -> Any:
+                nonlocal wi
+                if wi < len(widget_pool):
+                    value = widget_pool[wi]
+                    wi += 1
+                    return value
+                return None
+
+            defs: tuple[dict, dict] | None = None
+            try:
+                probed = provider(class_type_str)
+                if isinstance(probed, tuple) and len(probed) == 2:
+                    defs = (dict(probed[0] or {}), dict(probed[1] or {}))
+            except Exception:
+                defs = None
+
+            inputs: dict[str, Any] = {}
+            consumed_defs: set[str] = set()
+            if defs is not None:
+                for defs_dict in defs:
+                    for input_name, spec in defs_dict.items():
+                        if input_name in consumed_defs:
+                            continue
+                        consumed_defs.add(input_name)
+                        type_name, options = _parse_type_spec(spec)
+                        ui_entry = ui_by_name.get(input_name)
+                        link = ui_entry.get("link") if isinstance(ui_entry, dict) else None
+                        if link is not None and isinstance(ui_entry, dict):
+                            # Linked slot: resolve origin via slot index.
+                            slot = next(
+                                (s for s, e in ui_by_slot.items() if e is ui_entry),
+                                None,
+                            )
+                            conn = targets.get((node_id_str, slot)) if slot is not None else None
+                            if conn is not None:
+                                inputs[input_name] = [conn[0], conn[1]]
+                            else:
+                                inputs[input_name] = None
+                        elif _is_widget_input(ui_entry, type_name, options):
+                            inputs[input_name] = _next_widget()
+                        else:
+                            inputs[input_name] = None
+
+            # Slots the defs did not cover (unknown class or def drift):
+            # linked slots still resolve; widget-backed unconnected slots
+            # consume positionally (comparison._ensure_api_format pattern).
+            for name, ui_entry in ui_by_name.items():
+                if name in inputs:
+                    continue
+                link = ui_entry.get("link")
+                if link is not None:
+                    slot = next(
+                        (s for s, e in ui_by_slot.items() if e is ui_entry),
+                        None,
+                    )
+                    conn = targets.get((node_id_str, slot)) if slot is not None else None
+                    inputs[name] = [conn[0], conn[1]] if conn is not None else None
+                elif "widget" in ui_entry:
+                    inputs[name] = _next_widget()
+                else:
+                    inputs[name] = None
+
+            prompt[node_id_str] = {"class_type": class_type_str, "inputs": inputs}
+        except Exception:
+            continue
+    return prompt

@@ -300,6 +300,59 @@ function _studioSeed(sid) {
   return s;
 }
 
+// Mirror of the engine's listFakeWorkflows filter semantics (search/tag/
+// folder/favorite) applied to the legacy wf_fake record so picker
+// list/search filtering is consistent across both sources.
+function _legacyMatchesPickerQuery(wf, q) {
+  const search = String((q && q.search) || "").toLowerCase();
+  if (search) {
+    const hay = [wf.name, wf.description].filter(Boolean).join(" ").toLowerCase();
+    if (hay.indexOf(search) === -1) return false;
+  }
+  const tag = String((q && q.tag) || "");
+  if (tag && !((wf.tags || []).includes(tag))) return false;
+  const folder = String((q && q.folder) || "");
+  if (folder && !(String(wf.folder || "") === folder ||
+    String(wf.folder || "").startsWith(folder + "/"))) return false;
+  if (String((q && q.favorite) || "") === "1" && !wf.favorite) return false;
+  return true;
+}
+
+// ── Workflow binding state (leaf 1.2.1 follow-up, session-scoped) ───────
+// The engine seeds immutable mappings for mapped versions but exposes no
+// binding-mutation surface. Bindings created here via POST .../mapping live
+// in this server-local map (keyed by session + version) so the fake harness
+// can exercise the exact-binding flow: candidates → create (409 when a
+// mapping already exists) → read-back. Seeded engine mappings always win;
+// local state only covers versions the engine reports as unmapped.
+const LOCAL_BINDINGS = new Map(); // `${sid}::${vid}` → mapping record
+let _localBindingSeq = 0;
+
+function _bindingKey(sid, vid) {
+  return `${sid}::${vid}`;
+}
+
+// Resolve a version across both stores: the legacy wf_fake record and the
+// seeded engine dataset. Returns null when the version id is unknown.
+function _resolveFakeVersion(sid, vid) {
+  const s = _studioSeed(sid);
+  if (vid === s.version.workflow_version_id) return { record: s.version, legacy: true };
+  const r = engine.getFakeWorkflowVersion(sid, vid);
+  if (r && r.status === "ok" && r.version) return { record: r.version, legacy: false };
+  return null;
+}
+
+// Effective mapping for a version: local creation first, then the engine.
+// (Engine mappings are immutable seeds; local state only exists where the
+// engine reports no mapping.)
+function _effectiveFakeMapping(sid, vid) {
+  const local = LOCAL_BINDINGS.get(_bindingKey(sid, vid));
+  if (local) return local;
+  const r = engine.getFakeMapping(sid, vid);
+  if (r && r.mapping) return r.mapping;
+  return null;
+}
+
 // ── Static file serving ─────────────────────────────────────────────────
 
 async function _serveFile(res, fullPath, fallbackContentType) {
@@ -585,7 +638,19 @@ const ROUTES = [
 
   // Studio Workflows (deterministic fake dataset; see _studioSeed above).
   // Static paths before /workflows/:id catch-alls (regexes are anchored).
-  ["GET", "/comfymodal/studio/workflows/folders", async (res) => _json(res, { status: "ok", folders: [] })],
+  // Picker list/search (leaf 1.2.1): the legacy wf_fake record goes through
+  // the SAME search/tag/folder/favorite filter semantics as the seeded
+  // platform workflows so picker search results stay deterministic.
+  ["GET", "/comfymodal/studio/workflows/folders", async (res) => {
+    const seeded = engine.listFakeWorkflows(res._sid, {});
+    const set = new Set();
+    (Array.isArray(seeded.workflows) ? seeded.workflows : []).forEach((w) => {
+      if (w && w.folder) set.add(String(w.folder));
+    });
+    const legacy = _studioSeed(res._sid).workflow;
+    if (legacy && legacy.folder) set.add(String(legacy.folder));
+    _json(res, { status: "ok", folders: Array.from(set).sort() });
+  }],
   ["GET", "/comfymodal/studio/workflows/tags", async (res) => _json(res, { status: "ok", tags: [] })],
   ["GET", "/comfymodal/studio/workflows", async (res) => {
     // The seeded platform workflows (wf_text2img / wf_incomplete / wf_fail)
@@ -593,7 +658,8 @@ const ROUTES = [
     const s = _studioSeed(res._sid);
     const q = Object.fromEntries(res._url.searchParams.entries());
     const seeded = engine.listFakeWorkflows(res._sid, q);
-    const workflows = [Object.assign({}, s.workflow)].concat(
+    const legacy = Object.assign({}, s.workflow);
+    const workflows = (_legacyMatchesPickerQuery(legacy, q) ? [legacy] : []).concat(
       Array.isArray(seeded.workflows) ? seeded.workflows : []
     );
     _json(res, { status: "ok", workflows });
@@ -645,8 +711,43 @@ const ROUTES = [
     _json(res, r, r._httpStatus || 200);
   }],
   ["GET", "/comfymodal/studio/workflows/versions/:vid/mapping", async (res, body, params) => {
-    const r = engine.getFakeMapping(res._sid, params.vid);
-    _json(res, r, r._httpStatus || 200);
+    if (!_resolveFakeVersion(res._sid, params.vid)) return _error(res, "version not found", 404);
+    _json(res, { status: "ok", mapping: _effectiveFakeMapping(res._sid, params.vid) });
+  }],
+  // Binding candidates + creation (leaf 1.2.1 follow-up). Candidates mirror
+  // the workflows-mock contract {status, candidates:{entries,
+  // output_node_id}}: the effective mapping's entries when the version is
+  // mapped, otherwise an empty (but well-shaped) proposal set. Creation is
+  // immutable like production: a second POST for a mapped version is 409.
+  ["GET", "/comfymodal/studio/workflows/versions/:vid/mapping/candidates", async (res, body, params) => {
+    if (!_resolveFakeVersion(res._sid, params.vid)) return _error(res, "version not found", 404);
+    const mapping = _effectiveFakeMapping(res._sid, params.vid);
+    _json(res, {
+      status: "ok",
+      candidates: {
+        entries: mapping && Array.isArray(mapping.entries) ? mapping.entries : [],
+        output_node_id: (mapping && mapping.output_node_id) || null,
+      },
+    });
+  }],
+  ["POST", "/comfymodal/studio/workflows/versions/:vid/mapping", async (res, body, params) => {
+    if (!_resolveFakeVersion(res._sid, params.vid)) return _error(res, "version not found", 404);
+    if (_effectiveFakeMapping(res._sid, params.vid)) {
+      return _json(res, {
+        status: "error",
+        message: "This version already has an immutable mapping. Create a new version to change the mapping.",
+      }, 409);
+    }
+    const b = body || {};
+    _localBindingSeq += 1;
+    const mapping = {
+      mapping_id: `wmap_local_${_localBindingSeq}`,
+      workflow_version_id: params.vid,
+      output_node_id: b.output_node_id || null,
+      entries: Array.isArray(b.entries) ? b.entries : [],
+    };
+    LOCAL_BINDINGS.set(_bindingKey(res._sid, params.vid), mapping);
+    _json(res, { status: "ok", mapping });
   }],
   ["GET", "/comfymodal/studio/workflows/versions/:vid", async (res, body, params) => {
     const s = _studioSeed(res._sid);

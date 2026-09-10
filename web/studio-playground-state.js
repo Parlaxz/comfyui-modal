@@ -349,6 +349,202 @@ function _deepCloneObject(obj) {
   }
 }
 
+// ── Shelf Playground Persistence ──────────────────────────────────────────
+//
+// The Shelf (Studio Workflow effort, leaf 1.2.2) keeps two strictly separate
+// persistence lanes:
+//
+//   1. Durable lane — normal field values + field layout. Values are keyed by
+//      workflow+version so a reload restores exactly what the user typed;
+//      layout is keyed by workflow type (currently "t2i") so every workflow
+//      of the same type shares its card order/rows/Advanced placement.
+//   2. Local experiment draft lane — experiment-only state (selected
+//      workflows, axes, pills, per-workflow unique values). It lives under
+//      its own key and never overwrites the durable lane.
+//
+// No migration: unknown/malformed payloads degrade to empty defaults.
+
+const SHELF_LAYOUT_KEY = "comfymodal.studio.shelf.layout.v1";
+const SHELF_VALUES_KEY = "comfymodal.studio.shelf.values.v1";
+const SHELF_EXPERIMENT_DRAFT_KEY = "comfymodal.studio.shelf.experiment.v1";
+
+function _shelfValuesKey(workflowId, versionId) {
+  return `${workflowId || ""}::${versionId || ""}`;
+}
+
+/**
+ * Load the autosaved Shelf layout for a workflow type.
+ * @param {string} workflowType
+ * @returns {{order: string[], rows: object, advanced: string[]}|null}
+ */
+export function loadShelfLayout(workflowType) {
+  if (!workflowType) return null;
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(SHELF_LAYOUT_KEY);
+    if (!raw) return null;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return null;
+    const entry = all[String(workflowType)];
+    if (!entry || typeof entry !== "object") return null;
+    return {
+      order: Array.isArray(entry.order) ? entry.order.filter((r) => typeof r === "string") : [],
+      rows: entry.rows && typeof entry.rows === "object" ? _deepCloneObject(entry.rows) : {},
+      advanced: Array.isArray(entry.advanced) ? entry.advanced.filter((r) => typeof r === "string") : [],
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Autosave the Shelf layout for a workflow type. No Save button exists;
+ * callers persist on every order/row/Advanced change.
+ * @param {string} workflowType
+ * @param {{order?: string[], rows?: object, advanced?: string[]}} layout
+ */
+export function saveShelfLayout(workflowType, layout) {
+  if (!workflowType || !layout || typeof layout !== "object") return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(SHELF_LAYOUT_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const store = all && typeof all === "object" ? all : {};
+    store[String(workflowType)] = {
+      order: Array.isArray(layout.order) ? layout.order.filter((r) => typeof r === "string") : [],
+      rows: layout.rows && typeof layout.rows === "object" ? _deepCloneObject(layout.rows) : {},
+      advanced: Array.isArray(layout.advanced) ? layout.advanced.filter((r) => typeof r === "string") : [],
+    };
+    localStorage.setItem(SHELF_LAYOUT_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Load durably autosaved Shelf field values for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @returns {object} role → value (empty object when nothing saved)
+ */
+export function loadShelfValues(workflowId, versionId) {
+  if (!workflowId) return {};
+  try {
+    if (typeof localStorage === "undefined") return {};
+    const raw = localStorage.getItem(SHELF_VALUES_KEY);
+    if (!raw) return {};
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return {};
+    const entry = all[_shelfValuesKey(workflowId, versionId)];
+    return entry && typeof entry === "object" ? _deepCloneObject(entry) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/**
+ * Durably autosave Shelf field values for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ * @param {object} values role → value
+ */
+export function saveShelfValues(workflowId, versionId, values) {
+  if (!workflowId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(SHELF_VALUES_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const store = all && typeof all === "object" ? all : {};
+    store[_shelfValuesKey(workflowId, versionId)] = values && typeof values === "object"
+      ? _deepCloneObject(values)
+      : {};
+    localStorage.setItem(SHELF_VALUES_KEY, JSON.stringify(store));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Remove durably autosaved Shelf field values for a workflow+version.
+ * @param {string} workflowId
+ * @param {string} versionId
+ */
+export function clearShelfValues(workflowId, versionId) {
+  if (!workflowId) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(SHELF_VALUES_KEY);
+    if (!raw) return;
+    const all = JSON.parse(raw);
+    if (!all || typeof all !== "object") return;
+    delete all[_shelfValuesKey(workflowId, versionId)];
+    localStorage.setItem(SHELF_VALUES_KEY, JSON.stringify(all));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Load the local Shelf experiment draft (experiment-only state).
+ * Never touches the durable values/layout lane.
+ * @returns {{workflowIds: string[], axes: object, uniqueValues: object}|null}
+ */
+export function loadShelfExperimentDraft() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    const raw = localStorage.getItem(SHELF_EXPERIMENT_DRAFT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      workflowIds: Array.isArray(parsed.workflowIds)
+        ? parsed.workflowIds.filter((id) => typeof id === "string" && id)
+        : [],
+      axes: parsed.axes && typeof parsed.axes === "object" ? _deepCloneObject(parsed.axes) : {},
+      uniqueValues: parsed.uniqueValues && typeof parsed.uniqueValues === "object"
+        ? _deepCloneObject(parsed.uniqueValues)
+        : {},
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Autosave the local Shelf experiment draft (experiment-only state).
+ * Never overwrites durable Workflow values.
+ * @param {{workflowIds?: string[], axes?: object, uniqueValues?: object}} draft
+ */
+export function saveShelfExperimentDraft(draft) {
+  if (!draft || typeof draft !== "object") return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(SHELF_EXPERIMENT_DRAFT_KEY, JSON.stringify({
+      workflowIds: Array.isArray(draft.workflowIds)
+        ? draft.workflowIds.filter((id) => typeof id === "string" && id)
+        : [],
+      axes: draft.axes && typeof draft.axes === "object" ? _deepCloneObject(draft.axes) : {},
+      uniqueValues: draft.uniqueValues && typeof draft.uniqueValues === "object"
+        ? _deepCloneObject(draft.uniqueValues)
+        : {},
+    }));
+  } catch (e) {
+    // Ignore
+  }
+}
+
+/**
+ * Remove the local Shelf experiment draft.
+ */
+export function clearShelfExperimentDraft() {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(SHELF_EXPERIMENT_DRAFT_KEY);
+  } catch (e) {
+    // Ignore
+  }
+}
+
 // ── Workflow Selection Persistence ─────────────────────────────────────────
 //
 // Persists the currently selected workflow/version/preset so the Playground

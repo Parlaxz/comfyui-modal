@@ -12,9 +12,13 @@
 
 import { CONTROL_DEFS, getRecommendedSteps, getRecommendedStepsStatus, getLastFiniteSeed, cryptoRandomSeed } from "./studio-feature-registry.js";
 import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
+import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
+import { renderWorkflowPicker } from "./studio-workflow-picker.js";
+import { loadShelfExperimentDraft, saveShelfExperimentDraft } from "./studio-playground-state.js";
 import {
   runExperimentV2,
   getExperimentV2Status,
+  getWorkflowRunContext,
   cancelExperimentV2,
   resumeExperiment,
   retryCell,
@@ -1781,11 +1785,21 @@ export function renderExperimentMode(state, actions, context) {
   container.className = "comfymodal-studio-experiment-mode";
   container.setAttribute("data-testid", "experiment-mode");
 
-  // Compare Backends block (context passed explicitly)
-  container.appendChild(renderCompareBackends(state, actions, context || {}));
+  // Shelf flow (a modern Workflow is selected): Workflow comparison via the
+  // shared picker, common-field axes, and per-Workflow unique sections.
+  // No Backend/Preset UI in this flow. The legacy preset lane keeps the
+  // Compare Backends + Matrix Summary blocks when no Workflow is selected.
+  var shelfModernSel = null;
+  try { shelfModernSel = resolveModernWorkflowSelection(state); } catch (e) { shelfModernSel = null; }
+  if (shelfModernSel && shelfModernSel.workflowId) {
+    container.appendChild(renderShelfExperimentPanel(state, actions, context || {}));
+  } else {
+    // Compare Backends block (context passed explicitly)
+    container.appendChild(renderCompareBackends(state, actions, context || {}));
 
-  // Matrix Summary block
-  container.appendChild(renderMatrixSummary(state, actions));
+    // Matrix Summary block
+    container.appendChild(renderMatrixSummary(state, actions));
+  }
 
   // Exactly one run surface: the modern V2 section (gated when modern
   // identity is missing — H-WAVE A4 fallback closure).  H-WAVE D: the
@@ -1835,4 +1849,727 @@ export function renderExperimentMode(state, actions, context) {
   }
 
   return container;
+}
+
+// ── Shelf Experiment (Studio Workflow effort, leaf 1.2.2) ────────────────
+//
+// Experiment comparison over Workflows (not Backend presets):
+// - Explicit Experiment/Exit Experiment toggle owns visibility (the toggle
+//   itself is unchanged); axis selectors render only when enabled.
+// - Multi-Workflow comparison via the shared picker
+//   (web/studio-workflow-picker.js, mode "many").
+// - Common compatible fields across the selected Workflows become axes
+//   (blue active state, non-axis dimmed); unique fields live in hidden
+//   per-Workflow sections (settable inputs, never axes).
+// - Enter-to-create removable value pills (full prompt text on hover via
+//   the title attribute); generic Random/Increment/Decrement/Empty on
+//   integer and float fields.
+// - Matrix run gating (workflows x axis values); submission reuses the
+//   existing experiment-v2 engine (runExperimentV2 + the mounted
+//   experiment-v2 grid/History surfaces) — never a second result system.
+// - Experiment-only state autosaves as a local draft
+//   (studio-playground-state Shelf lane) without overwriting Workflow values.
+
+function _shelfExpGet(state) {
+  var pg = state && state.playground;
+  if (!pg) return null;
+  if (!pg._shelfExp || typeof pg._shelfExp !== "object") {
+    var draft = null;
+    try { draft = loadShelfExperimentDraft(); } catch (e) { draft = null; }
+    pg._shelfExp = {
+      workflowIds: (draft && draft.workflowIds) || [],
+      axes: (draft && draft.axes) || {},
+      uniqueValues: (draft && draft.uniqueValues) || {},
+      contexts: {},
+    };
+  }
+  return pg._shelfExp;
+}
+
+function _shelfExpSave(state) {
+  var exp = _shelfExpGet(state);
+  if (!exp) return;
+  try {
+    saveShelfExperimentDraft({
+      workflowIds: exp.workflowIds,
+      axes: exp.axes,
+      uniqueValues: exp.uniqueValues,
+    });
+  } catch (e) { /* local draft is best-effort */ }
+}
+
+// Primary workflow is the current single-run Workflow; it always leads.
+function _shelfExpPrimaryId(state) {
+  var sel = null;
+  try { sel = resolveModernWorkflowSelection(state); } catch (e) { sel = null; }
+  return (sel && sel.workflowId) || "";
+}
+
+function _shelfExpReconcileIds(state) {
+  var exp = _shelfExpGet(state);
+  if (!exp) return [];
+  var primary = _shelfExpPrimaryId(state);
+  var ids = [];
+  if (primary) ids.push(primary);
+  (exp.workflowIds || []).forEach(function (id) {
+    if (id && ids.indexOf(id) === -1) ids.push(id);
+  });
+  exp.workflowIds = ids;
+  return ids;
+}
+
+async function _shelfExpEnsureContexts(state, apiBase) {
+  var exp = _shelfExpGet(state);
+  if (!exp) return {};
+  var ids = _shelfExpReconcileIds(state);
+  var missing = ids.filter(function (id) { return !exp.contexts[id]; });
+  for (var i = 0; i < missing.length; i++) {
+    try {
+      var ctxRes = await getWorkflowRunContext(apiBase, missing[i]);
+      if (ctxRes && ctxRes.status !== "error") exp.contexts[missing[i]] = ctxRes;
+      else exp.contexts[missing[i]] = { error: (ctxRes && (ctxRes.message || ctxRes.error)) || "unavailable" };
+    } catch (e) {
+      exp.contexts[missing[i]] = { error: (e && e.message) || "unavailable" };
+    }
+  }
+  return exp.contexts;
+}
+
+function _shelfExpSchemaRoles(ctxRes) {
+  var schema = (ctxRes && ctxRes.control_schema) || {};
+  if (Array.isArray(schema)) {
+    return schema.map(function (e) { return (e && (e.semantic_role || e.input_name)) || ""; }).filter(Boolean);
+  }
+  return Object.keys(schema);
+}
+
+function _shelfExpEntryFor(ctxRes, role) {
+  var schema = (ctxRes && ctxRes.control_schema) || {};
+  if (Array.isArray(schema)) {
+    for (var i = 0; i < schema.length; i++) {
+      var e = schema[i];
+      if (e && ((e.semantic_role || e.input_name) === role)) return e;
+    }
+    return null;
+  }
+  return schema[role] || null;
+}
+
+function _shelfExpCommonRoles(contexts, ids) {
+  var usable = ids.filter(function (id) { return contexts[id] && !contexts[id].error; });
+  if (!usable.length) return [];
+  var common = null;
+  usable.forEach(function (id) {
+    var roles = _shelfExpSchemaRoles(contexts[id]);
+    if (common == null) common = roles.slice();
+    else common = common.filter(function (r) { return roles.indexOf(r) !== -1; });
+  });
+  return common || [];
+}
+
+function _shelfExpUniqueRoles(contexts, ids, wid, common) {
+  var ctxRes = contexts[wid];
+  if (!ctxRes || ctxRes.error) return [];
+  return _shelfExpSchemaRoles(ctxRes).filter(function (r) { return common.indexOf(r) === -1; });
+}
+
+// Catalog-owned role name; schema display_name fallback — never a second
+// hardcoded name table. controlKinds come from the schema entries.
+function _shelfExpDisplayName(role, entry) {
+  try {
+    var catalog = role && BINDABLE_INPUTS[role];
+    if (catalog) return catalog.name;
+  } catch (e) { /* catalog lookup best-effort */ }
+  if (entry && entry.display_name) return String(entry.display_name);
+  return String(role || "");
+}
+
+function _shelfExpNumericKind(entry) {
+  var kind = entry && entry.control_kind;
+  if (kind === "integer") return "int";
+  if (kind === "number" || kind === "float") return "float";
+  return "";
+}
+
+function _shelfExpParseValue(str) {
+  var s = str == null ? "" : String(str);
+  if (s.trim() === "") return "";
+  var num = Number(s);
+  return Number.isFinite(num) ? num : s;
+}
+
+function _shelfExpLastFinite(values) {
+  for (var i = values.length - 1; i >= 0; i--) {
+    var v = values[i];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  }
+  return null;
+}
+
+function _shelfExpRandomFor(entry) {
+  var kind = _shelfExpNumericKind(entry);
+  var min = entry && entry.minimum != null ? Number(entry.minimum) : null;
+  var max = entry && entry.maximum != null ? Number(entry.maximum) : null;
+  var rand = 0;
+  try {
+    rand = crypto.getRandomValues(new Uint32Array(1))[0] / 4294967296;
+  } catch (e) { rand = Math.random(); }
+  if (kind === "float") {
+    var lo = min != null && Number.isFinite(min) ? min : 0;
+    var hi = max != null && Number.isFinite(max) ? max : 1;
+    if (hi < lo) hi = lo + 1;
+    var step = entry && entry.step != null && Number(entry.step) > 0 ? Number(entry.step) : 0.01;
+    var raw = lo + rand * (hi - lo);
+    return Math.round(raw / step) * step;
+  }
+  var loI = min != null && Number.isFinite(min) ? Math.ceil(min) : 0;
+  var hiI = max != null && Number.isFinite(max) ? Math.floor(max) : 999999;
+  if (hiI < loI) hiI = loI;
+  return loI + Math.floor(rand * (hiI - loI + 1));
+}
+
+function _shelfExpMatrix(state) {
+  var exp = _shelfExpGet(state);
+  var contexts = (exp && exp.contexts) || {};
+  var ids = _shelfExpReconcileIds(state);
+  var axes = (exp && exp.axes) || {};
+  var roles = Object.keys(axes);
+  if (!ids.length) return { workflows: 0, axes: [], total: 0, runnable: false, reason: "Select at least one Workflow to compare." };
+  if (!roles.length) return { workflows: ids.length, axes: [], total: 0, runnable: false, reason: "Select at least one common field as an axis." };
+  var total = ids.length;
+  for (var i = 0; i < roles.length; i++) {
+    var vals = (axes[roles[i]] && axes[roles[i]].values) || [];
+    if (!vals.length) {
+      return { workflows: ids.length, axes: roles, total: 0, runnable: false, reason: "Axis " + roles[i] + " has no values." };
+    }
+    total *= vals.length;
+  }
+  if (total < 2) {
+    return { workflows: ids.length, axes: roles, total: total, runnable: false, reason: "Add more values or Workflows (matrix has 1 run)." };
+  }
+  return { workflows: ids.length, axes: roles, total: total, runnable: true, reason: "" };
+}
+
+function _shelfExpPrimaryPrompt(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  var values = (store && store.controlValues) || {};
+  var text = values.prompt != null ? values.prompt
+    : values.positive_prompt != null ? values.positive_prompt : "";
+  var negative = values.negative_prompt != null ? values.negative_prompt : "";
+  return { text: text, negative: negative };
+}
+
+export function renderShelfExperimentPanel(state, actions, context) {
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var container = document.createElement("div");
+  container.className = "comfymodal-studio-shelf-exp";
+  container.setAttribute("data-testid", "shelf-exp-panel");
+  _populateShelfExpPanel(container, state, actions, context || {}, apiBase);
+  return container;
+}
+
+function _populateShelfExpPanel(container, state, actions, context, apiBase) {
+  while (container.firstChild) container.removeChild(container.firstChild);
+  var exp = _shelfExpGet(state);
+  if (!exp) return;
+  var ids = _shelfExpReconcileIds(state);
+  _shelfExpSave(state);
+
+  var heading = document.createElement("h4");
+  heading.className = "comfymodal-studio-block-heading";
+  heading.textContent = "Experiment Workflows";
+  container.appendChild(heading);
+
+  var pickBtn = document.createElement("button");
+  pickBtn.type = "button";
+  pickBtn.className = "comfymodal-secondary-btn";
+  pickBtn.setAttribute("data-testid", "shelf-exp-pick-btn");
+  pickBtn.textContent = "Add workflows";
+  pickBtn.addEventListener("click", function () {
+    _openShelfExpPicker(state, actions, context, apiBase);
+  });
+  container.appendChild(pickBtn);
+
+  var list = document.createElement("div");
+  list.className = "comfymodal-studio-shelf-exp-list";
+  list.setAttribute("data-testid", "shelf-exp-workflow-list");
+  ids.forEach(function (wid, index) {
+    var chip = document.createElement("span");
+    chip.className = "comfymodal-studio-shelf-exp-chip";
+    chip.setAttribute("data-testid", "shelf-exp-workflow-" + wid);
+    var ctxRes = exp.contexts[wid];
+    var name = (ctxRes && ctxRes.workflow && ctxRes.workflow.name) || wid;
+    chip.textContent = (index === 0 ? "Primary: " : "") + name;
+    chip.title = wid;
+    if (index > 0) {
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn";
+      rm.setAttribute("data-testid", "shelf-exp-remove-" + wid);
+      rm.setAttribute("aria-label", "Remove workflow " + name);
+      rm.textContent = "\u00d7";
+      rm.addEventListener("click", function () {
+        exp.workflowIds = exp.workflowIds.filter(function (id) { return id !== wid; });
+        delete exp.contexts[wid];
+        _shelfExpSave(state);
+        _refreshShelfExpPanel(state, actions, context);
+      });
+      chip.appendChild(document.createTextNode(" "));
+      chip.appendChild(rm);
+    }
+    list.appendChild(chip);
+  });
+  container.appendChild(list);
+
+  var contexts = exp.contexts || {};
+  var missing = ids.filter(function (id) { return !contexts[id]; });
+  if (missing.length) {
+    var loading = document.createElement("p");
+    loading.className = "comfymodal-studio-control-note";
+    loading.setAttribute("data-testid", "shelf-exp-loading");
+    loading.textContent = "Loading workflow fields\u2026";
+    container.appendChild(loading);
+    _shelfExpEnsureContexts(state, apiBase).then(function () {
+      if (container.isConnected) _populateShelfExpPanel(container, state, actions, context, apiBase);
+    });
+    _renderShelfExpMatrix(container, state, actions, context, apiBase);
+    return;
+  }
+
+  var common = _shelfExpCommonRoles(contexts, ids);
+  var axesBox = document.createElement("div");
+  axesBox.className = "comfymodal-studio-shelf-exp-axes";
+  axesBox.setAttribute("data-testid", "shelf-exp-axes");
+  if (!common.length) {
+    var none = document.createElement("p");
+    none.className = "comfymodal-studio-control-note";
+    none.setAttribute("data-testid", "shelf-exp-no-common");
+    none.textContent = "No common fields across the selected Workflows.";
+    axesBox.appendChild(none);
+  }
+  common.forEach(function (role) {
+    axesBox.appendChild(_renderShelfExpAxisRow(container, state, actions, context, apiBase, exp, contexts, ids, role));
+  });
+  container.appendChild(axesBox);
+
+  // Unique fields: hidden per-Workflow sections, settable, never axes.
+  ids.forEach(function (wid) {
+    var unique = _shelfExpUniqueRoles(contexts, ids, wid, common);
+    if (!unique.length) return;
+    var ctxRes = contexts[wid];
+    var wname = (ctxRes && ctxRes.workflow && ctxRes.workflow.name) || wid;
+    var wrap = document.createElement("div");
+    wrap.className = "comfymodal-studio-shelf-exp-unique";
+    wrap.setAttribute("data-testid", "shelf-unique-" + wid);
+    var toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "comfymodal-studio-collapsible-summary";
+    toggle.setAttribute("data-testid", "shelf-unique-toggle-" + wid);
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.textContent = wname + " only fields (" + unique.length + ")";
+    var body = document.createElement("div");
+    body.className = "comfymodal-studio-collapsible-content";
+    body.hidden = true;
+    toggle.addEventListener("click", function () {
+      var open = body.hidden;
+      body.hidden = !open;
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      body.classList.toggle("is-visible", open);
+    });
+    wrap.appendChild(toggle);
+    unique.forEach(function (role) {
+      var entry = _shelfExpEntryFor(ctxRes, role);
+      var row = document.createElement("div");
+      row.className = "comfymodal-studio-shelf-exp-unique-row";
+      row.setAttribute("data-testid", "shelf-unique-row-" + wid + "-" + role);
+      row.appendChild(document.createTextNode(_shelfExpDisplayName(role, entry)));
+      var current = ((exp.uniqueValues[wid] || {})[role] !== undefined)
+        ? exp.uniqueValues[wid][role]
+        : "";
+      var field = _shelfExpUniqueInput(state, exp, wid, role, entry, current);
+      row.appendChild(field);
+      body.appendChild(row);
+    });
+    wrap.appendChild(body);
+    container.appendChild(wrap);
+  });
+
+  _renderShelfExpMatrix(container, state, actions, context, apiBase);
+}
+
+function _shelfExpUniqueInput(state, exp, wid, role, entry, current) {
+  var kind = (entry && entry.control_kind) || "";
+  var testid = "shelf-unique-input-" + wid + "-" + role;
+  function commit(next) {
+    if (!exp.uniqueValues[wid]) exp.uniqueValues[wid] = {};
+    exp.uniqueValues[wid][role] = next;
+    _shelfExpSave(state);
+  }
+  if (kind === "enum" && Array.isArray(entry.enum_options)) {
+    var select = document.createElement("select");
+    select.className = "comfymodal-input comfymodal-studio-select";
+    select.setAttribute("data-testid", testid);
+    entry.enum_options.forEach(function (optVal) {
+      var opt = document.createElement("option");
+      opt.value = String(optVal);
+      opt.textContent = String(optVal);
+      if (String(optVal) === String(current)) opt.selected = true;
+      select.appendChild(opt);
+    });
+    select.addEventListener("change", function () { commit(select.value); });
+    return select;
+  }
+  if (kind === "boolean") {
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "comfymodal-input";
+    cb.setAttribute("data-testid", testid);
+    cb.checked = current === true || current === 1 || current === "1" || current === "true";
+    cb.addEventListener("change", function () { commit(cb.checked); });
+    return cb;
+  }
+  if (kind === "multiline") {
+    var ta = document.createElement("textarea");
+    ta.className = "comfymodal-input comfymodal-studio-textarea";
+    ta.setAttribute("data-testid", testid);
+    ta.value = current != null ? String(current) : "";
+    ta.addEventListener("input", function () { commit(ta.value); });
+    return ta;
+  }
+  var input = document.createElement("input");
+  input.type = kind === "integer" || kind === "number" ? "number" : "text";
+  input.className = "comfymodal-input";
+  input.setAttribute("data-testid", testid);
+  input.value = current != null ? String(current) : "";
+  input.addEventListener("input", function () {
+    if (kind === "integer" || kind === "number") {
+      var parsed = kind === "integer" ? parseInt(input.value, 10) : parseFloat(input.value);
+      commit(input.value === "" || Number.isNaN(parsed) ? input.value : parsed);
+    } else {
+      commit(input.value);
+    }
+  });
+  return input;
+}
+
+function _renderShelfExpAxisRow(container, state, actions, context, apiBase, exp, contexts, ids, role) {
+  var firstCtx = contexts[ids[0]] || {};
+  var entry = _shelfExpEntryFor(firstCtx, role);
+  var axis = exp.axes[role];
+  var active = !!(axis && Array.isArray(axis.values));
+
+  var row = document.createElement("div");
+  row.className = "comfymodal-studio-shelf-exp-axis" + (active ? " is-axis" : " is-dimmed");
+  row.setAttribute("data-testid", "shelf-axis-row-" + role);
+
+  var toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "comfymodal-studio-shelf-exp-axis-toggle" + (active ? " is-axis" : " is-dimmed");
+  toggle.setAttribute("data-testid", "shelf-axis-" + role);
+  toggle.setAttribute("aria-pressed", active ? "true" : "false");
+  toggle.title = active ? "Remove as axis" : "Use as experiment axis";
+  toggle.textContent = _shelfExpDisplayName(role, entry);
+  toggle.addEventListener("click", function () {
+    if (exp.axes[role]) delete exp.axes[role];
+    else {
+      var current = null;
+      var pg = state && state.playground;
+      var store = pg && pg._workflowRun;
+      if (store && store.controlValues && store.controlValues[role] !== undefined) {
+        current = store.controlValues[role];
+      } else if (entry && entry.value !== undefined) {
+        current = entry.value;
+      } else {
+        current = "";
+      }
+      exp.axes[role] = { values: [current] };
+    }
+    _shelfExpSave(state);
+    _refreshShelfExpPanel(state, actions, context);
+  });
+  row.appendChild(toggle);
+
+  if (active) {
+    var pills = document.createElement("div");
+    pills.className = "comfymodal-studio-shelf-exp-pills";
+    pills.setAttribute("data-testid", "shelf-pills-" + role);
+    (axis.values || []).forEach(function (val, index) {
+      var full = val != null ? String(val) : "";
+      var pill = document.createElement("span");
+      pill.className = "comfymodal-studio-shelf-exp-pill";
+      pill.setAttribute("data-testid", "shelf-pill-" + role + "-" + index);
+      pill.title = full;
+      pill.textContent = full.length > 40 ? full.substring(0, 40) + "\u2026" : (full === "" ? "(empty)" : full);
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "comfymodal-studio-shelf-exp-pill-remove";
+      rm.setAttribute("data-testid", "shelf-pill-remove-" + role + "-" + index);
+      rm.setAttribute("aria-label", "Remove value " + (index + 1) + " from " + role);
+      rm.textContent = "\u00d7";
+      rm.addEventListener("click", function () {
+        axis.values.splice(index, 1);
+        _shelfExpSave(state);
+        _refreshShelfExpPanel(state, actions, context);
+      });
+      pill.appendChild(document.createTextNode(" "));
+      pill.appendChild(rm);
+      pills.appendChild(pill);
+    });
+    row.appendChild(pills);
+
+    var addInput = document.createElement("input");
+    addInput.type = "text";
+    addInput.className = "comfymodal-input";
+    addInput.setAttribute("data-testid", "shelf-axis-input-" + role);
+    addInput.setAttribute("placeholder", "Add value, press Enter");
+    addInput.setAttribute("aria-label", "Add " + role + " value");
+    addInput.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      var parsed = _shelfExpParseValue(addInput.value);
+      axis.values.push(parsed);
+      _shelfExpSave(state);
+      _refreshShelfExpPanel(state, actions, context);
+    });
+    row.appendChild(addInput);
+
+    if (_shelfExpNumericKind(entry)) {
+      var ops = document.createElement("div");
+      ops.className = "comfymodal-studio-shelf-exp-numops";
+      [["random", "Random"], ["inc", "+1"], ["dec", "\u22121"], ["empty", "Empty"]].forEach(function (pair) {
+        var mode = pair[0];
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn";
+        btn.setAttribute("data-testid", "shelf-num-" + mode + "-" + role);
+        btn.textContent = pair[1];
+        btn.title = pair[1] + " value for " + role;
+        btn.addEventListener("click", function () {
+          var next;
+          if (mode === "random") next = _shelfExpRandomFor(entry);
+          else if (mode === "empty") next = "";
+          else {
+            var last = _shelfExpLastFinite(axis.values);
+            var step = entry && entry.step != null && Number(entry.step) > 0 ? Number(entry.step) : 1;
+            if (last == null) next = mode === "inc" ? step : 0;
+            else next = mode === "inc" ? last + step : last - step;
+          }
+          axis.values.push(next);
+          _shelfExpSave(state);
+          _refreshShelfExpPanel(state, actions, context);
+        });
+        ops.appendChild(btn);
+      });
+      row.appendChild(ops);
+    }
+  }
+  return row;
+}
+
+function _renderShelfExpMatrix(container, state, actions, context, apiBase) {
+  var matrix = _shelfExpMatrix(state);
+  var box = document.createElement("div");
+  box.className = "comfymodal-studio-shelf-exp-matrix";
+  box.setAttribute("data-testid", "shelf-exp-matrix");
+  var summary = matrix.axes.length
+    ? matrix.workflows + " workflow(s) \u00d7 " + matrix.axes.map(function (r) {
+        var vals = ((_shelfExpGet(state).axes[r] || {}).values || []).length;
+        return r + "[" + vals + "]";
+      }).join(" \u00d7 ") + " = " + matrix.total + " run(s)"
+    : matrix.workflows + " workflow(s) selected";
+  box.textContent = summary;
+  container.appendChild(box);
+
+  var runBtn = document.createElement("button");
+  runBtn.type = "button";
+  runBtn.className = "comfymodal-primary-btn";
+  runBtn.setAttribute("data-testid", "shelf-exp-run-btn");
+  runBtn.textContent = "Run Experiment";
+  runBtn.disabled = !matrix.runnable;
+  if (!matrix.runnable && matrix.reason) runBtn.title = matrix.reason;
+  runBtn.addEventListener("click", function () {
+    if (runBtn.disabled) return;
+    runBtn.disabled = true;
+    runBtn.textContent = "Running\u2026";
+    submitShelfExperiment(state, actions, context).then(function (result) {
+      if (result && result.status !== "ok" && actions && actions.setRunState) {
+        actions.setRunState({ status: "error", message: result.message || "Experiment submission failed." });
+      }
+      _refreshShelfExpPanel(state, actions, context);
+    });
+  });
+  container.appendChild(runBtn);
+
+  if (!matrix.runnable && matrix.reason) {
+    var reason = document.createElement("p");
+    reason.className = "comfymodal-studio-control-note";
+    reason.setAttribute("data-testid", "shelf-exp-reason");
+    reason.textContent = matrix.reason;
+    container.appendChild(reason);
+  }
+}
+
+function _refreshShelfExpPanel(state, actions, context) {
+  var panel = document.querySelector('[data-testid="shelf-exp-panel"]');
+  if (!panel || !panel.isConnected) return;
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  _populateShelfExpPanel(panel, state, actions, context || {}, apiBase);
+}
+
+function _openShelfExpPicker(state, actions, context, apiBase) {
+  var overlay = document.createElement("div");
+  overlay.className = "comfymodal-studio-shelf-dialog-overlay";
+  overlay.setAttribute("data-testid", "shelf-exp-picker-dialog");
+  var dialog = document.createElement("div");
+  dialog.className = "comfymodal-studio-shelf-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-label", "Compare workflows");
+  var heading = document.createElement("h4");
+  heading.className = "comfymodal-studio-block-heading";
+  heading.textContent = "Compare Workflows";
+  dialog.appendChild(heading);
+  var closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "comfymodal-secondary-btn comfymodal-studio-shelf-mini-btn";
+  closeBtn.setAttribute("data-testid", "shelf-exp-picker-close");
+  closeBtn.textContent = "Close";
+  closeBtn.addEventListener("click", function () {
+    if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  });
+  dialog.appendChild(closeBtn);
+  var exp = _shelfExpGet(state);
+  dialog.appendChild(renderWorkflowPicker({
+    apiBase: apiBase,
+    mode: "many",
+    selectedIds: (exp && exp.workflowIds) || [],
+    confirmLabel: "Use selected workflows",
+    onConfirm: function (pickerIds) {
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      var next = (pickerIds || []).map(String).filter(Boolean);
+      var primary = _shelfExpPrimaryId(state);
+      if (primary && next.indexOf(primary) === -1) next.unshift(primary);
+      if (exp) {
+        var dropped = (exp.workflowIds || []).filter(function (id) { return next.indexOf(id) === -1; });
+        dropped.forEach(function (id) { delete exp.contexts[id]; });
+        exp.workflowIds = next;
+        _shelfExpSave(state);
+      }
+      _refreshShelfExpPanel(state, actions, context);
+    },
+  }));
+  overlay.addEventListener("click", function (ev) {
+    if (ev.target === overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  });
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+}
+
+// ── Shelf matrix submission (existing engine, no second result system) ────
+//
+// Builds the ONE modern definition with the verified builder (identity,
+// experiment_id, defaults, modal options), then overlays the Shelf matrix:
+// all selected Workflows (verbatim identities), Shelf axes, and Shelf
+// prompts. Submitted via runExperimentV2; results reconcile into the ONE
+// per-experiment controller and render in the mounted experiment-v2 grid
+// and History surfaces.
+
+export async function submitShelfExperiment(state, actions, context) {
+  var pg = state && state.playground;
+  if (!pg) return { status: "error", message: "Playground state unavailable." };
+  var apiBase = (context && context.apiBase) || "/comfymodal";
+  var exp = _shelfExpGet(state);
+  var matrix = _shelfExpMatrix(state);
+  if (!matrix.runnable) {
+    return { status: "error", gated: true, message: matrix.reason || "Experiment matrix is not runnable." };
+  }
+  var modalOptions = null;
+  try { modalOptions = await loadModalOptions(apiBase); } catch (e) { modalOptions = null; }
+  var built = buildModernExperimentDefinition(state, Object.assign({}, context || {}, {
+    modalOptions: modalOptions || undefined,
+  }));
+  var definition = (built && built.definition) || {};
+  var ids = _shelfExpReconcileIds(state);
+  var contexts = (exp && exp.contexts) || {};
+  definition.workflows = ids.map(function (wid, index) {
+    var ctxRes = contexts[wid] || {};
+    var w = ctxRes.workflow || {};
+    var v = ctxRes.version || {};
+    var preset = ctxRes.default_preset || {};
+    var entry = {
+      workflow_id: wid,
+      workflow_version_id: (v.workflow_version_id || (index === 0 ? _shelfExpPrimaryVersion(state) : "") || ""),
+      preset_id: index === 0
+        ? (_shelfExpPrimaryPreset(state) || preset.preset_id || "")
+        : (preset.preset_id || ""),
+      workflow_name: w.name || "",
+      preset_name: (index === 0 ? _shelfExpPrimaryPresetName(state) : "") || preset.name || "",
+    };
+    // Per-Workflow unique values ride along verbatim (additive metadata;
+    // the engine contract for axes/defaults/prompts is unchanged).
+    var unique = (exp.uniqueValues && exp.uniqueValues[wid]) || {};
+    if (unique && Object.keys(unique).length) entry.values = Object.assign({}, unique);
+    return entry;
+  });
+  var axes = {};
+  Object.keys(exp.axes || {}).forEach(function (role) {
+    var vals = (exp.axes[role] && exp.axes[role].values) || [];
+    axes[role] = { values: vals.slice() };
+  });
+  definition.axes = axes;
+  var axisNames = Object.keys(axes);
+  definition.axis_labels = { x: axisNames[0] || "", y: axisNames[1] || "" };
+  var prompt = _shelfExpPrimaryPrompt(state);
+  definition.prompts = [{ text: prompt.text, negative: prompt.negative }];
+  var missingVersion = definition.workflows.filter(function (w) { return !w.workflow_version_id; });
+  if (missingVersion.length) {
+    return { status: "error", gated: true, message: "Select a runnable Version for every compared Workflow." };
+  }
+  var payload = {
+    experiment_id: (built && built.experiment_id) || "",
+    name: (built && built.name) || "Studio Experiment",
+    definition: definition,
+  };
+  var result = null;
+  try {
+    result = await runExperimentV2(apiBase, payload);
+  } catch (e) {
+    return { status: "error", message: (e && e.message) || "Experiment submission failed." };
+  }
+  if (!result || result.status !== "ok" || !result.experiment_id) {
+    return {
+      status: "error",
+      message: (result && (result.message || result.detail)) || "Experiment submission failed.",
+    };
+  }
+  pg._activeExperimentId = result.experiment_id;
+  persistActiveExperimentId(result.experiment_id);
+  var controller = getModernExperimentController(state, context);
+  if (controller && result.item && typeof result.item === "object") {
+    controller.reconcile(result.item);
+  }
+  attachModernExperiment(state, actions, context);
+  try {
+    await refreshModernExperimentStatus(state, context);
+  } catch (e) { /* status polling continues on its timer */ }
+  return { status: "ok", experimentId: result.experiment_id };
+}
+
+function _shelfExpPrimaryVersion(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  return (store && store.workflowVersionId) || "";
+}
+
+function _shelfExpPrimaryPreset(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  return (store && store.presetId) || "";
+}
+
+function _shelfExpPrimaryPresetName(state) {
+  var pg = state && state.playground;
+  var store = pg && pg._workflowRun;
+  return (store && store.presetName) || "";
 }

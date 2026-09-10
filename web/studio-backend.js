@@ -6,7 +6,7 @@
 // renderBackend as the main entry point.
 
 import { el, statusBadge } from "./studio-ui.js";
-import { listPresets } from "./studio-backend-api.js";
+import { listPresets, listWorkflows, listWorkflowVersions, listVersionPresets } from "./studio-backend-api.js";
 import * as _capture from "./studio-backend-capture.js";
 import { renderSnapshotsPage, renderSnapshotsList, renderSnapshotDetail } from "./studio-backend-snapshots.js";
 import { renderPresetsPage, renderPresetsList, renderPresetDetail, renderPresetForm } from "./studio-backend-presets.js";
@@ -35,19 +35,80 @@ export const _STATE = { selectedItemId: null };
 // New Studio runtime selectors consume presets only (not legacy backends).
 // getRuntimePresets wraps the presets API so Playground and Experiment can
 // switch to presets-based selection without touching import/discovery paths.
+//
+// abs-2 (legacy absorption): the helper accepts an optional workflow scope
+// ({ workflowId, versionId }) and resolves scoped requests through the
+// workflows domain (listVersionPresets, translated server-side by the abs-1
+// adapters) instead of the unscoped legacy route. Cache keys include the
+// workflow/version scope, never only apiBase.
 
 // Module-level cache to avoid refetching presets on every render
 let _runtimePresetsCache = null;
 let _runtimePresetsCacheKey = "";
 
+function _runtimePresetsCacheKeyFor(apiBase, workflowId, versionId) {
+  return `${apiBase}::${workflowId || ""}::${versionId || ""}`;
+}
+
+/**
+ * Project one workflow-domain preset into the runtime shape consumed by
+ * Playground / Experiment selectors (id/label plus the version scope it
+ * was resolved from). Values keep their canonical workflow keys — key
+ * translation stays server-side in the abs-1 adapters.
+ */
+function _projectWorkflowRuntimePreset(preset, workflowId, versionId) {
+  const p = preset || {};
+  return {
+    id: p.preset_id || "",
+    preset_id: p.preset_id || "",
+    label: p.name || "",
+    name: p.name || "",
+    description: p.description || "",
+    values: p.values || {},
+    model_choices: p.model_choices || {},
+    state: p.state || null,
+    is_default: !!p.is_default,
+    workflowId: workflowId || "",
+    workflowVersionId: versionId || p.workflow_version_id || "",
+  };
+}
+
+async function _listScopedRuntimePresets(apiBase, workflowId, versionId) {
+  let versionIds = [];
+  let versionWorkflow = {};
+  if (versionId) {
+    versionIds = [versionId];
+    versionWorkflow[versionId] = workflowId || "";
+  } else if (workflowId) {
+    const versionsResp = await listWorkflowVersions(apiBase, workflowId);
+    const versions = (versionsResp && versionsResp.versions) || [];
+    versionIds = versions.map((v) => v.workflow_version_id).filter(Boolean);
+    versionIds.forEach((vid) => { versionWorkflow[vid] = workflowId; });
+  }
+  const out = [];
+  for (const vid of versionIds) {
+    const resp = await listVersionPresets(apiBase, vid);
+    const presets = (resp && resp.presets) || [];
+    presets.forEach((p) => out.push(_projectWorkflowRuntimePreset(p, versionWorkflow[vid] || workflowId, vid)));
+  }
+  return out;
+}
+
 export async function getRuntimePresets(context) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  // Use simple cache: invalidated when apiBase changes
-  if (_runtimePresetsCache && _runtimePresetsCacheKey === apiBase) {
+  const workflowId = (context && (context.workflowId || context.workflow_id)) || "";
+  const versionId = (context && (context.versionId || context.workflowVersionId || context.workflow_version_id)) || "";
+  const cacheKey = _runtimePresetsCacheKeyFor(apiBase, workflowId, versionId);
+  // Use simple cache: invalidated when apiBase or the workflow scope changes
+  if (_runtimePresetsCache && _runtimePresetsCacheKey === cacheKey) {
     return _runtimePresetsCache;
   }
-  _runtimePresetsCache = await listPresets(apiBase);
-  _runtimePresetsCacheKey = apiBase;
+  if (versionId || workflowId) {
+    _runtimePresetsCache = await _listScopedRuntimePresets(apiBase, workflowId, versionId);
+  } else {
+    _runtimePresetsCache = await listPresets(apiBase);
+  }
+  _runtimePresetsCacheKey = cacheKey;
   return _runtimePresetsCache;
 }
 
@@ -124,16 +185,75 @@ export function renderFeaturesChipGrid(features, onChange) {
 // ── Main render entry point ──────────────────────────────────────────────
 
 // ── Wizard launcher ──────────────────────────────────────────────────────
+//
+// abs-2 (legacy absorption): "Make Preset" binds the current ComfyUI graph
+// through the workflows domain — the graph is imported as a new workflow
+// version and the binding wizard opens in version-setup mode on it (mapping
+// POST route, never a Backend snapshot/preset). When capture or import is
+// unavailable the legacy preset wizard remains as the fallback so the
+// action never dead-ends.
+
+function _suggestWorkflowNameFromDate() {
+  try {
+    const d = new Date();
+    const pad = (x) => String(x).padStart(2, "0");
+    return `Studio Preset ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch (_) {
+    return "Studio Preset";
+  }
+}
 
 function launchPresetWizard(context) {
-  import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
-    const apiBase = (context && context.apiBase) || "/comfymodal";
-    openPresetWizard(() => {
-      invalidateRuntimePresetsCache();
-      if (context && typeof context.setPage === "function") {
-        context.setPage("backend");
+  const apiBase = (context && context.apiBase) || "/comfymodal";
+  const onDone = () => {
+    invalidateRuntimePresetsCache();
+    if (context && typeof context.setPage === "function") {
+      context.setPage("backend");
+    }
+  };
+  Promise.all([
+    import("./studio-preset-wizard.js"),
+    import("./studio-backend-api.js"),
+  ]).then(([wizard, api]) => {
+    const openLegacy = () => wizard.openPresetWizard(onDone, apiBase);
+    let capture = null;
+    try {
+      capture = _capture && _capture.captureCurrentComfyGraph
+        ? _capture.captureCurrentComfyGraph()
+        : Promise.resolve(null);
+    } catch (_) {
+      capture = Promise.resolve(null);
+    }
+    Promise.resolve(capture).then((result) => {
+      if (!result || !result.ok || !result.graphJson) {
+        openLegacy();
+        return;
       }
-    }, apiBase);
+      api.importWorkflow(apiBase, {
+        name: _suggestWorkflowNameFromDate(),
+        graph_json: result.graphJson,
+        api_prompt_json: result.apiPromptJson || null,
+      }).then((resp) => {
+        if (!resp || resp.status === "error") {
+          openLegacy();
+          return;
+        }
+        const workflow = (resp && (resp.workflow || resp)) || {};
+        const wfId = workflow.workflow_id || resp.workflow_id || "";
+        const verId = workflow.latest_version_id
+          || (resp.version && resp.version.workflow_version_id)
+          || resp.workflow_version_id
+          || "";
+        if (!wfId || !verId) {
+          openLegacy();
+          return;
+        }
+        wizard.openPresetWizard(onDone, apiBase, null, null, {
+          workflowId: wfId,
+          workflowVersionId: verId,
+        });
+      }).catch(openLegacy);
+    }).catch(openLegacy);
   });
 }
 

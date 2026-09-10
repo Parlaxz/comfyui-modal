@@ -1,859 +1,391 @@
-// Modal Studio — Experiment Mode E2E Tests
+// Modal Studio — Shelf Experiment E2E Tests (Studio Workflow effort, leaf 1.2.2)
 //
-// Tests experiment mode behaviors using the mock API.
-// Mock is installed BEFORE navigation per isolation contract.
-// Uses fresh Playwright Test page/context.
+// Drives the Shelf experiment flow against the mocked backend:
+// installStudioMockApi FIRST, then installWorkflowsMock (later routes take
+// precedence for /comfymodal/studio/workflows*). Uses fresh Playwright Test
+// page/context (never MCP/shared session).
 //
-// Required behaviors:
-//   1. Full experiment lifecycle with two presets, Steps axis, completion
-//   2. Disabled run button with <2 unique presets, enabled with 2+
-//   3. Axis eligibility considers base + compare presets (not compare only)
-//   4. Failed experiment shows precise Mock failure terminal UI
-//   5. Rapid axis toggle produces exactly one connected editor, no errors
-//   6. Archive/delete only owned preset IDs; unrelated remains
-//   7. Matrix summary deduplicates base present in compare list
-//   8. Zero unique presetIds returns HTTP 400 error
+// Covered contracts:
+//   1. Explicit Experiment/Exit Experiment toggle; axis selectors only when
+//      enabled.
+//   2. Multi-Workflow comparison via the shared picker (mode "many").
+//   3. Common compatible fields become axes (blue active, non-axis dimmed);
+//      unique fields live in hidden per-Workflow sections (settable, never
+//      axes).
+//   4. Enter-to-create removable value pills with full text on hover; generic
+//      Random/Increment/Decrement/Empty on integer and float fields.
+//   5. Matrix run gating (workflows x axis values); results use the existing
+//      experiment-v2 grid/output/History surfaces (no second result system).
 
 import { test, expect } from "@playwright/test";
 import {
   installConsoleGuard,
-  createOwnerPrefix,
-  createOwnedRecords,
-  createOwnedSnapshotAndPresets,
   openStudio,
 } from "./studio-fixtures.mjs";
 import { installStudioMockApi } from "./studio-mock-api.mjs";
+import { installWorkflowsMock } from "./studio-workflows-mock.mjs";
 
 const COMFYUI_URL = process.env.COMFYUI_URL || "http://127.0.0.1:8188";
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
-async function waitVisible(locator, timeout = 15000) {
-  await locator.waitFor({ state: "visible", timeout });
-  return locator;
+// ── Primary-extension pin (mirrors studio-workflows.spec.mjs) ─────────
+// The mocked suite has no Playwright webServer and navigates to the shared
+// ComfyUI instance at 127.0.0.1:8188. Sibling lanes register the same
+// extension name, so without pinning the page can load stale sibling code
+// instead of this repo's primary copy at /extensions/comfyui-modal/.
+async function pinPrimaryExtensionRequests(page) {
+  // NOTE: regex, not a "**/extensions/*" glob — in Playwright glob syntax
+  // "*" does not cross "/", so that glob would be a no-op.
+  await page.route(/\/extensions\//, async (route) => {
+    const reqUrl = new URL(route.request().url());
+    const match = reqUrl.pathname.match(/^\/extensions\/([^/]+)\/(.*)$/);
+    if (match && match[1] !== "comfyui-modal" && /modal/i.test(match[1])) {
+      reqUrl.pathname = `/extensions/comfyui-modal/${match[2]}`;
+      await route.continue({ url: reqUrl.toString() });
+      return;
+    }
+    await route.continue();
+  });
 }
 
-async function selectBackendPreset(page, presetLabel) {
-  const select = page.locator('[data-testid="backend-select"]');
-  await select.waitFor({ state: "visible", timeout: 15000 });
-  await select.selectOption(presetLabel);
-  // wait for the control panel to reflect the new preset (re-render driven
-  // by setPage from the select change handler)
-  await expect(page.locator('[data-testid="input-prompt"]')).toBeVisible({ timeout: 10000 });
+async function installMocks(page) {
+  const api = await installStudioMockApi(page);
+  const wfMock = await installWorkflowsMock(page);
+  await pinPrimaryExtensionRequests(page);
+  // The Shelf loads the model library on Workflow selection; the shared
+  // mock has no /studio/models handler, so stub it here (registered last,
+  // takes precedence, never recorded as unhandled).
+  await page.route("**/comfymodal/studio/models**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok", models: [] }),
+    });
+  });
+  return { api, wfMock };
 }
 
-async function enableExperimentMode(page) {
+function portraitIds(wfMock) {
+  const wf = wfMock.getWorkflow("Portrait Pro");
+  expect(wf).toBeTruthy();
+  const versions = wfMock.getVersions(wf.workflow_id);
+  const v1 = versions.find((v) => v.version_number === 1);
+  expect(v1).toBeTruthy();
+  return { workflowId: wf.workflow_id, v1: v1.workflow_version_id };
+}
+
+async function selectPortraitV1(page, wfMock) {
+  const ids = portraitIds(wfMock);
+  const wfSelect = page.locator('[data-testid="workflow-selector"]');
+  await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
+  await wfSelect.selectOption(ids.workflowId);
+  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
+  await page.locator('[data-testid="workflow-version-selector"]').selectOption(ids.v1);
+  await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
+  return ids;
+}
+
+async function enableExperiment(page) {
   const toggle = page.locator('[data-testid="experiment-toggle"]');
-  await toggle.waitFor({ state: "visible", timeout: 10000 });
-  const text = await toggle.textContent();
-  if (text && text.trim() === "Experiment") {
+  await expect(toggle).toBeVisible({ timeout: 10000 });
+  if ((await toggle.textContent()).trim() === "Experiment") {
     await toggle.click();
   }
-  // Wait for experiment mode container
-  await page.locator('[data-testid="experiment-mode"]').waitFor({ state: "visible", timeout: 10000 });
+  await expect(page.locator('[data-testid="shelf-exp-panel"]')).toBeVisible({ timeout: 15000 });
 }
 
-async function checkComparePreset(page, presetIdOrLabel) {
-  const compareSections = page.locator(
-    '[data-testid="compare-backends"] button.comfymodal-studio-collapsible-summary'
-  );
-  for (let i = 0; i < await compareSections.count(); i++) {
-    const section = compareSections.nth(i);
-    if ((await section.getAttribute("aria-expanded")) !== "true") {
-      await section.click();
-    }
-  }
-  const cb = page.locator(`[data-testid="compare-preset-${presetIdOrLabel}"], [data-backend-id="${presetIdOrLabel}"]`).first();
-  await cb.waitFor({ state: "visible", timeout: 10000 });
-  const isChecked = await cb.isChecked();
-  if (!isChecked) {
-    await cb.check();
-    // Wait for the checkbox to reflect the checked state (the change handler
-    // triggers context.setPage("playground") which re-renders the section).
-    await expect(cb).toBeChecked({ timeout: 5000 });
-  }
-}
-
-async function enableStepsAxis(page) {
-  const axisCb = page.locator('[data-axis="steps"]');
-  await axisCb.waitFor({ state: "visible", timeout: 10000 });
-  await axisCb.check();
-  // wait for the axis editor to appear (re-render driven by
-  // toggleExperimentAxis which calls context.setPage("playground"))
-  await expect(page.locator('[data-testid="axis-editor-steps"]')).toBeVisible({ timeout: 5000 });
-  await expect(page.locator('[data-testid="input-steps"]')).toHaveCount(0);
-}
-
-async function setStepsAxisValues(page, values) {
-  // The axis editor starts with the default value at index 0.  Each
-  // requested value is appended (via +) and filled, skipping values that
-  // are already present (mirrors the old quick-add dedupe semantics).
-  const editor = page.locator('[data-testid="axis-editor-steps"]');
-  await editor.waitFor({ state: "visible", timeout: 5000 });
-  await editor.locator('[data-testid="axis-value-steps-0"]').waitFor({ state: "visible", timeout: 5000 });
-  const current = await editor.evaluate((root) => {
-    return Array.from(root.querySelectorAll('[data-testid^="axis-value-steps-"]')).map((el) => el.value);
-  });
-  for (const v of values) {
-    if (current.includes(String(v))) continue;
-    await editor.locator('[data-testid="axis-add-value-steps"]').click();
-    // brief pause deliberately creates a race-like rapid-add sequence
-    await page.waitForTimeout(50);
-    const inputs = editor.locator('[data-testid^="axis-value-steps-"]');
-    const n = await inputs.count();
-    await inputs.nth(n - 1).fill(String(v));
-    current.push(String(v));
-  }
-}
-
-async function submitExperiment(page) {
-  const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
-  await runBtn.waitFor({ state: "visible", timeout: 10000 });
-  await expect(runBtn).toBeEnabled({ timeout: 10000 });
-  await runBtn.click();
-}
-
-async function waitForExperimentTerminal(page, timeout = 60000) {
-  // Wait until run-experiment-inline-btn is re-enabled (terminal state)
-  const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
-  await expect(runBtn).toBeEnabled({ timeout });
-}
-
-async function getDisabledReasonText(page) {
-  const reason = page.locator('[data-testid="experiment-run-section"]');
-  await reason.waitFor({ state: "visible", timeout: 10000 });
-  return (await reason.textContent()) || "";
-}
-
-/**
- * Create a snapshot with optional steps binding via POST /comfymodal/studio/snapshots.
- * Returns the snapshot object from the response.
- */
-async function createSnapshot(page, opts) {
-  return page.evaluate(async (payload) => {
-    const res = await fetch("/comfymodal/studio/snapshots", {
+// Create a second mapped Workflow with a SUBSET of roles (seed, steps,
+// positive_prompt) via the mocked workflow API: import, then map a filtered
+// candidate list. Returns { workflowId, versionId }.
+async function createSubsetWorkflow(page) {
+  const imported = await page.evaluate(async () => {
+    const res = await fetch("/comfymodal/studio/workflows/import", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ name: "Subset Workflow", graph_json: { nodes: [] }, api_prompt_json: {} }),
     });
-    if (!res.ok) return { error: `HTTP ${res.status}` };
-    const data = await res.json();
-    return data.snapshot || data;
-  }, opts);
-}
+    return res.json();
+  });
+  expect(imported.status).toBe("ok");
+  const versionId = imported.version.workflow_version_id;
+  const workflowId = imported.workflow.workflow_id;
 
-/**
- * Create a preset via POST /comfymodal/studio/presets.
- * Returns the preset object from the response.
- */
-async function createPreset(page, opts) {
-  return page.evaluate(async (payload) => {
-    const res = await fetch("/comfymodal/studio/presets", {
+  const subset = await page.evaluate(async (vid) => {
+    const candRes = await fetch(`/comfymodal/studio/workflows/versions/${encodeURIComponent(vid)}/mapping/candidates`);
+    const cand = await candRes.json();
+    const entries = (cand.candidates.entries || []).filter((e) =>
+      ["seed", "steps", "positive_prompt"].includes(e.semantic_role)
+    );
+    const mapRes = await fetch(`/comfymodal/studio/workflows/versions/${encodeURIComponent(vid)}/mapping`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ output_node_id: "6", entries }),
     });
-    if (!res.ok) return { error: `HTTP ${res.status}` };
-    const data = await res.json();
-    return data.preset || data;
-  }, opts);
+    return { cand: cand.status, mapped: await mapRes.json() };
+  }, versionId);
+  expect(subset.cand).toBe("ok");
+  expect(subset.mapped.status).toBe("ok");
+  return { workflowId, versionId };
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// Compare Portrait Pro with the subset Workflow via the many-mode picker.
+async function compareWithSubset(page, subsetId) {
+  await page.locator('[data-testid="shelf-exp-pick-btn"]').click();
+  const dialog = page.locator('[data-testid="shelf-exp-picker-dialog"]');
+  await expect(dialog).toBeVisible({ timeout: 10000 });
+  const options = dialog.locator('[data-testid="workflow-picker-option"]');
+  await expect(options).toHaveCount(3, { timeout: 10000 });
+  await dialog.locator(`[data-testid="workflow-picker-option"][data-workflow-id="${subsetId}"]`).click();
+  await dialog.locator('[data-testid="workflow-picker-confirm"]').click();
+  await expect(page.locator(`[data-testid="shelf-exp-workflow-${subsetId}"]`)).toBeVisible({ timeout: 10000 });
+}
 
-test.describe("Studio Experiment", () => {
-  let api;
+// ── Tests ────────────────────────────────────────────────────────────────
 
-  test.beforeEach(async ({ page }) => {
-    api = await installStudioMockApi(page, { terminalPoll: 4 });
-  });
-
-  // ── Test 1: Full experiment lifecycle ─────────────────────────────────
-  //
-  // Create two owned runnable presets with steps binding, select base and
-  // second compare preset, enable Experiment, enable Steps axis, set values
-  // [10,20], submit ONE unified /studio/experiment request. Assert:
-  //   - presetIds unique length 2
-  //   - axes values exact
-  //   - mock cellCount = 4 (2 presets × 2 axis values)
-  //   - terminal counters: completed = 4, failed = 0
-  //   - completed UI visible, no failed cells, no console errors
-
-  test("1. full experiment lifecycle with two presets and Steps axis", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
+test.describe("Studio Shelf Experiment", () => {
+  test("1. toggle shows shelf panel; axis selectors only when enabled", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+    const guard = installConsoleGuard(page);
 
     try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+      await selectPortraitV1(page, wfMock);
 
-      // Create two owned presets with steps binding
-      for (let i = 0; i < 2; i++) {
-        const snapResult = await createSnapshot(page, {
-          name: `${prefix}-snapshot-${i}`,
-          compatibleFeatures: ["txt2img"],
-          graphJson: { "1": { class_type: "CLIPTextEncode", inputs: { text: "test" } } },
-          apiPromptJson: { "1": { class_type: "CLIPTextEncode", inputs: { text: "" } } },
-          nodeBindings: {
-            prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-            steps: { kind: "widget", nodeId: "1", widgetName: "text" },
+      // Axis selectors exist only in experiment mode.
+      expect(await page.locator('[data-testid="shelf-exp-panel"]').count()).toBe(0);
+      const toggle = page.locator('[data-testid="experiment-toggle"]');
+      expect((await toggle.textContent()).trim()).toBe("Experiment");
+      await toggle.click();
+      await expect(page.locator('[data-testid="shelf-exp-panel"]')).toBeVisible({ timeout: 10000 });
+      expect((await toggle.textContent()).trim()).toBe("Exit Experiment");
+
+      // Exit hides the panel again.
+      await toggle.click();
+      await expect(page.locator('[data-testid="shelf-exp-panel"]')).toHaveCount(0, { timeout: 10000 });
+      expect((await toggle.textContent()).trim()).toBe("Experiment");
+
+      guard.assertNoErrors();
+      api.assertNoUnhandledCalls();
+      wfMock.assertNoUnhandledWorkflowCalls();
+    } finally {
+      guard.dispose();
+    }
+  });
+
+  test("2. multi-workflow comparison via picker; common axes and unique sections", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+
+    const ids = await selectPortraitV1(page, wfMock);
+    const subset = await createSubsetWorkflow(page);
+    await enableExperiment(page);
+
+    await compareWithSubset(page, subset.workflowId);
+    await expect(page.locator('[data-testid="shelf-exp-workflow-list"]')).toContainText("Portrait Pro");
+
+    // Common roles become axis toggles; activating one shows the blue state.
+    await expect(page.locator('[data-testid="shelf-axis-seed"]')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('[data-testid="shelf-axis-steps"]')).toBeVisible();
+    await expect(page.locator('[data-testid="shelf-axis-positive_prompt"]')).toBeVisible();
+    await page.locator('[data-testid="shelf-axis-seed"]').click();
+    const seedToggle = page.locator('[data-testid="shelf-axis-seed"]');
+    await expect(seedToggle).toHaveAttribute("aria-pressed", "true");
+    expect(await seedToggle.getAttribute("class")).toContain("is-axis");
+    // Non-axis rows stay dimmed.
+    expect(await page.locator('[data-testid="shelf-axis-steps"]').getAttribute("class")).toContain("is-dimmed");
+
+    // Unique roles (cfg lives only in Portrait Pro) never become axes, and
+    // sit in a hidden per-Workflow section with a settable input.
+    expect(await page.locator('[data-testid="shelf-axis-cfg"]').count()).toBe(0);
+    const unique = page.locator(`[data-testid="shelf-unique-${ids.workflowId}"]`);
+    await expect(unique).toBeVisible();
+    const uniqueBody = unique.locator(".comfymodal-studio-collapsible-content");
+    expect(await uniqueBody.isHidden()).toBe(true);
+    await unique.locator(`[data-testid="shelf-unique-toggle-${ids.workflowId}"]`).click();
+    const uniqueInput = unique.locator(`[data-testid="shelf-unique-input-${ids.workflowId}-cfg"]`);
+    await expect(uniqueInput).toBeVisible({ timeout: 5000 });
+    await uniqueInput.fill("9");
+    expect(await uniqueInput.inputValue()).toBe("9");
+
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
+  });
+
+  test("3. pills enter-to-create, hover full text, removable; number ops on int and float", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+
+    await selectPortraitV1(page, wfMock);
+    await enableExperiment(page);
+
+    // Activate the seed axis (integer field).
+    await page.locator('[data-testid="shelf-axis-seed"]').click();
+    await expect(page.locator('[data-testid="shelf-pills-seed"]')).toBeVisible({ timeout: 5000 });
+    const before = await page.locator('[data-testid^="shelf-pill-seed-"]').count();
+
+    // Enter-to-create with a long prompt-like value; full text on hover.
+    const longText = "a very long seed label value that exceeds the pill truncation width for title check";
+    await page.locator('[data-testid="shelf-axis-input-seed"]').fill(longText);
+    await page.locator('[data-testid="shelf-axis-input-seed"]').press("Enter");
+    const pill = page.locator(`[data-testid="shelf-pill-seed-${before}"]`);
+    await expect(pill).toBeVisible({ timeout: 5000 });
+    expect(await pill.getAttribute("title")).toBe(longText);
+
+    // Removable.
+    await pill.locator(`[data-testid="shelf-pill-remove-seed-${before}"]`).click();
+    await expect(page.locator(`[data-testid="shelf-pill-seed-${before}"]`)).toHaveCount(0, { timeout: 5000 });
+
+    // Generic integer ops: Random / Increment / Decrement / Empty.
+    const intCount = await page.locator('[data-testid^="shelf-pill-seed-"]').count();
+    await page.locator('[data-testid="shelf-num-random-seed"]').click();
+    await page.locator('[data-testid="shelf-num-inc-seed"]').click();
+    await page.locator('[data-testid="shelf-num-dec-seed"]').click();
+    await page.locator('[data-testid="shelf-num-empty-seed"]').click();
+    expect(await page.locator('[data-testid^="shelf-pill-seed-"]').count()).toBe(intCount + 4);
+
+    // Generic float ops on cfg.
+    await page.locator('[data-testid="shelf-axis-cfg"]').click();
+    await expect(page.locator('[data-testid="shelf-pills-cfg"]')).toBeVisible({ timeout: 5000 });
+    const floatCount = await page.locator('[data-testid^="shelf-pill-cfg-"]').count();
+    await page.locator('[data-testid="shelf-num-random-cfg"]').click();
+    await page.locator('[data-testid="shelf-num-inc-cfg"]').click();
+    await page.locator('[data-testid="shelf-num-dec-cfg"]').click();
+    await page.locator('[data-testid="shelf-num-empty-cfg"]').click();
+    expect(await page.locator('[data-testid^="shelf-pill-cfg-"]').count()).toBe(floatCount + 4);
+
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
+  });
+
+  test("4. matrix gating and submission render in the existing experiment-v2 surface", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+
+    // Stub the experiment-v2 engine: capture the definition, complete 4 cells.
+    let postedBody = null;
+    await page.route("**/comfymodal/studio/experiment-v2", async (route) => {
+      postedBody = route.request().postDataJSON();
+      const cells = [0, 1, 2, 3].map((i) => ({
+        cell_id: "cell_" + i,
+        status: "completed",
+        thumb_url: "/comfymodal/assets/shelf_cell_" + i,
+        workflow_id: i < 2 ? "wf_primary" : "wf_second",
+      }));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          experiment_id: "exp_shelf_matrix",
+          item: {
+            experiment_id: "exp_shelf_matrix",
+            aggregate_status: "completed",
+            total: 4,
+            counts: { queued: 0, running: 0, completed: 4, failed: 0, canceled: 0, interrupted: 0 },
+            cells,
           },
-          outputNodeId: "1",
-          source: "manual",
-        });
-        expect(snapResult.error).toBeFalsy();
-        expect(snapResult.id).toBeTruthy();
-        owned.snapshotIds.push(snapResult.id);
-
-        const presResult = await createPreset(page, {
-          label: `${prefix}-preset-${i}`,
-          snapshotId: snapResult.id,
-          compatibleFeatures: ["txt2img"],
-          defaults: { seed: 42, steps: 20, guidance: 7.0, sampler_name: "euler", scheduler: "normal", denoise: 1.0 },
-        });
-        expect(presResult.error).toBeFalsy();
-        expect(presResult.id).toBeTruthy();
-        owned.presetIds.push(presResult.id);
-      }
-      expect(owned.presetIds).toHaveLength(2);
-
-      // Open Studio
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Select the first preset as base
-      await selectBackendPreset(page, owned.presetIds[0]);
-
-      // Install guard AFTER startup
-      guard = installConsoleGuard(page);
-
-      // Enable experiment mode
-      await enableExperimentMode(page);
-
-      // Check the second preset as compare
-      await checkComparePreset(page, owned.presetIds[1]);
-
-      // Enable Steps axis and set values [10, 20]
-      await enableStepsAxis(page);
-      await setStepsAxisValues(page, [10, 20]);
-
-      // Assert no unhandled calls before experiment run
-      api.assertNoUnhandledCalls();
-
-      // Submit experiment
-      await submitExperiment(page);
-
-      // Wait for experiment to reach terminal state
-      await waitForExperimentTerminal(page);
-
-      // ── Assertions ────────────────────────────────────────────────
-
-      // The lastExperimentRequest must have correct presetIds and axes
-      const submitted = api.lastExperimentRequest;
-      expect(submitted).toBeTruthy();
-
-      // Unique presetIds length = 2
-      const presetIds = submitted.presetIds || [];
-      const uniquePresetIds = [...new Set(presetIds.filter(Boolean))];
-      expect(uniquePresetIds).toHaveLength(2);
-
-      // Axes values exact
-      const axes = submitted.experiment?.axes || {};
-      expect(axes.steps).toBeTruthy();
-      expect(axes.steps.enabled).toBe(true);
-      const stepsValues = axes.steps.values || [];
-      expect(stepsValues.map((v) => Number(v)).sort()).toEqual([10, 20]);
-
-      // cellCount should be 4 (2 presets × 2 axis values × 1 prompt)
-      const expIds = [...api.state.experiments.keys()];
-      expect(expIds.length).toBeGreaterThan(0);
-
-      // Find the last experiment's terminal snapshot
-      const lastExp = api.state.experiments.get(expIds[expIds.length - 1]);
-      expect(lastExp).toBeTruthy();
-      expect(lastExp.snapshot.total_cells).toBe(4);
-      expect(lastExp.snapshot.counters.completed).toBe(4);
-      expect(lastExp.snapshot.counters.failed).toBe(0);
-
-      // Completed UI: button should say "Run" (re-enabled after terminal)
-      const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
-      const btnText = (await runBtn.textContent()).trim();
-      expect(btnText).toBe("Run Experiment");
-
-      // Completion message shows exact cell count via canonical testid
-      await expect(page.locator('[data-testid="run-status-message"]')).toContainText("Run completed (4 cell(s)).");
-
-      // No failed cell events
-      const failedEvents = lastExp.events.filter((e) => e.type === "cell.failed");
-      expect(failedEvents).toHaveLength(0);
-
-      // Assert no console errors
-      guard.assertNoErrors();
-      api.assertNoUnhandledCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  test("cancels a running experiment through the stop-now endpoint", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 2, owned);
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, owned.presetIds[0]);
-
-      guard = installConsoleGuard(page);
-      await enableExperimentMode(page);
-      await checkComparePreset(page, owned.presetIds[1]);
-      await submitExperiment(page);
-
-      const cancelBtn = page.locator('[data-testid="cancel-experiment-btn"]');
-      await cancelBtn.waitFor({ state: "visible", timeout: 10000 });
-      await expect.poll(() => api.state.experiments.size, { timeout: 5000 }).toBeGreaterThan(0);
-      const expId = [...api.state.experiments.keys()][0];
-
-      await cancelBtn.click();
-      await waitForExperimentTerminal(page, 15000);
-
-      const stopCalls = api.state.calls.filter(function (call) {
-        return call.method === "POST" && call.pathname === "/comfymodal/experiments/" + expId + "/stop-now";
+        }),
       });
-      expect(stopCalls.length).toBeGreaterThan(0);
-      expect(api.state.experiments.get(expId).snapshot.status).toBe("stopped");
-      expect(api.state.experiments.get(expId).events.some((event) => event.type === "experiment.stopped")).toBe(true);
-      await expect(page.locator('[data-testid="cancel-experiment-btn"]')).toHaveCount(0);
-
-      guard.assertNoErrors();
-      api.assertNoUnhandledCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 2: Disabled with less than 2 presets ───────────────────────
-  //
-  // With only base or duplicate base compare selection, run-experiment
-  // disabled with exact at-least-2 reason; adding distinct second enables it.
-  // The compare checkbox change handler now calls context.setPage("playground")
-  // after updating state, so the Run button re-renders automatically.
-
-  test("2. run-experiment disabled until at least 2 unique presets selected", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 2, owned);
-      expect(owned.presetIds).toHaveLength(2);
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Select first preset as base
-      await selectBackendPreset(page, owned.presetIds[0]);
-
-      // Enable experiment mode
-      await enableExperimentMode(page);
-
-      // With only base (no compare), should be disabled
-      const runBtn = page.locator('[data-testid="run-experiment-inline-btn"]');
-      await runBtn.waitFor({ state: "visible", timeout: 10000 });
-
-      // Poll for disabled state (button state computed after async preset load)
-      await expect.poll(async () => runBtn.isDisabled(), { timeout: 5000 }).toBe(true);
-
-      // Check reason text contains "at least 2"
-      const reasonTextInitial = await getDisabledReasonText(page);
-      expect(reasonTextInitial.toLowerCase()).toContain("at least 2");
-
-      // Now check the second preset as compare.
-      // The compare checkbox change handler calls context.setPage("playground")
-      // which re-renders the control panel including the run button.
-      await checkComparePreset(page, owned.presetIds[1]);
-
-      // The run button should become enabled after re-render driven by
-      // context.setPage in the compare change handler.
-      await expect(runBtn).toBeEnabled({ timeout: 5000 });
-      const title = await runBtn.getAttribute("title");
-      expect(title).toBeFalsy(); // no disabled title
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 3: Axis eligibility with base + compare ────────────────────
-  //
-  // Build base preset/snapshot WITHOUT steps support and compare preset
-  // WITH steps support; Steps axis checkbox must be disabled and omitted
-  // from submitted request. Current recalcEligibleAxes uses only compareIds
-  // — write RED first, then fix to use canonical getExperimentPresetIds(state).
-
-  test("3. Steps axis checkbox disabled and omitted when base preset lacks steps binding", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Create base snapshot WITHOUT steps binding
-      const snapBase = await createSnapshot(page, {
-        name: "base-no-steps", compatibleFeatures: ["txt2img"],
-        graphJson: {}, apiPromptJson: {},
-        nodeBindings: { prompt: { kind: "widget", nodeId: "1", widgetName: "text" } },
-        outputNodeId: "1", source: "manual",
-      });
-      expect(snapBase.id).toBeTruthy();
-      owned.snapshotIds.push(snapBase.id);
-
-      const presBase = await createPreset(page, {
-        label: `${prefix}-base-no-steps`, snapshotId: snapBase.id,
-        compatibleFeatures: ["txt2img"], defaults: { seed: 1, steps: 20 },
-      });
-      expect(presBase.id).toBeTruthy();
-      owned.presetIds.push(presBase.id);
-
-      // Create compare snapshot WITH steps binding
-      const snapCompare = await createSnapshot(page, {
-        name: "compare-with-steps", compatibleFeatures: ["txt2img"],
-        graphJson: {}, apiPromptJson: {},
-        nodeBindings: {
-          prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-          steps: { kind: "widget", nodeId: "1", widgetName: "text" },
-        },
-        outputNodeId: "1", source: "manual",
-      });
-      expect(snapCompare.id).toBeTruthy();
-      owned.snapshotIds.push(snapCompare.id);
-
-      const presCompare = await createPreset(page, {
-        label: `${prefix}-compare-with-steps`, snapshotId: snapCompare.id,
-        compatibleFeatures: ["txt2img"], defaults: { seed: 2, steps: 30 },
-      });
-      expect(presCompare.id).toBeTruthy();
-      owned.presetIds.push(presCompare.id);
-
-      // Open Studio
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Select base preset (no steps)
-      await selectBackendPreset(page, presBase.id);
-
-      // Install guard after open
-      guard = installConsoleGuard(page);
-
-      // Enable experiment mode
-      await enableExperimentMode(page);
-
-      // Check compare preset (with steps).
-      // The compare change handler now calls context.setPage("playground")
-      // which re-renders, so we don't need toggle-off/on workaround.
-      await checkComparePreset(page, presCompare.id);
-
-      // When base preset lacks steps binding AND only prompt binding, Steps
-      // control is not in the visible control list (steps is optional and
-      // not bound). Consequently the axis checkbox wrapper for Steps is
-      // absent from the DOM entirely (not just disabled).
-      const stepsAxisWrapper = page.locator('[data-testid="axis-checkbox-steps"]');
-      await expect.poll(async () => stepsAxisWrapper.count(), { timeout: 5000 }).toBe(0);
-
-      // Also verify Steps control itself is not rendered
-      const stepsControl = page.locator('[data-testid="control-steps"]');
-      const stepsControlCount = await stepsControl.count();
-      expect(stepsControlCount).toBe(0);
-
-      // The axis editor for steps should NOT exist
-      const stepsEditor = page.locator('[data-testid="axis-editor-steps"]');
-      const editorCount = await stepsEditor.count();
-      expect(editorCount).toBe(0);
-
-      // Submit experiment
-      await submitExperiment(page);
-      await waitForExperimentTerminal(page);
-
-      // Assert Steps axis is NOT in the submitted request
-      const submitted = api.lastExperimentRequest;
-      expect(submitted).toBeTruthy();
-      const axes = submitted.experiment?.axes || {};
-      expect(axes.steps).toBeFalsy();
-
-      // No console errors from the eligibility / absence path
-      guard.assertNoErrors();
-      api.assertNoUnhandledCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 4: Failed experiment shows Mock failure terminal UI ─────────
-
-  test("4. failed experiment shows Mock failure terminal UI", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Create two presets with steps binding
-      for (let i = 0; i < 2; i++) {
-        const snapResult = await createSnapshot(page, {
-          name: `fail-test-snap-${i}`, compatibleFeatures: ["txt2img"],
-          graphJson: {}, apiPromptJson: {},
-          nodeBindings: {
-            prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-            steps: { kind: "widget", nodeId: "1", widgetName: "text" },
+    });
+    await page.route("**/comfymodal/history-v2/experiments/*/status", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "ok",
+          item: {
+            experiment_id: "exp_shelf_matrix",
+            aggregate_status: "completed",
+            total: 4,
+            counts: { queued: 0, running: 0, completed: 4, failed: 0, canceled: 0, interrupted: 0 },
+            cells: [0, 1, 2, 3].map((i) => ({
+              cell_id: "cell_" + i,
+              status: "completed",
+              thumb_url: "/comfymodal/assets/shelf_cell_" + i,
+            })),
           },
-          outputNodeId: "1", source: "manual",
-        });
-        expect(snapResult.id).toBeTruthy();
-        owned.snapshotIds.push(snapResult.id);
+        }),
+      });
+    });
 
-        const presResult = await createPreset(page, {
-          label: `${prefix}-fail-${i}`, snapshotId: snapResult.id,
-          compatibleFeatures: ["txt2img"],
-          defaults: { seed: i + 1, steps: 20 },
-        });
-        expect(presResult.id).toBeTruthy();
-        owned.presetIds.push(presResult.id);
-      }
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+    const guard = installConsoleGuard(page);
 
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, owned.presetIds[0]);
+    try {
+      await selectPortraitV1(page, wfMock);
+      const subset = await createSubsetWorkflow(page);
+      await enableExperiment(page);
+      await compareWithSubset(page, subset.workflowId);
 
-      guard = installConsoleGuard(page);
+      // Gated until an axis has values: enable seed, add a second value.
+      const runBtn = page.locator('[data-testid="shelf-exp-run-btn"]');
+      await expect(runBtn).toBeDisabled({ timeout: 10000 });
+      await page.locator('[data-testid="shelf-axis-seed"]').click();
+      await page.locator('[data-testid="shelf-axis-input-seed"]').fill("222");
+      await page.locator('[data-testid="shelf-axis-input-seed"]').press("Enter");
 
-      await enableExperimentMode(page);
-      await checkComparePreset(page, owned.presetIds[1]);
-      await enableStepsAxis(page);
-      await setStepsAxisValues(page, [10, 20]);
+      // Matrix summary: 2 workflows x seed[2] = 4 runs; run enabled.
+      await expect(page.locator('[data-testid="shelf-exp-matrix"]')).toContainText("2 workflow(s)", { timeout: 10000 });
+      await expect(page.locator('[data-testid="shelf-exp-matrix"]')).toContainText("4 run(s)");
+      await expect(runBtn).toBeEnabled({ timeout: 10000 });
+      await runBtn.click();
 
-      // Submit experiment
-      await submitExperiment(page);
+      // ONE definition posted: both workflows, exact seed values.
+      await expect.poll(() => postedBody !== null, { timeout: 15000 }).toBe(true);
+      const definition = postedBody.definition;
+      expect(definition.workflows.length).toBe(2);
+      expect(definition.axes.seed).toBeTruthy();
+      expect(definition.axes.seed.values.map((v) => Number(v)).sort((a, b) => a - b)).toEqual([42, 222]);
+      expect(postedBody.experiment_id).toBeTruthy();
 
-      // Wait for at least one experiment to exist, then force it to fail
-      await expect.poll(() => api.state.experiments.size, { timeout: 5000 }).toBeGreaterThan(0);
-      const expId = [...api.state.experiments.keys()][0];
-      api.setExperimentBehavior(expId, { forceFailed: true, terminalPoll: 3 });
-
-      // Wait for terminal state
-      await waitForExperimentTerminal(page, 45000);
-
-      // Should show "Mock failure" error
-      const reasonText = await getDisabledReasonText(page);
-      expect(reasonText.toLowerCase()).toContain("mock failure");
-
-      // Terminal snapshot counters should show all failed
-      const exp = api.state.experiments.get(expId);
-      expect(exp).toBeTruthy();
-      expect(exp.snapshot.counters.failed).toBeGreaterThan(0);
-      expect(exp.snapshot.counters.completed).toBe(0);
-
-      // Should have cell.failed events
-      const failedEvents = exp.events.filter((e) => e.type === "cell.failed");
-      expect(failedEvents.length).toBeGreaterThan(0);
+      // Results render in the EXISTING experiment-v2 grid (no second system).
+      const grid = page.locator('[data-testid="experiment-v2-grid"]');
+      await expect(grid.locator('[data-testid="experiment-v2-cell-cell_0"]')).toBeVisible({ timeout: 15000 });
+      expect(await grid.locator('[data-testid^="experiment-v2-cell-cell_"]').count()).toBe(4);
+      await expect(page.locator('[data-testid="experiment-v2-progress"]')).toContainText("4/4 complete", { timeout: 15000 });
 
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();
+      wfMock.assertNoUnhandledWorkflowCalls();
     } finally {
-      if (guard) guard.dispose();
+      guard.dispose();
     }
   });
 
-  // ── Test 5: Rapid axis toggle ────────────────────────────────────────
-  //
-  // Rapidly toggle Steps axis across re-renders; assert exactly one
-  // connected axis-editor-steps when axis ends enabled, no pageerror/
-  // console error, and no duplicate matching elements in the DOM.
-  // Current deferred insertion uses parent.insertBefore(editor,
-  // parent.nextSibling) incorrectly and lacks isConnected guard — RED
-  // then minimal fix using controlEl.isConnected, parent.isConnected,
-  // and parent.parentNode.insertBefore with stale-editor removal.
-
-  test("5. rapid axis toggle produces exactly one connected editor and no errors", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
+  test("5. shelf interactions stay console-clean with full mock coverage", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+    const guard = installConsoleGuard(page);
 
     try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
+      await selectPortraitV1(page, wfMock);
+      await enableExperiment(page);
 
-      // Create two presets with steps binding
-      for (let i = 0; i < 2; i++) {
-        const snapResult = await createSnapshot(page, {
-          name: `rapid-snap-${i}`, compatibleFeatures: ["txt2img"],
-          graphJson: {}, apiPromptJson: {},
-          nodeBindings: {
-            prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-            steps: { kind: "widget", nodeId: "1", widgetName: "text" },
-          },
-          outputNodeId: "1", source: "manual",
-        });
-        owned.snapshotIds.push(snapResult.id);
+      // Open + close the many-mode picker without confirming.
+      await page.locator('[data-testid="shelf-exp-pick-btn"]').click();
+      await expect(page.locator('[data-testid="shelf-exp-picker-dialog"]')).toBeVisible({ timeout: 10000 });
+      await page.locator('[data-testid="shelf-exp-picker-close"]').click();
+      await expect(page.locator('[data-testid="shelf-exp-picker-dialog"]')).toHaveCount(0, { timeout: 5000 });
 
-        const presResult = await createPreset(page, {
-          label: `${prefix}-rapid-${i}`, snapshotId: snapResult.id,
-          compatibleFeatures: ["txt2img"],
-          defaults: { seed: i + 1, steps: 20 },
-        });
-        owned.presetIds.push(presResult.id);
-      }
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, owned.presetIds[0]);
-      await enableExperimentMode(page);
-      await checkComparePreset(page, owned.presetIds[1]);
-
-      // Install guard AFTER open so ComfyUI startup noise is excluded
-      guard = installConsoleGuard(page);
-
-      // Rapidly toggle Steps axis checkbox multiple times
-      const stepsAxisCb = page.locator('[data-axis="steps"]');
-      await stepsAxisCb.waitFor({ state: "visible", timeout: 10000 });
-
-      // Toggle on->off->on->off->on quickly to create a race between
-      // deferred insertions and unmounts. 50ms between clicks is
-      // intentionally brief.
-      for (let t = 0; t < 5; t++) {
-        await stepsAxisCb.click();
-        await page.waitForTimeout(50);
-      }
-
-      // Final state: checked (5 toggles from unchecked = checked)
-      const isChecked = await stepsAxisCb.isChecked();
-      expect(isChecked).toBe(true);
-
-      // Wait for deferred insertions to settle: poll until the editor
-      // count stabilizes (no change across two consecutive polls).
-      const editorLocator = page.locator('[data-testid="axis-editor-steps"]');
-      let stableCount = -1;
-      await expect.poll(async () => {
-        const current = await editorLocator.count();
-        if (current === stableCount) return { stable: true, count: current };
-        stableCount = current;
-        return { stable: false, count: current };
-      }, { timeout: 5000, message: "editor count did not stabilise" }).toMatchObject({ stable: true });
-
-      // Assert exactly one editor, connected, with no duplicate elements
-      const finalCount = await editorLocator.count();
-      expect(finalCount).toBe(1);
-      const editor = editorLocator.first();
-      const isConnected = await editor.evaluate((el) => el.isConnected);
-      expect(isConnected).toBe(true);
-
-      // No page errors or console errors from the toggle dance
-      guard.assertNoErrors();
-      api.assertNoUnhandledCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 6: Archive/delete only owned presets ────────────────────────
-
-  test("6. archive owned presets, unrelated preset remains", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const testPresetId = owned.presetIds[0];
-
-      // Create an unrelated preset
-      const snapRes = await createSnapshot(page, {
-        name: "unrelated-snapshot-exp", compatibleFeatures: ["txt2img"],
-        graphJson: {}, apiPromptJson: {},
-        nodeBindings: {}, outputNodeId: "1", source: "manual",
-      });
-      expect(snapRes.id).toBeTruthy();
-
-      const presRes = await createPreset(page, {
-        label: "unrelated-preset-exp", snapshotId: snapRes.id,
-        compatibleFeatures: ["txt2img"], defaults: { seed: 99, steps: 20 },
-      });
-      expect(presRes.id).toBeTruthy();
-
-      // Delete the owned preset via API
-      const delRes = await page.evaluate(async (id) => {
-        const r = await fetch(`/comfymodal/studio/presets/${encodeURIComponent(id)}`, { method: "DELETE" });
-        return r.ok;
-      }, testPresetId);
-      expect(delRes).toBeTruthy();
-
-      // Reload Studio and check select options
-      await page.reload();
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      const options = await page.locator('[data-testid="backend-select"] option').allTextContents();
-      // Owned preset should be gone (archived)
-      expect(options.some((t) => t.includes(prefix))).toBeFalsy();
-      // Unrelated should remain
-      expect(options.some((t) => t.includes("unrelated-preset-exp"))).toBeTruthy();
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 7: Matrix summary de-duplication ────────────────────────────
-  //
-  // Verify matrix summary estimated runs and request canonical IDs
-  // de-duplicate base selected in compare list.
-
-  test("7. matrix summary deduplicates base present in compare list", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Create two presets WITH steps binding
-      for (let i = 0; i < 2; i++) {
-        const snapResult = await createSnapshot(page, {
-          name: `${prefix}-snap-${i}`, compatibleFeatures: ["txt2img"],
-          graphJson: {}, apiPromptJson: {},
-          nodeBindings: {
-            prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-            steps: { kind: "widget", nodeId: "1", widgetName: "text" },
-          },
-          outputNodeId: "1", source: "manual",
-        });
-        owned.snapshotIds.push(snapResult.id);
-
-        const presResult = await createPreset(page, {
-          label: `${prefix}-preset-${i}`, snapshotId: snapResult.id,
-          compatibleFeatures: ["txt2img"],
-          defaults: { seed: i + 1, steps: 20 },
-        });
-        owned.presetIds.push(presResult.id);
-      }
-
-      expect(owned.presetIds).toHaveLength(2);
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Select first preset as base
-      await selectBackendPreset(page, owned.presetIds[0]);
-
-      // Install guard
-      guard = installConsoleGuard(page);
-
-      // Enable experiment mode
-      await enableExperimentMode(page);
-
-      // Check the first preset ALSO in compare (self-reference to test deduplication)
-      await checkComparePreset(page, owned.presetIds[0]);
-
-      // Also add the second preset as compare
-      await checkComparePreset(page, owned.presetIds[1]);
-
-      // Enable Steps axis (which triggers re-render via toggleExperimentAxis action)
-      await enableStepsAxis(page);
-
-      // The getExperimentPresetIds should deduplicate: base (preset0) + compare [preset0, preset1]
-      // should yield [preset0, preset1] -> length 2
-      // Wait for the matrix summary to reflect the deduplicated count.
-      const matrixSummary = page.locator('[data-testid="matrix-summary"]');
-      await matrixSummary.waitFor({ state: "visible", timeout: 5000 });
-      await expect.poll(async () => (await matrixSummary.textContent()) || "", {
-        timeout: 5000,
-      }).toContain("Selected backends: 2");
-
-      // Now submit and verify the request has canonical IDs without dupes
-      await setStepsAxisValues(page, [10]);
-      await submitExperiment(page);
-      await waitForExperimentTerminal(page);
-
-      const submitted = api.lastExperimentRequest;
-      expect(submitted).toBeTruthy();
-
-      // Canonical preset IDs should be unique - base + compare should not duplicate
-      const presetIds = submitted.presetIds || [];
-      const uniquePresetIds = [...new Set(presetIds.filter(Boolean))];
-      expect(uniquePresetIds).toHaveLength(2);
-      expect(presetIds.length).toBe(uniquePresetIds.length);
-
-      // cellCount = 2 presets x axis values x 1 prompt.
-      // The axis editor starts with a default value (20 from CONTROL_DEFS),
-      // then quick-add of [10] adds a second value, giving [20, 10] = 2 values.
-      // Expected: 2 presets x 2 axis values x 1 prompt = 4 cells.
-      const expIds = [...api.state.experiments.keys()];
-      if (expIds.length > 0) {
-        const lastExp = api.state.experiments.get(expIds[expIds.length - 1]);
-        expect(lastExp).toBeTruthy();
-        expect(lastExp.snapshot.total_cells).toBe(4);
-      }
+      // Toggle an axis on and off; edit a shelf field while in experiment mode.
+      await page.locator('[data-testid="shelf-axis-steps"]').click();
+      await expect(page.locator('[data-testid="shelf-pills-steps"]')).toBeVisible({ timeout: 5000 });
+      await page.locator('[data-testid="shelf-axis-steps"]').click();
+      await expect(page.locator('[data-testid="shelf-pills-steps"]')).toHaveCount(0, { timeout: 5000 });
+      await page.locator('[data-testid="shelf-input-steps"]').fill("33");
+      await page.waitForTimeout(700);
 
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();
+      wfMock.assertNoUnhandledWorkflowCalls();
     } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 8: Zero presetIds rejected ──────────────────────────────────
-  //
-  // Mock /studio/experiment must return HTTP 400 error when canonical
-  // unique presetIds is zero; do not coerce zero to one.
-
-  test("8. experiment request with zero presetIds returns HTTP 400", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Create one snapshot but skip preset creation — we will POST the
-      // experiment request directly with an empty presetIds array.
-      const snapResult = await createSnapshot(page, {
-        name: `${prefix}-snapshot-0`,
-        compatibleFeatures: ["txt2img"],
-        graphJson: {}, apiPromptJson: {},
-        nodeBindings: { prompt: { kind: "widget", nodeId: "1", widgetName: "text" } },
-        outputNodeId: "1", source: "manual",
-      });
-      expect(snapResult.id).toBeTruthy();
-      owned.snapshotIds.push(snapResult.id);
-
-      // Submit an experiment with empty presetIds via direct fetch
-      const response = await page.evaluate(async () => {
-        const res = await fetch("/comfymodal/studio/experiment", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            presetIds: [],
-            featureId: "txt2img",
-            experiment: { name: "Empty preset test", axes: {}, prompts: [{ text: "test" }] },
-            metadata: { source: "studio_experiment" },
-          }),
-        });
-        return { status: res.status, body: await res.json() };
-      });
-
-      expect(response.status).toBe(400);
-      expect(response.body.status).toBe("error");
-      expect(response.body.message).toBeTruthy();
-      expect(response.body.message.toLowerCase()).toContain("preset");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
+      guard.dispose();
     }
   });
 });

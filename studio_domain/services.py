@@ -26,7 +26,9 @@ from .graph import (
     extract_executable_prompt,
     graph_hash_from_capture,
     input_exists,
+    is_ui_workflow_format,
     node_exists,
+    ui_graph_to_api_prompt,
 )
 from .models import (
     ImmutableVersionError,
@@ -51,11 +53,96 @@ from .models import (
     now_iso,
 )
 from .store import WorkflowDomainStore
+from .legacy_adapters import translate_legacy_preset
 
 # Fields a client may edit on each entity.
 _WORKFLOW_EDITABLE = {
     "name", "description", "folder", "tags", "favorite",
     "source_url", "source_author", "compatible_models",
+}
+
+# The wrapper configuration is kept on the Workflow record itself.  These
+# names are intentionally boring: they are the durable contract shared by
+# autosave, run-context, and portability adapters.
+WORKFLOW_CONFIG_FIELDS = frozenset({
+    "static_graph",
+    "bindings",
+    "output_binding",
+    "workflow_type",
+    "saved_values",
+    "layout_profile",
+    "allowed_options",
+})
+WORKFLOW_CONFIG_ALIASES = {
+    "graph": "static_graph",
+    "type": "workflow_type",
+    "output": "output_binding",
+    "layout": "layout_profile",
+    "field_values": "saved_values",
+    "values": "saved_values",
+    "allowed_options_filters": "allowed_options",
+}
+EXPERIMENT_ONLY_FIELDS = frozenset({
+    "selected_workflows", "workflow_ids", "axes", "value_pills",
+    "experiment_values", "experiment_draft", "run_history", "generated_images",
+})
+
+# Code-owned catalog/profile.  UI code may project these records into blocks,
+# but users cannot redefine their type or binding semantics.  The keys are
+# product API; graph-specific legacy role names are adapted only at the
+# internal Mapping compatibility seam below.
+_EXACT_BINDING = {"kind": "widget", "exact": True, "cardinality": "one"}
+BINDABLE_INPUT_CATALOG: dict[str, dict[str, Any]] = {
+    "prompt": {"key": "prompt", "name": "Prompt", "block": "multiline",
+               "input_kind": "multiline", "required_for": ("t2i",),
+               "optional_for": (), "experiment_eligible": True,
+               "rules": {"multiline": True}, "binding": _EXACT_BINDING},
+    "seed": {"key": "seed", "name": "Seed", "block": "integer",
+             "input_kind": "integer", "required_for": ("t2i",),
+             "optional_for": (), "experiment_eligible": True,
+             "rules": {"minimum": None, "allow_negative": True},
+             "binding": _EXACT_BINDING},
+    "step_count": {"key": "step_count", "name": "Step count", "block": "integer",
+                    "input_kind": "integer", "required_for": (),
+                    "optional_for": ("t2i",), "experiment_eligible": True,
+                    "rules": {"minimum": 1, "step": 1, "allow_negative": False},
+                    "binding": _EXACT_BINDING},
+    "cfg_scale": {"key": "cfg_scale", "name": "CFG scale", "block": "float",
+                   "input_kind": "float", "required_for": (),
+                   "optional_for": ("t2i",), "experiment_eligible": True,
+                   "rules": {"minimum": 0, "allow_negative": False},
+                   "binding": _EXACT_BINDING},
+    "sampler": {"key": "sampler", "name": "Sampler", "block": "dropdown",
+                "input_kind": "dropdown", "required_for": (),
+                "optional_for": ("t2i",), "experiment_eligible": True,
+                "rules": {}, "binding": _EXACT_BINDING},
+    "model_unet": {"key": "model_unet", "name": "Model UNET", "block": "model-picker",
+                    "input_kind": "model", "required_for": ("t2i",),
+                    "optional_for": (), "experiment_eligible": True,
+                    "rules": {"model_type": "unet"}, "binding": _EXACT_BINDING},
+    "vae": {"key": "vae", "name": "VAE", "block": "model-picker",
+            "input_kind": "model", "required_for": ("t2i",),
+            "optional_for": (), "experiment_eligible": True,
+            "rules": {"model_type": "vae"}, "binding": _EXACT_BINDING},
+    "clip": {"key": "clip", "name": "CLIP", "block": "model-picker",
+             "input_kind": "model", "required_for": ("t2i",),
+             "optional_for": (), "experiment_eligible": True,
+             "rules": {"model_type": "clip"}, "binding": _EXACT_BINDING},
+}
+T2I_REQUIRED_INPUTS = ("prompt", "seed", "model_unet", "vae", "clip")
+T2I_OPTIONAL_INPUTS = ("step_count", "cfg_scale", "sampler")
+OUTPUT_BINDING = {"key": "output", "name": "Output", "block": None,
+                  "required_for": ("t2i",),
+                  "binding": {"kind": "output", "exact": True, "cardinality": "one"}}
+_ROLE_ALIASES = {
+    "positive_prompt": "prompt", "steps": "step_count", "cfg": "cfg_scale",
+    "model": "model_unet", "unet": "model_unet",
+}
+WORKFLOW_TYPE_PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
+    "t2i": {
+        "required": T2I_REQUIRED_INPUTS,
+        "optional": T2I_OPTIONAL_INPUTS,
+    },
 }
 _PRESET_EDITABLE = {
     "name", "description", "values", "model_choices", "lora_values",
@@ -68,12 +155,17 @@ class WorkflowDomainService:
         self,
         root: str,
         dependency_provider: Optional[Callable[[dict[str, Any]], list[str]]] = None,
+        node_def_provider: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self.store = WorkflowDomainStore(root)
         # Optional callable(version_dict) -> list[str] feeding extra reasons
         # into derived version state (e.g. dependency resolution).  Must never
         # raise — any exception is swallowed by derive_version_state.
         self._dependency_provider = dependency_provider
+        # Optional callable(class_type) -> (required, optional) node-def
+        # pair used for UI-format graph conversion at import time.  Defaults
+        # to the lazy ComfyUI registry probe inside ui_graph_to_api_prompt.
+        self._node_def_provider = node_def_provider
 
     # ── value validation helpers ─────────────────────────────────────────
 
@@ -211,9 +303,34 @@ class WorkflowDomainService:
         source_url: str = "",
         source_author: str = "",
         compatible_models: Optional[list[str]] = None,
+        workflow_type: str = "t2i",
+        static_graph: Optional[dict[str, Any]] = None,
+        bindings: Optional[dict[str, Any]] = None,
+        output_binding: Optional[dict[str, Any]] = None,
+        saved_values: Optional[dict[str, Any]] = None,
+        layout_profile: Optional[dict[str, Any]] = None,
+        allowed_options: Optional[dict[str, Any]] = None,
+        require_complete: bool = False,
+        **aliases: Any,
     ) -> dict[str, Any]:
         if not isinstance(name, str) or not name.strip():
             raise WorkflowPresetValidationError("workflow name is required")
+        for key, value in aliases.items():
+            canonical = WORKFLOW_CONFIG_ALIASES.get(key)
+            if canonical is None:
+                raise WorkflowPresetValidationError(
+                    f"field {key!r} is not editable on a workflow"
+                )
+            if canonical == "static_graph" and static_graph is None:
+                static_graph = value
+            elif canonical == "workflow_type" and workflow_type == "t2i":
+                workflow_type = value
+            elif canonical == "saved_values" and saved_values is None:
+                saved_values = value
+            elif canonical == "layout_profile" and layout_profile is None:
+                layout_profile = value
+            elif canonical == "allowed_options" and allowed_options is None:
+                allowed_options = value
         now = now_iso()
         workflow = Workflow(
             workflow_id=make_workflow_id(),
@@ -228,7 +345,19 @@ class WorkflowDomainService:
             created_at=now,
             updated_at=now,
         )
-        return self.store.insert_workflow(workflow)
+        config = self._normalize_workflow_config(
+            {
+                "workflow_type": workflow_type,
+                "static_graph": static_graph if static_graph is not None else {},
+                "bindings": bindings if bindings is not None else {},
+                "output_binding": output_binding if output_binding is not None else {},
+                "saved_values": saved_values if saved_values is not None else {},
+                "layout_profile": layout_profile if layout_profile is not None else {},
+                "allowed_options": allowed_options if allowed_options is not None else {},
+            },
+            require_complete=require_complete,
+        )
+        return self.store.insert_workflow(workflow, config)
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         workflow = self.store.get_workflow(workflow_id)
@@ -243,40 +372,248 @@ class WorkflowDomainService:
         raw = self.store.get_workflow(workflow_id)
         if raw is None:
             raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
+        if not isinstance(body, dict):
+            raise WorkflowPresetValidationError("workflow update must be an object")
+        if "require_complete" in body:
+            raise WorkflowPresetValidationError("require_complete is not a saved field")
+        normalized_config = self._workflow_config_updates(raw, body)
+        metadata = {key: value for key, value in body.items()
+                    if key not in WORKFLOW_CONFIG_FIELDS and key not in WORKFLOW_CONFIG_ALIASES}
         workflow = Workflow.from_dict(raw)
-        for key in body:
+        for key in metadata:
             if key not in _WORKFLOW_EDITABLE:
                 raise WorkflowPresetValidationError(
                     f"field {key!r} is not editable on a workflow"
                 )
-        if "name" in body:
-            if not isinstance(body["name"], str) or not body["name"].strip():
+        if "name" in metadata:
+            if not isinstance(metadata["name"], str) or not metadata["name"].strip():
                 raise WorkflowPresetValidationError("workflow name is required")
-            workflow.name = body["name"].strip()[:200]
-        if "description" in body:
-            workflow.description = (body["description"] or "")[:2000]
-        if "folder" in body:
-            workflow.folder = (body["folder"] or "").strip("/")[:500]
-        if "tags" in body:
-            if not isinstance(body["tags"], list):
+            workflow.name = metadata["name"].strip()[:200]
+        if "description" in metadata:
+            workflow.description = (metadata["description"] or "")[:2000]
+        if "folder" in metadata:
+            workflow.folder = (metadata["folder"] or "").strip("/")[:500]
+        if "tags" in metadata:
+            if not isinstance(metadata["tags"], list):
                 raise WorkflowPresetValidationError("tags must be a list of strings")
-            workflow.tags = [t for t in body["tags"] if isinstance(t, str)]
-        if "favorite" in body:
-            workflow.favorite = bool(body["favorite"])
-        if "source_url" in body:
-            workflow.source_url = (body["source_url"] or "")[:2000]
-        if "source_author" in body:
-            workflow.source_author = (body["source_author"] or "")[:500]
-        if "compatible_models" in body:
-            if not isinstance(body["compatible_models"], list):
+            workflow.tags = [t for t in metadata["tags"] if isinstance(t, str)]
+        if "favorite" in metadata:
+            workflow.favorite = bool(metadata["favorite"])
+        if "source_url" in metadata:
+            workflow.source_url = (metadata["source_url"] or "")[:2000]
+        if "source_author" in metadata:
+            workflow.source_author = (metadata["source_author"] or "")[:500]
+        if "compatible_models" in metadata:
+            if not isinstance(metadata["compatible_models"], list):
                 raise WorkflowPresetValidationError(
                     "compatible_models must be a list of strings"
                 )
             workflow.compatible_models = [
-                m for m in body["compatible_models"] if isinstance(m, str)
+                m for m in metadata["compatible_models"] if isinstance(m, str)
             ]
         workflow.updated_at = now_iso()
+        if normalized_config:
+            # Keep the compatibility dataclass and wrapper fields in one
+            # atomic read-modify-write operation.
+            fields = workflow.to_dict()
+            fields.update(normalized_config)
+            return self.store.update_workflow_fields(workflow_id, fields)
         return self.store.update_workflow(workflow)
+
+    @staticmethod
+    def _normalize_binding_map(bindings: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(bindings, dict):
+            raise WorkflowPresetValidationError("bindings must be an object")
+        normalized: dict[str, dict[str, Any]] = {}
+        targets: set[tuple[str, str, str]] = set()
+        for role, raw in bindings.items():
+            if not isinstance(role, str) or not role.strip():
+                raise WorkflowPresetValidationError("binding roles must be non-empty strings")
+            canonical_role = _ROLE_ALIASES.get(role, role)
+            if canonical_role not in BINDABLE_INPUT_CATALOG:
+                raise WorkflowPresetValidationError(
+                    f"binding {role!r} is not a supported bindable input"
+                )
+            if not isinstance(raw, dict):
+                raise WorkflowPresetValidationError(f"binding {role!r} must be an object")
+            item = copy.deepcopy(raw)
+            node_id = str(item.get("node_id") or item.get("nodeId") or "")
+            input_name = str(
+                item.get("input_name")
+                or item.get("inputName")
+                or item.get("widget_name")
+                or item.get("widget")
+                or ""
+            )
+            output_name = str(item.get("output_name") or item.get("outputName") or "")
+            if not node_id or (not input_name and not output_name):
+                raise WorkflowPresetValidationError(
+                    f"binding {role!r} must name one concrete node input/widget or output"
+                )
+            target = (node_id, input_name, output_name)
+            if target in targets:
+                raise WorkflowPresetValidationError(
+                    f"binding {role!r} duplicates node/widget binding {target!r}"
+                )
+            targets.add(target)
+            item["node_id"] = node_id
+            if input_name:
+                item["input_name"] = input_name
+            if canonical_role in normalized:
+                raise WorkflowPresetValidationError(
+                    f"binding {role!r} duplicates role {canonical_role!r}"
+                )
+            normalized[canonical_role] = item
+        return normalized
+
+    @classmethod
+    def _normalize_workflow_config(
+        cls, fields: dict[str, Any], *, require_complete: bool = False
+    ) -> dict[str, Any]:
+        workflow_type = fields.get("workflow_type", "t2i")
+        if not isinstance(workflow_type, str) or not workflow_type.strip():
+            raise WorkflowPresetValidationError("workflow_type must be a non-empty string")
+        workflow_type = workflow_type.strip()
+        graph = fields.get("static_graph", {})
+        if not isinstance(graph, dict):
+            raise WorkflowPresetValidationError("static_graph must be an object")
+        bindings = cls._normalize_binding_map(fields.get("bindings", {}))
+        output = fields.get("output_binding", {})
+        if not isinstance(output, dict):
+            raise WorkflowPresetValidationError("output_binding must be an object")
+        output = copy.deepcopy(output)
+        if output:
+            output["node_id"] = str(
+                output.get("node_id")
+                or output.get("nodeId")
+                or output.get("output_node_id")
+                or ""
+            )
+            if not output["node_id"]:
+                raise WorkflowPresetValidationError("output_binding must name a concrete node")
+        values = fields.get("saved_values", {})
+        if not isinstance(values, dict):
+            raise WorkflowPresetValidationError("saved_values must be an object")
+        values = copy.deepcopy(values)
+        allowed = fields.get("allowed_options", {})
+        if not isinstance(allowed, dict):
+            raise WorkflowPresetValidationError("allowed_options must be an object")
+        allowed = copy.deepcopy(allowed)
+        for role, options in allowed.items():
+            if not isinstance(options, list):
+                raise WorkflowPresetValidationError(
+                    f"allowed_options[{role!r}] must be a list"
+                )
+            if role in values and values[role] is not None and values[role] not in options:
+                raise WorkflowPresetValidationError(
+                    f"saved value for {role!r} is outside its allowed options"
+                )
+        layout = fields.get("layout_profile", {})
+        if not isinstance(layout, dict):
+            raise WorkflowPresetValidationError("layout_profile must be an object")
+        result = {
+            "static_graph": copy.deepcopy(graph),
+            "bindings": bindings,
+            "output_binding": output,
+            "workflow_type": workflow_type,
+            "saved_values": values,
+            "layout_profile": copy.deepcopy(layout),
+            "allowed_options": allowed,
+        }
+        if require_complete:
+            profile = WORKFLOW_TYPE_PROFILES.get(workflow_type, {})
+            missing = []
+            for role in profile.get("required", ()):
+                if role in bindings:
+                    continue
+                # ``model`` is the legacy graph semantic role; the wrapper
+                # catalog names the same required component Model UNET.
+                if role == "model" and ({"model_unet", "unet"} & bindings.keys()):
+                    continue
+                missing.append(role)
+            if output.get("node_id") == "":
+                missing.append("output")
+            if missing:
+                raise WorkflowPresetValidationError(
+                    "workflow is missing required bindings: " + ", ".join(missing)
+                )
+        return result
+
+    def _workflow_config_updates(
+        self, raw: dict[str, Any], body: dict[str, Any]
+    ) -> dict[str, Any]:
+        forbidden = EXPERIMENT_ONLY_FIELDS.intersection(body)
+        if forbidden:
+            raise WorkflowPresetValidationError(
+                "experiment-only fields are not durable Workflow config: "
+                + ", ".join(sorted(forbidden))
+            )
+        supplied: dict[str, Any] = {}
+        for key, value in body.items():
+            canonical = WORKFLOW_CONFIG_ALIASES.get(key, key)
+            if canonical in WORKFLOW_CONFIG_FIELDS:
+                supplied[canonical] = value
+        if not supplied:
+            return {}
+        merged = {field: copy.deepcopy(raw.get(field, default)) for field, default in (
+            ("workflow_type", "t2i"), ("static_graph", {}), ("bindings", {}),
+            ("output_binding", {}), ("saved_values", {}), ("layout_profile", {}),
+            ("allowed_options", {}),
+        )}
+        merged.update(supplied)
+        return self._normalize_workflow_config(
+            merged, require_complete=bool(body.get("require_complete", False))
+        )
+
+    def autosave_workflow(
+        self, workflow_id: str, body: dict[str, Any], *, require_complete: bool = False
+    ) -> dict[str, Any]:
+        """Durably save normal Workflow content/layout; never experiment state."""
+        if not isinstance(body, dict):
+            raise WorkflowPresetValidationError("workflow autosave must be an object")
+        raw = self.store.get_workflow(workflow_id)
+        if raw is None:
+            raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
+        fields = self._workflow_config_updates(raw, body)
+        if not fields:
+            raise WorkflowPresetValidationError("autosave requires Workflow config fields")
+        if require_complete:
+            fields = self._normalize_workflow_config(fields, require_complete=True)
+        fields["updated_at"] = now_iso()
+        return self.store.update_workflow_fields(workflow_id, fields)
+
+    def save_workflow_config(
+        self, workflow_id: str, config: dict[str, Any], *, require_complete: bool = False
+    ) -> dict[str, Any]:
+        """Named API alias for callers that do not model autosave as a route."""
+        return self.autosave_workflow(
+            workflow_id, config, require_complete=require_complete
+        )
+
+    def validate_workflow_config(self, workflow_id: str, *, require_complete: bool = False) -> dict[str, Any]:
+        raw = self.get_workflow(workflow_id)
+        config = self._normalize_workflow_config(
+            {field: raw.get(field, default) for field, default in (
+                ("workflow_type", "t2i"), ("static_graph", {}), ("bindings", {}),
+                ("output_binding", {}), ("saved_values", {}), ("layout_profile", {}),
+                ("allowed_options", {}),
+            )},
+            require_complete=require_complete,
+        )
+        return {"valid": True, "complete": bool(require_complete), "config": config}
+
+    def get_workflow_config(self, workflow_id: str) -> dict[str, Any]:
+        """Return only the durable wrapper configuration for one Workflow."""
+        raw = self.get_workflow(workflow_id)
+        defaults = {
+            "workflow_type": "t2i", "static_graph": {}, "bindings": {},
+            "output_binding": {}, "saved_values": {}, "layout_profile": {},
+            "allowed_options": {},
+        }
+        return {
+            field: copy.deepcopy(raw.get(field, default))
+            for field, default in defaults.items()
+        }
 
     def list_folders(self) -> list[str]:
         folders: set[str] = set()
@@ -342,6 +679,18 @@ class WorkflowDomainService:
         raw_workflow = self.store.get_workflow(workflow_id)
         if raw_workflow is None:
             raise WorkflowNotFoundError(f"workflow {workflow_id!r} not found")
+        capture = dict(capture or {})
+        # File/canvas imports arrive as UI-format graphs (nodes list) with no
+        # API prompt. Derive the executable prompt server-side (registry
+        # probe) so candidates, dependency metadata, runnable state, and
+        # future runs all see the same graph downstream consumers expect.
+        graph_json = capture.get("graph_json") or {}
+        if not capture.get("api_prompt_json") and is_ui_workflow_format(graph_json):
+            derived = ui_graph_to_api_prompt(
+                graph_json, node_def_provider=self._node_def_provider
+            )
+            if derived:
+                capture["api_prompt_json"] = derived
         graph_hash = graph_hash_from_capture(capture)
 
         # Accidental duplicate capture: reuse the LATEST version with the
@@ -381,7 +730,19 @@ class WorkflowDomainService:
         workflow = Workflow.from_dict(raw_workflow)
         workflow.latest_version_id = stored["workflow_version_id"]
         workflow.updated_at = now_iso()
-        self.store.update_workflow(workflow)
+        updated = workflow.to_dict()
+        updated.update({
+            # Keep the first imported/captured graph on the user-facing
+            # Workflow.  Later immutable compatibility revisions do not
+            # silently replace the wrapper's static graph.
+            "static_graph": copy.deepcopy(
+                raw_workflow.get("static_graph")
+                or (capture or {}).get("graph_json")
+                or executable
+                or {}
+            ),
+        })
+        self.store.update_workflow_fields(workflow_id, updated)
 
         return self._enrich_version(stored)
 
@@ -448,7 +809,24 @@ class WorkflowDomainService:
         workflow = Workflow.from_dict(raw_workflow)
         workflow.latest_version_id = stored["workflow_version_id"]
         workflow.updated_at = now
-        self.store.update_workflow(workflow)
+        self.store.update_workflow_fields(
+            workflow.workflow_id,
+            {
+                **workflow.to_dict(),
+                "bindings": {
+                    _ROLE_ALIASES.get(role, role): {
+                        **entry.to_dict(),
+                        "semantic_role": _ROLE_ALIASES.get(role, role),
+                    }
+                    for role, entry in mapping.entries.items()
+                    if _ROLE_ALIASES.get(role, role) in BINDABLE_INPUT_CATALOG
+                },
+                "output_binding": {
+                    "node_id": mapping.output_node_id,
+                    "output_name": "",
+                } if mapping.output_node_id else {},
+            },
+        )
 
         return self._enrich_version(stored)
 
@@ -567,7 +945,28 @@ class WorkflowDomainService:
             output_node_id=str(output_node_id or ""),
             entries=self._normalize_entries(entries),
         )
-        return self.store.insert_mapping(mapping)
+        stored = self.store.insert_mapping(mapping)
+        raw_workflow = self.store.get_workflow(str(version.get("workflow_id", "")))
+        if raw_workflow is not None:
+            self.store.update_workflow_fields(
+                str(version.get("workflow_id", "")),
+                {
+                    "bindings": {
+                        _ROLE_ALIASES.get(role, role): {
+                            **entry.to_dict(),
+                            "semantic_role": _ROLE_ALIASES.get(role, role),
+                        }
+                        for role, entry in mapping.entries.items()
+                        if _ROLE_ALIASES.get(role, role) in BINDABLE_INPUT_CATALOG
+                    },
+                    "output_binding": {
+                        "node_id": mapping.output_node_id,
+                        "output_name": "",
+                    } if mapping.output_node_id else {},
+                    "updated_at": now_iso(),
+                },
+            )
+        return stored
 
     def get_mapping(self, workflow_version_id: str) -> Optional[dict[str, Any]]:
         mapping = self.store.get_mapping_for_version(workflow_version_id)
@@ -1031,3 +1430,47 @@ class WorkflowDomainService:
             bool(workflow) and workflow.get("default_preset_id") == preset.get("preset_id")
         )
         return enriched
+
+    # ── Legacy absorption bridge (abs-1) ─────────────────────────────────
+    # Shelf/Experiment submissions carrying unscoped legacy preset payloads
+    # (old semantic roles) enter the single durable authority HERE: the
+    # payload is translated by ``studio_domain.legacy_adapters`` (pure, no
+    # I/O, no migration) and persisted via the verified ``create_preset``
+    # path only.  Unknown roles pass through verbatim and surface through
+    # the preset state / unmapped reporting — never silently dropped.
+
+    def create_preset_from_legacy(
+        self,
+        workflow_version_id: str,
+        legacy_preset: dict[str, Any] | None,
+        *,
+        strict: bool = True,
+        name: str = "",
+        favorite: bool | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a version-scoped preset from an unscoped legacy payload.
+
+        Inputs: ``workflow_version_id`` — the version scope (never guessed);
+          ``legacy_preset`` — unscoped legacy payload (``values`` /
+          ``model_choices`` keyed by old roles); ``strict`` — forwarded to
+          ``create_preset``; ``name``/``favorite``/``tags`` — explicit
+          overrides winning over the translated payload.
+        Outputs: the enriched preset dict, exactly as ``create_preset``
+          returns (version-scoped, canonical keys).
+        """
+        translated = translate_legacy_preset(legacy_preset)
+        preset_name = name or translated["name"]
+        return self.create_preset(
+            workflow_version_id,
+            preset_name,
+            description=translated["description"],
+            values=translated["values"],
+            model_choices=translated["model_choices"],
+            lora_values=translated["lora_values"],
+            exposed_controls=translated["exposed_controls"],
+            recommended_values=translated["recommended_values"],
+            favorite=translated["favorite"] if favorite is None else bool(favorite),
+            tags=translated["tags"] if tags is None else list(tags),
+            strict=strict,
+        )

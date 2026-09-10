@@ -1,0 +1,162 @@
+[
+  {
+    "cache_format_version": 1,
+    "reports": {
+      "wv_3f7e1ec12fe14545": {
+        "report": {
+          "version_id": "wv_3f7e1ec12fe14545",
+          "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "risk_level": "unknown",
+          "rule_version": "portability-rules-v1",
+          "issue_count": 7,
+          "counts": {
+            "high": 0,
+            "medium": 7,
+            "low": 0
+          },
+          "issues": [
+            {
+              "code": "analysis_unavailable",
+              "severity": "medium",
+              "message": "Analysis unavailable: no executable prompt available for analysis.",
+              "subject": "graph",
+              "fix_hint": "Supply readable evidence and re-run analysis.",
+              "evidence": {
+                "reason": "no executable prompt available for analysis"
+              }
+            },
+            {
+              "code": "baseten_deployment_embedding_required",
+              "severity": "medium",
+              "message": "Baseten embeds the workflow into a deployment; free arbitrary graph-per-request dispatch is not the default model.",
+              "subject": "target",
+              "fix_hint": "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+            },
+            {
+              "code": "baseten_frontend_setup_required",
+              "severity": "medium",
+              "message": "The baseten image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "comfy_cloud_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "comfy_cloud frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runcomfy_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "runcomfy frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runpod_frontend_setup_required",
+              "severity": "medium",
+              "message": "The runpod image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "target_capability_unknown",
+              "severity": "medium",
+              "message": "A provider capability this readiness decision depends on is unverified.",
+              "subject": "target",
+              "fix_hint": "Verify the provider capability before relying on this target."
+            }
+          ],
+          "signals": {},
+          "targets": {
+            "local": {
+              "risk_level": "low",
+              "issue_codes": [],
+              "advice": []
+            },
+            "modal": {
+              "risk_level": "low",
+              "issue_codes": [],
+              "advice": []
+            },
+            "runpod": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "runpod_frontend_setup_required"
+              ],
+              "advice": [
+                "Ship a subgraph-capable ComfyUI frontend in the worker image."
+              ]
+            },
+            "runcomfy": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "runcomfy_subgraph_support_unknown",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Verify subgraph execution in a RunComfy session first."
+              ]
+            },
+            "comfy_cloud": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "comfy_cloud_subgraph_support_unknown",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Confirm Comfy Cloud catalog/frontend support before exporting there."
+              ]
+            },
+            "baseten": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "baseten_deployment_embedding_required",
+                "baseten_frontend_setup_required"
+              ],
+              "advice": [
+                "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+              ]
+            }
+          },
+          "environment": {
+            "risk_level": "unknown",
+            "issues": [
+              {
+                "code": "analysis_unavailable",
+                "severity": "medium",
+                "message": "Analysis unavailable: all environment dimensions unknown.",
+                "subject": "environment",
+                "fix_hint": "Supply prepared environment facts and re-run."
+              }
+            ],
+            "source": "current_studio_environment"
+          },
+          "stale": false,
+          "invalidation": {
+            "workflow_version_id": "wv_3f7e1ec12fe14545",
+            "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "dependency_metadata_hash": "898364f57b37b38003f6c2a37641cfaa2e95936af2143b50568053cee38546f6",
+            "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+            "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+            "rule_version": "portability-rules-v1",
+            "manifest_version": 1,
+            "comfyui_version": "0.24.0"
+          },
+          "analyzed_at": "2026-09-10T15:06:59.492341+00:00"
+        },
+        "stamp": {
+          "workflow_version_id": "wv_3f7e1ec12fe14545",
+          "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "dependency_metadata_hash": "898364f57b37b38003f6c2a37641cfaa2e95936af2143b50568053cee38546f6",
+          "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+          "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+          "rule_version": "portability-rules-v1",
+          "manifest_version": 1,
+          "comfyui_version": "0.24.0"
+        }
+      }
+    }
+  }
+]

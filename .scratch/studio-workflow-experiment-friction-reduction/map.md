@@ -18,11 +18,10 @@ Domain is ComfyUI Studio workflow wrappers, T2I field configuration, and experim
 - [Field-Card Experiment Prototype](issues/06-field-card-experiment-prototype.md) — Approved Shelf baseline: left field controls with drag/group/autosave layout, explicit Experiment mode with workflow comparison and axes/pills, and persistent output on the right.
 - [Durable Save Import Export Contract](issues/07-durable-save-import-export-contract.md) — Workflows autosave durable content/layout; experiment state stays a local draft; imports create new static Workflows and bundles exclude history/output artifacts.
 - [Implementation Acceptance Contract](issues/08-implementation-acceptance-contract.md) — The complete import-to-run-to-experiment journey is proven with focused Playwright, real graph capture evidence, existing matrix/history surfaces, cleanup checks, and Unlazy gates.
+- [Bindable Input Schema Contract](issues/09-bindable-input-schema-contract.md) — A code-owned fixed catalog maps canonical inputs one-to-one to coded blocks and exact node widgets; T2I required roles, optional roles, output binding, and cross-Workflow axis rules are explicit.
+- [Implementation Sequence and Ownership](issues/10-implementation-sequence-and-ownership.md) — Implementation starts with spec/gates and bindable-input/domain contracts, then Workflow creation/picker, Shelf Playground, Experiment integration, evidence, and legacy cleanup with separate owners.
 
 ## Not yet specified
-
-- Final canonical advanced-field/binding schema.
-- Implementation sequence and ownership.
 
 ## Out of scope
 

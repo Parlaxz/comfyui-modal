@@ -289,6 +289,13 @@ def register_studio_routes(server: Any, node_dir: str | os.PathLike, studio_outp
         return web.json_response({"status": "ok", "snapshot": found[0]})
 
     # ── Presets ─────────────────────────────────────────────────────────
+    # 1.3.1 legacy-cleanup evidence (KEEP): the preset authority
+    # (.studio_presets.json + these /studio/presets routes) still has active
+    # callers — web/studio-backend-api.js preset CRUD, getRuntimePresets in
+    # web/studio-backend.js consumed by studio-playground.js and
+    # studio-experiment-mode.js, settings counts in web/studio-settings.js,
+    # and StudioRouteBehaviourTests in tests/test_routes_registered.py.
+    # No migration work; nothing here qualified for removal.
 
     @server.routes.get("/comfymodal/studio/presets")
     async def studio_presets_list(request: web.Request) -> web.Response:

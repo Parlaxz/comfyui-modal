@@ -6418,6 +6418,302 @@ button.comfymodal-studio-feature-chip {
   top: auto;
   bottom: 8px;
 }
+
+/* ── Shelf Playground (leaf 1.2.2) ─────────────────────────────── */
+
+.comfymodal-studio-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #2a2a2a;
+}
+
+.comfymodal-studio-shelf-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.comfymodal-studio-shelf-workflow-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #d0d0d0;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-shelf-autosaved {
+  font-size: 10px;
+  color: #666;
+  font-style: italic;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-shelf-mini-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-shelf-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.comfymodal-studio-shelf-row {
+  display: flex;
+  gap: 6px;
+}
+
+.comfymodal-studio-shelf-row > .comfymodal-studio-shelf-card {
+  flex: 1;
+  min-width: 0;
+}
+
+.comfymodal-studio-shelf-card {
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 8px;
+}
+
+.comfymodal-studio-shelf-card.is-prompt {
+  border-color: #3a3a3a;
+}
+
+.comfymodal-studio-shelf-card.is-dragging {
+  opacity: 0.5;
+}
+
+.comfymodal-studio-shelf-card.is-drop-target,
+.comfymodal-studio-shelf-row.is-drop-target {
+  outline: 1px dashed var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
+.comfymodal-studio-shelf-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.comfymodal-studio-shelf-drag {
+  cursor: grab;
+  color: #555;
+  font-size: 12px;
+  letter-spacing: -2px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-shelf-drag:active {
+  cursor: grabbing;
+}
+
+.comfymodal-studio-shelf-card-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #a0a0a0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-shelf-card-body .comfymodal-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.comfymodal-studio-shelf-advanced-wrap {
+  margin-top: 4px;
+}
+
+.comfymodal-studio-shelf-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Stale output: right-side canvas dims until a new run completes. */
+
+.comfymodal-studio-canvas.is-stale img {
+  opacity: 0.45;
+}
+
+/* Shelf dialogs (picker + reuse prompt). */
+
+.comfymodal-studio-shelf-dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.7);
+}
+
+.comfymodal-studio-shelf-dialog {
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 16px;
+  max-width: min(560px, 92vw);
+  max-height: 84vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #d0d0d0;
+}
+
+/* ── Shelf Experiment (leaf 1.2.2) ─────────────────────────── */
+
+.comfymodal-studio-shelf-exp {
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 12px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.comfymodal-studio-shelf-exp-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.comfymodal-studio-shelf-exp-chip {
+  font-size: 11px;
+  color: #ccc;
+  background: #0a0a0a;
+  border: 1px solid #333;
+  border-radius: 3px;
+  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.comfymodal-studio-shelf-exp-axes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.comfymodal-studio-shelf-exp-axis {
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.comfymodal-studio-shelf-exp-axis.is-dimmed {
+  opacity: 0.55;
+}
+
+.comfymodal-studio-shelf-exp-axis-toggle {
+  background: #1a1a1a;
+  color: #aaa;
+  border: 1px solid #333;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.comfymodal-studio-shelf-exp-axis-toggle.is-axis {
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
+  border-color: var(--color-accent, #5a7fdb);
+  color: var(--color-accent, #5a7fdb);
+}
+
+.comfymodal-studio-shelf-exp-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.comfymodal-studio-shelf-exp-pill {
+  font-size: 11px;
+  color: #d0d0d0;
+  background: #0a0a0a;
+  border: 1px solid #3a3a3a;
+  border-radius: 10px;
+  padding: 2px 6px 2px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comfymodal-studio-shelf-exp-pill-remove {
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.comfymodal-studio-shelf-exp-pill-remove:hover {
+  color: #f87171;
+}
+
+.comfymodal-studio-shelf-exp-numops {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.comfymodal-studio-shelf-exp-unique {
+  border-top: 1px solid #2a2a2a;
+  padding-top: 4px;
+}
+
+.comfymodal-studio-shelf-exp-unique-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #a0a0a0;
+  padding: 3px 0;
+}
+
+.comfymodal-studio-shelf-exp-unique-row .comfymodal-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.comfymodal-studio-shelf-exp-matrix {
+  font-size: 12px;
+  color: #d0d0d0;
+  font-weight: 600;
+}
 `;
 
 let _injected = false;

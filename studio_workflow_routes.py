@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import json
 import logging
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,58 @@ async def _read_body(request: web.Request) -> dict[str, Any] | None:
     except Exception:
         return None
     return body if isinstance(body, dict) else None
+
+
+_WORKFLOW_CONFIG_FIELDS = (
+    "static_graph", "bindings", "output_binding", "workflow_type",
+    "saved_values", "layout_profile", "allowed_options",
+)
+_WORKFLOW_CONFIG_ALIASES = {
+    "graph": "static_graph",
+    "type": "workflow_type",
+    "output": "output_binding",
+    "layout": "layout_profile",
+    "field_values": "saved_values",
+    "values": "saved_values",
+    "allowed_options_filters": "allowed_options",
+}
+
+
+def _workflow_config_kwargs(body: dict[str, Any]) -> dict[str, Any]:
+    """Select only durable wrapper fields from a create/import body."""
+    result: dict[str, Any] = {}
+    for key, value in body.items():
+        canonical = _WORKFLOW_CONFIG_ALIASES.get(key, key)
+        if canonical in _WORKFLOW_CONFIG_FIELDS:
+            result[canonical] = value
+    if "require_complete" in body:
+        result["require_complete"] = bool(body["require_complete"])
+    return result
+
+
+def _workflow_bundle_fields(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Whitelist durable Workflow config; drafts/history/output never cross it."""
+    return {
+        field: copy.deepcopy(workflow[field])
+        for field in _WORKFLOW_CONFIG_FIELDS
+        if field in workflow
+    }
+
+
+def _manifest_workflow_config(payload: dict[str, Any]) -> dict[str, Any]:
+    section = payload.get("workflow")
+    if not isinstance(section, dict):
+        return {}
+    fields = {
+        key: copy.deepcopy(section[key])
+        for key in _WORKFLOW_CONFIG_FIELDS
+        if key in section
+    }
+    # v1's executable graph remains the integrity-bearing graph. Older
+    # bundles use it as the best available static copy.
+    if "static_graph" not in fields and isinstance(section.get("graph"), dict):
+        fields["static_graph"] = copy.deepcopy(section["graph"])
+    return fields
 
 
 def _enrich_workflow_summary(
@@ -262,6 +315,7 @@ def register_workflow_routes(
                 source_url=str(body.get("source_url", "")),
                 source_author=str(body.get("source_author", "")),
                 compatible_models=body.get("compatible_models"),
+                **_workflow_config_kwargs(body),
             )
             return web.json_response({"status": "ok", "workflow": workflow})
         except WorkflowPresetValidationError as exc:
@@ -291,6 +345,7 @@ def register_workflow_routes(
                 source_url=str(body.get("source_url", "")),
                 source_author=str(body.get("source_author", "")),
                 compatible_models=body.get("compatible_models"),
+                **_workflow_config_kwargs(body),
             )
             version = service.create_version_from_capture(
                 str(workflow.get("workflow_id", "")), capture
@@ -344,6 +399,30 @@ def register_workflow_routes(
             return _json_error(404, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow detail failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
+    @server.routes.patch("/comfymodal/studio/workflows/{workflow_id}/config")
+    @server.routes.patch("/comfymodal/studio/workflows/{workflow_id}/autosave")
+    async def workflows_autosave(request: web.Request) -> web.Response:
+        """Durable normal-content/layout autosave; drafts are never accepted."""
+        wf_id = request.match_info.get("workflow_id", "")
+        body = await _read_body(request)
+        if body is None:
+            return _json_error(400, "Invalid JSON body")
+        try:
+            workflow = service.autosave_workflow(
+                wf_id,
+                body,
+                require_complete=bool(body.get("require_complete", False)),
+            )
+            return web.json_response({"status": "ok", "workflow": workflow})
+        except WorkflowNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except WorkflowPresetValidationError as exc:
+            return _json_error(400, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Workflow autosave failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
@@ -415,7 +494,13 @@ def register_workflow_routes(
                 mapping = service.get_mapping(version_id)
             default_preset = service.get_default_preset(wf_id)
             control_schema: dict[str, Any] = {}
-            if mapping:
+            workflow_config = service.get_workflow_config(wf_id)
+            for role, entry in (workflow_config.get("bindings") or {}).items():
+                if isinstance(entry, dict):
+                    control_schema[str(role)] = entry
+            if not control_schema and mapping:
+                # Compatibility fallback for records created before wrapper
+                # bindings were persisted on the Workflow row.
                 for entry in mapping.get("entries") or []:
                     if isinstance(entry, dict) and entry.get("semantic_role"):
                         control_schema[str(entry["semantic_role"])] = entry
@@ -425,6 +510,7 @@ def register_workflow_routes(
                 "version": version,
                 "mapping": mapping,
                 "default_preset": default_preset,
+                "workflow_config": workflow_config,
                 "state": state,
                 "control_schema": control_schema,
             })
@@ -730,6 +816,39 @@ def register_workflow_routes(
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
+    # ── Legacy absorption bridge (abs-1) ─────────────────────────────────
+    # Accepts an UNSCOPED legacy preset payload (values/model_choices keyed
+    # by old semantic roles), translates it via
+    # ``studio_domain.legacy_adapters`` (pure, no migration), and persists it
+    # through the verified ``create_preset_from_legacy`` → ``create_preset``
+    # path under the URL version scope.  All existing preset routes are
+    # untouched; the legacy ``/studio/run`` dispatch branch stays as-is
+    # (removal happens only in a later lane with caller proof).
+
+    @server.routes.post(
+        "/comfymodal/studio/workflows/versions/{version_id}/presets/from-legacy"
+    )
+    async def presets_from_legacy(request: web.Request) -> web.Response:
+        version_id = request.match_info.get("version_id", "")
+        body = await _read_body(request)
+        if body is None:
+            return _json_error(400, "Invalid JSON body")
+        try:
+            preset = service.create_preset_from_legacy(
+                version_id,
+                body,
+                strict=bool(body.get("strict", True)),
+            )
+            return web.json_response({"status": "ok", "preset": preset})
+        except WorkflowVersionNotFoundError as exc:
+            return _json_error(404, str(exc))
+        except WorkflowPresetValidationError as exc:
+            return _json_error(400, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Preset from-legacy failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
     # ── Portability (Phase G9) ────────────────────────────────────────
 
     def _parse_bool_query(request: web.Request, name: str, default: bool):
@@ -770,6 +889,16 @@ def register_workflow_routes(
             _log.exception("Workflow manifest export failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
+        # PortabilityService owns the manifest mechanics; this route-owned
+        # adapter adds only the durable wrapper contract.  The whitelist is
+        # deliberate: experiment drafts, output artifacts, and run history
+        # are not Workflow configuration and never enter a bundle.
+        workflow_record = service.get_workflow(
+            str(result["manifest"].get("workflow", {}).get("workflow_id", ""))
+        )
+        result["manifest"].setdefault("workflow", {}).update(
+            _workflow_bundle_fields(workflow_record)
+        )
         body = studio_workflow_manifest.canonical_bytes(result["manifest"])
         filename = result["filename"]
         if '"' in filename or "\\" in filename:
@@ -846,11 +975,35 @@ def register_workflow_routes(
             if dry_run:
                 preview = portability.preview_import(payload)
                 return web.json_response(preview)
+            durable_config = _manifest_workflow_config(payload)
+            if durable_config:
+                # Validate before the portability transaction starts so a
+                # malformed wrapper section cannot leave a partially imported
+                # Workflow behind.
+                WorkflowDomainService._normalize_workflow_config(  # noqa: SLF001
+                    {
+                        "workflow_type": durable_config.get("workflow_type", "t2i"),
+                        "static_graph": durable_config.get("static_graph", {}),
+                        "bindings": durable_config.get("bindings", {}),
+                        "output_binding": durable_config.get("output_binding", {}),
+                        "saved_values": durable_config.get("saved_values", {}),
+                        "layout_profile": durable_config.get("layout_profile", {}),
+                        "allowed_options": durable_config.get("allowed_options", {}),
+                    }
+                )
             committed = portability.commit_import(
                 payload,
                 import_presets=import_presets,
                 apply_default_preset=apply_default_preset,
             )
+            # Import always minted a new local Workflow.  Apply the whitelisted
+            # wrapper fields to that new record only; foreign ids and all
+            # experiment/history fields remain non-authoritative.
+            if durable_config:
+                committed_workflow = service.autosave_workflow(
+                    str(committed["workflow_id"]), durable_config
+                )
+                committed["workflow"] = committed_workflow
             return web.json_response(committed)
         except ImportBlockedError as exc:
             return web.json_response(

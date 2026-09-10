@@ -444,6 +444,26 @@ export async function bulkCopyPresetsToVersion(apiBase, versionId, presetIds) {
   });
 }
 
+// ── Legacy absorption bridge (abs-2) ────────────────────────────────────
+//
+// Client for the abs-1 verified route
+// POST /comfymodal/studio/workflows/versions/{version_id}/presets/from-legacy
+// (``create_preset_from_legacy`` on the domain service). The payload is an
+// UNSCOPED legacy preset shape (``name``/``label``, ``description``,
+// ``values`` / ``model_choices`` keyed by old semantic roles); the server
+// translates it via ``translate_legacy_preset`` (LEGACY_ROLE_MAP) and
+// persists it through the verified ``create_preset`` path under the URL
+// version scope. The browser never translates keys itself — unknown keys
+// pass through verbatim server-side and surface via preset state.
+
+export async function createPresetFromLegacy(apiBase, versionId, legacyPayload) {
+  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets/from-legacy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(legacyPayload || {}),
+  });
+}
+
 // ── Studio Model Library API ────────────────────────────────────────────
 
 export async function listModels(apiBase, opts = {}) {

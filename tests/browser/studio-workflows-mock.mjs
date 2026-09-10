@@ -551,7 +551,11 @@ export async function installWorkflowsMock(page, seed) {
     return _json({ status: "ok", tags });
   }
 
-  function getWorkflow(route, url, body, params) {
+  // NOTE: named getWorkflowDetail (not getWorkflow) so the route handler
+  // cannot shadow the spec-facing getWorkflow(name) query helper below —
+  // duplicate function declarations in this closure would otherwise make
+  // wfMock.getWorkflow("...") invoke the handler with params undefined.
+  function getWorkflowDetail(route, url, body, params) {
     const w = state.workflows.get(params.id);
     if (!w) return _error("Workflow not found", 404);
     return _json({ status: "ok", workflow: _workflowSummary(state, w) });
@@ -716,11 +720,22 @@ export async function installWorkflowsMock(page, seed) {
         409
       );
     }
+    // The real mapping POST contract carries entries as a dict keyed by
+    // semantic role (the server normalizes and reads it back as a list).
+    // Normalize here so the mocked read-back matches the server shape and
+    // every list-shaped consumer (badges, preset editor, copy) keeps
+    // working. List payloads (legacy editor) pass through untouched.
+    const rawEntries = body && body.entries;
+    const entries = Array.isArray(rawEntries)
+      ? rawEntries
+      : Object.entries(rawEntries && typeof rawEntries === "object" ? rawEntries : {}).map(
+          ([role, e]) => ({ semantic_role: role, ...(e && typeof e === "object" ? e : {}) })
+        );
     const m = {
       mapping_id: _makeId("map_"),
       workflow_version_id: params.vid,
       output_node_id: (body && body.output_node_id) || null,
-      entries: body && Array.isArray(body.entries) ? body.entries : [],
+      entries,
       created_at: _now(),
       updated_at: _now(),
       immutable: true,
@@ -822,6 +837,56 @@ export async function installWorkflowsMock(page, seed) {
           ? body.recommended_values
           : {},
       exposed_controls: body && Array.isArray(body.exposed_controls) ? body.exposed_controls : [],
+    });
+    return _json({ status: "ok", preset: _presetEnriched(state, p, wf) });
+  }
+
+  // ── Legacy absorption bridge (abs-2) ────────────────────────────────
+  // Mirrors the verified abs-1 server contract
+  // (studio_domain/legacy_adapters.py LEGACY_ROLE_MAP): positive_prompt→
+  // prompt, steps→step_count, cfg→cfg_scale, guidance→cfg_scale,
+  // model→model_unet, unet→model_unet; unknown keys pass through verbatim.
+  // The mock applies that exact map so specs can assert the canonical
+  // persistence the real from-legacy route guarantees.
+  const LEGACY_ROLE_MAP = {
+    positive_prompt: "prompt",
+    steps: "step_count",
+    cfg: "cfg_scale",
+    guidance: "cfg_scale",
+    model: "model_unet",
+    unet: "model_unet",
+  };
+
+  function _translateLegacyKeys(container) {
+    const out = {};
+    if (container && typeof container === "object") {
+      for (const [k, v] of Object.entries(container)) {
+        out[LEGACY_ROLE_MAP[k] || k] = v;
+      }
+    }
+    return out;
+  }
+
+  function createPresetFromLegacy(route, url, body, params) {
+    const v = state.versions.get(params.vid);
+    if (!v) return _error("Version not found", 404);
+    const b = body || {};
+    const name = (typeof b.name === "string" && b.name.trim())
+      || (typeof b.label === "string" && b.label.trim())
+      || "";
+    if (!name) return _error("preset name is required", 400);
+    const wf = state.workflows.get(v.workflow_id);
+    const p = seedPreset(params.vid, {
+      name,
+      description: typeof b.description === "string" ? b.description : "",
+      tags: Array.isArray(b.tags) ? b.tags : [],
+      favorite: !!b.favorite,
+      // Legacy roles translated to canonical keys (unknowns verbatim).
+      values: _translateLegacyKeys(b.values),
+      model_choices: _translateLegacyKeys(b.model_choices),
+      lora_values: b.lora_values || {},
+      recommended_values: b.recommended_values || {},
+      exposed_controls: Array.isArray(b.exposed_controls) ? b.exposed_controls : [],
     });
     return _json({ status: "ok", preset: _presetEnriched(state, p, wf) });
   }
@@ -959,6 +1024,7 @@ export async function installWorkflowsMock(page, seed) {
     ["GET", "/comfymodal/studio/workflows/versions/:vid/mapping", getMapping],
     ["GET", "/comfymodal/studio/workflows/versions/:vid/dependencies", getVersionDependencies],
     ["POST", "/comfymodal/studio/workflows/versions/:vid/presets/copy-bulk", bulkCopyPresets],
+    ["POST", "/comfymodal/studio/workflows/versions/:vid/presets/from-legacy", createPresetFromLegacy],
     ["GET", "/comfymodal/studio/workflows/versions/:vid/presets", listVersionPresets],
     ["POST", "/comfymodal/studio/workflows/versions/:vid/presets", createVersionPreset],
     ["GET", "/comfymodal/studio/workflows/versions/:vid", getWorkflowVersion],
@@ -977,7 +1043,7 @@ export async function installWorkflowsMock(page, seed) {
     ["GET", "/comfymodal/studio/workflows/:id/versions", listWorkflowVersions],
     ["POST", "/comfymodal/studio/workflows/:id/versions", captureVersion],
     ["PATCH", "/comfymodal/studio/workflows/:id", updateWorkflow],
-    ["GET", "/comfymodal/studio/workflows/:id", getWorkflow],
+    ["GET", "/comfymodal/studio/workflows/:id", getWorkflowDetail],
   ];
 
   const compiledRoutes = routeEntries.map(([method, pattern, handler]) => {

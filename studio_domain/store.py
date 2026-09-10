@@ -84,25 +84,78 @@ class WorkflowDomainStore:
     def get_workflow(self, workflow_id: str) -> dict | None:
         return self._find(self.workflows, "workflow_id", workflow_id)
 
-    def insert_workflow(self, workflow: Workflow) -> dict[str, Any]:
+    def insert_workflow(
+        self,
+        workflow: Workflow,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Insert one durable Workflow record.
+
+        ``Workflow`` is the compatibility dataclass for the original domain
+        fields.  The wrapper-owned configuration is deliberately carried as
+        additional JSON fields so it remains one record in the same durable
+        authority without introducing a second store or a migration layer.
+        The uniqueness check lives in the mutator, not in a preceding read.
+        """
         data = workflow.to_dict()
-        if self._find(self.workflows, "workflow_id", data["workflow_id"]) is not None:
-            raise WorkflowPresetValidationError(
-                f"workflow {data['workflow_id']!r} already exists"
-            )
-        self.workflows.update(lambda rows: rows.append(data))
+        if fields:
+            data.update(fields)
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            if any(row.get("workflow_id") == data["workflow_id"] for row in rows):
+                raise WorkflowPresetValidationError(
+                    f"workflow {data['workflow_id']!r} already exists"
+                )
+            rows.append(data)
+
+        self.workflows.update(_mutate)
         return data
 
     def update_workflow(self, workflow: Workflow) -> dict[str, Any]:
         data = workflow.to_dict()
-        if self._find(self.workflows, "workflow_id", data["workflow_id"]) is None:
+        result: dict[str, Any] = {}
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            for index, existing in enumerate(rows):
+                if existing.get("workflow_id") != data["workflow_id"]:
+                    continue
+                # Preserve wrapper-owned fields unknown to the compatibility
+                # dataclass.  Metadata edits must never erase saved config.
+                merged = dict(existing)
+                merged.update(data)
+                rows[index] = merged
+                result.update(merged)
+                return
             raise WorkflowPresetValidationError(
                 f"workflow {data['workflow_id']!r} does not exist"
             )
-        self.workflows.update(
-            lambda rows: self._replace_in_list(rows, "workflow_id", data)
-        )
-        return data
+
+        self.workflows.update(_mutate)
+        return result
+
+    def update_workflow_fields(
+        self,
+        workflow_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically autosave wrapper-owned fields on one Workflow record."""
+        result: dict[str, Any] = {}
+
+        def _mutate(rows: list[dict[str, Any]]) -> None:
+            for index, existing in enumerate(rows):
+                if existing.get("workflow_id") != workflow_id:
+                    continue
+                merged = dict(existing)
+                merged.update(fields)
+                rows[index] = merged
+                result.update(merged)
+                return
+            raise WorkflowPresetValidationError(
+                f"workflow {workflow_id!r} does not exist"
+            )
+
+        self.workflows.update(_mutate)
+        return result
 
     # ── Workflow Versions (immutable) ────────────────────────────────────
 

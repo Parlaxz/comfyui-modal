@@ -774,6 +774,11 @@ def validate_studio_request_controls(
 
 
 # ── Defaults extraction ────────────────────────────────────────────────
+# 1.3.1 legacy-cleanup evidence (KEEP): extract_defaults_from_snapshot and
+# get_preset_scalar_defaults are still imported by the preset routes in
+# studio_routes.py and covered by PresetDefaultsScalarBackendTests in
+# tests/test_studio_backend.py. The wizard/picker/run-context paths still
+# rely on this preset/mapping layer. Must not be removed.
 
 
 def get_preset_scalar_defaults(
@@ -3098,6 +3103,39 @@ def resolve_request_gpu(gpu: Any = None, modal_options: dict | None = None) -> t
         return "", "server_settings"
 
 
+# ── Legacy absorption bridge (abs-1) ─────────────────────────────────────
+# Downstream Shelf/Experiment lanes call ``translate_legacy_controls_for_workflow``
+# to convert legacy-keyed control overrides (old semantic roles) to canonical
+# bindable-input keys BEFORE entering the workflow run branch
+# (``resolve_workflow_run_bundle`` → ``merge_workflow_controls`` →
+# ``handle_workflow_run_async``).  Pure translation via
+# ``studio_domain.legacy_adapters`` (renames per role table, unknown keys
+# verbatim — never silently dropped).  NOT wired into the legacy
+# ``/studio/run`` dispatch path in this lane: that branch stays working
+# as-is (removal happens only in a later lane with caller proof).
+
+def translate_legacy_controls_for_workflow(
+    controls: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Translate legacy control overrides to canonical workflow keys.
+
+    Inputs:  ``controls`` — request overrides keyed by old semantic roles
+      (``None`` → ``{}``).
+    Outputs: NEW dict keyed by canonical bindable-input keys
+      (``steps``→``step_count``, ``cfg``/``guidance``→``cfg_scale``,
+      ``positive_prompt``→``prompt``, ``model``/``unet``→``model_unet``;
+      unknown keys verbatim).
+    """
+    from studio_domain.legacy_adapters import translate_values
+
+    return translate_values(controls if isinstance(controls, dict) else {})
+
+
+# 1.3.1 legacy-cleanup evidence (KEEP): the single-run handler still serves
+# the live POST /comfymodal/studio/run route (__init__.py studio_run), called
+# by runStudioPreset in web/studio-backend-api.js (Shelf single runs) and
+# asserted MODERN_LIVE by tests/test_studio_runtime.py and
+# tests/test_studio_direct_run.py. Must not be removed.
 async def handle_studio_run_async(
     preset_id: str,
     feature_id: str,
@@ -3256,6 +3294,15 @@ def handle_studio_run(
         return _execution_error_response(exc, operation="studio_run", run_id=preset_id)
 
 
+# 1.3.1 legacy-cleanup evidence (KEEP): the legacy POST
+# /comfymodal/studio/experiment route itself is retired (410 in __init__.py,
+# modern runs use /studio/experiment-v2), but this adapter plus
+# _schedule_and_start/_create_experiment/_persist_experiment_error/_fire_and_forget
+# still have active test dependents (test_f8_gpu_authority,
+# test_h12_v2_only_consolidation, test_phase2_timing_data_flow,
+# test_studio_runtime, test_studio_timing_integration,
+# test_task2_run_history_extensions). Per the conditional-removal contract
+# they must not be removed while tests depend on them.
 def handle_studio_experiment(
     preset_ids: list[str],
     feature_id: str,

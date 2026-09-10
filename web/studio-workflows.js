@@ -59,6 +59,7 @@ import {
   listModels,
 } from "./studio-backend-api.js";
 import { subscribeStudioSync } from "./studio-sync.js";
+import { renderWorkflowPicker } from "./studio-workflow-picker.js";
 
 // ── Module-level view state ────────────────────────────────────────────────
 // Persists across shell re-renders so navigating away and back preserves
@@ -74,6 +75,7 @@ const _view = {
   revisionConfirm: false,          // mapping immutability confirmation open
   capturingVersion: false,
   importMode: "",                  // "" | "graph" | "manual" (dialog section)
+  picker: { open: false, mode: "single", selectedIds: [] },
   portability: {
     report: null,                  // current G5 report for the selected version
     priorStale: false,             // prior report shown after a failed recheck
@@ -459,6 +461,30 @@ export function renderWorkflows(state, context) {
     loadDetailData();
   }
 
+  // ── Binding wizard host (leaf 1.2.1) ────────────────────────────────
+  //
+  // File/graph import and unmapped-version setup both land in the unified
+  // binding wizard bound to the new/existing version — never on a separate
+  // Mapping/Preset setup surface. Completion or cancel returns to the
+  // workflow detail page, as import/detail navigation does today.
+  // Already-mapped versions keep the legacy "Edit mapping" revision path
+  // untouched. A missing version context falls back to the detail page.
+
+  function openVersionSetupWizard(wfId, versionId, notice) {
+    import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
+      if (stale()) return;
+      if (!wfId || !versionId) {
+        openWorkflowDetail(wfId, versionId, notice);
+        return;
+      }
+      openPresetWizard(() => {
+        openWorkflowDetail(wfId, versionId, notice);
+      }, apiBase, null, null, { workflowId: wfId, workflowVersionId: versionId });
+    }).catch(() => {
+      openWorkflowDetail(wfId, versionId, notice);
+    });
+  }
+
   function _resetPortabilityState() {
     _view.portability.report = null;
     _view.portability.priorStale = false;
@@ -786,6 +812,12 @@ export function renderWorkflows(state, context) {
       el("div", { class: "comfymodal-studio-workflows-header-actions" }, [
         el("button", {
           class: "comfymodal-secondary-btn",
+          "data-testid": "workflows-picker-button",
+          text: "Select workflow",
+          onclick: () => openPickerDialog("single"),
+        }),
+        el("button", {
+          class: "comfymodal-secondary-btn",
           "data-testid": "workflows-import-manifest-button",
           text: "Import workflow manifest",
           onclick: () => openImportManifestDialog(),
@@ -877,6 +909,7 @@ export function renderWorkflows(state, context) {
     viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-body" }, [sidebar, gridEl]));
 
     if (_view.importMode) viewEl.appendChild(renderImportDialog());
+    if (_view.picker.open) viewEl.appendChild(renderPickerDialog());
     if (_view.importManifest.open) viewEl.appendChild(renderImportManifestDialog());
     return viewEl;
   }
@@ -920,11 +953,62 @@ export function renderWorkflows(state, context) {
     render();
   }
 
+  // ── Shared workflow picker dialog (leaf 1.2.1) ─────────────────────────
+  //
+  // Thin host for the shared picker module: single-select here (opens the
+  // chosen workflow detail). Experiment multi-select lives with its caller;
+  // this page never duplicates picker behavior.
+
+  function openPickerDialog(mode) {
+    _view.picker = { open: true, mode: mode === "many" ? "many" : "single", selectedIds: [] };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function closePickerDialog() {
+    _view.picker.open = false;
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  function renderPickerDialog() {
+    const overlay = el("div", { class: "comfymodal-studio-dialog-overlay" });
+    const backdrop = el("div", { class: "comfymodal-studio-dialog-backdrop", onclick: closePickerDialog });
+    const dialog = el("div", {
+      class: "comfymodal-studio-dialog",
+      "data-testid": "workflow-picker-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": "Select workflow",
+    });
+    dialog.appendChild(el("h3", { class: "comfymodal-studio-dialog-title", text: "Select workflow" }));
+    dialog.appendChild(renderWorkflowPicker({
+      apiBase: apiBase,
+      mode: _view.picker.mode,
+      selectedIds: _view.picker.selectedIds,
+      onSelect: (ids) => { _view.picker.selectedIds = ids; },
+      onConfirm: (ids) => {
+        const id = (ids && ids[0]) || "";
+        closePickerDialog();
+        if (id) openWorkflowDetail(id, "", null);
+      },
+    }));
+    dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-actions" }, [
+      el("button", { class: "comfymodal-secondary-btn", text: "Cancel", onclick: closePickerDialog }),
+    ]));
+    overlay.appendChild(backdrop);
+    overlay.appendChild(dialog);
+    return overlay;
+  }
+
   function _ensureDialogEscHandler() {
     if (!_importEscHandler) {
       _importEscHandler = (e) => {
         if (e.key !== "Escape") return;
-        if (_view.importMode) {
+        if (_view.picker.open) {
+          e.stopPropagation();
+          closePickerDialog();
+        } else if (_view.importMode) {
           e.stopPropagation();
           closeImportDialog();
         } else if (_view.importManifest.open) {
@@ -937,7 +1021,7 @@ export function renderWorkflows(state, context) {
   }
 
   function _maybeRemoveDialogEscHandler() {
-    if (_importEscHandler && !_view.importMode && !_view.importManifest.open) {
+    if (_importEscHandler && !_view.importMode && !_view.importManifest.open && !_view.picker.open) {
       document.removeEventListener("keydown", _importEscHandler, true);
       _importEscHandler = null;
     }
@@ -1006,6 +1090,47 @@ export function renderWorkflows(state, context) {
       el("div", { class: "comfymodal-studio-dialog-actions" }, [createBtn]),
     ]));
 
+    // Section 3: minimal file / link import entry (leaf 1.2.1). A JSON file
+    // is parsed as graph content; a link is recorded as the source URL.
+    const fileStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
+    const fileInput = el("input", {
+      type: "file",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "import-file-input",
+      accept: ".json,application/json",
+      "aria-label": "Workflow JSON file",
+      onchange: (e) => {
+        const file = e.currentTarget.files && e.currentTarget.files[0];
+        if (file) handleFileImport(file, fileStatus);
+      },
+    });
+    const linkInput = el("input", {
+      type: "url",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "import-link-input",
+      placeholder: "https://…",
+      "aria-label": "Workflow link",
+    });
+    const linkStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
+    const linkBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "import-link-confirm",
+      text: "Import link",
+      onclick: async () => {
+        linkBtn.disabled = true;
+        try { await handleLinkImport(linkInput, linkStatus); }
+        finally { linkBtn.disabled = false; }
+      },
+    });
+    dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-section" }, [
+      el("h4", { class: "comfymodal-studio-dialog-section-title", text: "Import from file or link" }),
+      fileInput,
+      fileStatus,
+      linkInput,
+      linkStatus,
+      el("div", { class: "comfymodal-studio-dialog-actions" }, [linkBtn]),
+    ]));
+
     dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-actions" }, [
       el("button", { class: "comfymodal-secondary-btn", text: "Cancel", onclick: closeImportDialog }),
     ]));
@@ -1061,7 +1186,7 @@ export function renderWorkflows(state, context) {
       if (stale()) return;
     }
     closeImportDialog();
-    openWorkflowDetail(wfId, verId, "Version created");
+    openVersionSetupWizard(wfId, verId, "Version created");
   }
 
   async function handleManualCreate(nameInput, folderInput, descInput, statusEl) {
@@ -1076,6 +1201,63 @@ export function renderWorkflows(state, context) {
       folder: (folderInput.value || "").trim(),
       description: descInput.value || "",
     });
+    if (stale()) return;
+    if (!result || result.status === "error") {
+      _showStatus(statusEl, "Could not create workflow: " + _errorText(result), true);
+      return;
+    }
+    const workflow = result.workflow || result;
+    closeImportDialog();
+    openWorkflowDetail(workflow.workflow_id || result.workflow_id || "", "", null);
+  }
+
+  function _openImportedWorkflow(result, statusEl, failurePrefix) {
+    if (stale()) return;
+    if (!result || result.status === "error") {
+      _showStatus(statusEl, failurePrefix + _errorText(result), true);
+      return;
+    }
+    const workflow = result.workflow || result;
+    const wfId = workflow.workflow_id || result.workflow_id || "";
+    const verId = workflow.latest_version_id
+      || (result.version && result.version.workflow_version_id)
+      || result.workflow_version_id
+      || "";
+    closeImportDialog();
+    openVersionSetupWizard(wfId, verId, "Version created");
+  }
+
+  async function handleFileImport(file, statusEl) {
+    _showStatus(statusEl, "Reading file\u2026", false);
+    let text = "";
+    try {
+      text = await file.text();
+    } catch (err) {
+      _showStatus(statusEl, "Could not read the selected file.", true);
+      return;
+    }
+    let parsed = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      _showStatus(statusEl, "File is not valid JSON.", true);
+      return;
+    }
+    const graph = (parsed && (parsed.graph_json || parsed.graph)) || parsed;
+    const name = String(file.name || "").replace(/\.json$/i, "") || "Imported workflow";
+    _showStatus(statusEl, "Importing workflow\u2026", false);
+    const result = await importWorkflow(apiBase, { name: name, graph_json: graph });
+    _openImportedWorkflow(result, statusEl, "Import failed: ");
+  }
+
+  async function handleLinkImport(urlInput, statusEl) {
+    const url = (urlInput.value || "").trim();
+    if (!url) {
+      _showStatus(statusEl, "Enter a workflow link.", true);
+      return;
+    }
+    _showStatus(statusEl, "Creating workflow\u2026", false);
+    const result = await createWorkflow(apiBase, { name: url, source_url: url });
     if (stale()) return;
     if (!result || result.status === "error") {
       _showStatus(statusEl, "Could not create workflow: " + _errorText(result), true);
@@ -1538,6 +1720,15 @@ export function renderWorkflows(state, context) {
     if (version && version.workflow_version_id) {
       _view.data.version = version;
       _view.data.mappingVersionId = verId;
+      // Keep the versions-list badge (rendered from _view.data.versions, not
+      // _view.data.version) in sync with the freshly fetched version state.
+      // Without this the version-item badge and run bar disagree after a
+      // mapping save: the POST succeeds and the run bar enables, but the
+      // badge stays "Incomplete" until a full versions re-list.
+      if (version.state !== undefined) {
+        const vi = _view.data.versions.findIndex((x) => x && x.workflow_version_id === verId);
+        if (vi !== -1) _view.data.versions[vi] = Object.assign({}, _view.data.versions[vi], version);
+      }
     }
     const presets = _unwrap(preResp, "presets");
     _view.data.presets = Array.isArray(presets) ? presets : [];
@@ -2257,9 +2448,10 @@ export function renderWorkflows(state, context) {
         el("p", { class: "comfymodal-studio-dependencies-note", text: "This version has no mapping. Set up a mapping to expose its controls." }),
         el("button", {
           class: "comfymodal-primary-btn",
+          "data-testid": "mapping-setup-button",
           text: "Set up Mapping",
           style: "width:auto;",
-          onclick: () => { _view.editorMode = "mapping"; render(); ensureMappingEditorData(); },
+          onclick: () => openVersionSetupWizard(_view.selectedWorkflowId, _view.selectedVersionId, null),
         }),
       ]));
     }
@@ -2653,20 +2845,27 @@ export function renderWorkflows(state, context) {
   async function ensurePresetEditorData() {
     const verId = _view.selectedVersionId;
     if (!verId) return;
+    let changed = false;
     if (_view.data.mappingVersionId !== verId) {
       const mapResp = await getMapping(apiBase, verId);
       if (stale()) return;
       const mapData = _unwrap(mapResp, "mapping");
       _view.data.mapping = mapData && mapData.mapping_id ? mapData : null;
       _view.data.mappingVersionId = verId;
+      changed = true;
     }
     if (_view.activePresetId && (!_view.data.editPreset || _view.data.editPreset.preset_id !== _view.activePresetId)) {
       const pResp = await getWorkflowPreset(apiBase, _view.activePresetId);
       if (stale()) return;
       const preset = _unwrap(pResp, "preset");
       _view.data.editPreset = preset && preset.preset_id ? preset : null;
+      changed = true;
     }
-    render();
+    // Render ONLY when data actually changed. render() re-invokes this helper
+    // on every pass while editorMode === "preset", so an unconditional
+    // render() here is unbounded mutual recursion (stack overflow) and the
+    // preset editor never settles in the DOM.
+    if (changed) render();
   }
 
   // Lazily fetch the model library once per editor session for the preset
@@ -2943,6 +3142,7 @@ export function renderWorkflows(state, context) {
     const name = (presetRefs.name && (presetRefs.name.value || "").trim()) || "";
     if (!name) {
       _view.data.presetIncomplete = { reasons: ["Enter a preset name."] };
+      _view.data.notice = { text: "Enter a preset name before saving.", error: true };
       render();
       return;
     }
@@ -2960,6 +3160,7 @@ export function renderWorkflows(state, context) {
     const preset = result.preset || null;
     if (preset && preset.state && preset.state.status === "incomplete") {
       _view.data.presetIncomplete = { reasons: preset.state.reasons || [] };
+      _view.data.notice = { text: "Preset is incomplete — review the reasons below.", error: true };
       render();
       return;
     }

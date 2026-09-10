@@ -47,6 +47,8 @@ from .graph import (
     extract_executable_prompt,
     graph_hash_from_capture,
     infer_control_kind,
+    is_ui_workflow_format,
+    ui_graph_to_api_prompt,
 )
 from .services import WorkflowDomainService
 
@@ -85,4 +87,6 @@ __all__ = [
     "extract_executable_prompt",
     "graph_hash_from_capture",
     "infer_control_kind",
+    "is_ui_workflow_format",
+    "ui_graph_to_api_prompt",
 ]
