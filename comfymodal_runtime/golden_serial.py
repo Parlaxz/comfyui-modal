@@ -1861,6 +1861,56 @@ def stage_diagnostics_enabled() -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Phase B2: QD2 transport telemetry mode.  LIGHT is the timing default: no
+# per-copy records, no per-copy Golden event() calls, no per-copy monotonic
+# timestamps or shared-condition telemetry callbacks.  Only stage-level
+# monotonic boundaries, counters reconciled once after worker completion, and
+# already-required CUDA events are kept.  HEAVY_CURRENT preserves the exact
+# 2ce9376 per-range diagnostic behavior and is opt-in only.
+QD2_TELEMETRY_ENV = "COMFYMODAL_GOLDEN_QD2_TELEMETRY"
+QD2_TELEMETRY_MODES = ("light", "heavy_current")
+
+
+def normalize_qd2_telemetry_mode(value: Any) -> str:
+    """Normalize the QD2 telemetry selector and fail closed on unknown arms."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "light"
+    selected = str(value).strip().lower()
+    if selected in {"light", "timing", "0", "off", "false"}:
+        return "light"
+    if selected in {"heavy_current", "heavy", "diagnostic", "1", "true", "on"}:
+        return "heavy_current"
+    raise ValueError(f"qd2_telemetry_mode_invalid:{value!r}")
+
+
+def qd2_telemetry_mode(value: Any = None) -> str:
+    """Resolve the QD2 telemetry mode once at the ticket/request boundary."""
+    if value is not None:
+        return normalize_qd2_telemetry_mode(value)
+    return normalize_qd2_telemetry_mode(os.environ.get(QD2_TELEMETRY_ENV))
+
+
+# Phase B4 causal A/B #2: diagnostic-only DEFERRED-H2D probe.  When armed, the
+# QD2 consumer path keeps the exact same source transport (same ticket, worker
+# count, extent size, source mechanism, backing allocation) and the exact same
+# H2D machinery (same pinned slots, CUDA completion events, outstanding
+# counter, final drain, evidence reconciliation); only H2D pacing changes: no
+# H2D submit begins until the CPU source read has fully completed.  NORMAL
+# (unarmed) is byte-identical to the current source-ready->H2D overlap path.
+# This is a diagnostic probe, not production architecture.
+QD2_DEFER_H2D_ENV = "COMFYMODAL_GOLDEN_QD2_DEFER_H2D"
+
+
+def qd2_defer_h2d_enabled(value: Any = None) -> bool:
+    """Return whether the diagnostic deferred-H2D gate is armed.
+
+    Explicit opt-in only: truthy ``1/true/yes/on`` arms the gate, everything
+    else (including absent/empty/unknown) selects the unchanged NORMAL path.
+    """
+    raw = value if value is not None else os.environ.get(QD2_DEFER_H2D_ENV)
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 _GOLDEN_DEEP_TRACE_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "golden_deep_trace_active", default=False
 )
@@ -3716,6 +3766,27 @@ def project_cpu_qd2_telemetry(
             if isinstance(source_complete_before_h2d, bool) else None
         )
     )
+    telemetry_mode = telemetry.get("qd2_telemetry_mode")
+    if not isinstance(telemetry_mode, str):
+        nested = telemetry.get("telemetry")
+        if isinstance(nested, Mapping) and isinstance(nested.get("mode"), str):
+            telemetry_mode = str(nested.get("mode"))
+    # LIGHT carries no per-range records by design; the host-observed union
+    # and envelope are therefore unavailable rather than zero.
+    if telemetry_mode == "light" and interval_evidence in {"missing", "observed", "malformed"}:
+        if not enqueue_records and not completion_records:
+            interval_evidence = "light_mode_no_per_range_records"
+    host_span_ns = telemetry.get("h2d_host_span_ns")
+    if not isinstance(host_span_ns, int) or isinstance(host_span_ns, bool):
+        host_span_ns = None
+    source_to_gpu_ready_ns = (
+        max(0, load_ready - source_start)
+        if source_start is not None and load_ready is not None else None
+    )
+    post_source_tail_ns = (
+        max(0, final_completion - source_complete)
+        if final_completion is not None and source_complete is not None else None
+    )
     return {
         "qd2_source_start_monotonic_ns": source_start,
         "qd2_first_extent_ready_monotonic_ns": first_extent,
@@ -3753,8 +3824,31 @@ def project_cpu_qd2_telemetry(
         "qd2_extents_ready_at_first_h2d": telemetry.get("ready_extent_count_at_h2d_start"),
         "qd2_h2d_before_source_complete": h2d_before_source_complete,
         "qd2_source_duration_ns": source_duration,
+        "qd2_source_to_gpu_ready_ns": source_to_gpu_ready_ns,
+        "qd2_post_source_tail_ns": post_source_tail_ns,
         "qd2_h2d_active_wall_ns": h2d_active,
+        "qd2_h2d_active_wall_ns_semantics": (
+            "host_observed_submit_to_host_observed_completion_union_not_proven_device_activity"
+        ),
+        "qd2_h2d_host_observed_active_wall_ns": h2d_active,
         "qd2_h2d_envelope_wall_ns": h2d_envelope,
+        "qd2_h2d_envelope_wall_ns_semantics": (
+            "host_observed_first_enqueue_to_last_host_observed_completion_includes_idle_gaps"
+        ),
+        "qd2_h2d_host_span_ns": host_span_ns,
+        "qd2_h2d_host_span_ns_semantics": (
+            "stage_level_h2d_start_to_h2d_complete_monotonic_span"
+        ),
+        "qd2_h2d_device_active_wall_ns": None,
+        "qd2_h2d_device_active_wall_ns_semantics": (
+            "proven_device_activity_only_via_cuda_events_diagnostic_only_not_measured_here"
+        ),
+        "qd2_telemetry_mode": telemetry_mode,
+        "telemetry": {"mode": telemetry_mode},
+        "qd2_h2d_per_range_record_counts": {
+            "enqueue": len(enqueue_records),
+            "completion": len(completion_records),
+        },
         "qd2_h2d_interval_evidence": interval_evidence,
         "qd2_h2d_intervals": [[start, end] for start, end in h2d_union],
         "qd2_source_h2d_overlap_wall_ns": overlap,
@@ -3779,8 +3873,10 @@ class CpuRawPrefetchTicket:
     source_owner_count = 1
     worker_count = 2
 
-    def __init__(self, layout: FrozenClipSourceLayout):
+    def __init__(self, layout: FrozenClipSourceLayout, *, telemetry_mode: Any = None):
         self.layout = layout
+        # Resolved once at construction; never re-read per copy.
+        self._qd2_telemetry_mode = qd2_telemetry_mode(telemetry_mode)
         self._events: list[dict[str, Any]] = []
         self._event_lock = threading.Lock()
         self._memory_before = _host_memory_visibility()
@@ -3838,6 +3934,10 @@ class CpuRawPrefetchTicket:
         self._h2d_completions: list[dict[str, Any]] = []
         self._h2d_outstanding = 0
         self._h2d_finalized = False
+        # LIGHT-mode reconciliation counters: incremented per copy without
+        # per-copy timestamps, records, snapshots, or event() calls.
+        self._h2d_enqueue_count = 0
+        self._h2d_completed_count = 0
         self._expected_h2d_ranges: list[tuple[int, int]] = [
             (int(start) - int(layout.data_start),
              int(start) - int(layout.data_start) + int(length))
@@ -4349,7 +4449,7 @@ class CpuRawPrefetchTicket:
         ):
             raise RuntimeError("cpu_prefetch_expected_h2d_plan_invalid")
         with self._condition:
-            if self._h2d_enqueues or self._h2d_completions:
+            if self._h2d_enqueues or self._h2d_completions or self._h2d_enqueue_count or self._h2d_completed_count:
                 raise RuntimeError("cpu_prefetch_expected_h2d_plan_too_late")
             self._expected_h2d_ranges = list(plan)
             self._expected_h2d_count = len(plan)
@@ -4357,7 +4457,18 @@ class CpuRawPrefetchTicket:
     def mark_h2d_enqueue(
         self, *, extent_id: Any, relative_start: int, length: int
     ) -> None:
-        """Record one already-required H2D enqueue boundary."""
+        """Record one already-required H2D enqueue boundary.
+
+        LIGHT (timing default) keeps only a counter under the shared
+        condition: no per-copy monotonic timestamp, no per-copy record, no
+        Golden event() call, no dict snapshot.  HEAVY_CURRENT preserves the
+        exact per-range diagnostic behavior.
+        """
+        if self._qd2_telemetry_mode == "light":
+            with self._condition:
+                self._h2d_enqueue_count += 1
+                self._h2d_outstanding += 1
+            return
         enqueue_ns = time.monotonic_ns()
         with self._condition:
             self._h2d_enqueues.append({
@@ -4367,6 +4478,7 @@ class CpuRawPrefetchTicket:
                 "monotonic_ns": int(enqueue_ns),
             })
             self._h2d_outstanding += 1
+            self._h2d_enqueue_count += 1
             outstanding = int(self._h2d_outstanding)
         self.event(
             "CPU_PREFETCH_H2D_ENQUEUE",
@@ -4379,7 +4491,16 @@ class CpuRawPrefetchTicket:
     def mark_h2d_copy_complete(
         self, *, extent_id: Any, relative_start: int, length: int
     ) -> None:
-        """Record completion immediately after an existing event wait."""
+        """Record completion immediately after an existing event wait.
+
+        LIGHT keeps only counters; HEAVY_CURRENT keeps per-range records and
+        per-copy events exactly as before.
+        """
+        if self._qd2_telemetry_mode == "light":
+            with self._condition:
+                self._h2d_completed_count += 1
+                self._h2d_outstanding = max(0, self._h2d_outstanding - 1)
+            return
         completion_ns = time.monotonic_ns()
         with self._condition:
             self._h2d_completions.append({
@@ -4391,6 +4512,7 @@ class CpuRawPrefetchTicket:
             self._h2d_outstanding = max(0, self._h2d_outstanding - 1)
             outstanding = int(self._h2d_outstanding)
             completed_count = len(self._h2d_completions)
+            self._h2d_completed_count = int(completed_count)
             final = (
                 completed_count == self._expected_h2d_count
                 and self._h2d_outstanding == 0
@@ -4408,8 +4530,13 @@ class CpuRawPrefetchTicket:
 
     def mark_h2d_complete(self, *, h2d_bytes: int) -> None:
         with self._condition:
+            completed = (
+                int(self._h2d_completed_count)
+                if self._qd2_telemetry_mode == "light"
+                else len(self._h2d_completions)
+            )
             if (
-                len(self._h2d_completions) != self._expected_h2d_count
+                completed != self._expected_h2d_count
                 or self._h2d_outstanding != 0
             ):
                 raise RuntimeError("cpu_prefetch_h2d_completion_coverage")
@@ -4475,6 +4602,35 @@ class CpuRawPrefetchTicket:
         if (failed is not None or not complete) and not cancel:
             self._release_raw_backing()
             raise RuntimeError("cpu_prefetch_source_failed") from failed
+
+    def wait_for_source_complete(self) -> None:
+        """Block until the QD2 source workers publish full coverage.
+
+        Phase B4 DEFERRED-H2D gate: the H2D consumer path calls this once
+        before submitting any H2D so no copy begins until the CPU source
+        read has completed.  This waits on the existing source condition
+        only; it never joins source threads (the later ``join()`` still owns
+        thread lifecycle) and never touches H2D machinery.  Fail-closed on
+        source failure/cancellation/incompletion.
+        """
+        with self._condition:
+            while not self._complete and self._failed is None and not self._cancelled:
+                self._condition.wait()
+            failed = self._failed
+            complete = self._complete
+            cancelled = self._cancelled
+            bytes_read = int(self._bytes_read)
+        if failed is not None:
+            raise RuntimeError("cpu_prefetch_source_failed") from failed
+        if cancelled:
+            raise RuntimeError("cpu_prefetch_cancelled")
+        if not complete:
+            raise RuntimeError("cpu_prefetch_source_incomplete")
+        self.event(
+            "QD2_DEFERRED_H2D_GATE",
+            source_complete=True,
+            bytes_read_at_gate=bytes_read,
+        )
 
     def close(self, *, cancel: bool = False) -> None:
         error: Optional[BaseException] = None
@@ -4709,10 +4865,34 @@ class CpuRawPrefetchTicket:
                 for start, end in self._expected_h2d_ranges
             ],
             "expected_h2d_count": int(self._expected_h2d_count),
-            "h2d_enqueue_records": copy.deepcopy(self._h2d_enqueues),
-            "h2d_completion_records": copy.deepcopy(self._h2d_completions),
+            "qd2_telemetry_mode": str(self._qd2_telemetry_mode),
+            "telemetry": {"mode": str(self._qd2_telemetry_mode)},
+            "h2d_enqueue_records": (
+                [] if self._qd2_telemetry_mode == "light"
+                else copy.deepcopy(self._h2d_enqueues)
+            ),
+            "h2d_completion_records": (
+                [] if self._qd2_telemetry_mode == "light"
+                else copy.deepcopy(self._h2d_completions)
+            ),
+            "h2d_enqueue_count": int(self._h2d_enqueue_count),
+            "h2d_completion_count": int(self._h2d_completed_count),
+            "h2d_start_ns": self._h2d_start_ns,
+            "h2d_end_ns": self._h2d_end_ns,
+            "h2d_host_span_ns": (
+                max(0, int(self._h2d_end_ns) - int(self._h2d_start_ns))
+                if self._h2d_start_ns is not None and self._h2d_end_ns is not None else None
+            ),
             "h2d_outstanding": int(self._h2d_outstanding),
             "h2d_finalized": bool(self._h2d_finalized),
+            # Phase B4 mode proof: whether the diagnostic deferred-H2D gate
+            # was armed for this ticket's H2D consumption.  Resolved from the
+            # environment at report time; the env is request-scoped and never
+            # changes mid-request, matching the gate decision in
+            # ``read_file_qd_gpu``.  H2D_START's
+            # ``source_completed_before_h2d`` remains the primary boundary
+            # proof (True in every deferred run).
+            "qd2_defer_h2d_armed": bool(qd2_defer_h2d_enabled()),
         }
         report.update(project_cpu_qd2_telemetry(report, events=self.events))
         return report
@@ -6700,6 +6880,9 @@ def read_file_qd_gpu(
         # Fail-closed transport: these counters are structurally always zero.
         "fallback": {"pin_fallback": 0, "alignment_tensor_count": 0},
         "blocks": [],
+        # Phase B4 mode proof (default; the gate overwrites before workers
+        # start when a QD2 ticket is present).
+        "qd2_defer_h2d_armed": False,
         "quiescence": {
             "workers_joined": False,
             "h2d_events_waited": False,
@@ -6830,6 +7013,20 @@ def read_file_qd_gpu(
             threads.append(t)
         with _GOLDEN_THREAD_LOCK:
             _GOLDEN_THREADS.update(threads)
+        # Phase B4 DEFERRED-H2D diagnostic gate: same QD2 source transport,
+        # but no H2D submit begins until the CPU source read has completed.
+        # The gate runs once here, before any consumer worker starts, so the
+        # workers below (ticket/pinned slots/CUDA completion events/
+        # outstanding counter/final drain/evidence reconciliation) run
+        # unchanged — only their H2D pacing is deferred.  NORMAL (unarmed)
+        # skips this wait and preserves the current source-ready->H2D overlap.
+        defer_h2d_armed = bool(
+            cpu_prefetch_ticket is not None and qd2_defer_h2d_enabled()
+        )
+        stats["qd2_defer_h2d_armed"] = defer_h2d_armed
+        if defer_h2d_armed:
+            assert cpu_prefetch_ticket is not None
+            cpu_prefetch_ticket.wait_for_source_complete()
         t_wall0 = time.perf_counter_ns() if diagnostics_enabled else None
         for t in threads:
             t.start()
@@ -14384,6 +14581,12 @@ __all__ = [
     "GoldenVolumeHandle",
     "FrozenClipSourceLayout",
     "CpuRawPrefetchTicket",
+    "QD2_TELEMETRY_ENV",
+    "QD2_TELEMETRY_MODES",
+    "normalize_qd2_telemetry_mode",
+    "qd2_telemetry_mode",
+    "QD2_DEFER_H2D_ENV",
+    "qd2_defer_h2d_enabled",
     "project_cpu_qd2_telemetry",
     "PendingDurability",
     "canonical_workflow_sha256",

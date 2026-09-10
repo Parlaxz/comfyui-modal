@@ -1793,6 +1793,16 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
         }
     if publication is not None:
         identity = getattr(publication, "identity", None)
+        packages = getattr(identity, "package_manifests", None)
+        if packages is None:
+            packages = []
+        package_evidence: list[dict[str, Any]] = []
+        for item in packages:
+            to_dict = getattr(item, "to_dict", None)
+            raw: Any = to_dict() if callable(to_dict) else item
+            if isinstance(raw, Mapping):
+                package_evidence.append({str(key): raw[key] for key in raw})
+        receipt = getattr(publication, "receipt", None)
         manifest["custom_nodes_publication"] = {
             "action": str(getattr(publication, "action", "")),
             "reason": str(getattr(publication, "reason", "")),
@@ -1804,6 +1814,13 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
             "file_count": getattr(identity, "file_count", None),
             "total_bytes": getattr(identity, "total_bytes", None),
             "manifest_digest": getattr(identity, "manifest_digest", None),
+            "source_root": str(getattr(identity, "source_root", "") or ""),
+            "packages": package_evidence,
+            "destructive_override": bool(getattr(publication, "destructive_override", False)),
+            "destructive_delta": dict(getattr(publication, "destructive_delta", {}) or {}),
+            "receipt_destructive_override": bool(
+                getattr(receipt, "destructive_override", False)
+            ) if receipt is not None else False,
         }
     path = d / f"deploy_{time.strftime('%Y%m%d-%H%M%S')}_{deploy_fp[:8]}.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -2792,6 +2809,7 @@ def _publish_golden_custom_nodes(
     publisher_app_name: str | None = None,
     workspace_binding: WorkspaceBinding | None = None,
     local_content_generation: str | None = None,
+    allow_destructive: bool = False,
 ):
     """Mirror the canonical custom-node source before a native Golden deploy.
 
@@ -2853,6 +2871,7 @@ def _publish_golden_custom_nodes(
                 publisher=publisher,
                 workspace=workspace,
                 identity_provider=identity_provider,
+                allow_destructive=allow_destructive,
             )
         else:
             with process_scope:
@@ -2862,6 +2881,7 @@ def _publish_golden_custom_nodes(
                     publisher=publisher,
                     workspace=workspace,
                     identity_provider=identity_provider,
+                    allow_destructive=allow_destructive,
                 )
     except Exception as exc:  # noqa: BLE001 - publication is a deploy gate
         raise GateError(
@@ -2877,6 +2897,20 @@ def _publish_golden_custom_nodes(
             f"policy={custom_nodes_mod.PACKAGING_POLICY_VERSION}"
         )
         return decision
+    if decision.action == "blocked":
+        delta = getattr(decision, "destructive_delta", {}) or {}
+        blocked = delta.get("packages", []) if isinstance(delta, dict) else []
+        summary = "; ".join(
+            f"{entry.get('package')}: prev_files={entry.get('prev_files')} "
+            f"cand_files={entry.get('cand_files')} missing={entry.get('missing_count')}"
+            for entry in blocked
+        ) or decision.reason
+        raise GateError(
+            "Golden deploy refused: destructive custom-node publication blocked "
+            f"({summary}); re-run with --allow-destructive-custom-node-publication "
+            "to explicitly permit removal of previously-published external "
+            "package files; remote generation is unchanged"
+        )
     if decision.action not in {"published", "recovered"} or (
         decision.action == "published" and decision.reason != "published_verified"
     ):
@@ -2940,6 +2974,7 @@ def _invoke_golden_publisher(
     publisher_app_name: str,
     workspace_binding: WorkspaceBinding | None = None,
     local_content_generation: str | None = None,
+    allow_destructive: bool = False,
 ):
     """Pass the isolated app to the current hook without breaking old hooks."""
     hook = _publish_golden_custom_nodes
@@ -2952,6 +2987,8 @@ def _invoke_golden_publisher(
         kwargs["workspace_binding"] = workspace_binding
     if "local_content_generation" in parameters:
         kwargs["local_content_generation"] = local_content_generation
+    if "allow_destructive" in parameters:
+        kwargs["allow_destructive"] = allow_destructive
     if "publisher_app_name" in parameters or any(
         parameter.kind is inspect.Parameter.VAR_POSITIONAL
         for parameter in parameters.values()
@@ -3229,12 +3266,17 @@ def cmd_deploy(args, repo_root: Path) -> int:
                 # This is deliberately inside the deploy lock and before both
                 # version capture and native Modal deployment.  A publication
                 # failure exits through the lock's finally block and prevents
-                # the backend from running.
+                # the backend from running.  The destructive override is only
+                # ever explicit CLI input: never inferred from git dirty state
+                # or any other ambient signal.
                 publication = _invoke_golden_publisher(
                     repo_root,
                     publisher_app_name,
                     workspace_binding,
                     publication_generation,
+                    allow_destructive=bool(
+                        getattr(args, "allow_destructive_custom_node_publication", False)
+                    ),
                 )
                 if workspace_binding is not None:
                     _assert_publication_generation(publication, publication_generation)
@@ -4300,6 +4342,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-production", action="store_true",
         help="deprecated; always refused for Golden R0",
     )
+    parser.add_argument(
+        "--allow-destructive-custom-node-publication", action="store_true",
+        help="explicitly permit a custom-node publication that removes "
+        "previously-published external package files/content; never inferred, "
+        "never defaulted, recorded in the publication receipt",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("version")
@@ -4464,7 +4512,8 @@ def _hoist_global_options(argv: list[str]) -> list[str]:
             rest.append(arg)
             i += 1
             continue
-        if arg in ("--dry-run", "--json", "--allow-production"):
+        if arg in ("--dry-run", "--json", "--allow-production",
+                     "--allow-destructive-custom-node-publication"):
             front.append(arg)
             i += 1
             continue

@@ -4846,6 +4846,19 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
             "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH", "0"
         ),
+        # Phase B3: QD2 telemetry mode must cross Modal's class-env boundary;
+        # otherwise the deploy-time selector silently defaults to light in the
+        # container and the heavy_current arm is untestable.
+        "COMFYMODAL_GOLDEN_QD2_TELEMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD2_TELEMETRY", "light"
+        ),
+        # Phase B4: deferred-H2D diagnostic gate must cross Modal's class-env
+        # boundary alongside the telemetry mode; otherwise the deploy-time
+        # selector silently defaults to NORMAL in the container and the
+        # DEFERRED-H2D arm is untestable.  Telemetry/scheduling only.
+        "COMFYMODAL_GOLDEN_QD2_DEFER_H2D": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD2_DEFER_H2D", "0"
+        ),
         "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES": os.environ.get(
             "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES", "33554432"
         ),

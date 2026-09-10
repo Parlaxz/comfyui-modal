@@ -141,6 +141,8 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": _spec("COMFYMODAL_V2_SINGLE_USE_CONTAINERS", "bool", False, EXECUTION_POLICY, "Use a fresh container for every request."),
     "COMFYMODAL_V2_CRITICAL_PATH_LEDGER": _spec("COMFYMODAL_V2_CRITICAL_PATH_LEDGER", "bool", True, TIMING_DIAGNOSTICS, "Enable the canonical critical-path ledger."),
     "COMFYMODAL_V2_GANTT_TELEMETRY": _spec("COMFYMODAL_V2_GANTT_TELEMETRY", "bool", False, TIMING_DIAGNOSTICS, "Emit Gantt timing telemetry."),
+    "COMFYMODAL_GOLDEN_QD2_TELEMETRY": _spec("COMFYMODAL_GOLDEN_QD2_TELEMETRY", "enum", "light", TIMING_DIAGNOSTICS, "QD2 transport telemetry mode: light timing default vs heavy_current per-range diagnostics.", choices=("light", "heavy_current")),
+    "COMFYMODAL_GOLDEN_QD2_DEFER_H2D": _spec("COMFYMODAL_GOLDEN_QD2_DEFER_H2D", "bool", False, TIMING_DIAGNOSTICS, "Phase B4 diagnostic-only gate: defer QD2 H2D until CPU source read completes; NORMAL when off."),
     "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": _spec("COMFYMODAL_V2_CRITICAL_GPU_COORDINATION", "bool", False, EXECUTION_POLICY, "Coordinate the critical GPU lane."),
     "COMFYMODAL_V2_THREAD_POLICY": _spec("COMFYMODAL_V2_THREAD_POLICY", "string", "TBASE", EXECUTION_POLICY, "Runtime thread-shape policy."),
     "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": _spec("COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST", "bool", True, EXECUTION_POLICY, "Release GPU memory after each request."),

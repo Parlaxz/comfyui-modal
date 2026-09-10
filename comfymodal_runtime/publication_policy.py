@@ -43,6 +43,11 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
 EXCLUDED_DIRS = EXCLUDED_DIR_NAMES
 
 EXCLUDED_FILENAMES: frozenset[str] = frozenset({
+    # 1.3.1 legacy-cleanup evidence (KEEP): the .studio_* entries below are
+    # still the live Studio authority (snapshots/presets/backends JSON) with
+    # active test dependents (test_runtime_deployment_spec,
+    # test_studio_runtime gitignore/compat tests, publication-guard tests).
+    # Per the conditional-removal contract they must not be removed.
     ".gitignore", ".env", ".civitai_token", ".hf_token",
     ".modal_workspaces.json", ".deployed_state.json", ".modal_settings.json",
     ".deployed_version", ".deploy_log", "modal_logs.txt", "_deploy_output.log",

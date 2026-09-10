@@ -346,3 +346,163 @@ def test_qd2_projection_reports_duplicate_and_missing_ranges():
 def test_qd2_projection_fails_closed_on_absent_or_malformed_coverage(telemetry):
     projected = gs.project_cpu_qd2_telemetry(telemetry)
     assert projected["qd2_exact_copied_coverage"]["ok"] is False
+
+
+def test_qd2_telemetry_mode_defaults_to_light_and_rejects_unknown():
+    assert gs.qd2_telemetry_mode() == "light"
+    assert gs.qd2_telemetry_mode(None) == "light"
+    assert gs.normalize_qd2_telemetry_mode("heavy_current") == "heavy_current"
+    with pytest.raises(ValueError, match="qd2_telemetry_mode_invalid"):
+        gs.normalize_qd2_telemetry_mode("ultra")
+
+
+def test_qd2_light_avoids_per_copy_callbacks_events_and_records(tmp_path, monkeypatch):
+    _path, layout, _payload = _fixture(tmp_path)
+    monkeypatch.delenv(gs.QD2_TELEMETRY_ENV, raising=False)
+    ticket = gs.CpuRawPrefetchTicket(layout, telemetry_mode="light")
+    assert ticket._qd2_telemetry_mode == "light"
+    event_calls = {"count": 0}
+    original_event = ticket.event
+    h2d_event_names = set()
+
+    def counting_event(name, **fields):
+        if str(name) in {"CPU_PREFETCH_H2D_ENQUEUE", "CPU_PREFETCH_H2D_COMPLETE"}:
+            h2d_event_names.add(str(name))
+            event_calls["count"] += 1
+        return original_event(name, **fields)
+
+    monkeypatch.setattr(ticket, "event", counting_event)
+    for index in range(4):
+        ticket.mark_h2d_enqueue(extent_id=f"0:{index}", relative_start=index, length=1)
+        ticket.mark_h2d_copy_complete(extent_id=f"0:{index}", relative_start=index, length=1)
+    assert event_calls["count"] == 0
+    assert h2d_event_names == set()
+    assert ticket._h2d_enqueues == []
+    assert ticket._h2d_completions == []
+    assert ticket._h2d_enqueue_count == 4
+    assert ticket._h2d_completed_count == 4
+    telemetry = ticket.telemetry()
+    assert telemetry["qd2_telemetry_mode"] == "light"
+    assert telemetry["telemetry"] == {"mode": "light"}
+    assert telemetry["h2d_enqueue_records"] == []
+    assert telemetry["h2d_completion_records"] == []
+    assert telemetry["h2d_enqueue_count"] == 4
+    assert telemetry["h2d_completion_count"] == 4
+    projected = gs.project_cpu_qd2_telemetry(telemetry, events=ticket.events)
+    assert projected["qd2_telemetry_mode"] == "light"
+    assert projected["qd2_h2d_per_range_record_counts"] == {"enqueue": 0, "completion": 0}
+    assert projected["qd2_h2d_interval_evidence"] == "light_mode_no_per_range_records"
+    assert projected["qd2_h2d_active_wall_ns"] is None
+    assert projected["qd2_h2d_host_observed_active_wall_ns"] is None
+
+
+def test_qd2_heavy_retains_per_copy_records_and_events(tmp_path):
+    _path, layout, _payload = _fixture(tmp_path)
+    ticket = gs.CpuRawPrefetchTicket(layout, telemetry_mode="heavy_current")
+    ticket.mark_h2d_enqueue(extent_id="0:0", relative_start=0, length=4)
+    ticket.mark_h2d_copy_complete(extent_id="0:0", relative_start=0, length=4)
+    assert len(ticket._h2d_enqueues) == 1
+    assert len(ticket._h2d_completions) == 1
+    assert ticket._h2d_enqueue_count == 1
+    assert ticket._h2d_completed_count == 1
+    names = [event["name"] for event in ticket.events]
+    assert "CPU_PREFETCH_H2D_ENQUEUE" in names
+    assert "CPU_PREFETCH_H2D_COMPLETE" in names
+    telemetry = ticket.telemetry()
+    assert telemetry["qd2_telemetry_mode"] == "heavy_current"
+    assert len(telemetry["h2d_enqueue_records"]) == 1
+    assert len(telemetry["h2d_completion_records"]) == 1
+    # Caller-owned copies cannot mutate ticket state (deepcopy retained).
+    telemetry["h2d_enqueue_records"][0]["relative_start"] = 999
+    assert ticket._h2d_enqueues[0]["relative_start"] == 0
+
+
+def test_qd2_host_observed_wall_is_not_labeled_device_activity():
+    telemetry = {
+        "total_bytes": 8,
+        "logical_extent_count": 2,
+        "expected_h2d_ranges": [[0, 4], [4, 8]],
+        "h2d_enqueue_records": [
+            {"extent_id": "0:0", "relative_start": 0, "length": 4, "monotonic_ns": 150},
+            {"extent_id": "1:0", "relative_start": 4, "length": 4, "monotonic_ns": 260},
+        ],
+        "h2d_completion_records": [
+            {"extent_id": "0:0", "relative_start": 0, "length": 4, "monotonic_ns": 220},
+            {"extent_id": "1:0", "relative_start": 4, "length": 4, "monotonic_ns": 320},
+        ],
+        "h2d_host_span_ns": 175,
+        "h2d_outstanding": 0,
+        "h2d_finalized": True,
+    }
+    events = [
+        {"name": "CPU_PREFETCH_START", "monotonic_ns": 100, "wall_ns": 1000, "fields": {}},
+        {"name": "CPU_PREFETCH_SOURCE_COMPLETE", "monotonic_ns": 250, "wall_ns": 1150, "fields": {}},
+        {"name": "CLIP_GPU_READY", "monotonic_ns": 340, "wall_ns": 1240, "fields": {}},
+    ]
+    projected = gs.project_cpu_qd2_telemetry(telemetry, events=events)
+    # Host-observed union is preserved under its explicit name with semantics;
+    # the legacy key is kept for compatibility but classified identically.
+    assert projected["qd2_h2d_active_wall_ns"] == 130
+    assert projected["qd2_h2d_host_observed_active_wall_ns"] == 130
+    assert projected["qd2_h2d_active_wall_ns_semantics"] == (
+        "host_observed_submit_to_host_observed_completion_union_not_proven_device_activity"
+    )
+    assert projected["qd2_h2d_device_active_wall_ns"] is None
+    assert "cuda" in projected["qd2_h2d_device_active_wall_ns_semantics"]
+    assert projected["qd2_source_duration_ns"] == 150
+    assert projected["qd2_source_to_gpu_ready_ns"] == 240
+    assert projected["qd2_post_source_tail_ns"] == 70
+    assert projected["qd2_h2d_host_span_ns"] == 175
+
+
+def test_qd2_defer_h2d_gate_defaults_off_and_parses_truthy_only(monkeypatch):
+    monkeypatch.delenv(gs.QD2_DEFER_H2D_ENV, raising=False)
+    assert gs.qd2_defer_h2d_enabled() is False
+    assert gs.qd2_defer_h2d_enabled(None) is False
+    assert gs.qd2_defer_h2d_enabled("") is False
+    assert gs.qd2_defer_h2d_enabled("0") is False
+    assert gs.qd2_defer_h2d_enabled("ultra") is False
+    for truthy in ("1", "true", "YES", " on "):
+        assert gs.qd2_defer_h2d_enabled(truthy) is True
+    monkeypatch.setenv(gs.QD2_DEFER_H2D_ENV, "1")
+    assert gs.qd2_defer_h2d_enabled() is True
+
+
+def test_qd2_defer_gate_waits_for_source_then_emits_stage_event(tmp_path):
+    _path, layout, _payload = _fixture(tmp_path)
+    ticket = gs.CpuRawPrefetchTicket(layout)
+    # Simulate a completed source without running worker threads.
+    with ticket._condition:
+        ticket._complete = True
+        ticket._bytes_read = int(layout.total_data_bytes)
+        ticket._condition.notify_all()
+    ticket.wait_for_source_complete()
+    names = [event["name"] for event in ticket.events]
+    assert "QD2_DEFERRED_H2D_GATE" in names
+
+
+def test_qd2_defer_gate_fails_closed_on_source_failure(tmp_path):
+    _path, layout, _payload = _fixture(tmp_path)
+    ticket = gs.CpuRawPrefetchTicket(layout)
+    with ticket._condition:
+        ticket._failed = RuntimeError("boom")
+        ticket._condition.notify_all()
+    with pytest.raises(RuntimeError, match="cpu_prefetch_source_failed"):
+        ticket.wait_for_source_complete()
+
+
+def test_qd2_defer_armed_proof_in_ticket_telemetry(tmp_path, monkeypatch):
+    _path, layout, _payload = _fixture(tmp_path)
+    monkeypatch.delenv(gs.QD2_DEFER_H2D_ENV, raising=False)
+    assert gs.CpuRawPrefetchTicket(layout).telemetry()["qd2_defer_h2d_armed"] is False
+    monkeypatch.setenv(gs.QD2_DEFER_H2D_ENV, "1")
+    assert gs.CpuRawPrefetchTicket(layout).telemetry()["qd2_defer_h2d_armed"] is True
+
+
+def test_qd2_defer_gate_runs_before_any_h2d_worker_starts():
+    source = inspect.getsource(gs.read_file_qd_gpu)
+    gate_position = source.index("cpu_prefetch_ticket.wait_for_source_complete()")
+    # The gate must precede every consumer-worker start; H2D submits only
+    # happen inside _qd_gpu_worker after start, so no H2D can begin first.
+    assert gate_position < source.index("t.start()")
+    assert '"qd2_defer_h2d_armed"' in source or "'qd2_defer_h2d_armed'" in source or "qd2_defer_h2d_armed" in source

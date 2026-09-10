@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
@@ -85,7 +86,15 @@ def _load_active_workspace() -> dict:
     return modal_workspaces.resolve_modal_destination(_REPO_ROOT)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-destructive-custom-node-publication",
+        action="store_true",
+        help="explicitly permit removal of previously-published external "
+        "package files/content; never inferred, recorded in the receipt",
+    )
+    args = parser.parse_args(argv)
     try:
         cn_root = _resolve_custom_nodes_root()
         workspace = _load_active_workspace()
@@ -117,6 +126,7 @@ def main() -> int:
                 volume_factory=lambda volume_name: get_volume(
                     volume_name, workspace=workspace
                 ),
+                allow_destructive=args.allow_destructive_custom_node_publication,
             ))
 
         if os.environ.get("V2CTL_DEPLOY_LOCK_HELD") == "1":
@@ -141,6 +151,15 @@ def main() -> int:
         print(f"[custom_nodes.publish] decision={decision_label} reason={decision.reason} "
               f"generation={identity.generation[:12]} schema={RECEIPT_SCHEMA_VERSION} "
               f"policy={PACKAGING_POLICY_VERSION}")
+        if decision.action == "blocked":
+            delta = decision.destructive_delta or {}
+            for entry in delta.get("packages", []):
+                print(f"[custom_nodes.publish] blocked_package package={entry.get('package')} "
+                      f"prev_files={entry.get('prev_files')} cand_files={entry.get('cand_files')} "
+                      f"missing_count={entry.get('missing_count')}")
+            print("[custom_nodes.publish] refused without --allow-destructive-custom-node-publication; "
+                  "remote generation is unchanged")
+            return 1
         print(f"[v2.volume_publish] status={'ok' if decision.skip or decision.reason == 'published_verified' else 'failed'}")
         print(f"[v2.volume_publish] remote_status={remote_status or ('skipped' if decision.skip else 'missing')}")
         return 0 if decision.skip or decision.action == "recovered" or decision.reason == "published_verified" else 1

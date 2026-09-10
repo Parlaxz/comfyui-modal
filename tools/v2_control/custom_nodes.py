@@ -17,7 +17,7 @@ import json
 import os
 import stat
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -57,6 +57,35 @@ class SemanticFile:
 
 
 @dataclass(frozen=True)
+class PackagePublicationManifest:
+    """The canonical publication evidence for one top-level package."""
+
+    name: str
+    file_count: int
+    total_bytes: int
+    content_digest: str
+    path_list: tuple[str, ...]
+    path_digest: str
+    source_root: str = ""
+    generation: str = ""
+    first_party: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "file_count": self.file_count,
+            "bytes": self.total_bytes,
+            "total_bytes": self.total_bytes,
+            "content_digest": self.content_digest,
+            "path_list": list(self.path_list),
+            "path_digest": self.path_digest,
+            "source_root": self.source_root,
+            "generation": self.generation or self.content_digest,
+            "first_party": self.first_party,
+        }
+
+
+@dataclass(frozen=True)
 class CustomNodeSourceIdentity:
     content_generation: str
     identity_schema: int
@@ -66,6 +95,8 @@ class CustomNodeSourceIdentity:
     manifest_digest: str
     files: tuple[tuple[str, int, str], ...] = ()
     source_generation: str = ""
+    source_root: str = ""
+    package_manifests: tuple[PackagePublicationManifest, ...] = ()
 
     @property
     def generation(self) -> str:
@@ -89,6 +120,8 @@ class CustomNodeSourceIdentity:
             "total_bytes": self.total_bytes,
             "manifest_digest": self.manifest_digest,
             "source_generation": self.source_generation,
+            "source_root": self.source_root,
+            "packages": [item.to_dict() for item in self.package_manifests],
         }
 
 
@@ -108,6 +141,10 @@ class PublicationReceipt:
     ownership_marker: str
     integrity_digest: str
     created_at: str = ""
+    source_root: str = ""
+    package_manifests: tuple[dict[str, Any], ...] = ()
+    destructive_override: bool = False
+    destructive_delta: dict[str, Any] = field(default_factory=dict)
 
     @property
     def generation(self) -> str:
@@ -135,6 +172,10 @@ class PublicationReceipt:
             "publisher": self.publisher,
             "ownership_marker": self.ownership_marker,
             "created_at": self.created_at,
+            "source_root": self.source_root,
+            "packages": [dict(item) for item in self.package_manifests],
+            "destructive_override": self.destructive_override,
+            "destructive_delta": dict(self.destructive_delta),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,7 +187,14 @@ class PublicationReceipt:
         return _canonical_json(self.to_dict())
 
     @classmethod
-    def create(cls, identity: CustomNodeSourceIdentity, volume_name: str) -> "PublicationReceipt":
+    def create(
+        cls,
+        identity: CustomNodeSourceIdentity,
+        volume_name: str,
+        *,
+        destructive_override: bool = False,
+        destructive_delta: Mapping[str, Any] | None = None,
+    ) -> "PublicationReceipt":
         receipt = cls(
             schema_version=RECEIPT_SCHEMA_VERSION,
             content_generation=identity.content_generation,
@@ -162,6 +210,10 @@ class PublicationReceipt:
             ownership_marker=PUBLISHER_MARKER,
             integrity_digest="",
             created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            source_root=identity.source_root,
+            package_manifests=tuple(item.to_dict() for item in identity.package_manifests),
+            destructive_override=bool(destructive_override),
+            destructive_delta=dict(destructive_delta or {}),
         )
         return cls(**{**receipt.__dict__, "integrity_digest": _receipt_integrity(receipt)})
 
@@ -193,6 +245,10 @@ class PublicationReceipt:
                 manifest_digest=raw["manifest_digest"], publisher=raw["publisher"],
                 ownership_marker=raw["ownership_marker"],
                 integrity_digest=raw["integrity_digest"], created_at=raw["created_at"],
+                source_root=str(raw.get("source_root") or ""),
+                package_manifests=tuple(raw.get("packages") or ()),
+                destructive_override=bool(raw.get("destructive_override", False)),
+                destructive_delta=dict(raw.get("destructive_delta") or {}),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ReceiptError("malformed_receipt") from exc
@@ -235,6 +291,8 @@ class PublicationDecision:
     result: Any = None
     schema_version: int = RECEIPT_SCHEMA_VERSION
     publication_protocol_version: int = PUBLICATION_PROTOCOL_VERSION
+    destructive_delta: dict[str, Any] = field(default_factory=dict)
+    destructive_override: bool = False
 
     @property
     def skip(self) -> bool:
@@ -303,6 +361,141 @@ def _manifest(files: Iterable[SemanticFile]) -> tuple[list[dict[str, Any]], str,
     return entries, publication_manifest_digest(entries), sum(item.size for item in files)
 
 
+def _path_digest(paths: Iterable[str]) -> str:
+    return hashlib.sha256(_canonical_json(sorted(str(path) for path in paths))).hexdigest()
+
+
+def _is_first_party_package(root: Path, name: str) -> bool:
+    """Identify comfyui-modal from source identity, not worktree dirtiness."""
+    if name.casefold() != "comfyui-modal":
+        return False
+    package = root / name
+    return (
+        (package / ".git").exists()
+        or (package / "comfyapp.py").is_file()
+        and (package / "comfymodal_runtime" / "modal_app.py").is_file()
+    )
+
+
+def _package_manifests(
+    root: str | Path,
+    files: tuple[SemanticFile, ...],
+) -> tuple[PackagePublicationManifest, ...]:
+    root_path = Path(root).resolve()
+    grouped: dict[str, list[SemanticFile]] = {}
+    for item in files:
+        package, _, _relative = item.path.partition("/")
+        grouped.setdefault(package, []).append(item)
+    result: list[PackagePublicationManifest] = []
+    for name in sorted(grouped):
+        package_files = sorted(grouped[name], key=lambda item: item.path)
+        entries = [
+            {
+                "path": item.path,
+                "size": item.size,
+                "sha256": item.sha256,
+            }
+            for item in package_files
+        ]
+        paths = tuple(item.path for item in package_files)
+        content_digest = publication_manifest_digest(entries)
+        result.append(PackagePublicationManifest(
+            name=name,
+            file_count=len(package_files),
+            total_bytes=sum(item.size for item in package_files),
+            content_digest=content_digest,
+            path_list=paths,
+            path_digest=_path_digest(paths),
+            source_root=str(root_path),
+            generation=content_digest,
+            first_party=_is_first_party_package(root_path, name),
+        ))
+    return tuple(result)
+
+
+def _manifest_map(value: Any) -> dict[str, dict[str, Any]]:
+    if isinstance(value, PublicationReceipt):
+        raw = value.package_manifests
+    elif isinstance(value, CustomNodeSourceIdentity):
+        raw = value.package_manifests
+    elif isinstance(value, Mapping):
+        raw = value.get("packages", value.get("package_manifests", ()))
+    else:
+        raw = ()
+    result: dict[str, dict[str, Any]] = {}
+    for item in raw or ():
+        data = item.to_dict() if isinstance(item, PackagePublicationManifest) else dict(item)
+        name = str(data.get("name") or "")
+        if name:
+            result[name] = data
+    return result
+
+
+def publication_safety_delta(
+    previous: PublicationReceipt | Mapping[str, Any] | None,
+    desired: CustomNodeSourceIdentity,
+) -> dict[str, Any]:
+    """Return external-package file-loss evidence before any remote mutation."""
+    previous_packages = _manifest_map(previous)
+    desired_packages = _manifest_map(desired)
+    blocked: list[dict[str, Any]] = []
+    if not previous_packages and isinstance(previous, PublicationReceipt) and previous.file_count:
+        blocked.append({
+            "package": "<unavailable>",
+            "reason": "previous_package_manifest_missing",
+            "prev_files": previous.file_count,
+            "cand_files": desired.file_count,
+            "prev_bytes": previous.total_bytes,
+            "cand_bytes": desired.total_bytes,
+            "missing_paths": [],
+            "missing_count": previous.file_count,
+            "prev_digest": previous.manifest_digest,
+            "cand_digest": desired.manifest_digest,
+        })
+    for name, previous_item in sorted(previous_packages.items()):
+        prev_files = int(previous_item.get("file_count", 0) or 0)
+        if prev_files <= 0 or name.casefold() == "comfyui-modal" or previous_item.get("first_party"):
+            continue
+        candidate = desired_packages.get(name)
+        prev_paths = set(str(path) for path in previous_item.get("path_list", ()) or ())
+        cand_paths = set(str(path) for path in (candidate or {}).get("path_list", ()) or ())
+        missing = sorted(prev_paths - cand_paths)
+        cand_files = int((candidate or {}).get("file_count", 0) or 0)
+        if candidate is None or cand_files == 0 or missing:
+            blocked.append({
+                "package": name,
+                "prev_files": prev_files,
+                "cand_files": cand_files,
+                "prev_bytes": int(previous_item.get("total_bytes", previous_item.get("bytes", 0)) or 0),
+                "cand_bytes": int((candidate or {}).get("total_bytes", (candidate or {}).get("bytes", 0)) or 0),
+                "missing_paths": missing,
+                "missing_count": len(missing) if missing else prev_files,
+                "prev_digest": str(previous_item.get("content_digest", "")),
+                "cand_digest": str((candidate or {}).get("content_digest", "")),
+            })
+    return {
+        "blocked": bool(blocked),
+        "packages": blocked,
+        "previous_generation": (
+            previous.content_generation if isinstance(previous, PublicationReceipt)
+            else str((previous or {}).get("content_generation", ""))
+        ),
+        "candidate_generation": desired.content_generation,
+    }
+
+
+def check_publication_safety(
+    previous: PublicationReceipt | Mapping[str, Any] | None,
+    desired: CustomNodeSourceIdentity,
+    *,
+    allow_destructive: bool = False,
+) -> dict[str, Any]:
+    delta = publication_safety_delta(previous, desired)
+    delta["override_allowed"] = bool(allow_destructive)
+    delta["allowed"] = not delta["blocked"] or bool(allow_destructive)
+    return delta
+
+
 def build_source_identity(
     root: str | Path,
     *,
@@ -349,6 +542,8 @@ def build_source_identity(
         manifest_digest=manifest_digest,
         files=tuple((item.path, item.size, item.sha256) for item in files),
         source_generation=source_generation,
+        source_root=str(Path(root).resolve()),
+        package_manifests=_package_manifests(root, files),
     )
 
 
@@ -616,6 +811,7 @@ async def publish_or_skip(
     workspace: Mapping[str, object] | None = None,
     identity_provider: Callable[..., Any] | None = None,
     repair_requested: bool = False,
+    allow_destructive: bool = False,
 ) -> PublicationDecision:
     # Inspect the tiny receipt before constructing the archive.  Exact skips
     # therefore perform no tar/gzip work and do not invoke the publisher.
@@ -635,9 +831,11 @@ async def publish_or_skip(
             if inspect.isawaitable(volume):
                 volume = await volume
     volume_refresh_ok = True
+    verified_previous: PublicationReceipt | None = None
     try:
         volume = await _refresh_volume_async(volume)
         existing = await read_receipt_async(volume, volume_name=volume_name)
+        verified_previous = existing
         decision = evaluate_receipt(existing, identity, volume_name=volume_name,
                                     repair_requested=repair_requested)
     except ReceiptError as exc:
@@ -681,6 +879,48 @@ async def publish_or_skip(
             )
         return PublicationDecision("publish", "receipt_recovery_failed", identity)
 
+    # Destructive-publication guard: compare the candidate identity against
+    # the last verified remote receipt BEFORE any remote deletion/replacement
+    # (the remote publisher deletes the prior tree on commit).  A missing or
+    # unreadable receipt is not authority for a block; only a verified remote
+    # receipt is.  Fail-closed: on block, return without invoking the
+    # publisher, writing a receipt/generation, or mutating the remote.
+    safety = check_publication_safety(
+        verified_previous, identity, allow_destructive=allow_destructive
+    )
+    if safety["blocked"] and not safety["allowed"]:
+        print(
+            "[custom_nodes.publish] decision=blocked "
+            "reason=destructive_custom_node_publication_blocked "
+            f"previous_generation={str(safety['previous_generation'])[:16] or '(none)'} "
+            f"candidate_generation={str(safety['candidate_generation'])[:16] or '(none)'} "
+            f"packages={len(safety['packages'])}"
+        )
+        for entry in safety["packages"]:
+            print(
+                "[custom_nodes.publish] blocked_package "
+                f"package={entry['package']} "
+                f"prev_files={entry['prev_files']} cand_files={entry['cand_files']} "
+                f"prev_bytes={entry['prev_bytes']} cand_bytes={entry['cand_bytes']} "
+                f"missing_count={entry['missing_count']} "
+                f"prev_digest={str(entry['prev_digest'])[:16] or '(none)'} "
+                f"cand_digest={str(entry['cand_digest'])[:16] or '(none)'}"
+            )
+            for missing in entry["missing_paths"][:20]:
+                print(f"[custom_nodes.publish] missing_path package={entry['package']} path={missing}")
+        print(
+            "[custom_nodes.publish] refused without --allow-destructive-custom-node-publication; "
+            "remote generation is unchanged"
+        )
+        return PublicationDecision(
+            "blocked",
+            "destructive_custom_node_publication_blocked",
+            identity,
+            verified_previous,
+            destructive_delta=safety,
+            destructive_override=False,
+        )
+
     archive = build_archive(files)
     result = publisher(archive)
     if inspect.isawaitable(result):
@@ -706,7 +946,12 @@ async def publish_or_skip(
         or readback_content_generation != identity.content_generation
     ):
         return PublicationDecision("publish", "publication_incomplete", identity, result=result)
-    receipt = PublicationReceipt.create(identity, volume_name)
+    receipt = PublicationReceipt.create(
+        identity,
+        volume_name,
+        destructive_override=bool(safety["blocked"] and safety["allowed"]),
+        destructive_delta=dict(safety) if safety["blocked"] else {},
+    )
     try:
         await write_receipt_async(volume, receipt)
         trusted = evaluate_receipt(
@@ -738,5 +983,6 @@ __all__ = [
     "collect_semantic_files", "build_source_identity", "build_archive",
     "prepare_publication", "evaluate_receipt", "read_receipt", "read_receipt_async",
     "write_receipt", "write_receipt_async",
+    "check_publication_safety", "publication_safety_delta",
     "publish_or_skip", "run_publish_or_skip", "get_volume", "resolve_custom_nodes_root",
 ]
