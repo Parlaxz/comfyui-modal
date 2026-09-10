@@ -587,6 +587,18 @@ function renderFeaturesStep(body, state) {
   });
   body.appendChild(desc);
 
+  // Surface the stored-graph prefetch result here too (same testid as the
+  // bindings step; only one step renders at a time). The prefetch runs on
+  // open for version-setup mode, so the status is already visible before
+  // the user picks a feature.
+  if (state.suggestStatus) {
+    body.appendChild(el("p", {
+      "data-testid": "wizard-suggest-status",
+      style: "font-size:10px;color:#888;margin:4px 0 0;",
+      text: state.suggestStatus,
+    }));
+  }
+
   const featureList = el("div", { class: "comfymodal-studio-wizard-feature-list" });
 
   Object.values(FEATURE_DEFS).forEach((def) => {

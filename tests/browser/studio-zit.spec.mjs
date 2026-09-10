@@ -127,6 +127,15 @@ test.describe("Studio ZIT E2E", () => {
     const api = await installStudioMockApi(page);
     await pinPrimaryExtensionRequests(page);
 
+    // Workflows stay LIVE: pass /comfymodal/studio/workflows* through to the
+    // real backend. Registered AFTER installStudioMockApi so it takes
+    // precedence over the shared mock's 599 catch-all (later routes win;
+    // route.continue() sends the request to the network, bypassing the mock
+    // handler entirely, so these calls are never recorded as unhandled).
+    await page.route(/\/comfymodal\/studio\/workflows/, async (route) => {
+      await route.continue();
+    });
+
     // Stubbed model library (ZIT models only; workflows/* stays LIVE).
     await page.route("**/comfymodal/studio/models**", async (route) => {
       await route.fulfill({
@@ -302,7 +311,7 @@ test.describe("Studio ZIT E2E", () => {
     let wfId = sifatida ? sifatida.workflow_id : "";
     let verId = "";
 
-    if (!siquarta) {
+    if (!sifatida) {
       // ── 1. Import via file input (absolute ZIT path) ──────────────
       await page.locator('[data-testid="workflows-import-button"]').click();
       await expect(page.locator('[data-testid="import-dialog"]')).toBeVisible({ timeout: 10000 });
@@ -331,31 +340,37 @@ test.describe("Studio ZIT E2E", () => {
       await panel.getByRole("button", { name: "Continue to Bindings" }).click();
       await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
 
-      for (const [role, label] of [["prompt", "CLIPTextEncode"], ["model_unet", "UNETLoader"], ["vae", "VAELoader"], ["output", "SaveImage"]]) {
-        const row = panel.locator('[data-testid="wizard-binding-row"]', { hasText: new RegExp(label) });
-        await expect(row.first()).toContainText("Suggested", { timeout: 10000 });
-        await row.first().locator('[data-testid="wizard-use-suggestion"]').click();
+      // Rows are keyed by catalog role (data-binding-key); node-type text is
+      // not asserted because real graphs carry custom node titles (e.g. ZIT
+      // names its CLIPTextEncode nodes "CLIP Text Encode (Positive Prompt)").
+      for (const role of ["prompt", "model_unet", "vae", "output"]) {
+        const row = panel.locator(`[data-testid="wizard-binding-row"][data-binding-key="${role}"]`);
+        await expect(row).toContainText("Suggested", { timeout: 10000 });
+        await row.locator('[data-testid="wizard-use-suggestion"]').click();
       }
       // Seed: no catalog suggestion (documents the KSampler-pattern gap).
-      const seedRow = panel.locator('[data-testid="wizard-binding-row"]', { hasText: "Seed" }).first();
+      const seedRow = panel.locator('[data-testid="wizard-binding-row"][data-binding-key="seed"]');
       await expect(seedRow).toBeVisible({ timeout: 10000 });
       expect(await seedRow.locator('[data-testid="wizard-use-suggestion"]').count()).toBe(0);
 
       // Load ZIT onto the canvas, then bind seed + clip through capture.
       console.log("[zit] canvas load:", await loadZitOntoCanvas(page, zit));
 
-      async function captureBind(roleLabel, nodeId, widgetName) {
-        const row = panel.locator('[data-testid="wizard-binding-row"]', { hasText: roleLabel }).first();
+      async function captureBind(roleKey, nodeId, widgetName) {
+        // Keyed by catalog role: text matching is unreliable because real
+        // graphs carry custom node titles (ZIT's CLIPLoader is titled
+        // "Load CLIP", which also matches the prompt row's bound value).
+        const row = panel.locator(`[data-testid="wizard-binding-row"][data-binding-key="${roleKey}"]`);
         await row.click();
         const sel = await selectCanvasNode(page, nodeId);
-        console.log("[zit] canvas select", roleLabel, JSON.stringify(sel));
+        console.log("[zit] canvas select", roleKey, JSON.stringify(sel));
         expect(sel).toBeTruthy();
         expect(await readCanvasSelection(page)).toEqual({ id: String(nodeId), type: sel.type });
         await panel.getByRole("button", { name: "Use Selected Node" }).click();
         const dropdown = row.locator("select.comfymodal-studio-select");
         await expect(dropdown).toBeVisible({ timeout: 10000 });
         const options = await dropdown.locator("option").allTextContents();
-        console.log("[zit] candidates", roleLabel, JSON.stringify(options).slice(0, 400));
+        console.log("[zit] candidates", roleKey, JSON.stringify(options).slice(0, 400));
         expect(options.some((t) => t.includes(widgetName))).toBe(true);
         await dropdown.selectOption({ label: options.find((t) => t.includes(widgetName)) });
       }
@@ -363,13 +378,16 @@ test.describe("Studio ZIT E2E", () => {
       // Seed lives on ClownsharKSampler_Beta (node 1241 in the ZIT file).
       const samplerNode = zit.nodes.find((n) => n.type === "ClownsharKSampler_Beta");
       expect(samplerNode).toBeTruthy();
-      await captureBind("Seed", String(samplerNode.id), "seed");
-      // CLIP model: CLIPLoader clip_name1 (catalog suggests bare clip_name).
+      await captureBind("seed", String(samplerNode.id), "seed");
+      // CLIP model: CLIPLoader clip_name (the node's widget name).
       const clipNode = zit.nodes.find((n) => n.type === "CLIPLoader");
       expect(clipNode).toBeTruthy();
-      await captureBind("CLIP", String(clipNode.id), "clip_name1");
+      await captureBind("clip", String(clipNode.id), "clip_name");
 
       await expect(panel.locator('[data-testid="wizard-save-gate"]')).toContainText("required bindings complete", { timeout: 10000 });
+      // The gate text is substring-loose ("5 of 6 ..." also matches), so
+      // assert the button itself is enabled before clicking.
+      await expect(panel.getByRole("button", { name: "Continue to Details" })).toBeEnabled({ timeout: 10000 });
       await panel.getByRole("button", { name: "Continue to Details" }).click();
       await expect(panel).toContainText("Confirm Setup");
       const saveBtn = panel.locator('[data-testid="wizard-version-save"]');
@@ -403,17 +421,22 @@ test.describe("Studio ZIT E2E", () => {
     });
     await section.getByRole("button", { name: "New Preset" }).click();
     await expect(page.locator('[data-testid="preset-editor"]')).toBeVisible({ timeout: 10000 });
+    const editor = page.locator('[data-testid="preset-editor"]');
+    // Wait for the mapping-backed editor (mapping + model library load
+    // async; the editor first renders a mapping-less skeleton whose inputs
+    // would be discarded by the refresh — never fill before the Values
+    // fields and the three model pickers exist). Labels come from the saved
+    // mapping display_name ("Prompt"), not the mock's ("Positive Prompt").
+    await expect(editor.locator('.comfymodal-studio-backend-field', { hasText: "Prompt" }).first()).toBeVisible({ timeout: 20000 });
+    await expect(editor.locator('[data-testid="model-choice-select"]')).toHaveCount(3, { timeout: 20000 });
     await page.locator('[data-testid="preset-name-input"]').fill("ZIT Base");
     // Prompt + seed scalar fields.
-    const editor = page.locator('[data-testid="preset-editor"]');
-    const promptField = editor.locator('.comfymodal-studio-backend-field', { hasText: "Positive Prompt" }).first();
-    if (await promptField.count()) {
-      const ta = promptField.locator("textarea");
-      if (await ta.count()) await ta.fill("zit playground cat");
-      else await promptField.locator("input").fill("zit playground cat");
-    }
+    const promptField = editor.locator('.comfymodal-studio-backend-field', { hasText: "Prompt" }).first();
+    const ta = promptField.locator("textarea");
+    if (await ta.count()) await ta.fill("zit playground cat");
+    else await promptField.locator("input").fill("zit playground cat");
     const seedField = editor.locator('.comfymodal-studio-backend-field', { hasText: "Seed" }).first();
-    if (await seedField.count()) await seedField.locator("input").fill("75739920976641");
+    await seedField.locator("input").fill("75739920976641");
     // Model pickers (one per model role): choose the matching ZIT model.
     const modelSelects = editor.locator('[data-testid="model-choice-select"]');
     const selectCount = await modelSelects.count();
@@ -437,7 +460,9 @@ test.describe("Studio ZIT E2E", () => {
     console.log("[zit] preset", presetId);
 
     // ── Library shows the ZIT workflow ────────────────────────────────
-    await page.locator('.comfymodal-studio-topnav [data-page="workflows"]').click();
+    // The preset editor lives on the detail page, and the topnav Workflows
+    // tab preserves the open detail — go back explicitly to reach the list.
+    await page.getByRole("button", { name: "Back to Workflows" }).click();
     await expect(page.locator('[data-testid="workflows-page"]')).toBeVisible({ timeout: 15000 });
     await expect(page.locator('[data-testid="workflow-card"]', { hasText: ZIT_NAME }).first()).toBeVisible({ timeout: 15000 });
 
@@ -469,9 +494,9 @@ test.describe("Studio ZIT E2E", () => {
     await page.locator('[data-testid="shelf-axis-seed"]').click();
     await page.locator('[data-testid="shelf-axis-input-seed"]').fill("75739920970000");
     await page.locator('[data-testid="shelf-axis-input-seed"]').press("Enter");
-    await page.locator('[data-testid="shelf-axis-positive_prompt"]').click();
-    await page.locator('[data-testid="shelf-axis-input-positive_prompt"]').fill("zit experiment dog");
-    await page.locator('[data-testid="shelf-axis-input-positive_prompt"]').press("Enter");
+    await page.locator('[data-testid="shelf-axis-prompt"]').click();
+    await page.locator('[data-testid="shelf-axis-input-prompt"]').fill("zit experiment dog");
+    await page.locator('[data-testid="shelf-axis-input-prompt"]').press("Enter");
     await expect(page.locator('[data-testid="shelf-exp-matrix"]')).toContainText("4 run(s)", { timeout: 10000 });
     const expRunBtn = page.locator('[data-testid="shelf-exp-run-btn"]');
     await expect(expRunBtn).toBeEnabled({ timeout: 10000 });
@@ -491,18 +516,28 @@ test.describe("Studio ZIT E2E", () => {
     await expect(page.locator('[data-testid="history-v2-experiment-card"][data-id="exp_zit_2x2"]')).toBeVisible();
     await expect(page.locator('[data-testid="history-v2-generation-card"][data-id="gen_zit_single"]')).toBeVisible();
 
-    // Generation detail + favorite + note.
+    // Generation detail + favorite + note. The prompt renders on the feed
+    // card (established card-prompt contract); the detail dialog shows the
+    // canonical 9 params (Seed here) plus run metadata — prompt text is not
+    // a params key by contract (pinned 9-param count in sibling specs).
+    await expect(page.locator('[data-testid="history-v2-generation-card"][data-id="gen_zit_single"]')).toContainText("zit playground cat");
     await page.locator('[data-testid="history-v2-generation-card"][data-id="gen_zit_single"]').click();
     const dialog = page.getByRole("dialog", { name: "Generation detail" });
     await expect(dialog).toBeVisible({ timeout: 10000 });
-    await expect(dialog).toContainText("zit playground cat");
-    const favBtn = dialog.locator('[data-testid="history-v2-favorite"], [data-testid="history-favorite"]').first();
+    await expect(dialog).toContainText("75739920976641");
+    // Favorite star + note box use class hooks (proven pattern in the
+    // history-v2 annotation specs); testid variants kept as fallback.
+    const favBtn = dialog.locator('.comfymodal-studio-history-v2-fav, [data-testid="history-v2-favorite"], [data-testid="history-favorite"]').first();
     if (await favBtn.count()) await favBtn.click();
-    const noteInput = dialog.locator('[data-testid="history-v2-note-input"], [data-testid="history-note-input"], textarea').first();
+    const noteInput = dialog.locator('textarea.comfymodal-studio-history-v2-notes, [data-testid="history-v2-note-input"], [data-testid="history-note-input"], textarea').first();
     if (await noteInput.count()) {
       await noteInput.fill("zit e2e note");
-      const noteSave = dialog.locator('[data-testid="history-v2-note-save"], [data-testid="history-note-save"]').first();
+      const noteSave = dialog.getByRole("button", { name: "Save note" });
       if (await noteSave.count()) await noteSave.click();
+      else {
+        const noteSaveFallback = dialog.locator('[data-testid="history-v2-note-save"], [data-testid="history-note-save"]').first();
+        if (await noteSaveFallback.count()) await noteSaveFallback.click();
+      }
     }
     await expect.poll(() => zitState.genFav || zitState.genNote !== "", { timeout: 15000 }).toBe(true);
     await page.keyboard.press("Escape");

@@ -2963,9 +2963,13 @@ export function renderWorkflows(state, context) {
       editor.appendChild(_editorBlock("Values", grid));
     }
 
-    // Model choices — library dropdowns for model-kind roles. Falls back to
-    // plain text inputs when the model library cannot be fetched.
-    const modelEntries = presetEntries.filter((e) => e.kind === "model");
+    // Model choices — library dropdowns for model-kind roles. Model-ness
+    // lives in control_kind ("file"), mirroring the playground shelf
+    // convention; the mapping "kind" vocabulary only ever carries the
+    // binding mechanism (widget/node_input/node_output/node), so filtering
+    // on kind would never match. Falls back to plain text inputs when the
+    // model library cannot be fetched.
+    const modelEntries = presetEntries.filter((e) => e.control_kind === "file");
     if (modelEntries.length) {
       const mc = (editPreset && editPreset.model_choices) || {};
       const compatibleModels = (version && Array.isArray(version.compatible_models))

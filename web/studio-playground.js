@@ -3318,7 +3318,21 @@ function renderProgressSection(state, context) {
 
   const runState = state.playground && state.playground.runState;
   if (!runState || LEGACY_TERMINAL_STATUSES.indexOf(runState.status) !== -1) {
-    // Show completed/error state in metadata section instead
+    // Terminal (or no run yet): retain the final stage label so the
+    // section evidences completion instead of going blank. Completed and
+    // error detail continues to render in the metadata section.
+    if (runState) {
+      var terminalLabel = "Completed";
+      if (runState.status === "error") terminalLabel = "Error";
+      else if (runState.status === "canceled") terminalLabel = "Canceled";
+      else if (runState.status === "interrupted") terminalLabel = "Interrupted";
+      section.style.display = "block";
+      section.appendChild(el("span", {
+        "data-testid": "progress-stage",
+        style: "font-size:10px;color:#aaa;",
+        text: "Stage: " + terminalLabel,
+      }));
+    }
     return section;
   }
 

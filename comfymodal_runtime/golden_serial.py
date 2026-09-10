@@ -12841,8 +12841,9 @@ async def golden_sampling(session: GoldenSession) -> Any:
     )
     session.sampling_diagnostics = diagnostics
     rec.sampling_diagnostics = diagnostics
-    golden_serial_mode = str(getattr(session, "golden_mode", "serial")).lower() == "serial"
-    gc_suppression_enabled = golden_serial_mode and res4lyf_gc_suppression_enabled()
+    golden_mode = str(getattr(session, "golden_mode", "serial")).lower()
+    golden_mode_supported = golden_mode in ("serial", "parallel")
+    gc_suppression_enabled = golden_mode_supported and res4lyf_gc_suppression_enabled()
     if not gc_suppression_enabled:
         _record_res4lyf_gc_suppression(
             session,
@@ -12850,7 +12851,7 @@ async def golden_sampling(session: GoldenSession) -> Any:
             module_name=_RES4LYF_SAMPLERS_MODULE_NAME,
             skip_reason=(
                 "feature_flag_disabled"
-                if golden_serial_mode else "golden_mode_not_serial"
+                if golden_mode_supported else "golden_mode_unsupported"
             ),
             intercepted_collect_count=0,
             suppression_wall_ms=0.0,
