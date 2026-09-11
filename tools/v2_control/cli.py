@@ -1710,7 +1710,8 @@ def write_deployment_manifest(repo_root: Path, config: config_mod.ResolvedConfig
     d = _deployment_manifest_dir(repo_root)
     d.mkdir(parents=True, exist_ok=True)
     # Direct callers from older tests/tools retain the old convenience
-    # behavior.  Deploy commands always pass their pre-publication snapshot.
+    # behavior.  Deploy commands always pass their frozen deploy snapshot,
+    # captured after the verified custom-node publication generation is known.
     if deploy_identity is None:
         deploy_fp = getattr(fingerprints, "deploy_fingerprint")()
         deploy_inputs_method = getattr(fingerprints, "deploy_inputs", None)
@@ -2997,14 +2998,42 @@ def _invoke_golden_publisher(
     return hook(repo_root, **kwargs)
 
 
-def _assert_publication_generation(publication: object, expected: str) -> None:
-    """Keep the preflight and publisher on one full-content generation."""
-    actual = str(getattr(getattr(publication, "identity", None), "generation", "") or "")
-    if not expected or actual != expected:
+def _publication_verified_generation(publication: object) -> str:
+    """Return the publisher's own verified content generation when present."""
+    result = getattr(publication, "result", None)
+    if not isinstance(result, Mapping):
+        return ""
+    for key in ("content_generation", "generation", "observed_generation"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _resolve_publication_generation(publication: object, desired: str) -> str:
+    """Return the verified publication generation as the authoritative one.
+
+    A verified publication is authoritative: the generation calculated before
+    publication may legitimately differ when the shared custom-node tree
+    changed while the deploy was in flight (the publisher re-reads the live
+    tree).  A mismatch is logged, never fatal.  Real publication and
+    verification failures are raised by ``_invoke_golden_publisher`` before
+    this point.
+    """
+    resolved = str(
+        getattr(getattr(publication, "identity", None), "generation", "") or ""
+    )
+    if not resolved:
         raise GateError(
-            "custom-node publication generation mismatch: "
-            f"expected={expected[:16] or '(none)'} actual={actual[:16] or '(none)'}"
+            "custom-node publication has no verified generation after publication"
         )
+    if desired and desired != resolved:
+        print(
+            "[custom_nodes.publish] pre-publication generation differs from the "
+            "verified publication; continuing with the verified generation: "
+            f"desired={desired[:16]} verified={resolved[:16]}"
+        )
+    return resolved
 
 
 def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
@@ -3226,23 +3255,23 @@ def cmd_deploy(args, repo_root: Path) -> int:
                      target=config.target.app, profile=config.profile_name,
                      auto_recover=True)
         try:
-            deploy_identity = capture_deploy_identity(fingerprints, workspace_binding)
-            _apply_deploy_identity_to_env(env, deploy_identity)
-            print(f"[v2ctl.deploy] profile={config.profile_name} "
-                  f"deploy_fingerprint={deploy_identity.deploy_fingerprint}")
+            print(f"[v2ctl.deploy] profile={config.profile_name}")
             print(f"[v2ctl.deploy] command={command}")
             publication = None
             source_probe_expected = None
             final_publisher_preflight = None
+            desired_generation = ""
+            verified_generation = ""
+            resolved_generation = ""
             if native_golden:
                 assert publisher_app_name is not None
                 from . import source_probe as source_probe_mod
 
-                # Capture the exact source expectation alongside the frozen
-                # deploy identity, before publication or backend work starts.
+                # Capture the exact source expectation before publication or
+                # backend work starts.
                 source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
                 publisher_preflight = None
-                publication_generation = (
+                desired_generation = (
                     _local_content_generation(repo_root)
                     if workspace_binding is not None else ""
                 )
@@ -3250,7 +3279,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     publisher_preflight = run_publisher_preflight(
                         repo_root,
                         workspace_binding,
-                        local_content_generation=publication_generation,
+                        local_content_generation=desired_generation,
                         require_ready=False,
                     )
                     if publisher_preflight["PUBLICATION_DECISION"] == "bootstrap_required":
@@ -3273,17 +3302,25 @@ def cmd_deploy(args, repo_root: Path) -> int:
                     repo_root,
                     publisher_app_name,
                     workspace_binding,
-                    publication_generation,
+                    desired_generation,
                     allow_destructive=bool(
                         getattr(args, "allow_destructive_custom_node_publication", False)
                     ),
                 )
                 if workspace_binding is not None:
-                    _assert_publication_generation(publication, publication_generation)
+                    # The verified publication is authoritative: a generation
+                    # calculated before publication may differ when the shared
+                    # custom-node tree changed mid-deploy, and must not block.
+                    verified_generation = _publication_verified_generation(publication)
+                    resolved_generation = _resolve_publication_generation(
+                        publication, desired_generation
+                    )
+                    if not verified_generation:
+                        verified_generation = resolved_generation
                     final_publisher_preflight = run_publisher_preflight(
                         repo_root,
                         workspace_binding,
-                        local_content_generation=publication_generation,
+                        local_content_generation=resolved_generation,
                         require_ready=True,
                     )
                     _print_golden_predeploy_card(
@@ -3291,6 +3328,16 @@ def cmd_deploy(args, repo_root: Path) -> int:
                         final_publisher_preflight,
                         lock_state="RECOVERED" if lock.last_recovery else "CLEAR",
                     )
+            # The final deploy fingerprint is captured only after the verified
+            # custom-node publication generation is resolved.
+            deploy_identity = capture_deploy_identity(fingerprints, workspace_binding)
+            _apply_deploy_identity_to_env(env, deploy_identity)
+            print(
+                f"[v2ctl.deploy] desired_generation={desired_generation or '(none)'} "
+                f"verified_generation={verified_generation or '(none)'} "
+                f"resolved_generation={resolved_generation or '(none)'} "
+                f"fingerprint={deploy_identity.deploy_fingerprint}"
+            )
             # ── Deploy-version-advance verification (E29 root-cause fix) ──
             # Capture the app's highest deployment version BEFORE the deploy
             # so a post-deploy comparison can prove a NEW version appeared

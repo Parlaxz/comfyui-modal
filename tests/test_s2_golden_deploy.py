@@ -744,7 +744,7 @@ def test_native_golden_deploy_publishes_before_backend(tmp_path, monkeypatch):
     assert events.index("publish") < events.index("version") < events.index("backend")
 
 
-def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
+def test_deploy_manifest_uses_identity_captured_after_verified_publication(
     tmp_path, monkeypatch
 ):
     from tools.v2_control import cli
@@ -755,7 +755,8 @@ def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
         repo_root, "golden_p1", cli_options={"target.app": "golden-experimental"}
     )
     config, fingerprints = components[3], components[4]
-    captured = cli.capture_deploy_identity(fingerprints)
+    captured_before_publication = cli.capture_deploy_identity(fingerprints)
+    captured_after_publication: list = []
 
     class FakeLock:
         def __init__(self, _path):
@@ -776,7 +777,8 @@ def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
             return "modal deploy"
 
         def run(self, *_args, **_kwargs):
-            config.owner = "backend-mutated"
+            # A backend mutation must never leak into the captured identity.
+            config.git.head = "backend-mutated"
             return BackendResult(
                 exit_code=0, stdout="", stderr="", command="modal deploy",
                 started_at="2026-01-01T00:00:00+00:00",
@@ -784,7 +786,10 @@ def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
             )
 
     def publish(_root):
+        # The verified publication resolves before the final deploy fingerprint
+        # is captured, so this mutation is part of the captured identity.
         config.git.head = "publication-mutated"
+        captured_after_publication.append(cli.capture_deploy_identity(fingerprints))
         return SimpleNamespace(
             action="skip", reason="exact_match", identity=SimpleNamespace(
                 generation="generation", identity_schema=1,
@@ -800,16 +805,22 @@ def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
     })
     monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
     monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
+    # Keep this identity-ordering test isolated from the repository's
+    # persistent Golden receipt ledger.
+    monkeypatch.setattr(
+        cli, "_write_golden_deployment_receipt",
+        lambda *args, **kwargs: tmp_path / "deployment-receipt.json",
+    )
     args = SimpleNamespace(
         profile="golden_p1", app="golden-experimental", set=[], inherit=[],
         owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
     )
 
-    # The fake backend mutates the fingerprint inputs before bookkeeping.
     versions = iter((0, 1))
     monkeypatch.setattr(cli, "_app_version_number", lambda _app: next(versions))
     assert cli.cmd_deploy(args, tmp_path) == 0
 
+    captured = captured_after_publication[0]
     manifests = sorted((tmp_path / ".v2ctl" / "deployments").glob("deploy_*.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
@@ -821,6 +832,8 @@ def test_deploy_manifest_uses_identity_captured_before_publication_and_backend(
     assert effective_env["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] == captured.deploy_fingerprint
     assert effective_env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] == captured.deploy_fingerprint
     assert effective_env["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] == captured.profile_config_fingerprint
+    # The publication mutation is captured; the backend mutation is not.
+    assert captured.deploy_fingerprint != captured_before_publication.deploy_fingerprint
     assert fingerprints.deploy_fingerprint() != captured.deploy_fingerprint
 
 

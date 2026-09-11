@@ -266,9 +266,21 @@ def test_publication_diagnostic_is_bounded_and_redacted():
     assert "token_secret" in diagnostic
 
 
-def test_publication_generation_mismatch_fails_closed():
-    with pytest.raises(cli.GateError, match="generation mismatch"):
-        cli._assert_publication_generation(
-            SimpleNamespace(identity=SimpleNamespace(generation="published")),
+def test_verified_publication_generation_is_authoritative_despite_mismatch(capsys):
+    publication = SimpleNamespace(
+        identity=SimpleNamespace(generation="published"),
+        result={"content_generation": "published"},
+    )
+    assert cli._resolve_publication_generation(publication, "preflight") == "published"
+    assert "pre-publication generation differs" in capsys.readouterr().out
+    assert cli._publication_verified_generation(publication) == "published"
+
+
+def test_missing_publication_generation_fails_closed():
+    with pytest.raises(cli.GateError, match="no verified generation"):
+        cli._resolve_publication_generation(
+            SimpleNamespace(identity=SimpleNamespace(generation="")),
             "preflight",
         )
+    with pytest.raises(cli.GateError, match="no verified generation"):
+        cli._resolve_publication_generation(SimpleNamespace(identity=None), "")
