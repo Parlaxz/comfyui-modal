@@ -220,7 +220,7 @@ default = "0"
 consumed_at = "method_entry"
 change_requires = "deploy"
 owner = "golden-loader-ab"
-description = "Experimental Golden loader-process A/B switch. Default OFF; when ON, golden_parallel starts one persistent spawn worker, records startup separately, and fails closed with loader_process_handoff_invalid instead of reloading/copying model payload."
+description = "Experimental Golden loader-process A/B switch. Default OFF; when ON, golden_parallel starts one persistent spawn worker that runs the three full canonical loads and hands their CUDA storage to the parent via torch CUDA IPC (canonical preloaded re-bind; no second read/H2D; worker stopped after teardown)."
 
 [[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
