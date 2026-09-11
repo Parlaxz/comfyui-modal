@@ -223,6 +223,15 @@ owner = "golden-loader-ab"
 description = "Experimental Golden loader-process A/B switch. Default OFF; when ON, golden_parallel starts one persistent spawn worker that runs the three full canonical loads and hands their CUDA storage to the parent via torch CUDA IPC (canonical preloaded re-bind; no second read/H2D; worker stopped after teardown)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_MINIMAL_RESTORE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-minimal-restore"
+description = "Experimental Golden Parallel minimal post-snapshot restore. Default OFF; when ON, restore() runs a from-first-principles contract (container-local reset + logical GPU repair + models-generation guard + minimal telemetry) instead of the legacy restore. A failure fails closed and never falls back to the legacy path."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

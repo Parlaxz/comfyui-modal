@@ -3547,6 +3547,16 @@ def _golden_full_trace_requested() -> bool:
     return os.environ.get("COMFYMODAL_V2_FULL_TRACE", "").strip() == "1"
 
 
+def _golden_minimal_restore_enabled() -> bool:
+    """Return True only when the experimental minimal-restore switch is ON.
+
+    Default OFF: unset or any non-truthy value keeps the legacy restore path
+    selected.  Read at restore entry so the experimental path can be selected
+    by deploy without touching request configuration.
+    """
+    return env_flag("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", default=False)
+
+
 def _emit_golden_profiler_lifecycle(
     lifecycle: str,
     *,
@@ -5404,6 +5414,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # Pre-snapshot loader-worker experiment selector (deploy-baked; OFF when unset).
     if "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT" in os.environ:
         env["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"]
+    # Golden minimal-restore experiment selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
+        env["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"] = os.environ["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -12594,6 +12607,248 @@ class ModalRuntimeEntrypoint:
         self._restore_torch_interop_threads = _after_interop
         self._restore_torch_thread_limit_status = _status
 
+    def _golden_minimal_reset_container_state(self) -> str:
+        """Reset only per-container state that cannot survive a snapshot.
+
+        Each reset exists because the value captured at snap=True is runtime
+        progress, not immutable configuration; reusing it after restore would
+        mis-identify this restore or skip work this container never did.
+
+        Returns a status string so a partial legacy-barrier reset is visible
+        as restore evidence instead of being silently swallowed.
+        """
+        # First request after every restore must be request 1.  The counter is
+        # runtime progress and is snapshotted holding the previous container's
+        # value, which would misnumber the first restored request.
+        self._request_count = 0
+        # Post-restore nonce/session ids are runtime-owned evidence of THIS
+        # restore; a snapshotted value would falsely identify a prior restore.
+        self._post_restore_nonce = ""
+        self._restore_session_id = ""
+        # Prepared-state maps are keyed by workflow hash and record work done
+        # in this container.  A snapshotted entry would suppress preparation
+        # for a workflow that was never actually prepared here.
+        _RES4LYF_PREPARED.clear()
+        _CACHEDIT_PREPARED.clear()
+        # Process-global restore-stage timers accumulate per restore; stale
+        # values would be attributed to this restore.
+        _RESTORE_STAGE_TIMERS.clear()
+        # Legacy backend boundary/barrier events are per-restore synchronization
+        # primitives.  A snapshotted *set* event would let a boundary worker
+        # wake immediately as if a previous restore's boundary had been crossed.
+        legacy_api = getattr(self, "_legacy_api", None)
+        if legacy_api is None:
+            return "no_legacy_api"
+        try:
+            _init_registry = getattr(legacy_api, "_init_actual_load_registry", None)
+            if callable(_init_registry):
+                _init_registry()
+            for _barrier_name in (
+                "_production_unet_barrier_event",
+                "_production_unet_encode_barrier_event",
+            ):
+                _barrier = getattr(legacy_api, _barrier_name, None)
+                if _barrier is not None:
+                    _barrier.clear()
+            if hasattr(legacy_api, "_production_unet_boundary_anchor_unix_s"):
+                legacy_api._production_unet_boundary_anchor_unix_s = time.time()
+            if hasattr(legacy_api, "_rbg_unet_done_events"):
+                legacy_api._rbg_unet_done_events = {}
+            if hasattr(legacy_api, "_active_next_read_dedup"):
+                legacy_api._active_next_read_dedup = set()
+                if hasattr(legacy_api, "_active_next_read_call_count"):
+                    legacy_api._active_next_read_call_count = 0
+                if hasattr(legacy_api, "_active_next_bundle_observation_count"):
+                    legacy_api._active_next_bundle_observation_count = 0
+                if hasattr(legacy_api, "_active_next_bundle_diagnostic_emission_count"):
+                    legacy_api._active_next_bundle_diagnostic_emission_count = 0
+        except Exception as _reset_exc:
+            # Surfaced as evidence (not swallowed); the fail-closed guards
+            # below still own the minimal contract.
+            return f"error:{type(_reset_exc).__name__}"
+        return "ok"
+
+    def _golden_minimal_restore_logical_gpu_state(self) -> None:
+        """Flip only ComfyUI's logical model-placement state back to GPU.
+
+        snap=True forced ComfyUI into CPU mode so the snapshot carries no CUDA
+        driver handles; model placement and CUDA-only attention paths need GPU
+        state before the first execution.  Deliberately performs NO CUDA probe,
+        synchronize, or memory query: the first genuine GPU use pays the driver
+        cost, which is exactly what the remote A/B must measure.
+        """
+        import comfy.cli_args
+        import comfy.model_management as _mm
+
+        comfy.cli_args.args.cpu = False
+        _mm.cpu_state = _mm.CPUState.GPU
+        _mm.DISABLE_SMART_MEMORY = False
+        _vram_state = getattr(_mm, "VRAMState", None)
+        if _vram_state is not None and hasattr(_vram_state, "HIGH_VRAM"):
+            _mm.vram_state = _vram_state.HIGH_VRAM
+
+    def _golden_minimal_assert_models_generation(self) -> dict[str, Any]:
+        """Prove the mounted models generation matches the snapshot baseline.
+
+        Reuses the existing O(1) RuntimeBootstrap decision (one small
+        models_generation.json read + isdir; no Volume RPC, no tree walk, no
+        hashing).  Fail closed: any decision other than an exact match raises,
+        so the A/B observes a real failure instead of silently loading a wrong
+        or missing model under the same logical name.
+        """
+        bootstrap = getattr(self, "bootstrap", None)
+        decide = getattr(bootstrap, "_decide_models_reload", None)
+        if not callable(decide):
+            raise RuntimeError("golden_minimal_restore_models_guard_unavailable")
+        decision = decide()
+        if str(decision.get("decision", "")) != "skipped_generation_match":
+            raise RuntimeError(
+                "golden_minimal_restore_models_generation_check_failed:"
+                f"{decision.get('reason', 'unknown')}"
+            )
+        return decision
+
+    def _golden_minimal_restore(
+        self,
+        *,
+        remote_python_resume_wall_ns: int,
+        remote_python_resume_mono_ns: int,
+        restore_method_start_wall_ns: int,
+        restore_method_start_mono_ns: int,
+        restore_perf_start: float,
+    ) -> dict[str, Any]:
+        """Minimal Golden Parallel post-snapshot restore (default OFF).
+
+        Contract: reset container-local state, repair only logical GPU state,
+        prove the models-generation guard, emit minimal telemetry, READY.
+        A failure raises and never falls back to the heavyweight legacy restore,
+        so the remote A/B observes the true minimal-restore outcome.
+        """
+        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
+
+        _t_start = time.perf_counter()
+        telemetry: dict[str, Any] = {
+            "minimal_restore_start": time.monotonic_ns(),
+        }
+
+        def _mark(_name: str, _started_at: float) -> None:
+            telemetry[_name] = round((time.perf_counter() - _started_at) * 1000.0, 3)
+
+        try:
+            _t = time.perf_counter()
+            telemetry["legacy_api_reset"] = self._golden_minimal_reset_container_state()
+            _mark("mutable_state_reset_ms", _t)
+
+            _t = time.perf_counter()
+            self._golden_minimal_restore_logical_gpu_state()
+            _mark("logical_gpu_repair_ms", _t)
+
+            _t = time.perf_counter()
+            _models_decision = self._golden_minimal_assert_models_generation()
+            _mark("models_generation_check_ms", _t)
+            telemetry["models_generation_decision"] = str(
+                _models_decision.get("decision", "")
+            )
+        except Exception as _minimal_exc:
+            telemetry["minimal_restore_end"] = time.monotonic_ns()
+            telemetry["minimal_restore_total_ms"] = round(
+                (time.perf_counter() - _t_start) * 1000.0, 3
+            )
+            telemetry["minimal_restore_status"] = "failed"
+            telemetry["minimal_restore_failure_reason"] = (
+                f"{type(_minimal_exc).__name__}:{_minimal_exc}"
+            )
+            self._restore_timing = telemetry
+            _LATEST_LIFECYCLE_TIMING = telemetry
+            print(
+                "[v2.golden_minimal_restore] "
+                f"status=failed reason={type(_minimal_exc).__name__} "
+                f"detail={_minimal_exc} "
+                f"minimal_restore_total_ms={telemetry['minimal_restore_total_ms']}",
+                flush=True,
+            )
+            # Fail closed: never silently fall back to the legacy restore.
+            raise
+
+        _v2_container_restore_count += 1
+        self._restore_count = _v2_container_restore_count
+        restore_session_id = uuid.uuid4().hex
+        restored_instance_id = uuid.uuid4().hex
+        post_restore_nonce = uuid.uuid4().hex
+        self._restored_instance_id = restored_instance_id
+        _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+        self._restore_session_id = restore_session_id
+        self._post_restore_nonce = post_restore_nonce
+        os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
+        set_model_load_identity(restored_instance_id, restore_session_id)
+
+        restore_end_mono_ns = time.monotonic_ns()
+        restore_end_wall_ns = int(time.time() * 1_000_000_000)
+        restore_total_ms = round((time.perf_counter() - restore_perf_start) * 1000.0, 3)
+        telemetry["minimal_restore_end"] = restore_end_mono_ns
+        telemetry["minimal_restore_total_ms"] = restore_total_ms
+        telemetry["minimal_restore_status"] = "ok"
+
+        restore_timing = dict(telemetry)
+        restore_timing.update({
+            "restore_total_ms": restore_total_ms,
+            "restore_wall_ms_excluding_scheduling": round(
+                (restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000, 3
+            ),
+            "restore_timing_boundary": "restore_method_entry_to_restore_return",
+            "restore_session_id": restore_session_id,
+            "restored_instance_id": restored_instance_id,
+            "post_restore_nonce": post_restore_nonce,
+            "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "container_session_id": self.container_session_id,
+            "restore_count": self._restore_count,
+            "lifecycle_status": "ok",
+            "lifecycle_method": "restore",
+            "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+            "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+            "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+            "restore_method_start_mono_ns": restore_method_start_mono_ns,
+            "restore_method_end_wall_unix_ns": restore_end_wall_ns,
+            "restore_method_end_mono_ns": restore_end_mono_ns,
+            "restore_method_status": "success",
+        })
+        self._restore_timing = restore_timing
+        _LATEST_LIFECYCLE_TIMING = restore_timing
+        # Required for the resume -> FIRST_RESULT_READY boundary: a dropped
+        # marker would silently make the A/B window unmeasurable, so it is not
+        # swallowed here (matches the legacy call site).
+        set_restore_return_marker(
+            restored_instance_id=restored_instance_id,
+            restore_session_id=restore_session_id,
+            legacy_container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            modal_task_id=str(os.environ.get("MODAL_TASK_ID", "") or ""),
+            pid=os.getpid(),
+        )
+
+        _state = getattr(getattr(self, "bootstrap", None), "state", None)
+        print(
+            "[v2.golden_minimal_restore] "
+            f"status=ok minimal_restore_total_ms={restore_total_ms} "
+            f"mutable_state_reset_ms={telemetry.get('mutable_state_reset_ms')} "
+            f"logical_gpu_repair_ms={telemetry.get('logical_gpu_repair_ms')} "
+            f"models_generation_check_ms={telemetry.get('models_generation_check_ms')}",
+            flush=True,
+        )
+        return {
+            "backend": getattr(_state, "backend", "") or "",
+            "cuda": dict(getattr(_state, "cuda", {}) or {}),
+            "runtime_generation": getattr(_state, "runtime_generation", "") or "",
+            "status": "restored",
+            "_restore_timing": restore_timing,
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            "post_restore_nonce": post_restore_nonce,
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "minimal_restore": True,
+            "trace": {},
+            "phase_durations_ms": {},
+        }
+
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
         # Deep profiling is request-only.  Restore deliberately creates no
@@ -12616,6 +12871,23 @@ class ModalRuntimeEntrypoint:
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_perf_start = time.perf_counter()
+        if _golden_minimal_restore_enabled():
+            # ── Golden Parallel minimal restore (experimental, default OFF) ──
+            # A new from-first-principles post-snapshot contract that runs
+            # beside the legacy restore below instead of stripping it.  This
+            # branch returns before any probe, observability, ledger, span,
+            # manifest, host, warm, identity, bootstrap, or preload work.
+            # A failure inside the minimal path raises and never falls back to
+            # the legacy restore, so the remote A/B observes the real minimal
+            # outcome.  Disable COMFYMODAL_GOLDEN_MINIMAL_RESTORE and redeploy
+            # to select the legacy path again.
+            return self._golden_minimal_restore(
+                remote_python_resume_wall_ns=remote_python_resume_wall_ns,
+                remote_python_resume_mono_ns=remote_python_resume_mono_ns,
+                restore_method_start_wall_ns=restore_method_start_wall_ns,
+                restore_method_start_mono_ns=restore_method_start_mono_ns,
+                restore_perf_start=_restore_perf_start,
+            )
         _restore_clip_probe_source_info = _resolve_restore_clip_probe_source(
             staging_evidence=getattr(self, "_restore_clip_probe_staging", None),
         )
