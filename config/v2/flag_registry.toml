@@ -214,6 +214,15 @@ owner = "golden-p1"
 description = "Suppress the stock RES4LYF beta sampler's module-local gc.collect during Golden sampling. Default OFF; deploy-baked for the experimental request path."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_LOADER_PROCESS"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-loader-ab"
+description = "Experimental Golden loader-process A/B switch. Default OFF; when ON, golden_parallel starts one persistent spawn worker, records startup separately, and fails closed with loader_process_handoff_invalid instead of reloading/copying model payload."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

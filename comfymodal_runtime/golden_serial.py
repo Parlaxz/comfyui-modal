@@ -10977,7 +10977,9 @@ def _transport_read_options(session: GoldenSession, *, role: str) -> dict[str, A
     )
 
 
-async def golden_clip_load(session: GoldenSession) -> Any:
+async def golden_clip_load(
+    session: GoldenSession, *, preloaded_transports: Optional[list[dict]] = None
+) -> Any:
     """Load CLIP via the contract's :class:`ClipLoadSpec` and the real
     upstream constructor.
 
@@ -11058,13 +11060,33 @@ async def golden_clip_load(session: GoldenSession) -> Any:
         # One QD physical transport PER checkpoint, in spec order; every
         # per-file owner is retained (no reread, no second H2D).
         state_dicts: list[dict] = []
+        if preloaded_transports is not None:
+            # Loader-process experiment: the worker performed the real QD
+            # transport + H2D; the parent binds the CUDA-IPC-mapped views with
+            # the same canonical constructor + proofs and no second H2D.
+            transports.extend(preloaded_transports)
+            for transport in preloaded_transports:
+                state_dicts.append(transport["sd"])
+                owner = transport.get("owner")
+                if owner is not None:
+                    session.register_qd_owner(owner)
+            rec.event(
+                "clip_preloaded_transport",
+                checkpoints=len(preloaded_transports),
+                h2d_completed_bytes=sum(
+                    int((t.get("stats") or {}).get("h2d_completed_bytes", 0) or 0)
+                    for t in preloaded_transports
+                ),
+            )
         prefetch = getattr(session, "cpu_prefetch_ticket", None)
         if prefetch is not None:
             # This is the normal CLIP-demand boundary.  It must be sampled
             # before transport workers begin consuming ranges; their exposed
             # waits are reported separately in the ticket telemetry.
             prefetch.mark_clip_demand()
-        for index, path in enumerate(session.clip_paths):
+        for index, path in enumerate(
+            session.clip_paths if preloaded_transports is None else ()
+        ):
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
@@ -12460,7 +12482,9 @@ def resolve_clip_type(name: str) -> Any:
     return member
 
 
-async def golden_unet_load(session: GoldenSession) -> Any:
+async def golden_unet_load(
+    session: GoldenSession, *, preloaded_transport: Optional[dict] = None
+) -> Any:
     """UNET Candidate A: single-source QD payload -> real Lumina2/NextDiT
     skeleton -> CoreModelPatcher -> ``model.load_model_weights(dict(views),
     "", assign=True)`` -> strict 453/453 pointer-identity validation.
@@ -12586,15 +12610,21 @@ async def golden_unet_load(session: GoldenSession) -> Any:
 
         # The single QD physical producer into CUDA (one read, one H2D).
         reset_peak_stats()
-        with _golden_trace_span("golden.unet.source_h2d_transport"):
-            with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-                transport = read_file_qd_gpu(
-                    unet_path,
-                    role="unet",
-                    qd=contract.qd,
-                    block_bytes=_session_transport_block_bytes(session),
-                    **_transport_read_options(session, role="unet"),
-                )
+        if preloaded_transport is not None:
+            # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
+            # views (no second read, no second H2D) with the canonical
+            # adoption and pointer-identity proofs below.
+            transport = preloaded_transport
+        else:
+            with _golden_trace_span("golden.unet.source_h2d_transport"):
+                with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+                    transport = read_file_qd_gpu(
+                        unet_path,
+                        role="unet",
+                        qd=contract.qd,
+                        block_bytes=_session_transport_block_bytes(session),
+                        **_transport_read_options(session, role="unet"),
+                    )
         views = {
             k[len(prefix):] if prefix and k.startswith(prefix) else k: v
             for k, v in transport["sd"].items()
@@ -13344,7 +13374,9 @@ async def golden_sampler_tail(session: GoldenSession) -> dict:
         raise
 
 
-async def golden_vae_load(session: GoldenSession) -> Any:
+async def golden_vae_load(
+    session: GoldenSession, *, preloaded_transport: Optional[dict] = None
+) -> Any:
     """Resolve ``ae.safetensors`` and use the same serial QD physical transport;
     construct the real upstream VAE from the already-loaded state dict with
     correct keys/device/dtype and retained owner lifetime.  A dynamic
@@ -13369,14 +13401,19 @@ async def golden_vae_load(session: GoldenSession) -> Any:
 
         contract = session.contract
         transport_start_ns = time.perf_counter_ns() if diagnostics_enabled else None
-        with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-            transport = read_file_qd_gpu(
-                session.model_paths["vae"],
-                role="vae",
-                qd=contract.qd,
-                block_bytes=_session_transport_block_bytes(session),
-                **_transport_read_options(session, role="vae"),
-            )
+        if preloaded_transport is not None:
+            # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
+            # views + header metadata (no second read, no second H2D).
+            transport = preloaded_transport
+        else:
+            with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
+                transport = read_file_qd_gpu(
+                    session.model_paths["vae"],
+                    role="vae",
+                    qd=contract.qd,
+                    block_bytes=_session_transport_block_bytes(session),
+                    **_transport_read_options(session, role="vae"),
+                )
         transport_end_ns = time.perf_counter_ns() if diagnostics_enabled else None
         if diagnostics_enabled:
             components.append({

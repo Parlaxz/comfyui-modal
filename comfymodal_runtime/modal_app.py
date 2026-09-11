@@ -5398,6 +5398,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # contract: an unset host flag remains unset in the container.
     if "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS" in os.environ:
         env["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"] = os.environ["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"]
+    # Loader-process experiment selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_LOADER_PROCESS" in os.environ:
+        env["COMFYMODAL_GOLDEN_LOADER_PROCESS"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
