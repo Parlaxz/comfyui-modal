@@ -8,6 +8,7 @@ No GPU/CUDA is required by this test.
 from __future__ import annotations
 
 import os
+import threading
 
 from comfymodal_runtime.golden_io_process import (
     IO_SLOTS,
@@ -76,5 +77,34 @@ def test_child_roundtrip_exact_and_cuda_sterile(tmp_path):
         # shared -> pinned accounting reflects the real copied bytes.
         assert worker.shared_to_pinned_bytes == len(data) + 4096
         assert worker.shared_to_pinned_ms > 0.0
+    finally:
+        worker.stop()
+
+
+def test_concurrent_producers_preserve_child_source_qd(tmp_path):
+    data = os.urandom(8 * 1024 * 1024)
+    blob = tmp_path / "big.bin"
+    blob.write_bytes(data)
+
+    worker = GoldenIoProcess()
+    try:
+        worker.start()
+        results: dict[int, bool] = {}
+
+        def _run(i: int) -> None:
+            off = i * 1024 * 1024
+            target = bytearray(1024 * 1024)
+            got = worker.readinto(str(blob), target, off, i % 4)
+            results[i] = got == 1024 * 1024 and bytes(target) == data[off : off + 1024 * 1024]
+
+        threads = [threading.Thread(target=_run, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+
+        assert len(results) == 4, results
+        assert all(results.values()), results
+        assert worker.effective_child_source_qd_max >= 2, worker.effective_child_source_qd_max
     finally:
         worker.stop()

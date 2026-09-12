@@ -12,6 +12,12 @@ not forwarded to it.
 
 Default OFF: ``COMFYMODAL_GOLDEN_IO_PROCESS=0``.
 
+Control IPC preserves genuine source QD: the Golden transport submits reads from
+several producer threads.  A single IPC-dispatcher thread is the sole owner of
+the Pipe (thread-safe framing); producers submit request-ID-tagged requests and
+wait on their own reply.  The child executes multiple source reads concurrently
+(a bounded thread pool) so outstanding child source requests can exceed one.
+
 Lifecycle (pre-snapshot persistence, control IPC, survival accounting) mirrors
 the proven loader-process worker, but ownership of CUDA/H2D/model stays in the
 parent.  This module reuses no GPU ownership.
@@ -32,14 +38,12 @@ _TRUTHY = {"1", "true", "yes", "on"}
 # Golden transport geometry (8 slots x 32 MiB) instead of a model-sized backing.
 IO_SLOTS = 8
 IO_SLOT_BYTES = 32 * 1024 * 1024
+IO_MAX_INFLIGHT = IO_SLOTS
 
 
 def io_process_enabled() -> bool:
     """Return True only when the experimental I/O-process switch is ON."""
     return str(os.environ.get(IO_PROCESS_ENV) or "").strip().lower() in _TRUTHY
-
-
-# ── child (stdlib only; CUDA-sterile) ─────────────────────────────────────────
 
 
 def _safe_fileno(conn: Any) -> Optional[int]:
@@ -84,11 +88,17 @@ def _pread_into(fd: int, target: memoryview, offset: int, length: int) -> int:
     return len(data)
 
 
-def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) -> None:
-    """Spawn child entry: serve strict storage reads and lifecycle probes.
+# ── child (stdlib only; CUDA-sterile) ─────────────────────────────────────────
 
-    Imports only the standard library.  Never imports torch, never touches CUDA.
+
+def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) -> None:
+    """Spawn child entry: serve storage reads concurrently + lifecycle probes.
+
+    Storage reads run on a bounded thread pool so multiple parent producers can
+    have outstanding source reads at once.  A single send lock keeps reply
+    framing thread-safe.  Imports only the standard library; never touches CUDA.
     """
+    import concurrent.futures
     from multiprocessing import shared_memory
 
     shm = shared_memory.SharedMemory(name=shm_name)
@@ -103,6 +113,49 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
     cuda_initialized = False
     cuda_tasks_run = 0
     gpu_alloc_bytes = 0
+    send_lock = threading.Lock()
+
+    def _send(msg: dict) -> None:
+        with send_lock:
+            conn.send(msg)
+
+    def _do_read(msg: dict) -> None:
+        path = str(msg["path"])
+        offset = int(msg["offset"])
+        length = int(msg["length"])
+        slot = int(msg["slot"])
+        req_id = msg.get("req_id")
+        if slot < 0 or slot >= slot_count or length < 0 or length > slot_bytes:
+            _send({"op": "error", "kind": "read", "req_id": req_id,
+                   "error": "io_read_bounds"})
+            return
+        started_ns = time.perf_counter_ns()
+        try:
+            target = memoryview(buf)[slot * slot_bytes: slot * slot_bytes + length]
+            got = 0
+            with open(path, "rb", buffering=0) as fh:
+                fd = fh.fileno()
+                while got < length:
+                    n = _pread_into(fd, target, offset + got, length - got)
+                    if n <= 0:
+                        break
+                    got += n
+        except BaseException as exc:  # noqa: BLE001 - surface, then fail closed
+            _send({"op": "error", "kind": "read", "req_id": req_id,
+                   "error": f"{type(exc).__name__}: {exc}"[:300]})
+            return
+        _send({
+            "op": "ready",
+            "req_id": req_id,
+            "slot": slot,
+            "offset": offset,
+            "length": got,
+            "pread_ms": round((time.perf_counter_ns() - started_ns) / 1e6, 3),
+        })
+
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(4, slot_count), thread_name_prefix="io-read"
+    )
     try:
         while True:
             try:
@@ -111,9 +164,10 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                 break
             op = str(msg.get("op") or "")
             if op == "ping":
-                conn.send({
+                _send({
                     "op": "pong",
                     "nonce": msg.get("nonce"),
+                    "req_id": msg.get("req_id"),
                     "pid": os.getpid(),
                     "ppid": os.getppid(),
                     "uuid": msg.get("uuid"),
@@ -123,11 +177,6 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                     "cuda_tasks_run": int(cuda_tasks_run),
                     "gpu_alloc_bytes": int(gpu_alloc_bytes),
                 })
-            elif op == "canary":
-                marker = int(msg.get("marker") or 0)
-                mv = memoryview(buf)
-                mv[0: len(b"io-canary")] = b"io-canary"
-                conn.send({"op": "canary_ok", "marker": marker})
             elif op == "shm_check":
                 marker = int(msg.get("marker") or 0)
                 ok = False
@@ -138,43 +187,10 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                     ok = bytes(mv[0 : len(probe)]) == probe
                 except Exception:
                     ok = False
-                conn.send({"op": "shm_ok", "marker": marker, "canary_ok": bool(ok)})
+                _send({"op": "shm_ok", "marker": marker, "req_id": msg.get("req_id"),
+                       "canary_ok": bool(ok)})
             elif op == "read":
-                path = str(msg["path"])
-                offset = int(msg["offset"])
-                length = int(msg["length"])
-                slot = int(msg["slot"])
-                seq = int(msg["seq"])
-                if slot < 0 or slot >= slot_count or length < 0 or length > slot_bytes:
-                    conn.send({"op": "error", "kind": "read", "seq": seq,
-                               "error": "io_read_bounds"})
-                    continue
-                target = memoryview(buf)[slot * slot_bytes: slot * slot_bytes + length]
-                got = 0
-                try:
-                    with open(path, "rb", buffering=0) as fh:
-                        fd = fh.fileno()
-                        while got < length:
-                            n = _pread_into(fd, target, offset + got, length - got)
-                            if n <= 0:
-                                break
-                            got += n
-                except BaseException as exc:  # noqa: BLE001 - surface, then fail closed
-                    conn.send({"op": "error", "kind": "read", "seq": seq,
-                               "error": f"{type(exc).__name__}: {exc}"[:300]})
-                    continue
-                conn.send({
-                    "op": "ready",
-                    "slot": slot,
-                    "offset": offset,
-                    "length": got,
-                    "seq": seq,
-                })
-                # Wait for the parent to release the slot before reuse.
-                while True:
-                    rel = conn.recv()
-                    if str(rel.get("op")) == "release" and int(rel.get("slot", -1)) == slot:
-                        break
+                pool.submit(_do_read, msg)
             elif op == "exit":
                 break
     except BaseException as exc:  # noqa: BLE001 - surface child failure to the parent
@@ -183,6 +199,10 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
         except Exception:
             pass
     finally:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
         try:
             buf.release()
         except Exception:
@@ -208,15 +228,21 @@ class GoldenIoProcess:
         self._uuid = uuid.uuid4().hex
         self._seq = 0
         self._lock = threading.Lock()
-        # The Golden transport calls the source reader from multiple producer
-        # threads (qd).  The control Pipe must be used by exactly one thread at
-        # a time; the child serves reads serially, so serialize the parent side.
-        self._io_lock = threading.Lock()
         self._free: list[int] = list(range(IO_SLOTS))
         self._slot_cond = threading.Condition()
         self._proc_start_ticks: Optional[int] = None
         self._conn_fileno: Optional[int] = None
         self._child_fileno: Optional[int] = None
+        self._pre_capture: dict = {}
+        # ── single-owner IPC dispatcher (preserves genuine source QD) ──
+        self._pending: dict[int, dict] = {}
+        self._pending_lock = threading.Lock()
+        self._submit_q: list[dict] = []
+        self._q_cond = threading.Condition()
+        self._outstanding = 0
+        self._dispatch_stop = threading.Event()
+        self._dispatch_thread: Optional[threading.Thread] = None
+        self._dispatch_error: str = ""
         # evidence
         self.spawn_count = 0
         self.shared_to_pinned_ms = 0.0
@@ -224,6 +250,15 @@ class GoldenIoProcess:
         self.child_cuda_initialized = False
         self.child_cuda_tasks_run = 0
         self.child_gpu_alloc_bytes = 0
+        self.effective_child_source_qd_max = 0
+        self.producer_wait_ms_total = 0.0
+        self.producer_wait_ms_max = 0.0
+        self.child_pread_ms_total = 0.0
+        self.child_pread_ms_max = 0.0
+        self.child_read_count = 0
+        self.child_pread_ms_by_path: dict[str, float] = {}
+        self.dispatcher_send_ms = 0.0
+        self.dispatcher_recv_ms = 0.0
 
     @property
     def pid(self) -> Optional[int]:
@@ -235,7 +270,8 @@ class GoldenIoProcess:
         Uses ``torch.multiprocessing`` spawn (the proven pre-snapshot lifecycle
         that survives Modal's CPU memory snapshot) with a standard
         ``multiprocessing`` Pipe for control IPC and a stdlib shared-memory ring
-        for bulk bytes.
+        for bulk bytes.  After the spawn handshake a single dispatcher thread
+        becomes the sole owner of the Pipe.
         """
         import torch.multiprocessing as _torch_mp
         from multiprocessing import shared_memory
@@ -256,12 +292,15 @@ class GoldenIoProcess:
         self._conn = parent_conn
         self._pid = proc.pid
         self.spawn_count = getattr(self, "spawn_count", 0) + 1
-        # Handshake so a dead-at-spawn child fails closed immediately.
         try:
             child_conn.close()
         except Exception:
             pass
-        pong = self.ping(timeout=60.0)
+        # Direct spawn handshake BEFORE the dispatcher thread starts.
+        parent_conn.send({"op": "ping", "uuid": self._uuid})
+        if not parent_conn.poll(60.0):
+            raise RuntimeError("golden_io_worker_spawn_timeout")
+        pong = dict(parent_conn.recv())
         self._proc_start_ticks = _proc_start_ticks(self._pid)
         self._conn_fileno = _safe_fileno(parent_conn)
         self._child_fileno = pong.get("conn_fileno")
@@ -277,6 +316,7 @@ class GoldenIoProcess:
             "shm_bytes": IO_SLOTS * IO_SLOT_BYTES,
             "spawn_context": "torch.multiprocessing.spawn",
         }
+        self._start_dispatcher()
         return {
             **self._pre_capture,
             "slot_count": IO_SLOTS,
@@ -286,11 +326,100 @@ class GoldenIoProcess:
             "pong": pong,
         }
 
+    # ── dispatcher ────────────────────────────────────────────────────────
+    def _start_dispatcher(self) -> None:
+        self._dispatch_stop.clear()
+        self._dispatch_error = ""
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatcher_loop, daemon=True, name="golden-io-dispatcher"
+        )
+        self._dispatch_thread.start()
+
+    def _fail_all(self, message: str) -> None:
+        with self._pending_lock:
+            waiters = list(self._pending.values())
+            self._pending.clear()
+        for waiter in waiters:
+            waiter["error"] = message
+            waiter["event"].set()
+
+    def _dispatcher_loop(self) -> None:
+        """Sole owner of the Pipe: send tagged requests, match tagged replies."""
+        while not self._dispatch_stop.is_set():
+            with self._q_cond:
+                if not self._submit_q:
+                    self._q_cond.wait(0.05)
+                reqs = list(self._submit_q)
+                self._submit_q.clear()
+            for req in reqs:
+                _t0 = time.perf_counter_ns()
+                try:
+                    self._conn.send(req)
+                except BaseException as exc:  # noqa: BLE001
+                    self._dispatch_error = f"{type(exc).__name__}: {exc}"[:200]
+                    self._fail_all(self._dispatch_error)
+                    return
+                self.dispatcher_send_ms += (time.perf_counter_ns() - _t0) / 1e6
+                with self._pending_lock:
+                    self._outstanding += 1
+                    if self._outstanding > self.effective_child_source_qd_max:
+                        self.effective_child_source_qd_max = self._outstanding
+            try:
+                _t0 = time.perf_counter_ns()
+                while self._conn.poll(0):
+                    reply = self._conn.recv()
+                    self.dispatcher_recv_ms += (time.perf_counter_ns() - _t0) / 1e6
+                    _t0 = time.perf_counter_ns()
+                    if not isinstance(reply, dict):
+                        continue
+                    if reply.get("op") == "fatal":
+                        self._dispatch_error = f"child_fatal:{reply.get('error')}"[:200]
+                        self._fail_all(self._dispatch_error)
+                        return
+                    rid = reply.get("req_id")
+                    with self._pending_lock:
+                        waiter = self._pending.pop(rid, None)
+                        self._outstanding = max(0, self._outstanding - 1)
+                    if waiter is not None:
+                        if reply.get("op") == "error":
+                            waiter["error"] = str(reply.get("error"))
+                        else:
+                            waiter["reply"] = reply
+                        waiter["event"].set()
+            except BaseException as exc:  # noqa: BLE001
+                self._dispatch_error = f"{type(exc).__name__}: {exc}"[:200]
+                self._fail_all(self._dispatch_error)
+                return
+
+    def _request(self, op: str, *, timeout_s: float = 600.0, **fields: Any) -> dict:
+        """Submit one tagged request and wait for its matching reply."""
+        if self._conn is None:
+            raise RuntimeError("golden_io_worker_missing")
+        with self._lock:
+            self._seq += 1
+            req_id = self._seq
+        waiter = {"event": threading.Event(), "reply": None, "error": None}
+        with self._pending_lock:
+            self._pending[req_id] = waiter
+        req = {"op": op, "req_id": req_id, **fields}
+        if op == "read":
+            req["path"] = os.path.abspath(req["path"])
+        with self._q_cond:
+            self._submit_q.append(req)
+            self._q_cond.notify()
+        if not waiter["event"].wait(float(timeout_s)):
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            raise RuntimeError("golden_io_request_timeout")
+        if self._dispatch_error:
+            raise RuntimeError("golden_io_dispatcher_failed:" + self._dispatch_error)
+        if waiter["error"]:
+            raise RuntimeError(f"golden_io_{op}_error:{waiter['error']}")
+        return waiter["reply"] or {}
+
+    # ── probes (all Pipe access via the dispatcher) ───────────────────────
     def ping(self, *, timeout: float = 5.0) -> dict:
-        self._conn.send({"op": "ping", "uuid": self._uuid})
-        if not self._conn.poll(timeout):
-            raise RuntimeError("golden_io_worker_ping_timeout")
-        return dict(self._conn.recv())
+        return self._request("ping", timeout_s=timeout, uuid=self._uuid)
 
     def probe(self, *, anchor_monotonic_ns: Optional[int] = None, timeout_s: float = 15.0) -> dict:
         """Diagnose A/B/C survival: child, control Pipe, shared ring.
@@ -304,7 +433,6 @@ class GoldenIoProcess:
             "spawn_count": self.spawn_count,
             "spawn_count_match": self.spawn_count == int(pre.get("spawn_count") or -1),
         }
-        # --- A. child process survival ---
         alive = bool(self._proc is not None and self._proc.is_alive())
         pid = self._pid
         exists = None
@@ -326,25 +454,13 @@ class GoldenIoProcess:
             return ev
         ev["A_child_alive"] = True
 
-        # --- B. control Pipe survival (PING/PONG only; no payload path) ---
         nonce = uuid.uuid4().hex
         try:
-            self._conn.send({"op": "ping", "uuid": self._uuid, "nonce": nonce})
+            pong = self._request("ping", timeout_s=timeout_s, uuid=self._uuid, nonce=nonce)
         except Exception as exc:  # noqa: BLE001
             ev.update({"B_pipe_works": False, "ok": False,
-                       "error": f"ping_send_failed:{type(exc).__name__}:{exc}"[:200]})
+                       "error": f"ping_failed:{type(exc).__name__}:{exc}"[:200]})
             return ev
-        pong = None
-        deadline = time.monotonic() + float(timeout_s)
-        while time.monotonic() < deadline:
-            if self._conn.poll(0.25):
-                try:
-                    pong = self._conn.recv()
-                except Exception as exc:  # noqa: BLE001
-                    ev.update({"B_pipe_works": False, "ok": False,
-                               "error": f"recv_failed:{type(exc).__name__}:{exc}"[:200]})
-                    return ev
-                break
         if not isinstance(pong, dict) or pong.get("op") != "pong" or pong.get("nonce") != nonce:
             ev.update({"B_pipe_works": False, "ok": False,
                        "error": f"pong_invalid:{str(pong)[:160]}"})
@@ -364,8 +480,6 @@ class GoldenIoProcess:
         ev["child_fileno_match"] = pong.get("conn_fileno") == pre.get("child_fileno")
         ev["child_ppid_is_parent"] = pong.get("ppid") == os.getpid()
 
-        # --- C. shared ring survival (parent side + child side) ---
-        canary = b"io-ring-canary"
         parent_ok = False
         try:
             probe = f"io-probe-parent-{os.getpid()}".encode()
@@ -383,18 +497,8 @@ class GoldenIoProcess:
             ev["C_dev_shm_present"] = False
         child_ok = False
         try:
-            self._conn.send({"op": "shm_check", "marker": 1})
-            reply = None
-            deadline = time.monotonic() + float(timeout_s)
-            while time.monotonic() < deadline:
-                if self._conn.poll(0.25):
-                    reply = self._conn.recv()
-                    break
-            child_ok = bool(
-                isinstance(reply, dict)
-                and reply.get("op") == "shm_ok"
-                and reply.get("canary_ok")
-            )
+            reply = self._request("shm_check", timeout_s=timeout_s, marker=1)
+            child_ok = bool(reply.get("op") == "shm_ok" and reply.get("canary_ok"))
         except Exception as exc:  # noqa: BLE001
             ev["C_child_shm_error"] = f"{type(exc).__name__}:{exc}"[:160]
         ev["C_child_shm_ok"] = bool(child_ok)
@@ -414,6 +518,7 @@ class GoldenIoProcess:
         )
         return ev
 
+    # ── staged source fill ────────────────────────────────────────────────
     def _acquire_slot(self) -> int:
         with self._slot_cond:
             while not self._free:
@@ -429,9 +534,9 @@ class GoldenIoProcess:
     def readinto(self, path: str, target: Any, offset: int, producer_id: int) -> int:
         """Child pread into a shared slot, then parent memcpy shared -> target.
 
-        ``target`` is the existing pinned staging slot view supplied by the
-        canonical Golden producer.  This is the only injected step; the pinned
-        arena, the H2D backend and model construction are unchanged.
+        Producers submit concurrently; the dispatcher owns Pipe framing and the
+        child executes reads on a thread pool, so genuine source QD is preserved.
+        The pinned arena, the H2D backend and model construction are unchanged.
         """
         length = len(target)
         if length == 0:
@@ -439,46 +544,43 @@ class GoldenIoProcess:
         if length > IO_SLOT_BYTES:
             raise RuntimeError(f"golden_io_read_exceeds_slot:{length}>{IO_SLOT_BYTES}")
         slot = self._acquire_slot()
-        with self._io_lock:
-            try:
-                with self._lock:
-                    self._seq += 1
-                    seq = self._seq
-                self._conn.send({
-                    "op": "read",
-                    "path": os.path.abspath(path),
-                    "offset": int(offset),
-                    "length": int(length),
-                    "slot": int(slot),
-                    "seq": seq,
-                })
-                if not self._conn.poll(600.0):
-                    raise RuntimeError("golden_io_read_timeout")
-                reply = dict(self._conn.recv())
-                if reply.get("op") == "fatal":
-                    raise RuntimeError(f"golden_io_child_fatal:{reply.get('error')}")
-                if reply.get("op") == "error":
-                    raise RuntimeError(f"golden_io_read_error:{reply.get('error')}")
-                if reply.get("op") != "ready" or int(reply.get("seq", -1)) != seq:
-                    raise RuntimeError("golden_io_read_protocol_error")
-                got = int(reply.get("length") or 0)
-                if got <= 0:
-                    raise RuntimeError("golden_io_short_read_zero")
-                copy_started = time.perf_counter_ns()
-                src = memoryview(self._shm.buf)[slot * IO_SLOT_BYTES: slot * IO_SLOT_BYTES + got]
-                target[:got] = src
-                self.shared_to_pinned_ms += (time.perf_counter_ns() - copy_started) / 1e6
-                self.shared_to_pinned_bytes += got
-                return got
-            finally:
-                try:
-                    self._conn.send({"op": "release", "slot": int(slot)})
-                except Exception:
-                    pass
-                self._release_slot(slot)
+        try:
+            submit_ns = time.perf_counter_ns()
+            reply = self._request(
+                "read", path=path, offset=int(offset), length=int(length), slot=int(slot)
+            )
+            wait_ms = (time.perf_counter_ns() - submit_ns) / 1e6
+            self.producer_wait_ms_total += wait_ms
+            if wait_ms > self.producer_wait_ms_max:
+                self.producer_wait_ms_max = wait_ms
+            got = int(reply.get("length") or 0)
+            if got <= 0:
+                raise RuntimeError("golden_io_short_read_zero")
+            copy_started = time.perf_counter_ns()
+            src = memoryview(self._shm.buf)[slot * IO_SLOT_BYTES: slot * IO_SLOT_BYTES + got]
+            target[:got] = src
+            self.shared_to_pinned_ms += (time.perf_counter_ns() - copy_started) / 1e6
+            self.shared_to_pinned_bytes += got
+            pread_ms = float(reply.get("pread_ms") or 0.0)
+            self.child_pread_ms_total += pread_ms
+            self.child_read_count += 1
+            if pread_ms > self.child_pread_ms_max:
+                self.child_pread_ms_max = pread_ms
+            stem = os.path.basename(str(path))
+            self.child_pread_ms_by_path[stem] = (
+                self.child_pread_ms_by_path.get(stem, 0.0) + pread_ms
+            )
+            return got
+        finally:
+            self._release_slot(slot)
 
     def stop(self) -> dict:
         out: dict = {"pid": self._pid}
+        self._dispatch_stop.set()
+        with self._q_cond:
+            self._q_cond.notify_all()
+        if self._dispatch_thread is not None:
+            self._dispatch_thread.join(timeout=5.0)
         try:
             if self._conn is not None:
                 self._conn.send({"op": "exit"})
@@ -568,6 +670,7 @@ def io_process_evidence() -> dict:
     worker = _PRE_SNAPSHOT_IO
     if worker is None:
         return {"active": False}
+    count = int(worker.child_read_count or 0)
     return {
         "active": True,
         "pid": worker.pid,
@@ -575,12 +678,22 @@ def io_process_evidence() -> dict:
         "child_cuda_initialized": worker.child_cuda_initialized,
         "child_cuda_tasks_run": worker.child_cuda_tasks_run,
         "child_gpu_alloc_bytes": worker.child_gpu_alloc_bytes,
+        "effective_child_source_qd_max": int(worker.effective_child_source_qd_max),
+        "child_read_count": count,
+        "child_pread_ms_total": round(worker.child_pread_ms_total, 3),
+        "child_pread_ms_max": round(worker.child_pread_ms_max, 3),
+        "child_pread_ms_mean": round(worker.child_pread_ms_total / count, 3) if count else None,
+        "child_pread_ms_by_path": {
+            k: round(v, 3) for k, v in sorted(worker.child_pread_ms_by_path.items())
+        },
+        "producer_wait_ms_total": round(worker.producer_wait_ms_total, 3),
+        "producer_wait_ms_max": round(worker.producer_wait_ms_max, 3),
+        "dispatcher_send_ms": round(worker.dispatcher_send_ms, 3),
+        "dispatcher_recv_ms": round(worker.dispatcher_recv_ms, 3),
         "shared_to_pinned_ms": round(worker.shared_to_pinned_ms, 3),
         "shared_to_pinned_bytes": int(worker.shared_to_pinned_bytes),
         "shared_to_pinned_GBps": round(
-            (worker.shared_to_pinned_bytes / 1e9)
-            / (worker.shared_to_pinned_ms / 1e3),
-            3,
+            (worker.shared_to_pinned_bytes / 1e9) / (worker.shared_to_pinned_ms / 1e3), 3
         )
         if worker.shared_to_pinned_ms > 0
         else None,
