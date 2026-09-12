@@ -208,6 +208,10 @@ class GoldenIoProcess:
         self._uuid = uuid.uuid4().hex
         self._seq = 0
         self._lock = threading.Lock()
+        # The Golden transport calls the source reader from multiple producer
+        # threads (qd).  The control Pipe must be used by exactly one thread at
+        # a time; the child serves reads serially, so serialize the parent side.
+        self._io_lock = threading.Lock()
         self._free: list[int] = list(range(IO_SLOTS))
         self._slot_cond = threading.Condition()
         self._proc_start_ticks: Optional[int] = None
@@ -435,40 +439,42 @@ class GoldenIoProcess:
         if length > IO_SLOT_BYTES:
             raise RuntimeError(f"golden_io_read_exceeds_slot:{length}>{IO_SLOT_BYTES}")
         slot = self._acquire_slot()
-        try:
-            with self._lock:
-                self._seq += 1
-                seq = self._seq
-            self._conn.send({
-                "op": "read",
-                "path": os.path.abspath(path),
-                "offset": int(offset),
-                "length": int(length),
-                "slot": int(slot),
-                "seq": seq,
-            })
-            if not self._conn.poll(600.0):
-                raise RuntimeError("golden_io_read_timeout")
-            reply = dict(self._conn.recv())
-            if reply.get("op") == "fatal":
-                raise RuntimeError(f"golden_io_child_fatal:{reply.get('error')}")
-            if reply.get("op") == "error":
-                raise RuntimeError(f"golden_io_read_error:{reply.get('error')}")
-            if reply.get("op") != "ready" or int(reply.get("seq", -1)) != seq:
-                raise RuntimeError("golden_io_read_protocol_error")
-            got = int(reply.get("length") or 0)
-            if got <= 0:
-                raise RuntimeError("golden_io_short_read_zero")
-            copy_started = time.perf_counter_ns()
-            src = memoryview(self._shm.buf)[slot * IO_SLOT_BYTES: slot * IO_SLOT_BYTES + got]
-            target[:got] = src
-            self.shared_to_pinned_ms += (time.perf_counter_ns() - copy_started) / 1e6
-            self.shared_to_pinned_bytes += got
-            return got
-        finally:
+        with self._io_lock:
             try:
-                self._conn.send({"op": "release", "slot": int(slot)})
+                with self._lock:
+                    self._seq += 1
+                    seq = self._seq
+                self._conn.send({
+                    "op": "read",
+                    "path": os.path.abspath(path),
+                    "offset": int(offset),
+                    "length": int(length),
+                    "slot": int(slot),
+                    "seq": seq,
+                })
+                if not self._conn.poll(600.0):
+                    raise RuntimeError("golden_io_read_timeout")
+                reply = dict(self._conn.recv())
+                if reply.get("op") == "fatal":
+                    raise RuntimeError(f"golden_io_child_fatal:{reply.get('error')}")
+                if reply.get("op") == "error":
+                    raise RuntimeError(f"golden_io_read_error:{reply.get('error')}")
+                if reply.get("op") != "ready" or int(reply.get("seq", -1)) != seq:
+                    raise RuntimeError("golden_io_read_protocol_error")
+                got = int(reply.get("length") or 0)
+                if got <= 0:
+                    raise RuntimeError("golden_io_short_read_zero")
+                copy_started = time.perf_counter_ns()
+                src = memoryview(self._shm.buf)[slot * IO_SLOT_BYTES: slot * IO_SLOT_BYTES + got]
+                target[:got] = src
+                self.shared_to_pinned_ms += (time.perf_counter_ns() - copy_started) / 1e6
+                self.shared_to_pinned_bytes += got
+                return got
             finally:
+                try:
+                    self._conn.send({"op": "release", "slot": int(slot)})
+                except Exception:
+                    pass
                 self._release_slot(slot)
 
     def stop(self) -> dict:
