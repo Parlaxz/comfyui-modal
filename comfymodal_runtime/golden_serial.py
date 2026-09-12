@@ -5817,14 +5817,26 @@ def _read_file_qd_gpu_dispatcher(
                     # tensor while giving positioned OS I/O the writable byte
                     # protocol it requires.  This is a view, never a staging
                     # allocation or a bytes materialization.
-                    got = int(_read_at(
-                        self._fd_for_producer(producer_id),
-                        _writable_bytes_view(target),
-                        int(offset),
-                        actual_source=self.actual_source_telemetry,
-                        producer_id=producer_id,
-                        destination_offset=int(offset) - data_start,
-                    ))
+                    _io_readinto = _golden_io_readinto_hook()
+                    if _io_readinto is not None:
+                        # Experimental strict CPU-I/O child supplies the payload
+                        # bytes; the pinned slot, H2D backend, and model
+                        # construction remain the canonical parent path.
+                        got = int(_io_readinto(
+                            path,
+                            _writable_bytes_view(target),
+                            int(offset),
+                            producer_id,
+                        ))
+                    else:
+                        got = int(_read_at(
+                            self._fd_for_producer(producer_id),
+                            _writable_bytes_view(target),
+                            int(offset),
+                            actual_source=self.actual_source_telemetry,
+                            producer_id=producer_id,
+                            destination_offset=int(offset) - data_start,
+                        ))
                 except BaseException:
                     raise
                 else:
@@ -6709,6 +6721,25 @@ def _read_file_preplanned_gpu(
         },
     }
     return {"status": "ok", "sd": views, "owner": GoldenQDOwner(gpu_buf, list(extent_buffers), dev, role), "stats": stats, "tensor_map": tensor_map, "header_metadata": header.get("__metadata__")}
+def _golden_io_readinto_hook():
+    """Return the CPU-I/O child fill callable when the experiment is ON.
+
+    This is the only injected step in the source path: the child performs the
+    storage read and the parent copies shared bytes into the existing pinned
+    staging slot.  When OFF (default) this is a single cheap env check and the
+    canonical parent ``_read_at`` path is used unchanged.
+    """
+    if str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS") or "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        return None
+    try:
+        from .golden_io_process import io_process_readinto
+    except Exception:
+        return None
+    return io_process_readinto
+
+
 def read_file_qd_gpu(
     path: str,
     *,

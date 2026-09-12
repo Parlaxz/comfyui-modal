@@ -188,6 +188,16 @@ async def golden_parallel_execute(
             session.recorder.mark_true_durable()
         result = session.build_final_result()
         session.recorder.event("RESULT_ASSEMBLED", request_id=request.request_id)
+        # ── Strict CPU-I/O process evidence (experimental; default OFF) ────
+        # Records child CUDA-sterility and the shared->pinned copy cost.  The
+        # parent source-open count stays 0 because the child served every model
+        # payload read; the one H2D/model path remains in the parent.
+        try:
+            from .golden_io_process import io_process_enabled, io_process_evidence
+            if io_process_enabled():
+                session.recorder.event("golden_io_process", **io_process_evidence())
+        except Exception:
+            pass
     except BaseException as exc:
         primary_error = exc
         try:

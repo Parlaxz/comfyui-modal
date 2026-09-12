@@ -232,6 +232,15 @@ owner = "golden-minimal-restore"
 description = "Experimental Golden Parallel minimal post-snapshot restore. Default OFF; when ON, restore() runs a from-first-principles contract (container-local reset + logical GPU repair + models-generation guard + minimal telemetry) instead of the legacy restore. A failure fails closed and never falls back to the legacy path."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_IO_PROCESS"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-io-process"
+description = "Experimental Golden Parallel strict CPU-I/O process. Default OFF; when ON, a pre-snapshot persistent CUDA-sterile child performs model payload storage reads into a bounded process-shared CPU ring, and the parent copies bytes into the existing pinned staging slot before the unchanged H2D/model path."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
 type = "bool"
 default = "0"

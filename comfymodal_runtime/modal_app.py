@@ -5417,6 +5417,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # Golden minimal-restore experiment selector (deploy-baked; OFF when unset).
     if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
         env["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"] = os.environ["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"]
+    # Golden strict CPU-I/O process selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_IO_PROCESS" in os.environ:
+        env["COMFYMODAL_GOLDEN_IO_PROCESS"] = os.environ["COMFYMODAL_GOLDEN_IO_PROCESS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -12253,6 +12256,18 @@ class ModalRuntimeEntrypoint:
             _presnapshot_loader_record = maybe_spawn_pre_snapshot_worker()
             if _presnapshot_loader_record:
                 _restore_timing["presnapshot_loader_process"] = _presnapshot_loader_record
+
+        # ── Pre-snapshot persistent CPU-I/O worker (experimental) ─────────
+        # Strictly storage-only child: spawned before capture so it survives
+        # restore with no request-time spawn cost.  It is CUDA-sterile; the
+        # parent retains CUDA, H2D, and model construction.  Fail closed when
+        # the switch is ON (a failed spawn must not degrade silently).
+        if _golden_serial_active:
+            from .golden_io_process import io_process_enabled, maybe_spawn_io_worker
+            if io_process_enabled():
+                _io_process_record = maybe_spawn_io_worker()
+                if _io_process_record:
+                    _restore_timing["golden_io_process"] = _io_process_record
 
         # ── Snapshot quiescence proof (fail closed) ───────────────────────
         # Golden must prove quiescence before capture, but this proof must be

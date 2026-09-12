@@ -135,6 +135,7 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     # Restore, snapshot, and runtime policy controls.
     "COMFYMODAL_MINIMAL_RESTORE": _spec("COMFYMODAL_MINIMAL_RESTORE", "bool", True, EXECUTION_POLICY, "Select the E37 minimal restore path."),
     "COMFYMODAL_GOLDEN_MINIMAL_RESTORE": _spec("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel minimal post-snapshot restore. Default OFF."),
+    "COMFYMODAL_GOLDEN_IO_PROCESS": _spec("COMFYMODAL_GOLDEN_IO_PROCESS", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel strict CPU-I/O child process. Default OFF."),
     "COMFYMODAL_V2_CLEAN_LANE": _spec("COMFYMODAL_V2_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "Compatibility clean-lane selector."),
     "COMFYMODAL_V2_E37_CLEAN_LANE": _spec("COMFYMODAL_V2_E37_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "E37 clean-lane runtime selector."),
     "COMFYMODAL_V2_E37_STRICT_PROOF": _spec("COMFYMODAL_V2_E37_STRICT_PROOF", "bool", False, DEPRECATED_DIAGNOSTIC, "Enable fail-closed E37 proof validation."),
