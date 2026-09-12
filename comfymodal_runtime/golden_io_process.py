@@ -177,6 +177,11 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                         break
             elif op == "exit":
                 break
+    except BaseException as exc:  # noqa: BLE001 - surface child failure to the parent
+        try:
+            conn.send({"op": "fatal", "error": f"{type(exc).__name__}: {exc}"[:400]})
+        except Exception:
+            pass
     finally:
         try:
             buf.release()
@@ -445,6 +450,8 @@ class GoldenIoProcess:
             if not self._conn.poll(600.0):
                 raise RuntimeError("golden_io_read_timeout")
             reply = dict(self._conn.recv())
+            if reply.get("op") == "fatal":
+                raise RuntimeError(f"golden_io_child_fatal:{reply.get('error')}")
             if reply.get("op") == "error":
                 raise RuntimeError(f"golden_io_read_error:{reply.get('error')}")
             if reply.get("op") != "ready" or int(reply.get("seq", -1)) != seq:
