@@ -223,6 +223,198 @@ export function getSelectedGraphNodeTarget() {
   };
 }
 
+// ── View a node: center on canvas + magenta highlight ───────────────────
+//
+// QoL validation aid shared by the wizard's binding rows and suggestion
+// proposals.  Centers the node through the LiteGraph canvas (centerOnNode,
+// falling back to the DragAndScale scale/offset) and draws a transient DOM
+// overlay border for 3s.  Fully null-safe: with no graph/canvas/node the
+// helper reports ok:false and callers hide/disable their View control.
+
+const _VIEW_HIGHLIGHT_ID = "comfymodal-node-view-highlight";
+const _VIEW_HIGHLIGHT_MS = 3000;
+let _viewHighlightTimer = null;
+
+function _injectViewStyles() {
+  if (document.getElementById("comfymodal-node-view-styles")) return;
+  const style = document.createElement("style");
+  style.id = "comfymodal-node-view-styles";
+  style.textContent = `
+    .comfymodal-node-view-highlight {
+      position: fixed;
+      pointer-events: none;
+      z-index: 10050;
+      border: 2px solid #ff00ff !important;
+      border-radius: 4px;
+      box-shadow: 0 0 0 2px rgba(255, 0, 255, 0.45), 0 0 12px 2px rgba(255, 0, 255, 0.55);
+      transition: opacity 0.25s ease;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function _findGraphNodeById(graph, nodeId) {
+  if (!graph || nodeId == null) return null;
+  try {
+    if (typeof graph.getNodeById === "function") {
+      const node = graph.getNodeById(nodeId);
+      if (node) return node;
+    }
+  } catch (e) { /* fall through to list scan */ }
+  const byId = graph._nodes_by_id;
+  if (byId && byId[nodeId]) return byId[nodeId];
+  const nodes = graph.nodes || graph._nodes || [];
+  const sid = String(nodeId);
+  return nodes.find((n) => n && String(n.id) === sid) || null;
+}
+
+/** True when a live graph exists and contains *nodeId*. */
+export function isGraphNodeAvailable(nodeId) {
+  const ctx = getComfyGraphContext();
+  if (!ctx.ok) return false;
+  return !!_findGraphNodeById(ctx.graph, nodeId);
+}
+
+function _canvasCssSize(canvas) {
+  try {
+    const el = canvas && (canvas.canvas || canvas);
+    if (el && typeof el.getBoundingClientRect === "function") {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return { width: r.width, height: r.height };
+    }
+    if (el && typeof el.clientWidth === "number" && el.clientWidth > 0) {
+      return { width: el.clientWidth, height: el.clientHeight || 0 };
+    }
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+function _asNumPair(value, fallback) {
+  // Node geometry across ComfyUI generations: plain arrays, typed arrays /
+  // array-likes (0.34 ComfyNode pos/size), or {x,y} / {width,height} shapes.
+  try {
+    if (Array.isArray(value) && value.length >= 2
+      && typeof value[0] === "number" && typeof value[1] === "number") {
+      return [value[0], value[1]];
+    }
+    if (value && typeof value.length === "number" && value.length >= 2
+      && typeof value[0] === "number" && typeof value[1] === "number") {
+      return [value[0], value[1]];
+    }
+    if (value && typeof value.x === "number" && typeof value.y === "number") {
+      return [value.x, value.y];
+    }
+    if (value && typeof value.width === "number" && typeof value.height === "number") {
+      return [value.width, value.height];
+    }
+  } catch (e) { /* fall through */ }
+  return fallback;
+}
+
+function _snapCanvasToNode(canvas, node) {
+  // CSS-pixel ds math matching _nodeScreenRect: centers the node in the
+  // visible element. Uses client metrics (never the device-pixel backing
+  // store) so HiDPI canvases land correctly.
+  try {
+    const ds = canvas && canvas.ds;
+    const size = _canvasCssSize(canvas);
+    if (!ds || !size || typeof ds.scale !== "number" || ds.scale <= 0) return false;
+    const pos = _asNumPair(node && node.pos, null);
+    const off = _asNumPair(ds.offset, null);
+    if (!pos || !off) return false;
+    const nsize = _asNumPair(node && node.size, [140, 80]);
+    const cx = pos[0] + nsize[0] / 2;
+    const cy = pos[1] + nsize[1] / 2;
+    try {
+      ds.offset[0] = size.width / ds.scale / 2 - cx;
+      ds.offset[1] = size.height / ds.scale / 2 - cy;
+    } catch (e) { return false; }
+    if (typeof canvas.setDirty === "function") canvas.setDirty(true);
+    if (typeof canvas.draw === "function") canvas.draw(true);
+    return true;
+  } catch (e) { return false; }
+}
+
+function _centerCanvasOnNode(canvas, node) {
+  if (!canvas || !node) return false;
+  let centered = false;
+  try {
+    if (typeof canvas.centerOnNode === "function") {
+      canvas.centerOnNode(node);
+      centered = true;
+    }
+  } catch (e) { centered = false; }
+  // Snap afterwards: idempotent when centerOnNode already centered, and
+  // repairs the offset when it is missing, a no-op, or unit-mismatched.
+  return _snapCanvasToNode(canvas, node) || centered;
+}
+
+function _nodeScreenRect(ctx, node) {
+  const canvas = ctx.canvas;
+  const el = canvas && (canvas.canvas || canvas);
+  let base = { left: 0, top: 0, width: (window && window.innerWidth) || 0, height: (window && window.innerHeight) || 0 };
+  try {
+    if (el && typeof el.getBoundingClientRect === "function") {
+      const r = el.getBoundingClientRect();
+      base = { left: r.left, top: r.top, width: r.width, height: r.height };
+    }
+  } catch (e) { /* keep default */ }
+  const ds = (canvas && canvas.ds) || {};
+  const scale = typeof ds.scale === "number" && ds.scale > 0 ? ds.scale : 1;
+  const offset = _asNumPair(ds.offset, [0, 0]);
+  const pos = _asNumPair(node.pos, [0, 0]);
+  const size = _asNumPair(node.size, [140, 80]);
+  return {
+    left: base.left + (pos[0] + offset[0]) * scale,
+    top: base.top + (pos[1] + offset[1]) * scale,
+    width: Math.max(size[0] * scale, 8),
+    height: Math.max(size[1] * scale, 8),
+  };
+}
+
+function _showNodeViewHighlight(ctx, node) {
+  clearNodeViewHighlight();
+  const overlay = document.createElement("div");
+  overlay.id = _VIEW_HIGHLIGHT_ID;
+  overlay.className = "comfymodal-node-view-highlight";
+  overlay.setAttribute("data-testid", "node-view-highlight");
+  const rect = _nodeScreenRect(ctx, node);
+  overlay.style.left = rect.left + "px";
+  overlay.style.top = rect.top + "px";
+  overlay.style.width = rect.width + "px";
+  overlay.style.height = rect.height + "px";
+  document.body.appendChild(overlay);
+  _viewHighlightTimer = setTimeout(() => {
+    _viewHighlightTimer = null;
+    if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  }, _VIEW_HIGHLIGHT_MS);
+}
+
+/** Remove the transient node highlight (called on re-render/unmount). */
+export function clearNodeViewHighlight() {
+  if (_viewHighlightTimer) {
+    clearTimeout(_viewHighlightTimer);
+    _viewHighlightTimer = null;
+  }
+  const el = document.getElementById(_VIEW_HIGHLIGHT_ID);
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
+/**
+ * Center *nodeId* on the canvas and flash a magenta border for 3s.
+ * Returns { ok, reason } — never throws when the graph/canvas is absent.
+ */
+export function viewGraphNode(nodeId) {
+  const ctx = getComfyGraphContext();
+  if (!ctx.ok) return { ok: false, reason: ctx.reason || "Graph unavailable" };
+  const node = _findGraphNodeById(ctx.graph, nodeId);
+  if (!node) return { ok: false, reason: "Node not found on the canvas" };
+  _injectViewStyles();
+  _centerCanvasOnNode(ctx.canvas, node);
+  _showNodeViewHighlight(ctx, node);
+  return { ok: true };
+}
+
 // ── Node click detection ────────────────────────────────────────────────
 
 function findClickedNode(e, ctx) {

@@ -8,6 +8,7 @@ states and every public method is guarded so it never raises.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,6 +16,52 @@ from custom_node_registry import CustomNodeDiscovery, CustomNodeRegistryStore
 from model_library import ModelLibraryStore, record_is_installed
 from studio_store import StudioStoreError
 from workflow_metadata import extract_workflow_model_refs
+
+# Node classes that can never resolve to an installed pack: ComfyUI class
+# keys are Python identifiers, so anything else (bare UUIDs from
+# frontend-only proxy/subgraph nodes, display titles like
+# "Label (rgthere)" or "easy int") is a graph artifact, not a dependency.
+# These are reported separately (see unresolvable_classes) instead of
+# "missing" so they never inflate the attention count or block readiness.
+_CLASS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_resolvable_class_name(value: Any) -> bool:
+    return isinstance(value, str) and bool(_CLASS_NAME_RE.match(value))
+
+
+def _group_node_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse per-class rows into one row per pack.
+
+    Groups by pack identity; merges classes sorted and deduped. First-seen
+    group order is preserved. Row dict shapes are unchanged.
+    """
+    grouped: dict[tuple, dict[str, Any]] = {}
+    order: list[tuple] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = (
+            str(row.get("name") or ""),
+            str(row.get("state") or ""),
+            str(row.get("install_path") or ""),
+            str(row.get("installed_commit") or ""),
+            str(row.get("required_revision") or ""),
+            str(row.get("repository_url") or ""),
+        )
+        if key not in grouped:
+            grouped[key] = dict(row)
+            grouped[key]["classes"] = []
+            order.append(key)
+        for cls in row.get("classes") or []:
+            if cls not in grouped[key]["classes"]:
+                grouped[key]["classes"].append(cls)
+    for key in order:
+        try:
+            grouped[key]["classes"] = sorted(grouped[key]["classes"], key=str)
+        except Exception:
+            pass
+    return [grouped[key] for key in order]
 
 # Canonical role -> best-known model folder (used for missing refs with no
 # library record to fall back on).
@@ -198,7 +245,11 @@ class DependencyResolver:
         return self._discovery_cache
 
     def resolve_custom_nodes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
-        """Resolve each required node class to installed / wrong_revision / missing."""
+        """Resolve required node classes, grouped one row per pack.
+
+        Graph artifacts (non-identifier class strings) are excluded here
+        and reported via unresolvable_classes instead.
+        """
         dependency_metadata = (version or {}).get("dependency_metadata") or {}
         node_classes = dependency_metadata.get("node_classes") or []
         requirements = dependency_metadata.get("custom_node_requirements") or {}
@@ -208,8 +259,14 @@ class DependencyResolver:
             requirements = {}
         _records, core = self._ensure_discovery()
         results: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for class_type in node_classes:
             cls = str(class_type)
+            if cls in seen:
+                continue
+            seen.add(cls)
+            if not _is_resolvable_class_name(cls):
+                continue  # graph artifact; reported via unresolvable_classes
             req = requirements.get(cls) or {}
             if not isinstance(req, dict):
                 req = {}
@@ -269,12 +326,48 @@ class DependencyResolver:
                     "classes": [cls],
                 }
             )
-        return results
+        return _group_node_rows(results)
+
+    def unresolvable_classes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
+        """Graph-artifact class strings that can never resolve to a pack.
+
+        UUIDs from frontend-only proxy/subgraph nodes and display titles
+        recorded as types are not installable dependencies, so they are
+        excluded from missing/attention counts. Never raises.
+        """
+        try:
+            dependency_metadata = (version or {}).get("dependency_metadata") or {}
+            node_classes = dependency_metadata.get("node_classes") or []
+            if not isinstance(node_classes, list):
+                return []
+            out: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for class_type in node_classes:
+                cls = str(class_type)
+                if cls in seen:
+                    continue
+                seen.add(cls)
+                if _is_resolvable_class_name(cls):
+                    continue
+                out.append(
+                    {
+                        "name": cls,
+                        "classes": [cls],
+                        "reason": "graph artifact, not a registered node class",
+                    }
+                )
+            return out
+        except Exception:
+            return []
 
     # ── aggregate ─────────────────────────────────────────────────────────
 
     def resolve_version(self, version: dict[str, Any]) -> dict[str, Any]:
-        """Full dependency report: models + custom nodes + summary."""
+        """Full dependency report: models + custom nodes + summary.
+
+        Graph artifacts that can never resolve are listed under
+        ``unresolvable`` and excluded from the summary counts.
+        """
         models = self.resolve_model_refs(version)
         custom_nodes = self.resolve_custom_nodes(version)
         m_installed = sum(1 for m in models if m["state"] == "installed")
@@ -292,6 +385,7 @@ class DependencyResolver:
         return {
             "models": models,
             "custom_nodes": custom_nodes,
+            "unresolvable": self.unresolvable_classes(version),
             "summary": {
                 "installed": installed,
                 "missing": missing,

@@ -337,7 +337,9 @@ test.describe("Studio ZIT E2E", () => {
       // Recommender: catalog-covered roles propose concrete stored-graph
       // targets; seed has no KSampler pattern (verified below).
       await panel.locator(".comfymodal-studio-wizard-feature-card").first().click();
-      await panel.getByRole("button", { name: "Continue to Bindings" }).click();
+      await panel.locator('[data-testid="wizard-features-continue"]').click();
+      await expect(panel.locator('[data-testid="wizard-dependencies-continue"]')).toBeVisible({ timeout: 10000 });
+      await panel.locator('[data-testid="wizard-dependencies-continue"]').click();
       await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
 
       // Rows are keyed by catalog role (data-binding-key); node-type text is

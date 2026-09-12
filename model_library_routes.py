@@ -292,6 +292,7 @@ def register_model_library_routes(
                     "version_id": version_id,
                     "models": result["models"],
                     "custom_nodes": result["custom_nodes"],
+                    "unresolvable": result.get("unresolvable", []),
                     "summary": result["summary"],
                 }
             )

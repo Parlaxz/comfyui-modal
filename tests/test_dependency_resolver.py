@@ -420,5 +420,69 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertFalse(result["summary"]["ready"])
 
 
+    # ── 21. custom-node rows group by pack, core merges ────────────────
+
+    def test_custom_node_rows_group_by_pack(self):
+        self._seed_registry()
+        version = {
+            "workflow_version_id": "wv_group",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": [
+                    "CheckpointLoaderSimple",
+                    "SaveImage",
+                    "SomeCustomClass",
+                    "SomeCustomClass",  # duplicate class collapses
+                ],
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version)
+        core = [n for n in nodes if n["name"] == "ComfyUI core"]
+        self.assertEqual(len(core), 1)
+        self.assertEqual(
+            sorted(core[0]["classes"]), ["CheckpointLoaderSimple", "SaveImage"]
+        )
+        kj = [n for n in nodes if n["name"] == "ComfyUI-KJNodes"]
+        self.assertEqual(len(kj), 1)
+        self.assertEqual(kj[0]["classes"], ["SomeCustomClass"])
+        self.assertEqual(kj[0]["state"], "installed")
+
+    # ── 22. graph artifacts separate from missing, excluded from counts ──
+
+    def test_graph_artifacts_unresolvable_not_missing(self):
+        self._seed_registry()
+        bad_uuid = "0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77"
+        bad_title = "Label (rgthree)"
+        version = {
+            "workflow_version_id": "wv_art",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": [
+                    bad_uuid,
+                    bad_title,
+                    "SomeCustomClass",
+                    "TotallyUnknownClass",
+                ],
+            },
+        }
+        result = self.resolver.resolve_version(version)
+        names = [n["name"] for n in result["custom_nodes"]]
+        self.assertNotIn(bad_uuid, names)
+        self.assertNotIn(bad_title, names)
+        unres = [u["name"] for u in result["unresolvable"]]
+        self.assertEqual(sorted(unres), sorted([bad_uuid, bad_title]))
+        missing = [n for n in result["custom_nodes"] if n["state"] == "missing"]
+        self.assertEqual([n["name"] for n in missing], ["TotallyUnknownClass"])
+        self.assertEqual(result["summary"]["attention"], 1)
+        self.assertFalse(result["summary"]["ready"])
+        reasons = self.resolver.reasons_for(version)
+        self.assertFalse(
+            any(bad_uuid in r or bad_title in r for r in reasons)
+        )
+        self.assertTrue(any("TotallyUnknownClass" in r for r in reasons))
+
+
 if __name__ == "__main__":
     unittest.main()

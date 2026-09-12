@@ -13,9 +13,27 @@ import {
   beginGraphBindingCapture,
   cancelGraphBinding,
   getSelectedGraphNodeTarget,
+  viewGraphNode,
+  isGraphNodeAvailable,
+  clearNodeViewHighlight,
 } from "./studio-graph-binding.js";
 import { captureCurrentComfyGraph } from "./studio-backend-capture.js";
-import { createSnapshot, createPreset, updateSnapshot, updatePreset, getWorkflowVersion, createMapping } from "./studio-backend-api.js";
+import { renderDependencySection } from "./studio-model-library.js";
+import {
+  createSnapshot,
+  createPreset,
+  updateSnapshot,
+  updatePreset,
+  getWorkflowVersion,
+  createMapping,
+  getVersionDependencies,
+  batchInstallModels,
+  rescanModels,
+  getManagerVersion,
+  managerInstallNode,
+  listManagerInstalled,
+  managerReboot,
+} from "./studio-backend-api.js";
 import {
   BINDABLE_INPUTS,
   OUTPUT_BINDING,
@@ -227,6 +245,8 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     selectedFeatures: [],
     bindings: {},               // { [bindingKey]: bindingTarget | null }
     bindingCaptureActive: null, // bindingKey currently being captured, or null
+    captureNotice: null, // { key, message } when a capture found no bindable fields
+    viewNotice: null, // { key, message } when View found no node to highlight
     details: {
       name: "",
       description: "",
@@ -235,6 +255,16 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     graphJson: null,
     apiPromptJson: null,
     captureWarnings: [],
+    // Dependencies step (version-setup mode only)
+    dependencies: null,
+    dependenciesBusy: false,
+    dependenciesMessage: "",
+    managerProbed: false,
+    managerProbing: false,
+    managerDetected: null,
+    managerInstalled: [],
+    installingPack: null,
+    restartRequired: false,
     // Server responses
     snapshotResult: null,
     presetResult: null,
@@ -293,6 +323,16 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
   return state;
 }
 
+// QoL: while the wizard is open the modal header reads "Workflow Setup
+// wizard" instead of "Modal GPU"; restored on close. Null-safe for hosts
+// without the shell heading (e.g. focused test mounts).
+function _setStudioHeaderWizardMode(on) {
+  try {
+    const heading = document.getElementById("comfymodal-studio-heading");
+    if (heading) heading.textContent = on ? "Workflow Setup wizard" : "Modal GPU";
+  } catch (e) { /* non-DOM host */ }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapshot, options) {
@@ -316,6 +356,7 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
   if (overlayRoot) {
     overlayRoot.classList.add("comfymodal-studio-wizard-mode");
   }
+  _setStudioHeaderWizardMode(true);
 
   const panel = el("div", { class: "comfymodal-studio-wizard-panel" });
   _wizardRoot.appendChild(panel);
@@ -332,9 +373,11 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
   renderWizard(panel, _wizardState);
 
   // Version-setup mode: pre-seed suggestions from the version's stored
-  // graph so the wizard is usable without the live ComfyUI graph.
+  // graph so the wizard is usable without the live ComfyUI graph, and load
+  // the dependency report so the Dependencies step can be validated first.
   if (_wizardState.isVersionSetup) {
     prefetchVersionSetupGraph(_wizardState);
+    prefetchVersionDependencies(_wizardState);
   }
 
   // Notify modal layer that wizard is opening so it can release
@@ -346,8 +389,9 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
 }
 
 export function closePresetWizard() {
-  // Clean up graph binding capture if active
+  // Clean up graph binding capture + transient node highlight
   cancelGraphBinding();
+  clearNodeViewHighlight();
 
   // Remove any binding capture hint elements
   const hints = document.querySelectorAll(".comfymodal-binding-capture-hint");
@@ -363,6 +407,7 @@ export function closePresetWizard() {
   if (overlayRoot) {
     overlayRoot.classList.remove("comfymodal-studio-wizard-mode");
   }
+  _setStudioHeaderWizardMode(false);
 
   if (_wizardRoot && _wizardRoot.parentNode) {
     _wizardRoot.parentNode.removeChild(_wizardRoot);
@@ -378,17 +423,46 @@ export function closePresetWizard() {
 
 // ── Render helpers ──────────────────────────────────────────────────────
 
+// Step ordering. The Dependencies step is always woven into version-setup
+// mode as step 2 (features → dependencies → bindings → details) so validation
+// happens before bindings & controls. Preset/edit modes without a bound
+// version keep the original features → bindings → details path. Continue is
+// always available on the Dependencies step, so it never becomes a trap.
+function _wizardStepKeys(state) {
+  const includeDeps = !!(state && state.isVersionSetup);
+  return includeDeps
+    ? ["features", "dependencies", "bindings", "details"]
+    : ["features", "bindings", "details"];
+}
+
+function _wizardStepLabel(key) {
+  if (key === "features") return "Feature Type";
+  if (key === "dependencies") return "Dependencies";
+  if (key === "bindings") return "Bindings & Controls";
+  return "Details";
+}
+
 function renderWizard(panel, state) {
   const scrollTop = panel.scrollTop;
   while (panel.firstChild) panel.removeChild(panel.firstChild);
+  // The View highlight lives on document.body (outside the wizard DOM), so
+  // clear it explicitly whenever the wizard re-renders.
+  clearNodeViewHighlight();
 
   // Header
   const headerTitle = state.isVersionSetup ? "Set up Workflow" : state.isEdit ? "Edit Preset" : "Make Preset";
   const header = el("div", { class: "comfymodal-studio-wizard-header" }, [
     el("h3", { text: headerTitle, class: "comfymodal-studio-wizard-title" }),
     el("button", {
+      class: "comfymodal-secondary-btn comfymodal-studio-wizard-back",
+      text: "Back to Modal Studio",
+      "data-testid": "wizard-back-to-studio",
+      style: "width:auto;padding:4px 10px;font-size:11px;",
+      onclick: () => closePresetWizardAndNotify(),
+    }),
+    el("button", {
       class: "comfymodal-studio-wizard-close",
-      text: "\u00d7",
+      text: "×",
       onclick: () => closePresetWizardAndNotify(),
     }),
   ]);
@@ -396,9 +470,8 @@ function renderWizard(panel, state) {
 
   // Step indicator (skip in edit mode — edit starts at bindings)
   if (!state.isEdit) {
-    const stepNames = ["Feature Type", "Bindings & Controls", "Details"];
-    const stepKeys = ["features", "bindings", "details"];
-    const currentStepIdx = stepKeys.indexOf(state.step);
+    const stepKeys = _wizardStepKeys(state);
+    const stepNames = stepKeys.map(_wizardStepLabel);
 
     const stepIndicator = el("div", { class: "comfymodal-studio-wizard-steps" });
     stepKeys.forEach((key, idx) => {
@@ -445,6 +518,9 @@ function renderWizard(panel, state) {
     case "features":
       renderFeaturesStep(body, state);
       break;
+    case "dependencies":
+      renderDependenciesStep(body, state);
+      break;
     case "bindings":
       renderBindingsStep(body, state);
       break;
@@ -471,16 +547,34 @@ function renderWizard(panel, state) {
   }
 
   // Footer
+  const includeDeps = !!state.isVersionSetup;
   const footer = el("div", { class: "comfymodal-studio-wizard-footer" });
   if (state.step === "features") {
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
-      text: "Continue to Bindings",
+      "data-testid": "wizard-features-continue",
+      text: includeDeps ? "Continue to Dependencies" : "Continue to Bindings",
       disabled: state.selectedFeatures.length !== 1,
       onclick: () => {
         if (state.selectedFeatures.length !== 1) return;
-        navigateStep("bindings");
+        navigateStep(includeDeps ? "dependencies" : "bindings");
       },
+    }));
+  } else if (state.step === "dependencies") {
+    // Validation aid, never a trap: Continue is always available because
+    // some models legitimately have no source URL and some packs have no
+    // repository to install from.
+    footer.appendChild(el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "wizard-dependencies-back",
+      text: "Back to Features",
+      onclick: () => navigateStep("features"),
+    }));
+    footer.appendChild(el("button", {
+      class: "comfymodal-primary-btn",
+      "data-testid": "wizard-dependencies-continue",
+      text: "Continue to Bindings",
+      onclick: () => navigateStep("bindings"),
     }));
   } else if (state.step === "bindings") {
     const allRequiredBound = checkAllRequiredBindings(state);
@@ -488,12 +582,12 @@ function renderWizard(panel, state) {
 
     footer.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
-      text: state.isEdit ? "Cancel" : "Back to Features",
+      text: state.isEdit ? "Cancel" : (includeDeps ? "Back to Dependencies" : "Back to Features"),
       onclick: () => {
         if (state.isEdit) {
           closePresetWizardAndNotify();
         } else {
-          navigateStep("features");
+          navigateStep(includeDeps ? "dependencies" : "features");
         }
       },
     }));
@@ -762,6 +856,259 @@ function renderBindingsStep(body, state) {
   body.appendChild(summary);
 }
 
+// ── Step: Dependencies (version-setup mode) ─────────────────────────────
+//
+// Validation aid ordered before Bindings.  Reuses the exact dependency
+// report shape + renderer from the workflow detail page.  Nothing here
+// auto-downloads, auto-installs, or auto-reboots: every action is an
+// explicit click, and a missing/unavailable Manager degrades to the
+// existing record-only approval flow.
+
+function _missingModels(deps) {
+  const models = deps && Array.isArray(deps.models) ? deps.models : [];
+  return models.filter((m) => m && m.state !== "installed");
+}
+
+function _missingModelsWithUrl(deps) {
+  return _missingModels(deps).filter((m) => Array.isArray(m.source_urls) && m.source_urls[0]);
+}
+
+function _missingModelsWithoutUrl(deps) {
+  return _missingModels(deps).filter((m) => !(Array.isArray(m.source_urls) && m.source_urls[0]));
+}
+
+/** Best-effort folder bucket when the dependency report omits one. */
+function _roleToFolder(role) {
+  const r = String(role || "").toLowerCase();
+  if (r.includes("vae")) return "vae";
+  if (r.includes("clip") || r.includes("text_encoder")) return "clip";
+  if (r.includes("lora")) return "loras";
+  if (r.includes("unet") || r.includes("diffusion")) return "unet";
+  if (r.includes("controlnet")) return "controlnet";
+  if (r.includes("upscal")) return "upscale_models";
+  return "checkpoints";
+}
+
+function _modelSavePath(m) {
+  return m.folder || _roleToFolder(m.role);
+}
+
+function _rerenderWizard(state) {
+  const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
+  if (panel) renderWizard(panel, state);
+}
+
+function renderDependenciesStep(body, state) {
+  if (!state.isVersionSetup) {
+    body.appendChild(el("p", {
+      class: "comfymodal-studio-wizard-description",
+      "data-testid": "wizard-dependencies-unavailable",
+      text: "Dependency validation is available for workflow versions.",
+    }));
+    return;
+  }
+
+  if (!state.dependencies) {
+    body.appendChild(el("p", {
+      class: "comfymodal-studio-wizard-description",
+      "data-testid": "wizard-dependencies-loading",
+      text: "Loading dependency report…",
+    }));
+    return;
+  }
+
+  const missingWithUrl = _missingModelsWithUrl(state.dependencies);
+  const missingNoUrl = _missingModelsWithoutUrl(state.dependencies);
+
+  body.appendChild(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 8px;" }, [
+    el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "wizard-download-all",
+      text: state.dependenciesBusy ? "Downloading…" : `Download all (${missingWithUrl.length})`,
+      disabled: state.dependenciesBusy || missingWithUrl.length === 0,
+      style: "width:auto;padding:4px 10px;font-size:11px;",
+      onclick: () => downloadMissingModels(state),
+    }),
+    el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "wizard-dependencies-refresh",
+      text: "Refresh",
+      disabled: state.dependenciesBusy,
+      style: "width:auto;padding:4px 10px;font-size:11px;",
+      onclick: () => prefetchVersionDependencies(state),
+    }),
+  ]));
+
+  if (missingNoUrl.length > 0) {
+    body.appendChild(el("p", {
+      "data-testid": "wizard-download-skipped",
+      style: "font-size:10px;color:#888;margin:0 0 8px;",
+      text: `${missingNoUrl.length} missing model${missingNoUrl.length === 1 ? "" : "s"} have no source URL and will be skipped by Download all.`,
+    }));
+  }
+
+  const managerRow = el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 8px;" });
+  managerRow.appendChild(el("span", {
+    "data-testid": "wizard-manager-status",
+    style: "font-size:10px;color:#888;",
+    text: !state.managerProbed
+      ? "Checking for ComfyUI-Manager…"
+      : state.managerDetected
+        ? "ComfyUI-Manager detected."
+        : "Manager not detected — pack installs fall back to approval requests.",
+  }));
+  if (state.managerDetected && state.restartRequired) {
+    managerRow.appendChild(el("span", {
+      "data-testid": "wizard-restart-required",
+      style: "font-size:10px;color:#fbbf24;",
+      text: "Restart required.",
+    }));
+    managerRow.appendChild(el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "wizard-manager-reboot",
+      text: "Reboot ComfyUI",
+      style: "width:auto;padding:2px 8px;font-size:10px;",
+      onclick: () => rebootManagerAndReport(state),
+    }));
+  }
+  body.appendChild(managerRow);
+
+  if (state.dependenciesMessage) {
+    body.appendChild(el("p", {
+      "data-testid": "wizard-dependencies-message",
+      style: "font-size:10px;color:#aaa;margin:0 0 8px;",
+      text: state.dependenciesMessage,
+    }));
+  }
+
+  // Full report: reuse the detail page's renderer so markup/testids stay
+  // identical (dependency-status, dependency-model-row, dependency-node-row).
+  body.appendChild(renderDependencySection(null, state.dependencies, null, {
+    apiBase: state._apiBase,
+    managerAvailable: state.managerDetected === true,
+    managerInstalledNames: state.managerInstalled || [],
+    installingPack: state.installingPack,
+    onInstallPack: (n) => installPackViaManager(state, n),
+  }));
+
+  _maybeProbeManager(state);
+}
+
+async function prefetchVersionDependencies(state) {
+  if (!state || !state.isVersionSetup) return;
+  try {
+    const resp = await getVersionDependencies(state._apiBase, state.workflowVersionId);
+    if (_wizardState !== state) return;
+    state.dependencies = resp && resp.status === "ok" ? resp : null;
+    _rerenderWizard(state);
+  } catch (e) { /* best-effort; the step simply stays hidden */ }
+}
+
+async function downloadMissingModels(state) {
+  if (!state || state.dependenciesBusy) return;
+  const models = _missingModelsWithUrl(state.dependencies);
+  if (models.length === 0) {
+    state.dependenciesMessage = "No missing models with a source URL to download.";
+    _rerenderWizard(state);
+    return;
+  }
+  const items = models.map((m) => ({
+    url: m.source_urls[0],
+    filename: m.filename || "",
+    save_path: _modelSavePath(m),
+  }));
+  const skipped = _missingModelsWithoutUrl(state.dependencies).length;
+  state.dependenciesBusy = true;
+  state.dependenciesMessage = `Requesting ${items.length} model download${items.length === 1 ? "" : "s"}…`;
+  _rerenderWizard(state);
+  const resp = await batchInstallModels(state._apiBase, items);
+  if (_wizardState !== state) return;
+  state.dependenciesBusy = false;
+  if (!resp || resp.status !== "ok") {
+    state.dependenciesMessage = "Download all failed: "
+      + ((resp && (resp.message || resp.error)) || "request failed");
+    _rerenderWizard(state);
+    return;
+  }
+  let message = `Requested ${items.length} model download${items.length === 1 ? "" : "s"}.`;
+  if (skipped > 0) message += ` Skipped ${skipped} without a source URL.`;
+  await rescanModels(state._apiBase);
+  if (_wizardState !== state) return;
+  await prefetchVersionDependencies(state);
+  if (_wizardState !== state) return;
+  state.dependenciesMessage = message;
+  _rerenderWizard(state);
+}
+
+async function _refreshManagerInstalled(state) {
+  const installed = await listManagerInstalled();
+  if (_wizardState !== state) return;
+  let list = [];
+  if (installed && installed.ok) {
+    if (installed.data && Array.isArray(installed.data.nodes)) list = installed.data.nodes;
+    else if (Array.isArray(installed.data)) list = installed.data;
+  }
+  state.managerInstalled = list
+    .map((n) => (n && (n.cnr_id || n.name || n.title || n.repository || n.url)) || "")
+    .filter(Boolean);
+}
+
+function _maybeProbeManager(state) {
+  if (!state || state.managerProbed || state.managerProbing) return;
+  state.managerProbing = true;
+  (async () => {
+    const version = await getManagerVersion();
+    if (_wizardState !== state) return;
+    state.managerDetected = !!(version && version.ok);
+    if (state.managerDetected) await _refreshManagerInstalled(state);
+    if (_wizardState !== state) return;
+    state.managerProbing = false;
+    state.managerProbed = true;
+    _rerenderWizard(state);
+  })();
+}
+
+async function installPackViaManager(state, node) {
+  if (!state || !node || !node.repository_url || state.installingPack) return;
+  const label = node.name || node.repository_url;
+  state.installingPack = label;
+  state.dependenciesMessage = `Installing ${label}…`;
+  _rerenderWizard(state);
+  const resp = await managerInstallNode(node.repository_url);
+  if (_wizardState !== state) return;
+  state.installingPack = null;
+  if (!resp) {
+    state.dependenciesMessage = `Could not reach ComfyUI-Manager to install ${label}.`;
+  } else if (resp.status === 403) {
+    state.dependenciesMessage = "Manager refused the install (403). Set allow_git_url_install=true, "
+      + "use a loopback (127.0.0.1) session, then restart ComfyUI. Nothing was auto-restarted.";
+  } else if (resp.ok) {
+    state.dependenciesMessage = `${label} installed. Restart ComfyUI to load it.`;
+    state.restartRequired = true;
+    await _refreshManagerInstalled(state);
+    if (_wizardState !== state) return;
+  } else {
+    const msg = (resp.data && (resp.data.message || resp.data.error)) || `HTTP ${resp.status}`;
+    state.dependenciesMessage = `Install failed: ${msg}`;
+  }
+  _rerenderWizard(state);
+}
+
+async function rebootManagerAndReport(state) {
+  if (!state) return;
+  state.dependenciesMessage = "Requesting ComfyUI reboot…";
+  _rerenderWizard(state);
+  const resp = await managerReboot();
+  if (_wizardState !== state) return;
+  if (resp && resp.ok) {
+    state.restartRequired = false;
+    state.dependenciesMessage = "Reboot requested. ComfyUI will restart.";
+  } else {
+    state.dependenciesMessage = "Reboot request failed. Restart ComfyUI manually.";
+  }
+  _rerenderWizard(state);
+}
+
 // ── Binding row list renderer ────────────────────────────────────────────
 
 function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
@@ -819,20 +1166,52 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
           event.stopPropagation();
           const selected = getSelectedGraphNodeTarget();
           if (!selected) return;
+          // Mirror the canvas-click capture auto-select
+          // (studio-graph-binding.js): an unambiguous single candidate is
+          // the confirmed field. Without this a single-candidate manual
+          // capture stores a field-less node-only binding with no dropdown
+          // to fix it, and the save gate can never advance for that row.
+          const selectedCandidates = selected.candidates || [];
+          let selWidgetName = selected.widgetName;
+          let selInputName = selected.inputName;
+          let selOutputIndex = selected.outputIndex;
+          if (selectedCandidates.length === 1) {
+            const c = selectedCandidates[0];
+            if (c.kind === "widget") selWidgetName = c.name;
+            else if (c.kind === "input") selInputName = c.name;
+            else if (c.kind === "output") selOutputIndex = c.index;
+          }
           // Phase 4: extract widgetSchema from the selected candidate
           const selCandidate = _findSelectedCandidate(
             selected.candidates,
             { widgetName: selected.widgetName, inputName: selected.inputName, outputIndex: selected.outputIndex }
           );
           const selWidgetSchema = _buildWidgetSchemaFromCandidate(selCandidate);
+          // Refuse captures with no confirmable field: a node-only binding
+          // would look bound while the save gate can never count it. This
+          // covers zero candidates AND the lone node-fallback candidate
+          // (extractNodeCandidates emits kind "node" when a node exposes no
+          // widgets/inputs/outputs) — neither yields a field, and the
+          // dropdown cannot fix it (node options are not offered).
+          const selHasField = selWidgetName || selInputName || selOutputIndex != null;
+          const selPickable = selectedCandidates.some((c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output"));
+          if (!selHasField && !selPickable) {
+            const nodeLabel = selected.nodeTitle || selected.nodeType || ("Node " + selected.nodeId);
+            state.captureNotice = { key: bindingDef.key, message: nodeLabel + " exposes no bindable fields — pick a node with widgets or connections." };
+            cancelGraphBinding();
+            state.bindingCaptureActive = null;
+            renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+            return;
+          }
+          if (state.captureNotice && state.captureNotice.key === bindingDef.key) state.captureNotice = null;
           state.bindings[bindingDef.key] = {
-            kind: selected.widgetName ? "widget" : selected.inputName ? "input" : selected.outputIndex != null ? "output" : "node",
+            kind: selWidgetName ? "widget" : selInputName ? "input" : selOutputIndex != null ? "output" : "node",
             nodeId: selected.nodeId,
             nodeType: selected.nodeType,
             nodeTitle: selected.nodeTitle,
-            widgetName: selected.widgetName,
-            inputName: selected.inputName,
-            outputIndex: selected.outputIndex,
+            widgetName: selWidgetName,
+            inputName: selInputName,
+            outputIndex: selOutputIndex,
             label: selected.nodeTitle || selected.nodeType,
             candidates: selected.candidates || [],
             widgetSchema: selWidgetSchema,
@@ -857,6 +1236,17 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
     if (isBound && bindingValue.candidates && bindingValue.candidates.length > 1) {
       const candidateDropdown = renderCandidateDropdown(bindingValue, bindingDef, state);
       row.appendChild(candidateDropdown);
+    }
+
+    // Bound rows: a View aid that centers + highlights the node on the
+    // canvas.  Disabled (never hidden) when the node is not on the live
+    // canvas, so the row layout stays stable.
+    if (isBound) {
+      row.appendChild(renderViewButton(bindingValue.nodeId, {
+        testid: "wizard-view-binding",
+        bindingKey: bindingDef.key,
+        state,
+      }));
     }
 
     // Unbound rows: show the likely-target hint, plus a one-click
@@ -892,6 +1282,11 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
               renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
             },
           }),
+          renderViewButton(first.nodeId, {
+            testid: "wizard-view-suggestion",
+            bindingKey: bindingDef.key,
+            state,
+          }),
         ]));
       } else {
         const hint = _likelyTargetHint(bindingDef.key);
@@ -903,10 +1298,72 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
       }
     }
 
+    // Unbindable-capture notice: the picked node exposed no confirmable
+    // field, so nothing was stored. This keeps the row honestly unbound
+    // instead of a field-less pseudo-binding the save gate could never count.
+    if (state.captureNotice && state.captureNotice.key === bindingDef.key) {
+      row.appendChild(el("div", { style: "margin-top:4px;" }, [
+        el("span", { style: "font-size:10px;color:#fbbf24;", text: state.captureNotice.message }),
+      ]));
+    }
+    // View-failure notice: the node could not be centered/highlighted
+    // (usually gone from the canvas after the row rendered).
+    if (state.viewNotice && state.viewNotice.key === bindingDef.key) {
+      row.appendChild(el("div", { style: "margin-top:4px;" }, [
+        el("span", { style: "font-size:10px;color:#f87171;", text: state.viewNotice.message }),
+      ]));
+    }
+
     list.appendChild(row);
   });
 
   return list;
+}
+
+/**
+ * "View" aid: centers + highlights a node on the ComfyUI canvas.
+ * Null-safe — disabled when the node is not present on the live canvas.
+ */
+function renderViewButton(nodeId, opts) {
+  const o = opts || {};
+  const available = isGraphNodeAvailable(nodeId);
+  return el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": o.testid || "wizard-view-node",
+    "data-binding-key": o.bindingKey || "",
+    "data-node-id": nodeId != null ? String(nodeId) : "",
+    text: "View",
+    title: available ? "Center this node on the canvas" : "Node is not on the current canvas",
+    disabled: !available,
+    style: "width:auto;padding:2px 8px;font-size:10px;align-self:flex-start;",
+    onclick: (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      let res = null;
+      try { res = viewGraphNode(nodeId); } catch (e) { res = { ok: false }; }
+      // Surface failures on the row: a silent no-op looks identical to a
+      // working highlight otherwise (e.g. the node left the canvas between
+      // render and click).
+      if (!o.state) return;
+      if (res && res.ok === false) {
+        o.state.viewNotice = {
+          key: o.bindingKey,
+          message: res.reason || "Node is not on the current canvas",
+        };
+        const panel = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
+        if (panel) renderWizard(panel, o.state);
+        setTimeout(() => {
+          if (o.state.viewNotice && o.state.viewNotice.key === o.bindingKey) {
+            o.state.viewNotice = null;
+            const p = _wizardRoot && _wizardRoot.querySelector(".comfymodal-studio-wizard-panel");
+            if (p) renderWizard(p, o.state);
+          }
+        }, 3500);
+      } else if (o.state.viewNotice && o.state.viewNotice.key === o.bindingKey) {
+        o.state.viewNotice = null;
+      }
+    },
+  });
 }
 
 function renderBoundValue(bindingValue, bindingDef) {
@@ -938,13 +1395,29 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
   const currentWidget = bindingValue.widgetName;
   const currentInput = bindingValue.inputName;
   const currentOutput = bindingValue.outputIndex;
+  const hasField = !!(currentWidget || currentInput || currentOutput != null);
 
-  bindingValue.candidates.forEach((c) => {
+  // No field stored yet (fresh manual capture): force an explicit pick so
+  // the displayed first candidate is never mistaken for the stored binding.
+  // Without this, activating the already-displayed option fires no change
+  // event — nothing is written, nothing re-renders, and the save gate stays
+  // shut with no way to confirm the shown field.
+  if (!hasField) {
+    const placeholder = el("option", { value: "", text: "Select field…" });
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+  }
+
+  // Node-fallback candidates are never pickable (the change handler has no
+  // field to store for them), so they are not offered as options.
+  const pickableCandidates = (bindingValue.candidates || []).filter(
+    (c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output")
+  );
+  pickableCandidates.forEach((c) => {
     let isCurrent = false;
     if (c.kind === "widget") isCurrent = c.name === currentWidget;
     else if (c.kind === "input") isCurrent = c.name === currentInput;
     else if (c.kind === "output") isCurrent = c.index === currentOutput;
-    else if (c.kind === "node") isCurrent = !currentWidget && !currentInput && currentOutput == null;
 
     const opt = el("option", {
       value: JSON.stringify({ kind: c.kind, name: c.name, index: c.index }),
@@ -955,19 +1428,37 @@ function renderCandidateDropdown(bindingValue, bindingDef, state) {
   });
 
   select.addEventListener("change", () => {
+    if (!select.value) return; // placeholder re-selected: nothing to store
+    let parsed = null;
     try {
-      const val = JSON.parse(select.value);
-      if (val.kind === "widget") { bindingValue.widgetName = val.name; bindingValue.inputName = null; bindingValue.outputIndex = null; }
-      else if (val.kind === "input") { bindingValue.inputName = val.name; bindingValue.widgetName = null; bindingValue.outputIndex = null; }
-      else if (val.kind === "output") { bindingValue.outputIndex = val.index; bindingValue.widgetName = null; bindingValue.inputName = null; }
-      // Phase 4: keep widgetSchema in sync with the selected candidate
-      const updatedCandidate = _findSelectedCandidate(
-        bindingValue.candidates,
-        { widgetName: bindingValue.widgetName, inputName: bindingValue.inputName, outputIndex: bindingValue.outputIndex }
-      );
-      bindingValue.widgetSchema = _buildWidgetSchemaFromCandidate(updatedCandidate);
-      renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+      parsed = JSON.parse(select.value);
     } catch { /* ignore parse errors */ }
+    if (!parsed) return;
+    if (parsed.kind === "widget") {
+      bindingValue.kind = "widget";
+      bindingValue.widgetName = parsed.name;
+      bindingValue.inputName = null;
+      bindingValue.outputIndex = null;
+    } else if (parsed.kind === "input") {
+      bindingValue.kind = "input";
+      bindingValue.inputName = parsed.name;
+      bindingValue.widgetName = null;
+      bindingValue.outputIndex = null;
+    } else if (parsed.kind === "output") {
+      bindingValue.kind = "output";
+      bindingValue.outputIndex = parsed.index;
+      bindingValue.widgetName = null;
+      bindingValue.inputName = null;
+    } else {
+      return; // node-fallback or unknown kind: no field to store
+    }
+    // Phase 4: keep widgetSchema in sync with the selected candidate
+    const updatedCandidate = _findSelectedCandidate(
+      bindingValue.candidates,
+      { widgetName: bindingValue.widgetName, inputName: bindingValue.inputName, outputIndex: bindingValue.outputIndex }
+    );
+    bindingValue.widgetSchema = _buildWidgetSchemaFromCandidate(updatedCandidate);
+    renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
   });
 
   container.appendChild(select);
@@ -983,6 +1474,8 @@ function startBindingCapture(state, bindingDef) {
   cancelGraphBinding(); // Cancel any prior capture
 
   state.bindingCaptureActive = bindingDef.key;
+  if (state.captureNotice && state.captureNotice.key === bindingDef.key) state.captureNotice = null;
+  if (state.viewNotice && state.viewNotice.key === bindingDef.key) state.viewNotice = null;
   renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
 
   const cancelFn = beginGraphBindingCapture({
@@ -995,6 +1488,20 @@ function startBindingCapture(state, bindingDef) {
         { widgetName: result.widgetName, inputName: result.inputName, outputIndex: result.outputIndex }
       );
       const widgetSchema = _buildWidgetSchemaFromCandidate(selectedCandidate);
+      // Same refusal as "Use Selected Node": no confirmable field (zero
+      // candidates or only the node-fallback candidate) must not become a
+      // pseudo-binding the gate can never count.
+      const resHasField = result.widgetName || result.inputName || result.outputIndex != null;
+      const resCandidates = result.candidates || [];
+      const resPickable = resCandidates.some((c) => c && (c.kind === "widget" || c.kind === "input" || c.kind === "output"));
+      if (!resHasField && !resPickable) {
+        const nodeLabel = result.nodeTitle || result.nodeType || ("Node " + result.nodeId);
+        state.captureNotice = { key: result.bindingKey, message: nodeLabel + " exposes no bindable fields — pick a node with widgets or connections." };
+        state.bindingCaptureActive = null;
+        renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+        return;
+      }
+      if (state.captureNotice && state.captureNotice.key === result.bindingKey) state.captureNotice = null;
       state.bindings[result.bindingKey] = {
         kind: result.widgetName ? "widget" : result.inputName ? "input" : result.outputIndex != null ? "output" : "node",
         nodeId: result.nodeId,
@@ -1555,6 +2062,8 @@ function checkAllRequiredBindings(state) {
 function applySuggestedBinding(state, roleKey, suggestion) {
   if (!state || !roleKey || !suggestion || suggestion.nodeId == null) return false;
   if (!ROLE_SUGGESTIONS[roleKey]) return false; // catalog roles only
+  if (state.captureNotice && state.captureNotice.key === roleKey) state.captureNotice = null;
+  if (state.viewNotice && state.viewNotice.key === roleKey) state.viewNotice = null;
   state.bindings[roleKey] = {
     kind: suggestion.widgetName ? "widget" : suggestion.inputName ? "input" : suggestion.outputIndex != null ? "output" : "node",
     nodeId: suggestion.nodeId,

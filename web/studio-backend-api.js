@@ -525,6 +525,60 @@ export async function requestCustomNodeInstall(apiBase, body) {
   });
 }
 
+// ── Bulk model install + ComfyUI-Manager integration (wizard deps step) ──
+//
+// Bulk install maps the wizard's "Download all" action onto the existing
+// synchronous /models/batch-install route.  The Manager helpers talk to the
+// ROOT-relative ComfyUI-Manager routes (not under /comfymodal), so they use a
+// status-preserving fetch that also tolerates plain-text error bodies.
+
+export async function batchInstallModels(apiBase, items) {
+  return apiFetch(apiBase, "/models/batch-install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items: items || [] }),
+  });
+}
+
+async function managerFetch(path, options) {
+  try {
+    const res = await fetch(path, options);
+    let text = "";
+    try { text = await res.text(); } catch (e) { text = ""; }
+    let data = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch (e) { data = { message: text }; }
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return null;
+  }
+}
+
+/** GET /manager/version — presence probe for ComfyUI-Manager. */
+export async function getManagerVersion() {
+  return managerFetch("/manager/version");
+}
+
+/** POST /customnode/install/git_url — explicit user-triggered pack install. */
+export async function managerInstallNode(url) {
+  return managerFetch("/customnode/install/git_url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+}
+
+/** GET /customnode/installed — match which packs are already installed. */
+export async function listManagerInstalled() {
+  return managerFetch("/customnode/installed");
+}
+
+/** POST /manager/reboot — only ever called from an explicit Reboot click. */
+export async function managerReboot() {
+  return managerFetch("/manager/reboot", { method: "POST" });
+}
+
 // ── Studio Workflow Version Dependencies / Compatibility API ────────────
 
 export async function getVersionDependencies(apiBase, versionId) {

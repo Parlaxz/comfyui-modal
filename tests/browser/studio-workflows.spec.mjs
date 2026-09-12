@@ -178,10 +178,15 @@ async function confirmAllWizardSuggestions(panel) {
   }
 }
 
-/** Advance the wizard from the features step to the bindings step. */
+/** Advance the wizard from the features step to the bindings step (passing
+ * through the Dependencies step in version-setup mode). */
 async function wizardContinueToBindings(panel) {
   await panel.locator(".comfymodal-studio-wizard-feature-card").first().click();
-  await panel.getByRole("button", { name: "Continue to Bindings" }).click();
+  await panel.locator('[data-testid="wizard-features-continue"]').click();
+  const depsContinue = panel.locator('[data-testid="wizard-dependencies-continue"]');
+  if (await depsContinue.count()) {
+    await depsContinue.click();
+  }
   await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
 }
 

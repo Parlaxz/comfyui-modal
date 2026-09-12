@@ -821,6 +821,18 @@ export function renderDependencySection(version, deps, refreshHandler, opts) {
         el("div", { class: "comfymodal-studio-dependency-table" }, nodes.map((n) => renderDependencyNodeRow(n, ctx))),
       ]));
     }
+    // Graph artifacts (frontend-only UUIDs / display titles recorded as
+    // types) can never resolve to an installed pack, so the backend reports
+    // them separately instead of "missing". Surface the skip truthfully.
+    const skipped = (deps && Array.isArray(deps.unresolvable)) ? deps.unresolvable : [];
+    if (skipped.length) {
+      section.appendChild(el("p", {
+        class: "comfymodal-studio-dependencies-note",
+        "data-testid": "dependency-artifacts-note",
+        text: `${skipped.length} graph artifact${skipped.length === 1 ? "" : "s"} skipped — not installable node classes.`,
+        title: skipped.map((u) => (u && u.name) || "").filter(Boolean).join(", "),
+      }));
+    }
 
     const metaChips = renderMetadataChips(version);
     if (!models.length && !nodes.length && !metaChips) {
@@ -930,11 +942,34 @@ function renderDependencyNodeRow(n, ctx) {
   if (n.repository_url) {
     row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: n.repository_url, target: "_blank", rel: "noopener noreferrer", text: "repo" }));
   }
-  // Explicit install REQUEST for missing nodes with a known repo.  This only
-  // records approval via /studio/custom-nodes/install-request — nothing is
-  // cloned, pulled, or installed by this UI.
-  if (n.state === "missing" && n.repository_url && ctx && ctx.apiBase) {
-    row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
+  // Missing node with a known repo: when ComfyUI-Manager is detected the
+  // caller may provide an explicit install action; otherwise the existing
+  // record-only approval request flow is preserved.  Nothing installs on
+  // render — both controls require an explicit click.
+  if (n.state === "missing" && n.repository_url) {
+    const installedNames = Array.isArray(ctx && ctx.managerInstalledNames) ? ctx.managerInstalledNames : [];
+    const isKnownInstalled = installedNames.some(
+      (name) => name && (name === n.name || name === n.repository_url)
+    );
+    if (isKnownInstalled) {
+      row.appendChild(el("span", {
+        class: "comfymodal-studio-dependency-detail",
+        "data-testid": "dependency-node-manager-installed",
+        text: "Installed (restart may be required)",
+      }));
+    } else if (ctx && ctx.managerAvailable === true && typeof ctx.onInstallPack === "function") {
+      row.appendChild(el("button", {
+        class: "comfymodal-secondary-btn",
+        type: "button",
+        "data-testid": "dependency-node-manager-install",
+        "data-node-name": n.name || "",
+        text: (ctx.installingPack && ctx.installingPack === n.name) ? "Installing\u2026" : "Install via Manager",
+        style: "font-size:10px;padding:2px 8px;width:auto;",
+        onclick: () => ctx.onInstallPack(n),
+      }));
+    } else if (ctx && ctx.apiBase) {
+      row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
+    }
   }
   return row;
 }
