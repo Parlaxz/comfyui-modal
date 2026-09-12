@@ -8722,14 +8722,12 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
             raise RuntimeError("canonical dependency identity unavailable")
         source_identity = build_deployment_identity(
             runtime_root=Path(__file__).resolve().parent / "comfymodal_runtime",
-            custom_node_paths=[_LOCAL_CUSTOM_NODES],
             dependency_hash=_build_v2_dependency_cache_identity(
                 dependency_context["context_hash"]
             ).get("dependency_key", ""),
         )
         if (
             source_identity.source_bytes <= 0
-            or not source_identity.custom_node_hash
             or not source_identity.dependency_hash
         ):
             raise RuntimeError(
@@ -10918,9 +10916,11 @@ class _ComfyAPIMixin:
         # 1. Validate API prompt structure
         assert_valid_api_prompt_structure(workflow)
 
-        # 2. Sync custom nodes from volume
+        # 2. Custom nodes: manual publication only (no Volume/filesystem touch).
+        # Custom-node publication is manual. The deployed/snapshotted runtime uses
+        # the nodes already present; never sync from the Volume on the request path.
         _cn_start = time.time()
-        summary, state = self._sync_custom_nodes_from_volume()
+        summary = {"created": [], "removed": [], "kept": [], "blocked": [], "skipped": True, "skip_reason": "manual_publication"}
         _cn_created = summary.get("created", [])
         _cn_sync_ms = round((time.time() - _cn_start) * 1000, 1)
 
@@ -16178,13 +16178,12 @@ class _ComfyAPIMixin:
             duration_ms=_missing_node_repair_ms,
         )
         if repair_summary.get("blocked_by_mode") and repair_summary.get("missing_before"):
-            _mode = self._resolve_requirements_repair_mode()
+            # Custom-node publication is manual; never auto-publish/sync/repair here.
             raise RuntimeError(
-                f"Workflow references missing custom node class(es): "
-                f"{repair_summary['missing_before']}. "
-                f"Runtime repair is disabled in {_mode} mode. "
-                f"Install/sync the custom node and rebuild/deploy the "
-                f"Modal image if dependencies changed."
+                "Required ComfyUI custom node type is unavailable in this deployed snapshot.\n\n"
+                "Custom-node publishing is manual.\n"
+                "Run the canonical custom-node publisher, then perform a fresh deploy/snapshot if required."
+                f" Missing: {repair_summary['missing_before']}"
             )
 
         # GöÇGöÇ Fixed-workflow fast path: skip validation if hash matches GöÇGöÇ

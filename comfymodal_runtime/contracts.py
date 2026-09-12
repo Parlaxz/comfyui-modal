@@ -912,6 +912,10 @@ def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof:
                       and _plan["deployment_combined_hash"] == _proof["deployment_combined_hash"])
     _gen_match = bool(_plan.get("custom_nodes_generation") and _proof.get("custom_nodes_generation")
                       and _plan["custom_nodes_generation"] == _proof["custom_nodes_generation"])
+    # Manual publication policy: the whole custom-node generation is
+    # DIAGNOSTIC ONLY (``custom_nodes_generation_match`` below) and never an
+    # eligibility gate.  Deployment-hash, workflow-registry, and
+    # dependency-proof gates stay as they are.
     _reg_parity = evaluate_workflow_registry_parity(_plan.get("registry_proof"), _proof.get("registry_manifest"))
     _reg_match = bool(_plan.get("registry_proof_complete")) and bool(_reg_parity.get("workflow_registry_match"))
     # When the planner supplies the optional exact binding, reject a proof
@@ -934,7 +938,7 @@ def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof:
                             and _plan["dependency_manifest_identity"] == _proof["dependency_manifest_identity"])
     _schema_ok = bool(_proof.get("schema_version") and _proof.get("valid"))
     _eligible = bool(_plan.get("complete") and _proof.get("complete") and _schema_ok
-                     and _dep_match and _gen_match and _reg_match and _dep_proof_match)
+                      and _dep_match and _reg_match and _dep_proof_match)
     _reasons = []
     if not _plan.get("complete"):
         _reasons.append("plan_identity_incomplete")
@@ -944,8 +948,6 @@ def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof:
         _reasons.append("snapshot_proof_invalid_or_unsupported")
     if not _dep_match:
         _reasons.append("deployment_hash_mismatch")
-    if not _gen_match:
-        _reasons.append("custom_nodes_generation_mismatch")
     if not _reg_match:
         _reasons.append("workflow_registry_mismatch")
     if not _dep_proof_match:

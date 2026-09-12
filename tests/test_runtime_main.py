@@ -49,6 +49,7 @@ class TestBootstrap(unittest.TestCase):
             self.assertEqual((root / "models").resolve(), models.resolve())
 
     def test_lifecycle_order_and_no_startup_install(self):
+        # Manual publication policy: startup/restore never sync custom nodes.
         calls: list[str] = []
         model_path = Path(tempfile.gettempdir()) / "models"
         model_path.mkdir(exist_ok=True)
@@ -65,8 +66,9 @@ class TestBootstrap(unittest.TestCase):
         trace = RuntimeTrace(request_id="r")
         bootstrap.startup(trace=trace)
         bootstrap.restore(trace=trace)
-        self.assertEqual(calls[:4], ["models", "state", "nodes", "backend"])
-        self.assertEqual(calls[4:], ["gpu", "cuda", "sage", "state", "models", "nodes"])
+        self.assertNotIn("nodes", calls)
+        self.assertEqual(calls[:3], ["models", "state", "backend"])
+        self.assertEqual(calls[3:], ["gpu", "cuda", "sage", "state", "models"])
         self.assertEqual(bootstrap.state.backend, "in_process")
 
     def test_backend_callback_controls_snapshot_cuda_policy(self):
@@ -84,6 +86,8 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(observed, [before])
 
     def test_install_requirements_callback_fires_after_nodes_in_startup(self):
+        # Manual publication policy: install_requirements still fires on
+        # startup, but no node sync precedes it (sync never runs).
         calls: list[str] = []
         model_path = Path(tempfile.gettempdir()) / "models"
         model_path.mkdir(exist_ok=True)
@@ -102,8 +106,9 @@ class TestBootstrap(unittest.TestCase):
         trace = RuntimeTrace(request_id="r")
         bootstrap.startup(trace=trace)
         self.assertIn("install_reqs", calls)
-        self.assertEqual(calls[:4], ["models", "state", "nodes", "install_reqs"])
-        self.assertEqual(calls[4:], ["backend"])
+        self.assertNotIn("nodes", calls)
+        self.assertEqual(calls[:3], ["models", "state", "install_reqs"])
+        self.assertEqual(calls[3:], ["backend"])
 
     def test_install_requirements_not_called_when_flag_off(self):
         calls: list[str] = []
@@ -135,6 +140,10 @@ class TestBootstrap(unittest.TestCase):
         )
         bootstrap.startup(trace=trace)
         names = {e.name for e in trace.events}
+        # Manual publication: startup never syncs custom nodes, so no
+        # sync_custom_nodes trace events exist; observe_generations stays.
+        self.assertNotIn("sync_custom_nodes_start", names)
+        self.assertNotIn("sync_custom_nodes_end", names)
         for expected in (
             "snapshot_restore_start",
             "models_symlink_start",
@@ -145,8 +154,6 @@ class TestBootstrap(unittest.TestCase):
             "reload_models_end",
             "reload_runtime_state_start",
             "reload_runtime_state_end",
-            "sync_custom_nodes_start",
-            "sync_custom_nodes_end",
             "comfyui_path_setup_start",
             "comfyui_path_setup_end",
             "backend_startup_start",
@@ -201,6 +208,16 @@ class TestBootstrap(unittest.TestCase):
         )
         bootstrap.restore(trace=trace)
         names = {e.name for e in trace.events}
+        # Manual publication: restore never syncs custom nodes and no longer
+        # observes generations on the restore path.
+        for absent in (
+            "sync_custom_nodes_start",
+            "sync_custom_nodes_end",
+            "observe_generations_start",
+            "observe_generations_end",
+        ):
+            with self.subTest(event=absent):
+                self.assertNotIn(absent, names)
         for expected in (
             "snapshot_restore_start",
             "restore_gpu_state_start",
@@ -213,10 +230,6 @@ class TestBootstrap(unittest.TestCase):
             "reload_runtime_state_end",
             "reload_models_start",
             "reload_models_end",
-            "sync_custom_nodes_start",
-            "sync_custom_nodes_end",
-            "observe_generations_start",
-            "observe_generations_end",
             "snapshot_restore_end",
         ):
             with self.subTest(event=expected):
@@ -262,11 +275,15 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(state.sage_reason, "not-patched-or-not-found")
 
     def test_restore_callback_exceptions_record_unknown_before_reraise(self):
-        """Each restore callback stage records unknown before propagating errors."""
+        """Each restore callback stage records unknown before propagating errors.
+
+        Manual publication: sync_custom_nodes is never invoked on restore, so
+        a failing sync callback is never called and its stage is recorded as
+        skipped with decision=manual_publication instead.
+        """
         callback_stages = (
             ("reload_runtime_state", "reload_runtime_state"),
             ("reload_models", "reload_models"),
-            ("sync_custom_nodes", "sync_custom_nodes"),
             ("sage_policy", "apply_sage_policy"),
         )
         for stage, callback_name in callback_stages:
@@ -282,6 +299,23 @@ class TestBootstrap(unittest.TestCase):
                     bootstrap.state.restore_stage_classifications.get(stage),
                     "unknown",
                 )
+
+    def test_restore_never_invokes_sync_custom_nodes_callback(self):
+        """A failing sync callback must never fire: restore skips the stage."""
+        def _boom():
+            raise RuntimeError("sync_custom_nodes failed")
+
+        bootstrap = RuntimeBootstrap()
+        bootstrap.sync_custom_nodes = _boom
+        bootstrap.restore()
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications.get("sync_custom_nodes"),
+            "skipped",
+        )
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions.get("sync_custom_nodes"),
+            {"decision": "manual_publication", "reason": "manual_publication"},
+        )
 
     def test_restore_absent_sage_callback_is_skipped(self):
         bootstrap = RuntimeBootstrap()
@@ -314,7 +348,8 @@ class TestBootstrap(unittest.TestCase):
         self.assertIn("sage_policy", state.stage_durations)
         self.assertIn("reload_runtime_state", state.stage_durations)
         self.assertIn("reload_models", state.stage_durations)
-        self.assertIn("sync_custom_nodes", state.stage_durations)
+        # Manual publication: restore never syncs, so no sync stage duration.
+        self.assertNotIn("sync_custom_nodes", state.stage_durations)
         for name, duration_ms in state.stage_durations.items():
             self.assertIsInstance(duration_ms, (int, float))
             self.assertGreaterEqual(duration_ms, 0)

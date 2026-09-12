@@ -691,10 +691,20 @@ def test_native_golden_backend_is_not_a_bat(tmp_path):
 
 
 def test_native_golden_deploy_publishes_before_backend(tmp_path, monkeypatch):
+    """Manual publication policy: deploy never publishes or preflights.
+
+    Publication is fully manual (`golden publish-custom-nodes`); the normal
+    deploy path must NOT compute content generation, run the publisher
+    preflight, or publish. It still runs the backend and writes a valid
+    (S4-empty) deployment receipt + manifest.
+    """
     from tools.v2_control import cli
     from tools.v2_control.backend import BackendResult
 
     events = []
+    preflight_calls = []
+    invoke_calls = []
+    receipt_publications = []
     identity, _archive, _files = prepare_publication(_root(tmp_path))
     publication = SimpleNamespace(
         action="skip", reason="exact_match", identity=identity,
@@ -726,7 +736,28 @@ def test_native_golden_deploy_publishes_before_backend(tmp_path, monkeypatch):
                 ended_at="2026-01-01T00:00:01+00:00", elapsed_seconds=1.0,
             )
 
-    monkeypatch.setattr(cli, "_publish_golden_custom_nodes", lambda _root: events.append("publish") or publication)
+    def _fail_publish(*_args, **_kwargs):
+        events.append("publish")
+        return publication
+
+    def _fail_preflight(*_args, **_kwargs):
+        preflight_calls.append(True)
+        raise AssertionError("deploy must not run publisher preflight")
+
+    def _fail_invoke(*_args, **_kwargs):
+        invoke_calls.append(True)
+        raise AssertionError("deploy must not invoke golden publisher")
+
+    def _capture_receipt(*args, **kwargs):
+        # args: (repo_root, config, env, deploy_identity, version, manifest, publication, ...)
+        receipt_publications.append(args[6] if len(args) > 6 else kwargs.get("publication"))
+        return tmp_path / "deployment-receipt.json"
+
+    sentinel = tmp_path / "deploy.json"
+    sentinel.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_publish_golden_custom_nodes", _fail_publish)
+    monkeypatch.setattr(cli, "run_publisher_preflight", _fail_preflight)
+    monkeypatch.setattr(cli, "_invoke_golden_publisher", _fail_invoke)
     monkeypatch.setattr(cli, "_active_workspace_credentials", lambda _root: {
         "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret",
     })
@@ -734,19 +765,33 @@ def test_native_golden_deploy_publishes_before_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_app_version_number", lambda _app: events.append("version") or next(versions))
     monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
     monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
-    monkeypatch.setattr(cli, "write_deployment_manifest", lambda *args, **kwargs: tmp_path / "deploy.json")
+    monkeypatch.setattr(cli, "write_deployment_manifest", lambda *args, **kwargs: sentinel)
+    monkeypatch.setattr(cli, "_write_golden_deployment_receipt", _capture_receipt)
     args = SimpleNamespace(
         profile="golden_p1", app="golden-experimental", set=[], inherit=[],
         owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
     )
 
     assert cli.cmd_deploy(args, cli.Path(__file__).resolve().parents[1]) == 0
-    assert events.index("publish") < events.index("version") < events.index("backend")
+    # Manual publication: no publish/preflight/invoke on the deploy path.
+    assert "publish" not in events
+    assert preflight_calls == []
+    assert invoke_calls == []
+    assert events.index("version") < events.index("backend")
+    assert "backend" in events
+    # A valid S4-empty receipt is still written (publication=None).
+    assert receipt_publications == [None]
 
 
 def test_deploy_manifest_uses_identity_captured_after_verified_publication(
     tmp_path, monkeypatch
 ):
+    """Manual publication policy: deploy fingerprint is captured at deploy time.
+
+    Deploy never publishes, so no publication hook runs and the manifest
+    matches the deploy-time identity. A backend mutation must never leak
+    into the captured identity.
+    """
     from tools.v2_control import cli
     from tools.v2_control.backend import BackendResult
 
@@ -757,6 +802,7 @@ def test_deploy_manifest_uses_identity_captured_after_verified_publication(
     config, fingerprints = components[3], components[4]
     captured_before_publication = cli.capture_deploy_identity(fingerprints)
     captured_after_publication: list = []
+    publish_calls: list = []
 
     class FakeLock:
         def __init__(self, _path):
@@ -786,9 +832,8 @@ def test_deploy_manifest_uses_identity_captured_after_verified_publication(
             )
 
     def publish(_root):
-        # The verified publication resolves before the final deploy fingerprint
-        # is captured, so this mutation is part of the captured identity.
-        config.git.head = "publication-mutated"
+        # Manual publication policy: this hook must never run on deploy.
+        publish_calls.append(True)
         captured_after_publication.append(cli.capture_deploy_identity(fingerprints))
         return SimpleNamespace(
             action="skip", reason="exact_match", identity=SimpleNamespace(
@@ -820,21 +865,23 @@ def test_deploy_manifest_uses_identity_captured_after_verified_publication(
     monkeypatch.setattr(cli, "_app_version_number", lambda _app: next(versions))
     assert cli.cmd_deploy(args, tmp_path) == 0
 
-    captured = captured_after_publication[0]
+    # Deploy never publishes: the publication hook is not invoked.
+    assert publish_calls == []
+    assert captured_after_publication == []
     manifests = sorted((tmp_path / ".v2ctl" / "deployments").glob("deploy_*.json"))
     assert len(manifests) == 1
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-    assert manifest["deployment_hash"] == captured.deploy_fingerprint
-    assert manifest["deploy_fingerprint"] == captured.deploy_fingerprint
-    assert manifest["deploy_inputs"] == cli._thaw_deploy_identity(captured.deploy_inputs)
-    assert manifest["profile_config_fingerprint"] == captured.profile_config_fingerprint
+    assert manifest["deploy_fingerprint"] == manifest["deployment_hash"]
+    assert manifest["deploy_inputs"] == cli._thaw_deploy_identity(
+        captured_before_publication.deploy_inputs
+    )
+    assert manifest["profile_config_fingerprint"] == captured_before_publication.profile_config_fingerprint
     effective_env = manifest["effective_environment"]
-    assert effective_env["COMFYMODAL_V2CTL_DEPLOYMENT_HASH"] == captured.deploy_fingerprint
-    assert effective_env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] == captured.deploy_fingerprint
-    assert effective_env["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] == captured.profile_config_fingerprint
-    # The publication mutation is captured; the backend mutation is not.
-    assert captured.deploy_fingerprint != captured_before_publication.deploy_fingerprint
-    assert fingerprints.deploy_fingerprint() != captured.deploy_fingerprint
+    assert effective_env["COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT"] == manifest["deploy_fingerprint"]
+    # The deploy-time identity matches the pre-deploy capture (no publication
+    # mutation); the backend mutation is not captured.
+    assert manifest["deploy_fingerprint"] == captured_before_publication.deploy_fingerprint
+    assert fingerprints.deploy_fingerprint() != manifest["deploy_fingerprint"]
 
 
 def test_source_probe_skips_malformed_unrelated_manifest(tmp_path, monkeypatch):
@@ -884,19 +931,38 @@ def test_source_probe_skips_malformed_unrelated_manifest(tmp_path, monkeypatch):
     assert updated["source_identity_status"] == "verified"
 
 
-def test_native_golden_deploy_refuses_backend_when_publication_fails(monkeypatch):
+def test_native_golden_deploy_refuses_backend_when_publication_fails(monkeypatch, tmp_path):
+    """Manual publication policy: a publication failure never gates deploy.
+
+    Deploy never publishes, so even a failing publisher must not block the
+    backend. The backend still runs and a valid (S4-empty) receipt is
+    written.
+    """
     from tools.v2_control import cli
+    from tools.v2_control.backend import BackendResult
 
     backend_calls = []
-    monkeypatch.setattr(cli, "_publish_golden_custom_nodes", lambda _root: (_ for _ in ()).throw(RuntimeError("publish failed")))
-    monkeypatch.setattr(cli, "_active_workspace_credentials", lambda _root: {
-        "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret",
-    })
-    monkeypatch.setattr(cli.backend_mod, "BackendRunner", SimpleNamespace(
-        build_command_line=lambda *_args: "modal deploy",
-        __init__=lambda *_args: None,
-        run=lambda *_args, **_kwargs: backend_calls.append(True),
-    ))
+    receipt_publications = []
+
+    def _failing_publish(*_args, **_kwargs):
+        raise RuntimeError("publish failed")
+
+    class FakeRunner:
+        def __init__(self, _repo_root, _env_builder):
+            pass
+
+        @staticmethod
+        def build_command_line(_spec, _extra_args):
+            return "modal deploy"
+
+        def run(self, *_args, **_kwargs):
+            backend_calls.append(True)
+            return BackendResult(
+                exit_code=0, stdout="", stderr="", command="modal deploy",
+                started_at="2026-01-01T00:00:00+00:00",
+                ended_at="2026-01-01T00:00:01+00:00", elapsed_seconds=1.0,
+            )
+
     class FakeLock:
         def __init__(self, _path):
             pass
@@ -904,10 +970,28 @@ def test_native_golden_deploy_refuses_backend_when_publication_fails(monkeypatch
             pass
         def release(self):
             pass
+
+    def _capture_receipt(*args, **kwargs):
+        receipt_publications.append(args[6] if len(args) > 6 else kwargs.get("publication"))
+        return tmp_path / "deployment-receipt.json"
+
+    sentinel = tmp_path / "deploy.json"
+    sentinel.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cli, "_publish_golden_custom_nodes", _failing_publish)
+    monkeypatch.setattr(cli, "_invoke_golden_publisher", _failing_publish)
+    monkeypatch.setattr(cli, "_active_workspace_credentials", lambda _root: {
+        "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret",
+    })
+    monkeypatch.setattr(cli.backend_mod, "BackendRunner", FakeRunner)
     monkeypatch.setattr(cli.locking_mod, "DeployLock", FakeLock)
+    monkeypatch.setattr(cli, "write_deployment_manifest", lambda *args, **kwargs: sentinel)
+    monkeypatch.setattr(cli, "_write_golden_deployment_receipt", _capture_receipt)
+    versions = iter((0, 1))
+    monkeypatch.setattr(cli, "_app_version_number", lambda _app: next(versions))
     args = SimpleNamespace(
         profile="golden_p1", app="golden-experimental", set=[], inherit=[],
         owner=None, dry_run=False, gpu=None, memory_mb=None, cpu=None,
     )
-    assert cli.cmd_deploy(args, Path(__file__).resolve().parents[1]) == 1
-    assert backend_calls == []
+    assert cli.cmd_deploy(args, Path(__file__).resolve().parents[1]) == 0
+    assert backend_calls == [True]
+    assert receipt_publications == [None]

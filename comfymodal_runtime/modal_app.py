@@ -5619,7 +5619,6 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         identity.source_bytes <= 0
         or not identity.runtime_hash
         or not identity.dependency_hash
-        or not identity.custom_node_hash
     ):
         raise RuntimeError("canonical source identity is incomplete")
     if identity.hash_namespace != DEPLOYMENT_HASH_NAMESPACE:
@@ -10407,269 +10406,9 @@ class ModalRuntimeEntrypoint:
             global _RUNTIME_STATE_VOLUME_RELOADED_MONO
             _RUNTIME_STATE_VOLUME_RELOADED_MONO = time.monotonic()
 
-        def _valid_restore_custom_node_identity(identity: Any) -> bool:
-            """Accept only a complete identity produced by the mounted read."""
-            if type(identity) is not dict:
-                return False
-            if not isinstance(identity.get("custom_node_generation"), str):
-                return False
-            if not identity["custom_node_generation"]:
-                return False
-            if identity.get("generation_source") not in {
-                "persisted_record",
-                "mounted_volume_record",
-                "volume_record",
-            }:
-                return False
-            if identity.get("identity_read_reason") != "mounted_volume_record":
-                return False
-            return all(
-                isinstance(identity.get(key), str)
-                for key in (
-                    "generation_source",
-                    "identity_read_reason",
-                    "schema_version",
-                    "deployment_combined_hash",
-                    "token",
-                )
-            )
-
-        def _peek_restore_custom_node_identity() -> dict[str, str] | None:
-            """Return a valid same-restore identity, otherwise fail closed."""
-            if not getattr(self, "_restore_custom_node_identity_scope_active", False):
-                return None
-            cache = getattr(self, "_restore_custom_node_identity_cache", None)
-            if type(cache) is not dict:
-                return None
-            if cache.get("epoch") != getattr(
-                self, "_restore_custom_node_identity_epoch", None
-            ):
-                return None
-            identity = cache.get("identity")
-            if not _valid_restore_custom_node_identity(identity):
-                return None
-            return dict(identity)
-
-        def _consume_restore_custom_node_identity() -> dict[str, str] | None:
-            """Consume the one-shot read result, or force the old reload path."""
-            identity = _peek_restore_custom_node_identity()
-            self._restore_custom_node_identity_cache = None
-            return identity
-
-        def sync_custom_nodes() -> Any:
-            # The image already contains the production custom nodes.  Avoid
-            # copying the volume over them when the persisted generation is an
-            # exact match for the image-baked source.  This decision is
-            # intentionally O(1): it reads only the baked manifest and the
-            # existing generation record, never walks or hashes node files.
-            _baked_generation = ""
-            _current_generation = ""
-            _current_source = "unavailable"
-            _fallback_reason = "identity_unavailable"
-            # Construction-time parity mode: the deploy bat sets this flag ONLY
-            # for the construction invocation; restores and ordinary requests
-            # never set it, so the closure below stays O(1) and behaves exactly
-            # as before outside construction (no hashing, no record writes).
-            _construction = os.environ.get(
-                "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", ""
-            ).strip().lower() in ("1", "true", "yes", "on")
-            try:
-                _baked_manifest = module.load_baked_custom_node_dependency_manifest()
-                _baked_generation = str(
-                    (_baked_manifest or {}).get(
-                        "production_custom_node_generation", ""
-                    )
-                    or ""
-                )
-                _cached_identity = (
-                    None if _construction else _consume_restore_custom_node_identity()
-                )
-                if _cached_identity is not None:
-                    # read_current_custom_node_identity already reloaded the
-                    # authoritative mount immediately before this callback.
-                    # Reuse that exact result for this restore decision.
-                    _current_generation = str(
-                        _cached_identity.get("custom_node_generation", "") or ""
-                    )
-                    _current_source = str(
-                        _cached_identity.get("generation_source", "unavailable")
-                        or "unavailable"
-                    )
-                else:
-                    _custom_nodes_volume = getattr(module, "custom_nodes_vol", None)
-                    if _custom_nodes_volume is not None:
-                        _reload = getattr(_custom_nodes_volume, "reload", None)
-                        if callable(_reload):
-                            _reload()
-                    try:
-                        _cn_diag_root = getattr(module, "CUSTOM_NODES_PATH", "")
-                        if _cn_diag_root and os.path.isdir(_cn_diag_root):
-                            _cn_diag = module.custom_node_filter_diagnostics(_cn_diag_root)
-                            print(
-                                "[v2.custom_node_filter] "
-                                f"total_source_dirs={_cn_diag['total_source_dirs']} "
-                                f"accepted_dirs={_cn_diag['accepted_dirs']} "
-                                f"duplicate_comfymodal_dirs={_cn_diag['duplicate_comfymodal_dirs']} "
-                                f"duplicate_names={_cn_diag['duplicate_names_bounded']}",
-                                flush=True,
-                            )
-                    except Exception:
-                        pass
-                    _current_generation, _current_source = (
-                        module._resolve_custom_nodes_generation(
-                            api=api, authoritative_only=True
-                        )
-                    )
-                    _current_generation = str(_current_generation or "")
-                if _baked_generation and _current_generation:
-                    if _baked_generation == _current_generation:
-                        print(
-                            "[v2.custom_node_startup] "
-                            "decision=snapshot_exact_skip callback_called=0 "
-                            f"source={_current_source} "
-                            f"generation={_current_generation[:16]}",
-                            flush=True,
-                        )
-                        if _construction:
-                            # Fast-path parity event only: keep this branch O(1)
-                            # (no content hashing; actuals stay "").  The
-                            # persisted record is not rewritten here — the
-                            # deploy-time publication lane owns the volume
-                            # mirror.  The proof still fails closed when
-                            # baked != persisted.
-                            try:
-                                from comfymodal_runtime.custom_node_parity import (
-                                    build_parity_report,
-                                    format_parity_line,
-                                )
-                                _parity_report = build_parity_report(
-                                    baked_generation=_baked_generation,
-                                    persisted_generation=_current_generation,
-                                    pre_sync_actual_generation="",
-                                    post_sync_actual_generation="",
-                                    persisted_source=_current_source,
-                                    sync_performed=False,
-                                    sync_direction="none",
-                                    sync_reason="exact_match",
-                                )
-                                print(format_parity_line(_parity_report), flush=True)
-                            except Exception:
-                                pass
-                        return (
-                            {
-                                "created": [],
-                                "removed": [],
-                                "kept": [],
-                                "blocked": [],
-                                "skipped": True,
-                                "skip_reason": "snapshot_exact_generation",
-                            },
-                            getattr(api, "_custom_nodes_state", ()),
-                        )
-                    # Generation mismatch: the volume is authoritative and
-                    # differs from the image bake, so run the idempotent
-                    # full sync.  Deliberately no content re-fingerprinting
-                    # here: hashing every source file of every custom node
-                    # from the cold volume mount cost ~86s per snapshot
-                    # boot (custom_node_source_copy stage) while the sync
-                    # itself is a ~3s symlink pass.  The persisted
-                    # generation record is already content-derived and
-                    # maintained by the local volume sync / image build.
-                    _fallback_reason = "generation_mismatch"
-                elif not _baked_generation:
-                    _fallback_reason = "baked_generation_missing"
-                elif not _current_generation:
-                    _fallback_reason = "current_generation_missing"
-            except Exception as _startup_identity_exc:
-                _fallback_reason = type(_startup_identity_exc).__name__
-            print(
-                "[v2.custom_node_startup] decision=fallback_full_sync "
-                "callback_called=1 "
-                f"reason={_fallback_reason} "
-                f"baked_generation={_baked_generation[:16]} "
-                f"current_generation={_current_generation[:16]}",
-                flush=True,
-            )
-            if _construction:
-                # Construction-time parity reconciliation (content-verified).
-                # Hashes the custom-nodes source tree before and after the
-                # volume->container symlink sync so a stale persisted record
-                # can be repaired ONLY when the post-sync ACTUAL tree matches
-                # the image-baked generation.  Never blesses different code.
-                _parity_pre_sync_actual = ""
-                try:
-                    _parity_pre_sync_actual = str(
-                        module.custom_node_source_generation(module.CUSTOM_NODES_PATH)
-                        or ""
-                    )
-                except Exception:
-                    _parity_pre_sync_actual = ""
-                _sync_result = api._sync_custom_nodes_from_volume()
-                _parity_post_sync_actual = ""
-                try:
-                    _parity_post_sync_actual = str(
-                        module.custom_node_source_generation(module.CUSTOM_NODES_PATH)
-                        or ""
-                    )
-                except Exception:
-                    _parity_post_sync_actual = ""
-                # Content-verified stale-record repair: only when the post-sync
-                # ACTUAL tree generation is non-empty and differs from the
-                # persisted record AND equals the baked generation (i.e. the
-                # volume tree genuinely matches the deployed source; never
-                # bless different code).
-                if (
-                    _parity_post_sync_actual
-                    and _parity_post_sync_actual == _baked_generation
-                ):
-                    try:
-                        _rec = module._read_custom_nodes_generation_record() or {}
-                        if (
-                            str(_rec.get("content_generation", "") or "")
-                            != _parity_post_sync_actual
-                        ):
-                            module._write_custom_nodes_generation_record_no_commit(
-                                reason="v2_construction_reconcile",
-                                content_generation=_parity_post_sync_actual,
-                            )
-                            _vol = getattr(module, "custom_nodes_vol", None)
-                            if _vol is not None and callable(
-                                getattr(_vol, "commit", None)
-                            ):
-                                _vol.commit()
-                            _api_obj = api
-                            if _api_obj is not None:
-                                try:
-                                    _api_obj._custom_nodes_generation_seen = (
-                                        _parity_post_sync_actual
-                                    )
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                # Parity event: emitted ONLY during construction so the deploy
-                # log records baked vs persisted vs actual-tree generations
-                # and the predicted proof-freeze outcome (gen_ok=1).
-                try:
-                    from comfymodal_runtime.custom_node_parity import (
-                        build_parity_report,
-                        format_parity_line,
-                    )
-                    _parity_report = build_parity_report(
-                        baked_generation=_baked_generation,
-                        persisted_generation=_current_generation,
-                        pre_sync_actual_generation=_parity_pre_sync_actual,
-                        post_sync_actual_generation=_parity_post_sync_actual,
-                        persisted_source=_current_source,
-                        sync_performed=True,
-                        sync_direction="volume_to_container",
-                        sync_reason=_fallback_reason or "generation_mismatch",
-                    )
-                    print(format_parity_line(_parity_report), flush=True)
-                except Exception:
-                    pass
-                return _sync_result
-            return api._sync_custom_nodes_from_volume()
+        # Custom-node publication is manual: normal startup, restore, and
+        # request execution use the image-baked/snapshotted custom nodes and
+        # must not sync from the Volume (no reload, no auto-publish/repair).
 
         def install_requirements() -> Any:
             return api._install_custom_node_requirements()
@@ -10743,67 +10482,8 @@ class ModalRuntimeEntrypoint:
                 "custom_nodes_source": _cn_src,
             }
 
-        def read_current_custom_node_identity() -> dict[str, str]:
-            """Read current identity from a freshly reloaded custom-node Volume.
-
-            The API instance field may have been restored with the memory
-            snapshot, so it is never consulted for this restore decision.
-            Reloading the mounted Volume is intentional: the generation
-            record is the authoritative source and may not be replaced by a
-            network-free in-memory guess.
-            """
-            # A restore may perform this same authoritative read once for the
-            # Sage verifier before the custom-node guard.  Reuse the valid
-            # mounted result rather than reloading the same Volume; the sync
-            # callback remains the one-shot consumer below.
-            cached_identity = _peek_restore_custom_node_identity()
-            if cached_identity is not None:
-                return cached_identity
-            result: dict[str, str] = {
-                "custom_node_generation": "",
-                "generation_source": "unavailable",
-                "identity_read_reason": "unavailable",
-                "schema_version": "0",
-                "deployment_combined_hash": "",
-                "token": "",
-            }
-            try:
-                volume = getattr(module, "custom_nodes_vol", None)
-                reload_volume = getattr(volume, "reload", None)
-                if not callable(reload_volume):
-                    result["identity_read_reason"] = "volume_reload_unavailable"
-                    return result
-                reload_volume()
-                result["identity_read_reason"] = "mounted_volume_reloaded"
-                # authoritative_only excludes the snapshot-restored API field;
-                # this remains an O(1) generation-record read after reload.
-                cn_gen, cn_src = module._resolve_custom_nodes_generation(
-                    api=api,
-                    authoritative_only=True,
-                )
-                if cn_gen:
-                    result["custom_node_generation"] = str(cn_gen)
-                    result["generation_source"] = str(cn_src)
-                    result["schema_version"] = "1"
-                    result["deployment_combined_hash"] = _V2_DEPLOYMENT_COMBINED_HASH
-                    result["identity_read_reason"] = "mounted_volume_record"
-                else:
-                    result["identity_read_reason"] = "mounted_volume_record_missing"
-                # Capture API token
-                token = getattr(api, "_runtime_generation_seen", "")
-                if token:
-                    result["token"] = str(token)
-            except Exception as exc:
-                result["identity_read_reason"] = f"volume_identity_read_error:{type(exc).__name__}"
-            if (
-                getattr(self, "_restore_custom_node_identity_scope_active", False)
-                and _valid_restore_custom_node_identity(result)
-            ):
-                self._restore_custom_node_identity_cache = {
-                    "epoch": getattr(self, "_restore_custom_node_identity_epoch", None),
-                    "identity": dict(result),
-                }
-            return result
+        # Custom-node identity reads from the Volume are disabled on the
+        # normal path (publication is manual); RuntimeBootstrap receives None.
 
         config = self._config or BootstrapConfig(
             comfyui_root="/root/comfy/ComfyUI",
@@ -10819,7 +10499,9 @@ class ModalRuntimeEntrypoint:
             config,
             reload_models=reload_models,
             reload_runtime_state=reload_runtime_state,
-            sync_custom_nodes=sync_custom_nodes,
+            # Custom-node publication is manual: never sync from the Volume
+            # on the normal path; use image-baked/snapshotted nodes as-is.
+            sync_custom_nodes=None,
             install_requirements=install_requirements,
             start_backend=start_backend,
             restore_gpu_state=restore_gpu_state,
@@ -10837,7 +10519,7 @@ class ModalRuntimeEntrypoint:
             apply_sage_policy=apply_sage_policy,
             force_sage_selection_after_restore=restore_wide_sage_policy,
             observe_generations=observe_generations,
-            read_current_custom_node_identity=read_current_custom_node_identity,
+            read_current_custom_node_identity=None,
             deployment_combined_hash=_V2_DEPLOYMENT_COMBINED_HASH,
         )
         self.bootstrap._sage_baked_cuda_available = (
@@ -16936,9 +16618,14 @@ class ModalRuntimeEntrypoint:
                 and repair_summary.get("blocked_by_mode")
                 and repair_summary.get("missing_before")
             ):
+                # Custom-node publication is manual: fail closed with guidance;
+                # never auto-publish/sync/repair missing node types here.
                 raise RuntimeError(
-                    "Workflow references missing custom node class(es): "
-                    f"{repair_summary['missing_before']}. Runtime repair is disabled."
+                    "Required ComfyUI custom node type is unavailable in this deployed snapshot.\n"
+                    "\n"
+                    "Custom-node publishing is manual.\n"
+                    "Run the canonical custom-node publisher, then perform a fresh deploy/snapshot if required.\n"
+                    f"Missing: {repair_summary['missing_before']}"
                 )
 
             # Oracle Gate 2: if a cert skip occurred but the repair reports

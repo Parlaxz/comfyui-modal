@@ -184,10 +184,13 @@ class TestConsumptionGate(unittest.TestCase):
         self.assertIn("deployment_hash_mismatch", result["ineligible_reason"])
 
     def test_generation_mismatch(self):
-        result = _gate(parity=_full_parity(custom_nodes_generation_match=False, future_fast_path_eligible=False,
-                                           future_fast_path_ineligible_reason="custom_nodes_generation_mismatch"))
-        self.assertIs(result["eligible"], False)
-        self.assertIn("custom_nodes_generation_mismatch", result["ineligible_reason"])
+        # Manual publication policy: the whole custom-node generation is
+        # DIAGNOSTIC-only. The parity producer emits match=False with the
+        # fast path still eligible and no generation reason, so consumption
+        # stays eligible on a generation mismatch alone.
+        result = _gate(parity=_full_parity(custom_nodes_generation_match=False))
+        self.assertIs(result["eligible"], True)
+        self.assertEqual(result["ineligible_reason"], "")
 
     def test_workflow_registry_mismatch(self):
         result = _gate(parity=_full_parity(workflow_registry_match=False, future_fast_path_eligible=False,

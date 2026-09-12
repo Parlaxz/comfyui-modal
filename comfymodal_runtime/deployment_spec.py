@@ -308,8 +308,6 @@ def _validate_persisted_source_record(identity: DeploymentIdentity) -> None:
         raise ValueError("source identity runtime_hash is invalid")
     if not _is_sha256_hex(identity.dependency_hash):
         raise ValueError("source identity dependency_hash is invalid")
-    if not _is_sha256_hex(identity.custom_node_hash):
-        raise ValueError("source identity custom_node_hash is invalid")
 
     hashes = dict(identity.file_hashes)
     if not hashes:
@@ -332,8 +330,16 @@ def _validate_persisted_source_record(identity: DeploymentIdentity) -> None:
     }
     if compute_aggregate_hash(runtime_hashes) != identity.runtime_hash:
         raise ValueError("source identity runtime_hash does not match file_hashes")
-    if not custom_hashes or compute_aggregate_hash(custom_hashes) != identity.custom_node_hash:
-        raise ValueError("source identity custom_node_hash does not match file_hashes")
+    if not custom_hashes:
+        # Identities built without a custom-node tree walk carry an empty
+        # custom_node_hash and no custom_node_root_* file entries.
+        if identity.custom_node_hash != "":
+            raise ValueError("source identity custom_node_hash does not match file_hashes")
+    else:
+        if not _is_sha256_hex(identity.custom_node_hash):
+            raise ValueError("source identity custom_node_hash is invalid")
+        if compute_aggregate_hash(custom_hashes) != identity.custom_node_hash:
+            raise ValueError("source identity custom_node_hash does not match file_hashes")
     # Exact byte totals cannot be reconstructed from content digests.  This
     # lower bound is the only size relationship the persisted manifest proves.
     if identity.source_bytes < len(hashes):
@@ -424,7 +430,6 @@ def build_canonical_boundary_identity(
         source_identity.source_bytes <= 0
         or not source_identity.runtime_hash
         or not source_identity.dependency_hash
-        or not source_identity.custom_node_hash
     ):
         missing_inputs.append("source_identity")
     if source_identity is None and not source_inputs:

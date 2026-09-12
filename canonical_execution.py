@@ -1030,7 +1030,6 @@ def _compute_host_deployment_combined_hash() -> str:
         # The container call passes no dependency_hash (defaults to "").
         _identity = build_deployment_identity(
             runtime_root=_runtime_root,
-            custom_node_paths=[_custom_root],
         )
         _payload = runtime_shape_config().identity_payload()
         _HOST_DEPLOYMENT_HASH_COMPUTED = _stable_hash({

@@ -1868,18 +1868,23 @@ def _write_golden_deployment_receipt(
         if name in env
     }
     safe_env.update(deployment_flag_values)
-    identity = getattr(publication, "identity", None)
-    generation = str(getattr(identity, "generation", "") or "")
-    if not generation:
-        raise GateError("Golden deploy has no verified full-content S4 publication identity")
-    s4_identity = {
-        "generation": generation,
-        "identity_schema": getattr(identity, "identity_schema", None),
-        "packaging_policy_version": getattr(identity, "packaging_policy_version", None),
-        "file_count": getattr(identity, "file_count", None),
-        "total_bytes": getattr(identity, "total_bytes", None),
-        "manifest_digest": getattr(identity, "manifest_digest", None),
-    }
+    # Custom-node publication is fully manual: deploy carries no publication
+    # identity.  S4 fields stay empty when there is no publication; the manual
+    # `golden publish-custom-nodes` command owns publication separately.
+    identity = getattr(publication, "identity", None) if publication is not None else None
+    generation = str(getattr(identity, "generation", "") or "") if identity is not None else ""
+    if generation:
+        s4_identity: dict[str, Any] = {
+            "generation": generation,
+            "identity_schema": getattr(identity, "identity_schema", None),
+            "packaging_policy_version": getattr(identity, "packaging_policy_version", None),
+            "file_count": getattr(identity, "file_count", None),
+            "total_bytes": getattr(identity, "total_bytes", None),
+            "manifest_digest": getattr(identity, "manifest_digest", None),
+        }
+    else:
+        generation = ""
+        s4_identity = {}
     planned_path = receipt_mod.receipt_path(
         repo_root, deploy_identity.deploy_fingerprint, deployment_version
     )
@@ -2451,19 +2456,19 @@ def cmd_golden_status(args, repo_root: Path) -> int:
 
 def cmd_golden(args, repo_root: Path) -> int:
     """Dispatch the public Golden namespace to the canonical handlers."""
-    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap"}:
+    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
         print(
             "ERROR: public Golden commands are doctor, status, deploy, run, "
-            "and publisher-bootstrap",
+            "publisher-bootstrap, and publish-custom-nodes",
             file=sys.stderr,
         )
         return 2
     requested_profile = getattr(args, "profile", "production")
-    publisher_bootstrap = args.golden_command == "publisher-bootstrap"
+    publisher_command = args.golden_command in {"publisher-bootstrap", "publish-custom-nodes"}
     if (
         requested_profile != "production"
         and not is_golden_profile_name(requested_profile)
-        and not publisher_bootstrap
+        and not publisher_command
     ):
         print(
             f"ERROR: `golden` commands use profile {GOLDEN_P1_PROFILE!r}; "
@@ -2484,7 +2489,7 @@ def cmd_golden(args, repo_root: Path) -> int:
                 file=sys.stderr,
             )
             return 2
-    if requested_profile == "production" and not publisher_bootstrap:
+    if requested_profile == "production" and not publisher_command:
         args.profile = GOLDEN_P1_PROFILE
     args.golden_public = True
     if args.golden_command == "run":
@@ -2499,6 +2504,7 @@ def cmd_golden(args, repo_root: Path) -> int:
         "deploy": cmd_deploy,
         "run": cmd_run,
         "publisher-bootstrap": cmd_publisher_bootstrap,
+        "publish-custom-nodes": cmd_publish_custom_nodes,
     }
     handler = handlers.get(args.golden_command)
     if handler is None:
@@ -3037,7 +3043,7 @@ def _resolve_publication_generation(publication: object, desired: str) -> str:
 
 
 def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
-    """Deploy the shared custom-node ``comfyapp`` publisher."""
+    """Deploy the shared custom-node ``comfyapp`` publisher (compatibility)."""
     identity_error = _reject_golden_identity_args(args, public=True)
     if identity_error is not None:
         return identity_error
@@ -3182,6 +3188,80 @@ def cmd_publisher_bootstrap(args, repo_root: Path) -> int:
         return 1
 
 
+def _bootstrap_publisher_app(args, repo_root: Path) -> int:
+    """Shared helper: deploy the shared custom-node ``comfyapp`` publisher.
+
+    Single body shared by the ``publisher-bootstrap`` compatibility command
+    and the manual ``publish-custom-nodes`` command.
+    """
+    return cmd_publisher_bootstrap(args, repo_root)
+
+
+def cmd_publish_custom_nodes(args, repo_root: Path) -> int:
+    """Explicit manual custom-node publication (the only publishing entry).
+
+    Publication is fully manual: normal deploy/run/gate/confirm/doctor/
+    source-probe commands never compute content generation or publish.
+    This command ensures the shared publisher app exists (bootstrapping it
+    first when the probe shows it absent) and then runs the full verified
+    publication.  The destructive guard is only ever explicit CLI input.
+    """
+    identity_error = _reject_golden_identity_args(args, public=True)
+    if identity_error is not None:
+        return identity_error
+    try:
+        _, _, _, config, _, _, _ = _build_components_for_args(repo_root, args)
+        _reject_protected_effective_target(
+            config, command="v2ctl golden publish-custom-nodes"
+        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        if workspace_binding is None:
+            print(
+                "ERROR: publish-custom-nodes requires a canonical workspace binding",
+                file=sys.stderr,
+            )
+            return 1
+        if bool(getattr(args, "dry_run", False)):
+            print("[v2ctl.publish-custom-nodes] dry-run: no publication performed")
+            print(f"publisher_app={CUSTOM_NODES_PUBLISHER_APP_NAME}")
+            print(f"workspace={workspace_binding.workspace_id}")
+            return 0
+        preflight = run_publisher_preflight(repo_root, workspace_binding)
+        if (
+            not preflight.get("PUBLISHER_EXISTS")
+            or not preflight.get("PUBLISHER_FUNCTION_EXISTS")
+        ):
+            print(
+                "[v2ctl.publish-custom-nodes] publisher app/Function absent; "
+                "bootstrapping before publication"
+            )
+            bootstrapped = _bootstrap_publisher_app(args, repo_root)
+            if bootstrapped != 0:
+                return bootstrapped
+        decision = _publish_golden_custom_nodes(
+            repo_root,
+            CUSTOM_NODES_PUBLISHER_APP_NAME,
+            workspace_binding,
+            allow_destructive=bool(
+                getattr(args, "allow_destructive_custom_node_publication", False)
+            ),
+        )
+        action = str(getattr(decision, "action", "") or "")
+        reason = str(getattr(decision, "reason", "") or "")
+        generation = str(getattr(getattr(decision, "identity", None), "generation", "") or "")
+        skipped = bool(getattr(decision, "skip", False))
+        print(
+            f"[v2ctl.publish-custom-nodes] action={action or ('skip' if skipped else 'unknown')} "
+            f"reason={reason or 'unknown'} generation={generation[:16] or '(none)'}"
+        )
+        if skipped or action in {"published", "recovered", "skip"}:
+            return 0
+        return 1
+    except (V2CtlError, OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_deploy(args, repo_root: Path) -> int:
     identity_error = _reject_golden_identity_args(args)
     if identity_error is not None:
@@ -3210,9 +3290,6 @@ def cmd_deploy(args, repo_root: Path) -> int:
         spec = (
             backend_registry.native_deploy()
             if native_golden else backend_registry.deploy_only()
-        )
-        publisher_app_name: str | None = (
-            CUSTOM_NODES_PUBLISHER_APP_NAME if native_golden else None
         )
         env = env_builder.build(config, host_env=os.environ,
                                 backend_extra={**spec.deploy_only_env,
@@ -3257,86 +3334,22 @@ def cmd_deploy(args, repo_root: Path) -> int:
         try:
             print(f"[v2ctl.deploy] profile={config.profile_name}")
             print(f"[v2ctl.deploy] command={command}")
-            publication = None
+            # Custom-node publication is fully manual: deploy never computes
+            # the custom-node content generation, never runs the publisher
+            # preflight, and never publishes.  The source-probe expectation
+            # below is repo source identity recorded on the receipt, not
+            # custom-node content.
             source_probe_expected = None
-            final_publisher_preflight = None
-            desired_generation = ""
-            verified_generation = ""
-            resolved_generation = ""
             if native_golden:
-                assert publisher_app_name is not None
                 from . import source_probe as source_probe_mod
 
-                # Capture the exact source expectation before publication or
-                # backend work starts.
+                # Capture the exact source expectation before backend work.
                 source_probe_expected = source_probe_mod.compute_expected_local(repo_root)
-                publisher_preflight = None
-                desired_generation = (
-                    _local_content_generation(repo_root)
-                    if workspace_binding is not None else ""
-                )
-                if workspace_binding is not None:
-                    publisher_preflight = run_publisher_preflight(
-                        repo_root,
-                        workspace_binding,
-                        local_content_generation=desired_generation,
-                        require_ready=False,
-                    )
-                    if publisher_preflight["PUBLICATION_DECISION"] == "bootstrap_required":
-                        raise GateError(
-                            "consumer deploy is gated: publisher bootstrap is required"
-                        )
-                    if publisher_preflight["PUBLICATION_DECISION"] not in {
-                        "skip_exact", "publish_required"
-                    }:
-                        raise GateError(
-                            "consumer deploy is gated: publisher generation preflight is invalid"
-                        )
-                # This is deliberately inside the deploy lock and before both
-                # version capture and native Modal deployment.  A publication
-                # failure exits through the lock's finally block and prevents
-                # the backend from running.  The destructive override is only
-                # ever explicit CLI input: never inferred from git dirty state
-                # or any other ambient signal.
-                publication = _invoke_golden_publisher(
-                    repo_root,
-                    publisher_app_name,
-                    workspace_binding,
-                    desired_generation,
-                    allow_destructive=bool(
-                        getattr(args, "allow_destructive_custom_node_publication", False)
-                    ),
-                )
-                if workspace_binding is not None:
-                    # The verified publication is authoritative: a generation
-                    # calculated before publication may differ when the shared
-                    # custom-node tree changed mid-deploy, and must not block.
-                    verified_generation = _publication_verified_generation(publication)
-                    resolved_generation = _resolve_publication_generation(
-                        publication, desired_generation
-                    )
-                    if not verified_generation:
-                        verified_generation = resolved_generation
-                    final_publisher_preflight = run_publisher_preflight(
-                        repo_root,
-                        workspace_binding,
-                        local_content_generation=resolved_generation,
-                        require_ready=True,
-                    )
-                    _print_golden_predeploy_card(
-                        invocation_id,
-                        final_publisher_preflight,
-                        lock_state="RECOVERED" if lock.last_recovery else "CLEAR",
-                    )
-            # The final deploy fingerprint is captured only after the verified
-            # custom-node publication generation is resolved.
+            # The deploy fingerprint is captured at deploy time.
             deploy_identity = capture_deploy_identity(fingerprints, workspace_binding)
             _apply_deploy_identity_to_env(env, deploy_identity)
             print(
-                f"[v2ctl.deploy] desired_generation={desired_generation or '(none)'} "
-                f"verified_generation={verified_generation or '(none)'} "
-                f"resolved_generation={resolved_generation or '(none)'} "
-                f"fingerprint={deploy_identity.deploy_fingerprint}"
+                f"[v2ctl.deploy] fingerprint={deploy_identity.deploy_fingerprint}"
             )
             # ── Deploy-version-advance verification (E29 root-cause fix) ──
             # Capture the app's highest deployment version BEFORE the deploy
@@ -3377,7 +3390,6 @@ def cmd_deploy(args, repo_root: Path) -> int:
                 )
             manifest = write_deployment_manifest(
                 repo_root, config, fingerprints, env, result,
-                publication=publication,
                 deploy_identity=deploy_identity,
             )
             print(f"[v2ctl.deploy] exit={result.exit_code} manifest={manifest}")
@@ -3434,7 +3446,7 @@ def cmd_deploy(args, repo_root: Path) -> int:
                 if manifest.is_file():
                     receipt = _write_golden_deployment_receipt(
                         repo_root, config, env, deploy_identity, _post_version,
-                        manifest, publication,
+                        manifest, None,
                         source_probe_expected,
                     )
                     print(f"[v2ctl.deploy] deployment_receipt={receipt}")
@@ -3543,14 +3555,9 @@ def cmd_run(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="run")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                ack_drift = bool(getattr(args, "acknowledge_volume_drift", False))
-                if ack_drift:
-                    print(
-                        "[v2ctl.run] WARNING: operator acknowledged volume drift; "
-                        "skipping exact-content publisher preflight gate",
-                        file=sys.stderr,
-                    )
-                run_publisher_preflight(repo_root, workspace_binding, require_ready=not ack_drift)
+                # Custom-node publication is fully manual: run never computes
+                # content generation or gates on publication.  The
+                # --acknowledge-volume-drift flag is accepted as a no-op.
         # Run-only: refuse unregistered and deploy-required explicit changes.
         resolver.check_run_safety(
             config, run_only=True,
@@ -3782,7 +3789,8 @@ def cmd_gate(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="gate")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
+                # Custom-node publication is fully manual: gate never runs
+                # the publisher preflight or gates on publication.
         resolver.check_run_safety(
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
@@ -3919,7 +3927,8 @@ def cmd_confirm(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="confirm")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
+                # Custom-node publication is fully manual: confirm never runs
+                # the publisher preflight or gates on publication.
         resolver.check_run_safety(
             config, run_only=True,
             trusted_environment=(bound_receipt.effective_environment if bound_receipt else None),
@@ -4037,16 +4046,8 @@ def cmd_source_probe(args, repo_root: Path) -> int:
             if workspace_binding is not None:
                 _require_receipt_workspace(bound_receipt, workspace_binding, command="source-probe")
                 assert_workspace_binding_current(repo_root, workspace_binding)
-                publisher_state = run_publisher_preflight(
-                    repo_root, workspace_binding, require_ready=False
-                )
-                if not publisher_state.get("READY_FOR_CONSUMER_DEPLOY"):
-                    print(
-                        "[v2ctl.source-probe] WARNING: publisher content drift is "
-                        "recorded separately; continuing with immutable receipt "
-                        "and remote source identity probe",
-                        file=sys.stderr,
-                    )
+                # Custom-node publication is fully manual: source-probe never
+                # runs the publisher preflight.
         deploy_fp = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         expected_source = (
             bound_receipt.source_probe.get("expected") if bound_receipt is not None else None
@@ -4439,9 +4440,9 @@ def build_parser() -> argparse.ArgumentParser:
     gsub.add_parser("status", help="show local Golden readiness without backend calls").set_defaults(
         func=cmd_golden
     )
-    for name in ("doctor", "deploy", "run", "publisher-bootstrap"):
+    for name in ("doctor", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"):
         child = gsub.add_parser(name)
-        if name in {"deploy", "run", "publisher-bootstrap"}:
+        if name in {"deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
             # Visible on ``golden <command> --help`` while the existing
             # pre-parser continues to support root-option hoisting.
             # SUPPRESS is important: _hoist_global_options may already have
@@ -4454,9 +4455,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "--acknowledge-volume-drift",
                     action="store_true",
                     default=argparse.SUPPRESS,
-                    help="run despite local/Volume content-generation drift; "
-                    "deliberately skips the exact-content publisher preflight gate "
-                    "(operator accepts a stale shared Volume read)",
+                    help="accepted as a no-op for compatibility; publication is manual "
+                    "and run never gates on publisher content generation",
                 )
         child.set_defaults(func=cmd_golden)
 

@@ -326,11 +326,20 @@ class TestParityMatrix(unittest.TestCase):
         self.assertTrue(result["snapshot_proof_valid"])
 
     def test_parity_generation_mismatch(self):
+        # Manual publication policy: the whole custom-node generation is
+        # DIAGNOSTIC-only, never an eligibility gate. A generation mismatch
+        # still reports custom_nodes_generation_match=False but leaves the
+        # fast path eligible with no generation reason.
         result = evaluate_plan_snapshot_parity(
             _full_plan_identity(custom_nodes_generation="gen_other"), _full_proof()
         )
-        self.assertIs(result["future_fast_path_eligible"], False)
-        self.assertIn("custom_nodes_generation_mismatch", result["future_fast_path_ineligible_reason"])
+        self.assertIs(result["custom_nodes_generation_match"], False)
+        self.assertIs(result["future_fast_path_eligible"], True)
+        self.assertEqual(result["future_fast_path_ineligible_reason"], "")
+        self.assertNotIn(
+            "custom_nodes_generation_mismatch",
+            result["future_fast_path_ineligible_reason"],
+        )
 
     def test_parity_deployment_hash_mismatch(self):
         result = evaluate_plan_snapshot_parity(

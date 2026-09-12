@@ -1352,15 +1352,15 @@ class RuntimeBootstrap:
             if trace:
                 trace.emit("reload_runtime_state_end", phase="startup")
 
-            if trace:
-                trace.emit("sync_custom_nodes_start", phase="startup")
-            with variance_stage(trace, stage="custom_node_source_copy", phase="startup"):
-                _custom_node_copy_started = _emit_startup_stage("custom_node_source_copy", "start", trace=trace)
-                if self.sync_custom_nodes:
-                    self.sync_custom_nodes()
-                _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
-            if trace:
-                trace.emit("sync_custom_nodes_end", phase="startup")
+            # Manual publication policy: normal runtime startup must NOT
+            # sync, reconcile, publish, or Volume.reload custom nodes, and
+            # must NOT gate on the whole custom-node publication generation.
+            # The runtime uses the custom nodes already present
+            # (image-baked/snapshotted).
+            print(
+                "[v2.custom_node_startup] decision=manual_publication sync_called=0",
+                flush=True,
+            )
 
             # ── Batch A: freeze the models-volume generation baseline ──
             # O(1) local read of models_generation.json (custom-nodes
@@ -2126,26 +2126,15 @@ class RuntimeBootstrap:
             _sage_verify_ok = False
             _sage_verify_ms = 0.0
             if self.state.snapshot_sage_identity:
-                # Measurement-only bracket: the identity READ only; the verify
-                # duration below (_sage_verify_ms) is kept as-is.
-                _opt_sage_read_t0 = time.perf_counter()
-                _sage_current_identity = (
-                    self.read_current_custom_node_identity()
-                    if self.read_current_custom_node_identity is not None
-                    else {}
-                )
-                _opt_sage_identity_read_ms = round((time.perf_counter() - _opt_sage_read_t0) * 1000, 3)
-                emit_opt(
-                    trace,
-                    "restore_sage_identity_read_ms",
-                    phase="restore",
-                    metadata={"duration_ms": _opt_sage_identity_read_ms},
-                )
+                # Manual publication policy: do NOT read the current
+                # custom-node identity here — the injected reader reloads the
+                # custom-node Volume.  Use an empty identity so the verify
+                # below falls back to the snapshot's frozen
+                # snapshot_custom_node_generation /
+                # deployment_combined_hash values.
+                _sage_current_identity: dict[str, Any] = {}
                 _sage_t0 = time.perf_counter()
-                _sage_verify_ok = bool(
-                    not self.read_current_custom_node_identity
-                    or _sage_current_identity.get("custom_node_generation")
-                ) and _verify_sage_snapshot_identity(
+                _sage_verify_ok = _verify_sage_snapshot_identity(
                     snapshot_identity=self.state.snapshot_sage_identity,
                     current_custom_node_generation=str(
                         _sage_current_identity.get(
@@ -2439,173 +2428,32 @@ class RuntimeBootstrap:
                 metadata={"duration_ms": _opt_prescan_identity_ms},
             )
 
-            # ── Lane B: custom-node restore fast path (authoritative-only) ──
-            # Reads current authoritative-only identity and compares schema,
-            # generation, and deployment hash against the snapshot identity.
-            # Exact match skips sync_custom_nodes, observe_generations, and
-            # fingerprint/hash scans.
-            _check_start = time.perf_counter()
-            _skipped_cn_sync = False
-            _cn_decision = "snapshot_exact_skip"
-            _cn_fallback_reason = ""
-
-            _current_source = "unavailable"
-            _current_identity_reason = "unavailable"
-            if self.read_current_custom_node_identity and self.sync_custom_nodes:
-                current = self.read_current_custom_node_identity()
-                if not isinstance(current, Mapping):
-                    current = {}
-                    _current_identity_reason = "invalid_identity_shape"
-                else:
-                    _current_identity_reason = str(
-                        current.get("identity_read_reason", "") or "unavailable"
-                    )
-                _current_gen = str(current.get("custom_node_generation", "") or "")
-                _current_schema = str(current.get("schema_version", "0") or "0")
-                _current_dep_hash = str(current.get("deployment_combined_hash", "") or "")
-                _current_source = str(
-                    current.get("generation_source", "unavailable") or "unavailable"
-                )
-
-                if not _current_gen:
-                    _cn_fallback_reason = "missing_current_token"
-                    _cn_decision = "fallback_full_sync"
-                # Only an explicitly mounted-record source can authorize an
-                # exact skip; a snapshot-restored API field cannot.
-                elif _current_source not in {
-                    "persisted_record",
-                    "mounted_volume_record",
-                    "volume_record",
-                }:
-                    _cn_fallback_reason = "untrusted_source"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.snapshot_custom_node_schema and _current_schema != self.state.snapshot_custom_node_schema:
-                    _cn_fallback_reason = "schema_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.snapshot_custom_node_generation and _current_gen != self.state.snapshot_custom_node_generation:
-                    _cn_fallback_reason = "generation_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.deployment_combined_hash and _current_dep_hash != self.state.deployment_combined_hash:
-                    _cn_fallback_reason = "deployment_hash_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif not self.state.has_snapshot_custom_node_identity():
-                    _cn_fallback_reason = "untrusted_source"
-                    _cn_decision = "fallback_full_sync"
-                else:
-                    _skipped_cn_sync = True
-            elif self.state.has_prescan_identity() and self.sync_custom_nodes:
-                # Legacy prescan identity is snapshot state, not a fresh
-                # mounted-record read.  It cannot authorize an exact skip.
-                _current_source = "prescan_identity"
-                _cn_fallback_reason = "authoritative_reader_unavailable"
-                _cn_decision = "fallback_full_sync"
-
-            # Step-2: a fallback full-sync means the snapshot's canonical
-            # deployment-static proof no longer describes the current custom
-            # node set — mark it stale (instrumentation only, no decision
-            # changes; the exact-skip branch above never marks stale).
-            if _cn_fallback_reason:
-                self.state.mark_validation_proof_stale(f"custom_node_{_cn_fallback_reason}")
-
-            _check_ms = round((time.perf_counter() - _check_start) * 1000, 3)
-            # Measurement-only: attach the already-computed identity-check
-            # duration to the decomposition (reused, not re-bracketed).
-            _opt_custom_node_check_ms = _check_ms
-            emit_opt(
-                trace,
-                "restore_custom_node_check_ms",
-                phase="restore",
-                metadata={
-                    "duration_ms": _check_ms,
-                    "decision": _cn_decision,
-                    "skipped_sync": int(bool(_skipped_cn_sync)),
-                    "fallback_reason": _cn_fallback_reason,
-                    "current_source": _current_source,
-                    "identity_read_reason": _current_identity_reason,
+            # ── Lane B: custom-node restore (manual publication policy) ──
+            # Normal restore must NOT sync, reconcile, publish, or
+            # Volume.reload custom nodes, and must NOT gate on the whole
+            # custom-node publication generation.  The runtime uses the
+            # custom nodes already present (image-baked/snapshotted).
+            # In particular this block must NOT call
+            # self.read_current_custom_node_identity() (it reloads the
+            # custom-node Volume) and must NOT call self.sync_custom_nodes().
+            if self.state.snapshot_custom_node_generation:
+                self.state.custom_node_generation = self.state.snapshot_custom_node_generation
+            print(
+                "[v2.custom_node_restore] decision=manual_publication callback_called=0",
+                flush=True,
+            )
+            self._record_restore_stage(
+                "sync_custom_nodes",
+                "skipped",
+                trace=trace,
+                decision="manual_publication",
+                reason="manual_publication",
+                callback_called=False,
+                guard={
+                    "decision": "manual_publication",
+                    "reason": "manual_publication",
                 },
             )
-
-            _cn_callback_called = not _skipped_cn_sync and self.sync_custom_nodes is not None
-            _cn_classification = (
-                "skipped" if _skipped_cn_sync
-                else ("reloaded" if _cn_callback_called else "unknown")
-            )
-            _cn_guard = {
-                "decision": _cn_decision,
-                "reason": _cn_fallback_reason or ("exact_match" if _skipped_cn_sync else "unconditional"),
-                "current_source": _current_source,
-                "identity_read_reason": _current_identity_reason,
-            }
-            try:
-                with variance_stage(trace, stage="custom_node_sync", phase="restore"):
-                    if _skipped_cn_sync:
-                        print(
-                            f"[v2.custom_node_restore] "
-                            f"decision={_cn_decision} "
-                            f"callback_called=0 "
-                            f"source={_current_source} "
-                            f"identity_reason={_current_identity_reason} "
-                            f"check_ms={_check_ms}",
-                            flush=True,
-                        )
-                    else:
-                        if _cn_fallback_reason:
-                            print(
-                                f"[v2.custom_node_restore] "
-                                f"decision={_cn_decision} "
-                                f"callback_called=1 "
-                                f"source={_current_source if _current_source else 'unavailable'} "
-                                f"identity_reason={_current_identity_reason} "
-                                f"check_ms={_check_ms} "
-                                f"reason={_cn_fallback_reason}",
-                                flush=True,
-                            )
-                        if trace:
-                            trace.emit("sync_custom_nodes_start", phase="restore")
-                        try:
-                            if self.sync_custom_nodes:
-                                self.sync_custom_nodes()
-                        finally:
-                            if trace:
-                                trace.emit("sync_custom_nodes_end", phase="restore")
-            except Exception:
-                _cn_classification = "unknown"
-                raise
-            finally:
-                self._record_restore_stage(
-                    "sync_custom_nodes",
-                    _cn_classification,
-                    trace=trace,
-                    decision=_cn_decision,
-                    reason=_cn_guard["reason"],
-                    callback_called=_cn_callback_called,
-                    guard=_cn_guard,
-                )
-            with variance_stage(trace, stage="generation_observe", phase="restore"):
-                if not _skipped_cn_sync:
-                    if trace:
-                        trace.emit("observe_generations_start", phase="restore")
-                    if self.observe_generations:
-                        observed = self.observe_generations() or {}
-                        self.state.runtime_generation = str(observed.get("runtime_state", ""))
-                        self.state.custom_node_generation = str(observed.get("custom_nodes", ""))
-                    if trace:
-                        trace.emit("observe_generations_end", phase="restore")
-                    if self.state.custom_node_generation:
-                        self.state.snapshot_custom_node_generation = self.state.custom_node_generation
-                        self.state.snapshot_custom_node_source = "observe_generations"
-                        try:
-                            self._persist_custom_node_identity_record()
-                        except Exception as _pexc:
-                            print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
-                        # Step-2: the re-frozen identity records post-sync
-                        # state, so the frozen proof is stale by definition
-                        # when a fallback sync ran (guarded on reason — the
-                        # exact-skip path never reaches here).
-                        if _cn_fallback_reason:
-                            self.state.mark_validation_proof_stale(f"custom_node_{_cn_fallback_reason}")
-                else:
-                    self.state.custom_node_generation = self.state.snapshot_custom_node_generation
 
             # Lane B — build/hydrate SnapshotExecutionSeed (Step 3)
             # Hydrate the persisted publisher seed payload when available;

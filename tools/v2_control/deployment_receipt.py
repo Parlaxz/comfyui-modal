@@ -309,8 +309,9 @@ class DeploymentReceipt:
                         )
             if self.s4_identity and self.s4_identity.get("generation") != self.s4_generation:
                 raise GateError("deployment receipt S4 generation identity mismatch")
-            if not self.s4_generation or not self.s4_identity.get("manifest_digest"):
-                raise GateError("deployment receipt full-content S4 identity is incomplete")
+            # Custom-node publication is fully manual: the S4 publication
+            # identity is optional.  Mismatch still fails when a publication
+            # block is present, but an absent publication is valid.
 
 
 def receipt_path(

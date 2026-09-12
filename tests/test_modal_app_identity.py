@@ -1922,18 +1922,37 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
 
 
 class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
-    """The restore skip is authorized only by an explicit mounted-record source."""
+    """Restore never syncs custom nodes (manual publication policy)."""
 
     @staticmethod
     def _bootstrap(current: dict[str, str]):
         calls: list[str] = []
+        read_calls: list[str] = []
+        def _read():
+            read_calls.append("read")
+            return dict(current)
         bootstrap = RuntimeBootstrap(
             sync_custom_nodes=lambda: calls.append("sync"),
-            read_current_custom_node_identity=lambda: dict(current),
+            read_current_custom_node_identity=_read,
         )
         bootstrap.state.snapshot_custom_node_generation = "mounted-generation"
         bootstrap.state.snapshot_custom_node_schema = "1"
+        bootstrap._read_calls = read_calls  # type: ignore[attr-defined]
         return bootstrap, calls
+
+    def _assert_manual_publication_skip(self, bootstrap, calls):
+        # Manual publication: restore never syncs, never reads the Volume
+        # identity, and never gates on the publication generation.
+        self.assertEqual(calls, [])
+        self.assertEqual(getattr(bootstrap, "_read_calls", []), [])
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications["sync_custom_nodes"],
+            "skipped",
+        )
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"],
+            {"decision": "manual_publication", "reason": "manual_publication"},
+        )
 
     def test_snapshot_stale_instance_cannot_skip(self):
         bootstrap, calls = self._bootstrap(
@@ -1944,11 +1963,7 @@ class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
             }
         )
         bootstrap.restore()
-        self.assertEqual(calls, ["sync"])
-        self.assertEqual(
-            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"]["reason"],
-            "untrusted_source",
-        )
+        self._assert_manual_publication_skip(bootstrap, calls)
 
     def test_exact_mounted_record_skips(self):
         bootstrap, calls = self._bootstrap(
@@ -1959,11 +1974,7 @@ class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
             }
         )
         bootstrap.restore()
-        self.assertEqual(calls, [])
-        self.assertEqual(
-            bootstrap.state.restore_stage_classifications["sync_custom_nodes"],
-            "skipped",
-        )
+        self._assert_manual_publication_skip(bootstrap, calls)
 
     def test_mounted_generation_mismatch_reloads(self):
         bootstrap, calls = self._bootstrap(
@@ -1974,15 +1985,11 @@ class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
             }
         )
         bootstrap.restore()
-        self.assertEqual(calls, ["sync"])
-        self.assertEqual(
-            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"]["reason"],
-            "generation_mismatch",
-        )
+        self._assert_manual_publication_skip(bootstrap, calls)
 
 
 class TestModalCustomNodeRestoreReloadHandoff(unittest.TestCase):
-    """The restore identity read is reused by exactly one fallback sync."""
+    """Manual publication: the normal path wires no Volume identity read/sync."""
 
     @staticmethod
     def _configured_entry(current_generation: str):
@@ -2029,36 +2036,34 @@ class TestModalCustomNodeRestoreReloadHandoff(unittest.TestCase):
     def test_exact_match_reuses_read_and_skips_sync(self):
         entry, reloads, syncs = self._configured_entry("baked-generation")
 
-        identity = entry.bootstrap.read_current_custom_node_identity()
-        result = entry.bootstrap.sync_custom_nodes()
-
-        self.assertEqual(identity["custom_node_generation"], "baked-generation")
-        self.assertEqual(reloads, ["reload"])
+        # Manual publication: no Volume identity reader or sync callback is
+        # wired on the normal path, so no reload/sync can occur.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
+        self.assertEqual(reloads, [])
         self.assertEqual(syncs, [])
-        self.assertTrue(result[0]["skipped"])
 
     def test_mismatch_fallback_does_one_reload(self):
         entry, reloads, syncs = self._configured_entry("mounted-generation")
 
-        entry.bootstrap.read_current_custom_node_identity()
-        result = entry.bootstrap.sync_custom_nodes()
-
-        self.assertEqual(reloads, ["reload"])
-        self.assertEqual(syncs, ["sync"])
-        self.assertEqual(result, {"synced": True})
+        # Manual publication: a generation mismatch no longer triggers a
+        # Volume reload or a fallback sync; snapshot nodes are used as-is.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
+        self.assertEqual(reloads, [])
+        self.assertEqual(syncs, [])
 
     def test_cache_resets_between_restore_epochs(self):
         entry, reloads, syncs = self._configured_entry("mounted-generation")
 
-        entry.bootstrap.read_current_custom_node_identity()
-        entry.bootstrap.sync_custom_nodes()
+        # Manual publication: there is no per-epoch identity cache to reset
+        # because no Volume identity read happens on the normal path.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
         entry._restore_custom_node_identity_epoch = 2
         entry._restore_custom_node_identity_cache = None
-        entry.bootstrap.read_current_custom_node_identity()
-        entry.bootstrap.sync_custom_nodes()
-
-        self.assertEqual(reloads, ["reload", "reload"])
-        self.assertEqual(syncs, ["sync", "sync"])
+        self.assertEqual(reloads, [])
+        self.assertEqual(syncs, [])
 
 
 # ── Sync actual-sync generation record creation ──────────────────────

@@ -18,12 +18,15 @@ from comfymodal_runtime.deployment_spec import (
     EXCLUDED_INFIXES,
     EXCLUDED_PREFIXES,
     GENERATED_JSON_PREFIXES,
+    build_canonical_boundary_identity,
     build_deployment_identity,
     compute_aggregate_hash,
     compute_file_hashes,
     compute_source_bytes,
+    deployment_identity_from_dict,
     is_excluded_path,
     is_excluded_name,
+    validate_persisted_identity_pair,
 )
 from comfymodal_runtime import publication_policy
 
@@ -437,6 +440,34 @@ class TestBuildDeploymentIdentity(unittest.TestCase):
         id2 = build_deployment_identity(self.tmp_path)
         self.assertEqual(id1.combined_hash, id2.combined_hash)
         self.assertEqual(id1.to_dict(), id2.to_dict())
+
+
+class TestEmptyCustomNodeHashBoundary(unittest.TestCase):
+    """Identities built without a custom-node tree walk still round-trip."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_empty_custom_node_hash_passes_boundary_and_persisted_roundtrip(self):
+        (self.tmp_path / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+        source_identity = build_deployment_identity(
+            self.tmp_path, dependency_hash="d" * 64
+        )
+        self.assertEqual(source_identity.custom_node_hash, "")
+        canonical = build_canonical_boundary_identity(
+            source_identity=source_identity,
+            foundation_inputs={"foundation": "stable"},
+            dependency_inputs={"dependency": "stable"},
+            accelerator_inputs={"accelerator": "stable"},
+            late_config_inputs={"late": "stable"},
+        )
+        persisted = source_identity.with_deployment_hash(canonical.deployment)
+        restored = deployment_identity_from_dict(persisted.to_dict())
+        validate_persisted_identity_pair(restored, canonical)
 
 
 class TestComputeHelpers(unittest.TestCase):

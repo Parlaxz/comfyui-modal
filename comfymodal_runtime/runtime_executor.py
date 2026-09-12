@@ -138,7 +138,11 @@ def seed_identity_decision(
     * Deployment identity — when the seed records a deployment hash, the
       request must supply an EQUAL deployment hash.  Missing request hash is
       fail-closed (unverifiable).
-    * Custom-node generation — same rule as deployment identity.
+    * Custom-node generation — IGNORED (manual publication policy).  The
+      ``custom_node_generation`` parameter is accepted for signature
+      compatibility but never influences the decision; the runtime uses the
+      custom nodes already present (image-baked/snapshotted) and must NOT
+      gate seed reuse on the whole custom-node publication generation.
 
     No exception is raised on mismatch; the caller decides how to surface it.
     """
@@ -182,13 +186,10 @@ def seed_identity_decision(
         elif str(deployment_combined_hash) != seed_deployment:
             reasons.append("deployment_hash_mismatch")
 
-    # ── Custom-node generation (fail-closed when unverifiable) ──
-    seed_custom_node = str(seed.custom_node_generation or "")
-    if seed_custom_node:
-        if not custom_node_generation:
-            reasons.append("custom_node_generation_unverifiable")
-        elif str(custom_node_generation) != seed_custom_node:
-            reasons.append("custom_node_generation_mismatch")
+    # ── Custom-node generation: IGNORED (manual publication policy) ──
+    # Seed reuse must NOT gate on the whole custom-node publication
+    # generation.  ``custom_node_generation`` is accepted for signature
+    # compatibility only.  Workflow-hash and deployment-hash checks stay.
 
     status = _SEED_DECISION_MATCH if not reasons else _SEED_DECISION_MISMATCH
     return {
