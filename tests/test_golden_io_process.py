@@ -60,11 +60,18 @@ def test_child_roundtrip_exact_and_cuda_sterile(tmp_path):
 
         # The child must remain CUDA-sterile from spawn through reads.
         probe = worker.probe()
+        assert probe["A_child_alive"] is True
+        assert probe["A_child_exists_os_kill0"] is True
+        assert probe["B_pipe_works"] is True
         assert probe["pid_match"] is True
-        assert probe["child_cuda_initialized"] is False
-        assert probe["child_cuda_tasks_run"] == 0
-        assert probe["child_gpu_alloc_bytes"] == 0
+        assert probe["child"]["pid"] == worker.pid
+        assert probe["child"]["cuda_initialized"] is False
+        assert probe["child"]["cuda_tasks_run"] == 0
+        assert probe["child"]["gpu_alloc_bytes"] == 0
+        assert probe["C_parent_shm_ok"] is True
+        assert probe["C_child_shm_ok"] is True
         assert probe["spawn_count"] == 1
+        assert probe["spawn_count_match"] is True
 
         # shared -> pinned accounting reflects the real copied bytes.
         assert worker.shared_to_pinned_bytes == len(data) + 4096

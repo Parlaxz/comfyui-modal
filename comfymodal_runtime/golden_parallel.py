@@ -100,10 +100,31 @@ async def golden_parallel_execute(
 
         loader_process_active = loader_process_enabled()
         presnapshot_active = presnapshot_loader_enabled()
+        from .golden_io_process import io_process_enabled as _io_process_enabled
+        _io_process_active = _io_process_enabled()
         # No task is created here on purpose.  This is the P1 parallel control
         # plane and evidence foundation; overlap belongs to a later change.
         with _golden_trace_span("golden_parallel_execute"):
             await golden_restore(session)
+        if _io_process_active:
+            # Diagnostic probe BEFORE the first CLIP/model read: report exactly
+            # which of {child, control Pipe, shared ring} survived restore.
+            import json as _json
+            from .golden_io_process import io_process_probe
+            _io_probe = io_process_probe(
+                anchor_monotonic_ns=_stage_entry_ns(session, "golden_restore"),
+            )
+            session.recorder.event("golden_io_process_probe", **_io_probe)
+            print(
+                "[v2.golden_io_process.probe] "
+                + _json.dumps(_io_probe, sort_keys=True, default=str)[:1800],
+                flush=True,
+            )
+            if not _io_probe.get("ok"):
+                raise RuntimeError(
+                    "golden_io_worker_probe_failed:"
+                    + str(_io_probe.get("error") or "child/pipe/shm not survived")
+                )
         if presnapshot_active:
             # Fail closed: never replace a missing/dead pre-snapshot worker.
             probe_evidence = _presnapshot_worker_probe(

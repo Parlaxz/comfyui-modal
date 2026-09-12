@@ -93,6 +93,13 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
 
     shm = shared_memory.SharedMemory(name=shm_name)
     buf = shm.buf
+    canary = b"io-ring-canary"
+    # Pre-capture canary used only to test whether the segment survives the
+    # snapshot (14 bytes; negligible dirt relative to an 8x32MiB ring).
+    try:
+        memoryview(buf)[0 : len(canary)] = canary
+    except Exception:
+        pass
     cuda_initialized = False
     cuda_tasks_run = 0
     gpu_alloc_bytes = 0
@@ -106,6 +113,7 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
             if op == "ping":
                 conn.send({
                     "op": "pong",
+                    "nonce": msg.get("nonce"),
                     "pid": os.getpid(),
                     "ppid": os.getppid(),
                     "uuid": msg.get("uuid"),
@@ -120,6 +128,17 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                 mv = memoryview(buf)
                 mv[0: len(b"io-canary")] = b"io-canary"
                 conn.send({"op": "canary_ok", "marker": marker})
+            elif op == "shm_check":
+                marker = int(msg.get("marker") or 0)
+                ok = False
+                try:
+                    probe = f"io-probe-{marker}-{os.getpid()}".encode()
+                    mv = memoryview(buf)
+                    mv[0 : len(probe)] = probe
+                    ok = bytes(mv[0 : len(probe)]) == probe
+                except Exception:
+                    ok = False
+                conn.send({"op": "shm_ok", "marker": marker, "canary_ok": bool(ok)})
             elif op == "read":
                 path = str(msg["path"])
                 offset = int(msg["offset"])
@@ -237,17 +256,24 @@ class GoldenIoProcess:
         self._proc_start_ticks = _proc_start_ticks(self._pid)
         self._conn_fileno = _safe_fileno(parent_conn)
         self._child_fileno = pong.get("conn_fileno")
-        return {
+        self._pre_capture = {
             "pid": self._pid,
             "uuid": self._uuid,
+            "ppid": pong.get("ppid"),
+            "conn_fileno": self._conn_fileno,
+            "child_fileno": self._child_fileno,
+            "proc_start_ticks": self._proc_start_ticks,
+            "spawn_count": self.spawn_count,
             "shm_name": self._shm.name,
+            "shm_bytes": IO_SLOTS * IO_SLOT_BYTES,
+            "spawn_context": "torch.multiprocessing.spawn",
+        }
+        return {
+            **self._pre_capture,
             "slot_count": IO_SLOTS,
             "slot_bytes": IO_SLOT_BYTES,
             "ring_bytes": IO_SLOTS * IO_SLOT_BYTES,
             "startup_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            "conn_fileno": self._conn_fileno,
-            "child_fileno": self._child_fileno,
-            "proc_start_ticks": self._proc_start_ticks,
             "pong": pong,
         }
 
@@ -257,28 +283,127 @@ class GoldenIoProcess:
             raise RuntimeError("golden_io_worker_ping_timeout")
         return dict(self._conn.recv())
 
-    def probe(self, *, anchor_monotonic_ns: Optional[int] = None) -> dict:
-        """Prove the same child + IPC + shared ring survived snapshot restore."""
-        started = time.monotonic_ns()
-        pong = self.ping(timeout=10.0)
-        # Shared-memory round trip: write the canary again and confirm readiness.
-        self._conn.send({"op": "canary", "marker": 1})
-        canary_ok = bool(self._conn.poll(10.0)) and dict(self._conn.recv()).get("op") == "canary_ok"
+    def probe(self, *, anchor_monotonic_ns: Optional[int] = None, timeout_s: float = 15.0) -> dict:
+        """Diagnose A/B/C survival: child, control Pipe, shared ring.
+
+        Never touches the payload read path and never respawns the child.
+        """
+        pre = dict(getattr(self, "_pre_capture", {}) or {})
+        ev: dict = {
+            "anchor_monotonic_ns": anchor_monotonic_ns,
+            "pre_capture": pre,
+            "spawn_count": self.spawn_count,
+            "spawn_count_match": self.spawn_count == int(pre.get("spawn_count") or -1),
+        }
+        # --- A. child process survival ---
+        alive = bool(self._proc is not None and self._proc.is_alive())
+        pid = self._pid
+        exists = None
+        if pid:
+            try:
+                os.kill(int(pid), 0)
+                exists = True
+            except Exception:
+                exists = False
+        ev.update({
+            "A_child_is_alive": alive,
+            "A_child_pid": pid,
+            "A_child_exists_os_kill0": exists,
+            "A_child_exitcode": self._proc.exitcode if self._proc is not None else None,
+            "A_proc_start_ticks_now": _proc_start_ticks(pid),
+        })
+        if not alive or not exists:
+            ev.update({"A_child_alive": False, "ok": False, "error": "child_dead"})
+            return ev
+        ev["A_child_alive"] = True
+
+        # --- B. control Pipe survival (PING/PONG only; no payload path) ---
+        nonce = uuid.uuid4().hex
+        try:
+            self._conn.send({"op": "ping", "uuid": self._uuid, "nonce": nonce})
+        except Exception as exc:  # noqa: BLE001
+            ev.update({"B_pipe_works": False, "ok": False,
+                       "error": f"ping_send_failed:{type(exc).__name__}:{exc}"[:200]})
+            return ev
+        pong = None
+        deadline = time.monotonic() + float(timeout_s)
+        while time.monotonic() < deadline:
+            if self._conn.poll(0.25):
+                try:
+                    pong = self._conn.recv()
+                except Exception as exc:  # noqa: BLE001
+                    ev.update({"B_pipe_works": False, "ok": False,
+                               "error": f"recv_failed:{type(exc).__name__}:{exc}"[:200]})
+                    return ev
+                break
+        if not isinstance(pong, dict) or pong.get("op") != "pong" or pong.get("nonce") != nonce:
+            ev.update({"B_pipe_works": False, "ok": False,
+                       "error": f"pong_invalid:{str(pong)[:160]}"})
+            return ev
+        ev["B_pipe_works"] = True
+        ev["B_pipe_fileno_now"] = _safe_fileno(self._conn)
+        ev["B_pipe_fileno_pre"] = pre.get("conn_fileno")
+        ev["B_pipe_fileno_match"] = ev["B_pipe_fileno_now"] == pre.get("conn_fileno")
+        ev["child"] = {
+            key: pong.get(key)
+            for key in ("pid", "ppid", "uuid", "conn_fileno", "proc_start_ticks",
+                        "cuda_initialized", "cuda_tasks_run", "gpu_alloc_bytes")
+        }
+        ev["pid_match"] = pong.get("pid") == pre.get("pid")
+        ev["uuid_match"] = pong.get("uuid") == self._uuid
+        ev["proc_start_ticks_match"] = pong.get("proc_start_ticks") == pre.get("proc_start_ticks")
+        ev["child_fileno_match"] = pong.get("conn_fileno") == pre.get("child_fileno")
+        ev["child_ppid_is_parent"] = pong.get("ppid") == os.getpid()
+
+        # --- C. shared ring survival (parent side + child side) ---
+        canary = b"io-ring-canary"
+        parent_ok = False
+        try:
+            probe = f"io-probe-parent-{os.getpid()}".encode()
+            mv = memoryview(self._shm.buf)
+            mv[0 : len(probe)] = probe
+            parent_ok = bytes(mv[0 : len(probe)]) == probe
+        except Exception as exc:  # noqa: BLE001
+            ev["C_parent_shm_error"] = f"{type(exc).__name__}:{exc}"[:160]
+        ev["C_parent_shm_ok"] = bool(parent_ok)
+        try:
+            stat = os.stat(f"/dev/shm/{pre.get('shm_name')}")
+            ev["C_dev_shm_present"] = True
+            ev["C_dev_shm_size"] = int(stat.st_size)
+        except Exception:
+            ev["C_dev_shm_present"] = False
+        child_ok = False
+        try:
+            self._conn.send({"op": "shm_check", "marker": 1})
+            reply = None
+            deadline = time.monotonic() + float(timeout_s)
+            while time.monotonic() < deadline:
+                if self._conn.poll(0.25):
+                    reply = self._conn.recv()
+                    break
+            child_ok = bool(
+                isinstance(reply, dict)
+                and reply.get("op") == "shm_ok"
+                and reply.get("canary_ok")
+            )
+        except Exception as exc:  # noqa: BLE001
+            ev["C_child_shm_error"] = f"{type(exc).__name__}:{exc}"[:160]
+        ev["C_child_shm_ok"] = bool(child_ok)
+
         self.child_cuda_initialized = bool(pong.get("cuda_initialized"))
         self.child_cuda_tasks_run = int(pong.get("cuda_tasks_run") or 0)
         self.child_gpu_alloc_bytes = int(pong.get("gpu_alloc_bytes") or 0)
-        return {
-            "ok": bool(canary_ok),
-            "pid": pong.get("pid"),
-            "pid_match": int(pong.get("pid") or -1) == int(self._pid or -2),
-            "uuid_match": pong.get("uuid") == self._uuid,
-            "pong_ms": round((time.monotonic_ns() - started) / 1e6, 3),
-            "canary_ok": canary_ok,
-            "child_cuda_initialized": self.child_cuda_initialized,
-            "child_cuda_tasks_run": self.child_cuda_tasks_run,
-            "child_gpu_alloc_bytes": self.child_gpu_alloc_bytes,
-            "spawn_count": self.spawn_count,
-        }
+        ev["ok"] = bool(
+            ev["A_child_alive"]
+            and ev["B_pipe_works"]
+            and ev["pid_match"]
+            and ev["uuid_match"]
+            and ev["proc_start_ticks_match"]
+            and ev["child_fileno_match"]
+            and parent_ok
+            and child_ok
+        )
+        return ev
 
     def _acquire_slot(self) -> int:
         with self._slot_cond:
@@ -415,6 +540,17 @@ def io_process_readinto(path: str, target: Any, offset: int, producer_id: int) -
     return worker.readinto(path, target, offset, producer_id)
 
 
+def io_process_probe(*, anchor_monotonic_ns: Optional[int] = None) -> dict:
+    """Diagnose A/B/C survival of the pre-snapshot I/O worker (fail-closed)."""
+    worker = _PRE_SNAPSHOT_IO
+    if worker is None:
+        return {"ok": False, "error": "io_worker_missing"}
+    try:
+        return worker.probe(anchor_monotonic_ns=anchor_monotonic_ns)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def io_process_evidence() -> dict:
     worker = _PRE_SNAPSHOT_IO
     if worker is None:
@@ -446,6 +582,7 @@ __all__ = [
     "get_io_worker",
     "io_process_enabled",
     "io_process_evidence",
+    "io_process_probe",
     "io_process_readinto",
     "io_worker_record",
     "maybe_spawn_io_worker",
