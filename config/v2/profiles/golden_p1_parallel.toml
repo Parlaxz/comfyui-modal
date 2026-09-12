@@ -10,6 +10,17 @@ app = "batch-r0-golden-parallel-ops"
 class = "ModalRuntimeEntrypointV2"
 method = "run_golden_parallel_stream"
 
+# ComfyKitchen attention experiment: the canonical expected output SHA for this
+# attention backend was established by the first ComfyKitchen control run
+# (cohort_2026-09-12_02-43-36_5e9825).  This is run-only (not a deploy input);
+# both Phase 1 arms share it and must match it exactly.
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577"
+run_count = 1
+gap_seconds = 35.0
+
 [environment]
 V2_BENCHMARK_MODE = "golden_p1_parallel"
-COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "sage"
+COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND = "comfy_kitchen"
