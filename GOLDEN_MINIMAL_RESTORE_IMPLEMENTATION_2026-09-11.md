@@ -130,6 +130,63 @@ explicitly — which is the intended evidence, not a silent fallback.
 
 ---
 
+## 6.1 First-request GPU-repair trace (`_gpu_restore_deferred`) — no change required
+
+**Question:** does the minimal path cause the first Golden Parallel request to invoke
+`_restore_in_process_gpu_state()`, `_initialize_cuda_context()`, `get_total_memory()`, or any equivalent
+legacy GPU-repair?
+
+**Verdict: No. The deferred request-side path is not reached; therefore no code change was made.**
+
+Trace from snapshot capture to first request (line numbers in this worktree):
+
+**Snapshot capture (`snap=True`)**
+- `modal_app.py:11362` `startup()` → `self.bootstrap.startup(snapshot=True)`. `RuntimeBootstrap.startup`
+  (`runtime_bootstrap.py:1307+`) runs models/runtime-state/custom-node/baseline/backend/sage steps and
+  **never** calls the `restore_gpu_state` / `initialize_cuda` callbacks — those are invoked only inside
+  `RuntimeBootstrap.restore()` (`runtime_bootstrap.py:2068-2119`).
+- `_force_cpu_during_snapshot` (`comfyapp.py:17530`) only monkey-patches `torch.cuda.is_available` /
+  `current_device` and import guards; it does not touch `_gpu_restore_deferred`.
+- The only writer that makes the flag truthy is `_mark_gpu_restore_deferred` (`comfyapp.py:20043-20045`).
+  Its callers are `_refresh_gpu_snapshot_memory` (called only from `comfyapp.restore:21122`),
+  `_restore_in_process_gpu_state`, `_ensure_gpu_ready_for_request`, and `comfyapp.restore`. None executes
+  during `snap=True` startup in the modal_app runtime.
+- There is no `__init__` default for the attribute ⇒ it is **absent** in the snapshot.
+
+**Minimal restore (flag ON)**
+- The seam (`modal_app.py:12860`) returns before `self.bootstrap.restore()` (`modal_app.py:13476`), so the
+  `restore_gpu_state` / `initialize_cuda` callbacks (`modal_app.py:10682/10685`) never fire.
+- The minimal helpers never read or write `_gpu_restore_deferred` / `_gpu_restore_status`.
+
+**First Golden Parallel request**
+- `modal_app.py:23405` calls `legacy_api._ensure_gpu_ready_for_request()`.
+- `_ensure_gpu_ready_for_request` (`comfyapp.py:20127`) returns immediately at `:20131-20132` because
+  `getattr(self, "_gpu_restore_deferred", False)` is falsy.
+- Consequently `_restore_in_process_gpu_state()` (`comfyapp.py:20135`) and the following
+  `_initialize_cuda_context()` (`:20142`) are **not** called, and `get_total_memory()` (only reachable
+  inside those and `_refresh_gpu_snapshot_memory`) is **not** called.
+
+**Reader audit / equivalents**
+- Every runtime read of `_gpu_restore_deferred` uses `getattr(..., False)` (`comfyapp.py:20131, 21146,
+  21221`); absence is safely falsy.
+- No other call to `_restore_in_process_gpu_state`, `_initialize_cuda_context`, or `_warmup_cuda` exists on
+  the Golden Parallel request path.
+- No `_mark_gpu_restore_deferred` / `_refresh_gpu_snapshot_memory` / `_warmup_cuda` reference exists in
+  `modal_app.py`.
+
+This confirms the intended treatment: CUDA first-touch happens **naturally on the first genuine model/GPU
+operation** (e.g. ComfyUI's `get_torch_device()` during model work), not in restore and not in request setup.
+
+**Defensive note (not implemented, per instruction):** the minimal path relies on the snapshot not carrying
+`_gpu_restore_deferred=True`, which holds for the CPU-snapshot Golden deploy (attribute absent) and for a
+warm-container second restore under this same path (still falsy). If a future snapshot shape ever carried it
+truthy, the minimal correction would be to set, in `_golden_minimal_restore_logical_gpu_state`,
+`legacy_api._gpu_restore_deferred = False` and `legacy_api._gpu_restore_status = {"status":"ok","cuda_available":1}`.
+This was **not** added because the deferred path is not invoked and eager CUDA initialization must remain out
+of the minimal path.
+
+---
+
 ## 7. Local validation
 
 All read-only / local; no deploy.
@@ -146,6 +203,9 @@ All read-only / local; no deploy.
 **Genuine product-contract failures:** none.
 **Historical/structural tests that assert legacy restore internals:** none were run or broken by this change
 (the legacy `restore()` body is untouched).
+
+**After the §6.1 trace (no code change):** the same checks were re-run on the unchanged tree — `py_compile`
+OK, AST static proof PASS (forbidden reachable tokens NONE), `tests/test_minimal_restore.py` 6 passed.
 
 Independent review: `@oracle` found **no BLOCKER**. Its two hardening notes (silently swallowed
 return marker; silently swallowed legacy-barrier reset) were adopted before commit: the return marker is now
@@ -175,7 +235,8 @@ Both lanes edit `modal_app.py`; reconcile deliberately, preserving the early-ret
 | # | SHA | Summary |
 |---|---|---|
 | 1 | `789e93957386f29909712954bde29bffdda55487` | `feat: default-OFF Golden Parallel minimal restore path` |
-| 2 | *(this report commit)* | `docs: Golden minimal restore implementation report` |
+| 2 | `3014eb6192ffa456ec1ab563c640f3cc5c040305` | `docs: Golden minimal restore implementation report` |
+| 3 | *(this trace-addendum commit)* | `docs: prove deferred GPU-repair path is not invoked under minimal restore` |
 
 Final HEAD after commit 2 is recorded in the handoff message.
 
