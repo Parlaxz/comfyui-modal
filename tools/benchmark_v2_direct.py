@@ -11986,7 +11986,17 @@ async def _run_golden_p1(
                 msg4 = f"sage_effective_input_override: configured=auto effective={rec.get('sage_runtime_mode_effective_input')} source={rec.get('sage_runtime_mode_resolution_source')}"
                 if msg4 not in rec.get("failures", []):
                     rec.setdefault("failures", []).append(msg4)
-        if rec.get("sage_runtime_mode_resolved") in {"missing", "mixed", "auto"}:
+        # Sage runtime identity is only meaningful when Sage is the resolved
+        # attention backend.  When a non-Sage backend (e.g. comfy_kitchen) is
+        # resolved, no Sage mode is selected, so its absence must not be
+        # reported as false Sage metadata.  Sage validation stays strict when
+        # Sage IS selected, and a missing/unknown resolved attention backend is
+        # already failed closed above, so this narrowing never lets an
+        # unresolved backend pass.
+        if (
+            rec.get("attention_backend_resolved") == "sage"
+            and rec.get("sage_runtime_mode_resolved") in {"missing", "mixed", "auto"}
+        ):
             rec["valid"] = False
             sage_failure = (
                 "sage_resolved_is_auto_invalid"

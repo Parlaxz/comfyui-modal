@@ -12727,9 +12727,22 @@ class ModalRuntimeEntrypoint:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
 
         _t_start = time.perf_counter()
+        # Project the genuine pre-capture snapshot content proof captured at the
+        # snap=True boundary.  It is stored on the snapshotted self._restore_timing
+        # and survives restore, so the minimal path only exposes the existing
+        # immutable proof record; it never fabricates a proof, never re-runs the
+        # legacy restore, and never performs new snapshot/Volume/GPU work.
+        _prior_timing = getattr(self, "_restore_timing", None)
+        _preserved_snapshot_proof = (
+            _prior_timing.get("golden_snapshot_content_proof")
+            if isinstance(_prior_timing, Mapping)
+            else None
+        )
         telemetry: dict[str, Any] = {
             "minimal_restore_start": time.monotonic_ns(),
         }
+        if isinstance(_preserved_snapshot_proof, Mapping):
+            telemetry["golden_snapshot_content_proof"] = dict(_preserved_snapshot_proof)
 
         def _mark(_name: str, _started_at: float) -> None:
             telemetry[_name] = round((time.perf_counter() - _started_at) * 1000.0, 3)
