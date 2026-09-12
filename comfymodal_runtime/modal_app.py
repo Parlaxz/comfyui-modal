@@ -5401,6 +5401,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # Loader-process experiment selector (deploy-baked; OFF when unset).
     if "COMFYMODAL_GOLDEN_LOADER_PROCESS" in os.environ:
         env["COMFYMODAL_GOLDEN_LOADER_PROCESS"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS"]
+    # Pre-snapshot loader-worker experiment selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT" in os.environ:
+        env["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -12226,6 +12229,17 @@ class ModalRuntimeEntrypoint:
             maybe_freeze_snapshot_gpu_capacity()
         except Exception:
             pass
+
+        # ── Pre-snapshot persistent loader worker (experimental) ──────────
+        # Spawn the CPU-only loader worker BEFORE Modal captures the snapshot
+        # so worker spawn/import cost is removed from request time.  Fail
+        # closed when the switch is ON: a failed spawn must never silently
+        # degrade to request-time spawning.
+        if _golden_serial_active:
+            from .golden_loader_process import maybe_spawn_pre_snapshot_worker
+            _presnapshot_loader_record = maybe_spawn_pre_snapshot_worker()
+            if _presnapshot_loader_record:
+                _restore_timing["presnapshot_loader_process"] = _presnapshot_loader_record
 
         # ── Snapshot quiescence proof (fail closed) ───────────────────────
         # Golden must prove quiescence before capture, but this proof must be

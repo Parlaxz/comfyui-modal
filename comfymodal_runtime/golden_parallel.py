@@ -8,6 +8,7 @@ functions in the same order with a distinct runtime identity.
 
 from __future__ import annotations
 
+import json
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -77,24 +78,65 @@ async def golden_parallel_execute(
     loader_worker: Any = None
     loader_process_active = False
     try:
-        # Experimental Loader-Process A/B (disabled by default): one
-        # persistent spawn worker performs the three full canonical loads and
-        # stays alive for the request; the parent binds the same
-        # CUDA-IPC-mapped storage through the canonical constructor+proof
-        # path (no second read, no second H2D).
+        # Experimental loader-process modes (both disabled by default):
+        # - request-time worker (COMFYMODAL_GOLDEN_LOADER_PROCESS): one
+        #   persistent spawn worker performs the three full canonical loads
+        #   and stays alive for the request; the parent binds the same
+        #   CUDA-IPC-mapped storage through the canonical constructor+proof
+        #   path (no second read, no second H2D).
+        # - pre-snapshot worker (COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT):
+        #   the CPU-only worker was spawned before snapshot capture; after
+        #   restore the SAME process + IPC channel must be verified (PING/PONG,
+        #   no respawn) and is then used for the same canonical loads.
         from .golden_loader_process import (
             GoldenLoaderProcess,
+            cuda_visibility_probe,
+            get_pre_snapshot_worker,
             loader_process_enabled,
+            loader_spawn_count,
+            pre_snapshot_record,
+            presnapshot_loader_enabled,
         )
 
         loader_process_active = loader_process_enabled()
+        presnapshot_active = presnapshot_loader_enabled()
         # No task is created here on purpose.  This is the P1 parallel control
         # plane and evidence foundation; overlap belongs to a later change.
         with _golden_trace_span("golden_parallel_execute"):
             await golden_restore(session)
+        if presnapshot_active:
+            # Fail closed: never replace a missing/dead pre-snapshot worker.
+            probe_evidence = _presnapshot_worker_probe(
+                session,
+                get_pre_snapshot_worker(),
+                pre_snapshot_record(),
+                loader_spawn_count,
+            )
+            session.recorder.event("presnapshot_worker_probe", **probe_evidence)
         with _golden_trace_span("golden_request_setup"):
             await golden_request_setup(session)
-        if loader_process_active:
+        if presnapshot_active:
+            loader_worker = get_pre_snapshot_worker()
+            init_evidence = loader_worker.initialize_session(
+                request=session.request,
+                contract=session.contract,
+                model_paths=session.model_paths,
+                clip_paths=session.clip_paths,
+                output_root=session.output_root,
+            )
+            session.recorder.event("presnapshot_worker_session_init", **init_evidence)
+            session.recorder.event("presnapshot_cuda_env_probe", **cuda_visibility_probe())
+            try:
+                cuda_evidence = loader_worker.init_cuda()
+            except BaseException as exc:  # noqa: BLE001 - evidence then fail closed
+                session.recorder.event(
+                    "presnapshot_worker_cuda_init_failed",
+                    error=f"{type(exc).__name__}: {exc}"[:1600],
+                    diagnostic=getattr(exc, "diagnostic", None),
+                )
+                raise
+            session.recorder.event("presnapshot_worker_cuda_init", **cuda_evidence)
+        elif loader_process_active:
             loader_worker = GoldenLoaderProcess()
             worker_startup_ms = loader_worker.start(
                 request=session.request,
@@ -195,6 +237,51 @@ async def golden_parallel_execute(
         raise RuntimeError("parallel_result_missing")
     result.telemetry_persist_ms = session.telemetry_persist_ms
     return result
+
+
+def _stage_entry_ns(session: Any, name: str) -> Optional[int]:
+    interval = getattr(getattr(session, "recorder", None), "_intervals", {}).get(name)
+    return getattr(interval, "entry_monotonic_ns", None) if interval is not None else None
+
+
+def _presnapshot_worker_probe(session: Any, worker: Any, record: dict, spawn_count_fn: Callable[[], int]) -> dict:
+    """Verify the pre-snapshot worker survived restore; fail closed if not."""
+    if worker is None:
+        raise RuntimeError("presnapshot_worker_missing")
+    anchor_ns = _stage_entry_ns(session, "golden_restore")
+    evidence = worker.probe(anchor_monotonic_ns=anchor_ns)
+    evidence["pre_capture"] = record
+    evidence["spawn_count"] = spawn_count_fn()
+    evidence["request_id"] = str(getattr(session.request, "request_id", "") or "")
+    print(
+        "[v2.presnapshot.probe] "
+        + json.dumps(
+            {key: value for key, value in evidence.items() if key != "pre_capture"},
+            sort_keys=True,
+            default=str,
+        )[:1600],
+        flush=True,
+    )
+    if not evidence.get("ok"):
+        raise RuntimeError(
+            "presnapshot_worker_not_survived:"
+            + str(evidence.get("error") or {
+                "pid_match": evidence.get("pid_match"),
+                "uuid_match": evidence.get("uuid_match"),
+                "proc_start_ticks_match": evidence.get("proc_start_ticks_match"),
+                "child_fileno_match": evidence.get("child_fileno_match"),
+            })[:300]
+        )
+    if spawn_count_fn() != int(record.get("spawn_count") or -1):
+        raise RuntimeError(
+            "presnapshot_worker_replaced:spawn_count="
+            f"{spawn_count_fn()}!={record.get('spawn_count')}"
+        )
+    if not record.get("worker_pid") or int(record.get("worker_pid")) != int(
+        evidence.get("pid") or -1
+    ):
+        raise RuntimeError("presnapshot_worker_pid_precapture_mismatch")
+    return evidence
 
 
 @contextmanager

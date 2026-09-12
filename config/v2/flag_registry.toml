@@ -1293,3 +1293,12 @@ consumed_at = "harness"
 change_requires = "run"
 owner = "e29"
 description = "Variance cold run count."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-loader-ab"
+description = "Experimental: spawn the persistent CPU-only loader worker before snapshot capture so worker startup is removed from request time. On restore the same worker PID + IPC channel are verified (PING/PONG, no respawn) and then used for the three full loads. Default OFF."
