@@ -42,6 +42,24 @@ def io_process_enabled() -> bool:
 # ── child (stdlib only; CUDA-sterile) ─────────────────────────────────────────
 
 
+def _safe_fileno(conn: Any) -> Optional[int]:
+    try:
+        return int(conn.fileno())
+    except Exception:
+        return None
+
+
+def _proc_start_ticks(pid: Optional[int]) -> Optional[int]:
+    """Linux /proc start-ticks identity (survival accounting). None elsewhere."""
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r") as fh:
+            return int(fh.read().split()[21])
+    except Exception:
+        return None
+
+
 def _pread_into(fd: int, target: memoryview, offset: int, length: int) -> int:
     """Read *length* bytes at *offset* directly into *target*; return bytes read.
 
@@ -91,6 +109,8 @@ def _io_child_entry(conn: Any, shm_name: str, slot_count: int, slot_bytes: int) 
                     "pid": os.getpid(),
                     "ppid": os.getppid(),
                     "uuid": msg.get("uuid"),
+                    "conn_fileno": _safe_fileno(conn),
+                    "proc_start_ticks": _proc_start_ticks(os.getpid()),
                     "cuda_initialized": bool(cuda_initialized),
                     "cuda_tasks_run": int(cuda_tasks_run),
                     "gpu_alloc_bytes": int(gpu_alloc_bytes),
@@ -166,6 +186,9 @@ class GoldenIoProcess:
         self._lock = threading.Lock()
         self._free: list[int] = list(range(IO_SLOTS))
         self._slot_cond = threading.Condition()
+        self._proc_start_ticks: Optional[int] = None
+        self._conn_fileno: Optional[int] = None
+        self._child_fileno: Optional[int] = None
         # evidence
         self.spawn_count = 0
         self.shared_to_pinned_ms = 0.0
@@ -179,11 +202,18 @@ class GoldenIoProcess:
         return self._pid
 
     def start(self) -> dict:
-        """Spawn the child and allocate the process-shared ring (pre-snapshot)."""
-        from multiprocessing import get_context, shared_memory
+        """Spawn the child and allocate the process-shared ring (pre-snapshot).
+
+        Uses ``torch.multiprocessing`` spawn (the proven pre-snapshot lifecycle
+        that survives Modal's CPU memory snapshot) with a standard
+        ``multiprocessing`` Pipe for control IPC and a stdlib shared-memory ring
+        for bulk bytes.
+        """
+        import torch.multiprocessing as _torch_mp
+        from multiprocessing import shared_memory
 
         started = time.perf_counter()
-        ctx = get_context("spawn")
+        ctx = _torch_mp.get_context("spawn")
         self._ctx = ctx
         self._shm = shared_memory.SharedMemory(create=True, size=IO_SLOTS * IO_SLOT_BYTES)
         parent_conn, child_conn = ctx.Pipe(duplex=True)
@@ -203,7 +233,10 @@ class GoldenIoProcess:
             child_conn.close()
         except Exception:
             pass
-        pong = self.ping(timeout=30.0)
+        pong = self.ping(timeout=60.0)
+        self._proc_start_ticks = _proc_start_ticks(self._pid)
+        self._conn_fileno = _safe_fileno(parent_conn)
+        self._child_fileno = pong.get("conn_fileno")
         return {
             "pid": self._pid,
             "uuid": self._uuid,
@@ -212,6 +245,9 @@ class GoldenIoProcess:
             "slot_bytes": IO_SLOT_BYTES,
             "ring_bytes": IO_SLOTS * IO_SLOT_BYTES,
             "startup_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "conn_fileno": self._conn_fileno,
+            "child_fileno": self._child_fileno,
+            "proc_start_ticks": self._proc_start_ticks,
             "pong": pong,
         }
 
