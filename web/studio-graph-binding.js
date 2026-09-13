@@ -319,10 +319,13 @@ function _snapCanvasToNode(canvas, node) {
     const ds = canvas && canvas.ds;
     const size = _canvasCssSize(canvas);
     if (!ds || !size || typeof ds.scale !== "number" || ds.scale <= 0) return false;
-    const pos = _asNumPair(node && node.pos, null);
     const off = _asNumPair(ds.offset, null);
-    if (!pos || !off) return false;
-    const nsize = _asNumPair(node && node.size, [140, 80]);
+    if (!off) return false;
+    // Center on the same box the overlay draws so the two can never diverge.
+    const box = _nodeGraphBox(node);
+    const pos = box ? [box.x, box.y] : _asNumPair(node && node.pos, null);
+    const nsize = box ? [box.w, box.h] : _asNumPair(node && node.size, [140, 80]);
+    if (!pos || !nsize) return false;
     const cx = pos[0] + nsize[0] / 2;
     const cy = pos[1] + nsize[1] / 2;
     try {
@@ -349,6 +352,24 @@ function _centerCanvasOnNode(canvas, node) {
   return _snapCanvasToNode(canvas, node) || centered;
 }
 
+/** Graph-space box for a node, honoring the canvas system's own bounding
+ * box (title chrome included) over raw pos/size, which newer frontends
+ * store in body-relative or non-array forms. Never throws. */
+function _nodeGraphBox(node) {
+  try {
+    if (node && typeof node.getBoundingRect === "function") {
+      const b = node.getBoundingRect();
+      const arr = Array.isArray(b) ? b
+        : (b && typeof b.length === "number" ? [b[0], b[1], b[2], b[3]]
+        : (b ? [b.x, b.y, b.width, b.height] : null));
+      if (arr && arr.slice(0, 4).every((v) => typeof v === "number" && isFinite(v)) && arr[2] > 0 && arr[3] > 0) {
+        return { x: arr[0], y: arr[1], w: arr[2], h: arr[3] };
+      }
+    }
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
 function _nodeScreenRect(ctx, node) {
   const canvas = ctx.canvas;
   const el = canvas && (canvas.canvas || canvas);
@@ -362,13 +383,18 @@ function _nodeScreenRect(ctx, node) {
   const ds = (canvas && canvas.ds) || {};
   const scale = typeof ds.scale === "number" && ds.scale > 0 ? ds.scale : 1;
   const offset = _asNumPair(ds.offset, [0, 0]);
-  const pos = _asNumPair(node.pos, [0, 0]);
-  const size = _asNumPair(node.size, [140, 80]);
+  // Prefer the canvas system's own box (title chrome included); newer
+  // frontends store body-relative pos/size that would shift the overlay.
+  const box = _nodeGraphBox(node) || (() => {
+    const pos = _asNumPair(node && node.pos, [0, 0]);
+    const size = _asNumPair(node && node.size, [140, 80]);
+    return { x: pos[0], y: pos[1], w: size[0], h: size[1] };
+  })();
   return {
-    left: base.left + (pos[0] + offset[0]) * scale,
-    top: base.top + (pos[1] + offset[1]) * scale,
-    width: Math.max(size[0] * scale, 8),
-    height: Math.max(size[1] * scale, 8),
+    left: base.left + (box.x + offset[0]) * scale,
+    top: base.top + (box.y + offset[1]) * scale,
+    width: Math.max(box.w * scale, 8),
+    height: Math.max(box.h * scale, 8),
   };
 }
 
@@ -404,6 +430,59 @@ export function clearNodeViewHighlight() {
  * Center *nodeId* on the canvas and flash a magenta border for 3s.
  * Returns { ok, reason } — never throws when the graph/canvas is absent.
  */
+/**
+ * Find live canvas nodes matching suggestion patterns.
+ * Powers the "Found on canvas" confirmation on rows where the stored-graph
+ * scan found nothing (e.g. custom node types): returns concrete targets
+ * with widget/output identity resolved from the live node, capped for UI.
+ * Never throws; returns [] without a graph.
+ */
+export function findCanvasNodeTargets(patterns, limit) {
+  const out = [];
+  try {
+    const ctx = getComfyGraphContext();
+    if (!ctx.ok || !ctx.graph) return out;
+    const max = typeof limit === "number" && limit > 0 ? limit : 3;
+    const nodes = ctx.graph.nodes || ctx.graph._nodes || [];
+    const list = Array.isArray(nodes) ? nodes : Object.values(nodes);
+    for (const node of list) {
+      if (!node) continue;
+      const nodeType = node.type || node.class_type || "";
+      const nodeId = node.id;
+      if (nodeId == null) continue;
+      for (const pattern of patterns || []) {
+        if (!pattern || pattern.nodeType !== nodeType) continue;
+        if (pattern.widget) {
+          out.push({
+            nodeId: String(nodeId),
+            nodeType,
+            nodeTitle: node.title || nodeType,
+            widgetName: pattern.widget,
+            inputName: null,
+            outputIndex: null,
+          });
+        } else if (pattern.output) {
+          const outputs = Array.isArray(node.outputs) ? node.outputs : [];
+          let outputIndex = 0;
+          const named = outputs.findIndex((o) => o && (o.name === pattern.output || o.type === pattern.output));
+          if (named !== -1) outputIndex = named;
+          out.push({
+            nodeId: String(nodeId),
+            nodeType,
+            nodeTitle: node.title || nodeType,
+            widgetName: null,
+            inputName: null,
+            outputIndex,
+          });
+        }
+        if (out.length >= max) return out;
+      }
+      if (out.length >= max) return out;
+    }
+  } catch (e) { /* fall through */ }
+  return out;
+}
+
 export function viewGraphNode(nodeId) {
   const ctx = getComfyGraphContext();
   if (!ctx.ok) return { ok: false, reason: ctx.reason || "Graph unavailable" };

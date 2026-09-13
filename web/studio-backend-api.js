@@ -579,6 +579,27 @@ export async function managerReboot() {
   return managerFetch("/manager/reboot", { method: "POST" });
 }
 
+/** GET /externalmodel/getlist — Manager model catalog for source/download URLs. */
+export async function getManagerModels() {
+  const res = await managerFetch("/externalmodel/getlist?mode=cache");
+  if (res && res.ok && res.data && Array.isArray(res.data.models)) return res.data.models;
+  return [];
+}
+
+/** POST /comfymodal/model/install — async single download, returns download_id. */
+export async function installSingleModel(apiBase, item) {
+  return apiFetch(apiBase, "/model/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(item || {}),
+  });
+}
+
+/** GET /comfymodal/download/status/{id} — poll a single download. */
+export async function modelDownloadStatus(apiBase, downloadId) {
+  return apiFetch(apiBase, `/download/status/${encodeURIComponent(downloadId || "")}`);
+}
+
 // ── Studio Workflow Version Dependencies / Compatibility API ────────────
 
 export async function getVersionDependencies(apiBase, versionId) {

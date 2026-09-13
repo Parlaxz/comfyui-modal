@@ -16,6 +16,7 @@ import {
   viewGraphNode,
   isGraphNodeAvailable,
   clearNodeViewHighlight,
+  findCanvasNodeTargets,
 } from "./studio-graph-binding.js";
 import { captureCurrentComfyGraph } from "./studio-backend-capture.js";
 import { renderDependencySection } from "./studio-model-library.js";
@@ -33,6 +34,9 @@ import {
   managerInstallNode,
   listManagerInstalled,
   managerReboot,
+  getManagerModels,
+  installSingleModel,
+  modelDownloadStatus,
 } from "./studio-backend-api.js";
 import {
   BINDABLE_INPUTS,
@@ -263,6 +267,7 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     managerProbing: false,
     managerDetected: null,
     managerInstalled: [],
+    managerModelsByFilename: null,
     installingPack: null,
     restartRequired: false,
     // Server responses
@@ -989,6 +994,9 @@ function renderDependenciesStep(body, state) {
     managerInstalledNames: state.managerInstalled || [],
     installingPack: state.installingPack,
     onInstallPack: (n) => installPackViaManager(state, n),
+    managerModelsByFilename: state.managerModelsByFilename || null,
+    onDownloadModel: (info) => downloadSingleModel(state, info),
+    onDepsRefresh: () => prefetchVersionDependencies(state),
   }));
 
   _maybeProbeManager(state);
@@ -1002,6 +1010,53 @@ async function prefetchVersionDependencies(state) {
     state.dependencies = resp && resp.status === "ok" ? resp : null;
     _rerenderWizard(state);
   } catch (e) { /* best-effort; the step simply stays hidden */ }
+}
+
+/** Per-row Modal download: async single install + status polling, then
+ * library rescan + dependency refresh so the row flips to installed. */
+async function downloadSingleModel(state, info) {
+  const done = { ok: false, message: "" };
+  try {
+    const started = await installSingleModel(state && state._apiBase, {
+      url: info.url, filename: info.filename, save_path: info.savePath || "",
+    });
+    const downloadId = started && (started.download_id || (started.data && started.data.download_id));
+    if (!downloadId) {
+      done.message = "Download request failed.";
+      state.dependenciesMessage = done.message;
+      return done;
+    }
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for (;;) {
+      if (_wizardState !== state) return done;
+      const st = await modelDownloadStatus(state._apiBase, downloadId);
+      const last = (st && (st.data || st)) || {};
+      const s = String(last.state || last.status || "").toLowerCase();
+      if (s === "complete" || s === "done" || s === "success") break;
+      if (s === "error" || s === "failed") {
+        done.message = "Download failed: " + (last.message || last.error || "request failed");
+        state.dependenciesMessage = done.message;
+        return done;
+      }
+      if (Date.now() > deadline) {
+        done.message = "Download timed out — check the model library later.";
+        state.dependenciesMessage = done.message;
+        return done;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    try { await rescanModels(state._apiBase, false); } catch (e) { /* best-effort */ }
+    if (_wizardState !== state) return done;
+    done.ok = true;
+    done.message = "Downloaded — library rescanned.";
+    state.dependenciesMessage = done.message;
+    await prefetchVersionDependencies(state);
+    return done;
+  } catch (e) {
+    done.message = "Download failed: " + ((e && e.message) || "request failed");
+    try { state.dependenciesMessage = done.message; } catch (e2) { /* state may be gone */ }
+    return done;
+  }
 }
 
 async function downloadMissingModels(state) {
@@ -1061,11 +1116,32 @@ function _maybeProbeManager(state) {
     if (_wizardState !== state) return;
     state.managerDetected = !!(version && version.ok);
     if (state.managerDetected) await _refreshManagerInstalled(state);
+    if (state.managerDetected) await _loadManagerModels(state);
     if (_wizardState !== state) return;
     state.managerProbing = false;
     state.managerProbed = true;
     _rerenderWizard(state);
   })();
+}
+
+/** Load the Manager model catalog once per wizard (filename → URLs). */
+async function _loadManagerModels(state) {
+  try {
+    const models = await getManagerModels();
+    if (!state || _wizardState !== state) return;
+    const map = {};
+    (models || []).forEach((m) => {
+      if (m && m.filename && !map[m.filename]) {
+        map[m.filename] = {
+          url: m.url || "",
+          reference: m.reference || "",
+          savePath: m.save_path || "",
+          name: m.name || "",
+        };
+      }
+    });
+    state.managerModelsByFilename = map;
+  } catch (e) { /* catalog is best-effort */ }
 }
 
 async function installPackViaManager(state, node) {
@@ -1293,6 +1369,65 @@ function renderBindingRowList(bindingDefs, state, graphContext, listTestid) {
         if (hint) {
           row.appendChild(el("div", { style: "margin-top:4px;" }, [
             el("span", { style: "font-size:10px;color:#555;font-style:italic;", text: hint }),
+          ]));
+        }
+        // Live-canvas fallback: the stored-graph scan found nothing (often
+        // custom node types), but a matching node may sit on the canvas.
+        // Each found target gets the same explicit Use + View confirmation
+        // as scanned suggestions — nothing is ever auto-bound.
+        const found = findCanvasNodeTargets(ROLE_SUGGESTIONS[bindingDef.key], 3);
+        found.forEach((target) => {
+          const targetLabel = target.widgetName
+            ? `widget: ${target.widgetName}`
+            : target.inputName
+              ? `input: ${target.inputName}`
+              : target.outputIndex != null
+                ? `output #${target.outputIndex}`
+                : "node";
+          row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
+            el("span", {
+              style: "font-size:10px;color:#888;",
+              text: `Found: ${target.nodeTitle || target.nodeType} → ${targetLabel}`,
+            }),
+            el("button", {
+              class: "comfymodal-secondary-btn",
+              "data-testid": "wizard-use-found",
+              "data-binding-key": bindingDef.key,
+              text: "Use found",
+              style: "width:auto;padding:2px 8px;font-size:10px;",
+              onclick: (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                applySuggestedBinding(state, bindingDef.key, target);
+                renderWizard(_wizardRoot.querySelector(".comfymodal-studio-wizard-panel"), state);
+              },
+            }),
+            renderViewButton(target.nodeId, {
+              testid: "wizard-view-found",
+              bindingKey: bindingDef.key,
+              state,
+            }),
+          ]));
+        });
+        if (found.length === 0) {
+          // No live target: both buttons still render so every Likely row
+          // offers the same actions; disabled with the reason until a
+          // matching node is on the canvas.
+          row.appendChild(el("div", { style: "margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;" }, [
+            el("button", {
+              class: "comfymodal-secondary-btn",
+              "data-testid": "wizard-use-found",
+              "data-binding-key": bindingDef.key,
+              text: "Use found",
+              disabled: true,
+              title: "No matching node on the canvas — load the workflow or capture manually",
+              style: "width:auto;padding:2px 8px;font-size:10px;",
+            }),
+            renderViewButton(null, {
+              testid: "wizard-view-found",
+              bindingKey: bindingDef.key,
+              state,
+            }),
           ]));
         }
       }

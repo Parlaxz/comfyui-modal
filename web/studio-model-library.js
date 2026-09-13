@@ -891,6 +891,19 @@ function renderDependencyModelRow(m, ctx) {
     if (src) {
       row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: src, target: "_blank", rel: "noopener noreferrer", text: "source" }));
     }
+    // Manager catalog fallback: per-filename download + page URLs when the
+    // library record carries none.
+    const managed = ctx && ctx.managerModelsByFilename && m.filename
+      ? ctx.managerModelsByFilename[m.filename] : null;
+    const managerUrl = managed && managed.url ? managed.url : "";
+    const managerRef = managed && managed.reference ? managed.reference : "";
+    if (managerRef && managerRef !== src) {
+      row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: managerRef, target: "_blank", rel: "noopener noreferrer", text: "manager source", title: (managed && managed.name) || m.filename }));
+    }
+    const downloadUrl = src || managerUrl;
+    if (downloadUrl && ctx && typeof ctx.onDownloadModel === "function") {
+      row.appendChild(renderModelDownloadControl(m, downloadUrl, ctx));
+    }
     // Contextual handoff into the Model Library filter — no second
     // model-management implementation, just a prefilled library query.
     if (ctx && typeof ctx.onFindInLibrary === "function" && m.filename) {
@@ -904,6 +917,57 @@ function renderDependencyModelRow(m, ctx) {
     }
   }
   return row;
+}
+
+function renderModelDownloadControl(m, downloadUrl, ctx) {
+  const wrap = el("span", { class: "comfymodal-studio-dependency-request" });
+  const btn = el("button", {
+    class: "comfymodal-secondary-btn",
+    "data-testid": "dependency-model-download",
+    "data-model-key": m.key || "",
+    text: "Download on Modal",
+    style: "font-size:10px;padding:2px 8px;width:auto;",
+    onclick: async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = "Downloading…";
+      note.style.display = "block";
+      note.textContent = "Download requested…";
+      note.classList.remove("error");
+      try {
+        const res = await ctx.onDownloadModel({
+          filename: m.filename || "",
+          url: downloadUrl,
+          savePath: m.folder || "",
+        });
+        if (res && res.ok) {
+          note.textContent = res.message || "Downloaded.";
+          note.classList.remove("error");
+          if (typeof ctx.onDepsRefresh === "function") {
+            try { await ctx.onDepsRefresh(); } catch (e) { /* refresh is best-effort */ }
+          }
+        } else {
+          note.textContent = (res && res.message) || "Download failed.";
+          note.classList.add("error");
+          btn.disabled = false;
+          btn.textContent = "Download on Modal";
+        }
+      } catch (err) {
+        note.style.display = "block";
+        note.textContent = "Download failed: " + ((err && err.message) || "request failed");
+        note.classList.add("error");
+        btn.disabled = false;
+        btn.textContent = "Download on Modal";
+      }
+    },
+  });
+  const note = el("div", {
+    class: "comfymodal-studio-dependency-request-note",
+    style: "display:none;font-size:10px;color:#888;margin-top:2px;",
+  });
+  wrap.appendChild(btn);
+  wrap.appendChild(note);
+  return wrap;
 }
 
 function renderDependencyNodeRow(n, ctx) {
@@ -970,6 +1034,11 @@ function renderDependencyNodeRow(n, ctx) {
     } else if (ctx && ctx.apiBase) {
       row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
     }
+  }
+  // Missing packs without a known repository still get the record-only
+  // approval request: every missing row offers an action, URL or not.
+  if (n.state === "missing" && !n.repository_url && ctx && ctx.apiBase) {
+    row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
   }
   return row;
 }
