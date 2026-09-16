@@ -16,9 +16,11 @@ import struct
 import sys
 import tarfile
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from unittest import mock
 
 # Import the module under test
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1381,6 +1383,184 @@ class TorchOutputTests(unittest.TestCase):
         output = _format_report(report)
         self.assertIn("FULL_TRACE_TORCH=/extract/raw/torch_trace.json.gz", output)
         self.assertNotIn("absent", output)
+
+
+class CanonicalModalDestinationTests(unittest.TestCase):
+    """``_get_volume`` binds the config-owned workspace and restores the env.
+
+    All coverage is offline: fake ``modal``/``modal_workspaces`` modules are
+    injected through ``sys.modules`` so no credentials or network are used.
+    """
+
+    def setUp(self):
+        self._saved_environ = dict(os.environ)
+        self._ambient = {
+            "MODAL_TOKEN_ID": "ambient-id",
+            "MODAL_TOKEN_SECRET": "ambient-secret",
+            "MODAL_ENVIRONMENT": "ambient-env",
+            "MODAL_PROFILE": "ambient-profile",
+            "MODAL_CONFIG_PATH": "/ambient/modal.toml",
+            "COMFYMODAL_ENVIRONMENT": "ambient-comfy-env",
+            "COMFYMODAL_V2_ENVIRONMENT": "ambient-comfy-v2-env",
+            "COMFYMODAL_MODAL_PROFILE": "ambient-comfy-profile",
+            "KEEP_ME": "keep-me",
+        }
+        # Expected post-call env: original environment with ambient overrides.
+        self._expected_environ = {**self._saved_environ, **self._ambient}
+        os.environ.update(self._ambient)
+        self.addCleanup(self._restore_environ)
+
+    def _restore_environ(self):
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+
+    def _call_get_volume(self, destination: Dict[str, Any]):
+        """Invoke the real ``_get_volume`` with fake Modal modules.
+
+        Returns ``(result, observed_env, repo_root_seen)`` where
+        ``observed_env`` is the environment captured at ``from_name`` time.
+        """
+        observed: Dict[str, Any] = {}
+        seen: Dict[str, Any] = {}
+
+        class FakeVolume:
+            @staticmethod
+            def from_name(name, create_if_missing=False):
+                observed["name"] = name
+                observed["create_if_missing"] = create_if_missing
+                observed["env"] = dict(os.environ)
+                return ("volume-handle", name)
+
+        fake_modal = types.SimpleNamespace(Volume=FakeVolume)
+
+        def fake_resolve(repo_root):
+            seen["repo_root"] = repo_root
+            return destination
+
+        fake_workspaces = types.SimpleNamespace(
+            resolve_modal_destination=fake_resolve
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {"modal": fake_modal, "modal_workspaces": fake_workspaces},
+        ):
+            from tools import download_v2_full_trace as mod
+
+            result = mod._get_volume("test-volume")
+        return result, observed, seen
+
+    def test_canonical_binding_overrides_ambient_selection(self):
+        destination = {
+            "workspace_id": "ws-canonical",
+            "workspace_label": "Canonical",
+            "environment": "canonical-env",
+            "token_id": "ak-canonical",
+            "token_secret": "as-canonical",
+        }
+        result, observed, seen = self._call_get_volume(destination)
+
+        self.assertEqual(result, ("volume-handle", "test-volume"))
+        self.assertEqual(observed["name"], "test-volume")
+        self.assertFalse(observed["create_if_missing"])
+
+        env = observed["env"]
+        self.assertEqual(env["MODAL_TOKEN_ID"], "ak-canonical")
+        self.assertEqual(env["MODAL_TOKEN_SECRET"], "as-canonical")
+        self.assertEqual(env["MODAL_ENVIRONMENT"], "canonical-env")
+        self.assertEqual(env["COMFYMODAL_ENVIRONMENT"], "canonical-env")
+        self.assertEqual(env["COMFYMODAL_V2_ENVIRONMENT"], "canonical-env")
+        # Ambient Modal selection is scrubbed; unrelated env survives.
+        self.assertNotIn("MODAL_PROFILE", env)
+        self.assertNotIn("MODAL_CONFIG_PATH", env)
+        self.assertNotIn("COMFYMODAL_MODAL_PROFILE", env)
+        self.assertEqual(env["KEEP_ME"], "keep-me")
+
+        # The destination is resolved against the repo root (parents[1]).
+        self.assertEqual(
+            Path(seen["repo_root"]).resolve(),
+            Path(__file__).resolve().parent.parent,
+        )
+
+        # Caller environment is restored exactly afterward.
+        self.assertEqual(dict(os.environ), self._expected_environ)
+
+    def test_default_environment_scrubs_ambient_without_binding(self):
+        destination = {
+            "workspace_id": "ws-canonical",
+            "workspace_label": "Canonical",
+            "environment": "(default)",
+            "token_id": "ak-canonical",
+            "token_secret": "as-canonical",
+        }
+        _result, observed, _seen = self._call_get_volume(destination)
+
+        env = observed["env"]
+        self.assertEqual(env["MODAL_TOKEN_ID"], "ak-canonical")
+        self.assertEqual(env["MODAL_TOKEN_SECRET"], "as-canonical")
+        # A default environment is never bound, ambient values are removed.
+        self.assertNotIn("MODAL_ENVIRONMENT", env)
+        self.assertNotIn("COMFYMODAL_ENVIRONMENT", env)
+        self.assertNotIn("COMFYMODAL_V2_ENVIRONMENT", env)
+        self.assertNotIn("COMFYMODAL_MODAL_PROFILE", env)
+
+        self.assertEqual(dict(os.environ), self._expected_environ)
+
+    def test_environment_restored_when_volume_resolution_fails(self):
+        class FailingVolume:
+            @staticmethod
+            def from_name(name, create_if_missing=False):
+                raise RuntimeError("boom")
+
+        fake_modal = types.SimpleNamespace(Volume=FailingVolume)
+        fake_workspaces = types.SimpleNamespace(
+            resolve_modal_destination=lambda repo_root: {
+                "workspace_id": "ws-canonical",
+                "workspace_label": "Canonical",
+                "environment": "canonical-env",
+                "token_id": "ak-canonical",
+                "token_secret": "as-canonical",
+            }
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {"modal": fake_modal, "modal_workspaces": fake_workspaces},
+        ):
+            from tools import download_v2_full_trace as mod
+
+            with self.assertRaises(SystemExit):
+                mod._get_volume("test-volume")
+
+        self.assertEqual(dict(os.environ), self._expected_environ)
+
+    def test_injected_download_client_needs_no_credentials_or_modal(self):
+        files = {
+            "derived/report.md": b"report",
+            "raw/viztracer.json.gz": b"viz",
+            "derived/manifest.json": json.dumps({"version": 1}).encode(),
+        }
+        bundle_data = _make_bundle_tgz(files)
+        output_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(output_tmp.cleanup)
+        descriptor = ArtifactDescriptor(
+            volume="test-volume",
+            remote_path="/traces/bundle.tar.gz",
+            sha256=_sha256_of_bytes(bundle_data),
+            trace_id="test-trace-001",
+            output_dir=output_tmp.name,
+        )
+        client = MockDownloadClient(
+            MockVolume({descriptor.remote_path: bundle_data})
+        )
+
+        # ``None`` in sys.modules makes any import raise ImportError: the
+        # injected-client path must never touch Modal or credentials.
+        with mock.patch.dict(
+            sys.modules, {"modal": None, "modal_workspaces": None}
+        ):
+            report = run_download(descriptor, download_client=client)
+
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(dict(os.environ), self._expected_environ)
 
 
 if __name__ == "__main__":

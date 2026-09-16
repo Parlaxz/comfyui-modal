@@ -48,11 +48,11 @@ export default defineConfig({
   projects: [
     {
       name: "mocked",
-      testIgnore: /studio-live\.spec\.mjs|fake\//,
+      testIgnore: /studio-live\.spec\.mjs|studio-wizard-nested-deps-live\.spec\.mjs|fake\//,
     },
     {
       name: "live",
-      testMatch: /studio-live\.spec\.mjs/,
+      testMatch: /studio-(live|wizard-nested-deps-live)\.spec\.mjs/,
       workers: 1,
       timeout: Number(process.env.COMFYMODAL_LIVE_TIMEOUT_MS || 900000),
     },

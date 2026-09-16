@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -552,6 +554,272 @@ class ModelLibraryRoutesTestCase(unittest.TestCase):
             match_info={"version_id": "wv_ghost"},
         )
         self.assertEqual(resp.status, 404)
+
+    # ── 30. dependencies fall back to the owning Workflow static graph ────
+
+    @staticmethod
+    def _parent_graph_only_static_graph() -> dict:
+        """Workflow static graph holding UI-only classes absent from the
+        version's executable prompt (the live Manager-missing shape)."""
+        return {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "BlehSetSamplerPreset",
+                    "properties": {"cnr_id": "bleh", "ver": "1.2.3"},
+                    "inputs": [{"name": "value", "link": None}],
+                    "outputs": [{"name": "PRESET"}],
+                },
+                {
+                    "id": 2,
+                    "type": "KreaSeedVarianceEnhancer",
+                    "properties": {"aux_id": "Krea/krea-seed", "ver": "0.4.0"},
+                    "inputs": [{"name": "model", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                },
+                {
+                    # Workflow-only virtual panel: empty inputs/outputs and no
+                    # pack identity, so it must never become a missing row.
+                    "id": 3,
+                    "type": "WorkflowOnlyPanel",
+                    "properties": {},
+                    "inputs": [],
+                    "outputs": [],
+                },
+            ]
+        }
+
+    def _stored_version(self, version_id: str) -> dict:
+        path = self.node_dir / ".studio_workflow_versions.json"
+        records = json.loads(path.read_text(encoding="utf-8"))
+        return next(
+            r for r in records if r.get("workflow_version_id") == version_id
+        )
+
+    @pytest.mark.fast_unit
+    def test_dependencies_merge_parent_workflow_static_graph(self):
+        """When the version has no full UI graph, the owning Workflow's
+        static_graph supplies the graph-only classes (CNR/aux identity kept,
+        virtual panels excluded) without mutating the version store."""
+        parent = self._parent_graph_only_static_graph()
+        _workflow, version = self._import_workflow(static_graph=parent)
+        version_id = version["workflow_version_id"]
+
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/dependencies",
+            match_info={"version_id": version_id},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        rows = self._body(resp)["custom_nodes"]
+
+        bleh = [n for n in rows if n.get("cnr_id") == "bleh"]
+        self.assertEqual(len(bleh), 1, "graph-only CNR pack groups into one row")
+        self.assertEqual(bleh[0]["state"], "missing")
+        self.assertIn("BlehSetSamplerPreset", bleh[0]["classes"])
+
+        krea = [n for n in rows if n.get("aux_id") == "Krea/krea-seed"]
+        self.assertEqual(len(krea), 1, "graph-only aux pack groups into one row")
+        self.assertEqual(krea[0]["state"], "missing")
+        self.assertIn("KreaSeedVarianceEnhancer", krea[0]["classes"])
+
+        classes = [c for n in rows for c in n["classes"]]
+        self.assertNotIn(
+            "WorkflowOnlyPanel", classes, "virtual panel must never be a dependency"
+        )
+
+        # The persisted version is untouched: the parent graph is merged into a
+        # copy used only for resolution.
+        self.assertNotIn("static_graph", self._stored_version(version_id))
+
+    @pytest.mark.fast_unit
+    def test_dependencies_merge_parent_graph_with_nonempty_version_graph(self):
+        """A version with its own top-level graph still merges the owning
+        Workflow's static_graph: the version graph stays authoritative for
+        duplicate classes while parent-only nested classes and model widgets
+        remain resolvable. The stored version is never mutated."""
+        version_graph = {
+            "id": "v",
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "UNETLoader",
+                    "properties": {"cnr_id": "versionpack"},
+                    "inputs": [{"name": "unet_name", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {"unet_name": "version_model.safetensors"},
+                },
+                {
+                    "id": 2,
+                    "type": "DupNode",
+                    "properties": {"cnr_id": "versionpack"},
+                    "inputs": [{"name": "x", "link": None}],
+                    "outputs": [{"name": "Y"}],
+                },
+            ],
+        }
+        parent = {
+            "nodes": [
+                {
+                    # The version graph already carries this class: version
+                    # identity must win for the duplicate.
+                    "id": 2,
+                    "type": "DupNode",
+                    "properties": {"cnr_id": "parentpack"},
+                    "inputs": [{"name": "x", "link": None}],
+                    "outputs": [{"name": "Y"}],
+                },
+            ],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg",
+                        "nodes": [
+                            {
+                                "id": 10,
+                                "type": "UNETLoader",
+                                "properties": {"cnr_id": "parentpack"},
+                                "inputs": [{"name": "unet_name", "link": None}],
+                                "outputs": [{"name": "MODEL"}],
+                                "widgets_values_named": {
+                                    "unet_name": "parent_nested_model.safetensors"
+                                },
+                            },
+                            {
+                                "id": 11,
+                                "type": "ParentNestedNode",
+                                "properties": {"cnr_id": "parentpack"},
+                                "inputs": [{"name": "x", "link": None}],
+                                "outputs": [{"name": "Y"}],
+                            },
+                        ],
+                    }
+                ]
+            },
+        }
+        _workflow, version = self._import_workflow(
+            graph_json=version_graph, static_graph=parent
+        )
+        version_id = version["workflow_version_id"]
+
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/dependencies",
+            match_info={"version_id": version_id},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        body = self._body(resp)
+
+        filenames = {m["filename"] for m in body["models"]}
+        self.assertIn("version_model.safetensors", filenames)
+        self.assertIn(
+            "parent_nested_model.safetensors",
+            filenames,
+            "parent-only nested model widget must be resolved",
+        )
+
+        rows = body["custom_nodes"]
+        classes = [c for n in rows for c in n["classes"]]
+        self.assertIn("DupNode", classes)
+        self.assertIn("ParentNestedNode", classes)
+        dup = [n for n in rows if "DupNode" in n["classes"]]
+        self.assertEqual(len(dup), 1, "duplicate class resolves to one row")
+        self.assertEqual(
+            dup[0]["cnr_id"], "versionpack", "version class identity wins"
+        )
+
+        # The persisted version is untouched: the parent graph is merged into a
+        # copy used only for resolution.
+        self.assertNotIn("static_graph", self._stored_version(version_id))
+
+    # ── 30b. parent fallback reaches nested graph nodes ──────────────────
+
+    @staticmethod
+    def _nested_parent_static_graph() -> dict:
+        """Parent static graph whose real nodes live only inside nested
+        subgraph/group containers (the live Manager-missing shape)."""
+        return {
+            "nodes": [],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg",
+                        "nodes": [
+                            {
+                                "id": 1,
+                                "type": "NestedAlphaNode",
+                                "properties": {"cnr_id": "nested-pack", "ver": "1.2.3"},
+                                "inputs": [{"name": "x", "link": None}],
+                                "outputs": [{"name": "Y"}],
+                            },
+                            {
+                                "id": 2,
+                                "type": "NestedBetaNode",
+                                "properties": {"aux_id": "owner/nested-beta"},
+                                "inputs": [{"name": "m", "link": None}],
+                                "outputs": [{"name": "MODEL"}],
+                            },
+                            {
+                                # Nested virtual panel: must never be a row.
+                                "id": 3,
+                                "type": "NestedPanel",
+                                "properties": {},
+                                "inputs": [],
+                                "outputs": [],
+                            },
+                        ],
+                    }
+                ]
+            },
+            "extra": {
+                "groupNodes": {
+                    "g": {
+                        "nodes": [
+                            {
+                                "id": 4,
+                                "type": "NestedGammaNode",
+                                "properties": {"cnr_id": "nested-pack"},
+                                "inputs": [{"name": "x", "link": None}],
+                                "outputs": [{"name": "Y"}],
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+
+    @pytest.mark.fast_unit
+    def test_dependencies_merge_nested_parent_static_graph(self):
+        """The parent Workflow's static_graph fallback reaches nodes nested in
+        subgraph/group containers; identities group and virtual panels stay out
+        without mutating the version store."""
+        parent = self._nested_parent_static_graph()
+        _workflow, version = self._import_workflow(static_graph=parent)
+        version_id = version["workflow_version_id"]
+
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/dependencies",
+            match_info={"version_id": version_id},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        rows = self._body(resp)["custom_nodes"]
+        classes = [c for n in rows for c in n["classes"]]
+        self.assertIn("NestedAlphaNode", classes)
+        self.assertIn("NestedBetaNode", classes)
+        self.assertIn("NestedGammaNode", classes)
+
+        pack = [n for n in rows if n.get("cnr_id") == "nested-pack"]
+        self.assertEqual(len(pack), 1, "nested classes sharing cnr_id group into one row")
+        self.assertEqual(pack[0]["state"], "missing")
+        self.assertEqual(
+            sorted(pack[0]["classes"]), ["NestedAlphaNode", "NestedGammaNode"]
+        )
+        beta = [n for n in rows if n.get("aux_id") == "owner/nested-beta"]
+        self.assertEqual(len(beta), 1)
+        self.assertIn("NestedBetaNode", beta[0]["classes"])
+        self.assertNotIn("NestedPanel", classes)
+        self.assertNotIn("static_graph", self._stored_version(version_id))
 
 
 if __name__ == "__main__":

@@ -19,7 +19,15 @@ import {
   findCanvasNodeTargets,
 } from "./studio-graph-binding.js";
 import { captureCurrentComfyGraph } from "./studio-backend-capture.js";
-import { renderDependencySection } from "./studio-model-library.js";
+import {
+  applyDependencyInflightBadge,
+  applyDependencyStateBadge,
+  buildManagerPackIndex,
+  matchManagerModel,
+  normalizeManagerSavePath,
+  performManagerInstall,
+  renderDependencySection,
+} from "./studio-model-library.js";
 import {
   createSnapshot,
   createPreset,
@@ -30,13 +38,18 @@ import {
   getVersionDependencies,
   batchInstallModels,
   rescanModels,
+  refreshCustomNodes,
   getManagerVersion,
-  managerInstallNode,
   listManagerInstalled,
-  managerReboot,
+  managerRebootAndWait,
   getManagerModels,
-  installSingleModel,
-  modelDownloadStatus,
+  getManagerPackList,
+  getManagerMappings,
+  WIZARD_DRAFT_KEY,
+  WIZARD_DRAFT_MAX_CHARS,
+  buildWizardDraft,
+  parseWizardDraft,
+  applyWizardDraft,
 } from "./studio-backend-api.js";
 import {
   BINDABLE_INPUTS,
@@ -268,8 +281,15 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     managerDetected: null,
     managerInstalled: [],
     managerModelsByFilename: null,
+    managerPacks: null,
     installingPack: null,
     restartRequired: false,
+    rebootInFlight: false,
+    // Explicit per-row install status lives in wizard state (not just DOM) so
+    // a re-render — e.g. the Manager probe finishing or a dependency refresh —
+    // can never drop an in-flight model/pack row's queued/downloading status.
+    modelInstalls: {},  // report model key -> "Queued" | "Downloading…"
+    nodeInstalls: {},   // custom-node name -> "Queued"
     // Server responses
     snapshotResult: null,
     presetResult: null,
@@ -341,11 +361,19 @@ function _setStudioHeaderWizardMode(on) {
 // ── Public API ───────────────────────────────────────────────────────────
 
 export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapshot, options) {
-  closePresetWizard(); // Clean up any existing wizard first
+  closePresetWizard({ keepDraft: true }); // Clean up any existing wizard first
 
   _wizardState = makeInitialState(existingPreset, existingSnapshot, options);
   _wizardState._onDone = onDone;
   _wizardState._apiBase = apiBase || "/comfymodal";
+
+  // Browser refresh/reload: resume the same workflow/version wizard at the
+  // step (and bindings/details) it was left on. Identity is re-checked inside
+  // applyWizardDraft, so a draft for another version is ignored, not applied.
+  if (_wizardState.isVersionSetup) {
+    const draft = readWizardDraft();
+    if (draft) applyWizardDraft(_wizardState, draft, _wizardStepKeys(_wizardState));
+  }
 
   // Create wizard root element
   _wizardRoot = el("div", { class: "comfymodal-studio-wizard-overlay" });
@@ -393,7 +421,8 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
   document.dispatchEvent(new CustomEvent("comfymodal:wizard-opening"));
 }
 
-export function closePresetWizard() {
+export function closePresetWizard(options) {
+  const keepDraft = !!(options && options.keepDraft);
   // Clean up graph binding capture + transient node highlight
   cancelGraphBinding();
   clearNodeViewHighlight();
@@ -417,6 +446,11 @@ export function closePresetWizard() {
   if (_wizardRoot && _wizardRoot.parentNode) {
     _wizardRoot.parentNode.removeChild(_wizardRoot);
   }
+
+  // Done/close clears the persisted draft + URL marker; the internal cleanup
+  // at the start of openPresetWizard keeps it (keepDraft) so reopening the
+  // same wizard — e.g. after a reboot reload — still resumes in place.
+  if (!keepDraft) clearWizardDraft();
 
   _wizardRoot = null;
   _wizardState = null;
@@ -445,6 +479,84 @@ function _wizardStepLabel(key) {
   if (key === "dependencies") return "Dependencies";
   if (key === "bindings") return "Bindings & Controls";
   return "Details";
+}
+
+// ── Setup-wizard draft persistence (namespaced, bounded) ─────────────────
+//
+// A browser refresh must reopen the SAME workflow/version wizard at the SAME
+// step. The bounded draft schema is owned by studio-backend-api.js (pure and
+// unit-tested there); this module owns the sessionStorage + URL-marker side
+// effects. Version-setup mode only — preset/edit wizards opened from other
+// pages are neither persisted nor resumed, so unrelated pages stay untouched.
+
+const WIZARD_URL_PARAM = "comfymodal_wizard";
+
+function _wizardHashHasMarker(hash) {
+  return typeof hash === "string" && hash.indexOf(WIZARD_URL_PARAM + "=") !== -1;
+}
+
+/** Add/remove the namespaced marker on an existing Studio hash. Best-effort. */
+function _syncWizardUrlMarker(on) {
+  try {
+    if (typeof window === "undefined" || !window.location || typeof history === "undefined") return;
+    const loc = window.location;
+    const hash = loc.hash || "";
+    // Never manage an unrelated (non-Studio) host hash.
+    if (!/^#?comfymodal=/.test(hash)) return;
+    const has = _wizardHashHasMarker(hash);
+    if (on === has) return;
+    let next;
+    if (on) {
+      next = hash + "&" + WIZARD_URL_PARAM + "=1";
+    } else {
+      next = hash
+        .replace(new RegExp("([#&])" + WIZARD_URL_PARAM + "=1"), "$1")
+        .replace(/[#&]$/, "");
+    }
+    history.replaceState(history.state, "", loc.pathname + loc.search + next);
+  } catch (e) { /* URL marker is best-effort */ }
+}
+
+/** Store the bounded draft in sessionStorage + mark the Studio URL. */
+function saveWizardDraft(state) {
+  if (!state || !state.isVersionSetup) return;
+  const draft = buildWizardDraft(state);
+  if (!draft) return;
+  try {
+    const text = JSON.stringify(draft);
+    if (text.length <= WIZARD_DRAFT_MAX_CHARS && typeof sessionStorage !== "undefined") {
+      sessionStorage.setItem(WIZARD_DRAFT_KEY, text);
+    }
+  } catch (e) { /* storage unavailable/full: draft is best-effort */ }
+  _syncWizardUrlMarker(true);
+}
+
+/** Read + validate the bounded draft. Null when absent/malformed/stale. */
+export function readWizardDraft() {
+  try {
+    if (typeof sessionStorage === "undefined") return null;
+    return parseWizardDraft(sessionStorage.getItem(WIZARD_DRAFT_KEY));
+  } catch (e) { return null; }
+}
+
+/**
+ * True when the current Studio URL carries the draft marker. A real browser
+ * reload preserves it; an in-app shell navigation rewrites the hash and drops
+ * it — so only reloads auto-reopen the wizard.
+ */
+export function hasWizardUrlMarker() {
+  try {
+    if (typeof window === "undefined" || !window.location) return false;
+    return _wizardHashHasMarker(window.location.hash || "");
+  } catch (e) { return false; }
+}
+
+/** Drop the draft + URL marker after Done/close/save. */
+export function clearWizardDraft() {
+  try {
+    if (typeof sessionStorage !== "undefined") sessionStorage.removeItem(WIZARD_DRAFT_KEY);
+  } catch (e) { /* best-effort */ }
+  _syncWizardUrlMarker(false);
 }
 
 function renderWizard(panel, state) {
@@ -672,6 +784,19 @@ function renderWizard(panel, state) {
   }
   panel.appendChild(footer);
   panel.scrollTop = scrollTop;
+
+  // Persist the current step/bindings/details for a version-setup wizard so a
+  // browser refresh resumes here; Done/save clears it. `saving` is transient
+  // and an `error` step keeps the last good draft, so a refresh returns to the
+  // details step rather than a dead-end error screen.
+  if (state.isVersionSetup) {
+    if (state.step === "saved") {
+      clearWizardDraft();
+    } else if (state.step === "features" || state.step === "dependencies"
+      || state.step === "bindings" || state.step === "details") {
+      saveWizardDraft(state);
+    }
+  }
 }
 
 // ── Step: Features ──────────────────────────────────────────────────────
@@ -865,21 +990,59 @@ function renderBindingsStep(body, state) {
 //
 // Validation aid ordered before Bindings.  Reuses the exact dependency
 // report shape + renderer from the workflow detail page.  Nothing here
-// auto-downloads, auto-installs, or auto-reboots: every action is an
-// explicit click, and a missing/unavailable Manager degrades to the
-// existing record-only approval flow.
+// auto-downloads, auto-installs, or auto-reboots: each missing model row
+// offers explicit "Queue install" (async) / "Install now" (sync), and each
+// missing pack row offers a single Manager-backed "Install now".
 
 function _missingModels(deps) {
   const models = deps && Array.isArray(deps.models) ? deps.models : [];
   return models.filter((m) => m && m.state !== "installed");
 }
 
-function _missingModelsWithUrl(deps) {
-  return _missingModels(deps).filter((m) => Array.isArray(m.source_urls) && m.source_urls[0]);
+/** Basename for path-like names ("a/b/c.safetensors" → "c.safetensors"). */
+function _basename(name) {
+  const value = String(name || "");
+  const idx = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+  return idx === -1 ? value : value.slice(idx + 1);
 }
 
-function _missingModelsWithoutUrl(deps) {
-  return _missingModels(deps).filter((m) => !(Array.isArray(m.source_urls) && m.source_urls[0]));
+/**
+ * Manager catalog record for a missing model: exact filename first, then the
+ * catalog basename, with role/type compatibility. Mirrors the row renderer's
+ * resolution so `Download all` agrees with the per-row actions.
+ */
+function _managerModelFor(m, managerModelsByFilename) {
+  return matchManagerModel(m, managerModelsByFilename);
+}
+
+/** Effective download URL: report source first, then Manager catalog. */
+function _modelDownloadUrl(m, managerModelsByFilename) {
+  const src = Array.isArray(m.source_urls) && m.source_urls[0];
+  if (src) return src;
+  const managed = _managerModelFor(m, managerModelsByFilename);
+  return (managed && managed.url) || "";
+}
+
+/**
+ * Effective save path: report folder first, then Manager catalog. A catalog
+ * `save_path` of "default" is normalized through Manager's type→folder map.
+ */
+function _modelSavePath(m, managerModelsByFilename) {
+  if (m.folder) return m.folder;
+  const managed = _managerModelFor(m, managerModelsByFilename);
+  if (managed) {
+    const normalized = normalizeManagerSavePath(managed.savePath, managed.type);
+    if (normalized) return normalized;
+  }
+  return _roleToFolder(m.role);
+}
+
+function _missingModelsWithUrl(deps, managerModelsByFilename) {
+  return _missingModels(deps).filter((m) => _modelDownloadUrl(m, managerModelsByFilename));
+}
+
+function _missingModelsWithoutUrl(deps, managerModelsByFilename) {
+  return _missingModels(deps).filter((m) => !_modelDownloadUrl(m, managerModelsByFilename));
 }
 
 /** Best-effort folder bucket when the dependency report omits one. */
@@ -892,10 +1055,6 @@ function _roleToFolder(role) {
   if (r.includes("controlnet")) return "controlnet";
   if (r.includes("upscal")) return "upscale_models";
   return "checkpoints";
-}
-
-function _modelSavePath(m) {
-  return m.folder || _roleToFolder(m.role);
 }
 
 function _rerenderWizard(state) {
@@ -922,8 +1081,9 @@ function renderDependenciesStep(body, state) {
     return;
   }
 
-  const missingWithUrl = _missingModelsWithUrl(state.dependencies);
-  const missingNoUrl = _missingModelsWithoutUrl(state.dependencies);
+  const managerModels = state.managerModelsByFilename || null;
+  const missingWithUrl = _missingModelsWithUrl(state.dependencies, managerModels);
+  const missingNoUrl = _missingModelsWithoutUrl(state.dependencies, managerModels);
 
   body.appendChild(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 8px;" }, [
     el("button", {
@@ -966,12 +1126,14 @@ function renderDependenciesStep(body, state) {
     managerRow.appendChild(el("span", {
       "data-testid": "wizard-restart-required",
       style: "font-size:10px;color:#fbbf24;",
-      text: "Restart required.",
+      text: state.rebootInFlight ? "Rebooting — waiting for reconnect…" : "Restart required.",
     }));
     managerRow.appendChild(el("button", {
       class: "comfymodal-secondary-btn",
       "data-testid": "wizard-manager-reboot",
-      text: "Reboot ComfyUI",
+      text: state.rebootInFlight ? "Waiting…" : "Reboot ComfyUI",
+      disabled: state.rebootInFlight,
+      "aria-busy": state.rebootInFlight ? "true" : "false",
       style: "width:auto;padding:2px 8px;font-size:10px;",
       onclick: () => rebootManagerAndReport(state),
     }));
@@ -988,18 +1150,190 @@ function renderDependenciesStep(body, state) {
 
   // Full report: reuse the detail page's renderer so markup/testids stay
   // identical (dependency-status, dependency-model-row, dependency-node-row).
-  body.appendChild(renderDependencySection(null, state.dependencies, null, {
+  const depSection = renderDependencySection(null, state.dependencies, null, {
     apiBase: state._apiBase,
-    managerAvailable: state.managerDetected === true,
-    managerInstalledNames: state.managerInstalled || [],
+    managerInstalled: state.managerInstalled || [],
     installingPack: state.installingPack,
-    onInstallPack: (n) => installPackViaManager(state, n),
+    onInstallPack: (n, plan) => installPackViaManager(state, n, plan),
     managerModelsByFilename: state.managerModelsByFilename || null,
-    onDownloadModel: (info) => downloadSingleModel(state, info),
+    managerPacks: state.managerPacks || null,
     onDepsRefresh: () => prefetchVersionDependencies(state),
-  }));
+    // Once an install settles the report is the truth: drop the pseudo-status
+    // and re-render so the badge shows Installed/Missing, never a stale queue.
+    onInstallSettled: (m) => {
+      _clearModelInstall(state, m);
+      _rerenderWizard(state);
+    },
+  });
+  body.appendChild(depSection);
+
+  // Re-apply wizard-tracked in-flight status beside the rows and observe the
+  // shared row's own error notes so a failed install clears its status too.
+  _wireInstallStatus(depSection, state);
 
   _maybeProbeManager(state);
+}
+
+// ── In-flight install status (models + custom nodes) ─────────────────────
+//
+// The row's OWN state badge is the single source of truth for install state,
+// so the wizard tracks status in state and re-applies it to that same badge
+// after every render (never a detached supplemental chip). A wizard re-render
+// (Manager probe finishing, dependency refresh) rebuilds rows from the report
+// state, so without this the queued/downloading state would be lost. Never
+// auto-installs; reads explicit clicks only.
+
+const MODEL_QUEUED_STATUS = "Queued for download";
+const DOWNLOADING_STATUS = "Downloading\u2026";
+
+function _modelStatusKey(m) {
+  if (!m) return "";
+  return String(m.key || m.filename || "");
+}
+
+function _modelRowKey(row) {
+  if (!row) return "";
+  const own = row.getAttribute && row.getAttribute("data-model-key");
+  if (own) return own;
+  const holder = row.querySelector && row.querySelector("[data-model-key]");
+  return holder ? holder.getAttribute("data-model-key") || "" : "";
+}
+
+/** "Downloading…" is the only status that is not a queued pseudo-state. */
+function _statusKind(status) {
+  return /downloading/i.test(status || "") ? "downloading" : "queued";
+}
+
+function _setBadge(row, testid, status) {
+  if (!row || !status) return;
+  const badge = row.querySelector && row.querySelector('[data-testid="' + testid + '"]');
+  applyDependencyInflightBadge(badge, _statusKind(status), status);
+}
+
+function _applyInFlightStatus(section, state) {
+  if (!section || !state) return;
+  section.querySelectorAll('[data-testid="dependency-model-row"]').forEach((row) => {
+    const key = _modelRowKey(row);
+    _setBadge(row, "dependency-model-state", key ? state.modelInstalls[key] : "");
+  });
+  section.querySelectorAll('[data-testid="dependency-node-row"]').forEach((row) => {
+    const name = (row.getAttribute && row.getAttribute("data-node-name")) || "";
+    _setBadge(row, "dependency-node-state", name ? state.nodeInstalls[name] : "");
+  });
+}
+
+/** A failed row install restores the badge to the report's real state. */
+function _restoreRowBadge(row, key, name, state) {
+  if (!row) return;
+  const badge = row.querySelector
+    && row.querySelector('[data-testid="dependency-model-state"], [data-testid="dependency-node-state"]');
+  if (!badge) return;
+  const deps = (state && state.dependencies) || {};
+  let reportState = "missing";
+  if (key) {
+    const m = (Array.isArray(deps.models) ? deps.models : []).find((x) => _modelStatusKey(x) === key);
+    if (m && m.state) reportState = m.state;
+  }
+  if (name) {
+    const n = (Array.isArray(deps.custom_nodes) ? deps.custom_nodes : []).find((x) => x && String(x.name) === name);
+    if (n && n.state) reportState = n.state;
+  }
+  applyDependencyStateBadge(badge, reportState);
+}
+
+/** Drop a settled model's tracked status so the report's truth wins. */
+function _clearModelInstall(state, m) {
+  const key = _modelStatusKey(m);
+  if (key && state.modelInstalls[key]) delete state.modelInstalls[key];
+}
+
+/** Clear statuses whose item is now installed (or gone from the report). */
+function _reconcileInstallStatus(state) {
+  if (!state || !state.dependencies) return;
+  const models = Array.isArray(state.dependencies.models) ? state.dependencies.models : [];
+  const nodeRows = Array.isArray(state.dependencies.custom_nodes) ? state.dependencies.custom_nodes : [];
+  const presentModels = new Set();
+  models.forEach((m) => {
+    const key = _modelStatusKey(m);
+    if (!key) return;
+    presentModels.add(key);
+    if (m.state === "installed") delete state.modelInstalls[key];
+  });
+  Object.keys(state.modelInstalls).forEach((key) => {
+    if (!presentModels.has(key)) delete state.modelInstalls[key];
+  });
+  const presentNodes = new Set();
+  nodeRows.forEach((n) => {
+    const name = n && n.name ? String(n.name) : "";
+    if (!name) return;
+    presentNodes.add(name);
+    if (n.state === "installed") delete state.nodeInstalls[name];
+  });
+  Object.keys(state.nodeInstalls).forEach((name) => {
+    if (!presentNodes.has(name)) delete state.nodeInstalls[name];
+  });
+}
+
+function _wireInstallStatus(section, state) {
+  if (!section || !state) return;
+  _applyInFlightStatus(section, state);
+  // Explicit click marks the item in wizard state before the shared row's own
+  // handler runs; a re-render then keeps the badge visible.
+  section.addEventListener("click", (ev) => {
+    const target = ev.target;
+    if (!target || typeof target.closest !== "function") return;
+    const modelBtn = target.closest(
+      '[data-testid="dependency-model-queue"], [data-testid="dependency-model-install-now"], [data-testid="dependency-model-url-install"]'
+    );
+    if (modelBtn) {
+      const key = modelBtn.getAttribute("data-model-key") || _modelRowKey(modelBtn.closest('[data-testid="dependency-model-row"]'));
+      if (!key) return;
+      // Queue/bulk installs read "Queued for download"; synchronous installs
+      // read "Downloading…". Both update the SAME row state badge.
+      const id = modelBtn.getAttribute("data-testid");
+      state.modelInstalls[key] = id === "dependency-model-queue" ? MODEL_QUEUED_STATUS : DOWNLOADING_STATUS;
+      _applyInFlightStatus(section, state);
+      return;
+    }
+    const nodeBtn = target.closest('[data-testid="dependency-node-install-now"]');
+    if (nodeBtn) {
+      const name = nodeBtn.getAttribute("data-node-name") || "";
+      if (!name) return;
+      state.nodeInstalls[name] = "Queued";
+      _applyInFlightStatus(section, state);
+    }
+  }, true);
+  // Each render rebuilds the section; drop the previous observer so repeated
+  // re-renders cannot accumulate watchers on detached rows.
+  if (state._installStatusObserver) {
+    try { state._installStatusObserver.disconnect(); } catch (e) { /* already gone */ }
+  }
+  state._installStatusObserver = _watchInstallFailures(section, state);
+}
+
+/** A failed row install (note gains `error`) restores its report state. */
+function _watchInstallFailures(section, state) {
+  if (!section || typeof MutationObserver === "undefined") return null;
+  try {
+    const observer = new MutationObserver((records) => {
+      records.forEach((rec) => {
+        const note = rec.target;
+        if (!note || !note.classList || !note.classList.contains("error")) return;
+        const row = note.closest
+          ? note.closest('[data-testid="dependency-model-row"], [data-testid="dependency-node-row"]')
+          : null;
+        if (!row) return;
+        const key = _modelRowKey(row);
+        const name = (row.getAttribute && row.getAttribute("data-node-name")) || "";
+        if (key && state.modelInstalls[key]) delete state.modelInstalls[key];
+        if (name && state.nodeInstalls[name]) delete state.nodeInstalls[name];
+        _restoreRowBadge(row, key, name, state);
+      });
+    });
+    observer.observe(section, { subtree: true, attributes: true, attributeFilter: ["class"] });
+    return observer;
+  } catch (e) { /* observation is best-effort */ }
+  return null;
 }
 
 async function prefetchVersionDependencies(state) {
@@ -1008,78 +1342,45 @@ async function prefetchVersionDependencies(state) {
     const resp = await getVersionDependencies(state._apiBase, state.workflowVersionId);
     if (_wizardState !== state) return;
     state.dependencies = resp && resp.status === "ok" ? resp : null;
+    // The fresh report is the truth: installed items drop their in-flight
+    // status. The current step is preserved — Refresh never leaves the wizard.
+    _reconcileInstallStatus(state);
     _rerenderWizard(state);
   } catch (e) { /* best-effort; the step simply stays hidden */ }
 }
 
-/** Per-row Modal download: async single install + status polling, then
- * library rescan + dependency refresh so the row flips to installed. */
-async function downloadSingleModel(state, info) {
-  const done = { ok: false, message: "" };
-  try {
-    const started = await installSingleModel(state && state._apiBase, {
-      url: info.url, filename: info.filename, save_path: info.savePath || "",
-    });
-    const downloadId = started && (started.download_id || (started.data && started.data.download_id));
-    if (!downloadId) {
-      done.message = "Download request failed.";
-      state.dependenciesMessage = done.message;
-      return done;
-    }
-    const deadline = Date.now() + 10 * 60 * 1000;
-    for (;;) {
-      if (_wizardState !== state) return done;
-      const st = await modelDownloadStatus(state._apiBase, downloadId);
-      const last = (st && (st.data || st)) || {};
-      const s = String(last.state || last.status || "").toLowerCase();
-      if (s === "complete" || s === "done" || s === "success") break;
-      if (s === "error" || s === "failed") {
-        done.message = "Download failed: " + (last.message || last.error || "request failed");
-        state.dependenciesMessage = done.message;
-        return done;
-      }
-      if (Date.now() > deadline) {
-        done.message = "Download timed out — check the model library later.";
-        state.dependenciesMessage = done.message;
-        return done;
-      }
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    try { await rescanModels(state._apiBase, false); } catch (e) { /* best-effort */ }
-    if (_wizardState !== state) return done;
-    done.ok = true;
-    done.message = "Downloaded — library rescanned.";
-    state.dependenciesMessage = done.message;
-    await prefetchVersionDependencies(state);
-    return done;
-  } catch (e) {
-    done.message = "Download failed: " + ((e && e.message) || "request failed");
-    try { state.dependenciesMessage = done.message; } catch (e2) { /* state may be gone */ }
-    return done;
-  }
-}
-
 async function downloadMissingModels(state) {
   if (!state || state.dependenciesBusy) return;
-  const models = _missingModelsWithUrl(state.dependencies);
+  const managerModels = state.managerModelsByFilename || null;
+  const models = _missingModelsWithUrl(state.dependencies, managerModels);
   if (models.length === 0) {
     state.dependenciesMessage = "No missing models with a source URL to download.";
     _rerenderWizard(state);
     return;
   }
   const items = models.map((m) => ({
-    url: m.source_urls[0],
+    url: _modelDownloadUrl(m, managerModels),
     filename: m.filename || "",
-    save_path: _modelSavePath(m),
+    save_path: _modelSavePath(m, managerModels),
   }));
-  const skipped = _missingModelsWithoutUrl(state.dependencies).length;
+  const skipped = _missingModelsWithoutUrl(state.dependencies, managerModels).length;
   state.dependenciesBusy = true;
+  // Beside each row: bulk downloads are tracked per model key too, so a
+  // re-render during the batch keeps the queued state on the row's badge.
+  models.forEach((m) => {
+    const key = _modelStatusKey(m);
+    if (key) state.modelInstalls[key] = MODEL_QUEUED_STATUS;
+  });
   state.dependenciesMessage = `Requesting ${items.length} model download${items.length === 1 ? "" : "s"}…`;
   _rerenderWizard(state);
   const resp = await batchInstallModels(state._apiBase, items);
   if (_wizardState !== state) return;
   state.dependenciesBusy = false;
   if (!resp || resp.status !== "ok") {
+    models.forEach((m) => {
+      const key = _modelStatusKey(m);
+      if (key) delete state.modelInstalls[key];
+    });
     state.dependenciesMessage = "Download all failed: "
       + ((resp && (resp.message || resp.error)) || "request failed");
     _rerenderWizard(state);
@@ -1091,21 +1392,48 @@ async function downloadMissingModels(state) {
   if (_wizardState !== state) return;
   await prefetchVersionDependencies(state);
   if (_wizardState !== state) return;
+  // The batch settled: the refreshed report is truth, so drop the queued
+  // pseudo-status before the final render.
+  models.forEach((m) => {
+    const key = _modelStatusKey(m);
+    if (key) delete state.modelInstalls[key];
+  });
   state.dependenciesMessage = message;
   _rerenderWizard(state);
 }
 
+/**
+ * Parse Manager's `/customnode/installed` response. It is a dict keyed by
+ * module name with `{ ver, cnr_id, aux_id, enabled }` values (NOT a
+ * `{ nodes: [...] }` envelope). Preserve `enabled=false` truthfully so a
+ * disabled pack is not reported as ready.
+ */
 async function _refreshManagerInstalled(state) {
   const installed = await listManagerInstalled();
   if (_wizardState !== state) return;
-  let list = [];
+  const records = [];
   if (installed && installed.ok) {
-    if (installed.data && Array.isArray(installed.data.nodes)) list = installed.data.nodes;
-    else if (Array.isArray(installed.data)) list = installed.data;
+    const data = installed.data;
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      Object.keys(data).forEach((module) => {
+        const info = data[module];
+        if (!info || typeof info !== "object" || Array.isArray(info)) return;
+        records.push({
+          module: module,
+          ver: info.ver || "",
+          cnr_id: info.cnr_id || "",
+          aux_id: info.aux_id || "",
+          enabled: !(info.enabled === false || String(info.enabled).toLowerCase() === "false"),
+        });
+      });
+    } else if (Array.isArray(data)) {
+      // Defensive: tolerate a list shape without inventing fields.
+      data.forEach((info) => {
+        if (info && typeof info === "object") records.push(info);
+      });
+    }
   }
-  state.managerInstalled = list
-    .map((n) => (n && (n.cnr_id || n.name || n.title || n.repository || n.url)) || "")
-    .filter(Boolean);
+  state.managerInstalled = records;
 }
 
 function _maybeProbeManager(state) {
@@ -1117,6 +1445,7 @@ function _maybeProbeManager(state) {
     state.managerDetected = !!(version && version.ok);
     if (state.managerDetected) await _refreshManagerInstalled(state);
     if (state.managerDetected) await _loadManagerModels(state);
+    if (state.managerDetected) await _loadManagerPacks(state);
     if (_wizardState !== state) return;
     state.managerProbing = false;
     state.managerProbed = true;
@@ -1124,63 +1453,131 @@ function _maybeProbeManager(state) {
   })();
 }
 
-/** Load the Manager model catalog once per wizard (filename → URLs). */
+/**
+ * Load the Manager model catalog once per wizard. Records are keyed by
+ * filename and by basename (Manager catalogs basenames); a `save_path` of
+ * "default" is normalized through Manager's type→folder map so an install
+ * lands in a real folder.
+ */
 async function _loadManagerModels(state) {
   try {
     const models = await getManagerModels();
     if (!state || _wizardState !== state) return;
     const map = {};
     (models || []).forEach((m) => {
-      if (m && m.filename && !map[m.filename]) {
-        map[m.filename] = {
-          url: m.url || "",
-          reference: m.reference || "",
-          savePath: m.save_path || "",
-          name: m.name || "",
-        };
-      }
+      if (!m || !m.filename) return;
+      const record = {
+        url: m.url || "",
+        reference: m.reference || "",
+        savePath: normalizeManagerSavePath(m.save_path, m.type),
+        type: m.type || "",
+        name: m.name || "",
+        installed: m.installed,
+      };
+      if (!map[m.filename]) map[m.filename] = record;
+      const base = _basename(m.filename);
+      if (base && base !== m.filename && !map[base]) map[base] = record;
     });
     state.managerModelsByFilename = map;
   } catch (e) { /* catalog is best-effort */ }
 }
 
-async function installPackViaManager(state, node) {
-  if (!state || !node || !node.repository_url || state.installingPack) return;
-  const label = node.name || node.repository_url;
+/**
+ * Load Manager's pack list + class mappings once per wizard and build the
+ * class/CNR-id → pack index used to resolve missing custom-node rows to a
+ * pack repository. Best-effort: an absent/empty catalog leaves the index
+ * null, so rows simply keep their report-supplied repository (if any).
+ */
+async function _loadManagerPacks(state) {
+  try {
+    const [packList, mappings] = await Promise.all([
+      getManagerPackList(),
+      getManagerMappings(),
+    ]);
+    if (!state || _wizardState !== state) return;
+    state.managerPacks = buildManagerPackIndex(packList, mappings);
+  } catch (e) { /* catalog is best-effort */ }
+}
+
+async function installPackViaManager(state, node, installPlan) {
+  if (!state || state.installingPack) return;
+  const plan = installPlan || { kind: "none" };
+  const src = node || {};
+  const label = src.name || plan.name || src.cnr_id || src.aux_id
+    || src.repository_url || "pack";
   state.installingPack = label;
+  state.nodeInstalls[label] = "Queued";
   state.dependenciesMessage = `Installing ${label}…`;
   _rerenderWizard(state);
-  const resp = await managerInstallNode(node.repository_url);
+  const res = await performManagerInstall(plan);
   if (_wizardState !== state) return;
   state.installingPack = null;
-  if (!resp) {
-    state.dependenciesMessage = `Could not reach ComfyUI-Manager to install ${label}.`;
-  } else if (resp.status === 403) {
-    state.dependenciesMessage = "Manager refused the install (403). Set allow_git_url_install=true, "
-      + "use a loopback (127.0.0.1) session, then restart ComfyUI. Nothing was auto-restarted.";
-  } else if (resp.ok) {
-    state.dependenciesMessage = `${label} installed. Restart ComfyUI to load it.`;
-    state.restartRequired = true;
-    await _refreshManagerInstalled(state);
-    if (_wizardState !== state) return;
-  } else {
-    const msg = (resp.data && (resp.data.message || resp.data.error)) || `HTTP ${resp.status}`;
-    state.dependenciesMessage = `Install failed: ${msg}`;
+  delete state.nodeInstalls[label];
+  if (!res.ok) {
+    state.dependenciesMessage = res.message;
+    _rerenderWizard(state);
+    return;
   }
+  // Explicit install succeeded. Python custom nodes normally need a ComfyUI
+  // restart to import, so restartRequired stays truthful. Best-effort refresh
+  // the canonical registry and re-resolve the version: only the dependency
+  // resolver can report the classes actually installed, so the row is never
+  // claimed installed from the Manager package/queue alone. Never reboots.
+  state.restartRequired = true;
+  try { await refreshCustomNodes(state._apiBase); } catch (e) { /* best-effort */ }
+  if (_wizardState !== state) return;
+  await _refreshManagerInstalled(state);
+  if (_wizardState !== state) return;
+  await prefetchVersionDependencies(state);
+  if (_wizardState !== state) return;
+  // Only the dependency resolver can confirm the classes loaded; when the
+  // report is unavailable or still missing, say so rather than implying the
+  // install is complete.
+  const classesConfirmed =
+    !!state.dependencies && _unresolvedNodeClasses(state.dependencies).length === 0;
+  state.dependenciesMessage = classesConfirmed
+    ? res.message
+    : `${res.message} Package present, but required classes are not loaded.`;
   _rerenderWizard(state);
 }
 
+/** Custom-node dependency rows the resolver still does not report installed. */
+function _unresolvedNodeClasses(deps) {
+  const nodes = deps && Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
+  return nodes.filter((n) => n && n.state !== "installed");
+}
+
 async function rebootManagerAndReport(state) {
-  if (!state) return;
-  state.dependenciesMessage = "Requesting ComfyUI reboot…";
+  if (!state || state.rebootInFlight) return;
+  state.rebootInFlight = true;
+  state.dependenciesMessage = "Rebooting ComfyUI — waiting for it to reconnect…";
   _rerenderWizard(state);
-  const resp = await managerReboot();
+  // The reboot POST is expected to drop the connection; success is decided by
+  // the bounded reconnect probes, never by the POST response. Explicit click
+  // only — nothing here ever reboots on its own.
+  const res = await managerRebootAndWait({
+    expectManager: state.managerDetected === true,
+    onPhase: (phase) => {
+      if (_wizardState !== state) return;
+      state.dependenciesMessage = phase === "manager"
+        ? "ComfyUI reconnected — waiting for ComfyUI-Manager…"
+        : "Rebooting ComfyUI — waiting for it to reconnect…";
+      _rerenderWizard(state);
+    },
+  });
   if (_wizardState !== state) return;
-  if (resp && resp.ok) {
+  state.rebootInFlight = false;
+  if (res && res.ok) {
     state.restartRequired = false;
-    state.dependenciesMessage = "Reboot requested. ComfyUI will restart.";
+    state.dependenciesMessage = "ComfyUI rebooted and reconnected.";
+    // Re-probe Manager and re-resolve dependencies against the fresh runtime;
+    // the wizard stays open on the same step throughout.
+    state.managerProbed = false;
+    state.managerProbing = false;
+    await prefetchVersionDependencies(state);
   } else {
-    state.dependenciesMessage = "Reboot request failed. Restart ComfyUI manually.";
+    state.dependenciesMessage = (res && res.message)
+      || "ComfyUI did not reconnect after the reboot request — restart it manually if needed.";
   }
   _rerenderWizard(state);
 }

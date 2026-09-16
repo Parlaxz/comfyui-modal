@@ -728,6 +728,21 @@ async def download_model(
     )
 
 
+_DOWNLOAD_STREAM_EXHAUSTED = object()
+
+
+def _next_download_item(gen):
+    """Pull the next stream item in the worker thread, exhaustion as a value.
+
+    ``asyncio``/``concurrent.futures`` Futures cannot carry ``StopIteration``
+    as a result exception: doing so raises ``TypeError: StopIteration interacts
+    badly with generators``.  ``next(gen, sentinel)`` converts a normal
+    generator's ``StopIteration`` into an ordinary return value inside the
+    thread, so the executor Future only ever sees a value or a real error.
+    """
+    return next(gen, _DOWNLOAD_STREAM_EXHAUSTED)
+
+
 async def download_model_stream(
     url: str,
     filename: str,
@@ -747,11 +762,10 @@ async def download_model_stream(
         lambda: _workspace_function("download_model_stream", selected).remote_gen(**kwargs),
     )
     while True:
-        try:
-            item = await loop.run_in_executor(None, next, gen)
-            yield item
-        except StopIteration:
+        item = await loop.run_in_executor(None, _next_download_item, gen)
+        if item is _DOWNLOAD_STREAM_EXHAUSTED:
             break
+        yield item
 
 
 @_modal_error_handler

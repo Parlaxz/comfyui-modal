@@ -14,7 +14,11 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from production_workflow import _canonical_workflow_hash
-from workflow_metadata import extract_model_stack
+from workflow_metadata import (
+    extract_model_stack,
+    extract_ui_graph_model_refs,
+    iter_graph_nodes,
+)
 
 from .models import (
     GraphHashError,
@@ -340,16 +344,182 @@ def derive_mapping_candidates(
     return entries, output_node_id
 
 
+_CORE_CNR_IDS = ("comfy-core", "comfyui-core")
+
+
+def _identity_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _pack_identity_of(node: Any) -> dict[str, str]:
+    """Return a node's captured non-core pack identity, or {} when absent.
+
+    ComfyUI-Manager annotates UI nodes with ``properties.cnr_id`` (registry
+    pack) or ``properties.aux_id`` (git/aux pack) plus ``properties.ver``.
+    Core ids are ignored so they never become a fake pack. Only explicit
+    identity fields are kept; a bare version on a core node yields {}.
+    """
+    if not isinstance(node, dict):
+        return {}
+    properties = node.get("properties")
+    if not isinstance(properties, dict):
+        return {}
+    cnr_id = _identity_text(properties.get("cnr_id"))
+    if cnr_id.lower() in _CORE_CNR_IDS:
+        cnr_id = ""
+    aux_id = _identity_text(properties.get("aux_id"))
+    version = _identity_text(
+        properties.get("ver")
+        or properties.get("selected_version")
+        or properties.get("version")
+    )
+    if not cnr_id and not aux_id:
+        return {}
+    identity: dict[str, str] = {}
+    if cnr_id:
+        identity["cnr_id"] = cnr_id
+    if aux_id:
+        identity["aux_id"] = aux_id
+    if version:
+        identity["version"] = version
+    return identity
+
+
+def _merge_identity(
+    current: dict[str, str], incoming: dict[str, str]
+) -> dict[str, str]:
+    """Keep the first-seen value per identity key (existing behavior)."""
+    if not current:
+        return dict(incoming)
+    merged = dict(current)
+    for key in ("cnr_id", "aux_id", "version"):
+        if not merged.get(key) and incoming.get(key):
+            merged[key] = incoming[key]
+    return merged
+
+
+def _graph_node_types(graph: Any) -> set[str]:
+    """Valid ``type`` values recorded anywhere in a UI/static graph.
+
+    Walks nested group/subgraph containers, not just the top-level ``nodes``
+    list, so Manager-missing nodes nested under ``extra.groupNodes`` /
+    ``definitions.subgraphs`` still surface as dependencies.
+    """
+    classes: set[str] = set()
+    for node in iter_graph_nodes(graph):
+        node_type = node.get("type")
+        if isinstance(node_type, str) and node_type:
+            classes.add(node_type)
+    return classes
+
+
+def _collect_pack_identities(
+    prompt: dict[str, Any], graph_json: Any, static_graph: Any = None
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Map node ids and class types to captured pack identities.
+
+    The UI (static) graph carries ``properties.cnr_id``/``aux_id``; the
+    executable API prompt usually does not, so the two are indexed separately
+    and matched by node id first, then by class type. Both the ``graph_json``
+    capture and its ``static_graph`` alias are scanned so identities survive
+    whichever key the caller populated.
+    """
+    by_id: dict[str, dict[str, str]] = {}
+    by_class: dict[str, dict[str, str]] = {}
+    for graph in (graph_json, static_graph):
+        # Nested group/subgraph nodes carry the same cnr_id/aux_id as top-level
+        # nodes; collecting them here keeps Manager-missing nested packs
+        # groupable by identity.
+        for node in iter_graph_nodes(graph):
+            identity = _pack_identity_of(node)
+            if not identity:
+                continue
+            node_id = node.get("id")
+            if node_id is not None:
+                key = str(node_id)
+                by_id[key] = _merge_identity(by_id.get(key, {}), identity)
+            node_type = node.get("type")
+            if isinstance(node_type, str) and node_type:
+                by_class[node_type] = _merge_identity(
+                    by_class.get(node_type, {}), identity
+                )
+    for node_id, node in prompt.items():
+        identity = _pack_identity_of(node)
+        if not identity:
+            continue
+        key = str(node_id)
+        by_id[key] = _merge_identity(by_id.get(key, {}), identity)
+        class_type = node.get("class_type") if isinstance(node, dict) else None
+        if isinstance(class_type, str) and class_type:
+            by_class[class_type] = _merge_identity(
+                by_class.get(class_type, {}), identity
+            )
+    return by_id, by_class
+
+
 def extract_dependency_metadata(capture: dict[str, Any]) -> dict[str, Any]:
-    """Extract dependency metadata (model stack + node classes) from a capture."""
-    prompt = extract_executable_prompt((capture or {}).get("api_prompt_json") or {})
+    """Extract dependency metadata (model stack + node classes + pack ids).
+
+    ``custom_node_requirements[class_type]`` preserves the pack identity
+    recorded on the captured UI graph (``cnr_id``, ``aux_id``, ``version``) so
+    the resolver and Manager install flow can resolve a missing class back to
+    its pack.
+    """
+    api_prompt_json = (capture or {}).get("api_prompt_json") or {}
+    prompt = extract_executable_prompt(api_prompt_json)
+    graph_json = (capture or {}).get("graph_json")
+    static_graph = (capture or {}).get("static_graph")
     node_classes: set[str] = set()
     for node in prompt.values():
         if isinstance(node, dict) and node.get("class_type"):
             node_classes.add(str(node["class_type"]))
+    # ComfyUI-Manager scans the full UI graph, but the executable prompt drops
+    # UI-only nodes and nodes whose pack/code is missing. Union the captured
+    # graph node types so those dependencies still surface (the resolver's
+    # shape classifier keeps true virtual panels out of the missing count).
+    for graph in (graph_json, static_graph):
+        node_classes |= _graph_node_types(graph)
+    identity_by_id, identity_by_class = _collect_pack_identities(
+        prompt, graph_json, static_graph
+    )
+    custom_node_requirements: dict[str, dict[str, str]] = {}
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        if not class_type:
+            continue
+        class_type = str(class_type)
+        identity = identity_by_id.get(str(node_id)) or identity_by_class.get(class_type)
+        if identity:
+            custom_node_requirements[class_type] = dict(identity)
+    # Graph-only classes (UI/static nodes absent from the executable prompt)
+    # still keep their captured pack identity so the resolver can group and
+    # install them.
+    for class_type in node_classes:
+        if class_type in custom_node_requirements:
+            continue
+        identity = identity_by_class.get(class_type)
+        if identity:
+            custom_node_requirements[class_type] = dict(identity)
+    model_stack = extract_model_stack(prompt)
+    # Older API prompts can omit a custom loader's named widget value; the
+    # persisted UI/static graph still records it. Merge those refs through the
+    # same guards so custom loaders contribute models without treating prompt
+    # text, URLs, or virtual panels as models.
+    for graph_key in ("graph_json", "static_graph"):
+        for ref in extract_ui_graph_model_refs((capture or {}).get(graph_key)):
+            role = str(ref.get("role", ""))
+            filename = ref.get("filename")
+            if not isinstance(filename, str) or not filename:
+                continue
+            bucket = model_stack.setdefault(role, [])
+            if filename not in bucket:
+                bucket.append(filename)
     return {
-        "model_stack": extract_model_stack(prompt),
+        "model_stack": model_stack,
         "node_classes": sorted(node_classes),
+        "custom_node_requirements": custom_node_requirements,
     }
 
 

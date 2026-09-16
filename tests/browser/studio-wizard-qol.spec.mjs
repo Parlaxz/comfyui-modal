@@ -225,22 +225,81 @@ test.describe("Studio wizard QoL", () => {
     try {
       guard = installConsoleGuard(page);
 
-      const seen = { batch: null, rescan: 0, installs: [], reboots: 0, installedCalls: 0 };
+      const seen = { batch: null, rescan: 0, queue: [], starts: 0, gitInstalls: [], reboots: 0, installedCalls: 0 };
 
       await page.route("**/manager/version", async (route) => {
         await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ version: "abc123" }) });
       });
       await page.route("**/customnode/installed", async (route) => {
         seen.installedCalls += 1;
-        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ nodes: [] }) });
+        // Manager returns a dict keyed by module name, not { nodes: [] }.
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) });
+      });
+      // Manager catalog supplies a source URL for the row that has none.
+      await page.route("**/externalmodel/getlist**", async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ models: [
+            {
+              filename: "no_url.safetensors",
+              url: "https://example.com/no_url.safetensors",
+              reference: "https://example.com/no_url",
+              save_path: "vae",
+              name: "no_url.safetensors",
+              installed: "False",
+            },
+          ] }),
+        });
+      });
+      // Manager's default pack catalog + class mappings: the missing Donut
+      // row carries only a CNR id, so these authoritative default endpoints
+      // are what resolve it to a repository URL.
+      await page.route("**/customnode/getlist**", async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            channel: "default",
+            node_packs: {
+              donutnodes: {
+                title: "ComfyUI-DonutNodes",
+                repository: "https://github.com/DonutsDelivery/ComfyUI-DonutNodes",
+                state: "not-installed",
+              },
+            },
+          }),
+        });
+      });
+      await page.route("**/customnode/getmappings**", async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            donutnodes: [["DonutLoaderClass"], { title_aux: "ComfyUI-DonutNodes" }],
+          }),
+        });
+      });
+      await page.route("**/manager/queue/install", async (route) => {
+        seen.queue.push(route.request().postDataJSON());
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+      });
+      await page.route("**/manager/queue/start", async (route) => {
+        seen.starts += 1;
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
       });
       await page.route("**/customnode/install/git_url", async (route) => {
-        seen.installs.push(route.request().postDataJSON());
+        seen.gitInstalls.push(route.request().postDataJSON());
         await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
       });
       await page.route("**/manager/reboot", async (route) => {
         seen.reboots += 1;
         await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "ok" }) });
+      });
+      // Explicit reboot now waits for the reconnect: /system_stats (ComfyUI
+      // health) then /manager/version decide success, not the POST response.
+      await page.route("**/system_stats", async (route) => {
+        await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ system: {} }) });
       });
       await page.route("**/comfymodal/models/batch-install", async (route) => {
         seen.batch = route.request().postDataJSON();
@@ -275,9 +334,11 @@ test.describe("Studio wizard QoL", () => {
           ],
           custom_nodes: [
             {
-              name: "SomePack",
+              name: "ComfyUI-DonutNodes",
               state: "missing",
-              repository_url: "https://github.com/example/SomePack",
+              repository_url: "",
+              cnr_id: "donutnodes",
+              classes: ["DonutLoaderClass"],
               required_revision: "",
             },
           ],
@@ -293,25 +354,66 @@ test.describe("Studio wizard QoL", () => {
       await panel.locator('[data-testid="wizard-features-continue"]').click();
       await expect(panel.locator('[data-testid="wizard-dependencies-continue"]')).toBeVisible({ timeout: 10000 });
 
-      // Full report + truthful skip note.
+      // Full report; once the Manager catalog loads, its source URL resolves
+      // the source-less model, so nothing is skipped by Download all.
       await expect(panel.locator('[data-testid="dependency-model-row"]')).toHaveCount(2);
       await expect(panel.locator('[data-testid="dependency-node-row"]')).toHaveCount(1);
-      await expect(panel.locator('[data-testid="wizard-download-skipped"]')).toContainText("1 missing model");
       await expect(panel.locator('[data-testid="wizard-manager-status"]')).toContainText("ComfyUI-Manager detected", { timeout: 10000 });
+      await expect(panel.locator('[data-testid="wizard-download-skipped"]')).toHaveCount(0);
+      await expect(panel.locator('[data-testid="wizard-download-all"]')).toHaveText("Download all (2)");
 
-      // Download all → one item with the URL model only; rescan chained.
+      // Missing model row exposes EXACTLY two explicit install actions; the
+      // legacy single "Download on Modal" action is gone. The source-less row
+      // gains both actions from the Manager catalog.
+      const needsUrlRow = panel.locator('[data-testid="dependency-model-row"]').filter({ hasText: "needs_url.safetensors" });
+      const noUrlRow = panel.locator('[data-testid="dependency-model-row"]').filter({ hasText: "no_url.safetensors" });
+      await expect(needsUrlRow.getByTestId("dependency-model-queue")).toHaveText("Queue install");
+      await expect(needsUrlRow.getByTestId("dependency-model-install-now")).toHaveText("Install now");
+      await expect(needsUrlRow.getByTestId("dependency-model-download")).toHaveCount(0);
+      await expect(noUrlRow.getByTestId("dependency-model-queue")).toBeVisible({ timeout: 10000 });
+      await expect(noUrlRow.getByTestId("dependency-model-install-now")).toBeVisible();
+
+      // Missing Donut row carries no repository in the report; Manager's
+      // default getlist/getmappings resolve its cnr_id to the pack repo.
+      const packRow = panel.locator('[data-testid="dependency-node-row"]').filter({ hasText: "ComfyUI-DonutNodes" });
+      await expect(packRow.getByTestId("dependency-node-install-now")).toHaveText("Install now");
+      await expect(packRow.locator('a[href="https://github.com/DonutsDelivery/ComfyUI-DonutNodes"]')).toHaveCount(1);
+      await expect(panel.locator('[data-testid="dependency-node-install-request"]')).toHaveCount(0);
+      await expect(panel.locator('[data-testid="dependency-node-manager-install"]')).toHaveCount(0);
+      await expect(panel.locator('[data-testid="dependency-node-find-registry"]')).toHaveCount(0);
+
+      // Install now on the catalog-sourced row → synchronous single-item batch
+      // install with the Manager URL and save path.
+      await noUrlRow.getByTestId("dependency-model-install-now").click();
+      await expect.poll(() => seen.batch && seen.batch.items && seen.batch.items.length).toBe(1);
+      expect(seen.batch.items[0]).toEqual({
+        url: "https://example.com/no_url.safetensors",
+        filename: "no_url.safetensors",
+        save_path: "vae",
+      });
+      await expect.poll(() => seen.rescan).toBeGreaterThanOrEqual(1);
+      seen.batch = null;
+      seen.rescan = 0;
+
+      // Download all → both missing models: the report URL model and the
+      // Manager-catalog-sourced model (with its catalog save path).
       await panel.locator('[data-testid="wizard-download-all"]').click();
-      await expect(panel.locator('[data-testid="wizard-dependencies-message"]')).toContainText("Skipped 1", { timeout: 10000 });
-      expect(seen.batch.items).toHaveLength(1);
+      await expect.poll(() => seen.batch && seen.batch.items && seen.batch.items.length).toBe(2);
       expect(seen.batch.items[0]).toEqual({
         url: "https://example.com/needs_url.safetensors",
         filename: "needs_url.safetensors",
         save_path: "checkpoints",
       });
+      expect(seen.batch.items[1]).toEqual({
+        url: "https://example.com/no_url.safetensors",
+        filename: "no_url.safetensors",
+        save_path: "vae",
+      });
+      await expect(panel.locator('[data-testid="wizard-dependencies-message"]')).toContainText("Requested 2 model downloads", { timeout: 10000 });
       expect(seen.rescan).toBe(1);
 
       // Per-pack Manager install → restart-required + explicit reboot only.
-      const installBtn = panel.locator('[data-testid="dependency-node-manager-install"]');
+      const installBtn = panel.locator('[data-testid="dependency-node-install-now"]');
       await expect(installBtn).toBeVisible();
       expect(seen.reboots).toBe(0);
       await installBtn.click();
@@ -319,12 +421,25 @@ test.describe("Studio wizard QoL", () => {
       const rebootBtn = panel.locator('[data-testid="wizard-manager-reboot"]');
       await expect(rebootBtn).toBeVisible();
       expect(seen.reboots).toBe(0); // never before the explicit click
-      expect(seen.installs).toHaveLength(1);
-      expect(seen.installs[0]).toEqual({ url: "https://github.com/example/SomePack" });
+      // The identified Manager pack installs through Manager's queue. Its
+      // catalog record carries blank version metadata, which must NOT push it
+      // onto the security-gated git_url route.
+      expect(seen.queue).toHaveLength(1);
+      expect(seen.queue[0]).toMatchObject({
+        id: "donutnodes",
+        version: "unknown",
+        selected_version: "latest",
+        channel: "default",
+      });
+      expect(seen.starts).toBe(1);
+      expect(seen.gitInstalls).toEqual([]);
 
       await rebootBtn.click();
-      await expect(panel.locator('[data-testid="wizard-dependencies-message"]')).toContainText("Reboot requested", { timeout: 10000 });
+      // Success is decided by the bounded reconnect probes, so the click only
+      // reports completion once ComfyUI + Manager answer again.
+      await expect(panel.locator('[data-testid="wizard-dependencies-message"]')).toContainText("reconnected", { timeout: 15000 });
       expect(seen.reboots).toBe(1);
+      await expect(panel.locator('[data-testid="wizard-restart-required"]')).toHaveCount(0);
 
       // Continue is always available even though the VAE has no URL.
       const cont = panel.locator('[data-testid="wizard-dependencies-continue"]');
@@ -339,8 +454,8 @@ test.describe("Studio wizard QoL", () => {
     }
   });
 
-  // ── Item 4b fallback: Manager absent keeps the record-only request flow ──
-  test("3. missing Manager is reported and pack rows keep the approval request flow", async ({ page }) => {
+  // ── Item 4b: Manager absent still exposes the single Manager action ──
+  test("3. missing Manager is reported and pack rows keep exactly one Manager install action", async ({ page }) => {
     let guard;
     try {
       guard = installConsoleGuard(page);
@@ -369,9 +484,13 @@ test.describe("Studio wizard QoL", () => {
       await expect(panel.locator('[data-testid="wizard-dependencies-continue"]')).toBeVisible({ timeout: 10000 });
 
       await expect(panel.locator('[data-testid="wizard-manager-status"]')).toContainText("Manager not detected", { timeout: 10000 });
-      // Record-only approval control is preserved; no Manager install button.
-      await expect(panel.locator('[data-testid="dependency-node-install-request"]')).toBeVisible();
+      // The single Manager-backed install action is still the row's only
+      // action — no record-only request, no second installer, no Find in registry.
+      const packRow = panel.locator('[data-testid="dependency-node-row"]').filter({ hasText: "SomePack" });
+      await expect(packRow.getByTestId("dependency-node-install-now")).toHaveText("Install now");
+      await expect(panel.locator('[data-testid="dependency-node-install-request"]')).toHaveCount(0);
       await expect(panel.locator('[data-testid="dependency-node-manager-install"]')).toHaveCount(0);
+      await expect(panel.locator('[data-testid="dependency-node-find-registry"]')).toHaveCount(0);
 
       await panel.locator('[data-testid="wizard-dependencies-continue"]').click();
       await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });

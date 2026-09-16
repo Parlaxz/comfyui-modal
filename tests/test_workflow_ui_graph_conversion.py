@@ -20,6 +20,7 @@ import pytest
 
 from studio_domain import (
     derive_mapping_candidates,
+    extract_dependency_metadata,
     is_ui_workflow_format,
     ui_graph_to_api_prompt,
 )
@@ -177,6 +178,273 @@ class TestUiGraphConversion:
         assert entries["sampler"].input_name == "sampler_name"
         assert entries["positive_prompt"].node_id == "1"
         assert entries["model"].node_id == "4"
+
+
+class TestDependencyMetadataCnr:
+    def test_cnr_id_propagates_from_ui_graph_and_ignores_comfy_core(self):
+        graph = {
+            "nodes": [
+                {"id": 4, "type": "DonutLoader", "properties": {"cnr_id": "donutnodes"}},
+                {"id": 6, "type": "SaveImage", "properties": {"cnr_id": "comfy-core"}},
+            ],
+        }
+        prompt = {
+            "4": {"class_type": "DonutLoader", "inputs": {"model_name": "donut.safetensors"}},
+            "6": {"class_type": "SaveImage", "inputs": {}},
+        }
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert meta["custom_node_requirements"] == {"DonutLoader": {"cnr_id": "donutnodes"}}
+        assert "SaveImage" not in meta["custom_node_requirements"]
+        assert meta["node_classes"] == ["DonutLoader", "SaveImage"]
+
+    def test_cnr_id_matches_by_class_when_api_ids_differ(self):
+        graph = {
+            "nodes": [
+                {"id": 99, "type": "DonutLoader", "properties": {"cnr_id": "donutnodes"}}
+            ]
+        }
+        prompt = {"1": {"class_type": "DonutLoader", "inputs": {}}}
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert meta["custom_node_requirements"]["DonutLoader"]["cnr_id"] == "donutnodes"
+
+    def test_no_cnr_metadata_yields_empty_requirements(self):
+        prompt = {"1": {"class_type": "KSampler", "inputs": {"seed": 1}}}
+        meta = extract_dependency_metadata(
+            {"graph_json": {"nodes": []}, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert meta["custom_node_requirements"] == {}
+
+    def test_aux_id_and_version_propagate_from_ui_graph(self):
+        graph = {
+            "nodes": [
+                {
+                    "id": 4,
+                    "type": "KJNodesLoader",
+                    "properties": {"aux_id": "kijai/ComfyUI-KJNodes", "ver": "1.2.3"},
+                },
+            ],
+        }
+        prompt = {"4": {"class_type": "KJNodesLoader", "inputs": {}}}
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert meta["custom_node_requirements"]["KJNodesLoader"] == {
+            "aux_id": "kijai/ComfyUI-KJNodes",
+            "version": "1.2.3",
+        }
+
+    def test_core_node_with_only_version_yields_no_requirement(self):
+        """A core node's version is not a custom-node identity."""
+        graph = {
+            "nodes": [
+                {"id": 6, "type": "SaveImage", "properties": {"cnr_id": "comfy-core", "ver": "0.3.0"}},
+            ],
+        }
+        prompt = {"6": {"class_type": "SaveImage", "inputs": {}}}
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert meta["custom_node_requirements"] == {}
+
+    def test_ui_graph_only_classes_union_into_node_classes(self):
+        """UI-only nodes (absent from the executable prompt, e.g. a pack whose
+        code failed to load) still surface as dependencies and keep the pack
+        identity recorded on the graph node."""
+        graph = {
+            "nodes": [
+                {"id": 4, "type": "DonutLoader", "properties": {"cnr_id": "donutnodes"}},
+                {
+                    "id": 5,
+                    "type": "Krea2IdentityEdit",
+                    "properties": {"cnr_id": "krea2_identity_edit"},
+                    "inputs": [{"name": "image", "link": None}],
+                    "outputs": [{"name": "IMAGE"}],
+                },
+                {
+                    "id": 6,
+                    "type": "SeedVarianceEnhancer",
+                    "properties": {"aux_id": "owner/SeedVarianceEnhancer", "ver": "2.1.0"},
+                    "inputs": [{"name": "model", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                },
+            ],
+        }
+        prompt = {"4": {"class_type": "DonutLoader", "inputs": {}}}
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert set(meta["node_classes"]) == {
+            "DonutLoader",
+            "Krea2IdentityEdit",
+            "SeedVarianceEnhancer",
+        }
+        assert meta["custom_node_requirements"]["Krea2IdentityEdit"] == {
+            "cnr_id": "krea2_identity_edit"
+        }
+        assert meta["custom_node_requirements"]["SeedVarianceEnhancer"] == {
+            "aux_id": "owner/SeedVarianceEnhancer",
+            "version": "2.1.0",
+        }
+
+    def test_static_graph_only_classes_union_into_node_classes(self):
+        """The ``static_graph`` alias is scanned too (old captures / import)."""
+        graph = {
+            "nodes": [
+                {
+                    "id": 9,
+                    "type": "BlehNode",
+                    "properties": {"aux_id": "bleh/ComfyUI-bleh"},
+                    "inputs": [{"name": "x", "link": None}],
+                    "outputs": [{"name": "Y"}],
+                },
+            ],
+        }
+        meta = extract_dependency_metadata(
+            {"static_graph": graph, "api_prompt_json": {"workflow": {}, "output": {}}}
+        )
+        assert meta["node_classes"] == ["BlehNode"]
+        assert meta["custom_node_requirements"]["BlehNode"] == {
+            "aux_id": "bleh/ComfyUI-bleh"
+        }
+
+    def test_graph_named_widgets_merge_into_model_stack(self):
+        graph = {
+            "nodes": [
+                {
+                    "id": 4,
+                    "type": "CheckpointLoaderSimple",
+                    "inputs": [],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {"ckpt_name": "graph_only.safetensors"},
+                },
+                {
+                    "id": 5,
+                    "type": "DonutWorkflowPanel",
+                    "inputs": [],
+                    "outputs": [],
+                    "widgets_values_named": {"model_name": "ghost.safetensors"},
+                },
+            ],
+        }
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": {}}}
+        )
+        assert meta["model_stack"] == {"checkpoint": ["graph_only.safetensors"]}
+
+    def test_nested_graph_classes_and_identities_surface(self):
+        """Manager-missing nodes nested under subgraph/group containers still
+        union into node_classes and keep their captured pack identity."""
+        graph = {
+            "nodes": [
+                {"id": 1, "type": "TopNode", "properties": {"cnr_id": "top-pack"},
+                 "inputs": [], "outputs": [{"name": "OUT"}]},
+            ],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg",
+                        "nodes": [
+                            {
+                                "id": 2,
+                                "type": "NestedAlphaNode",
+                                "properties": {"cnr_id": "nested-pack", "ver": "1.2.3"},
+                                "inputs": [{"name": "model", "link": None}],
+                                "outputs": [{"name": "MODEL"}],
+                            },
+                            {
+                                "id": 3,
+                                "type": "NestedBetaNode",
+                                "properties": {"aux_id": "owner/nested-beta"},
+                                "inputs": [{"name": "x", "link": None}],
+                                "outputs": [{"name": "Y"}],
+                            },
+                        ],
+                    }
+                ]
+            },
+            "extra": {
+                "groupNodes": {
+                    "g": {
+                        "nodes": [
+                            {
+                                "id": 4,
+                                "type": "NestedGammaNode",
+                                "properties": {"cnr_id": "nested-pack"},
+                                "inputs": [{"name": "x", "link": None}],
+                                "outputs": [{"name": "Y"}],
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": {}}}
+        )
+        assert {"TopNode", "NestedAlphaNode", "NestedBetaNode", "NestedGammaNode"}.issubset(
+            set(meta["node_classes"])
+        )
+        assert meta["custom_node_requirements"]["NestedAlphaNode"] == {
+            "cnr_id": "nested-pack",
+            "version": "1.2.3",
+        }
+        assert meta["custom_node_requirements"]["NestedBetaNode"] == {
+            "aux_id": "owner/nested-beta"
+        }
+        assert meta["custom_node_requirements"]["NestedGammaNode"] == {
+            "cnr_id": "nested-pack"
+        }
+
+    def test_nested_virtual_panel_not_a_requirement(self):
+        """A nested empty-panel node with no pack identity is not a pack."""
+        graph = {
+            "nodes": [],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg",
+                        "nodes": [
+                            {
+                                "id": 1,
+                                "type": "NestedPanel",
+                                "properties": {},
+                                "inputs": [],
+                                "outputs": [],
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": {}}}
+        )
+        assert "NestedPanel" not in meta["custom_node_requirements"]
+
+    def test_graph_and_prompt_model_refs_both_preserved(self):
+        graph = {
+            "nodes": [
+                {
+                    "id": 4,
+                    "type": "DonutLoader",
+                    "inputs": [{"name": "clip", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {"vae_file": "graph_vae.safetensors"},
+                },
+            ],
+        }
+        prompt = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "prompt_unet.safetensors"}},
+        }
+        meta = extract_dependency_metadata(
+            {"graph_json": graph, "api_prompt_json": {"workflow": {}, "output": prompt}}
+        )
+        assert "prompt_unet.safetensors" in meta["model_stack"]["unet"]
+        assert "graph_vae.safetensors" in meta["model_stack"]["vae"]
 
 
 class TestServiceImportDerivesPrompt:

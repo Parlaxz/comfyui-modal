@@ -1033,6 +1033,14 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({ status: "ok", message: "Mock runtime ready" });
   }
 
+  /**
+   * POST /comfymodal/studio/custom-nodes/refresh — canonical registry refresh
+   * (wizard best-effort refresh after an explicit Manager install).
+   */
+  async function refreshCustomNodesMock(route, url, body) {
+    return _json({ status: "ok", custom_nodes: [] });
+  }
+
   /** Catch-all: 599 JSON for any unhandled /comfymodal/ request */
   async function catchAll(route, url, body) {
     return _error("unhandled mock endpoint", 599);
@@ -1082,6 +1090,9 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Custom-node registry refresh (wizard post-install best-effort refresh)
+    ["POST", "/comfymodal/studio/custom-nodes/refresh", refreshCustomNodesMock],
 
     // Settings page (studio-settings.spec.mjs) — full config, profile level,
     // and deploy status. Registered before the legacy stub config entries so

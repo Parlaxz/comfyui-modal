@@ -36,11 +36,27 @@ import os
 import secrets
 import sys
 import tarfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
+
+# Repo root (this file lives in ``tools/``); lets the tool import the
+# config-owned ``modal_workspaces`` module whether it is run as a script or
+# imported as ``tools.download_v2_full_trace``.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Ambient selection variables that must never decide which Modal workspace a
+# Volume is resolved against.  Mirrors tools/v2_control/source_probe.py.
+_AMBIENT_MODAL_SELECTORS: Tuple[str, ...] = (
+    "COMFYMODAL_ENVIRONMENT",
+    "COMFYMODAL_V2_ENVIRONMENT",
+    "COMFYMODAL_MODAL_PROFILE",
+)
 
 BUNDLE_FILENAME = "bundle.tar.gz"
 MANIFEST_FILENAME = "bundle_manifest.json"
@@ -562,6 +578,12 @@ def run_download(
     """
     if download_client is None:
         download_client = DownloadClient()
+        # Only the real client resolves the canonical Modal destination, so
+        # only it needs credentials.  Injected clients (tests/fakes) carry
+        # their own data source and must work offline.
+        resolve_volume = True
+    else:
+        resolve_volume = False
 
     output_dir = Path(descriptor.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -590,7 +612,7 @@ def run_download(
     try:
         # ── Step 1: Download with incremental hash -------------------
         _progress(progress_cb, "Downloading bundle ...")
-        vol = _get_volume(descriptor.volume)
+        vol = _get_volume(descriptor.volume) if resolve_volume else None
         chunks = download_client.read_file_chunks(vol, descriptor.remote_path)
         _incremental_verify(chunks, bundle_tmp, descriptor.sha256)
 
@@ -687,11 +709,46 @@ def run_download(
         }
 
 
-def _get_volume(volume_name: str) -> Any:
-    """Resolve a Modal Volume by name.
+@contextmanager
+def _canonical_modal_destination_environment() -> Iterator[Dict[str, Any]]:
+    """Temporarily bind the process env to the config-owned Modal destination.
 
-    Raises ``SystemExit(1)`` if Modal is not installed or the volume
-    cannot be found.
+    Resolves the canonical destination from the shared workspace registry,
+    then drops every ``MODAL_*`` variable and known COMFYMODAL selection
+    variable so an ambient profile/token cannot redirect the client.  The
+    destination's credentials and (non-default) environment are bound for
+    the duration of the context; the caller's environment is restored on
+    exit, including when the body raises.
+    """
+    import modal_workspaces
+
+    destination = modal_workspaces.resolve_modal_destination(_REPO_ROOT)
+    original = dict(os.environ)
+    try:
+        for name in list(os.environ):
+            if name.startswith("MODAL_") or name in _AMBIENT_MODAL_SELECTORS:
+                os.environ.pop(name, None)
+        os.environ["MODAL_TOKEN_ID"] = str(destination.get("token_id") or "")
+        os.environ["MODAL_TOKEN_SECRET"] = str(destination.get("token_secret") or "")
+        environment = str(destination.get("environment") or "(default)")
+        if environment != "(default)":
+            os.environ["MODAL_ENVIRONMENT"] = environment
+            os.environ["COMFYMODAL_ENVIRONMENT"] = environment
+            os.environ["COMFYMODAL_V2_ENVIRONMENT"] = environment
+        yield destination
+    finally:
+        os.environ.clear()
+        os.environ.update(original)
+
+
+def _get_volume(volume_name: str) -> Any:
+    """Resolve a Modal Volume by name against the canonical destination.
+
+    Ambient ``MODAL_*`` selection is scrubbed and the config-owned
+    workspace credentials/environment are bound for the duration of the
+    lookup, then the caller's environment is restored.  Raises
+    ``SystemExit(1)`` if Modal is not installed, the destination cannot be
+    resolved, or the volume cannot be found.
     """
     try:
         import modal
@@ -704,7 +761,8 @@ def _get_volume(volume_name: str) -> Any:
         raise SystemExit(1) from exc
 
     try:
-        return modal.Volume.from_name(volume_name, create_if_missing=False)
+        with _canonical_modal_destination_environment():
+            return modal.Volume.from_name(volume_name, create_if_missing=False)
     except Exception as exc:
         print(
             f"ERROR: Cannot resolve Modal Volume {volume_name!r}: {exc}",

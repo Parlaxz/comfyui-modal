@@ -569,6 +569,32 @@ export async function managerInstallNode(url) {
   });
 }
 
+/**
+ * POST /manager/queue/install — queue a KNOWN Manager pack by its record
+ * (id, version, selected_version, channel, mode, repository, files, ui_id).
+ * This is Manager's normal CNR install path and does NOT require the
+ * dedicated allow_git_url_install flag, so it avoids the git_url 403 gate.
+ */
+export async function managerQueueInstall(packRecord) {
+  return managerFetch("/manager/queue/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(packRecord || {}),
+  });
+}
+
+/**
+ * POST /manager/queue/start — explicitly start the queued installs. Manager
+ * rejects form-simple content types here, so send JSON.
+ */
+export async function managerQueueStart() {
+  return managerFetch("/manager/queue/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+}
+
 /** GET /customnode/installed — match which packs are already installed. */
 export async function listManagerInstalled() {
   return managerFetch("/customnode/installed");
@@ -579,11 +605,289 @@ export async function managerReboot() {
   return managerFetch("/manager/reboot", { method: "POST" });
 }
 
-/** GET /externalmodel/getlist — Manager model catalog for source/download URLs. */
+/**
+ * GET /system_stats — ComfyUI's own health endpoint (ROOT-relative, not under
+ * /comfymodal). Used to detect that the ComfyUI process is back after an
+ * explicit Manager reboot. Bounded by an AbortController so a hung socket can
+ * never stall the wizard. Returns null on transport failure/timeout.
+ */
+export async function getComfySystemStats(timeoutMs) {
+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5000;
+  let timer = null;
+  try {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    if (controller) timer = setTimeout(() => controller.abort(), ms);
+    const res = await fetch("/system_stats", controller ? { signal: controller.signal } : undefined);
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export const REBOOT_RECONNECT_TIMEOUT_MS = 90000;
+export const REBOOT_RECONNECT_INTERVAL_MS = 2000;
+
+/**
+ * Explicit-reboot completion probe. Fires the reboot request, then treats the
+ * expected connection drop as normal: it waits (bounded) for ComfyUI to
+ * reconnect by polling /system_stats, and — when Manager was detected before
+ * the reboot — waits for /manager/version to answer again.
+ *
+ * Resolution is only decided by the probes, never by the reboot POST itself:
+ * a transport failure/timeout on POST is expected and ignored. Failure is
+ * reported only after the shared timeout is exhausted.
+ *
+ * All side-effect seams are injectable (reboot/probeSystem/probeManager/
+ * now/sleep) so the reconnect contract is unit-testable without timers.
+ *
+ * @returns {{ok: boolean, phase: "reconnect"|"manager"|"ready", message: string}}
+ */
+export async function managerRebootAndWait(options) {
+  const o = options || {};
+  const now = typeof o.now === "function" ? o.now : () => Date.now();
+  const sleep = typeof o.sleep === "function"
+    ? o.sleep
+    : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const doReboot = typeof o.reboot === "function" ? o.reboot : managerReboot;
+  const probeSystem = typeof o.probeSystem === "function" ? o.probeSystem : getComfySystemStats;
+  const probeManager = typeof o.probeManager === "function" ? o.probeManager : getManagerVersion;
+  const expectManager = o.expectManager === true;
+  const timeoutMs = Number.isFinite(o.timeoutMs) && o.timeoutMs > 0
+    ? o.timeoutMs
+    : REBOOT_RECONNECT_TIMEOUT_MS;
+  const intervalMs = Number.isFinite(o.intervalMs) && o.intervalMs > 0
+    ? o.intervalMs
+    : REBOOT_RECONNECT_INTERVAL_MS;
+  const onPhase = typeof o.onPhase === "function" ? o.onPhase : null;
+
+  // The reboot POST very often drops the connection; that is the expected
+  // shape of a successful reboot, so it is never treated as a failure.
+  try { await doReboot(); } catch (e) { /* expected connection drop */ }
+
+  const deadline = now() + timeoutMs;
+  if (onPhase) onPhase("reconnect");
+  let systemBack = false;
+  while (now() <= deadline) {
+    let stats = null;
+    try { stats = await probeSystem(); } catch (e) { stats = null; }
+    if (stats && stats.ok) { systemBack = true; break; }
+    if (now() >= deadline) break;
+    await sleep(intervalMs);
+  }
+  if (!systemBack) {
+    return {
+      ok: false,
+      phase: "reconnect",
+      message: "ComfyUI did not reconnect after the reboot request — restart it manually if needed.",
+    };
+  }
+
+  if (expectManager) {
+    if (onPhase) onPhase("manager");
+    let managerBack = false;
+    while (now() <= deadline) {
+      let version = null;
+      try { version = await probeManager(); } catch (e) { version = null; }
+      if (version && version.ok) { managerBack = true; break; }
+      if (now() >= deadline) break;
+      await sleep(intervalMs);
+    }
+    if (!managerBack) {
+      return {
+        ok: false,
+        phase: "manager",
+        message: "ComfyUI reconnected, but ComfyUI-Manager did not come back in time.",
+      };
+    }
+  }
+
+  return { ok: true, phase: "ready", message: "ComfyUI rebooted and reconnected." };
+}
+
+// ── Setup-wizard draft contract (bounded, namespaced) ────────────────────
+//
+// The version-setup wizard persists its identity + current step + bindings +
+// details to sessionStorage (and a marker in the Studio URL hash) so a browser
+// refresh can reopen the same workflow/version wizard at the same step.
+// These pure builders/parsers live here (no DOM) so the bounded schema is
+// unit-testable in Node; web/studio-preset-wizard.js owns the storage + URL
+// side effects.
+
+export const WIZARD_DRAFT_KEY = "comfymodal.studio.wizard.draft.v1";
+export const WIZARD_DRAFT_SCHEMA = 1;
+export const WIZARD_DRAFT_MAX_CHARS = 12000;
+
+const WIZARD_DETAIL_NAME_MAX = 200;
+const WIZARD_DETAIL_DESC_MAX = 2000;
+const WIZARD_FEATURES_MAX = 8;
+const WIZARD_BINDING_KEYS_MAX = 16;
+const WIZARD_BINDING_STR_MAX = 80;
+
+function _draftStr(value, max) {
+  const s = typeof value === "string" ? value : (value == null ? "" : String(value));
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/** Normalize one binding to the bounded draft shape; null when unusable. */
+function _draftBindingValue(val) {
+  if (!val || typeof val !== "object" || val.nodeId == null) return null;
+  const out = {
+    nodeId: val.nodeId,
+    nodeType: _draftStr(val.nodeType || "", WIZARD_BINDING_STR_MAX),
+    nodeTitle: _draftStr(val.nodeTitle || "", WIZARD_BINDING_STR_MAX),
+  };
+  if (val.widgetName) out.widgetName = _draftStr(val.widgetName, WIZARD_BINDING_STR_MAX);
+  if (val.inputName) out.inputName = _draftStr(val.inputName, WIZARD_BINDING_STR_MAX);
+  if (val.outputIndex != null) out.outputIndex = val.outputIndex;
+  if (!out.widgetName && !out.inputName && out.outputIndex == null) return null;
+  return out;
+}
+
+/**
+ * Bounded draft for a version-setup wizard. Returns null for any other mode
+ * (preset/edit wizards are not resumed by the workflows page).
+ */
+export function buildWizardDraft(state) {
+  if (!state || !state.isVersionSetup) return null;
+  const workflowId = _draftStr(state.workflowId || "", WIZARD_BINDING_STR_MAX);
+  const workflowVersionId = _draftStr(state.workflowVersionId || "", WIZARD_BINDING_STR_MAX);
+  if (!workflowId || !workflowVersionId) return null;
+
+  const bindings = {};
+  let count = 0;
+  Object.keys(state.bindings || {}).sort().forEach((key) => {
+    if (count >= WIZARD_BINDING_KEYS_MAX) return;
+    const b = _draftBindingValue(state.bindings[key]);
+    if (!b) return;
+    bindings[_draftStr(key, WIZARD_BINDING_STR_MAX)] = b;
+    count += 1;
+  });
+
+  const features = Array.isArray(state.selectedFeatures)
+    ? state.selectedFeatures.map((f) => _draftStr(f, WIZARD_BINDING_STR_MAX)).filter(Boolean).slice(0, WIZARD_FEATURES_MAX)
+    : [];
+
+  return {
+    v: WIZARD_DRAFT_SCHEMA,
+    step: _draftStr(state.step || "", WIZARD_BINDING_STR_MAX),
+    workflowId: workflowId,
+    workflowVersionId: workflowVersionId,
+    selectedFeatures: features,
+    bindings: bindings,
+    details: {
+      name: _draftStr((state.details && state.details.name) || "", WIZARD_DETAIL_NAME_MAX),
+      description: _draftStr((state.details && state.details.description) || "", WIZARD_DETAIL_DESC_MAX),
+    },
+    at: Date.now(),
+  };
+}
+
+/**
+ * Validate + bound an untrusted draft string. Returns null for anything that
+ * is not a current-schema version-setup draft — stale/malformed storage is
+ * dropped softly, never thrown.
+ */
+export function parseWizardDraft(raw) {
+  if (typeof raw !== "string" || raw === "") return null;
+  if (raw.length > WIZARD_DRAFT_MAX_CHARS * 2) return null;
+  let obj = null;
+  try { obj = JSON.parse(raw); } catch (e) { return null; }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+  if (obj.v !== WIZARD_DRAFT_SCHEMA) return null;
+  const workflowId = typeof obj.workflowId === "string" ? obj.workflowId.slice(0, WIZARD_BINDING_STR_MAX) : "";
+  const workflowVersionId = typeof obj.workflowVersionId === "string" ? obj.workflowVersionId.slice(0, WIZARD_BINDING_STR_MAX) : "";
+  if (!workflowId || !workflowVersionId) return null;
+
+  const bindings = {};
+  if (obj.bindings && typeof obj.bindings === "object" && !Array.isArray(obj.bindings)) {
+    Object.keys(obj.bindings).slice(0, WIZARD_BINDING_KEYS_MAX).forEach((key) => {
+      const b = _draftBindingValue(obj.bindings[key]);
+      if (b) bindings[key.slice(0, WIZARD_BINDING_STR_MAX)] = b;
+    });
+  }
+
+  const features = Array.isArray(obj.selectedFeatures)
+    ? obj.selectedFeatures.filter((f) => typeof f === "string").slice(0, WIZARD_FEATURES_MAX)
+    : [];
+  const details = obj.details && typeof obj.details === "object" && !Array.isArray(obj.details) ? obj.details : {};
+
+  return {
+    v: WIZARD_DRAFT_SCHEMA,
+    step: typeof obj.step === "string" ? obj.step.slice(0, WIZARD_BINDING_STR_MAX) : "",
+    workflowId: workflowId,
+    workflowVersionId: workflowVersionId,
+    selectedFeatures: features,
+    bindings: bindings,
+    details: {
+      name: _draftStr(details.name || "", WIZARD_DETAIL_NAME_MAX),
+      description: _draftStr(details.description || "", WIZARD_DETAIL_DESC_MAX),
+    },
+  };
+}
+
+/**
+ * Merge a parsed draft into a fresh wizard state, but ONLY when the identity
+ * matches exactly. `validSteps` is the mode's ordered step list; an unknown
+ * step falls back to the freshly-computed default. Returns true when applied.
+ */
+export function applyWizardDraft(state, draft, validSteps) {
+  if (!state || !draft || !state.isVersionSetup) return false;
+  if (String(draft.workflowId) !== String(state.workflowId || "")) return false;
+  if (String(draft.workflowVersionId) !== String(state.workflowVersionId || "")) return false;
+  const steps = Array.isArray(validSteps) && validSteps.length
+    ? validSteps
+    : ["features", "dependencies", "bindings", "details"];
+  if (draft.step && steps.indexOf(draft.step) !== -1) state.step = draft.step;
+  if (draft.selectedFeatures && draft.selectedFeatures.length && state.selectedFeatures.length === 0) {
+    state.selectedFeatures = draft.selectedFeatures.slice();
+  }
+  Object.keys(draft.bindings || {}).forEach((key) => {
+    state.bindings[key] = Object.assign({}, draft.bindings[key]);
+  });
+  if (draft.details) {
+    if (draft.details.name) state.details.name = draft.details.name;
+    if (draft.details.description) state.details.description = draft.details.description;
+  }
+  return true;
+}
+
+/**
+ * GET /externalmodel/getlist?mode=default — authoritative Manager model
+ * catalog for source/download URLs (falls back to the cached channel only
+ * when the default channel is unavailable).
+ */
 export async function getManagerModels() {
-  const res = await managerFetch("/externalmodel/getlist?mode=cache");
-  if (res && res.ok && res.data && Array.isArray(res.data.models)) return res.data.models;
+  const fresh = await managerFetch("/externalmodel/getlist?mode=default");
+  if (fresh && fresh.ok && fresh.data && Array.isArray(fresh.data.models)) {
+    return fresh.data.models;
+  }
+  const cached = await managerFetch("/externalmodel/getlist?mode=cache");
+  if (cached && cached.ok && cached.data && Array.isArray(cached.data.models)) {
+    return cached.data.models;
+  }
   return [];
+}
+
+/**
+ * GET /customnode/getlist?mode=default&skip_update=true — Manager custom-node
+ * pack catalog. Returns the raw envelope ({ channel, node_packs }) or null.
+ */
+export async function getManagerPackList() {
+  const res = await managerFetch("/customnode/getlist?mode=default&skip_update=true");
+  return (res && res.ok && res.data) ? res.data : null;
+}
+
+/**
+ * GET /customnode/getmappings?mode=default — Manager class → pack mapping.
+ * Returns the raw map or null.
+ */
+export async function getManagerMappings() {
+  const res = await managerFetch("/customnode/getmappings?mode=default");
+  return (res && res.ok && res.data) ? res.data : null;
 }
 
 /** POST /comfymodal/model/install — async single download, returns download_id. */

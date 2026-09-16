@@ -13,9 +13,13 @@
 // Authority: this view is read-only over the canonical stores —
 // `.studio_model_library.json` (models) and `.studio_custom_nodes.json`
 // (custom nodes) via the /studio/models* and /studio/custom-nodes* routes.
-// Scans/refreshes run ONLY on explicit user action (never on render), and
-// install requests only RECORD approval — nothing is ever downloaded or
-// installed automatically.
+// Scans/refreshes run ONLY on explicit user action (never on render). The
+// dependency rows expose explicit-click install actions (Queue install /
+// Install now for sourced models, an explicit URL install for source-less
+// models — the backend downloads into the Modal workspace/volume, never the
+// browser — and a Manager-backed Install now for custom nodes); nothing
+// installs on render. The model detail dialog keeps its record-only request
+// flow.
 
 import { el, renderEmptyState } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
@@ -27,7 +31,12 @@ import {
   rescanModels,
   updateModel,
   requestModelInstall,
-  requestCustomNodeInstall,
+  batchInstallModels,
+  installSingleModel,
+  modelDownloadStatus,
+  managerInstallNode,
+  managerQueueInstall,
+  managerQueueStart,
 } from "./studio-backend-api.js";
 
 // ── Module helpers ────────────────────────────────────────────────────────
@@ -89,7 +98,8 @@ function _badge(text, kind) {
   const tone =
     kind === "installed" ? "ok"
       : (kind === "missing" || kind === "warning") ? "warn"
-        : "neutral";
+        : (kind === "downloading" || kind === "queued") ? "running"
+          : "neutral";
   return el("span", {
     class: "comfymodal-studio-model-badge " + kind + " cm-chip",
     "data-tone": tone,
@@ -97,11 +107,59 @@ function _badge(text, kind) {
   });
 }
 
+// Text/kind per dependency state. The dependency row's state badge is the
+// single source of truth for install state, so the in-flight transition
+// ("Downloading\u2026") can update the SAME node in place without re-rendering.
+const _STATE_BADGE = {
+  installed: ["Installed", "installed"],
+  missing: ["Missing", "missing"],
+  wrong_version: ["Wrong version", "warning"],
+  downloading: ["Downloading", "downloading"],
+  queued: ["Queued", "queued"],
+};
+
+/** Set a badge node's text/kind/tone in place (keeps cm-chip tone truthful). */
+function _applyBadge(node, text, kind) {
+  const tone =
+    kind === "installed" ? "ok"
+      : (kind === "missing" || kind === "warning") ? "warn"
+        : (kind === "downloading" || kind === "queued") ? "running"
+          : "neutral";
+  node.className = "comfymodal-studio-model-badge " + kind + " cm-chip";
+  node.setAttribute("data-tone", tone);
+  node.textContent = text;
+}
+
+/** Reset a badge node to a dependency state (text + kind + data-state). */
+function _applyStateBadge(node, state) {
+  const entry = _STATE_BADGE[state] || ["Unknown", "unknown"];
+  _applyBadge(node, entry[0], entry[1]);
+  node.setAttribute("data-state", state || "unknown");
+  return node;
+}
+
 function _stateBadgeFor(state) {
-  if (state === "installed") return _badge("Installed", "installed");
-  if (state === "missing") return _badge("Missing", "missing");
-  if (state === "wrong_version") return _badge("Wrong version", "warning");
-  return _badge("Unknown", "unknown");
+  return _applyStateBadge(el("span", {}), state);
+}
+
+/**
+ * Apply an in-flight badge (queued/downloading) to an EXISTING state badge
+ * node. Public so the wizard can re-apply its tracked status after a re-render
+ * on the row's real state badge — never a detached supplemental chip. `text`
+ * overrides the default label (a model's queue action reads
+ * "Queued for download" while a custom-node queue reads "Queued").
+ */
+export function applyDependencyInflightBadge(node, kind, text) {
+  if (!node) return node;
+  const entry = _STATE_BADGE[kind] || ["Unknown", "unknown"];
+  _applyBadge(node, text || entry[0], entry[1]);
+  node.setAttribute("data-state", kind || "unknown");
+  return node;
+}
+
+/** Apply a report state (installed/missing/wrong_version) to a badge node. */
+export function applyDependencyStateBadge(node, state) {
+  return _applyStateBadge(node, state);
 }
 
 // ── Model Library view ────────────────────────────────────────────────────
@@ -753,6 +811,393 @@ function renderDownloadRequestSection(model, apiBase, showStatus) {
 
 // ── Dependency section ────────────────────────────────────────────────────
 
+// ── Manager catalog lookups (custom nodes + models) ───────────────────────
+//
+// Manager data is advisory only: it can supply a pack repository or a model
+// source URL when the persisted library record has none. Nothing here
+// installs anything; every install stays an explicit user click on a row.
+
+/** Basename for path-like names ("a/b/c.safetensors" → "c.safetensors"). */
+function _basename(name) {
+  const value = String(name || "");
+  const idx = Math.max(value.lastIndexOf("/"), value.lastIndexOf("\\"));
+  return idx === -1 ? value : value.slice(idx + 1);
+}
+
+// Manager's type → ComfyUI folder behavior (mirrors Manager's
+// model_dir_name_map). Used to normalize a "default" save_path and to match a
+// dependency role against a catalog record's type without cross-type mixups.
+const _MANAGER_TYPE_FOLDERS = {
+  checkpoint: "checkpoints",
+  checkpoints: "checkpoints",
+  unclip: "checkpoints",
+  lora: "loras",
+  loras: "loras",
+  lycoris: "loras",
+  vae: "vae",
+  clip: "text_encoders",
+  text_encoder: "text_encoders",
+  text_encoders: "text_encoders",
+  unet: "diffusion_models",
+  diffusion_model: "diffusion_models",
+  diffusion_models: "diffusion_models",
+  t2i_adapter: "controlnet",
+  "t2i-adapter": "controlnet",
+  "t2i-style": "controlnet",
+  controlnet: "controlnet",
+  clip_vision: "clip_vision",
+  gligen: "gligen",
+  upscale: "upscale_models",
+  upscaler: "upscale_models",
+  upscale_models: "upscale_models",
+  embedding: "embeddings",
+  embeddings: "embeddings",
+  vae_approx: "vae_approx",
+  hypernetworks: "hypernetworks",
+  style_models: "style_models",
+  model_patches: "model_patches",
+};
+
+/** Map a Manager model type to a ComfyUI folder, or "" when unknown. */
+export function managerModelFolder(type) {
+  const key = String(type == null ? "" : type).trim().toLowerCase();
+  return (key && _MANAGER_TYPE_FOLDERS[key]) || "";
+}
+
+/**
+ * Normalize a Manager model save_path. Manager uses "default" to mean "let
+ * ComfyUI pick the folder for this model type"; resolve it through the
+ * type→folder map so a Modal install lands in a real folder. An explicit,
+ * non-default path is preserved as-is.
+ */
+export function normalizeManagerSavePath(savePath, type) {
+  const raw = String(savePath == null ? "" : savePath).trim();
+  if (raw && raw.toLowerCase() !== "default") return raw;
+  const folder = managerModelFolder(type);
+  // Never emit the literal "default": an unknown type falls back to "" so the
+  // caller can use its own role→folder bucket.
+  return folder || "";
+}
+
+function _folderFromSavePath(savePath) {
+  const raw = String(savePath == null ? "" : savePath).trim();
+  if (!raw || raw.toLowerCase() === "default") return "";
+  const head = raw.split("/")[0];
+  return _MANAGER_TYPE_FOLDERS[String(head).toLowerCase()] || head;
+}
+
+function _roleMatchesType(role, record) {
+  if (!role || !record || typeof record !== "object") return true;
+  const roleFolder = managerModelFolder(role) || String(role).toLowerCase();
+  const recordFolder = managerModelFolder(record.type) || _folderFromSavePath(record.savePath);
+  if (!roleFolder || !recordFolder) return true;
+  return roleFolder === recordFolder;
+}
+
+/**
+ * Resolve a missing dependency's Manager model record by filename. Exact
+ * filename wins; a path-like dependency filename otherwise matches the
+ * catalog basename (Manager catalogs basenames). A match is rejected when the
+ * dependency role and the catalog type map to different folders, so
+ * same-basename files of another type are never installed in the wrong place.
+ */
+export function matchManagerModel(m, map) {
+  if (!map || !m || !m.filename) return null;
+  const keys = [String(m.filename)];
+  const base = _basename(m.filename);
+  if (base && base !== m.filename) keys.push(base);
+  for (const key of keys) {
+    const record = map[key];
+    if (record && _roleMatchesType(m.role, record)) return record;
+  }
+  return null;
+}
+
+/**
+ * Pure: build the filename → Manager model record map consumed by
+ * `matchManagerModel` / the dependency rows. Records are keyed by exact
+ * filename and by basename (Manager catalogs basenames); a `default`
+ * save_path is normalized through the type→folder map so an install lands in
+ * a real folder. Advisory only — nothing here downloads or installs.
+ */
+export function buildManagerModelIndex(models) {
+  const map = {};
+  (Array.isArray(models) ? models : []).forEach((m) => {
+    if (!m || !m.filename) return;
+    const record = {
+      url: m.url || "",
+      reference: m.reference || "",
+      savePath: normalizeManagerSavePath(m.save_path, m.type),
+      type: m.type || "",
+      name: m.name || "",
+      installed: m.installed,
+    };
+    const filename = String(m.filename);
+    if (!map[filename]) map[filename] = record;
+    const base = _basename(filename);
+    if (base && base !== filename && !map[base]) map[base] = record;
+  });
+  return map;
+}
+
+function _managerModelFor(m, ctx) {
+  return matchManagerModel(m, ctx && ctx.managerModelsByFilename);
+}
+
+/**
+ * Prefer `repository`, then `files[0]`. `reference` is intentionally NOT used:
+ * for CNR packs it is a registry page, not an installable git URL.
+ */
+function _managerPackRepo(info) {
+  if (!info || typeof info !== "object") return "";
+  if (typeof info.repository === "string" && info.repository) return info.repository;
+  const files = Array.isArray(info.files) ? info.files : [];
+  if (typeof files[0] === "string" && files[0]) return files[0];
+  return "";
+}
+
+function _managerNodePacks(packList) {
+  if (Array.isArray(packList)) {
+    const out = {};
+    packList.forEach((p) => {
+      if (p && (p.id || p.title || p.name)) out[p.id || p.title || p.name] = p;
+    });
+    return out;
+  }
+  if (packList && typeof packList === "object") {
+    if (packList.node_packs && typeof packList.node_packs === "object") return packList.node_packs;
+    if (packList.packs && typeof packList.packs === "object") return packList.packs;
+  }
+  return {};
+}
+
+/** "owner/repo" for a GitHub URL, else "" (used to join aux ids). */
+function _repoSlug(url) {
+  const value = String(url || "").trim().replace(/\.git$/i, "");
+  const match = value.match(/github\.com[/:]([^/]+)\/([^/?#]+)/i);
+  return match ? (match[1] + "/" + match[2]).toLowerCase() : "";
+}
+
+function _safeRegExp(source) {
+  try {
+    const re = new RegExp(String(source));
+    return re.global ? new RegExp(String(source).replace(/[gmy]+$/, "")) : re;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _indexByKey(index, candidate, record) {
+  const key = String(candidate == null ? "" : candidate).trim().toLowerCase();
+  if (key && record && !index[key]) index[key] = record;
+}
+
+/**
+ * Pure: build a pack lookup from Manager's pack list
+ * (`/customnode/getlist`) and class mappings (`/customnode/getmappings`).
+ *
+ * Returns `{ packs, byClass, preemptions, patterns }`. Keys are matched
+ * case-insensitively and packs are indexed by their key, CNR id, aux id,
+ * repository/files URL, repository slug and reference — never by an invented
+ * URL. Resolution order is documented on `_resolveManagerPack`. Packs
+ * WITHOUT a repository are still indexed (pure-CNR packs install by record
+ * through Manager's queue, not by URL).
+ */
+export function buildManagerPackIndex(packList, mappings) {
+  const packs = {};
+  const byClass = {};
+  const preemptions = {};
+  const patterns = [];
+  const rawPacks = _managerNodePacks(packList);
+
+  const registerPack = (key, rawInfo) => {
+    const info = rawInfo && typeof rawInfo === "object" ? rawInfo : {};
+    const repositoryUrl = _managerPackRepo(info);
+    const record = {
+      key: String(key || ""),
+      cnrId: String(info.id || key || ""),
+      auxId: String(info.aux_id || info.auxId || ""),
+      name: String(info.title || info.name || key || ""),
+      repository: String(info.repository || ""),
+      repository_url: repositoryUrl,
+      reference: String(info.reference || ""),
+      files: Array.isArray(info.files) ? info.files.slice() : [],
+      version: info.version == null ? "" : String(info.version),
+      selected_version: info.selected_version == null ? "" : String(info.selected_version),
+      channel: info.channel == null ? "" : String(info.channel),
+      mode: info.mode == null ? "" : String(info.mode),
+      install_type: info.install_type == null ? "" : String(info.install_type),
+      nodename_pattern: info.nodename_pattern == null ? "" : String(info.nodename_pattern),
+    };
+    const repoUrl = record.repository || record.files[0] || "";
+    [
+      key,
+      record.cnrId,
+      record.auxId,
+      record.repository,
+      record.reference,
+      record.files[0],
+      repoUrl && _basename(repoUrl),
+      _repoSlug(repoUrl || record.reference),
+    ].forEach((candidate) => _indexByKey(packs, candidate, record));
+    if (record.nodename_pattern) {
+      const re = _safeRegExp(record.nodename_pattern);
+      if (re) patterns.push({ re: re, record: record });
+    }
+    if (Array.isArray(info.preemptions)) {
+      info.preemptions.forEach((cls) => _indexByKey(preemptions, cls, record));
+    }
+    return record;
+  };
+
+  Object.keys(rawPacks).forEach((key) => registerPack(key, rawPacks[key]));
+
+  if (mappings && typeof mappings === "object") {
+    Object.keys(mappings).forEach((key) => {
+      const entry = mappings[key];
+      const classes = Array.isArray(entry) ? entry[0] : (entry && entry.classes);
+      const meta = Array.isArray(entry) ? (entry[1] || {}) : {};
+      const record = packs[String(key).toLowerCase()] || packs[_repoSlug(key)];
+      if (record) {
+        if (Array.isArray(meta.preemptions)) {
+          meta.preemptions.forEach((cls) => _indexByKey(preemptions, cls, record));
+        }
+        if (meta.nodename_pattern) {
+          const re = _safeRegExp(meta.nodename_pattern);
+          if (re) patterns.push({ re: re, record: record });
+        }
+      }
+      (Array.isArray(classes) ? classes : []).forEach((cls) => {
+        if (record) _indexByKey(byClass, cls, record);
+      });
+    });
+  }
+  return { packs, byClass, preemptions, patterns };
+}
+
+/**
+ * Resolve a missing node's pack from the Manager index. Order matches
+ * Manager: explicit CNR/aux identity first, then preemptions, then the exact
+ * class mapping, then `nodename_pattern` regexes. Never guesses a URL — only
+ * case-insensitive matches already present in the index qualify.
+ */
+function _resolveManagerPack(n, ctx) {
+  const index = ctx && ctx.managerPacks;
+  if (!index || !n) return null;
+  const packs = index.packs || {};
+  const identities = [n.cnr_id, n.aux_id];
+  for (const raw of identities) {
+    if (!raw) continue;
+    const value = String(raw);
+    const record =
+      packs[value.toLowerCase()] ||
+      packs[_repoSlug(value)] ||
+      packs[_basename(value).toLowerCase()];
+    if (record) return record;
+  }
+  const classes = Array.isArray(n.classes) ? n.classes : (n.classes ? [n.classes] : []);
+  const lowered = classes.map((c) => String(c == null ? "" : c).toLowerCase()).filter(Boolean);
+  for (const lc of lowered) {
+    const record = index.preemptions && index.preemptions[lc];
+    if (record) return record;
+  }
+  for (const lc of lowered) {
+    const record = index.byClass && index.byClass[lc];
+    if (record) return record;
+  }
+  for (const cls of classes) {
+    const value = String(cls == null ? "" : cls);
+    if (!value) continue;
+    for (const pattern of index.patterns || []) {
+      if (pattern.re.test(value)) return pattern.record;
+    }
+  }
+  return null;
+}
+
+/**
+ * Decide how a missing node/pack should be installed. Explicit, single
+ * target: ANY pack identified by a Manager record installs through Manager's
+ * CNR queue — including records whose version metadata is blank/unknown —
+ * because the queue payload supplies safe defaults. Only a truly unmatched
+ * pack (no Manager record) falls back to the dependency report's explicit
+ * repository URL via the security-gated git_url route; otherwise no target.
+ */
+export function resolveNodeInstall(node, managerPacks) {
+  const n = node || {};
+  const pack = _resolveManagerPack(n, { managerPacks: managerPacks });
+  // Identified Manager packs never touch the git_url 403 gate; the CNR queue
+  // installs by record (id + safe defaults), not by repository URL.
+  if (pack) {
+    return { kind: "cnr", pack: pack, url: "", name: pack.name || n.name || "" };
+  }
+  // Truly unmatched: only an explicit repository from the dependency report
+  // qualifies for the (still security-gated) git_url fallback.
+  const repo = n.repository_url || "";
+  if (repo) {
+    return { kind: "git", pack: null, url: repo, name: n.name || "" };
+  }
+  return { kind: "none", pack: null, url: "", name: n.name || "" };
+}
+
+function _queueInstallPayload(pack) {
+  const files = Array.isArray(pack.files) ? pack.files.slice() : [];
+  return {
+    id: pack.cnrId || pack.repository || files[0] || "",
+    version: pack.version || "unknown",
+    selected_version: pack.selected_version || "latest",
+    channel: pack.channel || "default",
+    mode: pack.mode || "default",
+    repository: pack.repository || files[0] || "",
+    files: files,
+    ui_id: String(pack.key || pack.cnrId || ""),
+    install_type: pack.install_type || "",
+    skip_post_install: false,
+  };
+}
+
+/**
+ * Perform an explicit Manager install for a resolved plan. CNR records go
+ * through POST /manager/queue/install + /manager/queue/start (no git_url 403
+ * gate); an unmatched pack with an explicit repository keeps the dedicated
+ * git_url fallback. A plan with no target returns a truthful message and
+ * never guesses a URL. Never reboots.
+ */
+export async function performManagerInstall(plan) {
+  if (!plan || plan.kind === "none") {
+    return { ok: false, message: "No Manager install target identified for this pack." };
+  }
+  try {
+    if (plan.kind === "cnr") {
+      const queued = await managerQueueInstall(_queueInstallPayload(plan.pack));
+      if (!queued) return { ok: false, message: "Could not reach ComfyUI-Manager." };
+      if (queued.status === 403) {
+        return { ok: false, message: "Manager refused the CNR install (403). Raise Manager's security level, then retry." };
+      }
+      if (!queued.ok) {
+        const msg = (queued.data && (queued.data.message || queued.data.error)) || ("HTTP " + queued.status);
+        return { ok: false, message: "Install failed: " + msg };
+      }
+      const started = await managerQueueStart();
+      if (!started || !started.ok) {
+        return { ok: false, message: "Install queued, but Manager did not start it. Open ComfyUI-Manager and press Start." };
+      }
+      return { ok: true, message: "Install queued through ComfyUI-Manager \u2014 restart ComfyUI to load it." };
+    }
+    // Unknown/nightly git pack: still security-gated, never bypassed.
+    const resp = await managerInstallNode(plan.url);
+    if (!resp) return { ok: false, message: "Could not reach ComfyUI-Manager." };
+    if (resp.status === 403) {
+      return { ok: false, message: "Manager refused the install (403). Set allow_git_url_install=true, use a loopback session, then restart ComfyUI." };
+    }
+    if (resp.ok) return { ok: true, message: "Installed \u2014 restart ComfyUI to load it." };
+    const msg = (resp.data && (resp.data.message || resp.data.error)) || ("HTTP " + resp.status);
+    return { ok: false, message: "Install failed: " + msg };
+  } catch (err) {
+    return { ok: false, message: "Install failed: " + ((err && err.message) || "request failed") };
+  }
+}
+
 /**
  * Render the version dependency section.
  * @param {object} version - selected workflow version (may carry
@@ -762,10 +1207,20 @@ function renderDownloadRequestSection(model, apiBase, showStatus) {
  * @param {function} [refreshHandler] - optional click handler for the Refresh
  *   button (data-testid="dependencies-refresh")
  * @param {object} [opts] - optional parity context:
- *   { apiBase } enables the explicit per-node install-request action on
- *   missing custom-node rows; { onFindInLibrary(filename) } enables the
- *   contextual "Find in library" handoff on missing model rows.  Both are
- *   user-click-only; nothing here installs or downloads automatically.
+ *   { apiBase } enables the explicit model install actions on missing rows;
+ *   { managerModelsByFilename } supplies Manager catalog URLs/save paths when
+ *   the library record has no source; { managerPacks } supplies the Manager
+ *   pack index (CNR id / aux id / preemption / class / nodename_pattern) used
+ *   to resolve a missing node's pack; { managerInstalled } supplies Manager's
+ *   installed records (`{module, cnr_id, aux_id, enabled}`) for truthful
+ *   installed/disabled states; { onInstallPack(node, plan) } optionally
+ *   overrides the resolved Manager install (the wizard uses it to surface
+ *   restart state); { onDepsRefresh } refreshes the owner's dependency report
+ *   after an install; { onInstallSettled(model) } lets the owner drop its
+ *   tracked in-flight status once a model install resolves truthfully;
+ *   { onFindInLibrary(filename) } enables the contextual "Find in library"
+ *   handoff on missing model rows.  Every action is user-click-only; nothing
+ *   here installs or downloads automatically and nothing ever reboots.
  * @returns {HTMLElement}
  */
 export function renderDependencySection(version, deps, refreshHandler, opts) {
@@ -878,31 +1333,43 @@ function renderDependencyModelRow(m, ctx) {
   const row = el("div", {
     class: "comfymodal-studio-dependency-row",
     "data-testid": "dependency-model-row",
-    "data-model-key": m.key || "",
+    // Row + action key share one identity (key, else filename) so the wizard's
+    // tracked in-flight status can always find the row it belongs to.
+    "data-model-key": m.key || m.filename || "",
   });
   row.appendChild(_badge(m.role || "model", "role"));
   row.appendChild(el("span", { class: "comfymodal-studio-dependency-name", text: m.filename || "", title: m.filename || "" }));
-  row.appendChild(_stateBadgeFor(m.state));
+  // The state badge is the single source of truth for install state; the
+  // in-flight transition updates this same node in place (no "Not installed"
+  // detail duplicate).
+  const stateBadge = _stateBadgeFor(m.state);
+  stateBadge.setAttribute("data-testid", "dependency-model-state");
+  row.appendChild(stateBadge);
   if (m.state === "installed") {
     row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: m.local_path || m.folder || "" }));
   } else {
-    row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: "Not installed" }));
     const src = m.source_urls && m.source_urls[0];
     if (src) {
       row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: src, target: "_blank", rel: "noopener noreferrer", text: "source" }));
     }
     // Manager catalog fallback: per-filename download + page URLs when the
-    // library record carries none.
-    const managed = ctx && ctx.managerModelsByFilename && m.filename
-      ? ctx.managerModelsByFilename[m.filename] : null;
+    // library record carries none. Path-like dependency filenames match the
+    // catalog basename exactly.
+    const managed = _managerModelFor(m, ctx);
     const managerUrl = managed && managed.url ? managed.url : "";
     const managerRef = managed && managed.reference ? managed.reference : "";
     if (managerRef && managerRef !== src) {
       row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: managerRef, target: "_blank", rel: "noopener noreferrer", text: "manager source", title: (managed && managed.name) || m.filename }));
     }
+    // Sourced rows keep exactly two install actions: async queue (install +
+    // status polling) and sync single-item batch install. Source-less rows
+    // get the explicit URL install control instead. All explicit-click only.
     const downloadUrl = src || managerUrl;
-    if (downloadUrl && ctx && typeof ctx.onDownloadModel === "function") {
-      row.appendChild(renderModelDownloadControl(m, downloadUrl, ctx));
+    const savePath = m.folder
+      || (managed && normalizeManagerSavePath(managed.savePath, managed.type))
+      || "";
+    if (ctx && ctx.apiBase) {
+      row.appendChild(renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge));
     }
     // Contextual handoff into the Model Library filter — no second
     // model-management implementation, just a prefilled library query.
@@ -919,171 +1386,410 @@ function renderDependencyModelRow(m, ctx) {
   return row;
 }
 
-function renderModelDownloadControl(m, downloadUrl, ctx) {
+// Explicit model install controls for a missing dependency row.
+// Sourced rows keep the two existing actions: Queue install (async single
+// install + status polling) and Install now (single-item synchronous batch).
+// A source-less row gets an explicit URL input + install action so the user
+// can supply a source; the URL is handed to the EXISTING backend install
+// routes (validation/sanitization live there) and no model bytes are ever
+// fetched in the browser. While an install is in flight the row's state badge
+// shows "Downloading…" in place. Everything is explicit-click only.
+function renderModelInstallControls(m, downloadUrl, savePath, ctx, stateBadge) {
   const wrap = el("span", { class: "comfymodal-studio-dependency-request" });
-  const btn = el("button", {
+  const note = el("div", {
+    class: "comfymodal-studio-dependency-request-note",
+    "data-testid": "dependency-model-install-note",
+    style: "display:none;font-size:10px;color:#888;margin-top:2px;",
+  });
+  const baseInfo = { filename: m.filename || "", url: downloadUrl || "", savePath: savePath || "" };
+  const rowKey = m.key || m.filename || "";
+
+  // In-flight truth: the SAME state badge transitions, then falls back to the
+  // last-known state when the owner offers no refresh to re-evaluate it. A
+  // queued (async) install reads "Queued for download"; a synchronous install
+  // reads "Downloading…".
+  const markQueued = () => applyDependencyInflightBadge(stateBadge, "queued", "Queued for download");
+  const markDownloading = () => applyDependencyInflightBadge(stateBadge, "downloading", "Downloading\u2026");
+  const restoreState = () => _applyStateBadge(stateBadge, m.state);
+  const refreshDeps = async () => {
+    if (typeof ctx.onDepsRefresh === "function") {
+      try { await ctx.onDepsRefresh(); return true; } catch (e) { /* refresh is best-effort */ }
+    }
+    return false;
+  };
+  // The owner reconciles its tracked status once the install has settled so a
+  // successful install never leaves a stale pseudo-badge behind.
+  const settle = () => {
+    if (typeof ctx.onInstallSettled === "function") ctx.onInstallSettled(m);
+  };
+
+  // No library/Manager source: explicit user-supplied URL. The backend route
+  // validates and sanitizes it and downloads into the Modal workspace/volume;
+  // the browser never receives the model bytes.
+  if (!downloadUrl) {
+    const urlIn = el("input", {
+      type: "text",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "dependency-model-url-input",
+      "aria-label": "Model source URL for " + (m.filename || "model"),
+      placeholder: "https://\u2026",
+      style: "font-size:10px;padding:2px 6px;width:220px;",
+    });
+    const urlBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "dependency-model-url-install",
+      "data-model-key": rowKey,
+      text: "Install from URL",
+      style: "font-size:10px;padding:2px 8px;width:auto;",
+      onclick: async () => {
+        if (urlBtn.disabled) return; // dedupe while in flight
+        const url = (urlIn.value || "").trim();
+        if (!url) {
+          note.style.display = "block";
+          note.textContent = "Paste a model URL first.";
+          note.classList.add("error");
+          return;
+        }
+        urlBtn.disabled = true;
+        urlBtn.textContent = "Installing\u2026";
+        note.style.display = "block";
+        note.textContent = "Starting install\u2026";
+        note.classList.remove("error");
+        markDownloading();
+        const res = await queueModelInstall(ctx.apiBase, {
+          url: url,
+          filename: baseInfo.filename,
+          savePath: baseInfo.savePath,
+        });
+        note.textContent = res.message;
+        note.classList.toggle("error", !res.ok);
+        if (res.ok) {
+          if (!(await refreshDeps())) restoreState();
+          settle();
+        } else {
+          restoreState();
+          urlBtn.disabled = false;
+          urlBtn.textContent = "Install from URL";
+        }
+      },
+    });
+    wrap.appendChild(urlIn);
+    wrap.appendChild(urlBtn);
+    wrap.appendChild(note);
+    return wrap;
+  }
+
+  const info = baseInfo;
+
+  const queueBtn = el("button", {
     class: "comfymodal-secondary-btn",
-    "data-testid": "dependency-model-download",
-    "data-model-key": m.key || "",
-    text: "Download on Modal",
+    type: "button",
+    "data-testid": "dependency-model-queue",
+    "data-model-key": rowKey,
+    text: "Queue install",
     style: "font-size:10px;padding:2px 8px;width:auto;",
     onclick: async () => {
-      if (btn.disabled) return;
-      btn.disabled = true;
-      btn.textContent = "Downloading…";
+      if (queueBtn.disabled) return; // dedupe while in flight
+      queueBtn.disabled = true;
+      queueBtn.textContent = "Queueing\u2026";
       note.style.display = "block";
-      note.textContent = "Download requested…";
+      note.textContent = "Starting install\u2026";
       note.classList.remove("error");
-      try {
-        const res = await ctx.onDownloadModel({
-          filename: m.filename || "",
-          url: downloadUrl,
-          savePath: m.folder || "",
-        });
-        if (res && res.ok) {
-          note.textContent = res.message || "Downloaded.";
-          note.classList.remove("error");
-          if (typeof ctx.onDepsRefresh === "function") {
-            try { await ctx.onDepsRefresh(); } catch (e) { /* refresh is best-effort */ }
-          }
-        } else {
-          note.textContent = (res && res.message) || "Download failed.";
-          note.classList.add("error");
-          btn.disabled = false;
-          btn.textContent = "Download on Modal";
-        }
-      } catch (err) {
-        note.style.display = "block";
-        note.textContent = "Download failed: " + ((err && err.message) || "request failed");
-        note.classList.add("error");
-        btn.disabled = false;
-        btn.textContent = "Download on Modal";
+      markQueued();
+      const res = await queueModelInstall(ctx.apiBase, info);
+      note.textContent = res.message;
+      note.classList.toggle("error", !res.ok);
+      if (res.ok) {
+        if (!(await refreshDeps())) restoreState();
+        settle();
+      } else {
+        restoreState();
+        queueBtn.disabled = false;
+        queueBtn.textContent = "Queue install";
       }
     },
   });
-  const note = el("div", {
-    class: "comfymodal-studio-dependency-request-note",
-    style: "display:none;font-size:10px;color:#888;margin-top:2px;",
+
+  const nowBtn = el("button", {
+    class: "comfymodal-secondary-btn",
+    type: "button",
+    "data-testid": "dependency-model-install-now",
+    "data-model-key": rowKey,
+    text: "Install now",
+    style: "font-size:10px;padding:2px 8px;width:auto;",
+    onclick: async () => {
+      if (nowBtn.disabled) return; // dedupe while in flight
+      nowBtn.disabled = true;
+      nowBtn.textContent = "Installing\u2026";
+      note.style.display = "block";
+      note.textContent = "Installing\u2026";
+      note.classList.remove("error");
+      markDownloading();
+      const res = await installModelNow(ctx.apiBase, info);
+      note.textContent = res.message;
+      note.classList.toggle("error", !res.ok);
+      if (res.ok) {
+        if (!(await refreshDeps())) restoreState();
+        settle();
+      } else {
+        restoreState();
+        nowBtn.disabled = false;
+        nowBtn.textContent = "Install now";
+      }
+    },
   });
-  wrap.appendChild(btn);
+
+  wrap.appendChild(queueBtn);
+  wrap.appendChild(nowBtn);
   wrap.appendChild(note);
   return wrap;
 }
 
+/** Async single model install + status poll. Explicit click only. */
+async function queueModelInstall(apiBase, info) {
+  try {
+    const started = await installSingleModel(apiBase, {
+      url: info.url, filename: info.filename, save_path: info.savePath || "",
+    });
+    const downloadId = started && (started.download_id || (started.data && started.data.download_id));
+    if (!downloadId) {
+      return { ok: false, message: "Install request failed: " + ((started && started.message) || "request failed") };
+    }
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for (;;) {
+      const st = await modelDownloadStatus(apiBase, downloadId);
+      const last = (st && (st.data || st)) || {};
+      const s = String(last.state || last.status || "").toLowerCase();
+      if (s === "complete" || s === "done" || s === "success") break;
+      if (s === "error" || s === "failed") {
+        return { ok: false, message: "Install failed: " + (last.message || last.error || "request failed") };
+      }
+      if (Date.now() > deadline) {
+        return { ok: false, message: "Install timed out \u2014 check the Model Library later." };
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    try { await rescanModels(apiBase, false); } catch (e) { /* rescan is best-effort */ }
+    return { ok: true, message: "Downloaded \u2014 Model Library rescanned." };
+  } catch (err) {
+    return { ok: false, message: "Install failed: " + ((err && err.message) || "request failed") };
+  }
+}
+
+/** Synchronous single-item batch install (same route as the bulk action). */
+async function installModelNow(apiBase, info) {
+  try {
+    const resp = await batchInstallModels(apiBase, [{
+      url: info.url, filename: info.filename, save_path: info.savePath || "",
+    }]);
+    if (!resp || resp.status !== "ok") {
+      return { ok: false, message: "Install failed: " + ((resp && (resp.message || resp.error)) || "request failed") };
+    }
+    try { await rescanModels(apiBase, false); } catch (e) { /* rescan is best-effort */ }
+    return { ok: true, message: "Installed \u2014 Model Library rescanned." };
+  } catch (err) {
+    return { ok: false, message: "Install failed: " + ((err && err.message) || "request failed") };
+  }
+}
+
+/**
+ * Pure: normalize Manager's `/customnode/installed` payload into the
+ * `{ module, ver, cnr_id, aux_id, enabled }` list the dependency rows match
+ * against. The endpoint returns a dict keyed by module name; `enabled=false`
+ * is preserved so a disabled pack is never reported ready. A list shape is
+ * tolerated as-is without inventing fields.
+ */
+export function parseManagerInstalled(data) {
+  const records = [];
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    Object.keys(data).forEach((module) => {
+      const info = data[module];
+      if (!info || typeof info !== "object" || Array.isArray(info)) return;
+      records.push({
+        module: module,
+        ver: info.ver || "",
+        cnr_id: info.cnr_id || "",
+        aux_id: info.aux_id || "",
+        enabled: !(info.enabled === false || String(info.enabled).toLowerCase() === "false"),
+      });
+    });
+  } else if (Array.isArray(data)) {
+    data.forEach((info) => {
+      if (info && typeof info === "object") records.push(info);
+    });
+  }
+  return records;
+}
+
+/**
+ * Match a missing node against Manager's `/customnode/installed` records.
+ * The endpoint returns a dict keyed by module name with
+ * `{ ver, cnr_id, aux_id, enabled }` values; matching is by CNR id, aux id
+ * (full or basename), module name, or repository. Never assumes installed.
+ */
+function _installedRecordFor(n, ctx) {
+  const records = Array.isArray(ctx && ctx.managerInstalled) ? ctx.managerInstalled : [];
+  if (!records.length || !n) return null;
+  const lower = (v) => String(v == null ? "" : v).trim().toLowerCase();
+  const cnr = lower(n.cnr_id);
+  const aux = lower(n.aux_id);
+  const auxBase = _basename(aux);
+  const name = lower(n.name);
+  const repo = lower(n.repository_url);
+  for (const record of records) {
+    if (!record || typeof record !== "object") continue;
+    const recCnr = lower(record.cnr_id);
+    const recAux = lower(record.aux_id);
+    const recModule = lower(record.module || record.name);
+    if (cnr && recCnr && recCnr === cnr) return record;
+    if (aux && (recAux === aux || (auxBase && recAux === auxBase) || recModule === aux)) {
+      return record;
+    }
+    if (name && recModule && recModule === name) return record;
+    if (repo && recModule && recModule === repo) return record;
+  }
+  return null;
+}
+
+/**
+ * True only with an explicit loaded-class proof for every one of the node's
+ * required classes (e.g. a caller that probed ComfyUI's live node registry).
+ * Manager's `/customnode/installed` dict is NOT proof: a package can be on
+ * disk yet its classes never loaded. When absent, resolver state is authority.
+ */
+function _hasLoadedClassProof(n, ctx) {
+  const loaded = ctx && ctx.loadedClasses;
+  if (!loaded || !n) return false;
+  const classes = Array.isArray(n.classes) ? n.classes : (n.classes ? [n.classes] : []);
+  if (!classes.length) return false;
+  const has = (cls) => {
+    if (loaded instanceof Set) return loaded.has(cls);
+    if (Array.isArray(loaded)) return loaded.indexOf(cls) !== -1;
+    return false;
+  };
+  return classes.every((cls) => has(String(cls)));
+}
+
 function renderDependencyNodeRow(n, ctx) {
+  // Resolve before rendering: a missing row may be identified by CNR id,
+  // aux id, or class against the Manager catalog. Never invent a URL.
+  const plan = n.state === "missing"
+    ? resolveNodeInstall(n, ctx && ctx.managerPacks)
+    : { kind: "none" };
+  const node = plan.pack
+    ? Object.assign({}, n, {
+        repository_url: plan.pack.repository_url || n.repository_url || "",
+        name: plan.pack.name || n.name || n.cnr_id || n.aux_id || "",
+      })
+    : n;
+  const displayName = node.name || "";
   const row = el("div", {
     class: "comfymodal-studio-dependency-row",
     "data-testid": "dependency-node-row",
-    "data-node-name": n.name || "",
+    "data-node-name": displayName,
   });
-  row.appendChild(el("span", { class: "comfymodal-studio-dependency-name", text: n.name || "", title: n.name || "" }));
-  row.appendChild(_stateBadgeFor(n.state));
+  row.appendChild(el("span", { class: "comfymodal-studio-dependency-name", text: displayName, title: displayName }));
+  const nodeBadge = _stateBadgeFor(node.state);
+  nodeBadge.setAttribute("data-testid", "dependency-node-state");
+  row.appendChild(nodeBadge);
   row.appendChild(el("span", {
     class: "comfymodal-studio-dependency-detail",
-    text: n.installed_commit ? _shortCommit(n.installed_commit) : "",
-    title: n.installed_commit || "",
+    text: node.installed_commit ? _shortCommit(node.installed_commit) : "",
+    title: node.installed_commit || "",
   }));
-  if (n.required_revision) {
-    row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: "required " + n.required_revision }));
+  if (node.required_revision) {
+    row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: "required " + node.required_revision }));
   }
-  // I6 contextual handoff (H7 model-row parity): a MISSING custom-node row
-  // offers "Find in registry", which opens the single Model Library view
-  // scoped to its registry section, filtered to this identifier.  Navigation
-  // only — no install request fires from this control.
-  if (n.state === "missing" && n.name && ctx && typeof ctx.onFindInRegistry === "function") {
-    row.appendChild(el("button", {
-      class: "comfymodal-secondary-btn",
-      type: "button",
-      "data-testid": "dependency-node-find-registry",
-      text: "Find in registry",
-      style: "font-size:10px;padding:2px 8px;width:auto;",
-      onclick: () => ctx.onFindInRegistry(n.name),
-    }));
+  if (node.install_path) {
+    row.appendChild(el("span", { class: "comfymodal-studio-dependency-path", text: node.install_path, title: node.install_path }));
   }
-  if (n.install_path) {
-    row.appendChild(el("span", { class: "comfymodal-studio-dependency-path", text: n.install_path, title: n.install_path }));
+  if (node.repository_url) {
+    row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: node.repository_url, target: "_blank", rel: "noopener noreferrer", text: "repo" }));
   }
-  if (n.repository_url) {
-    row.appendChild(el("a", { class: "comfymodal-studio-models-link", href: n.repository_url, target: "_blank", rel: "noopener noreferrer", text: "repo" }));
-  }
-  // Missing node with a known repo: when ComfyUI-Manager is detected the
-  // caller may provide an explicit install action; otherwise the existing
-  // record-only approval request flow is preserved.  Nothing installs on
-  // render — both controls require an explicit click.
-  if (n.state === "missing" && n.repository_url) {
-    const installedNames = Array.isArray(ctx && ctx.managerInstalledNames) ? ctx.managerInstalledNames : [];
-    const isKnownInstalled = installedNames.some(
-      (name) => name && (name === n.name || name === n.repository_url)
-    );
-    if (isKnownInstalled) {
+  // Missing pack: the resolver is authoritative. Manager's installed dict is
+  // only advisory — it never proves the classes loaded, so it never hides the
+  // single install action nor reports "Installed". A loaded-class proof (live
+  // registry) is the only thing that can upgrade a resolver-missing row.
+  // Never auto-installs or auto-reboots.
+  if (node.state === "missing") {
+    const installedRecord = _installedRecordFor(n, ctx);
+    if (_hasLoadedClassProof(node, ctx)) {
       row.appendChild(el("span", {
         class: "comfymodal-studio-dependency-detail",
-        "data-testid": "dependency-node-manager-installed",
-        text: "Installed (restart may be required)",
+        "data-testid": "dependency-node-loaded",
+        text: "Installed (required classes loaded)",
       }));
-    } else if (ctx && ctx.managerAvailable === true && typeof ctx.onInstallPack === "function") {
-      row.appendChild(el("button", {
-        class: "comfymodal-secondary-btn",
-        type: "button",
-        "data-testid": "dependency-node-manager-install",
-        "data-node-name": n.name || "",
-        text: (ctx.installingPack && ctx.installingPack === n.name) ? "Installing\u2026" : "Install via Manager",
-        style: "font-size:10px;padding:2px 8px;width:auto;",
-        onclick: () => ctx.onInstallPack(n),
-      }));
-    } else if (ctx && ctx.apiBase) {
-      row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
+    } else {
+      if (installedRecord) {
+        const enabled = installedRecord.enabled !== false;
+        row.appendChild(el("span", {
+          class: "comfymodal-studio-dependency-detail",
+          "data-testid": "dependency-node-manager-stale",
+          text: enabled
+            ? "Manager package present, but required classes are not loaded"
+            : "Manager package present but disabled — required classes are not loaded",
+        }));
+      }
+      if (plan.kind === "none") {
+        row.appendChild(el("span", {
+          class: "comfymodal-studio-dependency-detail",
+          "data-testid": "dependency-node-no-target",
+          text: "No Manager install target identified \u2014 install manually.",
+        }));
+      } else {
+        row.appendChild(renderNodeInstallNowControl(node, plan, ctx, nodeBadge));
+      }
     }
-  }
-  // Missing packs without a known repository still get the record-only
-  // approval request: every missing row offers an action, URL or not.
-  if (n.state === "missing" && !n.repository_url && ctx && ctx.apiBase) {
-    row.appendChild(renderNodeInstallRequestControl(n, ctx.apiBase));
   }
   return row;
 }
 
-function renderNodeInstallRequestControl(node, apiBase) {
+// The single Manager-backed install action for a missing custom-node pack.
+// The owner (wizard) may override it to capture restart state; otherwise the
+// row performs the resolved plan directly. Explicit click only. The row's own
+// missing badge reads "Queued" while the install is in flight, then returns to
+// the report's real state so it never lies.
+function renderNodeInstallNowControl(n, installPlan, ctx, nodeBadge) {
+  const c = ctx || {};
   const wrap = el("span", { class: "comfymodal-studio-dependency-request" });
+  const note = el("div", {
+    class: "comfymodal-studio-dependency-request-note",
+    "data-testid": "dependency-node-install-note",
+    style: "display:none;font-size:10px;color:#888;margin-top:2px;",
+  });
+  const restoreState = () => applyDependencyStateBadge(nodeBadge, n.state);
   const btn = el("button", {
     class: "comfymodal-secondary-btn",
-    "data-testid": "dependency-node-install-request",
-    text: "Request install",
+    type: "button",
+    "data-testid": "dependency-node-install-now",
+    "data-node-name": n.name || "",
+    text: (c.installingPack && c.installingPack === n.name) ? "Installing\u2026" : "Install now",
     style: "font-size:10px;padding:2px 8px;width:auto;",
     onclick: async () => {
-      if (btn.disabled) return; // request dedupe while in flight
+      if (btn.disabled) return; // dedupe while in flight
+      if (typeof c.onInstallPack === "function") {
+        // Owner-managed install (wizard): it re-renders with restart state.
+        c.onInstallPack(n, installPlan);
+        return;
+      }
       btn.disabled = true;
-      btn.textContent = "Requesting\u2026";
-      try {
-        const resp = await requestCustomNodeInstall(apiBase, {
-          name: node.name || "",
-          repo_url: node.repository_url || "",
-          revision: node.required_revision || "",
-        });
-        note.style.display = "block";
-        if (resp && resp.status === "ok") {
-          note.textContent = "Approval recorded \u2014 nothing was installed."
-            + (resp.note ? " " + resp.note : "");
-          note.classList.remove("error");
-        } else {
-          note.textContent = "Request failed: " + ((resp && resp.message) || "request failed");
-          note.classList.add("error");
-          btn.disabled = false;
-          btn.textContent = "Request install";
-        }
-      } catch (err) {
-        note.style.display = "block";
-        note.textContent = "Request failed: " + (err && err.message ? err.message : "request failed");
-        note.classList.add("error");
+      btn.textContent = "Installing\u2026";
+      note.style.display = "block";
+      note.textContent = "Installing\u2026";
+      note.classList.remove("error");
+      applyDependencyInflightBadge(nodeBadge, "queued", "Queued");
+      const res = await performManagerInstall(installPlan);
+      note.textContent = res.message;
+      note.classList.toggle("error", !res.ok);
+      // Report truth on completion: the row is missing until the resolver says
+      // otherwise, so a settled install never leaves a stale "Queued" badge.
+      restoreState();
+      if (!res.ok) {
         btn.disabled = false;
-        btn.textContent = "Request install";
+        btn.textContent = "Install now";
       }
     },
-  });
-  const note = el("div", {
-    class: "comfymodal-studio-dialog-note",
-    "data-testid": "dependency-node-install-note",
-    style: "display:none;",
   });
   wrap.appendChild(btn);
   wrap.appendChild(note);

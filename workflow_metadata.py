@@ -222,6 +222,82 @@ _MODEL_REF_MAPPINGS: dict[str, list[tuple[str, str]]] = {
     "ControlNetLoader": [("controlnet", "control_net_name")],
 }
 
+# Generic fallback for nonstandard custom loaders (e.g. Donut loaders) whose
+# class/input names are outside _MODEL_REF_MAPPINGS. A value is only treated
+# as a model ref when BOTH hold: the input name or node class contains a
+# model-indicating token, AND the value carries a recognized model extension.
+# This keeps arbitrary prompt text and URLs out of the dependency report.
+_MODEL_TOKEN_ROLES: tuple[tuple[str, str], ...] = (
+    ("controlnet", "controlnet"),
+    ("checkpoint", "checkpoint"),
+    ("lycoris", "lora"),
+    ("lora", "lora"),
+    ("unet", "unet"),
+    ("diffusion", "unet"),
+    ("text_encoder", "clip"),
+    ("text-encoder", "clip"),
+    ("clip", "clip"),
+    ("vae", "vae"),
+)
+
+_MODEL_EXTENSIONS: tuple[str, ...] = (
+    ".safetensors",
+    ".ckpt",
+    ".pt",
+    ".pth",
+    ".bin",
+    ".gguf",
+    ".onnx",
+    ".sft",
+)
+
+
+def _model_role_hint(text: str) -> str:
+    """Return the model role implied by a name, or "" when it does not."""
+    if not isinstance(text, str) or not text:
+        return ""
+    lowered = text.lower()
+    for token, role in _MODEL_TOKEN_ROLES:
+        if token in lowered:
+            return role
+    if "model" in lowered or "filename" in lowered:
+        return "model"
+    return ""
+
+
+def _generic_model_filename(value) -> str:
+    """Return a model filename/path from a value, else "".
+
+    Rejects non-strings, blanks, URLs, and values without a recognized model
+    extension. Path-like values are accepted (the extension still applies).
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    if not candidate:
+        return ""
+    lowered = candidate.lower()
+    if lowered.startswith(("http://", "https://", "data:", "//")):
+        return ""
+    if not any(lowered.endswith(ext) for ext in _MODEL_EXTENSIONS):
+        return ""
+    return candidate
+
+
+def _generic_model_ref(class_type, input_name, value) -> dict[str, str] | None:
+    """Best-effort model ref for a custom loader input, or None.
+
+    Requires a model-indicating input name or class; the role prefers the
+    input name over the class and falls back to "model".
+    """
+    role = _model_role_hint(input_name) or _model_role_hint(class_type)
+    if not role:
+        return None
+    filename = _generic_model_filename(value)
+    if not filename:
+        return None
+    return {"role": role, "filename": filename}
+
 
 def extract_workflow_model_refs(prompt: dict) -> list[dict[str, str]]:
     seen = set()
@@ -229,10 +305,12 @@ def extract_workflow_model_refs(prompt: dict) -> list[dict[str, str]]:
     for node in prompt.values():
         if not isinstance(node, dict):
             continue
+        class_type = node.get("class_type", "")
         inputs = node.get("inputs", {})
         if not isinstance(inputs, dict):
             continue
-        mappings = _MODEL_REF_MAPPINGS.get(node.get("class_type", ""), [])
+        mappings = _MODEL_REF_MAPPINGS.get(class_type, [])
+        mapped_fields = {field for _role, field in mappings}
         for role, field in mappings:
             value = inputs.get(field)
             if not isinstance(value, str) or not value:
@@ -242,4 +320,186 @@ def extract_workflow_model_refs(prompt: dict) -> list[dict[str, str]]:
                 continue
             seen.add(key)
             refs.append({"role": role, "filename": value})
+        # Generic fallback for custom loader inputs not covered above.
+        for input_name, value in inputs.items():
+            if input_name in mapped_fields:
+                continue
+            ref = _generic_model_ref(class_type, input_name, value)
+            if ref is None:
+                continue
+            key = (ref["role"], ref["filename"])
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(ref)
     return refs
+
+
+# ── Recursive UI-graph node traversal ────────────────────────────────────
+#
+# ComfyUI nests real nodes below group/subgraph containers: legacy group
+# nodes under ``extra.groupNodes`` (a dict of id → graph), current subgraph
+# definitions under ``definitions.subgraphs`` (a list/dict of graphs), and
+# equivalent nested containers. Scanning only the top-level ``nodes`` list
+# misses those nodes, so every graph consumer walks the whole capture.
+
+def _is_graph_node(value) -> bool:
+    """True for a real graph-node row, never a slot/link/widget dict.
+
+    A node carries a non-empty UI ``type`` or API ``class_type`` plus
+    graph-node fields. Slot definitions share ``type`` but lack a node
+    ``properties`` dict and an ``inputs``/``outputs`` pair; link rows carry
+    ``origin_id``/``target_id``. Both are rejected so they are never reported
+    as dependencies.
+    """
+    if not isinstance(value, dict):
+        return False
+    node_type = value.get("type")
+    class_type = value.get("class_type")
+    has_type = isinstance(node_type, str) and bool(node_type.strip())
+    has_class_type = isinstance(class_type, str) and bool(class_type.strip())
+    if not (has_type or has_class_type):
+        return False
+    inputs = value.get("inputs")
+    if has_class_type and not has_type and isinstance(inputs, dict):
+        return True  # API-format node row
+    if "origin_id" in value or "target_id" in value:
+        return False  # link row shares a ``type`` but is not a node
+    if isinstance(value.get("properties"), dict):
+        return True
+    for key in ("widgets_values", "widgets_values_named", "widgetsValuesNamed"):
+        if key in value:
+            return True
+    return isinstance(inputs, list) and isinstance(value.get("outputs"), list)
+
+
+def iter_graph_nodes(graph):
+    """Yield every real graph node reachable in a UI/static graph capture.
+
+    Walks nested ``extra.groupNodes``, ``definitions.subgraphs``, group
+    structures and any equivalent nested dict/list container. Only graph-node
+    rows are yielded (see :func:`_is_graph_node`); slot definitions, link rows
+    and widget-value dicts are traversed but never returned. Nodes are
+    deduplicated by object identity, so a container reachable from two paths
+    yields its nodes once. Never raises: non-graph input yields nothing.
+    """
+    if not isinstance(graph, (dict, list)):
+        return
+    seen: set[int] = set()
+    stack = [graph]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if _is_graph_node(current):
+                yield current
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            stack.extend(current)
+
+
+# ── Captured UI/static graph widget metadata ─────────────────────────────
+#
+# API prompts carry connected values, but a stored UI graph also records
+# widget values by name on standard and custom loader nodes. Reshaping those
+# named fields into a synthetic prompt lets the exact same loader mappings and
+# model-token/extension guards apply, so a custom loader's named widget file
+# is recovered without loosening URL/prompt rejection.
+
+def _graph_node_has_identity(node: dict) -> bool:
+    properties = node.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    for key in ("cnr_id", "aux_id"):
+        value = properties.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _has_nonempty_collection(value) -> bool:
+    if isinstance(value, (list, tuple, dict)):
+        return len(value) > 0
+    return False
+
+
+def _is_virtual_graph_node(node: dict) -> bool:
+    """True for a frontend-only panel: empty inputs/outputs, no pack identity."""
+    if _graph_node_has_identity(node):
+        return False
+    return (
+        not _has_nonempty_collection(node.get("inputs"))
+        and not _has_nonempty_collection(node.get("outputs"))
+    )
+
+
+def _named_widget_values(node: dict) -> dict[str, object]:
+    """Collect name → value widget fields recorded on a captured graph node.
+
+    Supports ``widgets_values_named`` / ``widgetsValuesNamed`` dicts, a dict
+    ``widgets_values`` (some exporters key by input name), and a ``widgets``
+    list of ``{name, value}`` entries. Positional ``widgets_values`` lists are
+    intentionally ignored — they carry no reliable input names.
+    """
+    out: dict[str, object] = {}
+    for key in ("widgets_values_named", "widgetsValuesNamed"):
+        data = node.get(key)
+        if isinstance(data, dict):
+            for name, value in data.items():
+                if isinstance(name, str) and name and name not in out:
+                    out[name] = value
+    values = node.get("widgets_values")
+    if isinstance(values, dict):
+        for name, value in values.items():
+            if isinstance(name, str) and name and name not in out:
+                out[name] = value
+    widgets = node.get("widgets")
+    if isinstance(widgets, list):
+        for widget in widgets:
+            if not isinstance(widget, dict):
+                continue
+            name = widget.get("name")
+            if not isinstance(name, str) or not name or name in out:
+                continue
+            if "value" in widget:
+                out[name] = widget.get("value")
+            elif isinstance(widget.get("widget"), dict) and "value" in widget["widget"]:
+                out[name] = widget["widget"]["value"]
+    return out
+
+
+def extract_ui_graph_model_refs(graph_json) -> list[dict[str, str]]:
+    """Extract model refs from named widget metadata on a captured UI graph.
+
+    Each node's named widget fields are reshaped into a synthetic prompt node
+    and passed through :func:`extract_workflow_model_refs`, so standard loader
+    mappings and the generic custom-loader model-token/extension guards both
+    apply. Nodes nested in group/subgraph containers are included. Virtual
+    panels (empty inputs/outputs, no pack identity) are skipped so their
+    metadata can never surface as a model. Never raises.
+    """
+    if not isinstance(graph_json, dict):
+        return []
+    synthetic: dict[str, dict] = {}
+    for index, node in enumerate(iter_graph_nodes(graph_json)):
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("type")
+        if not isinstance(class_type, str) or not class_type:
+            continue
+        if _is_virtual_graph_node(node):
+            continue
+        inputs = _named_widget_values(node)
+        if not inputs:
+            continue
+        # Keys are only a uniqueness guard: nested subgraphs reuse local node
+        # ids, and `extract_workflow_model_refs` reads values, not keys.
+        synthetic["graph_%d" % index] = {"class_type": class_type, "inputs": inputs}
+    if not synthetic:
+        return []
+    return extract_workflow_model_refs(synthetic)

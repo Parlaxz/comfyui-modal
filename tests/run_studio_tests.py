@@ -190,6 +190,9 @@ NODE_UNIT_FILES: list[Path] = [
     ROOT / "tests" / "studio_backend_operations_unit.mjs",
     ROOT / "tests" / "studio_model_library_parity_unit.mjs",
     ROOT / "tests" / "studio_settings_compat_authority_unit.mjs",
+    # Setup-wizard bounded draft persistence + explicit-reboot reconnect
+    # (queued/download in-flight status survives re-renders).
+    ROOT / "tests" / "studio_wizard_draft_reboot_unit.mjs",
     # I2 shell/nav accessibility: semantic nav, aria-current page state,
     # h1 shell heading, _trapTab retirement, responsive overflow valve
     ROOT / "tests" / "studio_phase_i2_shell_nav_accessibility_unit.mjs",

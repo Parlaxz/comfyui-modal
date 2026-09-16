@@ -12,7 +12,14 @@
 
 import { el, renderEmptyState, statusBadge } from "./studio-ui.js";
 import { renderLoadingState } from "./studio-loading.js";
-import { renderModelLibraryView, renderDependencySection, renderModelPicker } from "./studio-model-library.js";
+import {
+  buildManagerModelIndex,
+  buildManagerPackIndex,
+  parseManagerInstalled,
+  renderModelLibraryView,
+  renderDependencySection,
+  renderModelPicker,
+} from "./studio-model-library.js";
 import {
   chipStateFromSummary,
   normalizePortabilitySummary,
@@ -57,6 +64,11 @@ import {
   fetchWorkflowManifestExport,
   importWorkflowManifest,
   listModels,
+  getManagerVersion,
+  getManagerPackList,
+  getManagerMappings,
+  getManagerModels,
+  listManagerInstalled,
 } from "./studio-backend-api.js";
 import { subscribeStudioSync } from "./studio-sync.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
@@ -140,12 +152,51 @@ const _view = {
     presetIncomplete: null,
     loadError: null,
     dependencies: null,
+    // Lazy workflow-detail Manager context. Loaded only when the SELECTED
+    // version's dependency report contains a missing item with no source
+    // (missing node without repository_url / missing model without source
+    // URL). Never loaded by the Model Library or by unrelated pages.
+    manager: {
+      key: "",                     // `${workflowId}::${versionId}` this context belongs to
+      loading: false,
+      loaded: false,
+      detected: false,
+      packs: null,                 // buildManagerPackIndex result
+      modelsByFilename: null,      // buildManagerModelIndex result
+      installed: [],               // parseManagerInstalled result
+    },
   },
 };
 
 let _currentToken = 0;
 let _searchTimer = null;
 let _importEscHandler = null;
+// One setup-wizard resume per page load: a real reload may mount Workflows
+// more than once, but reopening the wizard on every re-mount would hijack the
+// user's navigation.
+let _wizardResumeAttempted = false;
+
+/**
+ * True when this document load came from a real browser reload/back-forward
+ * rather than a fresh navigation. The wizard draft only auto-reopens for a
+ * reload; ComfyUI's graph loader can overwrite location.hash with the active
+ * workflow UUID, so the hash marker alone is not reliable in the live host.
+ */
+function _pageWasReloaded() {
+  try {
+    if (typeof performance === "undefined") return false;
+    const entries =
+      typeof performance.getEntriesByType === "function"
+        ? performance.getEntriesByType("navigation")
+        : [];
+    const type = entries && entries[0] && entries[0].type;
+    if (type) return type === "reload" || type === "back_forward";
+    const legacy = performance.navigation;
+    return !!legacy && legacy.type !== 0;
+  } catch (_err) {
+    return false;
+  }
+}
 
 // ── Small pure helpers ─────────────────────────────────────────────────────
 
@@ -380,6 +431,10 @@ export function renderWorkflows(state, context) {
   const setPage = (context && context.setPage) || function () {};
   const token = ++_currentToken;
 
+  // A real browser reload is the only trigger for auto-reopening the setup
+  // wizard; an in-app shell navigation into Workflows must never yank it open.
+  const reloadResumeEligible = _pageWasReloaded();
+
   const root = el("div", { class: "comfymodal-studio-workflows", "data-testid": "workflows-page" });
   let workflowsStale = false;
   let unsubscribeWorkflowsSync = null;
@@ -456,6 +511,7 @@ export function renderWorkflows(state, context) {
     _view.data.presets = [];
     _view.data.mapping = null;
     _view.data.dependencies = null;
+    _resetManagerContext();
     _resetPortabilityState();
     render();
     loadDetailData();
@@ -1740,6 +1796,7 @@ export function renderWorkflows(state, context) {
     _view.data.dependencies = depResp && depResp.status === "ok" ? depResp : null;
     _recordDependencyUsage(_view.data.dependencies);
     render();
+    maybeLoadManagerContext();
   }
 
   function selectVersion(versionId) {
@@ -1756,6 +1813,7 @@ export function renderWorkflows(state, context) {
     _view.data.presets = [];
     _view.data.mapping = null;
     _view.data.dependencies = null;
+    _resetManagerContext();
     _resetPortabilityState();
     render();
     loadVersionData();
@@ -2164,10 +2222,18 @@ export function renderWorkflows(state, context) {
   function renderDependenciesSection(version) {
     // Thin wrapper: the section body lives in studio-model-library.js; the
     // Refresh button re-fetches the dependencies endpoint for this version.
+    // The lazy Manager context (if loaded for this workflow/version) lets
+    // missing rows resolve CNR/aux/class packs and catalog-only models; the
+    // shared row performs the install directly on an explicit click.
+    const mgr = _view.data.manager;
     return renderDependencySection(version, _view.data.dependencies, refreshDependencies, {
       apiBase,
       onFindInLibrary: openModelLibraryFiltered,
       onFindInRegistry: openRegistryFiltered,
+      managerPacks: mgr.packs,
+      managerModelsByFilename: mgr.modelsByFilename,
+      managerInstalled: mgr.installed,
+      onDepsRefresh: refreshDependencies,
     });
   }
 
@@ -2216,6 +2282,114 @@ export function renderWorkflows(state, context) {
     if (stale()) return;
     _view.data.dependencies = resp && resp.status === "ok" ? resp : null;
     _recordDependencyUsage(_view.data.dependencies);
+    render();
+    maybeLoadManagerContext();
+  }
+
+  // ── Lazy workflow-detail Manager context ────────────────────────────────
+  //
+  // The workflow detail dependency rows can only resolve a missing item that
+  // carries no repository/source metadata (CNR/aux/class-identified packs,
+  // catalog-only models) by consulting ComfyUI-Manager. That catalog is
+  // fetched ONLY when the SELECTED version's report actually needs it, never
+  // on the Model Library or any other page, and it never installs/reboots —
+  // every install stays an explicit click on a row (the shared row calls
+  // performManagerInstall directly, which is itself click-gated).
+
+  function _managerKey(wfId, verId) {
+    return String(wfId || "") + "::" + String(verId || "");
+  }
+
+  function _resetManagerContext() {
+    _view.data.manager = {
+      key: "",
+      loading: false,
+      loaded: false,
+      detected: false,
+      packs: null,
+      modelsByFilename: null,
+      installed: [],
+    };
+  }
+
+  /**
+   * True only when a missing item cannot be resolved without Manager: a
+   * missing custom node with no repository URL, or a missing model with no
+   * source URL. Installed items and items that already carry a source are
+   * excluded, so ordinary versions trigger zero Manager traffic.
+   */
+  function _depsNeedManager(deps) {
+    if (!deps || deps.status !== "ok") return false;
+    const models = Array.isArray(deps.models) ? deps.models : [];
+    const nodes = Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
+    const modelNeeds = models.some((m) => m && m.state !== "installed"
+      && !(Array.isArray(m.source_urls) && m.source_urls[0]));
+    const nodeNeeds = nodes.some((n) => n && n.state === "missing" && !n.repository_url);
+    return modelNeeds || nodeNeeds;
+  }
+
+  async function _fetchManagerInstalled() {
+    const resp = await listManagerInstalled();
+    return parseManagerInstalled(resp && resp.ok ? resp.data : null);
+  }
+
+  function maybeLoadManagerContext() {
+    const wfId = _view.selectedWorkflowId;
+    const verId = _view.selectedVersionId;
+    if (!wfId || !verId) return;
+    if (!_depsNeedManager(_view.data.dependencies)) return;
+    const mgr = _view.data.manager;
+    const key = _managerKey(wfId, verId);
+    if (mgr.key === key && (mgr.loading || mgr.loaded)) return;
+    // New context: blank any prior version's catalog so stale rows cannot
+    // resolve against the wrong workflow/version while this one loads.
+    mgr.key = key;
+    mgr.loading = true;
+    mgr.loaded = false;
+    mgr.detected = false;
+    mgr.packs = null;
+    mgr.modelsByFilename = null;
+    mgr.installed = [];
+    _loadManagerContext(key, wfId, verId);
+  }
+
+  // Every await re-checks that the SAME workflow/version is still selected (and
+  // the page token unchanged) before applying anything or re-rendering; an
+  // abandoned load can neither overwrite another version nor render. Manager
+  // helpers already swallow transport failures, and the try/catch bounds the
+  // rest, so no rejection escapes.
+  async function _loadManagerContext(key, wfId, verId) {
+    const mgr = _view.data.manager;
+    const isCurrent = () => !stale()
+      && _view.mode === "detail"
+      && _view.data.manager === mgr
+      && mgr.key === key
+      && _view.selectedWorkflowId === wfId
+      && _view.selectedVersionId === verId;
+    try {
+      const version = await getManagerVersion();
+      if (!isCurrent()) return;
+      mgr.detected = !!(version && version.ok);
+      if (mgr.detected) {
+        mgr.installed = await _fetchManagerInstalled();
+        if (!isCurrent()) return;
+        const models = await getManagerModels();
+        if (!isCurrent()) return;
+        mgr.modelsByFilename = buildManagerModelIndex(models);
+        const [packList, mappings] = await Promise.all([
+          getManagerPackList(),
+          getManagerMappings(),
+        ]);
+        if (!isCurrent()) return;
+        mgr.packs = buildManagerPackIndex(packList, mappings);
+      }
+    } catch (e) {
+      if (!isCurrent()) return;
+      mgr.detected = false;
+    }
+    if (!isCurrent()) return;
+    mgr.loading = false;
+    mgr.loaded = true;
     render();
   }
 
@@ -3179,9 +3353,36 @@ export function renderWorkflows(state, context) {
 
   // ── Mount ───────────────────────────────────────────────────────────────
 
+  // Browser refresh/reload of an in-progress version-setup wizard: the wizard
+  // persisted a bounded sessionStorage draft (identity + step + bindings +
+  // details); reopen the SAME workflow/version wizard at the SAME step.
+  // Version-setup only, and stale ids degrade softly to the library. No other
+  // page reads or writes the draft.
+  function maybeResumeSetupWizard() {
+    import("./studio-preset-wizard.js").then(({ readWizardDraft }) => {
+      if (stale() || !root.isConnected || _view.mode !== "library") return;
+      // Only a real reload auto-reopens the wizard, and a single page load
+      // resumes at most once.
+      if (!reloadResumeEligible || _wizardResumeAttempted) return;
+      const draft = readWizardDraft();
+      if (!draft || !draft.workflowId || !draft.workflowVersionId) return;
+      const wfId = draft.workflowId;
+      const verId = draft.workflowVersionId;
+      const list = Array.isArray(_view.data.workflows) ? _view.data.workflows : null;
+      // A workflow the library no longer lists never reopens the wizard.
+      if (list && !list.some((w) => String(w.workflow_id) === String(wfId))) return;
+      _wizardResumeAttempted = true;
+      openWorkflowDetail(wfId, verId, null);
+      openVersionSetupWizard(wfId, verId, null);
+    }).catch(() => { /* resume is best-effort */ });
+  }
+
   render();
-  if (_view.mode === "detail") loadDetailData();
-  else loadLibrary();
+  if (_view.mode === "detail") {
+    loadDetailData();
+  } else {
+    loadLibrary().then(() => maybeResumeSetupWizard());
+  }
 
   return root;
 }

@@ -11,8 +11,10 @@
 //     and never collapses into Compatibility/identity presentation
 //   - the duplicated "Portability: …" accessible names become distinguishable
 //     per workflow
-//   - missing custom-node "Find in registry" handoff lands the single Model
-//     Library registry section pre-filtered (navigation only, zero installs)
+//   - missing custom-node dependency rows expose exactly ONE Manager-backed
+//     "Install now" action (no record-only request, no Find-in-registry)
+//   - missing model dependency rows expose exactly two explicit install
+//     actions ("Queue install" / "Install now")
 //   - model "Used by N workflows · View" derives from ALREADY-loaded
 //     dependency payloads and navigates the EXISTING Workflows filters
 //   - no duplicate installer authority anywhere in these flows
@@ -326,7 +328,7 @@ test.describe("I6 Workflows / Models polish", () => {
     }
   });
 
-  test("E. missing custom-node 'Find in registry' lands filtered; zero install traffic", async ({ page }) => {
+  test("E. missing custom-node row exposes one Manager install; no install on render", async ({ page }) => {
     const fx = await setupFakeTest(page);
     const installs = trackPosts(page, /install-request|models\/download/);
     try {
@@ -340,57 +342,19 @@ test.describe("I6 Workflows / Models polish", () => {
       const missingRow = page.getByTestId("dependency-node-row").filter({ hasText: "ComfyUI-Missing" });
       await expect(missingRow).toContainText("Missing", { timeout: 10000 });
 
-      // The install REQUEST stays the row's only installer control;
-      // "Find in registry" is a separate, navigation-only affordance.
-      await expect(missingRow.getByTestId("dependency-node-install-request")).toBeVisible();
-      await expect(missingRow.getByTestId("dependency-node-find-registry")).toHaveText("Find in registry");
+      // Exactly ONE install action, Manager-backed; no record-only request
+      // and no Find-in-registry alternate.
+      await expect(missingRow.getByTestId("dependency-node-install-now")).toHaveText("Install now");
+      await expect(missingRow.getByTestId("dependency-node-install-request")).toHaveCount(0);
+      await expect(missingRow.getByTestId("dependency-node-find-registry")).toHaveCount(0);
+      await expect(missingRow.getByTestId("dependency-node-manager-install")).toHaveCount(0);
 
-      await missingRow.getByTestId("dependency-node-find-registry").click();
-      await expect(page.getByTestId("models-page")).toBeVisible({ timeout: 10000 });
-
-      // Lands the registry section pre-filtered with a truthful scope banner.
-      await expect(page.getByTestId("custom-nodes-focus"))
-        .toContainText('Registry filtered by "ComfyUI-Missing"', { timeout: 10000 });
-      // Nothing installed carries that name → truthful no-match note.
-      await expect(page.getByTestId("custom-nodes-no-match")).toContainText("ComfyUI-Missing");
-      await expect(page.locator('[data-testid="custom-node-row"]')).toHaveCount(0);
-
-      // Navigation ONLY: the handoff fired zero installer requests.
+      // Rendering alone fired zero installer requests.
       expect(installs.hits).toEqual([]);
-
-      // Clearing restores the unfiltered canonical registry list.
-      await page.getByTestId("custom-nodes-focus-clear").click();
-      await expect(page.getByTestId("custom-nodes-focus")).toHaveCount(0);
-      await expect(page.locator('[data-testid="custom-node-row"]')).toHaveCount(1);
       fx.assertNoConsoleErrors();
       unstub();
     } finally {
       installs.dispose();
-      fx.guard.dispose();
-    }
-  });
-
-  test("F. exact registry match highlights the row (when current IDs allow)", async ({ page }) => {
-    const fx = await setupFakeTest(page);
-    try {
-      const unstub = await stubMissingNode(page, "ComfyUI-KJNodes", true);
-
-      await fx.gotoPage("workflows");
-      await expect(page.getByTestId("workflows-page")).toBeVisible({ timeout: 10000 });
-      await page.locator(CARD("wf_fake")).click();
-      await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-      const row = page.getByTestId("dependency-node-row").filter({ hasText: "Missing" }).first();
-      await row.getByTestId("dependency-node-find-registry").click();
-      await expect(page.getByTestId("models-page")).toBeVisible({ timeout: 10000 });
-      await expect(page.getByTestId("custom-nodes-focus")).toContainText("ComfyUI-KJNodes", { timeout: 10000 });
-
-      // Exact name match against the installed registry record → highlight.
-      const matched = page.locator('[data-testid="custom-node-row"][data-registry-match="true"]');
-      await expect(matched).toHaveCount(1);
-      await expect(matched).toHaveAttribute("data-node-name", "ComfyUI-KJNodes");
-      fx.assertNoConsoleErrors();
-      unstub();
-    } finally {
       fx.guard.dispose();
     }
   });
@@ -475,15 +439,20 @@ test.describe("I6 Workflows / Models polish", () => {
       await page.getByTestId("model-detail-dialog")
         .locator('.comfymodal-studio-dialog-actions button', { hasText: "Cancel" }).click();
 
-      // Version-scoped dependency section: exactly ONE install REQUEST on
-      // the single missing node row, plus the separate navigation-only
-      // Find-in-registry affordance — never a second installer.
+      // Version-scoped dependency section: the missing node row exposes
+      // exactly ONE Manager-backed install action; the missing model row
+      // exposes exactly the two explicit install actions. No record-only
+      // request and no Find-in-registry alternate.
       await page.getByTestId("models-back").click();
       await page.locator(CARD("wf_fake")).click();
       await expect(page.getByTestId("workflow-detail")).toBeVisible({ timeout: 15000 });
-      await expect(page.getByTestId("dependency-node-install-request")).toHaveCount(1);
-      await expect(page.getByTestId("dependency-node-find-registry")).toHaveCount(1);
-      await expect(page.locator('[data-testid="dependency-node-install-request"][data-duplicate-install="true"]')).toHaveCount(0);
+      await expect(page.getByTestId("dependency-node-install-now")).toHaveCount(1);
+      await expect(page.getByTestId("dependency-node-install-request")).toHaveCount(0);
+      await expect(page.getByTestId("dependency-node-find-registry")).toHaveCount(0);
+      await expect(page.getByTestId("dependency-node-manager-install")).toHaveCount(0);
+      await expect(page.getByTestId("dependency-model-queue")).toHaveCount(1);
+      await expect(page.getByTestId("dependency-model-install-now")).toHaveCount(1);
+      await expect(page.getByTestId("dependency-model-download")).toHaveCount(0);
       t.assertNoConsoleErrors();
       unstub();
     } finally {

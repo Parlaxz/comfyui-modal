@@ -1036,6 +1036,19 @@ async function handleRequest(req, res) {
     }
   }
 
+  // ComfyUI-Manager root-relative surface. Production exposes these at the
+  // server root (NOT under /comfymodal), so they bypass the ROUTES table.
+  // Deterministic stubs keep the workflow detail's LAZY Manager context from
+  // 404ing; tests that need a specific catalog override with page.route.
+  if (method === "GET" && pathname === "/manager/version") return _json(res, { version: "fake-manager" });
+  if (method === "GET" && pathname === "/customnode/installed") return _json(res, {});
+  if (method === "GET" && pathname === "/externalmodel/getlist") return _json(res, { models: [] });
+  if (method === "GET" && pathname === "/customnode/getlist") return _json(res, { channel: "default", node_packs: {} });
+  if (method === "GET" && pathname === "/customnode/getmappings") return _json(res, {});
+  if (method === "POST" && pathname === "/manager/queue/install") return _json(res, { status: "ok" });
+  if (method === "POST" && pathname === "/manager/queue/start") return _json(res, { status: "ok" });
+  if (method === "POST" && pathname === "/customnode/install/git_url") return _json(res, { status: "ok" });
+
   // Engine REST routes
   if (pathname.startsWith("/comfymodal/")) {
     const body = ["POST", "PATCH", "PUT"].includes(method) ? await _readBody(req) : null;

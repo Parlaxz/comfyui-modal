@@ -28,8 +28,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import {
+  buildManagerModelIndex,
+  buildManagerPackIndex,
+  managerModelFolder,
+  matchManagerModel,
+  normalizeManagerSavePath,
+  parseManagerInstalled,
+  performManagerInstall,
   renderModelLibraryView,
   renderDependencySection,
+  resolveNodeInstall,
 } from "../web/studio-model-library.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -178,9 +186,9 @@ function installFetch(router) {
       await Promise.resolve();
       const payload = router(call);
       if (payload && payload.__fail) {
-        return { ok: false, status: payload.__status || 500, json: async () => ({ status: "error", message: payload.__message || "boom" }) };
+        return { ok: false, status: payload.__status || 500, json: async () => ({ status: "error", message: payload.__message || "boom" }), text: async () => JSON.stringify({ status: "error", message: payload.__message || "boom" }) };
       }
-      return { ok: true, status: 200, json: async () => payload || {} };
+      return { ok: true, status: 200, json: async () => payload || {}, text: async () => (payload ? JSON.stringify(payload) : "") };
     } finally {
       inflight.count--;
     }
@@ -263,6 +271,15 @@ function defaultRouter(call) {
   if (call.method === "POST" && pathPart === "/comfymodal/studio/models/install-request") {
     return { status: "ok", request: { approved: true }, note: "Approval recorded." };
   }
+  if (call.method === "POST" && pathPart === "/customnode/install/git_url") {
+    return { status: "ok" };
+  }
+  if (call.method === "POST" && pathPart === "/comfymodal/model/install") {
+    return { status: "ok", download_id: "dl_1" };
+  }
+  if (call.method === "GET" && pathPart.indexOf("/comfymodal/download/status/") === 0) {
+    return { status: "ok", state: "complete" };
+  }
   return {};
 }
 
@@ -321,10 +338,20 @@ async function mountLibrary(router) {
   assert.equal(depRows.length, 2);
   const missingRow = depRows[1];
   assert.ok(missingRow.textContent.indexOf("Missing") !== -1);
-  assert.ok(missingRow.textContent.indexOf("Not installed") !== -1);
+  assert.equal(
+    missingRow.textContent.indexOf("Not installed"),
+    -1,
+    "redundant Not installed detail is replaced by the state badge alone"
+  );
+  const missingBadge = findOneByTestId(missingRow, "dependency-model-state");
+  assert.equal(missingBadge.textContent, "Missing");
+  assert.equal(missingBadge.getAttribute("data-state"), "missing");
   const installedRow = depRows[0];
   assert.ok(installedRow.textContent.indexOf("Installed") !== -1);
   assert.ok(installedRow.textContent.indexOf("/models/checkpoints/alpha.safetensors") !== -1);
+  const installedBadge = findOneByTestId(installedRow, "dependency-model-state");
+  assert.equal(installedBadge.textContent, "Installed");
+  assert.equal(installedBadge.getAttribute("data-state"), "installed");
   const nodeRows = findByTestId(deps, "dependency-node-row");
   assert.ok(nodeRows[0].textContent.indexOf("Missing") !== -1);
   assert.ok(nodeRows[1].textContent.indexOf("Installed") !== -1);
@@ -367,31 +394,305 @@ async function mountLibrary(router) {
   section("6+14. Custom-node refresh is explicit-only and request-deduped");
 }
 
-// ── 7. Install requests require user action ──────────────────────────────
+// ── 7. Install actions require user action ───────────────────────────────
 
 {
-  const { net, container } = await mountLibrary();
+  const { net } = await mountLibrary();
   const before = net.calls.filter((c) => c.method === "POST").length;
 
-  // Custom-node install request from a MISSING dependency row.
+  // Custom-node install from a MISSING dependency row: exactly ONE
+  // Manager-backed "Install now" — no record-only request, no second control.
   const deps = renderDependencySection({}, DEPS_PAYLOAD, null, { apiBase: "/comfymodal" });
-  const reqBtn = findOneByTestId(deps, "dependency-node-install-request");
+  const installBtn = findOneByTestId(deps, "dependency-node-install-now");
+  assert.equal(installBtn.textContent, "Install now");
+  assert.equal(findByTestId(deps, "dependency-node-install-request").length, 0, "record-only request removed");
+  assert.equal(findByTestId(deps, "dependency-node-manager-install").length, 0, "no second installer");
+  assert.equal(findByTestId(deps, "dependency-node-find-registry").length, 0, "Find in registry removed");
   assert.equal(before, net.calls.filter((c) => c.method === "POST").length, "rendering alone posts nothing");
-  reqBtn.click();
+  installBtn.click();
   await settle(net.inflight);
-  const installReqs = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/custom-nodes/install-request") !== -1);
-  assert.equal(installReqs.length, 1);
-  assert.equal(installReqs[0].body.name, "MissingNode");
-  assert.equal(installReqs[0].body.repo_url, "https://github.com/example/MissingNode");
+  const managerInstalls = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/customnode/install/git_url") !== -1);
+  assert.equal(managerInstalls.length, 1);
+  assert.equal(managerInstalls[0].body.url, "https://github.com/example/MissingNode");
+  assert.equal(net.calls.filter((c) => c.url.indexOf("/custom-nodes/install-request") !== -1).length, 0);
   const note = findOneByTestId(deps, "dependency-node-install-note");
-  assert.ok(note.textContent.indexOf("nothing was installed") !== -1, "approval-only disclosure shown");
-  section("7a. Custom-node install request is click-gated and approval-only");
+  assert.ok(note.textContent.indexOf("Installed") !== -1, "Manager install outcome shown");
+  section("7a. Custom-node install routes through Manager and is click-gated");
 
   // Model install request stays inside the detail dialog (existing flow).
   assert.ok(librarySource.indexOf("requestModelInstall") !== -1);
   assert.ok(librarySource.indexOf("Request download") !== -1);
   assert.ok(librarySource.indexOf("never fetched from here") !== -1, "approval-only copy retained");
   section("7b. Model download request remains the explicit detail-dialog flow");
+}
+
+// ── 7c/7d. Missing model rows expose exactly two explicit install actions ─
+
+{
+  const { net } = await mountLibrary();
+  const deps = renderDependencySection({}, DEPS_PAYLOAD, null, { apiBase: "/comfymodal" });
+
+  const queue = findByTestId(deps, "dependency-model-queue");
+  const now = findByTestId(deps, "dependency-model-install-now");
+  assert.equal(queue.length, 1, "only the missing model row offers Queue install");
+  assert.equal(now.length, 1, "only the missing model row offers Install now");
+  assert.equal(queue[0].textContent, "Queue install");
+  assert.equal(now[0].textContent, "Install now");
+  assert.equal(findByTestId(deps, "dependency-model-download").length, 0, "legacy single action removed");
+
+  // Install now → synchronous single-item batch install.
+  now[0].click();
+  await settle(net.inflight);
+  const batch = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/models/batch-install") !== -1);
+  assert.equal(batch.length, 1);
+  assert.deepEqual(batch[0].body.items, [{
+    url: "https://example.com/beta", filename: "beta.safetensors", save_path: "",
+  }]);
+  section("7c. Install now issues one synchronous single-item batch install");
+
+  // Queue install → async single install + status poll.
+  queue[0].click();
+  await settle(net.inflight);
+  const queued = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/comfymodal/model/install") !== -1);
+  assert.equal(queued.length, 1);
+  assert.deepEqual(queued[0].body, { url: "https://example.com/beta", filename: "beta.safetensors", save_path: "" });
+  assert.ok(
+    net.calls.some((c) => c.method === "GET" && c.url.indexOf("/comfymodal/download/status/") !== -1),
+    "status polled"
+  );
+  section("7d. Queue install polls the async download status");
+}
+
+// ── 7p. In-flight install transitions the row state badge ────────────────
+
+{
+  const { net } = await mountLibrary();
+  const deps = renderDependencySection({}, DEPS_PAYLOAD, null, { apiBase: "/comfymodal" });
+  const row = findByTestId(deps, "dependency-model-row")[1];
+  const badge = findOneByTestId(row, "dependency-model-state");
+  assert.equal(badge.textContent, "Missing");
+
+  const queue = findOneByTestId(row, "dependency-model-queue");
+  queue.click();
+  // The SAME node reports the queue truth synchronously, before awaiting.
+  assert.equal(badge.textContent, "Queued for download");
+  assert.equal(badge.getAttribute("data-state"), "queued");
+  await settle(net.inflight);
+  assert.equal(
+    net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/comfymodal/model/install") !== -1).length,
+    1
+  );
+  assert.ok(net.calls.some((c) => c.method === "GET" && c.url.indexOf("/comfymodal/download/status/") !== -1));
+  // No owner refresh handler → the badge falls back to the last-known state
+  // rather than staying stuck on the queued pseudo-state.
+  assert.equal(badge.textContent, "Missing");
+  section("7p. In-flight install transitions the row state badge to Queued for download");
+}
+
+// ── 7q. Source-less row installs from an explicit user-supplied URL ───────
+
+{
+  const { net } = await mountLibrary();
+  const deps = {
+    status: "ok",
+    models: [
+      {
+        key: "vae|no_source.safetensors",
+        role: "vae",
+        filename: "no_source.safetensors",
+        folder: "vae",
+        state: "missing",
+        source_urls: [],
+      },
+    ],
+    custom_nodes: [],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal" });
+  const row = findOneByTestId(depsSection, "dependency-model-row");
+  // No guessed source → neither existing action is offered.
+  assert.equal(findByTestId(row, "dependency-model-queue").length, 0);
+  assert.equal(findByTestId(row, "dependency-model-install-now").length, 0);
+  const urlIn = findOneByTestId(row, "dependency-model-url-input");
+  const urlBtn = findOneByTestId(row, "dependency-model-url-install");
+
+  // Empty URL: explicit validation, zero requests.
+  urlBtn.click();
+  await settle(net.inflight);
+  assert.equal(
+    net.calls.filter((c) => c.method === "POST").length,
+    0,
+    "empty URL never posts"
+  );
+  assert.ok(
+    findOneByTestId(row, "dependency-model-install-note").textContent.indexOf("Paste a model URL") !== -1,
+    "empty-URL guidance shown"
+  );
+
+  // Explicit URL install reuses the legacy async route + status polling; the
+  // browser only passes the URL — the backend downloads to the Modal volume.
+  urlIn.value = "https://example.com/no_source.safetensors";
+  const badge = findOneByTestId(row, "dependency-model-state");
+  urlBtn.click();
+  assert.equal(badge.textContent, "Downloading\u2026");
+  await settle(net.inflight);
+  const posts = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/comfymodal/model/install") !== -1);
+  assert.equal(posts.length, 1);
+  assert.deepEqual(posts[0].body, {
+    url: "https://example.com/no_source.safetensors",
+    filename: "no_source.safetensors",
+    save_path: "vae",
+  });
+  assert.ok(
+    net.calls.some((c) => c.method === "GET" && c.url.indexOf("/comfymodal/download/status/") !== -1),
+    "status polled"
+  );
+  section("7q. Source-less row installs from an explicit user URL via the legacy route");
+}
+
+// ── 7e. CNR / class → Manager pack resolution ────────────────────────────
+// A missing node whose report carries only a cnr_id (Donut-style) resolves to
+// its Manager pack repository and exposes the single Manager install action.
+
+{
+  const { net } = await mountLibrary();
+  const index = buildManagerPackIndex(
+    {
+      channel: "default",
+      node_packs: {
+        donutnodes: {
+          title: "ComfyUI-DonutNodes",
+          repository: "https://github.com/DonutsDelivery/ComfyUI-DonutNodes",
+          state: "not-installed",
+        },
+      },
+    },
+    { donutnodes: [["DonutLoaderClass"], { title_aux: "ComfyUI-DonutNodes" }] }
+  );
+  assert.ok(index.packs.donutnodes, "pack key indexed");
+  assert.ok(index.byClass.donutloaderclass, "class mapping indexed");
+
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      {
+        name: "ComfyUI-DonutNodes",
+        cnr_id: "donutnodes",
+        state: "missing",
+        repository_url: "",
+        classes: ["DonutLoaderClass"],
+      },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: index,
+  });
+  const btn = findOneByTestId(depsSection, "dependency-node-install-now");
+  assert.equal(btn.textContent, "Install now");
+  const nodeBadge = findOneByTestId(depsSection, "dependency-node-state");
+  assert.equal(nodeBadge.textContent, "Missing");
+  btn.click();
+  // The row's OWN missing badge reads "Queued" while the install is in flight.
+  assert.equal(nodeBadge.textContent, "Queued");
+  await settle(net.inflight);
+  // Settled install reconciles to the report's real state (no stale queued chip).
+  assert.equal(nodeBadge.textContent, "Missing");
+  // A matched Manager record installs through the CNR queue (blank version
+  // metadata included) — never the git_url 403 gate.
+  const queue = net.calls.filter(
+    (c) => c.method === "POST" && c.url.indexOf("/manager/queue/install") !== -1
+  );
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].body.id, "donutnodes");
+  assert.equal(
+    net.calls.filter((c) => c.url.indexOf("/customnode/install/git_url") !== -1).length,
+    0,
+    "matched CNR pack never uses git_url"
+  );
+  section("7e. Missing node CNR id resolves to its Manager pack install");
+}
+
+// No match → no guessed URL and no install action.
+{
+  const index = buildManagerPackIndex({ node_packs: {} }, {});
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "donutnodes", cnr_id: "donutnodes", state: "missing", repository_url: "", classes: ["DonutLoaderClass"] },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal", managerPacks: index });
+  assert.equal(findByTestId(depsSection, "dependency-node-install-now").length, 0, "no Manager match → no install");
+  assert.equal(findByTestId(depsSection, "dependency-node-row").length, 1, "row still rendered");
+  section("7f. No Manager match renders the row without a guessed install URL");
+}
+
+// An UNMATCHED pack with an explicit report repository keeps the security-gated
+// git_url fallback (the only path that still uses it).
+{
+  const { net } = await mountLibrary();
+  const index = buildManagerPackIndex({ node_packs: {} }, {});
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "ComfyUI-Missing", state: "missing", repository_url: "https://github.com/example/ComfyUI-Missing", classes: ["MissingClass"] },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal", managerPacks: index });
+  findOneByTestId(depsSection, "dependency-node-install-now").click();
+  await settle(net.inflight);
+  const git = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/customnode/install/git_url") !== -1);
+  assert.equal(git.length, 1, "unmatched explicit repository uses git_url");
+  assert.equal(git[0].body.url, "https://github.com/example/ComfyUI-Missing");
+  assert.equal(
+    net.calls.filter((c) => c.url.indexOf("/manager/queue/install") !== -1).length,
+    0,
+    "no Manager record → never the CNR queue"
+  );
+  section("7f-b. unmatched explicit repository keeps the git_url fallback");
+}
+
+// ── 7g. Path-like dependency filenames match Manager basenames ───────────
+
+{
+  const deps = {
+    status: "ok",
+    models: [
+      {
+        key: "lora|sub/dir/foo.safetensors",
+        role: "lora",
+        filename: "sub/dir/foo.safetensors",
+        state: "missing",
+        source_urls: [],
+      },
+    ],
+    custom_nodes: [],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerModelsByFilename: {
+      "foo.safetensors": {
+        url: "https://example.com/foo.safetensors",
+        savePath: "loras",
+        installed: "False",
+      },
+    },
+  });
+  const row = findByTestId(depsSection, "dependency-model-row")[0];
+  assert.equal(
+    findByTestId(row, "dependency-model-install-now").length,
+    1,
+    "basename match supplies the Manager install URL"
+  );
+  section("7g. Path-like dependency filename matches the Manager catalog basename");
 }
 
 // ── Find-in-library contextual handoff ───────────────────────────────────
@@ -520,7 +821,7 @@ async function mountLibrary(router) {
   for (const canonical of [
     "/studio/models",
     "/studio/custom-nodes",
-    "install-request",
+    "requestModelInstall",
     "dependencies",
   ]) {
     assert.ok(librarySource.includes(canonical), "modern module uses canonical surface: " + canonical);
@@ -531,6 +832,454 @@ async function mountLibrary(router) {
     assert.equal(librarySource.includes(operational), false, "Model Library must not reproduce backend-operational action " + operational);
   }
   section("1. Parity classifications represented in the owned module surface");
+}
+
+// ── 7h. Preemptions beat an exact class mapping ───────────────────────────
+
+{
+  const index = buildManagerPackIndex(
+    {
+      channel: "default",
+      node_packs: {
+        packA: { title: "PackA", repository: "https://github.com/ex/PackA", preemptions: ["SharedClass"] },
+        packB: { title: "PackB", repository: "https://github.com/ex/PackB" },
+      },
+    },
+    { packB: [["SharedClass"], {}] }
+  );
+  const plan = resolveNodeInstall(
+    { name: "SharedClass", classes: ["SharedClass"], state: "missing" },
+    index
+  );
+  // A matched Manager record queues through Manager, never the git_url gate,
+  // even without version metadata; the resolution still picks PackA.
+  assert.equal(plan.kind, "cnr");
+  assert.equal(plan.pack.name, "PackA");
+  section("7h. preemptions win over an exact class mapping");
+}
+
+// ── 7i. nodename_pattern regex resolves an unmapped class ────────────────
+
+{
+  const index = buildManagerPackIndex(
+    { node_packs: { patternpack: { title: "PatternPack", repository: "https://github.com/ex/Pattern" } } },
+    { patternpack: [["ExactClass"], { nodename_pattern: "^Donut.*Loader$" }] }
+  );
+  const exact = resolveNodeInstall({ name: "ExactClass", classes: ["ExactClass"], state: "missing" }, index);
+  assert.equal(exact.kind, "cnr", "matched class record queues via Manager");
+  assert.equal(exact.pack.name, "PatternPack");
+  const plan = resolveNodeInstall({ name: "DonutXLoader", classes: ["DonutXLoader"], state: "missing" }, index);
+  assert.equal(plan.kind, "cnr", "nodename_pattern match queues via Manager");
+  assert.equal(plan.pack.name, "PatternPack");
+  section("7i. nodename_pattern regex resolves an unmapped class");
+}
+
+// ── 7j. aux_id (full slug and basename) resolves to its pack ──────────────
+
+{
+  const index = buildManagerPackIndex(
+    {
+      node_packs: {
+        "https://github.com/kijai/ComfyUI-KJNodes": {
+          title: "ComfyUI-KJNodes",
+          repository: "https://github.com/kijai/ComfyUI-KJNodes",
+        },
+      },
+    },
+    {}
+  );
+  for (const aux of ["kijai/ComfyUI-KJNodes", "ComfyUI-KJNodes"]) {
+    const plan = resolveNodeInstall({ name: "KJNodes", aux_id: aux, state: "missing" }, index);
+    assert.equal(plan.kind, "cnr", "aux id " + aux + " queues via Manager");
+    assert.equal(plan.pack.name, "ComfyUI-KJNodes");
+  }
+  section("7j. aux_id (full slug and basename) resolves to its Manager pack");
+}
+
+// ── 7k. Pure-CNR pack installs via Manager queue (no git_url 403 gate) ────
+
+{
+  const { net } = await mountLibrary();
+  const index = buildManagerPackIndex(
+    {
+      node_packs: {
+        donutnodes: {
+          title: "ComfyUI-DonutNodes",
+          version: "1.2.3",
+          install_type: "cnr",
+          state: "not-installed",
+        },
+      },
+    },
+    { donutnodes: [["DonutLoaderClass"], { title_aux: "ComfyUI-DonutNodes" }] }
+  );
+  const plan = resolveNodeInstall(
+    { name: "ComfyUI-DonutNodes", cnr_id: "donutnodes", classes: ["DonutLoaderClass"], state: "missing" },
+    index
+  );
+  assert.equal(plan.kind, "cnr", "versioned CNR record queues instead of git_url");
+
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      {
+        name: "ComfyUI-DonutNodes",
+        cnr_id: "donutnodes",
+        state: "missing",
+        repository_url: "",
+        classes: ["DonutLoaderClass"],
+      },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal", managerPacks: index });
+  assert.equal(findByTestId(depsSection, "dependency-node-install-now").length, 1);
+  assert.equal(findByTestId(depsSection, "dependency-node-no-target").length, 0);
+  findOneByTestId(depsSection, "dependency-node-install-now").click();
+  await settle(net.inflight);
+
+  const queue = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/manager/queue/install") !== -1);
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].body.id, "donutnodes");
+  assert.equal(queue[0].body.version, "1.2.3");
+  assert.equal(queue[0].body.selected_version, "latest");
+  assert.equal(queue[0].body.channel, "default");
+  const start = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/manager/queue/start") !== -1);
+  assert.equal(start.length, 1);
+  assert.equal(
+    net.calls.filter((c) => c.url.indexOf("/customnode/install/git_url") !== -1).length,
+    0,
+    "CNR install never touches the git_url 403 gate"
+  );
+  section("7k. pure-CNR pack installs via Manager queue (no git_url 403 gate)");
+}
+
+// ── 7l. Manager 403 on the CNR queue is surfaced truthfully ──────────────
+
+{
+  installFetch((call) => {
+    if (call.method === "POST" && call.url.indexOf("/manager/queue/install") !== -1) {
+      return { __fail: true, __status: 403, __message: "not allowed" };
+    }
+    return defaultRouter(call);
+  });
+  const res = await performManagerInstall({ kind: "cnr", pack: { cnrId: "x", version: "1", files: [] } });
+  assert.equal(res.ok, false);
+  assert.ok(res.message.indexOf("403") !== -1, "403 surfaced");
+  section("7l. Manager 403 on the CNR queue is surfaced truthfully");
+}
+
+// ── 7l-b. Blank/unknown-version Manager pack never falls back to git_url ──
+//
+// Regression for the Manager 403 failure: a pack successfully resolved from
+// the Manager catalog (cnr/aux/class/pattern) has a valid record but may carry
+// blank or "unknown" version metadata. It must still install through Manager's
+// queue with safe defaults — never the security-gated git_url route that 403s
+// when git installs are disabled.
+
+{
+  const { net } = await mountLibrary();
+  const index = buildManagerPackIndex(
+    {
+      channel: "default",
+      node_packs: {
+        donutnodes: {
+          title: "ComfyUI-DonutNodes",
+          install_type: "cnr",
+          state: "not-installed",
+          // No version / selected_version at all (blank metadata).
+        },
+        nightlypack: {
+          title: "NightlyPack",
+          version: "unknown",
+          selected_version: "nightly",
+          install_type: "cnr",
+        },
+      },
+    },
+    { donutnodes: [["DonutLoaderClass"], { title_aux: "ComfyUI-DonutNodes" }] }
+  );
+
+  const blank = resolveNodeInstall(
+    { name: "ComfyUI-DonutNodes", cnr_id: "donutnodes", classes: ["DonutLoaderClass"], state: "missing" },
+    index
+  );
+  assert.equal(blank.kind, "cnr", "blank-version Manager record queues CNR");
+  const nightly = resolveNodeInstall({ name: "NightlyPack", cnr_id: "nightlypack", state: "missing" }, index);
+  assert.equal(nightly.kind, "cnr", "unknown/nightly Manager record still queues CNR");
+
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "ComfyUI-DonutNodes", cnr_id: "donutnodes", state: "missing", repository_url: "", classes: ["DonutLoaderClass"] },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal", managerPacks: index });
+  findOneByTestId(depsSection, "dependency-node-install-now").click();
+  await settle(net.inflight);
+  const queue = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/manager/queue/install") !== -1);
+  assert.equal(queue.length, 1, "blank-version matched pack queues once");
+  assert.equal(queue[0].body.id, "donutnodes");
+  assert.equal(queue[0].body.version, "unknown", "safe default version");
+  assert.equal(queue[0].body.selected_version, "latest", "safe default selected_version");
+  assert.equal(queue[0].body.channel, "default");
+  assert.equal(
+    net.calls.filter((c) => c.url.indexOf("/customnode/install/git_url") !== -1).length,
+    0,
+    "blank/unknown version never routes through the git_url 403 gate"
+  );
+  section("7l-b. blank/unknown-version Manager pack queues instead of git_url");
+}
+
+// ── 7m. Manager save_path default + role/type matching ───────────────────
+
+{
+  assert.equal(managerModelFolder("vae"), "vae");
+  assert.equal(managerModelFolder("clip"), "text_encoders");
+  assert.equal(managerModelFolder("unet"), "diffusion_models");
+  assert.equal(normalizeManagerSavePath("default", "lora"), "loras");
+  assert.equal(normalizeManagerSavePath("", "checkpoints"), "checkpoints");
+  assert.equal(normalizeManagerSavePath("custom/sub", "vae"), "custom/sub");
+  const map = { "foo.safetensors": { url: "u", savePath: "checkpoints", type: "checkpoints" } };
+  assert.equal(
+    matchManagerModel({ filename: "foo.safetensors", role: "lora" }, map),
+    null,
+    "cross-type basename rejected"
+  );
+  assert.ok(matchManagerModel({ filename: "foo.safetensors", role: "checkpoint" }, map), "same-type match kept");
+  section("7m. Manager save_path default + role/type matching");
+}
+
+// ── 7n. Manager installed dict alone never proves classes loaded ──────────
+
+{
+  const index = buildManagerPackIndex({ node_packs: {} }, {});
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "PackX", cnr_id: "packx", state: "missing", repository_url: "", classes: ["PackX"] },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+
+  // Disabled Manager record, no install plan: the row stays missing and
+  // explains the package is present but its classes are not loaded. It must
+  // never render as "Installed".
+  const disabled = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: index,
+    managerInstalled: [{ module: "packx_dir", cnr_id: "packx", aux_id: "", enabled: false, ver: "1" }],
+  });
+  assert.equal(findByTestId(disabled, "dependency-node-install-now").length, 0, "no plan → no install action");
+  assert.equal(findByTestId(disabled, "dependency-node-manager-installed").length, 0, "Manager dict is not installed proof");
+  const disabledNote = findOneByTestId(disabled, "dependency-node-manager-stale").textContent;
+  assert.ok(disabledNote.indexOf("disabled") !== -1, "disabled truth preserved");
+  assert.ok(disabledNote.indexOf("not loaded") !== -1, "classes-not-loaded truth");
+  assert.ok(findOneByTestId(disabled, "dependency-node-row").textContent.indexOf("Missing") !== -1, "row stays missing");
+
+  // Enabled Manager record, still no install plan: same missing truth.
+  const enabled = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: index,
+    managerInstalled: [{ module: "packx_dir", cnr_id: "packx", aux_id: "", enabled: true, ver: "1" }],
+  });
+  assert.ok(findOneByTestId(enabled, "dependency-node-manager-stale").textContent.indexOf("not loaded") !== -1);
+  assert.equal(findByTestId(enabled, "dependency-node-manager-installed").length, 0);
+  assert.equal(findByTestId(enabled, "dependency-node-install-now").length, 0, "no target → no install action");
+
+  // Manager record + resolvable plan: the installed dict must NOT suppress the
+  // single Install now action; the explanatory note stays alongside it.
+  const planIndex = buildManagerPackIndex(
+    { node_packs: { packx: { title: "PackX", repository: "https://github.com/ex/PackX" } } },
+    {}
+  );
+  const withPlan = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: planIndex,
+    managerInstalled: [{ module: "packx_dir", cnr_id: "packx", aux_id: "", enabled: true, ver: "1" }],
+  });
+  assert.equal(findByTestId(withPlan, "dependency-node-install-now").length, 1, "plan keeps the install action");
+  assert.ok(findOneByTestId(withPlan, "dependency-node-manager-stale").textContent.indexOf("not loaded") !== -1);
+  assert.ok(findOneByTestId(withPlan, "dependency-node-row").textContent.indexOf("Missing") !== -1, "still missing");
+
+  // Explicit loaded-class proof is the only thing that reports the classes
+  // loaded; it hides the install action.
+  const loaded = renderDependencySection({}, deps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: index,
+    loadedClasses: ["PackX"],
+  });
+  assert.ok(findOneByTestId(loaded, "dependency-node-loaded").textContent.indexOf("loaded") !== -1);
+  assert.equal(findByTestId(loaded, "dependency-node-install-now").length, 0, "loaded classes hide the install action");
+
+  const auxDeps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "KJ", aux_id: "kijai/ComfyUI-KJNodes", state: "missing", repository_url: "", classes: [] },
+    ],
+    summary: { ready: false, attention: 1 },
+  };
+  const aux = renderDependencySection({}, auxDeps, null, {
+    apiBase: "/comfymodal",
+    managerPacks: index,
+    managerInstalled: [{ module: "ComfyUI-KJNodes", cnr_id: "", aux_id: "ComfyUI-KJNodes", enabled: true }],
+  });
+  const auxNote = findOneByTestId(aux, "dependency-node-manager-stale").textContent;
+  assert.equal(auxNote.indexOf("disabled"), -1, "enabled aux install is not reported disabled");
+  assert.ok(auxNote.indexOf("not loaded") !== -1, "aux install still needs class-loaded proof");
+  section("7n. Manager installed dict alone never proves classes loaded");
+}
+
+// ── 7o. Newly-surfaced UI-only classes resolve across CNR/aux/class/pattern ─
+// The backend now unions full UI-graph node types into the dependency report
+// (UI-only packs absent from the executable prompt). Each surfaced row must
+// still resolve through the existing Manager index: direct CNR id, aux
+// repo basename, grouped CNR pack, class mapping, and nodename_pattern — one
+// "Install now" per pack, all via the CNR queue (never git_url).
+
+{
+  const { net } = await mountLibrary();
+  const index = buildManagerPackIndex(
+    {
+      channel: "default",
+      node_packs: {
+        krea2_identity_edit: {
+          title: "Krea 2 Identity Edit", version: "1.0.0", install_type: "cnr",
+          repository: "https://github.com/krea/ComfyUI-IdentityEdit",
+        },
+        "https://github.com/Derfuu/ComfyUI_Derfuu_ComfyUI_Modded_Nodes": {
+          title: "Derfuu Modded Nodes", version: "2.0.0", install_type: "cnr",
+          repository: "https://github.com/Derfuu/ComfyUI_Derfuu_ComfyUI_Modded_Nodes",
+        },
+        bleh: {
+          title: "ComfyUI-bleh", version: "1.1.0", install_type: "cnr",
+          repository: "https://github.com/bleh/ComfyUI-bleh",
+        },
+        impact_subpack: {
+          title: "ComfyUI Impact Subpack", version: "1.5.0", install_type: "cnr",
+          repository: "https://github.com/ltdrdata/ComfyUI-Impact-Subpack",
+        },
+        patternpack: {
+          title: "Seed Variance Enhancer", version: "3.0.0", install_type: "cnr",
+          repository: "https://github.com/ex/SeedVariance",
+        },
+      },
+    },
+    {
+      impact_subpack: [["ImpactSubpackNode"], {}],
+      patternpack: [["UnmappedClass"], { nodename_pattern: "^SeedVarianceEnhancer$" }],
+    }
+  );
+
+  const plans = [
+    resolveNodeInstall({ cnr_id: "krea2_identity_edit", classes: ["Krea2IdentityEdit"], state: "missing" }, index),
+    resolveNodeInstall({ aux_id: "Derfuu/ComfyUI_Derfuu_ComfyUI_Modded_Nodes", classes: ["DerfuuNode"], state: "missing" }, index),
+    resolveNodeInstall({ cnr_id: "bleh", classes: ["BlehNodeA", "BlehNodeB"], state: "missing" }, index),
+    resolveNodeInstall({ classes: ["ImpactSubpackNode"], state: "missing" }, index),
+    resolveNodeInstall({ classes: ["SeedVarianceEnhancer"], state: "missing" }, index),
+  ];
+  for (const plan of plans) assert.equal(plan.kind, "cnr", "known Manager record queues CNR: " + plan.name);
+
+  const deps = {
+    status: "ok",
+    models: [],
+    custom_nodes: [
+      { name: "Krea 2 Identity Edit", cnr_id: "krea2_identity_edit", state: "missing", repository_url: "", classes: ["Krea2IdentityEdit"] },
+      { name: "Derfuu Modded Nodes", aux_id: "Derfuu/ComfyUI_Derfuu_ComfyUI_Modded_Nodes", state: "missing", repository_url: "", classes: ["DerfuuNode"] },
+      { name: "ComfyUI-bleh", cnr_id: "bleh", state: "missing", repository_url: "", classes: ["BlehNodeA", "BlehNodeB"] },
+      { name: "ComfyUI Impact Subpack", state: "missing", repository_url: "", classes: ["ImpactSubpackNode"] },
+      { name: "Seed Variance Enhancer", state: "missing", repository_url: "", classes: ["SeedVarianceEnhancer"] },
+    ],
+    summary: { ready: false, attention: 5 },
+  };
+  const depsSection = renderDependencySection({}, deps, null, { apiBase: "/comfymodal", managerPacks: index });
+  const rows = findByTestId(depsSection, "dependency-node-row");
+  assert.equal(rows.length, 5, "one row per surfaced pack");
+  for (const row of rows) {
+    assert.equal(
+      findByTestId(row, "dependency-node-install-now").length,
+      1,
+      "exactly one Install now for " + row.getAttribute("data-node-name")
+    );
+  }
+
+  // The grouped CNR pack must queue once, never fall through to git_url.
+  const blehRow = rows.find((r) => r.getAttribute("data-node-name") === "ComfyUI-bleh");
+  findOneByTestId(blehRow, "dependency-node-install-now").click();
+  await settle(net.inflight);
+  const queue = net.calls.filter((c) => c.method === "POST" && c.url.indexOf("/manager/queue/install") !== -1);
+  assert.equal(queue.length, 1, "grouped pack queues exactly once");
+  assert.equal(queue[0].body.id, "bleh");
+  assert.equal(
+    net.calls.filter((c) => c.url.indexOf("/customnode/install/git_url") !== -1).length,
+    0,
+    "known Manager packs never touch the git_url gate"
+  );
+  section("7o. UI-only classes resolve CNR/aux/class/pattern with one queue install each");
+}
+
+// ── 16. Lazy workflow-detail Manager context is wired, never auto-installs ─
+
+{
+  // Only the workflow-detail host loads the Manager catalog, lazily, when a
+  // missing item lacks a source; it reuses the shared pure builders.
+  assert.ok(workflowsSource.includes("maybeLoadManagerContext"), "workflow detail owns the lazy Manager load");
+  assert.ok(workflowsSource.includes("_depsNeedManager"), "load is gated on missing items without a source");
+  for (const helper of ["getManagerVersion", "getManagerPackList", "getManagerMappings", "getManagerModels", "listManagerInstalled"]) {
+    assert.ok(workflowsSource.includes(helper), "workflow detail reuses backend helper " + helper);
+  }
+  assert.ok(workflowsSource.includes("buildManagerPackIndex"), "pack index reuse");
+  assert.ok(workflowsSource.includes("buildManagerModelIndex"), "model index reuse");
+  assert.ok(workflowsSource.includes("parseManagerInstalled"), "installed-dict parse reuse");
+  assert.equal(workflowsSource.includes("managerReboot"), false, "detail surface never reboots");
+  assert.equal(workflowsSource.includes("/manager/reboot"), false, "detail surface never posts reboot");
+  // The ordinary Model Library module must not fetch Manager itself.
+  assert.equal(librarySource.includes("getManagerVersion"), false, "Model Library loads no Manager context");
+  assert.equal(librarySource.includes("getManagerPackList"), false, "Model Library loads no Manager catalog");
+  // Rows still perform installs only through the shared click-gated primitive.
+  assert.ok(
+    librarySource.indexOf("performManagerInstall(installPlan)") !== -1,
+    "shared row performs the resolved plan on explicit click"
+  );
+  section("16. Workflow-detail Manager context is lazy, reused, and click-only");
+}
+
+// ── 17. buildManagerModelIndex: exact filename + basename + normalized save ─
+
+{
+  const index = buildManagerModelIndex([
+    { filename: "sub/dir/foo.safetensors", url: "https://example.com/foo", save_path: "default", type: "lora", name: "Foo" },
+    { filename: "bar.safetensors", url: "https://example.com/bar", save_path: "custom/sub", type: "vae" },
+  ]);
+  assert.equal(index["sub/dir/foo.safetensors"].savePath, "loras", "default save_path normalized");
+  assert.ok(index["foo.safetensors"], "basename keyed");
+  assert.equal(index["bar.safetensors"].savePath, "custom/sub", "explicit save_path preserved");
+  assert.equal(matchManagerModel({ filename: "sub/dir/foo.safetensors", role: "lora" }, index).url, "https://example.com/foo");
+  section("17. buildManagerModelIndex keys exact + basename with normalized save_path");
+}
+
+// ── 18. parseManagerInstalled: dict shape + disabled truth preserved ───────
+
+{
+  const records = parseManagerInstalled({
+    pack_enabled: { ver: "1.0", cnr_id: "packa", aux_id: "", enabled: true },
+    pack_disabled: { ver: "2.0", cnr_id: "packb", aux_id: "owner/repo", enabled: "false" },
+    junk: "not-an-object",
+  });
+  assert.equal(records.length, 2, "only object values become records");
+  const disabled = records.find((r) => r.module === "pack_disabled");
+  assert.equal(disabled.enabled, false, "disabled stays false");
+  assert.equal(disabled.cnr_id, "packb");
+  const enabled = records.find((r) => r.module === "pack_enabled");
+  assert.equal(enabled.enabled, true);
+  assert.deepEqual(parseManagerInstalled(null), []);
+  assert.deepEqual(parseManagerInstalled([{ module: "raw", enabled: false }]), [{ module: "raw", enabled: false }]);
+  section("18. parseManagerInstalled normalizes the dict and preserves disabled truth");
 }
 
 console.log("ALL H7 MODEL LIBRARY PARITY UNIT TESTS PASSED");

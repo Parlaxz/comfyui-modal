@@ -61,6 +61,12 @@ KNOWN_DISCOVERY_BUCKETS: tuple[str, ...] = (
     "gligen",
 )
 
+# ComfyUI ``folder_paths`` registry keys that are not model buckets: code and
+# dataset roots must never be walked as if every file were a model.
+_NON_MODEL_REGISTRY_KEYS: frozenset[str] = frozenset(
+    {"custom_nodes", "datasets", "configs"}
+)
+
 _ALLOWED_FOLDERS_FALLBACK: tuple[str, ...] = (
     "checkpoints",
     "unet",
@@ -121,21 +127,27 @@ def _allowed_model_folders() -> tuple[str, ...]:
 def record_is_installed(record: dict[str, Any]) -> bool:
     """Derive ``installed`` from the record's stored metadata + disk state.
 
-    A record is installed when its file exists, its stored size is positive,
-    and its stored fingerprint (size + mtime_ns) still matches the file on
-    disk.  A stale fingerprint means the file was replaced by a different
-    model — the old record is reported missing (``installed=False``).
+    A record is installed when its file exists on disk AND the file itself is
+    non-empty.  Zero-byte sentinels (``put_*_here``) and stale placeholders
+    therefore stay ``installed=False`` even when a legacy record stored a
+    positive size.  When a fingerprint (size + mtime_ns) was recorded it must
+    still match the file; a mismatch means the file was replaced by a
+    different model, so the old record is reported missing.
     """
     try:
         local_path = record.get("local_path", "")
         if not local_path or not os.path.isfile(local_path):
             return False
-        size = record.get("size", 0)
-        if not isinstance(size, int) or size <= 0:
+        st = os.stat(local_path)
+        if st.st_size <= 0:
+            # Zero-byte file: placeholder, never an installed model.
+            return False
+        stored_size = record.get("size", 0)
+        if isinstance(stored_size, int) and stored_size > 0 and stored_size != st.st_size:
+            # Disk content no longer matches the recorded size.
             return False
         fingerprint = record.get("fingerprint")
         if fingerprint and isinstance(fingerprint, dict):
-            st = os.stat(local_path)
             if fingerprint.get("size") != st.st_size:
                 return False
             if fingerprint.get("mtime_ns") != st.st_mtime_ns:
@@ -285,39 +297,76 @@ class ModelDiscovery:
     def folder_paths_map(self, comfyui_root: str | Path) -> dict[str, list[str]]:
         """Map model bucket -> list of base dirs to scan.
 
-        Prefers the ComfyUI ``folder_paths`` registry when importable;
-        otherwise falls back to ``<comfyui_root>/models/<bucket>`` for the
-        known buckets present on disk.  Never raises.
+        Uses the live ComfyUI ``folder_paths`` registry when importable so
+        every canonical model folder it registers is scanned (``unet`` aliases
+        its legacy directory through ``diffusion_models``, newer buckets like
+        ``diffusers``/``model_patches`` are picked up automatically).  On top
+        of that, every known bucket that exists on disk is merged in, so a
+        real ``models/<bucket>`` directory is still discovered when ComfyUI's
+        registry omits it.  A physical directory is assigned to exactly one
+        bucket (first wins) to keep one file from producing duplicate records.
+        Never raises.
         """
+        models_root = Path(comfyui_root) / "models"
+        buckets: dict[str, list[str]] = {}
+
         try:
             import folder_paths  # type: ignore[import-not-found]
 
             names = getattr(folder_paths, "folder_names_and_paths", None)
-            if names:
-                result: dict[str, list[str]] = {}
-                for bucket in self.KNOWN_BUCKETS:
-                    raw = names.get(bucket)
+            if isinstance(names, dict):
+                for raw_bucket, raw in names.items():
+                    bucket = str(raw_bucket)
+                    if not bucket or bucket in _NON_MODEL_REGISTRY_KEYS:
+                        continue
                     paths = None
                     if isinstance(raw, tuple) and raw:
                         paths = raw[0]
                     elif isinstance(raw, list):
                         paths = raw
-                    if paths:
-                        result[bucket] = [str(p) for p in paths]
-                if result:
-                    return result
+                    if not paths:
+                        continue
+                    bucket_paths = buckets.setdefault(bucket, [])
+                    for path in paths:
+                        value = str(path)
+                        if value and value not in bucket_paths:
+                            bucket_paths.append(value)
         except Exception:
             pass
-        fallback: dict[str, list[str]] = {}
-        models_root = Path(comfyui_root) / "models"
+
+        # Merge on-disk canonical buckets the registry did not expose (legacy
+        # ComfyUI versions, or a bucket whose directory exists but is not
+        # registered).  Registry paths keep priority so aliases stay grouped.
         for bucket in self.KNOWN_BUCKETS:
             try:
                 candidate = models_root / bucket
-                if candidate.is_dir():
-                    fallback[bucket] = [str(candidate)]
+                if not candidate.is_dir():
+                    continue
             except Exception:
                 continue
-        return fallback
+            bucket_paths = buckets.setdefault(bucket, [])
+            value = str(candidate)
+            if value not in bucket_paths:
+                bucket_paths.append(value)
+
+        # One physical directory belongs to one bucket only: scanning the same
+        # tree under two buckets would create duplicate records for one file.
+        seen_dirs: set[str] = set()
+        result: dict[str, list[str]] = {}
+        for bucket, dirs in buckets.items():
+            unique: list[str] = []
+            for directory in dirs:
+                try:
+                    key = os.path.normcase(os.path.normpath(directory))
+                except Exception:
+                    continue
+                if key in seen_dirs:
+                    continue
+                seen_dirs.add(key)
+                unique.append(directory)
+            if unique:
+                result[bucket] = unique
+        return result
 
     @staticmethod
     def _model_type_for_folder(folder: str) -> str:

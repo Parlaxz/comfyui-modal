@@ -290,6 +290,95 @@ class ModelLibraryTestCase(unittest.TestCase):
         self.assertEqual(len(self.service.list_models()), 1)
         self.assertEqual(store_path.read_bytes(), before)
 
+    # ── 12. installed derives from the real nonzero file on disk ─────────
+
+    def test_record_is_installed_requires_nonzero_disk_file(self):
+        from model_library import record_is_installed
+
+        real = self._write("checkpoints", "real.safetensors", CONTENT_A)
+        self.assertTrue(
+            record_is_installed(
+                {"local_path": str(real), "size": len(CONTENT_A), "fingerprint": None}
+            )
+        )
+
+        empty = self._write("checkpoints", "empty.safetensors", b"")
+        # Zero-byte file is a placeholder: never installed, even when a stale
+        # record claimed a positive size.
+        self.assertFalse(
+            record_is_installed(
+                {"local_path": str(empty), "size": 0, "fingerprint": None}
+            )
+        )
+        self.assertFalse(
+            record_is_installed(
+                {"local_path": str(empty), "size": 12345, "fingerprint": None}
+            )
+        )
+        # Stored size disagrees with the real file: content was replaced.
+        self.assertFalse(
+            record_is_installed(
+                {
+                    "local_path": str(real),
+                    "size": len(CONTENT_A) + 1,
+                    "fingerprint": None,
+                }
+            )
+        )
+
+    # ── 13. models/unet legacy folder is reconciled ──────────────────────
+
+    def test_scan_represents_unet_folder(self):
+        self._write("unet", "krea2_turbo_bf16.safetensors", CONTENT_A)
+        summary = self.service.rescan()
+        self.assertEqual(summary["added"], 1)
+        records = [
+            r
+            for r in self.service.list_models()
+            if r["filename"] == "krea2_turbo_bf16.safetensors"
+        ]
+        self.assertEqual(len(records), 1, "one physical file must yield one record")
+        self.assertEqual(records[0]["model_type"], "unet")
+        self.assertTrue(records[0]["installed"])
+
+    # ── 14. registry-driven coverage + alias dedup ───────────────────────
+
+    def test_folder_paths_map_covers_registry_and_dedups_alias_dirs(self):
+        import sys
+        import types
+        from unittest import mock
+
+        unet_dir = self._models_dir() / "unet"
+        unet_dir.mkdir(parents=True, exist_ok=True)
+        diff_dir = self._models_dir() / "diffusion_models"
+        diff_dir.mkdir(parents=True, exist_ok=True)
+        patches_dir = self._models_dir() / "model_patches"
+        patches_dir.mkdir(parents=True, exist_ok=True)
+
+        fake = types.ModuleType("folder_paths")
+        setattr(
+            fake,
+            "folder_names_and_paths",
+            {
+                # ``unet`` is an alias directory inside diffusion_models; a
+                # registry-only bucket (model_patches) must also be picked up.
+                "diffusion_models": ([str(unet_dir), str(diff_dir)], set()),
+                "model_patches": ([str(patches_dir)], set()),
+                "custom_nodes": ([str(self.comfyui_root / "custom_nodes")], set()),
+            },
+        )
+        with mock.patch.dict(sys.modules, {"folder_paths": fake}):
+            mapping = self.service.discovery.folder_paths_map(str(self.comfyui_root))
+
+        self.assertEqual(
+            mapping.get("diffusion_models"), [str(unet_dir), str(diff_dir)]
+        )
+        # The same tree merged from the on-disk unet bucket must not create a
+        # second bucket (that would duplicate every record).
+        self.assertNotIn("unet", mapping)
+        self.assertEqual(mapping.get("model_patches"), [str(patches_dir)])
+        self.assertNotIn("custom_nodes", mapping)
+
 
 if __name__ == "__main__":
     unittest.main()

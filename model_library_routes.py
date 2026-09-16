@@ -45,6 +45,7 @@ from model_library import (
 )
 from studio_domain.services import WorkflowDomainService
 from studio_store import StudioJsonStore, StudioStoreError
+from workflow_metadata import iter_graph_nodes
 
 _log = logging.getLogger(__name__)
 
@@ -76,6 +77,61 @@ async def _read_body(request: web.Request) -> dict[str, Any] | None:
     except Exception:
         return None
     return body if isinstance(body, dict) else None
+
+
+def _graph_has_nodes(graph: Any) -> bool:
+    """True for a stored UI/static graph that actually carries node rows.
+
+    Uses the recursive walker so a graph whose real nodes live only inside
+    group/subgraph containers still counts as a full UI graph.
+    """
+    return any(
+        isinstance(node.get("type"), str) and node.get("type")
+        for node in iter_graph_nodes(graph)
+    )
+
+
+def _version_for_resolution(
+    version: dict[str, Any], workflow_service: WorkflowDomainService
+) -> dict[str, Any]:
+    """Copied version exposing the owning Workflow's static graph alongside it.
+
+    A WorkflowVersion persists the executable API prompt, but the owning
+    Workflow keeps the user-facing ``static_graph``, which records UI-only node
+    types and model widgets the API prompt never contains — including nodes
+    nested under ``extra.groupNodes`` / ``definitions.subgraphs``. Even when the
+    version already carries top-level graph nodes, its capture may lack those
+    parent-only nested definitions, so the parent graph is always supplied
+    through the ``static_graph`` alias the resolver already scans.
+
+    The version's own ``graph_json`` stays authoritative for duplicate node
+    ids/classes: the resolver scans ``graph_json`` before ``static_graph`` and
+    first-seen wins, so the parent graph only contributes its extra nested
+    definitions/groups/subgraphs. A version that already carries a full UI graph
+    under the ``static_graph`` key is left untouched. The persisted version dict
+    is never mutated.
+    """
+    if not isinstance(version, dict):
+        return version
+    workflow_id = str(version.get("workflow_id") or "")
+    if not workflow_id:
+        return version
+    try:
+        workflow = workflow_service.store.get_workflow(workflow_id)
+    except (StudioStoreError, OSError):
+        return version
+    if not isinstance(workflow, dict):
+        return version
+    parent_graph = workflow.get("static_graph")
+    if not _graph_has_nodes(parent_graph):
+        return version
+    # The version's own static_graph alias, when present, is already scanned by
+    # the resolver and stays authoritative; never clobber it with the parent.
+    if _graph_has_nodes(version.get("static_graph")):
+        return version
+    resolved = dict(version)
+    resolved["static_graph"] = parent_graph
+    return resolved
 
 
 def register_model_library_routes(
@@ -285,7 +341,9 @@ def register_model_library_routes(
             version = workflow_service.store.get_version(version_id)
             if version is None:
                 return _json_error(404, f"workflow version {version_id!r} not found")
-            result = resolver.resolve_version(version)
+            result = resolver.resolve_version(
+                _version_for_resolution(version, workflow_service)
+            )
             return web.json_response(
                 {
                     "status": "ok",

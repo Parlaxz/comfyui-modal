@@ -5753,6 +5753,15 @@ button.comfymodal-studio-feature-chip {
   border: 1px solid #2a2a2a;
 }
 
+/* In-progress states share the existing accent (running) family — no new
+   palette. Hooks for dependency rows reporting downloading/queued truth. */
+.comfymodal-studio-model-badge.downloading,
+.comfymodal-studio-model-badge.queued {
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.18));
+  color: var(--color-accent, #5a7fdb);
+  border: 1px solid rgba(90, 127, 219, 0.45);
+}
+
 .comfymodal-studio-model-badge.type,
 .comfymodal-studio-model-badge.role {
   background: #0d1526;
@@ -5830,21 +5839,21 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-dependency-group {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-bottom: 10px;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 
 .comfymodal-studio-dependency-table {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 8px;
 }
 
 .comfymodal-studio-dependency-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 5px 8px;
+  gap: 8px 12px;
+  padding: 10px 12px;
   background: #0a0a0a;
   border: 1px solid #2a2a2a;
   border-radius: 3px;
@@ -5855,8 +5864,25 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-dependency-name {
   color: #d0d0d0;
   font-weight: 500;
-  min-width: 180px;
-  max-width: 320px;
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Status badges (installed/missing/warning/unknown/downloading/queued) sit
+   at the card's trailing edge; role/type identity badges stay inline. */
+.comfymodal-studio-dependency-row > .comfymodal-studio-model-badge:not(.role):not(.type) {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.comfymodal-studio-dependency-detail,
+.comfymodal-studio-dependency-path {
+  min-width: 0;
+  max-width: 100%;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5865,17 +5891,26 @@ button.comfymodal-studio-feature-chip {
 .comfymodal-studio-dependency-detail {
   color: #888;
   font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .comfymodal-studio-dependency-path {
   color: #666;
   font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+/* Row actions share one wrapping line; the status note always takes its
+   own line so buttons never collide with feedback text. */
+.comfymodal-studio-dependency-request {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.comfymodal-studio-dependency-request-note {
+  flex-basis: 100%;
+  min-width: 0;
 }
 
 /* ── Model picker (preset editor) ───────────────────────── */

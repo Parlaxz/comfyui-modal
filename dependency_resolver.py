@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from custom_node_registry import CustomNodeDiscovery, CustomNodeRegistryStore
+from model_manifest import WORKFLOW_ROLE_FOLDERS
 from model_library import ModelLibraryStore, record_is_installed
 from studio_store import StudioStoreError
-from workflow_metadata import extract_workflow_model_refs
+from workflow_metadata import (
+    extract_ui_graph_model_refs,
+    extract_workflow_model_refs,
+    iter_graph_nodes,
+)
 
 # Node classes that can never resolve to an installed pack: ComfyUI class
 # keys are Python identifiers, so anything else (bare UUIDs from
@@ -25,9 +30,269 @@ from workflow_metadata import extract_workflow_model_refs
 # "missing" so they never inflate the attention count or block readiness.
 _CLASS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Frontend-only virtual nodes are never installable dependencies. ComfyUI
+# drops them from the executable prompt, but skip them defensively so they can
+# never become a fake "missing pack" row.
+_VIRTUAL_NODE_CLASSES = frozenset({
+    "reroute",
+    "note",
+    "primitive",
+    "primitivenode",
+    "workflownode",
+    "subgraph",
+    "groupnode",
+})
+
 
 def _is_resolvable_class_name(value: Any) -> bool:
     return isinstance(value, str) and bool(_CLASS_NAME_RE.match(value))
+
+
+def _identity_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _pack_identity_of_node(node: Any) -> dict[str, str]:
+    """Return a stored UI/API node's non-core pack identity, or {}.
+
+    Mirrors the capture-side extraction (``studio_domain.graph``): an explicit
+    string ``properties.cnr_id`` or ``properties.aux_id`` (plus ``ver``)
+    counts, and core ids are ignored so they never become a fake pack.
+    """
+    if not isinstance(node, dict):
+        return {}
+    properties = node.get("properties")
+    if not isinstance(properties, dict):
+        return {}
+    cnr_id = _identity_text(properties.get("cnr_id"))
+    if cnr_id.lower() in ("comfy-core", "comfyui-core"):
+        cnr_id = ""
+    aux_id = _identity_text(properties.get("aux_id"))
+    version = _identity_text(
+        properties.get("ver")
+        or properties.get("selected_version")
+        or properties.get("version")
+    )
+    if not cnr_id and not aux_id:
+        return {}
+    identity: dict[str, str] = {}
+    if cnr_id:
+        identity["cnr_id"] = cnr_id
+    if aux_id:
+        identity["aux_id"] = aux_id
+    if version:
+        identity["version"] = version
+    return identity
+
+
+def _merge_identity(
+    current: dict[str, str], incoming: dict[str, str]
+) -> dict[str, str]:
+    if not current:
+        return dict(incoming)
+    merged = dict(current)
+    for key in ("cnr_id", "aux_id", "version"):
+        if not merged.get(key) and incoming.get(key):
+            merged[key] = incoming[key]
+    return merged
+
+
+def _has_nonempty_collection(value: Any) -> bool:
+    """True when a UI graph node's inputs/outputs field carries content."""
+    if isinstance(value, (list, tuple, dict)):
+        return len(value) > 0
+    return False
+
+
+def _graph_virtual_class_names(version: dict[str, Any]) -> set[str]:
+    """Class types whose stored UI graph node is a frontend-only virtual node.
+
+    A node qualifies only when it records no ``cnr_id``/``aux_id`` pack
+    identity AND both its UI ``inputs`` and ``outputs`` are empty. ComfyUI
+    serialises JS-only virtual panels (``isVirtualNode`` registrations) exactly
+    that way, while any node that consumes or produces data carries a
+    non-empty collection. This is a shape classifier, not a class allowlist,
+    so a new virtual panel is handled without code changes. Nested
+    group/subgraph nodes are classified too.
+    """
+    if not isinstance(version, dict):
+        return set()
+    virtual: set[str] = set()
+    real: set[str] = set()
+    for key in ("graph_json", "static_graph"):
+        for node in iter_graph_nodes(version.get(key)):
+            node_type = node.get("type")
+            if not isinstance(node_type, str) or not node_type:
+                continue
+            if _pack_identity_of_node(node):
+                real.add(node_type)  # has pack identity: never a virtual panel
+                continue
+            if _has_nonempty_collection(node.get("inputs")):
+                real.add(node_type)
+                continue
+            if _has_nonempty_collection(node.get("outputs")):
+                real.add(node_type)
+                continue
+            virtual.add(node_type)
+    return virtual - real
+
+
+def _executable_class_names(version: dict[str, Any]) -> set[str]:
+    """Class types actually present in the version's executable API prompt."""
+    out: set[str] = set()
+    prompt = (version or {}).get("executable_prompt") or {}
+    if isinstance(prompt, dict):
+        for node in prompt.values():
+            if isinstance(node, dict) and node.get("class_type"):
+                out.add(str(node["class_type"]))
+    return out
+
+
+def _executable_consuming_classes(version: dict[str, Any]) -> set[str]:
+    """Executable classes that actually consume an input binding.
+
+    UI-only virtual panels can survive capture as no-op API prompt entries
+    with empty ``inputs`` (ComfyUI serialises ``isVirtualNode`` registrations
+    that way). A class whose every executable entry is input-free is treated
+    as non-consuming so the graph shape classifier can still recognise the
+    panel; a class with at least one real input binding is never dropped.
+    """
+    out: set[str] = set()
+    prompt = (version or {}).get("executable_prompt") or {}
+    if isinstance(prompt, dict):
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            class_type = node.get("class_type")
+            if not class_type:
+                continue
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and inputs:
+                out.add(str(class_type))
+    return out
+
+
+def _stored_graph_node_classes(version: dict[str, Any]) -> list[str]:
+    """Class types recorded on a stored version's UI/static graph nodes.
+
+    Order-preserving and deduped; checks both the ``graph_json`` field and its
+    ``static_graph`` alias, including nodes nested in group/subgraph
+    containers. Never raises on malformed graphs.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    if not isinstance(version, dict):
+        return out
+    for key in ("graph_json", "static_graph"):
+        for node in iter_graph_nodes(version.get(key)):
+            node_type = node.get("type")
+            if not isinstance(node_type, str) or not node_type:
+                continue
+            if node_type in seen:
+                continue
+            seen.add(node_type)
+            out.append(node_type)
+    return out
+
+
+def _version_node_classes(version: dict[str, Any]) -> list[str]:
+    """Union of declared dependency classes and stored graph node types.
+
+    ``dependency_metadata.node_classes`` only reflects the executable API
+    prompt, so UI-only / unknown / missing-code nodes never appear there.
+    Captures now union the graph at extraction time, but older stored versions
+    predate both that union and ``custom_node_requirements``; their persisted
+    UI/static graph still records the node types, so merge them here. True
+    virtual empty panels are still excluded downstream by the shape classifier.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    dependency_metadata = (version or {}).get("dependency_metadata")
+    if not isinstance(dependency_metadata, dict):
+        dependency_metadata = {}
+    declared = dependency_metadata.get("node_classes") or []
+    if isinstance(declared, list):
+        for class_type in declared:
+            cls = str(class_type)
+            if cls in seen:
+                continue
+            seen.add(cls)
+            out.append(cls)
+    for cls in _stored_graph_node_classes(version):
+        if cls not in seen:
+            seen.add(cls)
+            out.append(cls)
+    return out
+
+
+def _class_identity_from_metadata(
+    cls: str,
+    requirements: dict[str, Any],
+    graph_identity_by_class: dict[str, dict[str, str]],
+) -> tuple[str, str]:
+    """Best-known ``(cnr_id, aux_id)`` identity for a required class."""
+    req = requirements.get(cls) or {}
+    if not isinstance(req, dict):
+        req = {}
+    cnr_id = str(req.get("cnr_id") or "")
+    aux_id = str(req.get("aux_id") or "")
+    if not cnr_id and not aux_id:
+        graph_identity = graph_identity_by_class.get(cls) or {}
+        cnr_id = str(graph_identity.get("cnr_id") or "")
+        aux_id = str(graph_identity.get("aux_id") or "")
+    return cnr_id, aux_id
+
+
+def _is_virtual_workflow_class(
+    cls: str,
+    *,
+    executable_classes: set[str],
+    graph_virtual_classes: set[str],
+    core: set[str],
+    has_identity: bool,
+    record_exists: bool,
+) -> bool:
+    """True for a valid class that is only a frontend virtual panel.
+
+    The class must be absent from the executable prompt, core, registry and
+    pack identities, and its stored graph node must match the empty
+    inputs/outputs virtual shape. Such panels are not installable dependencies
+    and must never inflate missing/attention.
+    """
+    return (
+        not has_identity
+        and not record_exists
+        and cls not in core
+        and cls not in executable_classes
+        and cls in graph_virtual_classes
+    )
+
+
+def _class_pack_identities_from_graph(
+    version: dict[str, Any]
+) -> dict[str, dict[str, str]]:
+    """Derive class -> pack identity from a stored version's UI graph.
+
+    Older stored versions predate ``custom_node_requirements`` in
+    ``dependency_metadata``, but their persisted UI graph still records
+    ``properties.cnr_id``/``aux_id``/``ver`` per node. Indexing node ``type``
+    -> identity lets the resolver recover the pack for those versions without
+    guessing. Checks both the version's ``graph_json`` field and the
+    ``static_graph`` alias, including nodes nested in group/subgraph
+    containers.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if not isinstance(version, dict):
+        return out
+    for key in ("graph_json", "static_graph"):
+        for node in iter_graph_nodes(version.get(key)):
+            node_type = node.get("type")
+            if not isinstance(node_type, str) or not node_type:
+                continue
+            identity = _pack_identity_of_node(node)
+            if identity:
+                out[node_type] = _merge_identity(out.get(node_type, {}), identity)
+    return out
 
 
 def _group_node_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -48,6 +313,8 @@ def _group_node_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("installed_commit") or ""),
             str(row.get("required_revision") or ""),
             str(row.get("repository_url") or ""),
+            str(row.get("cnr_id") or ""),
+            str(row.get("aux_id") or ""),
         )
         if key not in grouped:
             grouped[key] = dict(row)
@@ -73,6 +340,23 @@ _ROLE_TO_FOLDER: dict[str, str] = {
     "lora": "loras",
     "controlnet": "controlnet",
 }
+
+
+def _role_alias_folders(role: str) -> set[str]:
+    """Folders that satisfy a dependency role, aliases included.
+
+    ``unet`` and ``diffusion_models`` are one identity in current ComfyUI, as
+    are ``clip``/``text_encoders``. ``WORKFLOW_ROLE_FOLDERS`` is the shared
+    authority for those aliases; an unknown role falls back to itself.
+    """
+    aliases = WORKFLOW_ROLE_FOLDERS.get(str(role).strip().lower())
+    if aliases:
+        return {str(folder).lower() for folder in aliases}
+    return set()
+
+
+def _basename_of_ref(filename: str) -> str:
+    return filename.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 class DependencyResolver:
@@ -120,6 +404,16 @@ class DependencyResolver:
                 filename = ref.get("filename")
                 if isinstance(filename, str) and filename:
                     refs[(role, filename)] = {"role": role, "filename": filename}
+        # Older persisted versions predate graph-widget extraction; recover any
+        # model refs their stored UI graph recorded by name (same guards).
+        for graph_key in ("graph_json", "static_graph"):
+            for ref in extract_ui_graph_model_refs((version or {}).get(graph_key)):
+                role = str(ref.get("role", ""))
+                filename = ref.get("filename")
+                if isinstance(filename, str) and filename:
+                    refs.setdefault(
+                        (role, filename), {"role": role, "filename": filename}
+                    )
         return list(refs.values())
 
     @staticmethod
@@ -128,6 +422,33 @@ class DependencyResolver:
             return str(record.get("updated_at") or record.get("discovered_at") or "")
 
         return max(records, key=_ts)
+
+    def _records_for_ref(
+        self, role: str, filename: str
+    ) -> list[dict[str, Any]]:
+        """Library records matching a ``(role, filename)`` dependency ref.
+
+        A stored ref may arrive folder-qualified (``diffusion_models/x``),
+        while records key on the in-bucket relative path, so the basename is
+        tried as a fallback. When the role has folder aliases and records exist
+        in more than one folder, alias-matching records win so ``unet``
+        resolves against ``unet`` or ``diffusion_models`` consistently.
+        """
+        records = self._models.records_by_filename(filename)
+        if not records:
+            base = _basename_of_ref(filename)
+            if base and base != filename:
+                records = self._models.records_by_filename(base)
+        aliases = _role_alias_folders(role)
+        if records and aliases:
+            preferred = [
+                r
+                for r in records
+                if str(r.get("folder") or "").strip().lower() in aliases
+            ]
+            if preferred:
+                records = preferred
+        return records
 
     def resolve_model_refs(self, version: dict[str, Any]) -> list[dict[str, Any]]:
         """Resolve each model ref to installed / missing / wrong_version / unknown."""
@@ -157,7 +478,7 @@ class DependencyResolver:
                 )
                 continue
             try:
-                records = self._models.records_by_filename(filename)
+                records = self._records_for_ref(role, filename)
             except (StudioStoreError, OSError):
                 results.append(
                     {
@@ -251,12 +572,24 @@ class DependencyResolver:
         and reported via unresolvable_classes instead.
         """
         dependency_metadata = (version or {}).get("dependency_metadata") or {}
-        node_classes = dependency_metadata.get("node_classes") or []
+        # Union declared classes with the stored graph node types so UI-only
+        # nodes and covers from old captures (predating the metadata union)
+        # still resolve. The shape classifier below still excludes true virtual
+        # panels from missing/attention.
+        node_classes = _version_node_classes(version)
         requirements = dependency_metadata.get("custom_node_requirements") or {}
-        if not isinstance(node_classes, list):
-            node_classes = []
         if not isinstance(requirements, dict):
             requirements = {}
+        # Older stored versions captured before custom_node_requirements
+        # existed still carry pack identity on the persisted UI graph; recover
+        # it so classes sharing a pack group into one missing row instead of
+        # six.
+        graph_identity_by_class = _class_pack_identities_from_graph(version)
+        # Only classes that consume an input count as "executable" for the
+        # virtual-panel shape check: a no-op prompt entry with empty inputs is
+        # the live signature of a UI-only panel (DonutLatestPreview etc.).
+        executable_classes = _executable_consuming_classes(version)
+        graph_virtual_classes = _graph_virtual_class_names(version)
         _records, core = self._ensure_discovery()
         results: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -267,10 +600,18 @@ class DependencyResolver:
             seen.add(cls)
             if not _is_resolvable_class_name(cls):
                 continue  # graph artifact; reported via unresolvable_classes
+            if cls.lower() in _VIRTUAL_NODE_CLASSES:
+                continue  # frontend-only virtual node; never a pack dependency
             req = requirements.get(cls) or {}
             if not isinstance(req, dict):
                 req = {}
             required_revision = str(req.get("revision") or "")
+            cnr_id, aux_id = _class_identity_from_metadata(
+                cls, requirements, graph_identity_by_class
+            )
+            display_name = (
+                req.get("name") or req.get("repository") or cnr_id or aux_id or cls
+            )
             if cls in core:
                 results.append(
                     {
@@ -280,6 +621,8 @@ class DependencyResolver:
                         "installed_commit": "",
                         "required_revision": required_revision,
                         "repository_url": "",
+                        "cnr_id": "",
+                        "aux_id": "",
                         "classes": [cls],
                     }
                 )
@@ -289,12 +632,14 @@ class DependencyResolver:
             except (StudioStoreError, OSError):
                 results.append(
                     {
-                        "name": req.get("name") or req.get("repository") or cls,
+                        "name": display_name,
                         "state": "missing",
                         "install_path": "",
                         "installed_commit": "",
                         "required_revision": required_revision,
                         "repository_url": req.get("repository") or "",
+                        "cnr_id": cnr_id,
+                        "aux_id": aux_id,
                         "classes": [cls],
                     }
                 )
@@ -311,35 +656,63 @@ class DependencyResolver:
                         "installed_commit": record.get("installed_commit", ""),
                         "required_revision": required_revision,
                         "repository_url": record.get("repo_url", ""),
+                        "cnr_id": cnr_id,
+                        "aux_id": aux_id,
                         "classes": [cls],
                     }
                 )
                 continue
+            # A valid class that only exists in the UI graph as an empty
+            # inputs/outputs panel with no pack identity is a frontend virtual
+            # node, not an installable dependency. Report it via
+            # unresolvable_classes instead of a fake missing pack row.
+            if _is_virtual_workflow_class(
+                cls,
+                executable_classes=executable_classes,
+                graph_virtual_classes=graph_virtual_classes,
+                core=core,
+                has_identity=bool(cnr_id or aux_id),
+                record_exists=False,
+            ):
+                continue
             results.append(
                 {
-                    "name": req.get("name") or req.get("repository") or cls,
+                    "name": display_name,
                     "state": "missing",
                     "install_path": "",
                     "installed_commit": "",
                     "required_revision": required_revision,
                     "repository_url": req.get("repository") or "",
+                    "cnr_id": cnr_id,
+                    "aux_id": aux_id,
                     "classes": [cls],
                 }
             )
         return _group_node_rows(results)
 
     def unresolvable_classes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
-        """Graph-artifact class strings that can never resolve to a pack.
+        """Class strings that can never resolve to a pack.
 
-        UUIDs from frontend-only proxy/subgraph nodes and display titles
-        recorded as types are not installable dependencies, so they are
-        excluded from missing/attention counts. Never raises.
+        Two kinds qualify: non-identifier graph artifacts (UUIDs from
+        frontend-only proxy/subgraph nodes, display titles recorded as types)
+        and valid class names whose stored UI graph node is an empty
+        inputs/outputs virtual panel with no pack identity and which never
+        appear in the executable prompt, core set, or registry. Neither is an
+        installable dependency, so both stay out of missing/attention counts.
+        Never raises.
         """
         try:
             dependency_metadata = (version or {}).get("dependency_metadata") or {}
-            node_classes = dependency_metadata.get("node_classes") or []
-            if not isinstance(node_classes, list):
+            node_classes = _version_node_classes(version)
+            if not node_classes:
                 return []
+            requirements = dependency_metadata.get("custom_node_requirements") or {}
+            if not isinstance(requirements, dict):
+                requirements = {}
+            graph_identity_by_class = _class_pack_identities_from_graph(version)
+            executable_classes = _executable_class_names(version)
+            graph_virtual_classes = _graph_virtual_class_names(version)
+            _records, core = self._ensure_discovery()
             out: list[dict[str, Any]] = []
             seen: set[str] = set()
             for class_type in node_classes:
@@ -347,15 +720,43 @@ class DependencyResolver:
                 if cls in seen:
                     continue
                 seen.add(cls)
-                if _is_resolvable_class_name(cls):
+                if not _is_resolvable_class_name(cls):
+                    out.append(
+                        {
+                            "name": cls,
+                            "classes": [cls],
+                            "reason": "graph artifact, not a registered node class",
+                        }
+                    )
                     continue
-                out.append(
-                    {
-                        "name": cls,
-                        "classes": [cls],
-                        "reason": "graph artifact, not a registered node class",
-                    }
+                if cls.lower() in _VIRTUAL_NODE_CLASSES:
+                    continue
+                if cls in core or cls in executable_classes:
+                    continue
+                cnr_id, aux_id = _class_identity_from_metadata(
+                    cls, requirements, graph_identity_by_class
                 )
+                try:
+                    record_exists = self._registry.record_by_class(cls) is not None
+                except (StudioStoreError, OSError):
+                    # Unreadable registry is not proof of absence: leave the
+                    # class to resolve_custom_nodes (conservative missing).
+                    continue
+                if _is_virtual_workflow_class(
+                    cls,
+                    executable_classes=executable_classes,
+                    graph_virtual_classes=graph_virtual_classes,
+                    core=core,
+                    has_identity=bool(cnr_id or aux_id),
+                    record_exists=record_exists,
+                ):
+                    out.append(
+                        {
+                            "name": cls,
+                            "classes": [cls],
+                            "reason": "workflow-only virtual node, not an installable node class",
+                        }
+                    )
             return out
         except Exception:
             return []
