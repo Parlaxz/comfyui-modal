@@ -179,6 +179,29 @@ Post-failure `golden status` reported no deployment manifest, no remote checks,
 and `ready=False`. Six remote runs therefore remain unperformed rather than
 being represented as passing or failing observations.
 
+### Testing 1 follow-up
+
+At the user's request, the operation was retried temporarily against Testing 1
+(`ws_e677ab553606`) with the destination environment first `(default)` and then
+`main`. The first successful deployment receipt had
+`COMFYMODAL_GOLDEN_MINIMAL_RESTORE=1`; source-probe passed with exact source
+identity. The subsequent run attempts were rejected before entering the app:
+
+- `run_20260917-101508_979a0497.json` / evidence
+  `EXPERIMENT_EVIDENCE_golden_p1_131d82cd72d74b49_2026-09-17.md`: app not found
+  in environment `main` while the deployment used `(default)`.
+- `run_20260917-102116_9dbc9562.json` / evidence
+  `EXPERIMENT_EVIDENCE_golden_p1_0f0a5182dd94440e_2026-09-17.md`: same app-not-
+  found rejection after redeploying with environment `main`.
+- Deployment receipts:
+  `.v2ctl/deployments/receipt_2_275f671fb02bddb4e03a4e5e0c51898edc9bcf4318ac10624da27ea2a64f2fa8.json`
+  and
+  `.v2ctl/deployments/receipt_3_6471cd93080554cf9763a804663489de0224afd8e73a7f49f49e198e243c5ce5.json`.
+
+These are retained invalid/platform attempts, not Golden observations. The
+temporary target configuration was restored to Testing 6 / `(default)` after
+the operation. No valid remote run or restore timing was collected.
+
 ## WORKTREE / ARTIFACTS
 
 - Worktree: `C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal`
