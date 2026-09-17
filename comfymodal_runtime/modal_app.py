@@ -3548,13 +3548,19 @@ def _golden_full_trace_requested() -> bool:
 
 
 def _golden_minimal_restore_enabled() -> bool:
-    """Return True only when the experimental minimal-restore switch is ON.
+    """Return whether ModalRuntimeEntrypoint.restore() selects the minimal path.
 
-    Default OFF: unset or any non-truthy value keeps the legacy restore path
-    selected.  Read at restore entry so the experimental path can be selected
-    by deploy without touching request configuration.
+    Golden Serial selects ``_golden_minimal_restore()`` by default.  An explicit
+    ``COMFYMODAL_GOLDEN_MINIMAL_RESTORE`` always wins over the profile default:
+    a truthy value forces minimal, while ``0``/``false``/``no``/``off``
+    deliberately selects the legacy rollback/debug restore.  Non-Golden
+    containers remain on the legacy path unless explicitly enabled.  Read at
+    restore entry so the selection can be changed by deploy without touching
+    request configuration.
     """
-    return env_flag("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", default=False)
+    if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
+        return env_flag("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", default=False)
+    return _golden_serial_profile_active()
 
 
 def _emit_golden_profiler_lifecycle(
@@ -5414,7 +5420,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
     # Pre-snapshot loader-worker experiment selector (deploy-baked; OFF when unset).
     if "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT" in os.environ:
         env["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"]
-    # Golden minimal-restore experiment selector (deploy-baked; OFF when unset).
+    # Golden minimal-restore selector (deploy-baked).  Absent preserves the
+    # profile default (Golden Serial -> minimal); an explicit value is the
+    # override, so 0 intentionally selects legacy rollback/debug.
     if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
         env["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"] = os.environ["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"]
     # Golden strict CPU-I/O process selector (deploy-baked; OFF when unset).
@@ -12414,7 +12422,7 @@ class ModalRuntimeEntrypoint:
         restore_method_start_mono_ns: int,
         restore_perf_start: float,
     ) -> dict[str, Any]:
-        """Minimal Golden Parallel post-snapshot restore (default OFF).
+        """Minimal Golden Parallel post-snapshot restore (Golden Serial default).
 
         Contract: reset container-local state, repair only logical GPU state,
         prove the models-generation guard, emit minimal telemetry, READY.
@@ -12533,6 +12541,9 @@ class ModalRuntimeEntrypoint:
             legacy_container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
             modal_task_id=str(os.environ.get("MODAL_TASK_ID", "") or ""),
             pid=os.getpid(),
+            # The minimal restore deliberately opts out of the host probe
+            # (which reads /proc boot_id on Linux).
+            include_host_info=False,
         )
 
         _state = getattr(getattr(self, "bootstrap", None), "state", None)
@@ -12582,15 +12593,15 @@ class ModalRuntimeEntrypoint:
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_perf_start = time.perf_counter()
         if _golden_minimal_restore_enabled():
-            # ── Golden Parallel minimal restore (experimental, default OFF) ──
+            # ── Golden Parallel minimal restore (Golden Serial default) ──
             # A new from-first-principles post-snapshot contract that runs
             # beside the legacy restore below instead of stripping it.  This
             # branch returns before any probe, observability, ledger, span,
             # manifest, host, warm, identity, bootstrap, or preload work.
             # A failure inside the minimal path raises and never falls back to
             # the legacy restore, so the remote A/B observes the real minimal
-            # outcome.  Disable COMFYMODAL_GOLDEN_MINIMAL_RESTORE and redeploy
-            # to select the legacy path again.
+            # outcome.  Set COMFYMODAL_GOLDEN_MINIMAL_RESTORE=0 and redeploy to
+            # explicitly select the legacy rollback/debug path.
             return self._golden_minimal_restore(
                 remote_python_resume_wall_ns=remote_python_resume_wall_ns,
                 remote_python_resume_mono_ns=remote_python_resume_mono_ns,
@@ -12617,7 +12628,10 @@ class ModalRuntimeEntrypoint:
             "staging_validation": _restore_clip_probe_source_info.get("staging_validation"),
         }
         self._restore_clip_probe_state = _restore_clip_probe_state
-        if _restore_clip_probe_state["enabled"]:
+        # Golden Serial forbids restore-time probe pollution even on an explicit
+        # legacy escape (COMFYMODAL_GOLDEN_MINIMAL_RESTORE=0); the probe is a
+        # non-Golden diagnostic only.
+        if _restore_clip_probe_state["enabled"] and not _golden_serial_profile_active():
             _restore_clip_probe_path = _restore_clip_probe_source_info["path"]
             _restore_clip_probe_thread = threading.Thread(
                 target=_run_restore_clip_qd2_probe,
@@ -13028,11 +13042,14 @@ class ModalRuntimeEntrypoint:
                     except Exception:
                         pass
 
-                threading.Thread(
-                    target=_run_folder_warm,
-                    daemon=True,
-                    name="comfymodal-folder-warm",
-                ).start()
+                # Golden Serial forbids restore-time folder warming even on an
+                # explicit legacy escape; it is a non-Golden diagnostic only.
+                if not _golden_serial_profile_active():
+                    threading.Thread(
+                        target=_run_folder_warm,
+                        daemon=True,
+                        name="comfymodal-folder-warm",
+                    ).start()
             except Exception:
                 # Unimportable / thread-start failure — advisory only; the
                 # request pays the original cold lookup cost (no impact).
@@ -13232,30 +13249,34 @@ class ModalRuntimeEntrypoint:
                     pass
                 _span_preload = _restore_phase_span("restore:preload")
 
-                # [v2.generation_identity] bootstrap diagnostic
-                _boot_cn_gen = str(state.custom_node_generation or "")
-                _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
-                _boot_rs_gen = str(state.runtime_generation or "")
-                _boot_cn_src = "missing"
-                _boot_api_id = str(id(self._legacy_api))
-                try:
-                    _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
-                        api=self._legacy_api
+                # [v2.generation_identity] bootstrap diagnostic.  Under Golden
+                # Serial this resolver call and verbose identity print are
+                # restore-time pollution, so they are gated even on an explicit
+                # legacy escape; non-Golden restores keep the diagnostic.
+                if not _golden_serial_profile_active():
+                    _boot_cn_gen = str(state.custom_node_generation or "")
+                    _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
+                    _boot_rs_gen = str(state.runtime_generation or "")
+                    _boot_cn_src = "missing"
+                    _boot_api_id = str(id(self._legacy_api))
+                    try:
+                        _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
+                            api=self._legacy_api
+                        )
+                        _boot_cn_src = _boot_src
+                    except Exception:
+                        pass
+                    print(
+                        f"[v2.generation_identity] "
+                        f"method=restore "
+                        f"custom_nodes_generation={_boot_cn_short!r} "
+                        f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
+                        f"source={_boot_cn_src} "
+                        f"runtime_state_generation={_boot_rs_gen!r} "
+                        f"api_object_id={_boot_api_id} "
+                        f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
+                        flush=True,
                     )
-                    _boot_cn_src = _boot_src
-                except Exception:
-                    pass
-                print(
-                    f"[v2.generation_identity] "
-                    f"method=restore "
-                    f"custom_nodes_generation={_boot_cn_short!r} "
-                    f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
-                    f"source={_boot_cn_src} "
-                    f"runtime_state_generation={_boot_rs_gen!r} "
-                    f"api_object_id={_boot_api_id} "
-                    f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
-                    flush=True,
-                )
             except Exception as exc:
                 _lifecycle_error = str(exc)[:200]
                 trace.emit("v2_bootstrap_restore_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})

@@ -9937,19 +9937,32 @@ def set_restore_return_marker(
     legacy_container_session_id: str,
     modal_task_id: str = "",
     pid: int = 0,
+    *,
+    include_host_info: bool = True,
 ) -> None:
-    """Set ``_LATEST_RESTORE_RETURN_MARKER`` immediately before restore return."""
+    """Set ``_LATEST_RESTORE_RETURN_MARKER`` immediately before restore return.
+
+    ``include_host_info`` defaults to True to preserve legacy behavior
+    (hostname/native_tid plus the Linux ``/proc`` boot_id).  Callers that must
+    not probe the host (the minimal restore) pass False, constructing the
+    marker from the timing/identity/modal_task_id/pid fields only.
+    """
     global _LATEST_RESTORE_RETURN_MARKER
-    _LATEST_RESTORE_RETURN_MARKER = {
-        **_capture_host_info(),
-        "wall_unix_ns": int(time.time() * 1_000_000_000),
-        "monotonic_ns": time.monotonic_ns(),
-        "restored_instance_id": restored_instance_id,
-        "restore_session_id": restore_session_id,
-        "legacy_container_session_id": legacy_container_session_id,
-        "modal_task_id": modal_task_id,
-        "pid": pid,
-    }
+    _marker: dict[str, Any] = {}
+    if include_host_info:
+        _marker.update(_capture_host_info())
+    _marker.update(
+        {
+            "wall_unix_ns": int(time.time() * 1_000_000_000),
+            "monotonic_ns": time.monotonic_ns(),
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            "legacy_container_session_id": legacy_container_session_id,
+            "modal_task_id": modal_task_id,
+            "pid": pid,
+        }
+    )
+    _LATEST_RESTORE_RETURN_MARKER = _marker
 
 
 def get_restore_return_marker() -> dict[str, Any] | None:
