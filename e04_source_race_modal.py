@@ -1425,6 +1425,117 @@ def run_worker_model_rtx(
     )
 
 
+def _run_mmap_gpu(
+    requested_gpu: str,
+    role: str,
+    model_name: str,
+    read_mib: int,
+    qd: int,
+    min_launch_gap_ms: float,
+    mode: str,
+    slots: int,
+    attempt_id: str,
+    verify: bool,
+) -> dict[str, Any]:
+    """Minimal additive GPU variant of the frozen fresh-window mmap harness.
+
+    mode="private"    : staging disabled - byte-identical to the frozen CPU harness.
+    mode="shared"     : produced bytes land in POSIX shared-memory staging (Phase 1).
+    mode="registered" : staging is additionally CUDA-pinned (Phase 2).
+    mode="h2d"        : blocks are cudaMemcpyAsync'd to the GPU as produced (Phase 3).
+
+    The reader processes never touch CUDA; all CUDA stays in this parent process.
+    """
+    observed_gpu = _observed_gpu()
+    identity = _identity(requested_gpu, observed_gpu)
+    result: dict[str, Any] = {
+        "role": str(role).strip().lower(),
+        "attempt_id": str(attempt_id),
+        "model_name": str(model_name).strip(),
+        "identity": identity,
+        "gpu_mode": str(mode),
+        "staging_slots": int(slots),
+    }
+    try:
+        path = _resolve_model_path(role, model_name)
+        result["resolved_path"] = str(path)
+        read_bytes = int(read_mib) * 1024 * 1024
+        from comfymodal_runtime.source_race_oracle import run_mmap_lifecycle_probe
+        from comfymodal_runtime import source_race_gpu
+
+        staging = None
+        consumer = None
+        consumer_state: dict[str, Any] = {}
+        if str(mode) != "private":
+            staging = source_race_gpu.build_staging(int(qd), int(slots), read_bytes)
+            consumer, consumer_state = source_race_gpu.start_consumer(
+                staging, int(qd), read_bytes, str(mode), verify=bool(verify))
+        engine_result = run_mmap_lifecycle_probe(
+            file_path=str(path),
+            read_bytes=read_bytes,
+            qd=int(qd),
+            lifecycle="fresh",
+            staging=staging,
+            min_launch_gap_ns=int(round(float(min_launch_gap_ms) * 1e6)),
+            requested_gpu=requested_gpu,
+            observed_gpu=observed_gpu,
+        )
+        if consumer is not None:
+            assert staging is not None
+            staging["alive"].value = 0
+            consumer.join(timeout=600.0)
+            engine_result["staging_consumer"] = dict(consumer_state)
+        if not isinstance(engine_result, dict):
+            raise TypeError(f"engine_returned_{type(engine_result).__name__}")
+        result.update(engine_result)
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}:{str(exc)[:800]}"
+        result["status"] = "error"
+    result["identity"] = identity
+    result["requested_gpu"] = requested_gpu
+    result["observed_gpu"] = observed_gpu
+    result["provider"] = identity["provider"]
+    result["region"] = identity["region"]
+    result["container_session_id"] = identity["container_session_id"]
+    result["image_id"] = identity["image_id"]
+    result["hostname"] = identity["hostname"]
+    result.setdefault("status", "ok")
+    return result
+
+
+@app.function(
+    image=_image,
+    gpu=_H100_MODAL_GPU,
+    cpu=_DECLARED_CPU,
+    memory=_DECLARED_MEMORY_MB,
+    timeout=3600,
+    retries=0,
+    min_containers=0,
+    single_use_containers=True,
+    volumes={str(_MODELS_ROOT): _models_mount},
+    env={
+        "COMFYMODAL_V2_GPU": _H100_MODAL_GPU,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    },
+)
+def run_mmap_gpu_h100(
+    role: str = "clip",
+    model_name: str = "qwen_3_4b.safetensors",
+    read_mib: int = 64,
+    qd: int = 4,
+    min_launch_gap_ms: float = 4.0,
+    mode: str = "shared",
+    slots: int = 2,
+    attempt_id: str = "",
+    verify: bool = False,
+) -> dict:
+    return _run_mmap_gpu(
+        _H100_MODAL_GPU, role, model_name, read_mib, qd, min_launch_gap_ms,
+        mode, slots, attempt_id, verify,
+    )
+
+
 @app.function(
     image=_image,
     cpu=_DECLARED_CPU,

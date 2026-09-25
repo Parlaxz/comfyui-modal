@@ -7861,13 +7861,15 @@ def _mlc_child(args: tuple) -> None:
      attempts, completed, lock, next_global, last_start, pacer_lock, gap_ns,
      total_blocks, max_idle_s, prep_ns, live_maps, map_bytes, map_errors,
      unmap_errors, ready_count, go, child_conn, map_shared, cpu_instrument,
-     affinity, fixed_va) = args
+     affinity, fixed_va, staging) = args
     payload: dict[str, Any] = {"reader": reader_id, "pid": os.getpid(),
                                "status": "ok", "records": [], "stale": 0,
                                "affinity_breaks": 0, "idle_no_work_ms": 0.0,
                                "claimed": 0, "exit_reason": None,
                                "lane_len": 0, "prep_maps": 0,
-                               "affinity": None, "fixed_va": None}
+                               "affinity": None, "fixed_va": None,
+                               "staging_wait_ms": 0.0, "staging_wait_events": 0,
+                               "staging_published": 0}
     fd = -1
     replacements = 0
     replacement_errors = 0
@@ -7878,8 +7880,22 @@ def _mlc_child(args: tuple) -> None:
     try:
         if _LIBC is None:
             raise RuntimeError("libc_unavailable")
-        dest = bytearray(read_bytes)
-        dest_addr = _ct.addressof(_ct.c_char.from_buffer(dest))
+        if staging is None:
+            dest = bytearray(read_bytes)
+            dest_addr = _ct.addressof(_ct.c_char.from_buffer(dest))
+            stage_published = None
+        else:
+            # Additive seam: write produced bytes into the caller's shared
+            # staging region instead of a process-private bytearray.  The
+            # source algorithm, scheduling, FD lifetime and timing are unchanged.
+            dest = None
+            dest_addr = 0
+            stage_published = staging["published"][reader_id]
+            stage_consumed = staging["consumed"][reader_id]
+            stage_off = staging["slot_off"][reader_id]
+            stage_len = staging["slot_len"][reader_id]
+            stage_slots = int(staging["slots"])
+            stage_lane_base = int(staging["seg_base"]) + reader_id * int(staging["lane_bytes"])
         fd = os.open(file_path, os.O_RDONLY)
         my_start = int(lane_off[reader_id])
         my_end = int(lane_off[reader_id + 1])
@@ -8002,6 +8018,9 @@ def _mlc_child(args: tuple) -> None:
         cpu_last = 0
         fresh_map_ms = 0.0
         fresh_unmap_ms = 0.0
+        slot_wait_ms = 0.0
+        slot_wait_events = 0
+        stage_seq = 0
         while True:
             with lock:
                 if int(completed.value) >= total_blocks:
@@ -8089,16 +8108,33 @@ def _mlc_child(args: tuple) -> None:
                 ptr = win_addr
                 win_len = w_len
                 fresh_map_ms += map_ms
+            mem_dest = dest_addr
+            if staging is not None:
+                stage_seq = int(stage_published.value)
+                if stage_seq - int(stage_consumed.value) >= stage_slots:
+                    wait_t0 = int(clock())
+                    while stage_seq - int(stage_consumed.value) >= stage_slots:
+                        time.sleep(0.0001)
+                    slot_wait_ms += (int(clock()) - wait_t0) / 1e6
+                    slot_wait_events += 1
+                stage_i = stage_seq % stage_slots
+                stage_off[stage_i] = offset
+                stage_len[stage_i] = length
+                mem_dest = stage_lane_base + stage_i * read_bytes
             cpu_t0 = int(cpu_clock()) if cpu_clock is not None else 0
             enter = int(clock())
             err = None
             try:
-                _LIBC.memcpy(dest_addr, ptr, length)
+                _LIBC.memcpy(mem_dest, ptr, length)
                 got = length
             except BaseException as exc:  # noqa: BLE001
                 got = -1
                 err = f"{type(exc).__name__}:{str(exc)[:160]}"
             exit_ns = int(clock())
+            if staging is not None:
+                # Publish only after the native memcpy has fully returned, so a
+                # consumer can never observe a partially written slot.
+                stage_published.value = stage_seq + 1
             cpu_t1 = int(cpu_clock()) if cpu_clock is not None else 0
             if lifecycle == "fresh" and win_addr and not fixed_va:
                 t = int(clock())
@@ -8138,6 +8174,10 @@ def _mlc_child(args: tuple) -> None:
         payload["first_enter_ns"] = first_enter
         payload["last_exit_ns"] = last_exit
         payload["fresh_map_ms"] = fresh_map_ms
+        payload["staging_wait_ms"] = float(slot_wait_ms)
+        payload["staging_wait_events"] = int(slot_wait_events)
+        payload["staging_published"] = (
+            int(stage_published.value) if staging is not None else 0)
         payload["fixed_va"] = {
             "enabled": bool(fixed_va),
             "slot_base": slot_base,
@@ -8205,6 +8245,7 @@ def run_mmap_lifecycle_probe(
     affinity: bool = False,
     fixed_va: bool = False,
     sticky_lanes: bool = True,
+    staging: dict | None = None,
     min_launch_gap_ns: int = 4_000_000,
     requested_gpu: str | None = None,
     observed_gpu: str | None = None,
@@ -8289,7 +8330,7 @@ def run_mmap_lifecycle_probe(
                    total_blocks, max_idle_s, prep_ns, live_maps, map_bytes,
                    map_errors, unmap_errors, ready_count, go, cc,
                    bool(map_shared), bool(cpu_instrument),
-                   bool(affinity), bool(fixed_va)),),
+                   bool(affinity), bool(fixed_va), staging),),
             daemon=True)
         p.start(); cc.close(); conns.append(cp); procs.append(p)
 
@@ -8491,6 +8532,16 @@ def run_mmap_lifecycle_probe(
                  for p in payloads), default=0),
         },
         "fully_cleaned_wall_ms": wall_ms + cleanup_max_ms,
+        "staging": {
+            "enabled": staging is not None,
+            "slots": (int(staging["slots"]) if staging is not None else 0),
+            "bytes": (int(staging["bytes"]) if staging is not None else 0),
+            "wait_ms_total": sum(float(p.get("staging_wait_ms") or 0) for p in payloads),
+            "wait_events_total": sum(int(p.get("staging_wait_events") or 0) for p in payloads),
+            "published_total": sum(int(p.get("staging_published") or 0) for p in payloads),
+            "reader_wait_ms": [float(p.get("staging_wait_ms") or 0) for p in payloads],
+            "reader_published": [int(p.get("staging_published") or 0) for p in payloads],
+        },
         "min_ms": min(durations), "median_ms": percentile(durations, 50),
         "mean_ms": statistics.fmean(durations), "p95_ms": percentile(durations, 95),
         "p99_ms": percentile(durations, 99), "max_ms": max(durations),
