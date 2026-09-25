@@ -371,6 +371,15 @@ def _identity(requested_gpu: str, observed_gpu: str) -> dict[str, Any]:
     }
 
 
+def _call_id() -> str:
+    """Modal call id so a result binds to its dashboard invocation row."""
+    try:
+        import modal as _modal
+        return str(_modal.current_function_call_id() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _resolve_model_path(role: str, model_name: str) -> Path:
     """Resolve a basename under the read-only models mount.
 
@@ -930,6 +939,8 @@ def _run_worker_model(
     affinity: bool = False,
     fixed_va: bool = False,
 ) -> dict[str, Any]:
+    import time as _time
+    _t0 = _time.perf_counter()
     observed_gpu = _observed_gpu()
     identity = _identity(requested_gpu, observed_gpu)
     result: dict[str, Any] = {
@@ -1156,6 +1167,8 @@ def _run_worker_model(
     result["image_id"] = identity["image_id"]
     result["hostname"] = identity["hostname"]
     result.setdefault("status", "ok")
+    result["function_wall_ms"] = (_time.perf_counter() - _t0) * 1000.0
+    result["modal_call_id"] = _call_id()
     return result
 
 
@@ -1425,6 +1438,29 @@ def run_worker_model_rtx(
     )
 
 
+def _gpu_telemetry(engine_result: dict, consumer_state: dict) -> dict:
+    """Combine source and H2D clocks into the two authoritative walls."""
+    gpu = dict(consumer_state)
+    records = engine_result.get("physical_attempts_log") or []
+    last_done = consumer_state.get("last_done_ns")
+    if records and last_done is not None:
+        first = min(int(r["preadv_enter_ns"]) for r in records)
+        last = max(int(r["preadv_exit_ns"]) for r in records)
+        gpu["source_first_enter_ns"] = first
+        gpu["source_last_exit_ns"] = last
+        gpu["source_wall_ms"] = (last - first) / 1e6
+        gpu["gpu_ready_wall_ms"] = (int(last_done) - first) / 1e6
+        gpu["exposed_h2d_tail_ms"] = (int(last_done) - last) / 1e6
+    cov = engine_result.get("coverage") or {}
+    expected = cov.get("blocks_expected")
+    gpu["blocks_expected"] = expected
+    gpu["coverage_offsets_exact"] = bool(
+        expected is not None
+        and consumer_state.get("coverage_offsets") == expected
+        and consumer_state.get("coverage_exact"))
+    return gpu
+
+
 def _run_mmap_gpu(
     requested_gpu: str,
     role: str,
@@ -1460,18 +1496,19 @@ def _run_mmap_gpu(
         path = _resolve_model_path(role, model_name)
         result["resolved_path"] = str(path)
         read_bytes = int(read_mib) * 1024 * 1024
-        from comfymodal_runtime.source_race_oracle import run_mmap_lifecycle_probe
+        from comfymodal_runtime.source_race_oracle import run_mmap_source_probe
         from comfymodal_runtime import source_race_gpu
 
         staging = None
         consumer = None
         consumer_state: dict[str, Any] = {}
         reg_state: dict[str, Any] = {}
+        gpu_bytes = os.path.getsize(str(path)) if str(mode) == "h2d" else 0
 
         def _on_ready() -> None:
             assert staging is not None
             try:
-                reg_state.update(source_race_gpu.register_staging_now(staging))
+                reg_state.update(source_race_gpu.setup_cuda(staging, str(mode), gpu_bytes))
             except Exception as exc:  # noqa: BLE001
                 reg_state["registered"] = False
                 reg_state["register_error"] = f"{type(exc).__name__}:{str(exc)[:300]}"
@@ -1480,30 +1517,37 @@ def _run_mmap_gpu(
         if str(mode) != "private":
             staging = source_race_gpu.build_staging(int(qd), int(slots), read_bytes)
             consumer, consumer_state = source_race_gpu.start_consumer(
-                staging, int(qd), read_bytes, str(mode), verify=bool(verify))
+                staging, int(qd), read_bytes, str(mode), verify=bool(verify), file_path=str(path))
             if str(mode) in ("registered", "h2d"):
                 on_ready = _on_ready
-        engine_result = run_mmap_lifecycle_probe(
+        engine_result = run_mmap_source_probe(
             file_path=str(path),
             read_bytes=read_bytes,
             qd=int(qd),
-            lifecycle="fresh",
+            mmap_mode="window",
+            consume_mode="memcpy",
             staging=staging,
             on_ready=on_ready,
             min_launch_gap_ns=int(round(float(min_launch_gap_ms) * 1e6)),
             requested_gpu=requested_gpu,
             observed_gpu=observed_gpu,
+            ready_timeout_s=120.0,
+            max_idle_s=60.0,
         )
         if consumer is not None:
             assert staging is not None
             staging["alive"].value = 0
-            consumer.join(timeout=600.0)
+            consumer.join(timeout=300.0)
             engine_result["staging_consumer"] = dict(consumer_state)
+            if consumer.is_alive():
+                engine_result["staging_consumer"]["consumer_alive_after_join"] = True
             if str(mode) in ("registered", "h2d"):
                 engine_result["staging_registration"] = dict(reg_state)
                 if not reg_state.get("registered"):
                     raise RuntimeError(
                         f"staging_registration_failed:{reg_state.get('register_error')}")
+            if str(mode) == "h2d":
+                engine_result["gpu"] = _gpu_telemetry(engine_result, consumer_state)
         if not isinstance(engine_result, dict):
             raise TypeError(f"engine_returned_{type(engine_result).__name__}")
         result.update(engine_result)
@@ -1549,10 +1593,78 @@ def run_mmap_gpu_h100(
     attempt_id: str = "",
     verify: bool = False,
 ) -> dict:
-    return _run_mmap_gpu(
+    import time as _time
+    _t0 = _time.perf_counter()
+    result = _run_mmap_gpu(
         _H100_MODAL_GPU, role, model_name, read_mib, qd, min_launch_gap_ms,
         mode, slots, attempt_id, verify,
     )
+    result["function_wall_ms"] = (_time.perf_counter() - _t0) * 1000.0
+    result["modal_call_id"] = _call_id()
+    return result
+
+
+@app.function(
+    image=_image,
+    gpu=_H100_MODAL_GPU,
+    cpu=_DECLARED_CPU,
+    memory=_DECLARED_MEMORY_MB,
+    timeout=300,
+    retries=0,
+    min_containers=0,
+    single_use_containers=True,
+    env={
+        "COMFYMODAL_V2_GPU": _H100_MODAL_GPU,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    },
+)
+def cuda_h2d_probe_h100(n_bytes: int = 67108864) -> dict:
+    """Bounded CUDA H2D self-test: pin -> HtoDAsync -> event -> DtoH -> compare."""
+    import ctypes as ct
+    import hashlib
+    import time as _time
+
+    from comfymodal_runtime import source_race_gpu as g
+
+    out: dict = {"status": "ok"}
+    try:
+        lib = g._load_driver()
+        g._check(lib["cuInit"](0), "cuInit")
+        dev = ct.c_int()
+        g._check(lib["cuDeviceGet"](ct.byref(dev), 0), "cuDeviceGet")
+        name = ct.create_string_buffer(128)
+        lib["cuDeviceGetName"](name, 128, dev)
+        ctx = ct.c_void_p()
+        g._check(lib["cuCtxCreate_v2"](ct.byref(ctx), 0, dev), "cuCtxCreate")
+        out["device"] = name.value.decode("utf-8", "replace").split("\x00")[0]
+        buf = (ct.c_char * int(n_bytes))()
+        t0 = _time.perf_counter()
+        g._check(lib["cuMemHostRegister_v2"](
+            ct.addressof(buf), ct.c_size_t(int(n_bytes)), ct.c_uint(0)), "cuMemHostRegister")
+        out["register_ms"] = (_time.perf_counter() - t0) * 1000.0
+        ct.memset(ct.addressof(buf), 0x5A, int(n_bytes))
+        dptr = ct.c_uint64(0)
+        g._check(lib["cuMemAlloc_v2"](ct.byref(dptr), ct.c_size_t(int(n_bytes))), "cuMemAlloc")
+        stream = ct.c_void_p()
+        g._check(lib["cuStreamCreate"](ct.byref(stream), ct.c_uint(1)), "cuStreamCreate")
+        ev = ct.c_void_p()
+        g._check(lib["cuEventCreate"](ct.byref(ev), ct.c_uint(0)), "cuEventCreate")
+        t0 = _time.perf_counter()
+        g._check(lib["cuMemcpyHtoDAsync_v2"](
+            dptr, ct.c_void_p(ct.addressof(buf)), ct.c_size_t(int(n_bytes)), stream), "cuMemcpyHtoDAsync")
+        g._check(lib["cuEventRecord"](ev, stream), "cuEventRecord")
+        done = g._wait_event(lib, ev, 30.0)
+        out["h2d_ms"] = (_time.perf_counter() - t0) * 1000.0
+        out["event_done"] = bool(done)
+        if done:
+            back = (ct.c_char * int(n_bytes))()
+            g._check(lib["cuMemcpyDtoH_v2"](ct.addressof(back), dptr, ct.c_size_t(int(n_bytes))), "cuMemcpyDtoH")
+            out["match"] = (hashlib.sha256(bytes(back)).hexdigest() == hashlib.sha256(bytes(buf)).hexdigest())
+    except Exception as exc:  # noqa: BLE001
+        out["status"] = "error"
+        out["error"] = f"{type(exc).__name__}:{str(exc)[:400]}"
+    return out
 
 
 @app.function(

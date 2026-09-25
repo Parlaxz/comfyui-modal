@@ -7329,12 +7329,13 @@ def _mm2_child(args: tuple) -> None:
      lane_flat, lane_off, qd, sticky, ownership, winner, winner_kind, start_ns,
      winner_exit_ns, attempts, completed, lock, next_global, last_start, pacer_lock,
      gap_ns, total_blocks, max_idle_s, consumer_pos, touch_pos, touch_events,
-     ready_count, go, child_conn) = args
+     ready_count, go, child_conn, staging) = args
     payload: dict[str, Any] = {"reader": reader_id, "pid": os.getpid(),
                                "status": "ok", "records": [], "stale": 0,
                                "affinity_breaks": 0, "idle_no_work_ms": 0.0,
                                "touch_events": [], "payload_copy_bytes": 0,
-                               "dest_allocated": False}
+                               "dest_allocated": False, "staging_wait_ms": 0.0,
+                               "staging_wait_events": 0, "staging_published": 0}
     fd = -1
     mm_base = 0
     clock = time.perf_counter_ns
@@ -7347,8 +7348,21 @@ def _mm2_child(args: tuple) -> None:
         zero_copy = consume_mode != "memcpy"
         dest_addr = 0
         if not zero_copy:
-            dest = bytearray(read_bytes)
-            dest_addr = _ct.addressof(_ct.c_char.from_buffer(dest))
+            if staging is None:
+                dest = bytearray(read_bytes)
+                dest_addr = _ct.addressof(_ct.c_char.from_buffer(dest))
+            else:
+                # Additive seam: write produced bytes into the caller's shared
+                # staging region instead of a process-private bytearray.
+                dest = None
+                dest_addr = 0
+                stage_published = staging["published"][reader_id]
+                stage_consumed = staging["consumed"][reader_id]
+                stage_off = staging["slot_off"][reader_id]
+                stage_len = staging["slot_len"][reader_id]
+                stage_slots = int(staging["slots"])
+                stage_lane_base = (int(staging["seg_base"])
+                                   + reader_id * int(staging["lane_bytes"]))
             payload["dest_allocated"] = True
         fd = os.open(file_path, os.O_RDONLY)
         if mmap_mode == "persistent":
@@ -7406,6 +7420,9 @@ def _mm2_child(args: tuple) -> None:
         cursor = 0
         idle_total = 0.0
         idle_deadline: float | None = None
+        slot_wait_ms = 0.0
+        slot_wait_events = 0
+        stage_seq = 0
         while True:
             with lock:
                 if int(completed.value) >= total_blocks:
@@ -7467,12 +7484,25 @@ def _mm2_child(args: tuple) -> None:
                 ptr = win_addr + (offset - w_start)
             else:
                 ptr = mm_base + offset
+            mem_dest = dest_addr
+            if staging is not None:
+                stage_seq = int(stage_published.value)
+                if stage_seq - int(stage_consumed.value) >= stage_slots:
+                    wait_t0 = int(clock())
+                    while stage_seq - int(stage_consumed.value) >= stage_slots:
+                        time.sleep(0.0001)
+                    slot_wait_ms += (int(clock()) - wait_t0) / 1e6
+                    slot_wait_events += 1
+                stage_i = stage_seq % stage_slots
+                stage_off[stage_i] = offset
+                stage_len[stage_i] = length
+                mem_dest = stage_lane_base + stage_i * read_bytes
             enter = int(clock())
             sink = 0
             err = None
             try:
                 if consume_mode == "memcpy":
-                    _LIBC.memcpy(dest_addr, ptr, length)
+                    _LIBC.memcpy(mem_dest, ptr, length)
                 elif consume_mode == "d0":
                     sink = int(lib.st_touch_pages(_ct.c_void_p(ptr),
                                                   _ct.c_size_t(length), 4096))
@@ -7487,6 +7517,9 @@ def _mm2_child(args: tuple) -> None:
                 got = -1
                 err = f"{type(exc).__name__}:{str(exc)[:160]}"
             exit_ns = int(clock())
+            if staging is not None:
+                # Publish only after the native memcpy has fully returned.
+                stage_published.value = stage_seq + 1
             if mmap_mode == "window" and win_addr:
                 t = int(clock())
                 _LIBC.munmap(win_addr, ((offset + length - (offset & ~(_PAGE - 1))
@@ -7518,6 +7551,10 @@ def _mm2_child(args: tuple) -> None:
         payload["idle_no_work_ms"] = idle_total
         payload["payload_copy_bytes"] = (0 if zero_copy
                                          else sum(int(r["length"]) for r in payload["records"]))
+        payload["staging_wait_ms"] = float(slot_wait_ms)
+        payload["staging_wait_events"] = int(slot_wait_events)
+        payload["staging_published"] = (
+            int(stage_published.value) if staging is not None else 0)
     except BaseException as exc:  # noqa: BLE001
         payload["status"] = "error"
         payload["error"] = f"{type(exc).__name__}:{str(exc)[:400]}"
@@ -7548,6 +7585,8 @@ def run_mmap_source_probe(
     consume_mode: str = "memcpy",
     touch_ahead: int = 0,
     sticky_lanes: bool = True,
+    staging: dict | None = None,
+    on_ready: Callable[[], None] | None = None,
     min_launch_gap_ns: int = 4_000_000,
     requested_gpu: str | None = None,
     observed_gpu: str | None = None,
@@ -7629,7 +7668,7 @@ def run_mmap_source_probe(
                    winner, winner_kind, start_ns, winner_exit_ns, attempts, completed,
                    lock, next_global, last_start, pacer_lock, min_launch_gap_ns,
                    total_blocks, max_idle_s, consumer_pos, touch_pos, None,
-                   ready_count, go, cc),),
+                   ready_count, go, cc, staging),),
             daemon=True)
         p.start(); cc.close(); conns.append(cp); procs.append(p)
 
@@ -7650,6 +7689,10 @@ def run_mmap_source_probe(
             if time.monotonic() > deadline:
                 raise TimeoutError("readers_not_ready")
             time.sleep(0.002)
+        if on_ready is not None:
+            # Post-fork, pre-source setup hook (CUDA context + host
+            # registration).  Readers are parked on `go`.
+            on_ready()
         release_ns = int(clock_ns())
         go.value = 1
     except BaseException as exc:  # noqa: BLE001
@@ -7779,6 +7822,16 @@ def run_mmap_source_probe(
         "payload_copy_bytes_per_block": (0.0 if consume_mode != "memcpy"
                                          else read_bytes),
         "dest_allocated": any(bool(p.get("dest_allocated")) for p in payloads),
+        "staging": {
+            "enabled": staging is not None,
+            "slots": (int(staging["slots"]) if staging is not None else 0),
+            "bytes": (int(staging["bytes"]) if staging is not None else 0),
+            "wait_ms_total": sum(float(p.get("staging_wait_ms") or 0) for p in payloads),
+            "wait_events_total": sum(int(p.get("staging_wait_events") or 0) for p in payloads),
+            "published_total": sum(int(p.get("staging_published") or 0) for p in payloads),
+            "reader_wait_ms": [float(p.get("staging_wait_ms") or 0) for p in payloads],
+            "reader_published": [int(p.get("staging_published") or 0) for p in payloads],
+        },
         "parent_pid": os.getpid(),
         "worker_pids": sorted({int(r["pid"]) for r in records if r.get("pid") is not None}),
         "reader_pids": [p.get("pid") for p in payloads],
