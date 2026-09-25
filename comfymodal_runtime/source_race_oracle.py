@@ -8246,6 +8246,7 @@ def run_mmap_lifecycle_probe(
     fixed_va: bool = False,
     sticky_lanes: bool = True,
     staging: dict | None = None,
+    on_ready: Callable[[], None] | None = None,
     min_launch_gap_ns: int = 4_000_000,
     requested_gpu: str | None = None,
     observed_gpu: str | None = None,
@@ -8351,6 +8352,12 @@ def run_mmap_lifecycle_probe(
             if time.monotonic() > deadline:
                 raise TimeoutError("readers_not_ready")
             time.sleep(0.002)
+        if on_ready is not None:
+            # Post-fork, pre-source setup hook (e.g. CUDA context + host
+            # registration).  Readers are parked on `go`, so this cannot be
+            # attributed to source production.  With on_ready=None the path is
+            # byte-identical to the frozen harness.
+            on_ready()
         release_ns = int(clock_ns())
         go.value = 1
     except BaseException as exc:  # noqa: BLE001

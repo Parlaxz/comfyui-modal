@@ -1466,16 +1466,30 @@ def _run_mmap_gpu(
         staging = None
         consumer = None
         consumer_state: dict[str, Any] = {}
+        reg_state: dict[str, Any] = {}
+
+        def _on_ready() -> None:
+            assert staging is not None
+            try:
+                reg_state.update(source_race_gpu.register_staging_now(staging))
+            except Exception as exc:  # noqa: BLE001
+                reg_state["registered"] = False
+                reg_state["register_error"] = f"{type(exc).__name__}:{str(exc)[:300]}"
+
+        on_ready = None
         if str(mode) != "private":
             staging = source_race_gpu.build_staging(int(qd), int(slots), read_bytes)
             consumer, consumer_state = source_race_gpu.start_consumer(
                 staging, int(qd), read_bytes, str(mode), verify=bool(verify))
+            if str(mode) in ("registered", "h2d"):
+                on_ready = _on_ready
         engine_result = run_mmap_lifecycle_probe(
             file_path=str(path),
             read_bytes=read_bytes,
             qd=int(qd),
             lifecycle="fresh",
             staging=staging,
+            on_ready=on_ready,
             min_launch_gap_ns=int(round(float(min_launch_gap_ms) * 1e6)),
             requested_gpu=requested_gpu,
             observed_gpu=observed_gpu,
@@ -1485,6 +1499,11 @@ def _run_mmap_gpu(
             staging["alive"].value = 0
             consumer.join(timeout=600.0)
             engine_result["staging_consumer"] = dict(consumer_state)
+            if str(mode) in ("registered", "h2d"):
+                engine_result["staging_registration"] = dict(reg_state)
+                if not reg_state.get("registered"):
+                    raise RuntimeError(
+                        f"staging_registration_failed:{reg_state.get('register_error')}")
         if not isinstance(engine_result, dict):
             raise TypeError(f"engine_returned_{type(engine_result).__name__}")
         result.update(engine_result)
