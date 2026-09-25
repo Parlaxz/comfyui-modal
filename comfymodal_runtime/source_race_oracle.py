@@ -7586,6 +7586,7 @@ def run_mmap_source_probe(
     touch_ahead: int = 0,
     sticky_lanes: bool = True,
     staging: dict | None = None,
+    on_post_fork: Callable[[], None] | None = None,
     on_ready: Callable[[], None] | None = None,
     min_launch_gap_ns: int = 4_000_000,
     requested_gpu: str | None = None,
@@ -7638,6 +7639,7 @@ def run_mmap_source_probe(
     for l in lanes:
         lane_off_list.append(lane_off_list[-1] + len(l))
 
+    _tm: dict[str, float] = {"t0": time.perf_counter()}
     ctx = mp.get_context(pacer_start_method)
     lock = ctx.Lock()
     ownership = ctx.Array("b", total_blocks, lock=False)
@@ -7657,6 +7659,7 @@ def run_mmap_source_probe(
     ready_count = ctx.Value("i", 0, lock=False)
     go = ctx.Value("i", 0, lock=False)
 
+    _tm["t_prefork"] = time.perf_counter()
     procs: list[Any] = []
     conns: list[Any] = []
     for rid in range(qd):
@@ -7672,6 +7675,11 @@ def run_mmap_source_probe(
             daemon=True)
         p.start(); cc.close(); conns.append(cp); procs.append(p)
 
+    if on_post_fork is not None:
+        # Post-fork hook: start independent setup (e.g. CUDA context init) so it
+        # overlaps reader prep and the ready wait.  Readers are not released yet.
+        on_post_fork()
+    _tm["t_fork"] = time.perf_counter()
     barrier_error = None
     release_ns = None
     deadline = time.monotonic() + ready_timeout_s
@@ -7689,12 +7697,14 @@ def run_mmap_source_probe(
             if time.monotonic() > deadline:
                 raise TimeoutError("readers_not_ready")
             time.sleep(0.002)
+        _tm["t_ready"] = time.perf_counter()
         if on_ready is not None:
             # Post-fork, pre-source setup hook (CUDA context + host
             # registration).  Readers are parked on `go`.
             on_ready()
         release_ns = int(clock_ns())
         go.value = 1
+        _tm["t_go"] = time.perf_counter()
     except BaseException as exc:  # noqa: BLE001
         barrier_error = f"{type(exc).__name__}:{str(exc)[:200]}"
 
@@ -7704,6 +7714,7 @@ def run_mmap_source_probe(
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=30.0)
+    _tm["t_join"] = time.perf_counter()
     for rid, conn in enumerate(conns):
         try:
             payloads.append(conn.recv())
@@ -7717,6 +7728,7 @@ def run_mmap_source_probe(
         except BaseException:  # noqa: BLE001
             pass
 
+    _tm["t_collect"] = time.perf_counter()
     reader_errors = [{"reader": p.get("reader"), "error": p.get("error")}
                      for p in payloads if p.get("status") != "ok"]
     records = [r for p in payloads for r in (p.get("records") or [])]
@@ -7831,6 +7843,14 @@ def run_mmap_source_probe(
             "published_total": sum(int(p.get("staging_published") or 0) for p in payloads),
             "reader_wait_ms": [float(p.get("staging_wait_ms") or 0) for p in payloads],
             "reader_published": [int(p.get("staging_published") or 0) for p in payloads],
+        },
+        "timing": {
+            "pre_fork_ms": (_tm["t_prefork"] - _tm["t0"]) * 1000.0,
+            "fork_ms": (_tm["t_fork"] - _tm["t_prefork"]) * 1000.0,
+            "ready_ms": (_tm["t_ready"] - _tm["t_fork"]) * 1000.0,
+            "on_ready_ms": (_tm["t_go"] - _tm["t_ready"]) * 1000.0,
+            "join_ms": (_tm["t_join"] - _tm["t_go"]) * 1000.0,
+            "collect_ms": (_tm["t_collect"] - _tm["t_join"]) * 1000.0,
         },
         "parent_pid": os.getpid(),
         "worker_pids": sorted({int(r["pid"]) for r in records if r.get("pid") is not None}),

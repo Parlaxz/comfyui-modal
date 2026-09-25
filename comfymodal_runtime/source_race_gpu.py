@@ -36,6 +36,7 @@ from __future__ import annotations
 import collections
 import ctypes
 import hashlib
+import multiprocessing as mp
 import threading
 import time
 from typing import Any
@@ -139,6 +140,7 @@ def _wait_event(lib: Any, event: Any, timeout_s: float) -> bool:
 
 def _cuda_context() -> dict[str, Any]:
     """cuInit + device 0 + a fresh context on the calling thread."""
+    t0 = time.perf_counter()
     lib = _load_driver()
     _check(lib["cuInit"](0), "cuInit")
     dev = ctypes.c_int()
@@ -151,19 +153,40 @@ def _cuda_context() -> dict[str, Any]:
         "lib": lib,
         "ctx": ctx,
         "device_name": name.value.decode("utf-8", "replace").split("\x00")[0],
+        "ctx_init_ms": (time.perf_counter() - t0) * 1000.0,
     }
 
 
-def setup_cuda(staging: dict[str, Any], mode: str, gpu_bytes: int = 0) -> dict[str, Any]:
-    """Post-fork, pre-source CUDA setup, called from the harness ``on_ready`` hook.
+def cuda_ctx_init(staging: dict[str, Any]) -> dict[str, Any]:
+    """Create the CUDA context (cuInit + cuCtxCreate) and pop it from this thread.
 
-    Pins the shared staging via cuMemHostRegister and, for ``h2d``, allocates the
-    single GPU destination and the single non-blocking stream.  The context is
-    popped from the calling thread so the H2D consumer can make it current.
+    Independent of staging and source, so it can run concurrently with reader
+    fork/prep (``on_post_fork``).  The context is stored on ``staging`` for the
+    later registration and for the H2D consumer to make current.
     """
     rt = _cuda_context()
-    lib = rt["lib"]
-    setup_t0 = time.perf_counter()
+    staging["_cuda"] = {
+        "lib": rt["lib"],
+        "ctx": rt["ctx"],
+        "device_name": rt["device_name"],
+        "ctx_init_ms": rt["ctx_init_ms"],
+    }
+    popped = ctypes.c_void_p()
+    rt["lib"]["cuCtxPopCurrent_v2"](ctypes.byref(popped))
+    return {"device_name": rt["device_name"], "ctx_init_ms": rt["ctx_init_ms"]}
+
+
+def register_and_alloc(
+    staging: dict[str, Any], mode: str, gpu_bytes: int = 0
+) -> dict[str, Any]:
+    """Pin the staging (cuMemHostRegister) and, for h2d, allocate GPU + stream.
+
+    Runs after ``cuda_ctx_init``; makes the context current on this thread,
+    registers, optionally allocates, then pops the context.
+    """
+    cuda = staging["_cuda"]
+    lib = cuda["lib"]
+    _check(lib["cuCtxSetCurrent"](cuda["ctx"]), "cuCtxSetCurrent")
     t0 = time.perf_counter()
     _check(lib["cuMemHostRegister_v2"](
         ctypes.c_void_p(int(staging["seg_base"])),
@@ -172,12 +195,12 @@ def setup_cuda(staging: dict[str, Any], mode: str, gpu_bytes: int = 0) -> dict[s
     register_ms = (time.perf_counter() - t0) * 1000.0
 
     info: dict[str, Any] = {
-        "device_name": rt["device_name"],
+        "device_name": cuda["device_name"],
         "registered": True,
         "register_ms": register_ms,
         "register_bytes": int(staging["bytes"]),
+        "ctx_init_ms": cuda.get("ctx_init_ms"),
     }
-    cuda: dict[str, Any] = {"lib": lib, "ctx": rt["ctx"], "device_name": rt["device_name"]}
     if mode == "h2d":
         alloc_t0 = time.perf_counter()
         dptr = ctypes.c_uint64(0)
@@ -188,16 +211,57 @@ def setup_cuda(staging: dict[str, Any], mode: str, gpu_bytes: int = 0) -> dict[s
         cuda.update({"dptr": int(dptr.value), "stream": stream, "gpu_bytes": int(gpu_bytes)})
         info.update({"gpu_bytes": int(gpu_bytes), "gpu_alloc": True, "gpu_alloc_ms": alloc_ms,
                      "stream_created": True})
-    info["setup_ms"] = (time.perf_counter() - setup_t0) * 1000.0
-    staging["_cuda"] = cuda
+    staging["_cuda_ready"] = True
     popped = ctypes.c_void_p()
     lib["cuCtxPopCurrent_v2"](ctypes.byref(popped))
     return info
 
 
-def build_staging(qd: int, slots: int, read_bytes: int) -> dict[str, Any]:
-    """Allocate one POSIX shared-memory staging region for ``qd`` reader lanes."""
-    import multiprocessing as mp
+def setup_cuda(staging: dict[str, Any], mode: str, gpu_bytes: int = 0) -> dict[str, Any]:
+    """Non-overlapped CUDA setup: context init then register/alloc."""
+    cuda_ctx_init(staging)
+    return register_and_alloc(staging, mode, gpu_bytes)
+
+
+_MEMSET = None
+
+
+def _memset_fn() -> Any:
+    """libc memset via a CDLL call so the GIL is released during prefault."""
+    global _MEMSET
+    if _MEMSET is None:
+        lib = ctypes.CDLL(None)
+        lib.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        lib.memset.restype = ctypes.c_void_p
+        _MEMSET = lib.memset
+    return _MEMSET
+
+
+def _prefault_region(base: int, total: int) -> None:
+    """Fault the staging pages in once, off the source critical path."""
+    _memset_fn()(ctypes.c_void_p(base), 0, ctypes.c_size_t(total))
+
+
+def join_prefault(staging: dict[str, Any], timeout: float = 120.0) -> None:
+    thread = staging.get("_prefault_thread")
+    if thread is not None:
+        thread.join(timeout=timeout)
+        staging["_prefault_thread"] = None
+
+
+def build_staging(
+    qd: int,
+    slots: int,
+    read_bytes: int,
+    prefault: bool = True,
+) -> dict[str, Any]:
+    """Allocate lazy shared-memory staging (anonymous mmap, no eager zero-fill).
+
+    Pages are faulted in once by a background thread so the fault cost overlaps
+    reader fork/prep instead of landing on the source read.  ``_mm`` keeps the
+    mapping owner alive; ``seg_base`` is its address, inherited by fork.
+    """
+    import mmap as _mmap
 
     qd = int(qd)
     slots = int(slots)
@@ -206,10 +270,11 @@ def build_staging(qd: int, slots: int, read_bytes: int) -> dict[str, Any]:
         raise ValueError("qd, slots and read_bytes must be positive")
     lane_bytes = slots * read_bytes
     total = qd * lane_bytes
-    buf = mp.RawArray(ctypes.c_char, total)
-    return {
+    mm = _mmap.mmap(-1, total, access=_mmap.ACCESS_WRITE)
+    base = int(ctypes.addressof(ctypes.c_char.from_buffer(mm)))
+    staging: dict[str, Any] = {
         "enabled": True,
-        "seg_base": int(ctypes.addressof(buf)),
+        "seg_base": base,
         "slots": slots,
         "lane_bytes": lane_bytes,
         "read_bytes": read_bytes,
@@ -219,8 +284,15 @@ def build_staging(qd: int, slots: int, read_bytes: int) -> dict[str, Any]:
         "slot_off": [mp.Array("q", slots, lock=False) for _ in range(qd)],
         "slot_len": [mp.Array("q", slots, lock=False) for _ in range(qd)],
         "alive": mp.Value("i", 1, lock=False),
-        "_buf": buf,
+        "_mm": mm,
+        "_prefault_thread": None,
     }
+    if prefault:
+        thread = threading.Thread(
+            target=_prefault_region, args=(base, total), name="staging-prefault", daemon=True)
+        staging["_prefault_thread"] = thread
+        thread.start()
+    return staging
 
 
 def start_consumer(
@@ -293,14 +365,14 @@ def _start_h2d_thread(
     def _run() -> None:
         started = time.perf_counter()
         # setup_cuda() runs in the harness on_ready hook, i.e. after this thread
-        # starts but before the readers are released; wait for it to install the
-        # context/stream/destination.
-        while "_cuda" not in staging and int(staging["alive"].value) == 1:
+        # starts but before the readers are released; wait for the full context
+        # + registration + destination + stream, not just the context.
+        while not staging.get("_cuda_ready") and int(staging["alive"].value) == 1:
             time.sleep(0.0005)
-        if "_cuda" not in staging:
+        cuda = staging.get("_cuda")
+        if not staging.get("_cuda_ready") or cuda is None:
             state["error"] = "cuda_setup_missing"
             return
-        cuda = staging["_cuda"]
         lib = cuda["lib"]
         ctx = cuda["ctx"]
         dptr = int(cuda["dptr"])

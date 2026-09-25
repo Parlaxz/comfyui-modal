@@ -1472,18 +1472,26 @@ def _run_mmap_gpu(
     slots: int,
     attempt_id: str,
     verify: bool,
+    observe_gpu: bool = False,
 ) -> dict[str, Any]:
     """Minimal additive GPU variant of the frozen fresh-window mmap harness.
 
     mode="private"    : staging disabled - byte-identical to the frozen CPU harness.
-    mode="shared"     : produced bytes land in POSIX shared-memory staging (Phase 1).
-    mode="registered" : staging is additionally CUDA-pinned (Phase 2).
-    mode="h2d"        : blocks are cudaMemcpyAsync'd to the GPU as produced (Phase 3).
+    mode="shared"     : produced bytes land in lazy POSIX shared-memory staging.
+    mode="registered" : staging is additionally CUDA-pinned.
+    mode="h2d"        : blocks are cudaMemcpyAsync'd to the GPU as produced.
 
     The reader processes never touch CUDA; all CUDA stays in this parent process.
+    ``observe_gpu=False`` (production default) skips the nvidia-smi subprocess.
     """
-    observed_gpu = _observed_gpu()
+    import time as _time
+    _tm: dict[str, float] = {}
+    _t = _time.perf_counter()
+    observed_gpu = _observed_gpu() if observe_gpu else ""
+    _tm["observed_gpu_ms"] = (_time.perf_counter() - _t) * 1000.0
+    _t = _time.perf_counter()
     identity = _identity(requested_gpu, observed_gpu)
+    _tm["identity_ms"] = (_time.perf_counter() - _t) * 1000.0
     result: dict[str, Any] = {
         "role": str(role).strip().lower(),
         "attempt_id": str(attempt_id),
@@ -1496,8 +1504,10 @@ def _run_mmap_gpu(
         path = _resolve_model_path(role, model_name)
         result["resolved_path"] = str(path)
         read_bytes = int(read_mib) * 1024 * 1024
+        _t = _time.perf_counter()
         from comfymodal_runtime.source_race_oracle import run_mmap_source_probe
         from comfymodal_runtime import source_race_gpu
+        _tm["import_ms"] = (_time.perf_counter() - _t) * 1000.0
 
         staging = None
         consumer = None
@@ -1505,21 +1515,55 @@ def _run_mmap_gpu(
         reg_state: dict[str, Any] = {}
         gpu_bytes = os.path.getsize(str(path)) if str(mode) == "h2d" else 0
 
+        import threading as _threading
+        _ctx_thread: dict[str, Any] = {"t": None}
+
+        def _on_post_fork() -> None:
+            assert staging is not None
+            if str(mode) in ("registered", "h2d"):
+                # Independent of readers: overlap CUDA context init with reader prep.
+                st = staging
+                assert st is not None
+                thread = _threading.Thread(
+                    target=lambda: reg_state.update(source_race_gpu.cuda_ctx_init(st)),
+                    name="cuda-ctx-init", daemon=True)
+                _ctx_thread["t"] = thread
+                thread.start()
+
         def _on_ready() -> None:
             assert staging is not None
-            try:
-                reg_state.update(source_race_gpu.setup_cuda(staging, str(mode), gpu_bytes))
-            except Exception as exc:  # noqa: BLE001
-                reg_state["registered"] = False
-                reg_state["register_error"] = f"{type(exc).__name__}:{str(exc)[:300]}"
+            _t2 = _time.perf_counter()
+            source_race_gpu.join_prefault(staging)
+            _tm["prefault_join_ms"] = (_time.perf_counter() - _t2) * 1000.0
+            if str(mode) in ("registered", "h2d"):
+                _t2 = _time.perf_counter()
+                thread = _ctx_thread["t"]
+                if thread is not None:
+                    thread.join(timeout=120.0)
+                _tm["ctx_overlap_join_ms"] = (_time.perf_counter() - _t2) * 1000.0
+                _t2 = _time.perf_counter()
+                try:
+                    reg_state.update(source_race_gpu.register_and_alloc(
+                        staging, str(mode), gpu_bytes))
+                except Exception as exc:  # noqa: BLE001
+                    reg_state["registered"] = False
+                    reg_state["register_error"] = f"{type(exc).__name__}:{str(exc)[:300]}"
+                _tm["cuda_setup_ms"] = (_time.perf_counter() - _t2) * 1000.0
 
         on_ready = None
+        on_post_fork = None
         if str(mode) != "private":
-            staging = source_race_gpu.build_staging(int(qd), int(slots), read_bytes)
+            _t = _time.perf_counter()
+            staging = source_race_gpu.build_staging(
+                int(qd), int(slots), read_bytes, prefault=(str(mode) == "shared"))
+            _tm["staging_alloc_ms"] = (_time.perf_counter() - _t) * 1000.0
+            _t = _time.perf_counter()
             consumer, consumer_state = source_race_gpu.start_consumer(
                 staging, int(qd), read_bytes, str(mode), verify=bool(verify), file_path=str(path))
-            if str(mode) in ("registered", "h2d"):
-                on_ready = _on_ready
+            _tm["consumer_start_ms"] = (_time.perf_counter() - _t) * 1000.0
+            on_ready = _on_ready
+            on_post_fork = _on_post_fork
+        _t = _time.perf_counter()
         engine_result = run_mmap_source_probe(
             file_path=str(path),
             read_bytes=read_bytes,
@@ -1527,6 +1571,7 @@ def _run_mmap_gpu(
             mmap_mode="window",
             consume_mode="memcpy",
             staging=staging,
+            on_post_fork=on_post_fork,
             on_ready=on_ready,
             min_launch_gap_ns=int(round(float(min_launch_gap_ms) * 1e6)),
             requested_gpu=requested_gpu,
@@ -1534,10 +1579,15 @@ def _run_mmap_gpu(
             ready_timeout_s=120.0,
             max_idle_s=60.0,
         )
+        _tm["source_call_ms"] = (_time.perf_counter() - _t) * 1000.0
+        _tm["source_wall_ms"] = float(engine_result.get("full_file_wall_ms") or 0.0)
+        _tm["engine_overhead_ms"] = _tm["source_call_ms"] - _tm["source_wall_ms"]
         if consumer is not None:
             assert staging is not None
+            _t = _time.perf_counter()
             staging["alive"].value = 0
             consumer.join(timeout=300.0)
+            _tm["consumer_join_ms"] = (_time.perf_counter() - _t) * 1000.0
             engine_result["staging_consumer"] = dict(consumer_state)
             if consumer.is_alive():
                 engine_result["staging_consumer"]["consumer_alive_after_join"] = True
@@ -1554,6 +1604,7 @@ def _run_mmap_gpu(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}:{str(exc)[:800]}"
         result["status"] = "error"
+    result["gpu_timing"] = _tm
     result["identity"] = identity
     result["requested_gpu"] = requested_gpu
     result["observed_gpu"] = observed_gpu
@@ -1589,15 +1640,16 @@ def run_mmap_gpu_h100(
     qd: int = 4,
     min_launch_gap_ms: float = 4.0,
     mode: str = "shared",
-    slots: int = 2,
+    slots: int = 1,
     attempt_id: str = "",
     verify: bool = False,
+    observe_gpu: bool = False,
 ) -> dict:
     import time as _time
     _t0 = _time.perf_counter()
     result = _run_mmap_gpu(
         _H100_MODAL_GPU, role, model_name, read_mib, qd, min_launch_gap_ms,
-        mode, slots, attempt_id, verify,
+        mode, slots, attempt_id, verify, observe_gpu,
     )
     result["function_wall_ms"] = (_time.perf_counter() - _t0) * 1000.0
     result["modal_call_id"] = _call_id()
