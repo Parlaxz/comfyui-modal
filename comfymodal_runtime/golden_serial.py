@@ -13145,7 +13145,7 @@ async def golden_unet_load(
                 - int(before_skeleton["allocated_bytes"]),
                 0,
             )
-            if skeleton_peak_delta >= int(transport["stats"]["gpu_bytes"]):
+            if shared_transport is None and skeleton_peak_delta >= int(transport["stats"]["gpu_bytes"]):
                 raise RuntimeError(f"unet_skeleton_model_sized_allocation:{skeleton_peak_delta}")
 
         # load_model_weights POPS keys from the dict it receives; pass a copy
