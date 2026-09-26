@@ -71,7 +71,6 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     ),
     # CLIP loader and hydration controls.
     "COMFYMODAL_V2_CLIP_QD_READER": _spec("COMFYMODAL_V2_CLIP_QD_READER", "bool", False, LOADER_SELECTION, "Enable the genuine queue-depth CLIP reader."),
-    "COMFYMODAL_V2_M2_PRODUCTION_LOADER": _spec("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "bool", False, LOADER_SELECTION, "Enable the M2 mmap/process production CLIP loader."),
     "COMFYMODAL_V2_CLIP_QD_QD": _spec("COMFYMODAL_V2_CLIP_QD_QD", "int", 4, LOADER_SELECTION, "CLIP queue depth."),
     "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": _spec("COMFYMODAL_V2_CLIP_QD_BLOCK_MIB", "int", 32, LOADER_SELECTION, "CLIP queue-reader block size in MiB."),
     "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": _spec("COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY", "enum", "restore_earliest", LOADER_SELECTION, "CLIP queue-reader launch boundary.", choices=("restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore")),
@@ -136,9 +135,19 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     # Restore, snapshot, and runtime policy controls.
     "COMFYMODAL_MINIMAL_RESTORE": _spec("COMFYMODAL_MINIMAL_RESTORE", "bool", True, EXECUTION_POLICY, "Select the E37 minimal restore path."),
     "COMFYMODAL_GOLDEN_MINIMAL_RESTORE": _spec("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel minimal post-snapshot restore. Default OFF."),
-    "COMFYMODAL_GOLDEN_IO_PROCESS": _spec("COMFYMODAL_GOLDEN_IO_PROCESS", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel strict CPU-I/O child process. Default OFF."),
-    "COMFYMODAL_GOLDEN_CLIP_LOADER": _spec("COMFYMODAL_GOLDEN_CLIP_LOADER", "enum", "c0", LOADER_SELECTION, "Golden CLIP transport selector.", choices=("c0", "m2")),
-    "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": _spec("COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP", "bool", False, EXECUTION_POLICY, "Build the weightless CLIP skeleton concurrently with source/H2D."),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2", "bool", False, EXECUTION_POLICY, "Faithful two-process Golden I/O (V2): one reusable process-shared host backing registered for direct parent H2D. Default OFF."),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING", "enum", "posix", EXECUTION_POLICY, "Golden I/O Process V2 backing selector; no cross-arm fallback.", choices=("posix", "sysv")),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY", "enum", "qd4_32", EXECUTION_POLICY, "Golden I/O Process V2 child source-reader geometry; parent H2D remains unchanged.", choices=("qd4_32", "qd2_128", "qd4_64")),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "bool", False, EXECUTION_POLICY, "Golden I/O V2 C0 bounded shared-pinned streaming arena selector; requires the V2 switch and has no cross-arm fallback. Default OFF."),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS", "bool", False, EXECUTION_POLICY, "Golden I/O V2 C0 child persistent positioned-FD cache selector: reuse one descriptor per normalized (path, producer_id) instead of per-fill open/close. Default OFF (control); requires the C0 streaming arm and has no cross-arm fallback."),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "enum", "preadv", EXECUTION_POLICY, "Golden I/O V2 C0 child byte-producer engine: preadv (default positioned-read control) or mmap_fresh (frozen mmap engine: independent reader processes with a persistent per-(path,producer) descriptor, a fresh exact-window PROT_READ|MAP_PRIVATE mapping per read, native libc.memcpy into the leased slot, synchronous munmap, and a 4 ms global launch-spacing floor). No cross-arm fallback.", choices=("preadv", "mmap_fresh")),
+    "COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER": _spec("COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER", "bool", False, TIMING_DIAGNOSTICS, "Forensic child-only VizTracer capture for the C0 CUDA-sterile reader process: traces source worker/writer/positioned-read boundaries and writes a deterministic child trace the parent bundles. Default OFF; trace config only, never execution semantics."),
+    "COMFYMODAL_GOLDEN_C0_PRIVATE_SPLIT_IO": _spec("COMFYMODAL_GOLDEN_C0_PRIVATE_SPLIT_IO", "bool", False, TIMING_DIAGNOSTICS, "Diagnostic-only C0 source/destination split selector: ON stages each fill in one reusable private buffer per source worker (thread or mmap reader process) and then copies into the existing leased SHM slot, exposing split source-read vs private->SHM timings. Default OFF reproduces the exact direct source->SHM path with no private buffers. Evidence-only; requires C0 streaming and never changes geometry, FD lifecycle, H2D, or adoption."),
+    "COMFYMODAL_GOLDEN_C0_HOST_REGISTER": _spec("COMFYMODAL_GOLDEN_C0_HOST_REGISTER", "bool", True, EXECUTION_POLICY, "C0 POSIX-SHM arena cudaHostRegister arm selector. Default ON registers the shared mapping once so the parent H2Ds directly from it (existing production behavior). OFF leaves the byte-identical mapping, slots, geometry, source engine, and H2D dispatcher unregistered. Requires C0 streaming; no other difference between arms."),
+    "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": _spec("COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP", "bool", False, EXECUTION_POLICY, "CLIP skeleton overlap selector. Default OFF keeps the fused source-then-construct order. ON builds the weightless CLIP skeleton from header-derived meta tensors concurrently with the QD source/H2D read, then binds the real transported views into it; the frozen mmap/QD4/64 MiB/process-reader source path, H2D dispatcher, adoption proof, and restore lifecycle are unchanged. Fail-closed: any unsupported header or upstream key normalization falls back to the exact fused constructor."),
+    "COMFYMODAL_GOLDEN_C0_SOURCE_VOLUME_V1": _spec("COMFYMODAL_GOLDEN_C0_SOURCE_VOLUME_V1", "bool", False, LOADER_SELECTION, "Distinct C0 direct Volume V1 treatment selector: ON replaces only the child's byte producer with a VolumeGetFile2 ranged read streamed 8 MiB-block-by-block into the leased SHM slot, with no preadv fallback. Default OFF preserves the exact C0 preadv control. Requires the C0 streaming arm; geometry, worker pool, IPC, SHM, H2D, and adoption are unchanged."),
+    "COMFYMODAL_GOLDEN_C0_PREADV_SICKNESS_DIAG": _spec("COMFYMODAL_GOLDEN_C0_PREADV_SICKNESS_DIAG", "bool", False, TIMING_DIAGNOSTICS, "Diagnostic-only clustered C0 preadv-sickness selector: ON instruments every child production preadv with an outstanding-read registry and runs an independent 500ms watchdog that captures a passive snapshot before a bounded, fresh-FD active probe matrix against pre-registered CLIP/UNET control offsets. Default OFF preserves the exact C0 persistent-FD preadv control; never changes QD, geometry, SHM, H2D, adoption, fallback, or validation. Evidence-only, never promoted."),
+
     "COMFYMODAL_V2_CLEAN_LANE": _spec("COMFYMODAL_V2_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "Compatibility clean-lane selector."),
     "COMFYMODAL_V2_E37_CLEAN_LANE": _spec("COMFYMODAL_V2_E37_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "E37 clean-lane runtime selector."),
     "COMFYMODAL_V2_E37_STRICT_PROOF": _spec("COMFYMODAL_V2_E37_STRICT_PROOF", "bool", False, DEPRECATED_DIAGNOSTIC, "Enable fail-closed E37 proof validation."),
@@ -148,6 +157,10 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     "COMFYMODAL_V2_GANTT_TELEMETRY": _spec("COMFYMODAL_V2_GANTT_TELEMETRY", "bool", False, TIMING_DIAGNOSTICS, "Emit Gantt timing telemetry."),
     "COMFYMODAL_GOLDEN_QD2_TELEMETRY": _spec("COMFYMODAL_GOLDEN_QD2_TELEMETRY", "enum", "light", TIMING_DIAGNOSTICS, "QD2 transport telemetry mode: light timing default vs heavy_current per-range diagnostics.", choices=("light", "heavy_current")),
     "COMFYMODAL_GOLDEN_QD2_DEFER_H2D": _spec("COMFYMODAL_GOLDEN_QD2_DEFER_H2D", "bool", False, TIMING_DIAGNOSTICS, "Phase B4 diagnostic-only gate: defer QD2 H2D until CPU source read completes; NORMAL when off."),
+    "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME": _spec("COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME", "enum", "reuse", EXECUTION_POLICY, "Golden H2D completion-event lifetime: reuse (default) keeps the persistent per-slot event pair; one_shot_events allocates ONE fresh production event pair per H2D ticket and retires it when the slot is returned, so no completion-event object is ever reused between transfers.", choices=("reuse", "one_shot_events")),
+    "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG": _spec("COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG", "bool", False, TIMING_DIAGNOSTICS, "Diagnostic-only: in the mmap source engine, repeat each read's copy into a private anonymous buffer and report its duration, so source page-in cost can be split from destination-copy cost. Default OFF; it doubles the copied bytes and must never be enabled for production throughput."),
+    "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": _spec("COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "enum", "serial", EXECUTION_POLICY, "Golden CLIP-forward || UNET-load schedule. serial (default) keeps the exact historical ordering; overlap runs both stages concurrently on the request event loop and joins both before sampler preparation.", choices=("serial", "overlap")),
+    "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE": _spec("COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE", "enum", "serial", EXECUTION_POLICY, "Golden sampling || VAE-load schedule. serial (default) keeps the exact historical ordering; overlap starts the VAE load concurrently with sampling, joins before VAE decode, and never changes sampler math, steps, or output.", choices=("serial", "overlap")),
     "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": _spec("COMFYMODAL_V2_CRITICAL_GPU_COORDINATION", "bool", False, EXECUTION_POLICY, "Coordinate the critical GPU lane."),
     "COMFYMODAL_V2_THREAD_POLICY": _spec("COMFYMODAL_V2_THREAD_POLICY", "string", "TBASE", EXECUTION_POLICY, "Runtime thread-shape policy."),
     "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": _spec("COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST", "bool", True, EXECUTION_POLICY, "Release GPU memory after each request."),
@@ -377,6 +390,65 @@ def requested_loader(role: str, resolved: ResolvedConfig | None = None) -> str:
     raise ValueError("role must be one of: clip, unet, vae")
 
 
+_OVERLAP_SCHEDULE_CHOICES = ("serial", "overlap")
+
+
+def _resolve_overlap_schedule(
+    flag: str, value: Any, resolved: ResolvedConfig | None
+) -> str:
+    if value is not None:
+        selected = str(value).strip().lower() or "serial"
+    else:
+        config = resolve() if resolved is None else resolved
+        selected = str(config.get(flag, "serial")).strip().lower() or "serial"
+    if selected not in _OVERLAP_SCHEDULE_CHOICES:
+        raise ValueError(
+            f"invalid {flag} value {selected!r}; expected serial or overlap"
+        )
+    return selected
+
+
+def resolve_clip_unet_schedule(
+    value: Any = None, resolved: ResolvedConfig | None = None
+) -> str:
+    """Resolve the CLIP-forward || UNET-load schedule (``serial`` default)."""
+    return _resolve_overlap_schedule(
+        "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", value, resolved
+    )
+
+
+def resolve_sampling_vae_schedule(
+    value: Any = None, resolved: ResolvedConfig | None = None
+) -> str:
+    """Resolve the sampling || VAE-load schedule (``serial`` default)."""
+    return _resolve_overlap_schedule(
+        "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE", value, resolved
+    )
+
+
+def resolve_completion_event_lifetime(
+    value: Any = None, resolved: ResolvedConfig | None = None
+) -> str:
+    """Resolve the H2D completion-event lifetime (``reuse`` default).
+
+    Applies to every transport role: ``one_shot_events`` gives each H2D its own
+    freshly allocated completion event pair, retired when the slot is returned.
+    """
+    if value is not None:
+        selected = str(value).strip().lower() or "reuse"
+    else:
+        config = resolve() if resolved is None else resolved
+        selected = str(
+            config.get("COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME", "reuse")
+        ).strip().lower() or "reuse"
+    if selected not in {"reuse", "one_shot_events"}:
+        raise ValueError(
+            f"invalid completion-event lifetime {selected!r}; "
+            "expected reuse or one_shot_events"
+        )
+    return selected
+
+
 __all__ = [
     "ALLOWLIST_UNREGISTERED",
     "GOLDEN_CONTROL_FLAGS",
@@ -385,4 +457,7 @@ __all__ = [
     "reconcile",
     "requested_loader",
     "resolve",
+    "resolve_clip_unet_schedule",
+    "resolve_sampling_vae_schedule",
+    "resolve_completion_event_lifetime",
 ]

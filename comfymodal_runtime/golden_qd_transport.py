@@ -88,6 +88,10 @@ class CompletionTicket:
     byte_count: int
     completion: bool = False
     timing_consumed: bool = False
+    # Set only for a one-shot transfer, so the completion-event lifecycle can be
+    # reconciled: every H2D owns its own generation of production events.
+    production_event_generation: int | None = None
+    production_events_retired: bool = False
 
 
 class GoldenTransferResources:
@@ -112,14 +116,25 @@ class GoldenTransferResources:
         *,
         slot_count: int = DEFAULT_STAGING_SLOTS,
         slot_bytes: int = DEFAULT_BLOCK_BYTES,
+        shared_arena: bool = False,
     ) -> None:
-        if len(views) != slot_count or len(events) != slot_count:
-            raise ValueError("request transport resources require matching slots and event pairs")
+        if len(events) != slot_count:
+            raise ValueError("request transport resources require one event pair per slot")
         if slot_count < 1 or slot_bytes < 1:
             raise ValueError("request transport resource dimensions must be positive")
+        if shared_arena:
+            # Borrowed mode: the caller owns the registered staging storage
+            # (the C0 shared arena).  Only the dedicated H2D stream and the
+            # persistent per-slot event pairs are allocated here; there is no
+            # pinned host arena, and no staging views may be attached.
+            if views:
+                raise ValueError("shared-arena transport resources must not carry staging views")
+        elif len(views) != slot_count:
+            raise ValueError("request transport resources require matching slots and event pairs")
         self.slot_count = int(slot_count)
         self.slot_bytes = int(slot_bytes)
         self.arena_bytes = self.slot_count * self.slot_bytes
+        self.shared_arena = bool(shared_arena)
         self.arena = arena
         self.views = tuple(views)
         self.slot_indices = tuple(range(self.slot_count))
@@ -127,7 +142,8 @@ class GoldenTransferResources:
         self.events = tuple(events)
         self.span_events = span_events
         self._event_object_count = self.slot_count * 2 + len(self.span_events)
-        self.physical_pinned_alloc_count = 1
+        # Borrowed shared-arena resources perform no pinned host allocation.
+        self.physical_pinned_alloc_count = 0 if shared_arena else 1
         self.transport_physical_pinned_alloc_count = 0
         self.created = True
         self.closed = False
@@ -137,6 +153,15 @@ class GoldenTransferResources:
         self._active_transports = 0
         self.transport_use_count = 0
         self._next_submission_id = 0
+        # Completion-event lifetime.  ``reuse`` (default) keeps the persistent
+        # per-slot event pair.  ``one_shot_events`` allocates ONE fresh
+        # production event pair per H2D ticket and retires it when the slot is
+        # returned, so no completion-event object is ever reused between
+        # transfers.  The optional ``event_factory`` lets tests inject a fake.
+        self.completion_event_lifetime = "reuse"
+        self.production_event_allocations = 0
+        self.retired_event_allocations = 0
+        self.event_factory: Any = None
         self._span_started = False
         self._span_finished = False
         self.gpu_copy_active_sum_ms = 0.0
@@ -208,6 +233,50 @@ class GoldenTransferResources:
             slot_bytes=slot_bytes,
         )
 
+    @classmethod
+    def create_shared(
+        cls,
+        stream: Any = None,
+        *,
+        slot_count: int,
+        slot_bytes: int,
+        device: str | None = None,
+    ) -> "GoldenTransferResources":
+        """Borrow a caller-owned registered shared arena as staging storage.
+
+        Golden I/O V2 C0 uses exactly one shared, CUDA-registered arena for
+        every payload byte.  This factory therefore allocates only the
+        persistent copy resources: one dedicated H2D stream and one reusable
+        event pair per slot.  It performs **no** pinned host allocation and
+        exposes **no** staging views; the caller's ``StagingPool`` over the
+        registered arena is the only staging storage.
+        """
+        try:
+            import torch
+        except ImportError as exc:
+            raise TransportError("shared-arena transport resources require torch") from exc
+        if not torch.cuda.is_available():
+            raise TransportError("CUDA is unavailable for shared-arena transport resources")
+        dev = device or f"cuda:{torch.cuda.current_device()}"
+        h2d_stream = stream if stream is not None else torch.cuda.Stream(device=dev)
+        events = tuple(
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in range(int(slot_count))
+        )
+        span_events = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        return cls(
+            None, (), h2d_stream, events, span_events,
+            slot_count=int(slot_count),
+            slot_bytes=int(slot_bytes),
+            shared_arena=True,
+        )
+
     @property
     def event_object_count(self) -> int:
         return self._event_object_count
@@ -221,6 +290,10 @@ class GoldenTransferResources:
             raise TransportError("request transport resources are closed")
         if self._poisoned:
             raise PoolPoisonedError("request transport resources are poisoned")
+        if self.shared_arena:
+            # Borrowed resources own no staging views; the caller must provide
+            # its own pool over the registered shared arena.
+            raise TransportError("shared-arena transport resources own no staging pool")
         return StagingPool(
             self.slot_count, self.slot_bytes, capacity_class,
             buffers=self.views,
@@ -272,16 +345,53 @@ class GoldenTransferResources:
                 0.0, elapsed - self.gpu_copy_active_union_ms
             )
 
+    def set_completion_event_lifetime(self, lifetime: str) -> str:
+        """Select the per-transfer completion-event lifetime without changing geometry."""
+        selected = str(lifetime).strip().lower() or "reuse"
+        if selected not in {"reuse", "one_shot_events"}:
+            raise TransportError(
+                "completion event lifetime must be reuse or one_shot_events"
+            )
+        self.completion_event_lifetime = selected
+        return selected
+
+    def _allocate_production_events(self) -> tuple[Any, Any]:
+        """Allocate ONE fresh production event pair for this transfer.
+
+        Injected factories are honoured so tests can observe allocation and
+        retirement without CUDA.  Production uses timing-enabled CUDA events.
+        """
+        if self.event_factory is not None:
+            return self.event_factory(), self.event_factory()
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - import error path
+            raise TransportError("one-shot production events require torch") from exc
+        return (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
     def begin_ticket(self, slot_index: int, byte_count: int) -> CompletionTicket:
         if slot_index in self._active_tickets:
             raise TransportError("staging slot event is still in use")
         if not 0 <= int(slot_index) < self.slot_count:
             raise TransportError("invalid request staging slot")
         self._next_submission_id += 1
-        start, end = self.events[int(slot_index)]
-        ticket = CompletionTicket(int(slot_index), self._next_submission_id, start, end, int(byte_count))
+        if self.completion_event_lifetime == "one_shot_events":
+            # One fresh completion event pair for THIS H2D; never reused.
+            start, end = self._allocate_production_events()
+            production_generation = self._next_submission_id
+            self.production_event_allocations += 2
+        else:
+            start, end = self.events[int(slot_index)]
+            production_generation = None
+        ticket = CompletionTicket(
+            int(slot_index), self._next_submission_id, start, end, int(byte_count),
+            production_event_generation=production_generation,
+        )
         self._active_tickets[int(slot_index)] = ticket
-        if self._next_submission_id > self.slot_count:
+        if production_generation is None and self._next_submission_id > self.slot_count:
             self.event_rerecord_count += 2
         return ticket
 
@@ -319,6 +429,13 @@ class GoldenTransferResources:
         if self._active_tickets.get(ticket.slot_index) is not ticket:
             raise TransportError("completion ticket is stale")
         self._active_tickets.pop(ticket.slot_index, None)
+        if ticket.production_event_generation is not None and not ticket.production_events_retired:
+            # Retire THIS transfer's one-shot event objects.  They are never
+            # reused by a later H2D; dropping the references lets them be freed.
+            ticket.production_events_retired = True
+            self.retired_event_allocations += 2
+            ticket.start_event = None
+            ticket.end_event = None
 
     def telemetry(self) -> dict[str, Any]:
         timing_available = (
@@ -336,13 +453,17 @@ class GoldenTransferResources:
             "arena_bytes": self.arena_bytes,
             "slot_count": self.slot_count,
             "slot_bytes": self.slot_bytes,
+            "shared_arena": self.shared_arena,
+            "shared_arena_staging": self.shared_arena,
             "request_physical_pinned_alloc_count": self.physical_pinned_alloc_count,
             "pinned_arena_physical_allocation_count": self.physical_pinned_alloc_count,
-            "pinned_arena_physical_allocation_bytes": self.arena_bytes,
+            "pinned_arena_physical_allocation_bytes": (
+                0 if self.shared_arena else self.arena_bytes
+            ),
             "logical_slot_count": self.slot_count,
             "logical_slot_bytes": self.slot_bytes,
             "transport_physical_pinned_alloc_count": (
-                1 if self.transport_use_count == 1 else 0
+                0 if self.shared_arena else (1 if self.transport_use_count == 1 else 0)
             ),
             "created_vs_reused": "CREATED" if self.transport_use_count <= 1 else "REUSED",
             "dedicated_h2d_stream_count": 1,
@@ -352,7 +473,12 @@ class GoldenTransferResources:
             "cuda_end_event_object_count": self.slot_count,
             "event_rerecord_count": self.event_rerecord_count,
             "cuda_event_rerecord_count": self.event_rerecord_count,
-            "fresh_cuda_event_per_copy_count": 0,
+            "fresh_cuda_event_per_copy_count": int(
+                self.production_event_allocations // 2
+            ),
+            "completion_event_lifetime": self.completion_event_lifetime,
+            "production_event_allocations": int(self.production_event_allocations),
+            "retired_event_allocations": int(self.retired_event_allocations),
             "h2d_submit_count": self.h2d_submit_count,
             "h2d_completion_count": self.h2d_completion_count,
             "GPU_COPY_ACTIVE_SUM_MS": active_sum,
@@ -714,6 +840,15 @@ class StageLease:
     def filled_bytes(self) -> int:
         return self._filled
 
+    @property
+    def declared_range(self) -> SourceRange | None:
+        """The canonical source/destination extent declared for this lease.
+
+        C0 child-fill relies on this to carry the absolute destination offset
+        and source identity without exposing the raw staging buffer.
+        """
+        return self._declared_range
+
     def fill(self, payload: bytes | bytearray | memoryview) -> None:
         data = memoryview(payload)
         if len(data) > self._pool.block_bytes:
@@ -849,6 +984,11 @@ class StagingPool:
         self.block_bytes = block_bytes
         self.capacity_class = capacity_class
         self.backing_buffer = backing_buffer
+        # Golden I/O Process V2: when set to a CPU uint8 tensor over the
+        # CUDA-registered shared backing, the dispatcher H2Ds directly from
+        # ``backing[destination_offset:...]`` instead of from a filled slot.
+        # The slots remain lifecycle/ticket tokens only; no payload is copied.
+        self.v2_source_backing: Any = None
         self._meta = threading.RLock()
         self._available = threading.Condition(self._meta)
         self._slots = [
@@ -1006,6 +1146,23 @@ class StagingPool:
             if slot.state != SlotState.READY or not lease._producer_retired:
                 raise LeaseError("only a retired ready lease can be submitted")
             slot.state = SlotState.IN_FLIGHT
+
+    def _v2_dispatch_source(self, record: ReadyRecord, nbytes: int) -> Any:
+        """Return the registered-backing slice for a V2 record, or None.
+
+        The slice is indexed by payload offset (``destination_offset``), which is
+        exactly where the CUDA-sterile child wrote the model bytes.  Returning a
+        zero-copy view keeps the canonical H2D destination/event/ticket path and
+        removes the shared->pinned staging copy entirely.
+        """
+        backing = self.v2_source_backing
+        if backing is None:
+            return None
+        start = int(record.destination_offset)
+        end = start + int(nbytes)
+        if start < 0 or end > len(backing):
+            raise ReconciliationError("V2 backing slice is out of bounds")
+        return backing[start:end]
 
     def _buffer_for_dispatch(self, lease: StageLease, nbytes: int) -> Any:
         with self._meta:
@@ -2203,11 +2360,15 @@ class TransportDispatcher:
                     with self._lease_cleanup_lock:
                         for member in submission.leases:
                             self.pool._mark_in_flight(member)
-                        source = (
-                            self.pool._buffer_for_dispatch_group(submission.leases, submission.byte_count)
-                            if len(submission.leases) > 1
-                            else self.pool._buffer_for_dispatch(lease, record.nbytes)
-                        )
+                        v2_source = self.pool._v2_dispatch_source(record, submission.byte_count)
+                        if v2_source is not None:
+                            source = v2_source
+                        else:
+                            source = (
+                                self.pool._buffer_for_dispatch_group(submission.leases, submission.byte_count)
+                                if len(submission.leases) > 1
+                                else self.pool._buffer_for_dispatch(lease, record.nbytes)
+                            )
                     submit_ns = time.monotonic_ns()
                     actual_h2d_token = None
                     if self.telemetry.actual_source is not None:
@@ -2743,9 +2904,15 @@ class GoldenQDTransport:
             # Do not catch TypeError here: it may be raised after a reader has
             # already touched the target. Retrying through another API would
             # turn one physical source read into an unaccounted duplicate.
+            # Golden I/O V2 C0 child-fill is lease-aware: the reader needs the
+            # slot/generation/declared range to write the exact leased arena
+            # slot.  Prefer that explicit seam over the raw target/offset form.
+            lease_reader = getattr(reader, "readinto_lease", None)
             bound_actual_source = getattr(reader, "actual_source_telemetry", None)
             handles_actual_source = getattr(reader, "handles_actual_source_telemetry", False) is True
-            if handles_actual_source and bound_actual_source is not None:
+            if callable(lease_reader):
+                count = lease_reader(lease, view, offset, producer_id)
+            elif handles_actual_source and bound_actual_source is not None:
                 count = reader.readinto(view, offset, producer_id)
             elif telemetry.actual_source is not None:
                 count = telemetry.actual_source.readinto(
@@ -2980,7 +3147,18 @@ class GoldenQDTransport:
             raise error
         handles_actual_source = getattr(read_source, "handles_actual_source_telemetry", False) is True
         bound_actual_source = getattr(read_source, "actual_source_telemetry", None)
-        if handles_actual_source:
+        if self.pool.v2_source_backing is not None:
+            # Golden I/O Process V2: the CUDA-sterile child already filled the
+            # registered backing, so the parent performs NO physical source
+            # read.  Leave actual-source telemetry unset rather than fabricating
+            # physical syscall events for the parent.
+            self.telemetry.actual_source = None
+        elif getattr(read_source, "child_owned_physical_reads", False) is True:
+            # Golden I/O V2 C0: the CUDA-sterile child performs the positioned
+            # source reads directly into the leased shared slots.  The parent
+            # records no physical source syscall of its own.
+            self.telemetry.actual_source = None
+        elif handles_actual_source:
             if not isinstance(bound_actual_source, ActualSourceTelemetry):
                 close_errors = self._close_source()
                 error = ReconciliationError(
