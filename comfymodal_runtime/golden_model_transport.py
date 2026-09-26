@@ -321,7 +321,6 @@ class GoldenModelTransport:
             self.prepare_cpu()
             if self._cuda_ready:
                 return self.lifecycle_telemetry(reused=True)
-            assert self.staging is not None
             import torch
 
             if not torch.cuda.is_available():
@@ -345,6 +344,7 @@ class GoldenModelTransport:
                 }
                 self._cuda_ready = True
                 return self.lifecycle_telemetry(reused=False)
+            assert self.staging is not None
             lib = source_race_gpu._load_driver()
             current = ctypes.c_void_p()
             source_race_gpu._check(lib["cuCtxGetCurrent"](ctypes.byref(current)), "cuCtxGetCurrent")
