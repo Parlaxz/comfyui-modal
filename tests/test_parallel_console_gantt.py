@@ -73,6 +73,17 @@ def test_gantt_tolerates_missing_stages_and_transports():
     text.encode("ascii")
 
 
+def test_gantt_shows_external_restore_lead_in():
+    text = render_parallel_console_gantt(
+        {"golden_clip_load": (0, 1000)},
+        external_restore_ms=1906.9,
+        external_snapshot_ms=1484.5,
+    )
+    assert "external restore: 1906.9ms" in text
+    assert "platform snapshot 1484.5ms" in text
+    text.encode("ascii")
+
+
 def test_gantt_empty_without_closed_intervals():
     assert "no closed stage intervals" in render_parallel_console_gantt({})
     assert "no closed stage intervals" in render_parallel_console_gantt(

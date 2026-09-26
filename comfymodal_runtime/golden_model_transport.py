@@ -461,6 +461,38 @@ def _summarize_cpu_windows(windows: Any) -> dict[str, Any]:
     return out
 
 
+def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
+    """Report C0 arena establishment cost (Part 4 restore decomposition).
+
+    Reads already-recorded SharedArenaRing fields; performs no I/O and no
+    synchronization.  The arena is ensured once per container (at restore);
+    later loads reread the same establishment evidence.
+    """
+    def _get(name: str, default: Any = None) -> Any:
+        try:
+            return getattr(runtime, name, default)
+        except BaseException:
+            return default
+
+    start_ns = _get("child_start_ns")
+    ready_ns = _get("child_ready_ns")
+    detail: dict[str, Any] = {
+        "arena_bytes": _get("size_bytes"),
+        "slot_count": _get("slot_count"),
+        "slot_bytes": _get("slot_bytes"),
+        "backing_create_ms": _get("backing_create_ms"),
+        "register_ms": _get("register_ms"),
+        "registered": _get("registered"),
+        "child_pid": _get("child_pid"),
+        "child_startup_ms": (
+            (ready_ns - start_ns) / 1e6
+            if isinstance(start_ns, int) and isinstance(ready_ns, int)
+            and ready_ns >= start_ns else None
+        ),
+    }
+    return detail
+
+
 def summarize_c0_reader(source: Any) -> dict[str, Any]:
     """Summarize one load's C0 reader evidence (Stages A-D measurement).
 
@@ -1077,6 +1109,7 @@ class GoldenModelTransport:
             # per-window arrays ride only the explicit window-trace selector.
             source_detail: dict[str, Any] = {
                 "transport_geometry": str(geo["name"]),
+                "arena_ensure": arena_ensure_detail(self._c0_runtime),
                 "reader": summarize_c0_reader(source),
                 "dispatcher": summarize_dispatcher(dispatcher),
             }

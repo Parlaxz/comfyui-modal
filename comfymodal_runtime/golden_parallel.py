@@ -245,10 +245,19 @@ async def golden_parallel_execute(
                         and _end >= _entry
                     ):
                         _gantt_intervals[str(_name)] = (_entry, _end)
+                _gantt_ext = (
+                    getattr(session.recorder, "_external_restore", None) or {}
+                )
                 _gantt_text = render_parallel_console_gantt(
                     _gantt_intervals,
                     transports=list(getattr(session, "model_transport_records", None) or []),
                     arch="c0_parallel/m2_exact_window",
+                    external_restore_ms=(
+                        _gantt_ext.get("restore_total_ms") if isinstance(_gantt_ext, dict) else None
+                    ),
+                    external_snapshot_ms=(
+                        _gantt_ext.get("snapshot_restore_ms") if isinstance(_gantt_ext, dict) else None
+                    ),
                 )
                 print(_gantt_text, flush=True)
                 session.recorder.event("golden_parallel_gantt", gantt=_gantt_text)

@@ -1327,6 +1327,8 @@ def render_parallel_console_gantt(
     transports: Sequence[Mapping[str, Any]] | None = None,
     arch: str = "",
     width: int = _PARALLEL_CONSOLE_GANTT_WIDTH,
+    external_restore_ms: Any = None,
+    external_snapshot_ms: Any = None,
 ) -> str:
     """Render one compact ASCII Gantt for a Golden Parallel request.
 
@@ -1385,6 +1387,13 @@ def render_parallel_console_gantt(
         header += f" arch={arch}"
     header += arena_note
     lines = [header]
+    restore_ms = _parallel_gantt_ms(external_restore_ms)
+    snapshot_ms = _parallel_gantt_ms(external_snapshot_ms)
+    if restore_ms is not None:
+        lead = f"external restore: {restore_ms:.1f}ms (pre-method, observation-only)"
+        if snapshot_ms is not None:
+            lead += f" [platform snapshot {snapshot_ms:.1f}ms]"
+        lines.append(lead)
     for stage_name, label in PARALLEL_CONSOLE_GANTT_ORDER:
         bounds = spans.get(stage_name)
         if bounds is None:

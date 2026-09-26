@@ -292,6 +292,30 @@ def test_summarize_cpu_windows_reports_deltas():
     assert _summarize_cpu_windows({})["per_pid"] == {}
 
 
+def test_arena_ensure_detail_reports_establishment_cost():
+    from comfymodal_runtime.golden_model_transport import arena_ensure_detail
+
+    class FakeRuntime:
+        size_bytes = 536870912
+        slot_count = 8
+        slot_bytes = 67108864
+        backing_create_ms = 12.5
+        register_ms = 44.0
+        registered = True
+        child_pid = 66
+        child_start_ns = 1_000_000_000
+        child_ready_ns = 1_300_000_000
+
+    detail = arena_ensure_detail(FakeRuntime())
+
+    assert detail["arena_bytes"] == 536870912
+    assert detail["backing_create_ms"] == 12.5
+    assert detail["register_ms"] == 44.0
+    assert detail["child_startup_ms"] == pytest.approx(300.0)
+    assert arena_ensure_detail(None)["arena_bytes"] is None
+    assert arena_ensure_detail(object())["child_startup_ms"] is None
+
+
 def test_summarize_dispatcher_tolerates_missing_telemetry():
     summary = summarize_dispatcher(object())
 
