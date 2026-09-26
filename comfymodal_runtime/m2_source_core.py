@@ -352,6 +352,12 @@ def _persistent_reader_load(
     staging: dict[str, Any],
     fd_cache: collections.OrderedDict,
     fd_cache_limit: int,
+    ownership: Any,
+    completed: Any,
+    failed: Any,
+    scheduler_lock: Any,
+    last_start: Any,
+    pacer_lock: Any,
 ) -> dict[str, Any]:
     if _LIBC is None:
         raise RuntimeError("libc_unavailable")
@@ -374,54 +380,109 @@ def _persistent_reader_load(
     slot_len = staging["slot_len"][reader_id]
     slots = int(staging["slots"])
     lane_base = int(staging["seg_base"]) + reader_id * int(staging["lane_bytes"])
-    sequence = 0
+    lane_ranges = [tuple(int(value) for value in bounds) for bounds in request["lane_ranges"]]
+    total_blocks = int(request["total_blocks"])
+    min_launch_gap_ns = int(request["min_launch_gap_ns"])
+    own_start, own_end = lane_ranges[reader_id]
+    cursor = own_start
     first_enter = 0
     last_exit = 0
     bytes_read = 0
+    affinity_breaks = 0
+    idle_wait_ns = 0
     records: list[dict[str, int]] = []
-    for block_id in request["block_ids"]:
-        block_id = int(block_id)
+    while True:
+        wait_started = time.perf_counter_ns()
+        block_id = -1
+        with scheduler_lock:
+            if int(failed.value):
+                raise RuntimeError("persistent_reader_peer_failed")
+            if int(completed.value) >= total_blocks:
+                break
+            while cursor < own_end:
+                candidate = cursor
+                cursor += 1
+                if int(ownership[candidate]) == 0:
+                    block_id = candidate
+                    break
+            if block_id < 0:
+                for lane, (start, end) in enumerate(lane_ranges):
+                    if lane == reader_id:
+                        continue
+                    for candidate in range(start, end):
+                        if int(ownership[candidate]) == 0:
+                            block_id = candidate
+                            affinity_breaks += 1
+                            break
+                    if block_id >= 0:
+                        break
+            if block_id >= 0:
+                ownership[block_id] = 1
+        if block_id < 0:
+            idle_wait_ns += time.perf_counter_ns() - wait_started
+            time.sleep(0.0002)
+            continue
+
         length = min(read_bytes, data_bytes - block_id * read_bytes)
         if length <= 0:
             raise RuntimeError(f"persistent_reader_block_out_of_range:{block_id}")
-        while sequence - int(consumed.value) >= slots:
-            if int(staging["alive"].value) == 0:
-                raise RuntimeError("persistent_reader_staging_stopped")
-            time.sleep(0.0001)
         destination_offset = block_id * read_bytes
         absolute_offset = source_offset + destination_offset
         window_start = absolute_offset & ~(_PAGE - 1)
         window_len = ((absolute_offset + length - window_start + _PAGE - 1) // _PAGE) * _PAGE
+        claim_ns, gate_wait_ns = _alloc_gate(
+            pacer_lock, last_start, min_launch_gap_ns, time.perf_counter_ns
+        )
+        map_started = time.perf_counter_ns()
         window = int(_LIBC.mmap(
             None, window_len, _PROT_READ, _MAP_PRIVATE, fd, window_start
         ))
+        map_ns = time.perf_counter_ns() - map_started
         if window in (0, -1) or window == 0xFFFFFFFFFFFFFFFF:
             raise OSError(f"persistent_mmap_failed errno={_ct.get_errno()}")
-        entered = int(time.perf_counter_ns())
         try:
+            sequence = int(published.value)
+            while sequence - int(consumed.value) >= slots:
+                if int(staging["alive"].value) == 0:
+                    raise RuntimeError("persistent_reader_staging_stopped")
+                if int(failed.value):
+                    raise RuntimeError("persistent_reader_peer_failed")
+                time.sleep(0.0001)
+            if int(failed.value):
+                raise RuntimeError("persistent_reader_peer_failed")
+            slot = sequence % slots
+            slot_off[slot] = destination_offset
+            slot_len[slot] = length
+            entered = int(time.perf_counter_ns())
             _LIBC.memcpy(
-                lane_base + (sequence % slots) * read_bytes,
+                lane_base + slot * read_bytes,
                 window + absolute_offset - window_start,
                 length,
             )
+            exited = int(time.perf_counter_ns())
+            # Publish as soon as memcpy completes so H2D can overlap munmap.
+            published.value = sequence + 1
         finally:
+            unmap_started = time.perf_counter_ns()
             _LIBC.munmap(window, window_len)
-        exited = int(time.perf_counter_ns())
+            unmap_ns = time.perf_counter_ns() - unmap_started
         if first_enter == 0:
             first_enter = entered
         last_exit = exited
-        slot = sequence % slots
-        slot_off[slot] = destination_offset
-        slot_len[slot] = length
-        published.value = sequence + 1
-        sequence += 1
         bytes_read += length
+        with scheduler_lock:
+            ownership[block_id] = 2
+            completed.value = int(completed.value) + 1
         records.append({
             "block_id": block_id,
             "offset": destination_offset,
             "length": length,
+            "gate_claim_ns": int(claim_ns),
+            "gate_wait_ns": int(gate_wait_ns),
+            "map_ns": int(map_ns),
             "enter_ns": entered,
             "exit_ns": exited,
+            "unmap_ns": int(unmap_ns),
         })
     return {
         "reader": int(reader_id),
@@ -432,6 +493,8 @@ def _persistent_reader_load(
         "read_count": len(records),
         "read_bytes": bytes_read,
         "fd_cache_hit": fd_cache_hit,
+        "affinity_breaks": affinity_breaks,
+        "idle_wait_ns": idle_wait_ns,
         "records": records,
     }
 
@@ -441,6 +504,12 @@ def persistent_reader_main(
     command_conn: Any,
     staging: dict[str, Any],
     fd_cache_limit: int = 4,
+    ownership: Any = None,
+    completed: Any = None,
+    failed: Any = None,
+    scheduler_lock: Any = None,
+    last_start: Any = None,
+    pacer_lock: Any = None,
 ) -> None:
     """Run one CUDA-sterile reader for the lifetime of the container."""
     fd_cache: collections.OrderedDict = collections.OrderedDict()
@@ -466,9 +535,25 @@ def persistent_reader_main(
                 continue
             try:
                 payload = _persistent_reader_load(
-                    reader_id, request, staging, fd_cache, fd_cache_limit
+                    reader_id,
+                    request,
+                    staging,
+                    fd_cache,
+                    fd_cache_limit,
+                    ownership,
+                    completed,
+                    failed,
+                    scheduler_lock,
+                    last_start,
+                    pacer_lock,
                 )
             except BaseException as exc:
+                if failed is not None:
+                    if scheduler_lock is None:
+                        failed.value = 1
+                    else:
+                        with scheduler_lock:
+                            failed.value = 1
                 payload = {
                     "reader": int(reader_id),
                     "pid": int(os.getpid()),

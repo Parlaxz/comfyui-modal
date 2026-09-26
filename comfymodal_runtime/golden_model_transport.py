@@ -10,9 +10,9 @@ import json
 import multiprocessing as mp
 import os
 import struct
+import sys
 import threading
 import time
-import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,9 +23,14 @@ QD = 4
 BLOCK_BYTES = 64 * 1024 * 1024
 STAGING_SLOTS = 1
 STAGING_BYTES = QD * BLOCK_BYTES
+MIN_LAUNCH_GAP_NS = 4_000_000
+MAX_SOURCE_BLOCKS = 65_536
+DESTINATION_RESERVE_FRACTION = 0.30
+DESTINATION_ALIGNMENT = 256
 LAYOUT_CACHE_LIMIT = 3
 FD_CACHE_LIMIT = 4
 TRANSFER_TIMEOUT_S = 300.0
+ABORT_TIMEOUT_S = 5.0
 
 DTYPE_NAMES = {
     "F64": "float64", "F32": "float32", "F16": "float16", "BF16": "bfloat16",
@@ -45,13 +50,30 @@ class SafetensorsLayout:
     tensor_map: tuple[dict[str, Any], ...]
 
 
+@dataclass
+class _GpuDestinationSlot:
+    tensor: Any
+    capacity_bytes: int
+    reserved: bool
+    active_lease: Any = None
+    use_count: int = 0
+
+
 class GpuAllocationLease:
     """An explicit active lease over one reusable generic CUDA allocation."""
 
-    def __init__(self, pool: "GpuDestinationPool", tensor: Any, capacity: int, reused: bool):
+    def __init__(
+        self,
+        pool: "GpuDestinationPool",
+        slot: _GpuDestinationSlot,
+        required_bytes: int,
+        reused: bool,
+    ):
         self._pool = pool
-        self._tensor = tensor
-        self.capacity_bytes = int(capacity)
+        self._slot = slot
+        self._tensor = slot.tensor
+        self.capacity_bytes = int(slot.capacity_bytes)
+        self.required_bytes = int(required_bytes)
         self.reused = bool(reused)
         self.released = False
 
@@ -88,48 +110,94 @@ class GpuAllocationLease:
 class GpuDestinationPool:
     def __init__(self, device: str):
         self.device = str(device)
-        self._leases: list[GpuAllocationLease] = []
+        self._slots: list[_GpuDestinationSlot] = []
         self._lock = threading.Lock()
+        self.reserve_count = 0
+        self.reserve_ms = 0.0
         self.growth_count = 0
         self.growth_ms = 0.0
+
+    @staticmethod
+    def _allocate(device: str, capacity_bytes: int) -> Any:
+        import torch
+
+        with torch.cuda.device(device):
+            return getattr(torch, "empty")(
+                int(capacity_bytes), dtype=getattr(torch, "uint8"), device=device
+            )
+
+    def reserve(self, capacities: list[int]) -> None:
+        capacities = [int(value) for value in capacities if int(value) > 0]
+        if not capacities:
+            return
+        started = time.perf_counter()
+        slots = [
+            _GpuDestinationSlot(
+                tensor=self._allocate(self.device, capacity),
+                capacity_bytes=capacity,
+                reserved=True,
+            )
+            for capacity in capacities
+        ]
+        with self._lock:
+            self._slots.extend(slots)
+            self.reserve_count += len(slots)
+            self.reserve_ms += (time.perf_counter() - started) * 1000.0
 
     def acquire(self, required_bytes: int) -> GpuAllocationLease:
         required_bytes = int(required_bytes)
         if required_bytes < 1:
             raise ValueError("gpu_destination_bytes_must_be_positive")
         with self._lock:
-            for lease in self._leases:
-                if not lease.released and lease._tensor is not None:
-                    continue
-                if lease.capacity_bytes >= required_bytes:
-                    lease.released = False
-                    lease.reused = True
-                    return lease
-        import torch
+            candidates = [
+                slot
+                for slot in self._slots
+                if slot.active_lease is None and slot.capacity_bytes >= required_bytes
+            ]
+            if candidates:
+                slot = min(candidates, key=lambda candidate: candidate.capacity_bytes)
+                lease = GpuAllocationLease(self, slot, required_bytes, reused=True)
+                slot.active_lease = lease
+                slot.use_count += 1
+                return lease
 
-        started = time.perf_counter()
-        with torch.cuda.device(self.device):
-            tensor = getattr(torch, "empty")(required_bytes, dtype=getattr(torch, "uint8"), device=self.device)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        lease = GpuAllocationLease(self, tensor, required_bytes, reused=False)
-        with self._lock:
-            self._leases.append(lease)
+            started = time.perf_counter()
+            tensor = self._allocate(self.device, required_bytes)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            slot = _GpuDestinationSlot(
+                tensor=tensor,
+                capacity_bytes=required_bytes,
+                reserved=False,
+                use_count=1,
+            )
+            lease = GpuAllocationLease(self, slot, required_bytes, reused=False)
+            slot.active_lease = lease
+            self._slots.append(slot)
             self.growth_count += 1
             self.growth_ms += elapsed_ms
         return lease
 
     def release(self, lease: GpuAllocationLease) -> None:
-        if lease not in self._leases:
-            raise RuntimeError("gpu_allocation_lease_unknown")
+        with self._lock:
+            slot = lease._slot
+            if not any(candidate is slot for candidate in self._slots) or slot.active_lease is not lease:
+                raise RuntimeError("gpu_allocation_lease_unknown")
+            slot.active_lease = None
 
     def telemetry(self) -> dict[str, Any]:
         with self._lock:
-            capacities = [int(lease.capacity_bytes) for lease in self._leases]
-            active = sum(1 for lease in self._leases if not lease.released)
+            capacities = [int(slot.capacity_bytes) for slot in self._slots]
+            active = sum(1 for slot in self._slots if slot.active_lease is not None)
+            reserved = sum(
+                int(slot.capacity_bytes) for slot in self._slots if slot.reserved
+            )
         return {
             "allocation_count": len(capacities),
             "active_lease_count": active,
             "capacity_bytes": sum(capacities),
+            "reserved_capacity_bytes": reserved,
+            "destination_reserve_count": self.reserve_count,
+            "destination_reserve_ms": self.reserve_ms,
             "destination_growth_count": self.growth_count,
             "destination_growth_ms": self.growth_ms,
         }
@@ -175,6 +243,26 @@ def _file_identity(path: str) -> tuple[int, int, int, int]:
         int(stat_result.st_size),
         int(getattr(stat_result, "st_mtime_ns", 0)),
     )
+
+
+def _sticky_lane_ranges(total_blocks: int, qd: int = QD) -> tuple[tuple[int, int], ...]:
+    base, extra = divmod(int(total_blocks), int(qd))
+    cursor = 0
+    ranges: list[tuple[int, int]] = []
+    for lane in range(int(qd)):
+        count = base + (1 if lane < extra else 0)
+        ranges.append((cursor, cursor + count))
+        cursor += count
+    return tuple(ranges)
+
+
+def _destination_reserve_capacities(free_bytes: int, total_bytes: int) -> tuple[int, ...]:
+    available = min(int(free_bytes), int(total_bytes))
+    budget = int(available * DESTINATION_RESERVE_FRACTION)
+    unit = (budget // 6 // DESTINATION_ALIGNMENT) * DESTINATION_ALIGNMENT
+    if unit < DESTINATION_ALIGNMENT:
+        return ()
+    return (3 * unit, 2 * unit, unit)
 
 
 def _parse_layout(path: str, identity: tuple[int, int, int, int]) -> SafetensorsLayout:
@@ -239,22 +327,19 @@ class GoldenModelTransport:
             raise ValueError("GoldenModelTransport geometry is fixed at QD4/64MiB")
         self.qd = QD
         self.block_bytes = BLOCK_BYTES
-        self.staging_slots = (
-            2
-            if (
-                str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
-                in {"1", "true", "yes", "on"}
-                and str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY") or "").strip().lower()
-                == "qd4_64"
-            )
-            else STAGING_SLOTS
-        )
+        self.staging_slots = STAGING_SLOTS
         self.staging_bytes = self.qd * self.staging_slots * self.block_bytes
-        self.staging_backing = "posix" if self.staging_slots > 1 else "anonymous"
+        self.staging_backing = "anonymous"
         self.staging: dict[str, Any] | None = None
         self._ctx: Any = None
         self._children: list[Any] = []
         self._connections: list[Any] = []
+        self._ownership: Any = None
+        self._completed: Any = None
+        self._failed: Any = None
+        self._scheduler_lock: Any = None
+        self._last_start: Any = None
+        self._pacer_lock: Any = None
         self._prepared = False
         self._cuda_ready = False
         self._cuda: dict[str, Any] = {}
@@ -262,16 +347,9 @@ class GoldenModelTransport:
         self._layout_cache: collections.OrderedDict[str, SafetensorsLayout] = collections.OrderedDict()
         self._models_generation = ""
         self._generation = 0
+        self._reader_done: set[int] = set()
         self._lock = threading.RLock()
         self._pool: GpuDestinationPool | None = None
-        self._c0_runtime: Any = None
-        self._c0_resources: Any = None
-        self._c0_enabled = (
-            str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
-            in {"1", "true", "yes", "on"}
-            and str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE") or "").strip().lower()
-            == "mmap_fresh"
-        )
         self._load_count = 0
         self._closed = False
         self._poisoned = False
@@ -284,11 +362,13 @@ class GoldenModelTransport:
         with self._lock:
             if self._prepared:
                 return self.lifecycle_telemetry(reused=True)
-            if self._c0_enabled:
-                self._prepared = True
-                return self.lifecycle_telemetry(reused=False)
             if os.name == "nt" or "fork" not in mp.get_all_start_methods():
                 raise RuntimeError("persistent_m2_requires_fork")
+            torch_module = sys.modules.get("torch")
+            cuda_module = getattr(torch_module, "cuda", None)
+            is_initialized = getattr(cuda_module, "is_initialized", None)
+            if callable(is_initialized) and is_initialized():
+                raise RuntimeError("persistent_m2_readers_must_fork_before_cuda")
             self._ctx = mp.get_context("fork")
             self.staging = source_race_gpu.build_staging(
                 self.qd,
@@ -297,11 +377,28 @@ class GoldenModelTransport:
                 prefault=False,
                 backing=self.staging_backing,
             )
+            self._ownership = self._ctx.Array("b", MAX_SOURCE_BLOCKS, lock=False)
+            self._completed = self._ctx.Value("i", 0, lock=False)
+            self._failed = self._ctx.Value("i", 0, lock=False)
+            self._scheduler_lock = self._ctx.Lock()
+            self._last_start = self._ctx.Value("q", 0)
+            self._pacer_lock = self._last_start.get_lock()
             for reader_id in range(self.qd):
                 parent_conn, child_conn = self._ctx.Pipe(duplex=True)
                 process = self._ctx.Process(
                     target=m2_source_core.persistent_reader_main,
-                    args=(reader_id, child_conn, self.staging, FD_CACHE_LIMIT),
+                    args=(
+                        reader_id,
+                        child_conn,
+                        self.staging,
+                        FD_CACHE_LIMIT,
+                        self._ownership,
+                        self._completed,
+                        self._failed,
+                        self._scheduler_lock,
+                        self._last_start,
+                        self._pacer_lock,
+                    ),
                     daemon=True,
                 )
                 process.start()
@@ -328,23 +425,12 @@ class GoldenModelTransport:
                 raise RuntimeError("cuda_unavailable")
             device_index = int(torch.cuda.current_device())
             target = device or f"cuda:{device_index}"
-            if self._c0_enabled:
-                from . import golden_io_process_v2 as c0
-                from . import golden_qd_transport as qd_transport
-                self._c0_runtime = c0.ensure_arena_runtime()
-                self._c0_resources = qd_transport.GoldenTransferResources.create_shared(
-                    slot_count=int(self._c0_runtime.slot_count),
-                    slot_bytes=int(self._c0_runtime.slot_bytes),
-                    device=target,
+            target_device = getattr(torch, "device")(target)
+            target_index = device_index if target_device.index is None else int(target_device.index)
+            if target_device.type != "cuda" or target_index != device_index:
+                raise RuntimeError(
+                    f"persistent_transport_device_mismatch:{target}!={device_index}"
                 )
-                self._pool = GpuDestinationPool(target)
-                self._cuda = {
-                    "device": target,
-                    "device_index": device_index,
-                    "c0": True,
-                }
-                self._cuda_ready = True
-                return self.lifecycle_telemetry(reused=False)
             assert self.staging is not None
             lib = source_race_gpu._load_driver()
             current = ctypes.c_void_p()
@@ -386,6 +472,8 @@ class GoldenModelTransport:
             }
             self._event_pool = events
             self._pool = GpuDestinationPool(target)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(target_index)
+            self._pool.reserve(list(_destination_reserve_capacities(free_bytes, total_bytes)))
             self._cuda_ready = True
             return self.lifecycle_telemetry(reused=False)
 
@@ -426,8 +514,6 @@ class GoldenModelTransport:
         return self._load_sync(path)
 
     def _load_sync(self, path: str) -> LoadedSafetensors:
-        if self._c0_enabled:
-            return self._load_canonical_m2_sync(path)
         started_ns = time.perf_counter_ns()
         with self._lock:
             if self._poisoned:
@@ -443,16 +529,32 @@ class GoldenModelTransport:
             layout = self.inspect(path)
             layout_end_ns = time.perf_counter_ns()
             total_blocks = (layout.data_bytes + self.block_bytes - 1) // self.block_bytes
-            lanes = [[] for _ in range(self.qd)]
-            for block_id in range(total_blocks):
-                lanes[block_id % self.qd].append(block_id)
+            if total_blocks > MAX_SOURCE_BLOCKS:
+                raise RuntimeError(
+                    f"persistent_source_block_capacity_exceeded:{total_blocks}>{MAX_SOURCE_BLOCKS}"
+                )
+            lane_ranges = _sticky_lane_ranges(total_blocks, self.qd)
+            assert self._ownership is not None
+            assert self._completed is not None
+            assert self._failed is not None
+            assert self._scheduler_lock is not None
+            assert self._last_start is not None
+            assert self._pacer_lock is not None
             self._generation += 1
             generation = self._generation
+            self._reader_done.clear()
             for lane in range(self.qd):
                 staging["published"][lane].value = 0
                 staging["consumed"][lane].value = 0
+            with self._scheduler_lock:
+                for block_id in range(total_blocks):
+                    self._ownership[block_id] = 0
+                self._completed.value = 0
+                self._failed.value = 0
+            with self._pacer_lock:
+                self._last_start.value = 0
             identity = tuple(int(value) for value in layout.identity)
-            for reader_id, connection in enumerate(self._connections):
+            for connection in self._connections:
                 connection.send({
                     "command": "LOAD",
                     "generation": generation,
@@ -461,32 +563,36 @@ class GoldenModelTransport:
                     "source_offset": layout.data_start,
                     "data_bytes": layout.data_bytes,
                     "read_bytes": self.block_bytes,
-                    "block_ids": lanes[reader_id],
+                    "total_blocks": total_blocks,
+                    "lane_ranges": lane_ranges,
+                    "min_launch_gap_ns": MIN_LAUNCH_GAP_NS,
                 })
 
-            allocation_future = None
-            allocation_executor = None
-            if self._pool is not None:
-                from concurrent.futures import ThreadPoolExecutor
-                allocation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="golden-destination")
-                allocation_future = allocation_executor.submit(self._pool.acquire, layout.data_bytes)
-            self._cuda["lib"]["cuCtxSetCurrent"](self._cuda["ctx"])
+            owner = None
+            growth_ms_before = self._pool.growth_ms
+            source_race_gpu._check(
+                self._cuda["lib"]["cuCtxSetCurrent"](self._cuda["ctx"]),
+                "cuCtxSetCurrent",
+            )
             try:
-                result = self._copy_until_complete(layout, generation, allocation_future)
-            except BaseException:
-                self._abort_transfer(generation)
-                if allocation_future is not None:
-                    try:
-                        allocation_future.result().release_storage()
-                    except BaseException:
-                        pass
+                owner = self._pool.acquire(layout.data_bytes)
+                result = self._copy_until_complete(layout, generation, owner)
+            except BaseException as exc:
+                try:
+                    self._abort_transfer(generation)
+                except BaseException as abort_exc:
+                    add_note = getattr(exc, "add_note", None)
+                    if callable(add_note):
+                        add_note(f"transport_abort_failed:{type(abort_exc).__name__}:{abort_exc}")
+                if owner is not None:
+                    owner.release_storage()
                 self._poisoned = True
                 raise
-            finally:
-                if allocation_executor is not None:
-                    allocation_executor.shutdown(wait=True)
-            owner = result["owner"]
-            views = self._views(owner.gpu_tensor, layout.tensor_map)
+            try:
+                views = self._views(owner.gpu_tensor, layout.tensor_map)
+            except BaseException:
+                owner.release_storage()
+                raise
             finished_ns = time.perf_counter_ns()
             source_start_ns = result["source_start_ns"]
             source_end_ns = result["source_end_ns"]
@@ -511,6 +617,8 @@ class GoldenModelTransport:
                 "h2d_submitted_bytes": layout.data_bytes,
                 "h2d_completed_bytes": layout.data_bytes,
                 "source_wall_ms": source_wall_ms,
+                "source_child_wall_ms": source_wall_ms,
+                "source_fill_wall_ms": None,
                 "qd_source_io_wall_ms": source_wall_ms,
                 "source_gbps": source_gbps,
                 "coverage": {
@@ -532,19 +640,20 @@ class GoldenModelTransport:
                     "copies_complete": True,
                     "operation_live": False,
                 },
-                "reader_pool_reused": self._load_count > 0,
+                "reader_pool_reused": True,
                 "staging_reused": True,
-                "host_registration_reused": self._load_count > 0,
-                "cuda_stream_reused": self._load_count > 0,
+                "host_registration_reused": True,
+                "cuda_stream_reused": True,
                 "destination_reused": bool(owner.reused),
-                "transport_runtime_reused": self._load_count > 0,
+                "transport_runtime_reused": True,
                 "layout_cache_hit": bool(layout_cache_hit),
                 "fd_cache_hit": bool(result["fd_cache_hit"]),
+                "source_scheduler": result["source_scheduler"],
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "source_go_offset_ms": (source_start_ns - started_ns) / 1e6 if source_start_ns else None,
                 "gpu_ready_wall_ms": (last_h2d_ns - started_ns) / 1e6 if last_h2d_ns else None,
                 "gpu_ready_tail_ms": (last_h2d_ns - source_end_ns) / 1e6 if last_h2d_ns and source_end_ns else None,
-                "destination_growth_ms": self._pool.growth_ms if self._pool else None,
+                "destination_growth_ms": self._pool.growth_ms - growth_ms_before,
                 "new_capacity_bytes": owner.capacity_bytes if not owner.reused else None,
                 "total_load_ms": (finished_ns - started_ns) / 1e6,
                 "source": {
@@ -552,231 +661,58 @@ class GoldenModelTransport:
                     "source_last_exit_ns": source_end_ns,
                     "readers": result["readers"],
                 },
-                "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
-            }
-            self._load_count += 1
-            return LoadedSafetensors(layout.path, views, owner, layout, stats)
-
-    def _load_canonical_m2_sync(self, path: str) -> LoadedSafetensors:
-        """Use the proven mmap/process source arm for the mmap selector.
-
-        The historical C0 selector routes ``mmap_fresh`` through the canonical
-        M2 loader so source children fork before CUDA setup.  Keep that routing
-        at the generic transport boundary instead of entering the slower
-        per-fill C0 arena dispatcher.
-        """
-        with self._lock:
-            if self._poisoned:
-                raise RuntimeError("persistent_model_transport_poisoned")
-            normalized_path = os.path.abspath(str(path))
-            layout_cache_hit = normalized_path in self._layout_cache
-            layout = self.inspect(path)
-            from .production_m2_loader import load_m2_safetensors
-
-            try:
-                loaded = load_m2_safetensors(path)
-            except BaseException as exc:
-                raise RuntimeError(
-                    "canonical_m2_load_failed:\n" + traceback.format_exc()
-                ) from exc
-            source = dict(loaded.get("source") or {})
-            raw_stats = dict(loaded.get("stats") or {})
-            timing = dict(loaded.get("timing") or {})
-            source_wall_ms = raw_stats.get("source_wall_ms")
-            stats = {
-                **raw_stats,
-                "execution_arm": "m2_mmap_process",
-                "source_engine": "m2_mmap_process",
-                "source_child_wall_ms": source_wall_ms,
-                "source_fill_wall_ms": None,
-                "c0_arena_created": False,
-                "layout_cache_hit": bool(layout_cache_hit),
-                "fd_cache_hit": False,
-                "transport_runtime_reused": False,
-                "reader_pool_reused": False,
-                "staging_reused": False,
-                "host_registration_reused": False,
-                "cuda_stream_reused": False,
-                "destination_reused": False,
-                "source": source,
-                "gpu_ready_wall_ms": timing.get("gpu_ready_wall_ms"),
-                "gpu_ready_tail_ms": timing.get("exposed_h2d_tail_ms"),
-                "total_load_ms": timing.get("loader_wall_ms"),
-            }
-            self._load_count += 1
-            return LoadedSafetensors(
-                layout.path,
-                loaded["sd"],
-                loaded["owner"],
-                layout,
-                stats,
-            )
-
-    def _load_c0_sync(self, path: str) -> LoadedSafetensors:
-        started_ns = time.perf_counter_ns()
-        with self._lock:
-            if self._poisoned:
-                raise RuntimeError("persistent_model_transport_poisoned")
-            self.prepare_cpu()
-            self.initialize_cuda()
-            assert self._pool is not None
-            assert self._c0_runtime is not None
-            assert self._c0_resources is not None
-            from . import golden_qd_transport as qd_transport
-
-            normalized_path = os.path.abspath(str(path))
-            layout_cache_hit = normalized_path in self._layout_cache
-            layout_started_ns = time.perf_counter_ns()
-            layout = self.inspect(path)
-            layout_end_ns = time.perf_counter_ns()
-            owner = self._pool.acquire(layout.data_bytes)
-            backend = qd_transport.CudaTransferBackend(
-                owner.gpu_tensor, resources=self._c0_resources
-            )
-            config = qd_transport.TransportConfig(
-                queue_depth=QD,
-                block_bytes=BLOCK_BYTES,
-                staging_slots=int(self._c0_runtime.slot_count),
-                ready_queue_capacity=int(self._c0_runtime.slot_count),
-                producer_workers=QD,
-                capacity_class="c0-qd4-64m",
-                h2d_target_bytes=BLOCK_BYTES,
-                aggregation_enabled=False,
-            )
-            pool = self._c0_runtime.new_stage_pool()
-            dispatcher = qd_transport.GoldenQDTransport(
-                config,
-                backend,
-                arm="static_e27",
-                pool=pool,
-                diagnostics=False,
-                resources=self._c0_resources,
-            )
-            ranges = []
-            block_id = 0
-            offset = layout.data_start
-            remaining = layout.data_bytes
-            while remaining > 0:
-                length = min(BLOCK_BYTES, remaining)
-                ranges.append(
-                    qd_transport.SourceRange(
-                        offset,
-                        length,
-                        block_id * BLOCK_BYTES,
-                        block_id,
-                    )
-                )
-                block_id += 1
-                offset += length
-                remaining -= length
-            source = self._c0_runtime.stage_reader(
-                role="model",
-                pool=pool,
-                source=layout.path,
-            )
-            result = dispatcher.execute(
-                ranges,
-                source,
-                destination_size=layout.data_bytes,
-                materialize_output=False,
-                parse_count=1,
-                owner=owner,
-                owner_count=1,
-                adoption_result="transport_backing_pending",
-            )
-            dispatcher.snapshot_quiescence()
-            views = self._views(owner.gpu_tensor, layout.tensor_map)
-            child_start_ns = int(getattr(source, "first_child_read_start_mono_ns", 0) or 0)
-            child_end_ns = int(getattr(source, "last_child_read_end_mono_ns", 0) or 0)
-            source_child_wall_ms = (
-                (child_end_ns - child_start_ns) / 1e6
-                if child_start_ns and child_end_ns and child_end_ns >= child_start_ns
-                else None
-            )
-            source_fill_wall_ms = float(getattr(source, "fill_wall_ns", 0) or 0) / 1e6
-            source_wall_ms = source_child_wall_ms or source_fill_wall_ms
-            source_gbps = (
-                layout.data_bytes / ((source_wall_ms / 1000.0) * 1e9)
-                if source_wall_ms > 0 else None
-            )
-            finished_ns = time.perf_counter_ns()
-            stats = {
-                "status": "ok",
-                "source_engine": "c0_mmap_fresh_shared_arena",
-                "execution_arm": "m2_mmap_process",
-                "c0_arena_created": False,
-                "source_read_count": int(getattr(source, "fills", 0) or len(ranges)),
-                "source_read_bytes": layout.data_bytes,
-                "bytes_read": layout.data_bytes,
-                "gpu_bytes": layout.data_bytes,
-                "h2d_submitted_bytes": int(result.submitted_bytes),
-                "h2d_completed_bytes": int(result.completed_bytes),
-                "source_wall_ms": source_wall_ms,
-                "source_child_wall_ms": source_child_wall_ms,
-                "source_fill_wall_ms": source_fill_wall_ms,
-                "qd_source_io_wall_ms": source_wall_ms,
-                "source_gbps": source_gbps,
-                "coverage": {
-                    "ok": int(result.completed_bytes) == layout.data_bytes,
-                    "covers_entire_file_exactly_once": int(result.completed_bytes) == layout.data_bytes,
-                    "source_bytes": layout.data_bytes,
-                    "source_blocks": len(ranges),
-                },
-                "h2d_coverage": {
-                    "ok": int(result.completed_bytes) == layout.data_bytes,
-                    "bytes": int(result.completed_bytes),
-                    "blocks": len(result.records),
-                },
-                "fallback": {"count": 0, "reason": None},
-                "quiescence": {
-                    "workers_joined": False,
-                    "reader_pool_persistent": True,
-                    "h2d_events_waited": True,
-                    "copies_complete": True,
-                    "operation_live": False,
-                },
-                "reader_pool_reused": self._load_count > 0,
-                "staging_reused": True,
-                "host_registration_reused": self._load_count > 0,
-                "cuda_stream_reused": self._load_count > 0,
-                "destination_reused": bool(owner.reused),
-                "transport_runtime_reused": self._load_count > 0,
-                "layout_cache_hit": bool(layout_cache_hit),
-                "fd_cache_hit": bool(getattr(source, "fd_reuse_count", 0)),
-                "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
-                "source_go_offset_ms": (int(getattr(source, "first_source_read_start_mono_ns", 0) or 0) - started_ns) / 1e6,
-                "gpu_ready_wall_ms": (finished_ns - started_ns) / 1e6,
-                "gpu_ready_tail_ms": None,
-                "destination_growth_ms": self._pool.growth_ms,
-                "new_capacity_bytes": owner.capacity_bytes if not owner.reused else None,
-                "total_load_ms": (finished_ns - started_ns) / 1e6,
-                "source": {
-                    "source_first_enter_ns": getattr(source, "first_child_read_start_mono_ns", None),
-                    "source_last_exit_ns": getattr(source, "last_child_read_end_mono_ns", None),
-                    "readers": [],
-                },
-                "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
+                "transport_lifecycle": self.lifecycle_telemetry(reused=True),
             }
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
     def _abort_transfer(self, generation: int) -> None:
+        if self._failed is not None:
+            if self._scheduler_lock is None:
+                self._failed.value = 1
+            else:
+                with self._scheduler_lock:
+                    self._failed.value = 1
         if self.staging is not None:
             for lane in range(self.qd):
                 self.staging["consumed"][lane].value = int(self.staging["published"][lane].value)
-        deadline = time.monotonic() + 30.0
-        for reader_id, connection in enumerate(self._connections):
-            while time.monotonic() < deadline:
-                if connection.poll(0.05):
-                    message = connection.recv()
-                    if (
-                        message.get("command") != "LOAD_DONE"
-                        or int(message.get("generation", -1)) != generation
-                    ):
-                        raise RuntimeError(f"persistent_reader_abort_protocol:{reader_id}")
-                    break
+        outstanding = {
+            reader_id
+            for reader_id in range(self.qd)
+            if reader_id not in self._reader_done
+        }
+        deadline = time.monotonic() + ABORT_TIMEOUT_S
+        while outstanding and time.monotonic() < deadline:
+            for reader_id in tuple(outstanding):
+                process = self._children[reader_id]
+                if not process.is_alive():
+                    outstanding.remove(reader_id)
+                    continue
+                connection = self._connections[reader_id]
+                if not connection.poll(0.05):
+                    continue
+                message = connection.recv()
+                if (
+                    message.get("command") != "LOAD_DONE"
+                    or int(message.get("generation", -1)) != generation
+                ):
+                    raise RuntimeError(f"persistent_reader_abort_protocol:{reader_id}")
+                self._reader_done.add(reader_id)
+                outstanding.remove(reader_id)
+        if outstanding:
+            for reader_id in outstanding:
+                process = self._children[reader_id]
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1.0)
+            raise RuntimeError(f"persistent_reader_abort_timeout:{sorted(outstanding)}")
 
-    def _copy_until_complete(self, layout: SafetensorsLayout, generation: int, allocation_future: Any) -> dict[str, Any]:
+    def _copy_until_complete(
+        self,
+        layout: SafetensorsLayout,
+        generation: int,
+        owner: GpuAllocationLease,
+    ) -> dict[str, Any]:
         assert self.staging is not None
         staging = self.staging
         lib = self._cuda["lib"]
@@ -789,19 +725,12 @@ class GoldenModelTransport:
         first_source = 0
         last_source = 0
         last_h2d = 0
-        fd_cache_hit = False
         deadline = time.monotonic() + TRANSFER_TIMEOUT_S
         h2d_ranges: list[tuple[int, int]] = []
-        if allocation_future is None:
-            raise RuntimeError("persistent_destination_missing")
-        try:
-            owner = allocation_future.result(timeout=TRANSFER_TIMEOUT_S)
-        except TypeError:
-            owner = allocation_future.result()
         destination_ptr = int(owner.gpu_tensor.data_ptr())
 
         def collect_done() -> None:
-            nonlocal first_source, last_source, fd_cache_hit
+            nonlocal first_source, last_source
             for reader_id, connection in enumerate(self._connections):
                 if reader_id in done or not connection.poll():
                     continue
@@ -809,6 +738,7 @@ class GoldenModelTransport:
                 if message.get("command") != "LOAD_DONE" or int(message.get("generation", -1)) != generation:
                     raise RuntimeError("persistent_reader_completion_generation_mismatch")
                 done[reader_id] = message
+                self._reader_done.add(reader_id)
                 if message.get("status") != "ok":
                     raise RuntimeError(f"persistent_reader_failed:{message.get('error')}")
                 enter = int(message.get("first_enter_ns") or 0)
@@ -817,8 +747,6 @@ class GoldenModelTransport:
                     first_source = enter if not first_source else min(first_source, enter)
                 if exit_ns:
                     last_source = max(last_source, exit_ns)
-                if message.get("fd_cache_hit"):
-                    fd_cache_hit = True
 
         def complete_oldest() -> None:
             nonlocal last_h2d
@@ -839,6 +767,13 @@ class GoldenModelTransport:
                 raise RuntimeError(
                     f"persistent_transport_timeout:done={len(done)}/{self.qd}:pending={len(pending)}"
                 )
+            dead_readers = [
+                reader_id
+                for reader_id, process in enumerate(self._children)
+                if not process.is_alive()
+            ]
+            if dead_readers:
+                raise RuntimeError(f"persistent_reader_process_died:{dead_readers}")
             collect_done()
             issued = False
             for lane in range(self.qd):
@@ -896,14 +831,33 @@ class GoldenModelTransport:
         source_read_count = len(source_records)
         if source_read_count != total_blocks:
             raise RuntimeError("persistent_source_coverage_count_mismatch")
+        claims = sorted(int(record["gate_claim_ns"]) for record in source_records)
+        claim_gaps_ms = [
+            (claims[index] - claims[index - 1]) / 1e6
+            for index in range(1, len(claims))
+        ]
+        if claim_gaps_ms and min(claim_gaps_ms) < MIN_LAUNCH_GAP_NS / 1e6:
+            raise RuntimeError("persistent_source_launch_gap_violation")
         return {
             "owner": owner,
             "source_start_ns": first_source,
             "source_end_ns": last_source,
             "last_h2d_ns": last_h2d,
             "source_read_count": source_read_count,
-            "fd_cache_hit": fd_cache_hit,
+            "fd_cache_hit": bool(done) and all(
+                bool(message.get("fd_cache_hit")) for message in done.values()
+            ),
             "readers": done,
+            "source_scheduler": {
+                "selfservice": True,
+                "sticky_lanes": True,
+                "lane_ranges": [list(bounds) for bounds in _sticky_lane_ranges(total_blocks)],
+                "affinity_breaks": sum(
+                    int(message.get("affinity_breaks") or 0) for message in done.values()
+                ),
+                "configured_min_gap_ms": MIN_LAUNCH_GAP_NS / 1e6,
+                "observed_min_global_claim_gap_ms": min(claim_gaps_ms) if claim_gaps_ms else None,
+            },
         }
 
     @staticmethod
@@ -927,7 +881,7 @@ class GoldenModelTransport:
         return result
 
     def lifecycle_telemetry(self, *, reused: bool) -> dict[str, Any]:
-        return {
+        result = {
             "transport_runtime_reused": bool(reused),
             "reader_pool_reused": bool(reused and self._prepared),
             "staging_reused": bool(self.staging is not None),
@@ -935,8 +889,14 @@ class GoldenModelTransport:
             "cuda_stream_reused": bool(reused and self._cuda_ready),
             "event_pool_size": len(self._event_pool),
             "staging_bytes": self.staging_bytes,
+            "source_qd": self.qd,
+            "source_block_bytes": self.block_bytes,
+            "source_min_launch_gap_ms": MIN_LAUNCH_GAP_NS / 1e6,
             "models_generation": self._models_generation,
         }
+        if self._pool is not None:
+            result["destination_pool"] = self._pool.telemetry()
+        return result
 
     def release_lease(self, owner: Any) -> None:
         if self._pool is not None and getattr(owner, "_pool", None) is self._pool:
@@ -957,19 +917,11 @@ class GoldenModelTransport:
                     process.terminate()
                     process.join(timeout=5.0)
             if self._cuda_ready:
-                if self._c0_runtime is not None:
-                    try:
-                        self._c0_resources.close()
-                    except BaseException:
-                        pass
-                    try:
-                        from . import golden_io_process_v2 as c0
-                        c0.close_runtime()
-                    except BaseException:
-                        pass
-                    self._closed = True
-                    return
                 lib = self._cuda["lib"]
+                source_race_gpu._check(
+                    lib["cuCtxSetCurrent"](self._cuda["ctx"]),
+                    "cuCtxSetCurrent",
+                )
                 for event in self._event_pool:
                     lib["cuEventDestroy_v2"](event)
                 lib["cuStreamDestroy_v2"](self._cuda["stream"])

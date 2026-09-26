@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tools.v2_control import cli
 from tools.v2_control.golden_payload import _golden_p1_request_payload
 
@@ -12,20 +14,24 @@ ROOT = Path(__file__).resolve().parents[1]
 PARALLEL_SOURCE = ROOT / "comfymodal_runtime" / "golden_parallel.py"
 SERIAL_SOURCE = ROOT / "comfymodal_runtime" / "golden_serial.py"
 HARNESS_SOURCE = ROOT / "tools" / "benchmark_v2_direct.py"
+M2_PROFILE = ROOT / "config" / "v2" / "profiles" / "golden_p1_parallel_m2clip_h100.toml"
+MODEL_TRANSPORT_SOURCE = ROOT / "comfymodal_runtime" / "golden_model_transport.py"
+
+pytestmark = pytest.mark.fast_unit
 
 
 def _config(profile: str):
     return cli.build_components(ROOT, profile)[3]
 
 
-def test_parallel_profile_selects_distinct_method_mode_and_sage_default():
+def test_parallel_profile_selects_distinct_method_mode_and_comfy_kitchen_backend():
     config = _config("golden_p1_parallel")
     assert config.target.method == "run_golden_parallel_stream"
     assert config.target.app == "batch-r0-golden-parallel-ops"
     assert cli._benchmark_mode(config) == "golden_p1_parallel"
     attention = config.flag("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND")
     assert attention is not None
-    assert attention.value == "sage"
+    assert attention.value == "comfy_kitchen"
     assert cli.golden_method_for_profile(config.profile_name) == config.target.method
 
 
@@ -49,6 +55,30 @@ def test_parallel_orchestrator_overlaps_independent_model_stages():
     assert "_resolve_clip_unet_schedule" in source
     assert "_resolve_sampling_vae_schedule" in source
     assert "GoldenSerialRunner" not in source
+
+
+def test_parallel_m2_profile_keeps_overlap_and_excludes_c0_dispatcher_flags():
+    profile = M2_PROFILE.read_text(encoding="utf-8")
+    transport = MODEL_TRANSPORT_SOURCE.read_text(encoding="utf-8")
+    serial = SERIAL_SOURCE.read_text(encoding="utf-8")
+    config = _config("golden_p1_parallel_m2clip_h100")
+    clip_loader = config.flag("COMFYMODAL_GOLDEN_CLIP_LOADER")
+    model_transport = config.flag("COMFYMODAL_GOLDEN_MODEL_TRANSPORT")
+
+    assert config.target.method == "run_golden_parallel_stream"
+    assert clip_loader is not None and clip_loader.value == "m2"
+    assert model_transport is not None and str(model_transport.value).lower() in {"1", "true"}
+    assert 'COMFYMODAL_GOLDEN_CLIP_LOADER = "m2"' in profile
+    assert 'COMFYMODAL_GOLDEN_MODEL_TRANSPORT = "1"' in profile
+    assert 'COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE = "overlap"' in profile
+    assert 'COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE = "overlap"' in profile
+    assert "COMFYMODAL_GOLDEN_IO_PROCESS_V2" not in profile
+    assert "_load_canonical_m2_sync" not in transport
+    assert "_load_c0_sync" not in transport
+    assert "load_m2_safetensors" not in transport
+    assert "transport.load_sync(path)" in serial
+    assert "shared_transport.load(unet_path)" in serial
+    assert 'model_transport.load(session.model_paths["vae"])' in serial
 
 
 def test_serial_entrypoint_and_parallel_entrypoint_are_distinct():

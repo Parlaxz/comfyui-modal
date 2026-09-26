@@ -7,6 +7,7 @@ import pytest
 
 from comfymodal_runtime.production_m2_loader import (
     build_header_tensor_map,
+    load_m2_safetensors,
     parse_safetensors_header,
 )
 
@@ -47,3 +48,36 @@ def test_parse_header_rejects_overlapping_ranges(tmp_path):
 
     with pytest.raises(ValueError, match="overlapping_tensor_ranges"):
         parse_safetensors_header(str(path))
+
+
+def test_m2_adapter_delegates_one_way_to_supplied_transport():
+    class Transport:
+        def __init__(self):
+            self.paths = []
+
+        def load_sync(self, path):
+            self.paths.append(path)
+            return type("Loaded", (), {
+                "views": {"weight": object()},
+                "owner": object(),
+                "stats": {
+                    "total_load_ms": 12.0,
+                    "source_wall_ms": 10.0,
+                    "gpu_ready_wall_ms": 11.0,
+                    "gpu_ready_tail_ms": 1.0,
+                    "source": {"readers": 4},
+                },
+                "layout": type("Layout", (), {
+                    "tensor_map": ({"key": "weight"},),
+                    "data_start": 64,
+                    "data_bytes": 128,
+                })(),
+            })()
+
+    transport = Transport()
+    loaded = load_m2_safetensors("model.safetensors", transport=transport)
+
+    assert transport.paths == ["model.safetensors"]
+    assert loaded["status"] == "ok"
+    assert loaded["data_bytes"] == 128
+    assert loaded["timing"]["loader_wall_ms"] == 12.0
