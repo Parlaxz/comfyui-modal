@@ -11383,7 +11383,13 @@ async def golden_clip_load(
             if _golden_model_transport_enabled():
                 transport_record = {
                     "path": os.path.basename(str(path)),
+                    "execution_architecture": stats.get("execution_architecture"),
+                    "execution_arm": stats.get("execution_arm"),
+                    "source_engine": stats.get("source_engine"),
+                    "h2d_engine": stats.get("h2d_engine"),
+                    "c0_arena_bytes": stats.get("c0_arena_bytes"),
                     "c0_arena_created": stats.get("c0_arena_created", False),
+                    "c0_arena_reused": stats.get("c0_arena_reused"),
                     "layout_cache_hit": stats.get("layout_cache_hit"),
                     "fd_cache_hit": stats.get("fd_cache_hit"),
                     "transport_runtime_reused": stats.get("transport_runtime_reused"),
@@ -13106,7 +13112,13 @@ async def golden_unet_load(
             }
             transport_record = {
                 "path": os.path.basename(str(unet_path)),
+                "execution_architecture": loaded.stats.get("execution_architecture"),
+                "execution_arm": loaded.stats.get("execution_arm"),
+                "source_engine": loaded.stats.get("source_engine"),
+                "h2d_engine": loaded.stats.get("h2d_engine"),
+                "c0_arena_bytes": loaded.stats.get("c0_arena_bytes"),
                 "c0_arena_created": loaded.stats.get("c0_arena_created", False),
+                "c0_arena_reused": loaded.stats.get("c0_arena_reused"),
                 **{
                     key: loaded.stats.get(key)
                     for key in (

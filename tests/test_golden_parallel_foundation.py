@@ -57,7 +57,11 @@ def test_parallel_orchestrator_overlaps_independent_model_stages():
     assert "GoldenSerialRunner" not in source
 
 
-def test_parallel_m2_profile_keeps_overlap_and_excludes_c0_dispatcher_flags():
+def test_parallel_c0_profile_keeps_overlap_and_selects_c0_shared_arena():
+    # FAST C0 contract: the 12-CPU parallel profile routes CLIP/UNET/VAE
+    # through the shared transport, and the transport must resolve to the C0
+    # shared arena (512 MiB, streaming, frozen exact-window mmap engine) --
+    # never to a standalone M2 execution arm.
     profile = M2_PROFILE.read_text(encoding="utf-8")
     transport = MODEL_TRANSPORT_SOURCE.read_text(encoding="utf-8")
     serial = SERIAL_SOURCE.read_text(encoding="utf-8")
@@ -66,16 +70,28 @@ def test_parallel_m2_profile_keeps_overlap_and_excludes_c0_dispatcher_flags():
     model_transport = config.flag("COMFYMODAL_GOLDEN_MODEL_TRANSPORT")
 
     assert config.target.method == "run_golden_parallel_stream"
+    assert config.resources.cpu == 12
     assert clip_loader is not None and clip_loader.value == "m2"
     assert model_transport is not None and str(model_transport.value).lower() in {"1", "true"}
     assert 'COMFYMODAL_GOLDEN_CLIP_LOADER = "m2"' in profile
     assert 'COMFYMODAL_GOLDEN_MODEL_TRANSPORT = "1"' in profile
     assert 'COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE = "overlap"' in profile
     assert 'COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE = "overlap"' in profile
-    assert "COMFYMODAL_GOLDEN_IO_PROCESS_V2" not in profile
+    # C0 shared-arena selectors (deploy-baked): streaming + exact-window mmap
+    # engine + treatment geometry over the registered POSIX backing.
+    assert 'COMFYMODAL_GOLDEN_IO_PROCESS_V2 = "1"' in profile
+    assert 'COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING = "posix"' in profile
+    assert 'COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING = "1"' in profile
+    assert 'COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE = "mmap_fresh"' in profile
+    assert 'COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY = "qd4_64"' in profile
+    assert 'COMFYMODAL_GOLDEN_C0_HOST_REGISTER = "1"' in profile
+    # The C0 dispatch lives inside the transport; the standalone M2 loader
+    # wrapper must not be reachable from it.
+    assert "_load_c0_sync" in transport
     assert "_load_canonical_m2_sync" not in transport
-    assert "_load_c0_sync" not in transport
     assert "load_m2_safetensors" not in transport
+    assert '"execution_architecture": "c0_parallel"' in transport
+    assert '"source_engine": "m2_exact_window"' in transport
     assert "transport.load_sync(path)" in serial
     assert "shared_transport.load(unet_path)" in serial
     assert 'model_transport.load(session.model_paths["vae"])' in serial

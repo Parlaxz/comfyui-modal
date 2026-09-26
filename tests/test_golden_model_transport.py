@@ -75,8 +75,12 @@ def test_transport_load_is_role_neutral_and_path_driven():
 
 
 def test_transport_geometry_is_fixed_to_proven_m2_contract(monkeypatch):
-    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "1")
-    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY", "qd4_64")
+    for key in (
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING",
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE",
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
     transport = GoldenModelTransport()
 
@@ -87,7 +91,44 @@ def test_transport_geometry_is_fixed_to_proven_m2_contract(monkeypatch):
     )
     assert transport.staging_bytes == STAGING_BYTES == 256 * 1024 * 1024
     assert transport.staging_backing == "anonymous"
-    assert not hasattr(transport, "_c0_enabled")
+    assert transport._c0_enabled is False
+
+
+def test_c0_streaming_with_exact_window_engine_selects_shared_arena(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "1")
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "mmap_fresh")
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY", "qd4_64")
+
+    transport = GoldenModelTransport()
+
+    assert transport._c0_enabled is True
+    # C0 prepare is a cheap no-op: no fork, no staging build, no CUDA work.
+    telemetry = transport.prepare_cpu()
+    assert transport._prepared is True
+    assert transport.staging is None
+    assert transport._children == []
+    assert telemetry["transport_runtime_reused"] is False
+
+
+def test_c0_streaming_without_exact_window_engine_fails_closed(monkeypatch):
+    # Half-armed C0 selection must not silently run the M2 execution arm.
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "1")
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", raising=False)
+
+    with pytest.raises(RuntimeError, match="c0_streaming_requires_mmap_fresh"):
+        GoldenModelTransport()
+
+
+def test_c0_identity_is_c0_parallel_not_m2_arm():
+    import inspect as _inspect
+
+    source = _inspect.getsource(GoldenModelTransport._load_c0_sync)
+    assert '"execution_architecture": "c0_parallel"' in source
+    assert '"source_engine": "m2_exact_window"' in source
+    assert '"c0_arena_bytes"' in source
+    assert "m2_mmap_process" not in source
+    assert "load_m2_safetensors" not in source
+    assert "build_staging" not in source
 
 
 def test_sticky_lanes_are_contiguous_and_cover_every_block_once():

@@ -699,7 +699,7 @@ consumed_at = "method_entry"
 change_requires = "deploy"
 owner = "golden-io-process-v2"
 enum_values = ["c0", "m2"]
-description = "Select the Golden CLIP transport; M2 replaces only CLIP source/H2D while Golden adoption remains authoritative."
+description = "Select the Golden CLIP transport entry; the shared transport resolves to the C0 shared arena (C0 execution body, exact-window mmap source kernel) when C0 streaming is selected, and Golden adoption remains authoritative."
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_MODEL_TRANSPORT"
@@ -708,7 +708,7 @@ default = "0"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "golden-model-transport"
-description = "Enable the persistent role-neutral M2 model transport shared by CLIP and UNET."
+description = "Enable the persistent role-neutral shared model transport for CLIP and UNET; it runs the C0 shared arena (never a standalone M2 execution arm) when C0 streaming with the exact-window engine is selected."
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
