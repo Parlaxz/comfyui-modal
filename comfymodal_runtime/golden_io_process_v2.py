@@ -34,6 +34,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -3133,6 +3134,32 @@ def _format_child_ready_failure(ready: Any) -> str:
     return (prefix + text)[:_C0_CHILD_READY_FAILURE_LIMIT]
 
 
+def write_c0_child_source_file(source: str) -> str:
+    """Materialize the C0 child program to a content-hashed file.
+
+    The child program outgrew the kernel single-argument limit for
+    ``python -c`` spawn (MAX_ARG_STRLEN = 131072 bytes); passing it as argv
+    fails the launch closed.  A content-hashed file in the temp dir makes
+    spawn independent of program size while staying reproducible: identical
+    source always maps to the same path, and argv indexing is unchanged
+    (``sys.argv[1:]`` are the arena arguments either way).  Write failures
+    raise; there is deliberately no silent ``-c`` fallback.
+    """
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), f"comfymodal_c0_child_{digest}.py")
+    try:
+        with open(path, "rb") as handle:
+            if handle.read() == source.encode("utf-8"):
+                return path
+    except FileNotFoundError:
+        pass
+    tmp_path = path + f".tmp-{os.getpid()}"
+    with open(tmp_path, "wb") as handle:
+        handle.write(source.encode("utf-8"))
+    os.replace(tmp_path, path)
+    return path
+
+
 class SharedArenaRing:
     """Parent-owned 512 MiB POSIX arena + persistent CUDA-sterile filler child.
 
@@ -3389,9 +3416,13 @@ class SharedArenaRing:
                 self.preadv_sickness_invocation_id or ""
             )
         self.child_start_ns = time.monotonic_ns()
+        # Spawn from a content-hashed file, never ``python -c``: the child
+        # program exceeds the kernel single-argument size limit, so argv
+        # spawn fails the launch closed.  argv indexing is unchanged.
+        child_source_path = write_c0_child_source_file(_C0_CHILD_SOURCE)
         self._proc = subprocess.Popen(
             [
-                sys.executable, "-c", _C0_CHILD_SOURCE,
+                sys.executable, child_source_path,
                 str(self._shm.name), str(self.size_bytes),
                 str(self.slot_count), str(self.slot_bytes), str(C0_SOURCE_WORKERS),
             ],
@@ -4703,6 +4734,10 @@ class C0StageReader:
         self._mmap_read_records: list[dict] = []
         self._mmap_minflt: list[int] = []
         self._mmap_majflt: list[int] = []
+        self._mmap_ru_utime_ns: list[int] = []
+        self._mmap_ru_stime_ns: list[int] = []
+        self._mmap_sched_run_ns: list[int] = []
+        self._mmap_sched_wait_ns: list[int] = []
         self._mmap_reader_pids: set[int] = set()
         # FIRST_FILL vs REUSED_SLOT split.  The parent classifies every fill
         # from its own slot-fill counter: the first touch of a slot
@@ -4921,6 +4956,10 @@ class C0StageReader:
             ("_mmap_pipe_rtt_ns", "mmap_pipe_rtt_ns"),
             ("_mmap_minflt", "mmap_minflt"),
             ("_mmap_majflt", "mmap_majflt"),
+            ("_mmap_ru_utime_ns", "mmap_ru_utime_ns"),
+            ("_mmap_ru_stime_ns", "mmap_ru_stime_ns"),
+            ("_mmap_sched_run_ns", "mmap_sched_run_ns"),
+            ("_mmap_sched_wait_ns", "mmap_sched_wait_ns"),
         ):
             _value = source.get(_key)
             if _is_plain_int(_value):
@@ -4931,6 +4970,8 @@ class C0StageReader:
             returned = source.get("returned_bytes")
             if all(_is_plain_int(value) for value in (copy_start, copy_end, returned)):
                 self._mmap_read_records.append({
+                    "producer_id": int(producer_id),
+                    "reader_pid": source.get("reader_pid"),
                     "copy_start_ns": int(copy_start),
                     "copy_end_ns": int(copy_end),
                     "returned_bytes": int(returned),
@@ -7657,6 +7698,29 @@ def _mmap_fault_counters():
         return None, None
 
 
+def _mmap_cpu_counters():
+    # (utime_ns, stime_ns) CPU totals for this process, or (None, None).
+    # Same getrusage family as the fault counters; measurement only.
+    try:
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return int(ru.ru_utime * 1e9), int(ru.ru_stime * 1e9)
+    except BaseException:
+        return None, None
+
+
+def _mmap_schedstat_counters():
+    # (run_ns, wait_ns) from Linux /proc/self/schedstat, or (None, None).
+    # Best-effort deschedule evidence for Stage D CPU analysis; never fails.
+    try:
+        with open("/proc/self/schedstat", "r", encoding="ascii") as handle:
+            parts = handle.read().split()
+        if len(parts) < 2:
+            return None, None
+        return int(parts[0]), int(parts[1])
+    except BaseException:
+        return None, None
+
+
 def _mmap_reader_fill(req):
     base = {
         "request_id": req.get("request_id"),
@@ -7778,6 +7842,12 @@ def _mmap_reader_fill(req):
             _mmap_libc.munmap(win, window_len)
             unmap_end_ns = time.monotonic_ns()
         faults_after = _mmap_fault_counters()
+        # Passive CPU/scheduling attribution for this reader process, taken
+        # from the same getrusage call family as the fault counters plus
+        # best-effort Linux schedstat run/wait deltas.  Measurement only:
+        # no scheduling decisions are made from these values.
+        cpu_utime_ns, cpu_stime_ns = _mmap_cpu_counters()
+        sched_run_ns, sched_wait_ns = _mmap_schedstat_counters()
         read_end_ns = unmap_end_ns
         minflt = None
         majflt = None
@@ -7835,6 +7905,10 @@ def _mmap_reader_fill(req):
              "source_end_offset": int(offset + length),
             "mmap_minflt": minflt,
             "mmap_majflt": majflt,
+            "mmap_ru_utime_ns": cpu_utime_ns,
+            "mmap_ru_stime_ns": cpu_stime_ns,
+            "mmap_sched_run_ns": sched_run_ns,
+            "mmap_sched_wait_ns": sched_wait_ns,
             "mmap_memcpy_warm_ns": warm_ns,
             "mmap_memcpy_shm_warm_ns": shm_warm_ns,
             "mmap_frozen_copy_ns": frozen_copy_ns,
@@ -8811,6 +8885,7 @@ __all__ = [
     "C0StageReader",
     "C0LiveSampler",
     "SharedArenaRing",
+    "write_c0_child_source_file",
     "C0_LIVE_SAMPLER_ENV",
     "c0_live_sampler_enabled",
     "parse_mountinfo_line",
