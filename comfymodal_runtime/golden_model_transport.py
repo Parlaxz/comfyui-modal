@@ -426,7 +426,7 @@ class GoldenModelTransport:
 
     def _load_sync(self, path: str) -> LoadedSafetensors:
         if self._c0_enabled:
-            return self._load_c0_sync(path)
+            return self._load_canonical_m2_sync(path)
         started_ns = time.perf_counter_ns()
         with self._lock:
             if self._poisoned:
@@ -555,6 +555,56 @@ class GoldenModelTransport:
             }
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
+
+    def _load_canonical_m2_sync(self, path: str) -> LoadedSafetensors:
+        """Use the proven mmap/process source arm for the mmap selector.
+
+        The historical C0 selector routes ``mmap_fresh`` through the canonical
+        M2 loader so source children fork before CUDA setup.  Keep that routing
+        at the generic transport boundary instead of entering the slower
+        per-fill C0 arena dispatcher.
+        """
+        with self._lock:
+            if self._poisoned:
+                raise RuntimeError("persistent_model_transport_poisoned")
+            normalized_path = os.path.abspath(str(path))
+            layout_cache_hit = normalized_path in self._layout_cache
+            layout = self.inspect(path)
+            from .production_m2_loader import load_m2_safetensors
+
+            loaded = load_m2_safetensors(path)
+            source = dict(loaded.get("source") or {})
+            raw_stats = dict(loaded.get("stats") or {})
+            timing = dict(loaded.get("timing") or {})
+            source_wall_ms = raw_stats.get("source_wall_ms")
+            stats = {
+                **raw_stats,
+                "execution_arm": "m2_mmap_process",
+                "source_engine": "m2_mmap_process",
+                "source_child_wall_ms": source_wall_ms,
+                "source_fill_wall_ms": None,
+                "c0_arena_created": False,
+                "layout_cache_hit": bool(layout_cache_hit),
+                "fd_cache_hit": False,
+                "transport_runtime_reused": False,
+                "reader_pool_reused": False,
+                "staging_reused": False,
+                "host_registration_reused": False,
+                "cuda_stream_reused": False,
+                "destination_reused": False,
+                "source": source,
+                "gpu_ready_wall_ms": timing.get("gpu_ready_wall_ms"),
+                "gpu_ready_tail_ms": timing.get("exposed_h2d_tail_ms"),
+                "total_load_ms": timing.get("loader_wall_ms"),
+            }
+            self._load_count += 1
+            return LoadedSafetensors(
+                layout.path,
+                loaded["sd"],
+                loaded["owner"],
+                layout,
+                stats,
+            )
 
     def _load_c0_sync(self, path: str) -> LoadedSafetensors:
         started_ns = time.perf_counter_ns()
