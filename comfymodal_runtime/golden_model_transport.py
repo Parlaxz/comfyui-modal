@@ -630,7 +630,15 @@ class GoldenModelTransport:
             )
             dispatcher.snapshot_quiescence()
             views = self._views(owner.gpu_tensor, layout.tensor_map)
-            source_wall_ms = float(getattr(source, "fill_wall_ns", 0) or 0) / 1e6
+            child_start_ns = int(getattr(source, "first_child_read_start_mono_ns", 0) or 0)
+            child_end_ns = int(getattr(source, "last_child_read_end_mono_ns", 0) or 0)
+            source_child_wall_ms = (
+                (child_end_ns - child_start_ns) / 1e6
+                if child_start_ns and child_end_ns and child_end_ns >= child_start_ns
+                else None
+            )
+            source_fill_wall_ms = float(getattr(source, "fill_wall_ns", 0) or 0) / 1e6
+            source_wall_ms = source_child_wall_ms or source_fill_wall_ms
             source_gbps = (
                 layout.data_bytes / ((source_wall_ms / 1000.0) * 1e9)
                 if source_wall_ms > 0 else None
@@ -648,6 +656,8 @@ class GoldenModelTransport:
                 "h2d_submitted_bytes": int(result.submitted_bytes),
                 "h2d_completed_bytes": int(result.completed_bytes),
                 "source_wall_ms": source_wall_ms,
+                "source_child_wall_ms": source_child_wall_ms,
+                "source_fill_wall_ms": source_fill_wall_ms,
                 "qd_source_io_wall_ms": source_wall_ms,
                 "source_gbps": source_gbps,
                 "coverage": {
