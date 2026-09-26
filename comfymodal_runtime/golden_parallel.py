@@ -228,6 +228,32 @@ async def golden_parallel_execute(
             teardown_error = exc
         else:
             session.recorder.event("TEARDOWN_COMPLETE", request_id=request.request_id)
+            # ── Golden Parallel console Gantt (observability only) ──────
+            # Renders already-recorded stage intervals + transport durations;
+            # no measurement, no synchronization, never fails the request.
+            # stdout lands in Modal container logs; the event keeps it in
+            # the persisted artifact.
+            try:
+                from .golden_human_report import render_parallel_console_gantt
+                _gantt_intervals = {}
+                for _name, _iv in dict(getattr(session.recorder, "_intervals", {}) or {}).items():
+                    _entry = getattr(_iv, "entry_monotonic_ns", None)
+                    _end = getattr(_iv, "end_monotonic_ns", None)
+                    if (
+                        isinstance(_entry, int) and not isinstance(_entry, bool)
+                        and isinstance(_end, int) and not isinstance(_end, bool)
+                        and _end >= _entry
+                    ):
+                        _gantt_intervals[str(_name)] = (_entry, _end)
+                _gantt_text = render_parallel_console_gantt(
+                    _gantt_intervals,
+                    transports=list(getattr(session, "model_transport_records", None) or []),
+                    arch="c0_parallel/m2_exact_window",
+                )
+                print(_gantt_text, flush=True)
+                session.recorder.event("golden_parallel_gantt", gantt=_gantt_text)
+            except Exception:
+                pass
     finally:
         if loader_worker is not None:
             # Teardown has already released the parent-side owner handles;

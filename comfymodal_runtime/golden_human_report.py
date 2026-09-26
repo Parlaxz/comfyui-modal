@@ -1278,12 +1278,148 @@ def render_full_console(
     return "\n".join(lines) + "\n"
 
 
+PARALLEL_CONSOLE_GANTT_ORDER = (
+    ("golden_restore", "restore"),
+    ("golden_request_setup", "request_setup"),
+    ("golden_clip_load", "CLIP load"),
+    ("golden_unet_load", "UNET load"),
+    ("golden_clip_forward", "CLIP forward"),
+    ("golden_sampler_prepare", "sampler_prepare"),
+    ("golden_sampling", "sampling"),
+    ("golden_vae_load", "VAE load"),
+    ("golden_sampler_tail", "sampler_tail"),
+    ("golden_vae_decode", "VAE decode"),
+    ("golden_output", "output"),
+    ("golden_durable_commit", "durable_commit"),
+    ("golden_teardown", "teardown"),
+)
+
+_PARALLEL_CONSOLE_GANTT_WIDTH = 56
+
+
+def _parallel_gantt_ms(value: Any) -> float | None:
+    number = _number(value)
+    if number is None:
+        return None
+    return float(number)
+
+
+def _parallel_gantt_bar(start_ms: float, end_ms: float, total_ms: float, width: int) -> str:
+    if not total_ms > 0 or width < 8:
+        return ""
+    lo = max(0, min(width - 1, int(start_ms / total_ms * width)))
+    hi = max(lo + 1, min(width, int(end_ms / total_ms * width) + 1))
+    return "[" + "." * lo + "#" * (hi - lo) + "." * (width - hi) + "]"
+
+
+def _parallel_gantt_overlap(first: tuple[float, float] | None,
+                            second: tuple[float, float] | None) -> float | None:
+    if not first or not second:
+        return None
+    start = max(first[0], second[0])
+    end = min(first[1], second[1])
+    return max(0.0, end - start) if end > start else 0.0
+
+
+def render_parallel_console_gantt(
+    stages: Mapping[str, Any],
+    *,
+    transports: Sequence[Mapping[str, Any]] | None = None,
+    arch: str = "",
+    width: int = _PARALLEL_CONSOLE_GANTT_WIDTH,
+) -> str:
+    """Render one compact ASCII Gantt for a Golden Parallel request.
+
+    Pure rendering over already-recorded measurements: ``stages`` maps a
+    recorder stage name to an ``(entry_ns, end_ns)`` pair on ONE monotonic
+    clock (normally the session recorder intervals).  Transport records
+    contribute standalone durations only -- no cross-clock arithmetic is
+    performed.  Stages without a closed interval are skipped silently so a
+    partial request still renders.  Output is plain ASCII for Modal logs.
+    """
+    spans: dict[str, tuple[float, float]] = {}
+    if isinstance(stages, Mapping):
+        for name, bounds in stages.items():
+            entry_ns, end_ns = None, None
+            if isinstance(bounds, Mapping):
+                entry_ns = _parallel_gantt_ms(bounds.get("entry_monotonic_ns"))
+                end_ns = _parallel_gantt_ms(bounds.get("end_monotonic_ns"))
+            elif isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+                entry_ns = _parallel_gantt_ms(bounds[0])
+                end_ns = _parallel_gantt_ms(bounds[1])
+            if entry_ns is None or end_ns is None or end_ns < entry_ns:
+                continue
+            spans[str(name)] = (entry_ns / 1e6, end_ns / 1e6)
+    if not spans:
+        return "[GOLDEN GANTT]\nno closed stage intervals recorded"
+    t0 = min(start for start, _end in spans.values())
+    total_ms = max(end for _start, end in spans.values()) - t0
+    transport_list = [item for item in (transports or []) if isinstance(item, Mapping)]
+
+    def transport_detail(index: int) -> str:
+        if index >= len(transport_list):
+            return ""
+        record = transport_list[index]
+        parts = []
+        source_ms = _parallel_gantt_ms(record.get("source_wall_ms"))
+        full_ms = _parallel_gantt_ms(record.get("total_load_ms"))
+        if source_ms is not None:
+            parts.append(f"src={source_ms:.1f}ms")
+        if full_ms is not None:
+            parts.append(f"full={full_ms:.1f}ms")
+        engine = record.get("source_engine")
+        if engine:
+            parts.append(f"eng={engine}")
+        path = record.get("path")
+        if path:
+            parts.append(str(path).replace("\r", " ").replace("\n", " "))
+        return " | " + " ".join(parts) if parts else ""
+
+    arena_note = ""
+    if transport_list:
+        arena_bytes = _parallel_gantt_ms(transport_list[0].get("c0_arena_bytes"))
+        if arena_bytes is not None:
+            arena_note = f" arena={arena_bytes / (1024 * 1024):.0f}MiB"
+    header = "[GOLDEN GANTT] mode=parallel"
+    if arch:
+        header += f" arch={arch}"
+    header += arena_note
+    lines = [header]
+    for stage_name, label in PARALLEL_CONSOLE_GANTT_ORDER:
+        bounds = spans.get(stage_name)
+        if bounds is None:
+            continue
+        start_ms, end_ms = bounds[0] - t0, bounds[1] - t0
+        wall_ms = end_ms - start_ms
+        bar = _parallel_gantt_bar(start_ms, end_ms, total_ms, int(width))
+        detail = ""
+        if stage_name == "golden_clip_load":
+            detail = transport_detail(0)
+        elif stage_name == "golden_unet_load":
+            detail = transport_detail(1)
+        elif stage_name == "golden_restore":
+            detail = " | observation-only"
+        lines.append(
+            f"t+{start_ms / 1000.0:7.3f}s |{label:14s}| {wall_ms:9.1f}ms {bar}{detail}"
+        )
+    overlaps = [
+        ("unet_load", "clip_forward",
+         _parallel_gantt_overlap(spans.get("golden_unet_load"), spans.get("golden_clip_forward"))),
+        ("vae_load", "sampling",
+         _parallel_gantt_overlap(spans.get("golden_vae_load"), spans.get("golden_sampling"))),
+    ]
+    shown = [f"{inner} inside {outer} {ms:.1f}ms" for inner, outer, ms in overlaps if ms]
+    lines.append("OVERLAP: " + ("; ".join(shown) if shown else "none measured"))
+    return "\n".join(lines)
+
+
 __all__ = [
     "ClockDomainError",
     "render_artifacts_footer",
     "render_full_console",
     "render_mini_gantt",
     "render_overall_timeline",
+    "render_parallel_console_gantt",
     "render_qd_histogram",
     "render_sampling_stage",
     "render_stage_artifact",
