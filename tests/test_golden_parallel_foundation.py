@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 from tools.v2_control import cli
@@ -43,34 +42,12 @@ def test_omitted_attention_is_explicit_sage_and_parallel_payload_is_not_serial()
     assert payload["request_origin_info"]["serial"] is False
 
 
-def test_parallel_orchestrator_reuses_serial_stages_without_overlap_primitives():
-    tree = ast.parse(PARALLEL_SOURCE.read_text(encoding="utf-8"))
-    fn = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef))
-    calls = []
-    awaited = sorted(ast.walk(fn), key=lambda item: getattr(item, "lineno", 0))
-    for node in awaited:
-        if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
-            continue
-        called = node.value.func
-        if isinstance(called, ast.Name) and called.id.startswith("golden_"):
-            calls.append(called.id)
-    assert calls[:12] == [
-        "golden_restore",
-        "golden_request_setup",
-        "golden_clip_load",
-        "golden_clip_forward",
-        "golden_unet_load",
-        "golden_sampler_prepare",
-        "golden_vae_load",
-        "golden_sampling",
-        "golden_sampler_tail",
-        "golden_vae_decode",
-        "golden_output",
-        "golden_durable_commit",
-    ]
+def test_parallel_orchestrator_overlaps_independent_model_stages():
     source = PARALLEL_SOURCE.read_text(encoding="utf-8")
-    assert "create_task" not in source
-    assert "gather(" not in source
+    assert "golden_clip_forward_unet_window" in source
+    assert "golden_sampling_vae_window" in source
+    assert "_resolve_clip_unet_schedule" in source
+    assert "_resolve_sampling_vae_schedule" in source
     assert "GoldenSerialRunner" not in source
 
 

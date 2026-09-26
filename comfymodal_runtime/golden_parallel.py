@@ -1,13 +1,8 @@
-"""Golden parallel foundation.
-
-This is a distinct orchestration boundary for the future overlapped Golden
-path.  It intentionally has no overlap yet: the canonical stage functions
-remain owned by :mod:`golden_serial`, and this module only composes those
-functions in the same order with a distinct runtime identity.
-"""
+"""Golden parallel orchestration over the canonical stage implementations."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import contextmanager
@@ -22,6 +17,9 @@ from .golden_serial import (
     _GOLDEN_QD_ARM_CONTEXT,
     _persist_final_telemetry,
     _golden_trace_span,
+    _resolve_clip_unet_schedule,
+    _resolve_sampling_vae_schedule,
+    golden_clip_forward_unet_window,
     golden_clip_forward,
     golden_clip_load,
     golden_durable_commit,
@@ -31,6 +29,7 @@ from .golden_serial import (
     golden_sampler_prepare,
     golden_sampler_tail,
     golden_sampling,
+    golden_sampling_vae_window,
     golden_teardown,
     golden_unet_load,
     golden_vae_decode,
@@ -52,12 +51,7 @@ async def golden_parallel_execute(
     restore_observation: Optional[dict] = None,
     cpu_prefetch_ticket: Any = None,
 ) -> GoldenFinalResult:
-    """Execute the parallel Golden composition without overlap yet.
-
-    Keeping the orchestration separate now makes the future scheduling change
-    explicit while guaranteeing that loaders, sampler behavior, durability,
-    and teardown remain the existing Golden implementations.
-    """
+    """Overlap independent model stages while retaining canonical ownership."""
     session = GoldenSession(
         request,
         volume=volume,
@@ -178,18 +172,20 @@ async def golden_parallel_execute(
         with _golden_trace_span("golden_clip_load"):
             with _loader_worker_stage(session, loader_worker, "clip", "transports") as _preloaded:
                 await golden_clip_load(session, preloaded_transports=_preloaded)
-        with _golden_trace_span("golden_clip_forward"):
-            await golden_clip_forward(session)
-        with _golden_trace_span("golden_unet_load"):
-            with _loader_worker_stage(session, loader_worker, "unet", "transport") as _preloaded:
-                await golden_unet_load(session, preloaded_transport=_preloaded)
+        clip_unet_schedule = _resolve_clip_unet_schedule()
+        sampling_vae_schedule = _resolve_sampling_vae_schedule()
+        await golden_clip_forward_unet_window(
+            session,
+            schedule=clip_unet_schedule,
+            unet_load=lambda: _unet_load_with_worker_stage(session, loader_worker),
+        )
         with _golden_trace_span("golden_sampler_prepare"):
             await golden_sampler_prepare(session)
-        with _golden_trace_span("golden_vae_load"):
-            with _loader_worker_stage(session, loader_worker, "vae", "transport") as _preloaded:
-                await golden_vae_load(session, preloaded_transport=_preloaded)
-        with _golden_trace_span("golden_sampling"):
-            await golden_sampling(session)
+        await golden_sampling_vae_window(
+            session,
+            schedule=sampling_vae_schedule,
+            vae_load=lambda: _vae_load_with_worker_stage(session, loader_worker),
+        )
         with _golden_trace_span("golden_sampler_tail"):
             await golden_sampler_tail(session)
         with _golden_trace_span("golden_vae_decode"):
@@ -268,6 +264,16 @@ async def golden_parallel_execute(
         raise RuntimeError("parallel_result_missing")
     result.telemetry_persist_ms = session.telemetry_persist_ms
     return result
+
+
+async def _unet_load_with_worker_stage(session: Any, worker: Any) -> Any:
+    with _loader_worker_stage(session, worker, "unet", "transport") as preloaded:
+        return await golden_unet_load(session, preloaded_transport=preloaded)
+
+
+async def _vae_load_with_worker_stage(session: Any, worker: Any) -> Any:
+    with _loader_worker_stage(session, worker, "vae", "transport") as preloaded:
+        return await golden_vae_load(session, preloaded_transport=preloaded)
 
 
 def _stage_entry_ns(session: Any, name: str) -> Optional[int]:

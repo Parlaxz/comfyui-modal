@@ -702,6 +702,35 @@ enum_values = ["c0", "m2"]
 description = "Select the Golden CLIP transport; M2 replaces only CLIP source/H2D while Golden adoption remains authoritative."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_MODEL_TRANSPORT"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-model-transport"
+description = "Enable the persistent role-neutral M2 model transport shared by CLIP and UNET."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
+type = "enum"
+default = "serial"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-parallel"
+enum_values = ["serial", "overlap"]
+description = "Schedule CLIP forward and UNET load serially or in the bounded parallel overlap window."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE"
+type = "enum"
+default = "serial"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-parallel"
+enum_values = ["serial", "overlap"]
+description = "Schedule sampling and VAE load serially or in the bounded parallel overlap window."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP"
 type = "bool"
 default = "0"

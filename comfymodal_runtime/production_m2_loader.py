@@ -8,9 +8,6 @@ import struct
 import time
 from typing import Any
 
-from . import m2_source_core
-from . import source_race_gpu
-
 _QD = 4
 _BLOCK_BYTES = 64 * 1024 * 1024
 _SLOTS = 1
@@ -144,152 +141,33 @@ def load_m2_safetensors(
     qd: int = _QD,
     block_bytes: int = _BLOCK_BYTES,
     trace: Any = None,
+    transport: Any = None,
 ) -> dict[str, Any]:
-    """Read one safetensors file into one PyTorch-owned CUDA allocation."""
-    del trace
-    import torch
-
-    loader_start_ns = time.perf_counter_ns()
+    """Compatibility adapter to the container-lifetime generic transport."""
+    del device, trace
     if int(qd) != _QD or int(block_bytes) != _BLOCK_BYTES:
         raise ValueError("production M2 geometry is fixed at QD4 and 64 MiB")
-    if not torch.cuda.is_available():
-        raise RuntimeError("cuda_unavailable")
-    target = device or f"cuda:{torch.cuda.current_device()}"
-    header, data_start, data_bytes = parse_safetensors_header(path)
-    tensor_map = build_header_tensor_map(header)
-    staging_started = time.perf_counter()
-    staging = source_race_gpu.build_staging(_QD, _SLOTS, _BLOCK_BYTES, prefault=False)
-    staging_alloc_ms = (time.perf_counter() - staging_started) * 1000.0
-    consumer, consumer_state = source_race_gpu.start_consumer(
-        staging, _QD, _BLOCK_BYTES, "h2d", verify=False, file_path=path,
-        diagnostics=False,
-    )
-    gpu_tensor_holder: dict[str, Any] = {}
-    setup_timing: dict[str, float] = {}
-
-    def on_ready() -> None:
-        started = time.perf_counter()
-        gpu_tensor = torch.empty(int(data_bytes), dtype=torch.uint8, device=target)
-        gpu_tensor_holder["tensor"] = gpu_tensor
-        setup = source_race_gpu.setup_current_torch_context(staging, "h2d", gpu_tensor)
-        setup_timing.update(setup)
-        setup_timing["total_ms"] = (time.perf_counter() - started) * 1000.0
-
-    try:
-        source = m2_source_core.run_mmap_source_probe(
-            file_path=path,
-            read_bytes=_BLOCK_BYTES,
-            qd=_QD,
-            mmap_mode="window",
-            consume_mode="memcpy",
-            staging=staging,
-            on_ready=on_ready,
-            min_launch_gap_ns=4_000_000,
-            source_offset=data_start,
-            source_size=data_bytes,
-            ready_timeout_s=300.0,
-            max_idle_s=120.0,
-            diagnostics=False,
-        )
-        staging["alive"].value = 0
-        consumer.join(timeout=300.0)
-        if consumer.is_alive():
-            raise RuntimeError("h2d_consumer_did_not_stop")
-        if not source["coverage"]["covers_entire_file_exactly_once"]:
-            raise RuntimeError(f"m2_source_coverage_failed:{source['coverage']}")
-        if source.get("worker_errors"):
-            raise RuntimeError(f"m2_reader_failed:{source['worker_errors']}")
-        if consumer_state.get("error"):
-            raise RuntimeError(f"m2_h2d_failed:{consumer_state['error']}")
-        if not consumer_state.get("coverage_exact"):
-            raise RuntimeError("m2_h2d_coverage_failed")
-        if int(consumer_state.get("transfers", 0) or 0) != int(source["physical_reads"]):
-            raise RuntimeError("m2_h2d_transfer_count_mismatch")
-        if int(consumer_state.get("h2d_bytes", 0) or 0) != int(data_bytes):
-            raise RuntimeError("m2_h2d_byte_count_mismatch")
-        gpu_tensor = gpu_tensor_holder.get("tensor")
-        if gpu_tensor is None:
-            raise RuntimeError("m2_gpu_destination_missing")
-        first_source = int(source.get("source_first_enter_ns") or 0)
-        last_source = int(source.get("source_last_exit_ns") or 0)
-        last_h2d = int(consumer_state.get("last_done_ns") or 0)
-        tensor_views = _tensor_views(gpu_tensor, tensor_map)
-        try:
-            staging["_mm"].close()
-        except Exception:
-            pass
-        owner = M2GpuOwner(gpu_tensor, None, target, list(tensor_views))
-        source_stats = {
-            "status": "ok",
-            "source_read_count": int(source["physical_reads"]),
-            "physical_attempts": int(source["physical_attempts"]),
-            "source_read_bytes": int(data_bytes),
-            "bytes_read": int(data_bytes),
-            "source_wall_ms": float(source["full_file_wall_ms"]),
-            "qd_source_io_wall_ms": float(source["full_file_wall_ms"]),
-            "source_gbps": source.get("full_file_decimal_gbps"),
-            "source_reads": {
-                "bytes": int(data_bytes),
-                "read_count": int(source["physical_reads"]),
-                "wall_ms": float(source["full_file_wall_ms"]),
-            },
-            "gpu_bytes": int(data_bytes),
-            "h2d_completed_bytes": int(data_bytes),
-            "h2d_submitted_bytes": int(consumer_state.get("h2d_bytes", 0) or 0),
-            "h2d_device_ms": None,
-            "coverage": dict(source["coverage"]),
-            "quiescence": {
-                "workers_joined": True,
-                "h2d_events_waited": True,
-                "copies_complete": True,
-                "operation_live": False,
-            },
-            "source_engine": "m2_mmap_process",
-            "source_geometry": {"qd": _QD, "block_bytes": _BLOCK_BYTES},
-            "reader_timing": list(source.get("reader_timing") or []),
-            "staging_wait_ms": float(
-                (source.get("staging") or {}).get("wait_ms_total_shared", 0.0) or 0.0
-            ),
-            "staging_wait_events": int(
-                (source.get("staging") or {}).get("wait_events_total_shared", 0) or 0
-            ),
-        }
-        return {
-            "status": "ok",
-            "sd": tensor_views,
-            "owner": owner,
-            "stats": source_stats,
-            "tensor_map": tensor_map,
-            "source": source,
-            "staging": consumer_state,
-            "timing": {
-                "loader_wall_ms": (time.perf_counter_ns() - loader_start_ns) / 1e6,
-                "source_wall_ms": float(source["full_file_wall_ms"]),
-                "gpu_ready_wall_ms": ((last_h2d - first_source) / 1e6) if last_h2d and first_source else None,
-                "exposed_h2d_tail_ms": ((last_h2d - last_source) / 1e6) if last_h2d and last_source else None,
-                "staging_alloc_ms": staging_alloc_ms,
-                "fork_ms": source["timing"].get("fork_ms"),
-                "reader_ready_ms": source["timing"].get("ready_ms"),
-                "cuda_setup_ms": setup_timing.get("total_ms"),
-                "host_register_ms": setup_timing.get("register_ms"),
-                "reader_completion_ms": source["timing"].get("join_ms"),
-                "h2d_drain_ms": consumer_state.get("wall_ms"),
-            },
-            "ownership": {
-                "destination": "torch.cuda.uint8",
-                "destination_data_ptr": int(gpu_tensor.data_ptr()),
-                "model_sized_second_copy": False,
-                "context": setup_timing,
-                "owner": owner,
-            },
-            "loader_entry_ns": loader_start_ns,
-            "data_start": data_start,
-            "data_bytes": data_bytes,
-        }
-    except BaseException:
-        staging["alive"].value = 0
-        consumer.join(timeout=30.0)
-        raise
+    if transport is None:
+        from .golden_model_transport import get_golden_model_transport
+        transport = get_golden_model_transport()
+    loaded = transport.load_sync(path)
+    return {
+        "status": "ok",
+        "sd": loaded.views,
+        "owner": loaded.owner,
+        "stats": loaded.stats,
+        "tensor_map": list(loaded.layout.tensor_map),
+        "source": loaded.stats.get("source") or {},
+        "timing": {
+            "loader_wall_ms": loaded.stats.get("total_load_ms"),
+            "source_wall_ms": loaded.stats.get("source_wall_ms"),
+            "gpu_ready_wall_ms": loaded.stats.get("gpu_ready_wall_ms"),
+            "exposed_h2d_tail_ms": loaded.stats.get("gpu_ready_tail_ms"),
+            "layout_resolve_ms": loaded.stats.get("layout_resolve_ms"),
+        },
+        "data_start": loaded.layout.data_start,
+        "data_bytes": loaded.layout.data_bytes,
+    }
 
 
 def bind_m2_clip(clip: Any, loaded: dict[str, Any]) -> dict[str, Any]:

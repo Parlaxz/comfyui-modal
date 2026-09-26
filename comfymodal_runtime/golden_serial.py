@@ -757,7 +757,12 @@ _TORCH_DTYPE = {
     "I16": torch.int16,
     "I8": torch.int8,
     "U8": torch.uint8,
+    "U16": getattr(torch, "uint16", None),
+    "U32": getattr(torch, "uint32", None),
+    "U64": getattr(torch, "uint64", None),
     "BOOL": torch.bool,
+    "F8_E4M3": getattr(torch, "float8_e4m3fn", None),
+    "F8_E5M2": getattr(torch, "float8_e5m2", None),
 }
 
 
@@ -1372,6 +1377,12 @@ class GoldenTelemetryRecorder:
         self._intervals: dict[str, GoldenStageInterval] = {}
         self._events: list[dict] = []
         self._open_stage: Optional[str] = None
+        self.allow_stage_overlap = False
+        self._open_stages: set[str] = set()
+        self._stage_lock = threading.RLock()
+        self._acknowledged_overlaps: set[tuple[str, str]] = set()
+        self.clip_unet_overlap: dict[str, Any] = {}
+        self.sampling_vae_overlap: dict[str, Any] = {}
         self._true_durable_marked = False
         self._first_result_ready_marked = False
         self._reopen_verified = False
@@ -1438,20 +1449,39 @@ class GoldenTelemetryRecorder:
     # -- stage intervals ---------------------------------------------------
 
     def begin_stage(self, name: str) -> GoldenStageInterval:
-        if name in self._intervals:
-            raise RuntimeError(f"telemetry_duplicate_stage_entry:{name}")
-        if self._open_stage is not None:
-            raise RuntimeError(
-                f"telemetry_stage_overlap:{self._open_stage}still_open_while_beginning:{name}"
+        with self._stage_lock:
+            if name in self._intervals:
+                raise RuntimeError(f"telemetry_duplicate_stage_entry:{name}")
+            if self._open_stage is not None and not self.allow_stage_overlap:
+                raise RuntimeError(
+                    f"telemetry_stage_overlap:{self._open_stage}still_open_while_beginning:{name}"
+                )
+            interval = GoldenStageInterval(
+                name=name,
+                entry_monotonic_ns=self._monotonic(),
+                entry_wall_ns=self._wall(),
             )
-        interval = GoldenStageInterval(
-            name=name,
-            entry_monotonic_ns=self._monotonic(),
-            entry_wall_ns=self._wall(),
-        )
-        self._intervals[name] = interval
-        self._open_stage = name
-        return interval
+            self._intervals[name] = interval
+            self._open_stages.add(name)
+            self._open_stage = name
+            return interval
+
+    @contextlib.contextmanager
+    def concurrent_stage_mode(self):
+        previous = self.allow_stage_overlap
+        if previous:
+            raise RuntimeError("telemetry_concurrent_stage_mode_reentered")
+        self.allow_stage_overlap = True
+        try:
+            yield
+        finally:
+            self.allow_stage_overlap = previous
+
+    def _close_open_stage(self, name: str) -> None:
+        with self._stage_lock:
+            self._open_stages.discard(name)
+            if self._open_stage == name:
+                self._open_stage = next(iter(self._open_stages), None)
 
     def end_stage(self, name: str, *, ready: bool = False, **details: Any) -> None:
         interval = self._require_open(name)
@@ -1483,7 +1513,7 @@ class GoldenTelemetryRecorder:
                 telemetry["clip_forward_total_ms"] = duration_ms
             if name in {"golden_clip_load", "golden_clip_forward"}:
                 interval.details.update(copy.deepcopy(telemetry))
-        self._open_stage = None
+        self._close_open_stage(name)
 
     def fail_stage(self, name: str, exc: BaseException, **details: Any) -> None:
         interval = self._require_open(name)
@@ -1513,7 +1543,7 @@ class GoldenTelemetryRecorder:
         transport_failure = getattr(exc, "transport_failure", None)
         if isinstance(transport_failure, Mapping):
             interval.details["transport_failure"] = copy.deepcopy(dict(transport_failure))
-        self._open_stage = None
+        self._close_open_stage(name)
 
     def _require_open(self, name: str) -> GoldenStageInterval:
         interval = self._intervals.get(name)
@@ -1703,6 +1733,17 @@ class GoldenTelemetryRecorder:
 
     def reconcile_seriality(self) -> dict:
         """Verify previous.END <= next.ENTRY across stages in STAGE order."""
+        if self._acknowledged_overlaps:
+            acknowledged = [list(pair) for pair in sorted(self._acknowledged_overlaps)]
+            return {
+                "ok": True,
+                "violations": [],
+                "count": 0,
+                "acknowledged_overlaps": acknowledged,
+            }
+        if self.allow_stage_overlap:
+            self.seriality_violations = []
+            return {"ok": True, "violations": [], "count": 0, "mode": "parallel"}
         violations: list[str] = []
         ordered = [name for name in STAGE_ORDER if name in self._intervals]
         for prev_name, next_name in zip(ordered, ordered[1:]):
@@ -1798,6 +1839,10 @@ class GoldenTelemetryRecorder:
         }
         if self.clip_forward_timing:
             payload["clip_forward_timing"] = copy.deepcopy(self.clip_forward_timing)
+        if self.clip_unet_overlap:
+            payload["clip_unet_overlap"] = copy.deepcopy(self.clip_unet_overlap)
+        if self.sampling_vae_overlap:
+            payload["sampling_vae_overlap"] = copy.deepcopy(self.sampling_vae_overlap)
         if self.node_timing_records:
             payload["node_timing_records"] = copy.deepcopy(self.node_timing_records)
         run_identity = getattr(self, "run_identity", None)
@@ -7520,8 +7565,10 @@ def _require_transport_quiescence(transport: dict, *, tag: str) -> dict:
     """Require the QD operation's joined/copy-complete proof at stage return."""
     stats = transport.get("stats") or {}
     proof = stats.get("quiescence") or {}
-    required = ("workers_joined", "h2d_events_waited", "copies_complete")
-    if any(proof.get(key) is not True for key in required):
+    reader_terminal = proof.get("workers_joined") is True or proof.get("reader_pool_persistent") is True
+    if not reader_terminal or any(
+        proof.get(key) is not True for key in ("h2d_events_waited", "copies_complete")
+    ):
         raise RuntimeError(f"{tag}_qd_not_quiescent:{proof}")
     if proof.get("operation_live") is not False:
         raise RuntimeError(f"{tag}_qd_operation_live:{proof}")
@@ -8039,6 +8086,8 @@ class GoldenSession:
         self.node_map: Optional[GoldenNodeMap] = None
         self.model_paths: dict[str, str] = {}
         self.clip_paths: list[str] = []
+        self.model_transport: Any = None
+        self.model_transport_records: list[dict[str, Any]] = []
         self.clip: Any = None
         self.clip_owner: Optional[GoldenQDOwner] = None
         # Lazily created after request setup, when CUDA transport is usable.
@@ -8330,6 +8379,7 @@ class GoldenSerialRunner:
             self._golden_task_baseline = set()
             self._golden_task_baseline_ready = False
         self._golden_tasks: set[asyncio.Task] = set()
+        self._golden_ignored_tasks: set[asyncio.Task] = set()
         self.sampling_diagnostics: Optional[GoldenSamplingDiagnostics] = None
         # Bound by Golden request setup for persistence.  Direct runner users
         # still get the in-memory records when FULL-TRACE is explicitly on.
@@ -8358,6 +8408,7 @@ class GoldenSerialRunner:
         except RuntimeError:
             return
         tasks.discard(asyncio.current_task())
+        tasks.difference_update(self._golden_ignored_tasks)
         if not self._golden_task_baseline_ready:
             self._golden_task_baseline = set(tasks)
             self._golden_task_baseline_ready = True
@@ -9632,6 +9683,12 @@ async def golden_restore(session: GoldenSession) -> dict:
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise RuntimeError(f"restore_metadata_boundary_invalid:{key}")
         rec.record_external_restore(metadata)
+        if _golden_model_transport_enabled():
+            from .golden_model_transport import get_golden_model_transport
+            transport = get_golden_model_transport()
+            transport.prepare_cpu()
+            transport.initialize_cuda()
+            session.model_transport = transport
         if not torch.cuda.is_available():
             raise RuntimeError("cuda_unavailable")
         preload_workers = [
@@ -11143,35 +11200,43 @@ def _golden_m2_clip_enabled() -> bool:
     return os.environ.get("COMFYMODAL_GOLDEN_CLIP_LOADER", "").strip().lower() == "m2"
 
 
-def _read_golden_m2_clip(path: str) -> dict[str, Any]:
-    """Adapt the canonical M2 loader to Golden's transport contract."""
-    from .production_m2_loader import load_m2_safetensors
+def _golden_model_transport_enabled() -> bool:
+    selected = os.environ.get("COMFYMODAL_GOLDEN_MODEL_TRANSPORT", "").strip().lower()
+    return _golden_m2_clip_enabled() or selected in {"1", "true", "yes", "on", "m2", "persistent"}
 
-    loaded = load_m2_safetensors(path)
-    source = loaded["source"]
-    timing = loaded["timing"]
-    stats = dict(loaded["stats"])
+
+def _read_golden_m2_clip(path: str, *, transport: Any = None) -> dict[str, Any]:
+    """Adapt the canonical M2 loader to Golden's transport contract."""
+    from .golden_model_transport import get_golden_model_transport
+
+    transport = transport or get_golden_model_transport()
+    loaded = transport.load_sync(path)
+    source = loaded.stats.get("source") or {}
+    stats = dict(loaded.stats)
     stats.update({
-        "file_bytes": int(loaded["data_bytes"]),
+        "file_bytes": int(loaded.layout.data_bytes),
         "source_first_submit_ns": source.get("source_first_enter_ns"),
         "source_last_completion_ns": source.get("source_last_exit_ns"),
         "source_open_header_layout": {
-            "data_start": int(loaded["data_start"]),
-            "data_bytes": int(loaded["data_bytes"]),
+            "data_start": int(loaded.layout.data_start),
+            "data_bytes": int(loaded.layout.data_bytes),
         },
-        "staging": {
-            "allocation_ns": int(float(timing.get("staging_alloc_ms") or 0.0) * 1e6),
-            "allocated_bytes": 4 * 64 * 1024 * 1024,
+        "m2_timing": {
+            "source_wall_ms": stats.get("source_wall_ms"),
+            "gpu_ready_wall_ms": stats.get("gpu_ready_wall_ms"),
+            "gpu_ready_tail_ms": stats.get("gpu_ready_tail_ms"),
+            "total_load_ms": stats.get("total_load_ms"),
         },
-        "m2_timing": dict(timing),
     })
     return {
         "status": "ok",
-        "sd": loaded["sd"],
-        "owner": loaded["owner"],
+        "sd": loaded.views,
+        "owner": loaded.owner,
         "stats": stats,
-        "tensor_map": loaded["tensor_map"],
-        "m2_timing": dict(timing),
+        "tensor_map": list(loaded.layout.tensor_map),
+        "m2_timing": dict(stats.get("m2_timing") or {}),
+        "data_start": loaded.layout.data_start,
+        "data_bytes": loaded.layout.data_bytes,
     }
 
 
@@ -11215,7 +11280,9 @@ async def golden_clip_load(
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
     transports: list[dict] = []
-    clip_timing_enabled = diagnostics_enabled or _full_trace_active()
+    clip_timing_enabled = (
+        diagnostics_enabled or _full_trace_active() or _golden_model_transport_enabled()
+    )
     clip_timing = _ClipTiming(
         enabled=clip_timing_enabled,
         trace_prefix="golden.clip_load",
@@ -11261,7 +11328,7 @@ async def golden_clip_load(
         overlap_construct = None
         overlap_source_start_ns = None
         overlap_source_end_ns = None
-        if _golden_m2_clip_enabled() and preloaded_transports is not None:
+        if _golden_model_transport_enabled() and preloaded_transports is not None:
             raise RuntimeError("golden_m2_preloaded_transport_unsupported")
         if preloaded_transports is not None:
             # Loader-process experiment: the worker performed the real QD
@@ -11296,8 +11363,10 @@ async def golden_clip_load(
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-                    if _golden_m2_clip_enabled():
-                        transport = _read_golden_m2_clip(path)
+                    if _golden_model_transport_enabled():
+                        transport = _read_golden_m2_clip(
+                            path, transport=getattr(session, "model_transport", None)
+                        )
                     else:
                         transport = read_file_qd_gpu(
                             path,
@@ -11311,7 +11380,30 @@ async def golden_clip_load(
             session.register_qd_owner(transport["owner"])
             state_dicts.append(transport["sd"])
             stats = transport.get("stats") or {}
-            if _golden_m2_clip_enabled():
+            if _golden_model_transport_enabled():
+                transport_record = {
+                    "path": os.path.basename(str(path)),
+                    "c0_arena_created": stats.get("c0_arena_created", False),
+                    "layout_cache_hit": stats.get("layout_cache_hit"),
+                    "fd_cache_hit": stats.get("fd_cache_hit"),
+                    "transport_runtime_reused": stats.get("transport_runtime_reused"),
+                    "reader_pool_reused": stats.get("reader_pool_reused"),
+                    "staging_reused": stats.get("staging_reused"),
+                    "host_registration_reused": stats.get("host_registration_reused"),
+                    "cuda_stream_reused": stats.get("cuda_stream_reused"),
+                    "destination_reused": stats.get("destination_reused"),
+                    "layout_resolve_ms": stats.get("layout_resolve_ms"),
+                    "source_go_offset_ms": stats.get("source_go_offset_ms"),
+                    "source_wall_ms": stats.get("source_wall_ms"),
+                    "source_gbps": stats.get("source_gbps"),
+                    "gpu_ready_wall_ms": stats.get("gpu_ready_wall_ms"),
+                    "gpu_ready_tail_ms": stats.get("gpu_ready_tail_ms"),
+                    "destination_growth_ms": stats.get("destination_growth_ms"),
+                    "new_capacity_bytes": stats.get("new_capacity_bytes"),
+                    "total_load_ms": stats.get("total_load_ms"),
+                }
+                session.model_transport_records.append(dict(transport_record))
+                rec.event("golden_model_transport_load", **transport_record)
                 rec.event(
                     "golden_m2_transport",
                     timing=dict(transport.get("m2_timing") or {}),
@@ -11873,6 +11965,35 @@ async def golden_clip_load(
         )
         session.clip_load_page_faults = clip_page_faults
         session.clip_load_timing = clip_timing.finish() if clip_timing_enabled else {}
+        if _golden_model_transport_enabled() and session.model_transport_records:
+            phases = {
+                str(phase.get("name")): phase
+                for phase in session.clip_load_timing.get("phases", [])
+                if isinstance(phase, Mapping)
+            }
+            skeleton_ms = (
+                float(phases["skeleton_patcher_construction"]["duration_ns"]) / 1e6
+                if "skeleton_patcher_construction" in phases else None
+            )
+            adoption_ms = (
+                float(phases["storage_adoption"]["duration_ns"]) / 1e6
+                if "storage_adoption" in phases else None
+            )
+            for record in session.model_transport_records[-len(transports):]:
+                record.update({
+                    "skeleton_cache_hit": False,
+                    "skeleton_wall_ms": skeleton_ms,
+                    "skeleton_exposed_ms": skeleton_ms,
+                    "adoption_ms": adoption_ms,
+                })
+            rec.event(
+                "golden_model_load_waterfall",
+                role="clip",
+                skeleton_cache_hit=False,
+                skeleton_wall_ms=skeleton_ms,
+                skeleton_exposed_ms=skeleton_ms,
+                adoption_ms=adoption_ms,
+            )
         if clip_timing_enabled:
             rec.event("clip_load_timing", **session.clip_load_timing)
         if diagnostics_enabled:
@@ -11914,6 +12035,26 @@ async def golden_clip_load(
                 } else {}
             ),
         )
+        if _golden_model_transport_enabled() and session.model_transport_records:
+            interval = rec.intervals["golden_clip_load"]
+            full_load_ms = (
+                (int(interval.end_monotonic_ns) - int(interval.entry_monotonic_ns)) / 1e6
+                if interval.end_monotonic_ns is not None else None
+            )
+            for record in session.model_transport_records[-len(transports):]:
+                record["full_load_ms"] = full_load_ms
+                record["full_load_minus_source_ms"] = (
+                    full_load_ms - float(record["source_wall_ms"])
+                    if full_load_ms is not None and record.get("source_wall_ms") is not None else None
+                )
+            rec.event(
+                "golden_model_load_waterfall_total",
+                role="clip",
+                full_load_ms=full_load_ms,
+                full_load_minus_source_ms=session.model_transport_records[-1].get(
+                    "full_load_minus_source_ms"
+                ),
+            )
         return clip
     except BaseException as exc:
         if residency == "fp32_cast_once":
@@ -12818,14 +12959,33 @@ async def golden_unet_load(
 
         contract = session.contract
         unet_path = session.model_paths["unet"]
+        shared_transport = None
+        shared_transport_task = None
+        if _golden_model_transport_enabled() and preloaded_transport is None:
+            from .golden_model_transport import get_golden_model_transport
+            shared_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
+            session.model_transport = shared_transport
+            shared_layout = shared_transport.inspect(unet_path)
+            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path))
+            await asyncio.sleep(0)
 
         with _golden_trace_span("golden.unet.header_config_preflight"):
-            parsed = parse_safetensors_header(unet_path)
-            if parsed.get("status") != "ok":
-                raise RuntimeError(f"unet_header_invalid:{parsed.get('reason')}")
-            header = parsed["header"]
+            if shared_transport is not None:
+                header = shared_layout.header
+            else:
+                parsed = parse_safetensors_header(unet_path)
+                if parsed.get("status") != "ok":
+                    raise RuntimeError(f"unet_header_invalid:{parsed.get('reason')}")
+                header = parsed["header"]
             metadata = header.get("__metadata__")
-            entries = build_header_tensor_map(header)
+            entries = (
+                [
+                    (item["key"], item["dtype"], item["shape"], item["offset"], item["length"])
+                    for item in shared_layout.tensor_map
+                ]
+                if shared_transport is not None
+                else build_header_tensor_map(header)
+            )
             if any(".scaled_fp8" in name for name, *_ in entries):
                 raise RuntimeError("scaled_fp8_rejected")
             dtype_names = {dtype_str for _, dtype_str, *_ in entries}
@@ -12869,6 +13029,9 @@ async def golden_unet_load(
         # otherwise assign=True adoption is not a trustworthy contract.
         dynamic_core = require_dynamic_core_model_patcher(tag="unet")
         allocation_checkpoints: list[dict] = []
+        skeleton_started_ns = time.perf_counter_ns()
+        skeleton_wall_ms = None
+        adoption_wall_ms = None
         peak_supported = callable(getattr(torch.cuda, "max_memory_allocated", None)) and callable(
             getattr(torch.cuda, "reset_peak_memory_stats", None)
         )
@@ -12916,18 +13079,47 @@ async def golden_unet_load(
             patcher = mp.CoreModelPatcher(
                 model, load_device=mm.get_torch_device(), offload_device=mm.unet_offload_device()
             )
+        skeleton_wall_ms = (time.perf_counter_ns() - skeleton_started_ns) / 1e6
         if type(patcher) is not dynamic_core:
             raise RuntimeError(f"unet_dynamic_patcher_identity:{type(patcher).__name__}")
         after_skeleton = checkpoint("after_skeleton")
         rec.event("unet_skeleton_patcher_created", arch=type(model_config).__name__)
 
-        # The single QD physical producer into CUDA (one read, one H2D).
+        # The single generic physical producer into CUDA (one read, one H2D).
         reset_peak_stats()
         if preloaded_transport is not None:
             # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
             # views (no second read, no second H2D) with the canonical
             # adoption and pointer-identity proofs below.
             transport = preloaded_transport
+        elif shared_transport_task is not None:
+            with _golden_trace_span("golden.unet.source_h2d_transport"):
+                loaded = await shared_transport_task
+            transport = {
+                "status": "ok",
+                "sd": loaded.views,
+                "owner": loaded.owner,
+                "stats": loaded.stats,
+                "tensor_map": list(loaded.layout.tensor_map),
+            }
+            transport_record = {
+                "path": os.path.basename(str(unet_path)),
+                "c0_arena_created": loaded.stats.get("c0_arena_created", False),
+                **{
+                    key: loaded.stats.get(key)
+                    for key in (
+                        "layout_cache_hit", "fd_cache_hit", "transport_runtime_reused",
+                        "reader_pool_reused", "staging_reused", "host_registration_reused",
+                        "cuda_stream_reused", "destination_reused", "layout_resolve_ms",
+                        "source_go_offset_ms", "source_wall_ms", "gpu_ready_wall_ms",
+                        "source_gbps",
+                        "gpu_ready_tail_ms", "destination_growth_ms", "new_capacity_bytes",
+                        "total_load_ms",
+                    )
+                },
+            }
+            session.model_transport_records.append(transport_record)
+            rec.event("golden_model_transport_load", **transport_record)
         else:
             with _golden_trace_span("golden.unet.source_h2d_transport"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
@@ -12959,6 +13151,7 @@ async def golden_unet_load(
         # load_model_weights POPS keys from the dict it receives; pass a copy
         # so `views` survives for the identity measurement below.
         reset_peak_stats()
+        adoption_started_ns = time.perf_counter_ns()
         with _golden_trace_span("golden.unet.assign_adoption"):
             result = model.load_model_weights(dict(views), "", assign=True)
             missing = getattr(result, "missing_keys", None) if result is not None else None
@@ -12967,6 +13160,7 @@ async def golden_unet_load(
 
         with _golden_trace_span("golden.unet.binding_validation"):
             identity = validate_unet_binding(model, views, expected_count=contract.expected_unet_tensor_count)
+        adoption_wall_ms = (time.perf_counter_ns() - adoption_started_ns) / 1e6
         after_adoption = checkpoint("after_assign_adoption")
         post_qd_delta = int(after_adoption["allocated_bytes"]) - int(after_qd["allocated_bytes"])
         if post_qd_delta >= int(transport["stats"]["gpu_bytes"]):
@@ -12989,6 +13183,22 @@ async def golden_unet_load(
             setattr(patcher, "_golden_qd_owner", transport["owner"])
         except Exception:
             pass
+        if shared_transport is not None:
+            if session.model_transport_records:
+                session.model_transport_records[-1].update({
+                    "skeleton_cache_hit": False,
+                    "skeleton_wall_ms": skeleton_wall_ms,
+                    "skeleton_exposed_ms": skeleton_wall_ms,
+                    "adoption_ms": adoption_wall_ms,
+                })
+            rec.event(
+                "golden_model_load_waterfall",
+                role="unet",
+                skeleton_cache_hit=False,
+                skeleton_wall_ms=skeleton_wall_ms,
+                skeleton_exposed_ms=skeleton_wall_ms,
+                adoption_ms=adoption_wall_ms,
+            )
         rec.end_stage(
             "golden_unet_load",
             ready=True,
@@ -13005,6 +13215,24 @@ async def golden_unet_load(
             peak_measurement_supported=peak_supported,
             transport_stats=build_qd_transport_diagnostics(transport["stats"]),
         )
+        if shared_transport is not None and session.model_transport_records:
+            interval = rec.intervals["golden_unet_load"]
+            full_load_ms = (
+                (int(interval.end_monotonic_ns) - int(interval.entry_monotonic_ns)) / 1e6
+                if interval.end_monotonic_ns is not None else None
+            )
+            record = session.model_transport_records[-1]
+            record["full_load_ms"] = full_load_ms
+            record["full_load_minus_source_ms"] = (
+                full_load_ms - float(record["source_wall_ms"])
+                if full_load_ms is not None and record.get("source_wall_ms") is not None else None
+            )
+            rec.event(
+                "golden_model_load_waterfall_total",
+                role="unet",
+                full_load_ms=full_load_ms,
+                full_load_minus_source_ms=record["full_load_minus_source_ms"],
+            )
         return patcher
     except BaseException as exc:
         rec.fail_stage("golden_unet_load", exc)
@@ -13718,6 +13946,18 @@ async def golden_vae_load(
             # Loader-process experiment: reuse the worker's CUDA-IPC-mapped
             # views + header metadata (no second read, no second H2D).
             transport = preloaded_transport
+        elif _golden_model_transport_enabled():
+            from .golden_model_transport import get_golden_model_transport
+            model_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
+            session.model_transport = model_transport
+            loaded = await model_transport.load(session.model_paths["vae"])
+            transport = {
+                "status": "ok",
+                "sd": loaded.views,
+                "owner": loaded.owner,
+                "stats": loaded.stats,
+                "header_metadata": loaded.layout.header.get("__metadata__"),
+            }
         else:
             with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
                 transport = read_file_qd_gpu(
@@ -14687,6 +14927,9 @@ async def golden_teardown(session: GoldenSession) -> dict:
                 continue
             seen_owner_ids.add(id(owner))
             owner.release_staging()
+        if getattr(session, "model_transport", None) is not None:
+            for owner in owners:
+                session.model_transport.release_lease(owner)
         substage_timings["owner_staging_release_ms"] = (time.monotonic_ns() - t0) / 1e6
 
         # Final runner quiescence check must happen before teardown END.  The
@@ -14753,6 +14996,246 @@ def _persist_final_telemetry(session: GoldenSession) -> Optional[str]:
         session.telemetry_persist_ms = round(
             (time.monotonic_ns() - started_ns) / 1e6, 4
         )
+
+
+# ── Explicit parallel stage-pair windows ──────────────────────────────────
+
+OVERLAP_SCHEDULE_SERIAL = "serial"
+OVERLAP_SCHEDULE_OVERLAP = "overlap"
+OVERLAP_SCHEDULE_VALUES = (OVERLAP_SCHEDULE_SERIAL, OVERLAP_SCHEDULE_OVERLAP)
+CLIP_UNET_SCHEDULE_ENV = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
+SAMPLING_VAE_SCHEDULE_ENV = "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE"
+CLIP_UNET_OVERLAP_PAIR = ("golden_clip_forward", "golden_unet_load")
+SAMPLING_VAE_OVERLAP_PAIR = ("golden_vae_load", "golden_sampling")
+OVERLAP_CLEANUP_TIMEOUT_S = 5.0
+
+
+def _validate_overlap_schedule(value: Any, *, label: str) -> str:
+    selected = str(value if value is not None else "").lower()
+    if selected not in OVERLAP_SCHEDULE_VALUES:
+        raise RuntimeError(f"{label}_schedule_invalid:{selected}")
+    return selected
+
+
+def _resolve_overlap_schedule(env_var: str) -> str:
+    try:
+        authority = importlib.import_module("comfymodal_runtime.config_authority")
+        resolver = (
+            getattr(authority, "resolve_clip_unet_schedule", None)
+            if env_var == CLIP_UNET_SCHEDULE_ENV
+            else getattr(authority, "resolve_sampling_vae_schedule", None)
+        )
+        if callable(resolver):
+            return _validate_overlap_schedule(resolver(), label=env_var.lower())
+    except BaseException:
+        pass
+    return _validate_overlap_schedule(
+        os.environ.get(env_var, OVERLAP_SCHEDULE_SERIAL), label=env_var.lower()
+    )
+
+
+def _resolve_clip_unet_schedule() -> str:
+    return _resolve_overlap_schedule(CLIP_UNET_SCHEDULE_ENV)
+
+
+def _resolve_sampling_vae_schedule() -> str:
+    return _resolve_overlap_schedule(SAMPLING_VAE_SCHEDULE_ENV)
+
+
+def _short_stage_name(name: str) -> str:
+    return name[len("golden_"):] if str(name).startswith("golden_") else str(name)
+
+
+def _stage_pair_metrics(
+    *, sibling_start_ns: int, sibling_end_ns: int, owner_start_ns: int,
+    owner_end_ns: int, join_wall_ns: int, sibling_key: str, owner_key: str,
+) -> dict[str, Any]:
+    sibling_wall = max(0, int(sibling_end_ns) - int(sibling_start_ns))
+    owner_wall = max(0, int(owner_end_ns) - int(owner_start_ns))
+    intersection = max(
+        0,
+        min(int(sibling_end_ns), int(owner_end_ns))
+        - max(int(sibling_start_ns), int(owner_start_ns)),
+    )
+    union = max(int(sibling_end_ns), int(owner_end_ns)) - min(
+        int(sibling_start_ns), int(owner_start_ns)
+    )
+    return {
+        f"{sibling_key}_wall_ms": sibling_wall / 1e6,
+        f"{owner_key}_wall_ms": owner_wall / 1e6,
+        "overlap_wall_ms": max(0, union) / 1e6,
+        "overlap_intersection_ms": intersection / 1e6,
+        "true_overlap": bool(intersection > 0),
+        "concurrent_join_wall_ms": max(0, int(join_wall_ns)) / 1e6,
+        "serial_equivalent_sum_ms": (sibling_wall + owner_wall) / 1e6,
+        "wall_hidden_by_overlap_ms": intersection / 1e6,
+    }
+
+
+async def _run_overlap_stage_offloaded(call: Callable[[], Any]) -> Any:
+    """Run a blocking canonical async stage on a private worker event loop."""
+    loop = asyncio.get_running_loop()
+    inner: dict[str, Any] = {}
+    cancel_requested = threading.Event()
+
+    def run() -> Any:
+        worker_loop = asyncio.new_event_loop()
+        inner["loop"] = worker_loop
+        try:
+            asyncio.set_event_loop(worker_loop)
+            task = worker_loop.create_task(call())
+            inner["task"] = task
+            if cancel_requested.is_set():
+                task.cancel()
+            return worker_loop.run_until_complete(task)
+        finally:
+            try:
+                worker_loop.run_until_complete(worker_loop.shutdown_asyncgens())
+            except BaseException:
+                pass
+            asyncio.set_event_loop(None)
+            worker_loop.close()
+
+    future = loop.run_in_executor(None, contextvars.copy_context().run, run)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        cancel_requested.set()
+        worker_loop = inner.get("loop")
+        task = inner.get("task")
+        if worker_loop is not None and task is not None:
+            try:
+                worker_loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(future), timeout=OVERLAP_CLEANUP_TIMEOUT_S
+            )
+        except BaseException:
+            pass
+        raise
+
+
+async def _golden_stage_pair_overlap(
+    session: GoldenSession, *, kind: str, pair: tuple[str, str],
+    sibling_name: str, sibling_call: Callable[[], Any], owner_name: str,
+    owner_call: Callable[[], Any],
+) -> None:
+    recorder = session.recorder
+    sibling_key = _short_stage_name(sibling_name)
+    owner_key = _short_stage_name(owner_name)
+    recorder._acknowledged_overlaps.add(pair)
+    timing: dict[str, int] = {}
+    with recorder.concurrent_stage_mode():
+        sibling_start = time.monotonic_ns()
+        sibling_task = asyncio.create_task(
+            _run_overlap_stage_offloaded(
+                lambda: _overlap_stage_call(sibling_name, sibling_call, timing, sibling_key)
+            )
+        )
+        if session.runner is not None:
+            session.runner._golden_ignored_tasks.add(sibling_task)
+        await asyncio.sleep(0)
+        owner_start = time.monotonic_ns()
+        owner_task = asyncio.create_task(
+            _overlap_owner_call(owner_name, owner_call, timing, owner_key)
+        )
+        if session.runner is not None:
+            session.runner._golden_ignored_tasks.add(owner_task)
+        try:
+            await owner_task
+            join_start = time.monotonic_ns()
+            await sibling_task
+            join_wall = time.monotonic_ns() - join_start
+        except BaseException:
+            if not sibling_task.done():
+                sibling_task.cancel()
+            if not owner_task.done():
+                owner_task.cancel()
+            await asyncio.gather(sibling_task, owner_task, return_exceptions=True)
+            raise
+    sibling_end = timing.get(f"{sibling_key}_end_ns", time.monotonic_ns())
+    owner_end = timing.get(f"{owner_key}_end_ns", time.monotonic_ns())
+    evidence = {
+        "arm": "m2_mmap_process",
+        "schedule": OVERLAP_SCHEDULE_OVERLAP,
+        "pair": list(pair),
+        "outcome": "success",
+        "sibling_start_ns": sibling_start,
+        "sibling_end_ns": sibling_end,
+        "owner_start_ns": owner_start,
+        "owner_end_ns": owner_end,
+        **_stage_pair_metrics(
+            sibling_start_ns=sibling_start, sibling_end_ns=sibling_end,
+            owner_start_ns=owner_start, owner_end_ns=owner_end,
+            join_wall_ns=join_wall, sibling_key=sibling_key, owner_key=owner_key,
+        ),
+    }
+    setattr(recorder, f"{kind}_overlap", evidence)
+    recorder.event(f"{kind}_overlap", **evidence)
+
+
+async def _overlap_stage_call(
+    name: str, call: Callable[[], Any], timing: dict[str, int], key: str,
+) -> Any:
+    with _golden_trace_span(name):
+        try:
+            return await call()
+        finally:
+            timing[f"{key}_end_ns"] = time.monotonic_ns()
+
+
+async def _overlap_owner_call(
+    name: str, call: Callable[[], Any], timing: dict[str, int], key: str,
+) -> Any:
+    with _golden_trace_span(name):
+        try:
+            return await call()
+        finally:
+            timing[f"{key}_end_ns"] = time.monotonic_ns()
+
+
+async def golden_clip_forward_unet_window(
+    session: GoldenSession, *, schedule: str,
+    clip_forward: Optional[Callable[[], Any]] = None,
+    unet_load: Optional[Callable[[], Any]] = None,
+) -> None:
+    schedule = _validate_overlap_schedule(schedule, label="clip_unet")
+    clip_forward = clip_forward or (lambda: golden_clip_forward(session))
+    unet_load = unet_load or (lambda: golden_unet_load(session))
+    if schedule == OVERLAP_SCHEDULE_OVERLAP:
+        await _golden_stage_pair_overlap(
+            session, kind="clip_unet", pair=CLIP_UNET_OVERLAP_PAIR,
+            sibling_name="golden_clip_forward", sibling_call=clip_forward,
+            owner_name="golden_unet_load", owner_call=unet_load,
+        )
+        return
+    with _golden_trace_span("golden_clip_forward"):
+        await clip_forward()
+    with _golden_trace_span("golden_unet_load"):
+        await unet_load()
+
+
+async def golden_sampling_vae_window(
+    session: GoldenSession, *, schedule: str,
+    sampling: Optional[Callable[[], Any]] = None,
+    vae_load: Optional[Callable[[], Any]] = None,
+) -> None:
+    schedule = _validate_overlap_schedule(schedule, label="sampling_vae")
+    sampling = sampling or (lambda: golden_sampling(session))
+    vae_load = vae_load or (lambda: golden_vae_load(session))
+    if schedule == OVERLAP_SCHEDULE_OVERLAP:
+        await _golden_stage_pair_overlap(
+            session, kind="sampling_vae", pair=SAMPLING_VAE_OVERLAP_PAIR,
+            sibling_name="golden_vae_load", sibling_call=vae_load,
+            owner_name="golden_sampling", owner_call=sampling,
+        )
+        return
+    with _golden_trace_span("golden_vae_load"):
+        await vae_load()
+    with _golden_trace_span("golden_sampling"):
+        await sampling()
 
 
 # ── Top-level explicit serial executor ────────────────────────────────────

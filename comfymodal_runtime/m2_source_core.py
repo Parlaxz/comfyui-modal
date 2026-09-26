@@ -9,6 +9,7 @@ correctness state and waits for every child to exit before returning.
 from __future__ import annotations
 
 import ctypes as _ct
+import collections
 import os
 import platform
 import statistics
@@ -304,6 +305,192 @@ def _reader(args: tuple) -> None:
                 child_conn.close()
             except BaseException:
                 pass
+
+
+def _persistent_reader_close_fds(fd_cache: collections.OrderedDict) -> None:
+    for value in tuple(fd_cache.values()):
+        fd = value[0] if isinstance(value, tuple) else value
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    fd_cache.clear()
+
+
+def _persistent_reader_fd(
+    fd_cache: collections.OrderedDict,
+    path: str,
+    identity: tuple[int, int, int, int],
+    cache_limit: int,
+) -> int:
+    cached = fd_cache.get(path)
+    if cached is not None:
+        fd, cached_identity = cached
+        if cached_identity == identity:
+            fd_cache.move_to_end(path)
+            return int(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        fd_cache.pop(path, None)
+    fd = os.open(path, os.O_RDONLY)
+    fd_cache[path] = (fd, identity)
+    fd_cache.move_to_end(path)
+    while len(fd_cache) > max(1, int(cache_limit)):
+        _old_path, (old_fd, _old_identity) = fd_cache.popitem(last=False)
+        try:
+            os.close(old_fd)
+        except OSError:
+            pass
+    return int(fd)
+
+
+def _persistent_reader_load(
+    reader_id: int,
+    request: dict[str, Any],
+    staging: dict[str, Any],
+    fd_cache: collections.OrderedDict,
+    fd_cache_limit: int,
+) -> dict[str, Any]:
+    if _LIBC is None:
+        raise RuntimeError("libc_unavailable")
+    path = str(request["path"])
+    source_offset = int(request["source_offset"])
+    data_bytes = int(request["data_bytes"])
+    read_bytes = int(request["read_bytes"])
+    identity_values = tuple(int(value) for value in request["identity"])
+    if len(identity_values) != 4:
+        raise RuntimeError("persistent_reader_file_identity_invalid")
+    identity = (
+        identity_values[0], identity_values[1], identity_values[2], identity_values[3]
+    )
+    cached = fd_cache.get(path)
+    fd_cache_hit = bool(cached is not None and cached[1] == identity)
+    fd = _persistent_reader_fd(fd_cache, path, identity, fd_cache_limit)
+    published = staging["published"][reader_id]
+    consumed = staging["consumed"][reader_id]
+    slot_off = staging["slot_off"][reader_id]
+    slot_len = staging["slot_len"][reader_id]
+    slots = int(staging["slots"])
+    lane_base = int(staging["seg_base"]) + reader_id * int(staging["lane_bytes"])
+    sequence = 0
+    first_enter = 0
+    last_exit = 0
+    bytes_read = 0
+    records: list[dict[str, int]] = []
+    for block_id in request["block_ids"]:
+        block_id = int(block_id)
+        length = min(read_bytes, data_bytes - block_id * read_bytes)
+        if length <= 0:
+            raise RuntimeError(f"persistent_reader_block_out_of_range:{block_id}")
+        while sequence - int(consumed.value) >= slots:
+            if int(staging["alive"].value) == 0:
+                raise RuntimeError("persistent_reader_staging_stopped")
+            time.sleep(0.0001)
+        destination_offset = block_id * read_bytes
+        absolute_offset = source_offset + destination_offset
+        window_start = absolute_offset & ~(_PAGE - 1)
+        window_len = ((absolute_offset + length - window_start + _PAGE - 1) // _PAGE) * _PAGE
+        window = int(_LIBC.mmap(
+            None, window_len, _PROT_READ, _MAP_PRIVATE | _MAP_POPULATE, fd, window_start
+        ))
+        if window in (0, -1) or window == 0xFFFFFFFFFFFFFFFF:
+            raise OSError(f"persistent_mmap_failed errno={_ct.get_errno()}")
+        entered = int(time.perf_counter_ns())
+        try:
+            _LIBC.memcpy(
+                lane_base + (sequence % slots) * read_bytes,
+                window + absolute_offset - window_start,
+                length,
+            )
+        finally:
+            _LIBC.munmap(window, window_len)
+        exited = int(time.perf_counter_ns())
+        if first_enter == 0:
+            first_enter = entered
+        last_exit = exited
+        slot = sequence % slots
+        slot_off[slot] = destination_offset
+        slot_len[slot] = length
+        published.value = sequence + 1
+        sequence += 1
+        bytes_read += length
+        records.append({
+            "block_id": block_id,
+            "offset": destination_offset,
+            "length": length,
+            "enter_ns": entered,
+            "exit_ns": exited,
+        })
+    return {
+        "reader": int(reader_id),
+        "pid": int(os.getpid()),
+        "status": "ok",
+        "first_enter_ns": first_enter,
+        "last_exit_ns": last_exit,
+        "read_count": len(records),
+        "read_bytes": bytes_read,
+        "fd_cache_hit": fd_cache_hit,
+        "records": records,
+    }
+
+
+def persistent_reader_main(
+    reader_id: int,
+    command_conn: Any,
+    staging: dict[str, Any],
+    fd_cache_limit: int = 4,
+) -> None:
+    """Run one CUDA-sterile reader for the lifetime of the container."""
+    fd_cache: collections.OrderedDict = collections.OrderedDict()
+    try:
+        command_conn.send({"command": "READY", "reader": int(reader_id), "pid": os.getpid()})
+        while True:
+            request = command_conn.recv()
+            command = str(request.get("command", ""))
+            if command == "EXIT":
+                return
+            if command == "INVALIDATE_FDS":
+                _persistent_reader_close_fds(fd_cache)
+                command_conn.send({"command": "INVALIDATE_FDS_DONE", "reader": int(reader_id)})
+                continue
+            if command != "LOAD":
+                command_conn.send({
+                    "command": "LOAD_DONE",
+                    "generation": request.get("generation"),
+                    "reader": int(reader_id),
+                    "status": "error",
+                    "error": f"unknown_reader_command:{command}",
+                })
+                continue
+            try:
+                payload = _persistent_reader_load(
+                    reader_id, request, staging, fd_cache, fd_cache_limit
+                )
+            except BaseException as exc:
+                payload = {
+                    "reader": int(reader_id),
+                    "pid": int(os.getpid()),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}:{str(exc)[:400]}",
+                    "first_enter_ns": 0,
+                    "last_exit_ns": 0,
+                    "read_count": 0,
+                    "read_bytes": 0,
+                    "records": [],
+                }
+            command_conn.send({
+                "command": "LOAD_DONE",
+                "generation": request.get("generation"),
+                **payload,
+            })
+    finally:
+        _persistent_reader_close_fds(fd_cache)
+        try:
+            command_conn.close()
+        except BaseException:
+            pass
 
 
 def run_mmap_source_probe(

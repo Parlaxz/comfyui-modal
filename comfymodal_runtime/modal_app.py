@@ -10473,11 +10473,23 @@ class ModalRuntimeEntrypoint:
                 api._start_in_process_backend()
             return "in_process"
 
+        def golden_model_transport_enabled() -> bool:
+            selected = os.environ.get("COMFYMODAL_GOLDEN_MODEL_TRANSPORT", "").strip().lower()
+            return os.environ.get("COMFYMODAL_GOLDEN_CLIP_LOADER", "").strip().lower() == "m2" or selected in {
+                "1", "true", "yes", "on", "m2", "persistent",
+            }
+
         def restore_gpu_state() -> Any:
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().prepare_cpu()
             return api._restore_in_process_gpu_state()
 
         def initialize_cuda() -> dict[str, Any]:
             value = api._initialize_cuda_context()
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().initialize_cuda()
             if isinstance(value, tuple) and len(value) == 2:
                 return {"device": str(value[0]), "diagnostics": value[1]}
             return {"result": value}
@@ -10526,8 +10538,13 @@ class ModalRuntimeEntrypoint:
 
         def observe_generations() -> dict[str, str]:
             _cn_val, _cn_src = module._resolve_custom_nodes_generation(api=api)
+            model_generation = str(module._current_models_generation_id() or "")
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().update_models_generation(model_generation)
             return {
                 "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "models": model_generation,
                 "custom_nodes": _cn_val,
                 "custom_nodes_source": _cn_src,
             }
