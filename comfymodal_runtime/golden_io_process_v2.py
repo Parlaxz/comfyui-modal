@@ -3377,16 +3377,13 @@ class SharedArenaRing:
         # the deploy-baked selector turned registration OFF.  OFF leaves the
         # mapping, slots, geometry, source engine, and H2D dispatcher byte
         # identical; only the registration is skipped.
-        if self.host_register_enabled:
-            self.register_start_ns = time.monotonic_ns()
-            t0 = time.perf_counter()
-            rc = int(register(self._arena_address, self.size_bytes, _CUDA_HOST_REGISTER_DEFAULT))
-            self.register_end_ns = time.monotonic_ns()
-            self.register_ms = round((time.perf_counter() - t0) * 1000.0, 4)
-            if rc != 0:
-                self._release_mapping_after_failed_setup()
-                raise RuntimeError(f"cudaHostRegister_failed:{rc}:{_cudart_error_str(cudart, rc)}")
-            self.registered = True
+        #
+        # Overlap note (Part 4 restore): the child spawn below needs only the
+        # SHM name, not the registration.  The environment is fully built
+        # first so the spawn can start before the synchronous
+        # cudaHostRegister call, hiding ~100+ ms of fork/exec/python-startup
+        # behind registration with no threading and no behavior change; the
+        # ready handshake still joins before ensure() returns.
         child_env = os.environ.copy()
         child_env["CUDA_VISIBLE_DEVICES"] = ""
         # The CUDA-sterile child loads the stdlib transport module by explicit
@@ -3446,6 +3443,18 @@ class SharedArenaRing:
         )
         self._stdin = self._proc.stdin
         self._stdout = self._proc.stdout
+        if self.host_register_enabled:
+            self.register_start_ns = time.monotonic_ns()
+            t0 = time.perf_counter()
+            rc = int(register(self._arena_address, self.size_bytes, _CUDA_HOST_REGISTER_DEFAULT))
+            self.register_end_ns = time.monotonic_ns()
+            self.register_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+            if rc != 0:
+                # The child was already spawned above (spawn/register overlap),
+                # so full cleanup -- not just mapping release -- is required.
+                self._cleanup_failed_setup()
+                raise RuntimeError(f"cudaHostRegister_failed:{rc}:{_cudart_error_str(cudart, rc)}")
+            self.registered = True
         ready = self._read_child_ready(timeout_s=180.0)
         self.child_ready_ns = time.monotonic_ns()
         if not isinstance(ready, dict) or ready.get("op") != "ready_child":
