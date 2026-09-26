@@ -711,6 +711,25 @@ owner = "golden-model-transport"
 description = "Enable the persistent role-neutral shared model transport for CLIP and UNET; it runs the C0 shared arena (never a standalone M2 execution arm) when C0 streaming with the exact-window engine is selected."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY"
+type = "enum"
+default = "qd4_64"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-model-transport"
+enum_values = ["qd4_64", "qd2_128", "qd4_64_h2d128"]
+description = "C0 source/H2D scheduling geometry (window usage only; the 512 MiB C0 arena is never resized). qd2_128 requires 128 MiB C0 slots."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-model-transport"
+description = "Attach full per-window source records to C0 transport telemetry (diagnostic only; default OFF)."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
 type = "enum"
 default = "serial"

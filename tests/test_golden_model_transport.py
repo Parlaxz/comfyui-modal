@@ -17,8 +17,13 @@ from comfymodal_runtime.golden_model_transport import (
     MIN_LAUNCH_GAP_NS,
     QD,
     STAGING_BYTES,
+    _c0_window_trace_enabled,
     _destination_reserve_capacities,
+    _percentile_summary,
     _sticky_lane_ranges,
+    resolve_c0_transport_geometry,
+    summarize_c0_reader,
+    summarize_dispatcher,
 )
 from comfymodal_runtime.m2_source_core import (
     _persistent_reader_close_fds,
@@ -117,6 +122,134 @@ def test_c0_streaming_without_exact_window_engine_fails_closed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="c0_streaming_requires_mmap_fresh"):
         GoldenModelTransport()
+
+
+def test_c0_transport_geometry_defaults_to_qd4_64(monkeypatch):
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", raising=False)
+
+    geo = resolve_c0_transport_geometry()
+
+    assert geo["name"] == "qd4_64"
+    assert geo["queue_depth"] == QD == 4
+    assert geo["block_bytes"] == BLOCK_BYTES == 64 * 1024 * 1024
+    assert geo["producer_workers"] == 4
+    assert geo["aggregation_enabled"] is False
+    assert geo["required_slot_bytes"] == 64 * 1024 * 1024
+
+
+def test_c0_transport_geometry_qd2_128(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd2_128")
+
+    geo = resolve_c0_transport_geometry()
+
+    assert geo["queue_depth"] == 2
+    assert geo["block_bytes"] == 128 * 1024 * 1024
+    assert geo["producer_workers"] == 2
+    assert geo["required_slot_bytes"] == 128 * 1024 * 1024
+
+
+def test_c0_transport_geometry_h2d128_keeps_64mib_source_windows(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd4_64_h2d128")
+
+    geo = resolve_c0_transport_geometry()
+
+    assert geo["queue_depth"] == 4
+    assert geo["block_bytes"] == 64 * 1024 * 1024
+    assert geo["aggregation_enabled"] is True
+    assert geo["h2d_target_bytes"] == 128 * 1024 * 1024
+
+
+def test_c0_transport_geometry_unknown_fails_closed(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd8_256")
+
+    with pytest.raises(ValueError, match="invalid C0 transport geometry"):
+        resolve_c0_transport_geometry()
+
+
+def test_c0_window_trace_defaults_off(monkeypatch):
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_C0_WINDOW_TRACE", raising=False)
+    assert _c0_window_trace_enabled() is False
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_WINDOW_TRACE", "1")
+    assert _c0_window_trace_enabled() is True
+
+
+def test_percentile_summary_math():
+    assert _percentile_summary([]) == {"count": 0}
+    assert _percentile_summary(["x", None, True]) == {"count": 0}
+
+    summary = _percentile_summary([100_000_000, 200_000_000, 300_000_000, 400_000_000])
+
+    assert summary["count"] == 4
+    assert summary["min_ms"] == 100.0
+    assert summary["max_ms"] == 400.0
+    assert summary["p50_ms"] == pytest.approx(250.0)
+    assert summary["mean_ms"] == pytest.approx(250.0)
+    assert summary["sum_ms"] == pytest.approx(1000.0)
+
+
+def test_summarize_c0_reader_tolerates_missing_attributes():
+    summary = summarize_c0_reader(object())
+
+    assert summary["fills"] == 0
+    assert summary["map"] == {"count": 0}
+    assert summary["worst_window"] is None
+    assert summary["reader_pids"] == []
+
+
+def test_summarize_c0_reader_collects_phases_and_worst_window():
+    class FakeRing:
+        backpressure_block_count = 3
+        backpressure_block_ns = 9_000_000
+        fills_submitted = 10
+        fills_ready = 10
+
+    class FakeReader:
+        _ring = FakeRing()
+        fills = 4
+        fill_wall_ns = 1_000_000_000
+        fd_open_count = 1
+        fd_reuse_count = 3
+        fd_close_count = 0
+        _mmap_map_ns = [1_000_000, 2_000_000]
+        _mmap_memcpy_ns = [200_000_000, 260_000_000]
+        _mmap_munmap_ns = [5_000_000, 7_000_000]
+        _mmap_pipe_rtt_ns = [210_000_000, 270_000_000]
+        _mmap_gate_wait_ns = [0, 4_000_000]
+        _mmap_minflt = [100, 120]
+        _mmap_majflt = [0, 2]
+        _mmap_reader_pids = {111, 222}
+        _mmap_memcpy_first_ns = [200_000_000]
+        _mmap_memcpy_reuse_ns = [260_000_000]
+        _mmap_map_first_ns = []
+        _mmap_map_reuse_ns = []
+        _mmap_read_records = [
+            {"mmap_op_ns": 100_000_000, "producer_id": 0,
+             "source_range": [0, 67108864]},
+            {"mmap_op_ns": 300_000_000, "producer_id": 2,
+             "source_range": [134217728, 201326592]},
+        ]
+
+    summary = summarize_c0_reader(FakeReader())
+
+    assert summary["fills"] == 4
+    assert summary["ring_backpressure_blocks"] == 3
+    assert summary["memcpy"]["count"] == 2
+    assert summary["memcpy"]["max_ms"] == pytest.approx(260.0)
+    assert summary["majflt_total"] == 2
+    assert summary["reader_pids"] == [111, 222]
+    assert summary["worst_window"]["producer_id"] == 2
+    assert summary["worst_window"]["source_range"] == [134217728, 201326592]
+    assert summary["memcpy_first_ms"] == pytest.approx(200.0)
+    assert summary["memcpy_reuse_ms"] == pytest.approx(260.0)
+
+
+def test_summarize_dispatcher_tolerates_missing_telemetry():
+    summary = summarize_dispatcher(object())
+
+    assert summary["producer_capacity_block_count"] is None
+    assert summary["min_free_slots"] is None
+    assert summary["qd_depth_max"] is None
+    assert summary["h2d_latency"] == {"count": 0}
 
 
 def test_c0_identity_is_c0_parallel_not_m2_arm():

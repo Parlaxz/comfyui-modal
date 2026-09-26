@@ -11390,6 +11390,7 @@ async def golden_clip_load(
                     "c0_arena_bytes": stats.get("c0_arena_bytes"),
                     "c0_arena_created": stats.get("c0_arena_created", False),
                     "c0_arena_reused": stats.get("c0_arena_reused"),
+                    "source_detail": stats.get("source_detail"),
                     "layout_cache_hit": stats.get("layout_cache_hit"),
                     "fd_cache_hit": stats.get("fd_cache_hit"),
                     "transport_runtime_reused": stats.get("transport_runtime_reused"),
@@ -13119,6 +13120,7 @@ async def golden_unet_load(
                 "c0_arena_bytes": loaded.stats.get("c0_arena_bytes"),
                 "c0_arena_created": loaded.stats.get("c0_arena_created", False),
                 "c0_arena_reused": loaded.stats.get("c0_arena_reused"),
+                "source_detail": loaded.stats.get("source_detail"),
                 **{
                     key: loaded.stats.get(key)
                     for key in (

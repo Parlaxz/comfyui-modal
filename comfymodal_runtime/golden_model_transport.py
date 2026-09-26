@@ -319,6 +319,221 @@ def _parse_layout(path: str, identity: tuple[int, int, int, int]) -> Safetensors
     )
 
 
+C0_TRANSPORT_GEOMETRY_ENV = "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY"
+C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+_C0_TRANSPORT_GEOMETRIES = ("qd4_64", "qd2_128", "qd4_64_h2d128")
+_C0_WINDOW_TRACE_LIMIT = 4096
+
+
+def _c0_window_trace_enabled() -> bool:
+    return str(os.environ.get(C0_WINDOW_TRACE_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def resolve_c0_transport_geometry(value: Any = None) -> dict[str, Any]:
+    """Resolve the C0 source/H2D scheduling geometry (deploy-baked selector).
+
+    Geometry describes scheduling/window usage only; the 512 MiB C0 arena is
+    never resized here.  ``qd2_128`` requires 128 MiB C0 slots (control
+    geometry); anything else requires 64 MiB slots (treatment geometry).
+    Unknown selectors fail closed.
+    """
+    selected = (
+        os.environ.get(C0_TRANSPORT_GEOMETRY_ENV) if value is None else value
+    )
+    selected = str(selected if selected is not None else "qd4_64").strip().lower()
+    if selected not in _C0_TRANSPORT_GEOMETRIES:
+        raise ValueError(
+            f"invalid C0 transport geometry {selected!r}; "
+            f"expected one of {_C0_TRANSPORT_GEOMETRIES}"
+        )
+    if selected == "qd2_128":
+        return {
+            "name": selected,
+            "queue_depth": 2,
+            "block_bytes": 128 * 1024 * 1024,
+            "producer_workers": 2,
+            "aggregation_enabled": False,
+            "h2d_target_bytes": 128 * 1024 * 1024,
+            "capacity_class": "c0-qd2-128m",
+            "required_slot_bytes": 128 * 1024 * 1024,
+        }
+    if selected == "qd4_64_h2d128":
+        return {
+            "name": selected,
+            "queue_depth": QD,
+            "block_bytes": BLOCK_BYTES,
+            "producer_workers": QD,
+            "aggregation_enabled": True,
+            "h2d_target_bytes": 128 * 1024 * 1024,
+            "capacity_class": "c0-qd4-64m",
+            "required_slot_bytes": 64 * 1024 * 1024,
+        }
+    return {
+        "name": selected,
+        "queue_depth": QD,
+        "block_bytes": BLOCK_BYTES,
+        "producer_workers": QD,
+        "aggregation_enabled": False,
+        "h2d_target_bytes": BLOCK_BYTES,
+        "capacity_class": "c0-qd4-64m",
+        "required_slot_bytes": 64 * 1024 * 1024,
+    }
+
+
+def _percentile_summary(values: list[Any]) -> dict[str, Any]:
+    """Compact count/min/p50/p90/max/sum over plain-int samples (ms assumed)."""
+    samples = sorted(
+        int(value) for value in values
+        if isinstance(value, int) and not isinstance(value, bool)
+    )
+    if not samples:
+        return {"count": 0}
+    def at(frac: float) -> float:
+        pos = frac * (len(samples) - 1)
+        lo = int(pos)
+        hi = min(lo + 1, len(samples) - 1)
+        return samples[lo] + (samples[hi] - samples[lo]) * (pos - lo)
+    total = sum(samples)
+    return {
+        "count": len(samples),
+        "min_ms": samples[0] / 1e6,
+        "p50_ms": at(0.50) / 1e6,
+        "p90_ms": at(0.90) / 1e6,
+        "max_ms": samples[-1] / 1e6,
+        "sum_ms": total / 1e6,
+        "mean_ms": (total / len(samples)) / 1e6,
+    }
+
+
+def _mean_ns(values: Any) -> float | None:
+    samples = [
+        int(value) for value in (values or [])
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if not samples:
+        return None
+    return (sum(samples) / len(samples)) / 1e6
+
+
+def summarize_c0_reader(source: Any) -> dict[str, Any]:
+    """Summarize one load's C0 reader evidence (Stages A-D measurement).
+
+    Reads only already-accumulated reader/ring counters; performs no I/O and
+    no synchronization.  Missing attributes degrade to None/empty, never raise.
+    """
+    def _get(name: str, default: Any = None) -> Any:
+        try:
+            return getattr(source, name, default)
+        except BaseException:
+            return default
+
+    ring = _get("_ring")
+    def _ring(name: str, default: Any = None) -> Any:
+        try:
+            return getattr(ring, name, default) if ring is not None else default
+        except BaseException:
+            return default
+
+    summary: dict[str, Any] = {
+        "fills": int(_get("fills", 0) or 0),
+        "fill_wall_ms": float(_get("fill_wall_ns", 0) or 0) / 1e6,
+        "fd_open": int(_get("fd_open_count", 0) or 0),
+        "fd_reuse": int(_get("fd_reuse_count", 0) or 0),
+        "fd_close": int(_get("fd_close_count", 0) or 0),
+        "ring_backpressure_blocks": int(_ring("backpressure_block_count", 0) or 0),
+        "ring_backpressure_ms": float(_ring("backpressure_block_ns", 0) or 0) / 1e6,
+        "ring_fills_submitted": int(_ring("fills_submitted", 0) or 0),
+        "ring_fills_ready": int(_ring("fills_ready", 0) or 0),
+        "map": _percentile_summary(_get("_mmap_map_ns", [])),
+        "memcpy": _percentile_summary(_get("_mmap_memcpy_ns", [])),
+        "munmap": _percentile_summary(_get("_mmap_munmap_ns", [])),
+        "pipe_rtt": _percentile_summary(_get("_mmap_pipe_rtt_ns", [])),
+        "gate_wait": _percentile_summary(_get("_mmap_gate_wait_ns", [])),
+        "memcpy_first_ms": _mean_ns(_get("_mmap_memcpy_first_ns", [])),
+        "memcpy_reuse_ms": _mean_ns(_get("_mmap_memcpy_reuse_ns", [])),
+        "map_first_ms": _mean_ns(_get("_mmap_map_first_ns", [])),
+        "map_reuse_ms": _mean_ns(_get("_mmap_map_reuse_ns", [])),
+        "minflt_total": sum(
+            int(v) for v in (_get("_mmap_minflt", []) or []) if isinstance(v, int)
+        ),
+        "majflt_total": sum(
+            int(v) for v in (_get("_mmap_majflt", []) or []) if isinstance(v, int)
+        ),
+        "reader_pids": sorted(int(p) for p in (_get("_mmap_reader_pids", set()) or set())),
+    }
+    worst: dict[str, Any] | None = None
+    for record in (_get("_mmap_read_records", []) or []):
+        if not isinstance(record, dict):
+            continue
+        op_ns = record.get("mmap_op_ns")
+        if not isinstance(op_ns, int) or isinstance(op_ns, bool):
+            continue
+        if worst is None or op_ns > worst["mmap_op_ns"]:
+            worst = {
+                "mmap_op_ns": op_ns,
+                "producer_id": record.get("producer_id"),
+                "reader_pid": record.get("reader_pid"),
+                "source_range": record.get("source_range"),
+                "mmap_map_ns": record.get("mmap_map_ns"),
+                "source_touch_copy_ns": record.get("source_touch_copy_ns"),
+                "mmap_munmap_ns": record.get("mmap_munmap_ns"),
+                "mmap_pipe_rtt_ns": record.get("mmap_pipe_rtt_ns"),
+            }
+    summary["worst_window"] = worst
+    return summary
+
+
+def summarize_dispatcher(dispatcher: Any) -> dict[str, Any]:
+    """Summarize dispatcher slot/H2D/QD telemetry (Stage A measurement).
+
+    Reads only already-recorded telemetry fields; never synchronizes.
+    """
+    def _get(obj: Any, name: str, default: Any = None) -> Any:
+        try:
+            return getattr(obj, name, default)
+        except BaseException:
+            return default
+
+    telemetry = _get(dispatcher, "telemetry")
+    out: dict[str, Any] = {
+        "producer_capacity_block_ms": (
+            float(_get(telemetry, "producer_capacity_block_wall_ns", 0) or 0) / 1e6
+            if _get(telemetry, "producer_capacity_block_wall_ns") is not None else None
+        ),
+        "producer_capacity_block_count": _get(telemetry, "producer_capacity_block_count"),
+        "ready_queue_block_ms": (
+            float(_get(telemetry, "ready_queue_block_wall_ns", 0) or 0) / 1e6
+            if _get(telemetry, "ready_queue_block_wall_ns") is not None else None
+        ),
+        "min_free_slots": _get(telemetry, "min_free_slots"),
+        "source_qd_target": _get(telemetry, "source_qd_target"),
+        "h2d_submitted": _get(telemetry, "h2d_submitted_bytes"),
+        "h2d_completed": _get(telemetry, "h2d_completed_bytes"),
+        "gpu_copy_active_union_ms": _get(telemetry, "gpu_copy_active_union_ms"),
+        "gpu_copy_idle_inside_span_ms": _get(telemetry, "gpu_copy_idle_inside_stream_span_ms"),
+        "producer_read_counts": dict(_get(telemetry, "producer_read_counts", {}) or {}),
+        "drain_ms": None,
+    }
+    start = _get(telemetry, "final_drain_start_ns")
+    end = _get(telemetry, "final_drain_end_ns")
+    if isinstance(start, int) and isinstance(end, int) and end >= start:
+        out["drain_ms"] = (end - start) / 1e6
+    depths = [
+        int(item.get("depth", 0)) for item in (_get(telemetry, "source_qd_timeline", []) or [])
+        if isinstance(item, dict)
+    ]
+    out["qd_depth_max"] = max(depths) if depths else None
+    out["qd_depth_transitions"] = len(depths)
+    latencies = [
+        int(v) for v in (_get(telemetry, "h2d_latencies_ns", []) or [])
+        if isinstance(v, int) and not isinstance(v, bool)
+    ]
+    out["h2d_latency"] = _percentile_summary(latencies)
+    return out
+
+
 class GoldenModelTransport:
     """One persistent, path-driven M2 transport for all model roles."""
 
@@ -742,11 +957,13 @@ class GoldenModelTransport:
             assert self._c0_resources is not None
             from . import golden_qd_transport as qd_transport
 
-            if int(self._c0_runtime.slot_bytes) != int(self.block_bytes):
+            geo = resolve_c0_transport_geometry()
+            if int(self._c0_runtime.slot_bytes) != int(geo["required_slot_bytes"]):
                 raise RuntimeError(
                     "c0_transport_geometry_unsupported:"
                     f"slot_bytes={int(self._c0_runtime.slot_bytes)}"
-                    f"!=block_bytes={int(self.block_bytes)}"
+                    f"!=required_slot_bytes={int(geo['required_slot_bytes'])}"
+                    f"for {geo['name']}"
                 )
             normalized_path = os.path.abspath(str(path))
             layout_cache_hit = normalized_path in self._layout_cache
@@ -758,14 +975,14 @@ class GoldenModelTransport:
                 owner.gpu_tensor, resources=self._c0_resources
             )
             config = qd_transport.TransportConfig(
-                queue_depth=QD,
-                block_bytes=BLOCK_BYTES,
+                queue_depth=int(geo["queue_depth"]),
+                block_bytes=int(geo["block_bytes"]),
                 staging_slots=int(self._c0_runtime.slot_count),
                 ready_queue_capacity=int(self._c0_runtime.slot_count),
-                producer_workers=QD,
-                capacity_class="c0-qd4-64m",
-                h2d_target_bytes=BLOCK_BYTES,
-                aggregation_enabled=False,
+                producer_workers=int(geo["producer_workers"]),
+                capacity_class=str(geo["capacity_class"]),
+                h2d_target_bytes=int(geo["h2d_target_bytes"]),
+                aggregation_enabled=bool(geo["aggregation_enabled"]),
             )
             pool = self._c0_runtime.new_stage_pool()
             dispatcher = qd_transport.GoldenQDTransport(
@@ -773,7 +990,7 @@ class GoldenModelTransport:
                 backend,
                 arm="static_e27",
                 pool=pool,
-                diagnostics=False,
+                diagnostics=True,
                 resources=self._c0_resources,
             )
             ranges = []
@@ -781,12 +998,12 @@ class GoldenModelTransport:
             offset = layout.data_start
             remaining = layout.data_bytes
             while remaining > 0:
-                length = min(BLOCK_BYTES, remaining)
+                length = min(int(geo["block_bytes"]), remaining)
                 ranges.append(
                     qd_transport.SourceRange(
                         offset,
                         length,
-                        block_id * BLOCK_BYTES,
+                        block_id * int(geo["block_bytes"]),
                         block_id,
                     )
                 )
@@ -810,6 +1027,21 @@ class GoldenModelTransport:
             )
             dispatcher.snapshot_quiescence()
             views = self._views(owner.gpu_tensor, layout.tensor_map)
+            # Stages A-D measurement: summarize already-accumulated reader +
+            # dispatcher evidence (no I/O, no synchronization).  Full
+            # per-window arrays ride only the explicit window-trace selector.
+            source_detail: dict[str, Any] = {
+                "transport_geometry": str(geo["name"]),
+                "reader": summarize_c0_reader(source),
+                "dispatcher": summarize_dispatcher(dispatcher),
+            }
+            if _c0_window_trace_enabled():
+                try:
+                    records = list(getattr(source, "_mmap_read_records", []) or [])
+                    source_detail["window_trace"] = records[:_C0_WINDOW_TRACE_LIMIT]
+                    source_detail["window_trace_truncated"] = len(records) > _C0_WINDOW_TRACE_LIMIT
+                except BaseException:
+                    source_detail["window_trace"] = None
             child_start_ns = int(getattr(source, "first_child_read_start_mono_ns", 0) or 0)
             child_end_ns = int(getattr(source, "last_child_read_end_mono_ns", 0) or 0)
             source_child_wall_ms = (
@@ -836,6 +1068,7 @@ class GoldenModelTransport:
                 "c0_arena_bytes": int(self._c0_runtime.size_bytes),
                 "c0_arena_created": bool(self._c0_runtime.created),
                 "c0_arena_reused": bool(self._load_count > 0),
+                "source_detail": source_detail,
                 "source_read_count": int(getattr(source, "fills", 0) or len(ranges)),
                 "source_read_bytes": layout.data_bytes,
                 "bytes_read": layout.data_bytes,
