@@ -12,6 +12,7 @@ import os
 import struct
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -572,7 +573,12 @@ class GoldenModelTransport:
             layout = self.inspect(path)
             from .production_m2_loader import load_m2_safetensors
 
-            loaded = load_m2_safetensors(path)
+            try:
+                loaded = load_m2_safetensors(path)
+            except BaseException as exc:
+                raise RuntimeError(
+                    "canonical_m2_load_failed:\n" + traceback.format_exc()
+                ) from exc
             source = dict(loaded.get("source") or {})
             raw_stats = dict(loaded.get("stats") or {})
             timing = dict(loaded.get("timing") or {})
