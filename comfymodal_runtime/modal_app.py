@@ -4895,6 +4895,16 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME": os.environ.get(
             "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME", "one_shot_events"
         ),
+        # C0 source/H2D scheduling geometry + per-window trace selector must
+        # cross Modal's class-env boundary; otherwise deploy-time selectors
+        # silently default in the container and geometry experiments are
+        # untestable.  Scheduling/diagnostics only; the arena is untouched.
+        "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd4_64"
+        ),
+        "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE", "0"
+        ),
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
         ),
