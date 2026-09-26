@@ -393,7 +393,7 @@ def _persistent_reader_load(
         window_start = absolute_offset & ~(_PAGE - 1)
         window_len = ((absolute_offset + length - window_start + _PAGE - 1) // _PAGE) * _PAGE
         window = int(_LIBC.mmap(
-            None, window_len, _PROT_READ, _MAP_PRIVATE | _MAP_POPULATE, fd, window_start
+            None, window_len, _PROT_READ, _MAP_PRIVATE, fd, window_start
         ))
         if window in (0, -1) or window == 0xFFFFFFFFFFFFFFFF:
             raise OSError(f"persistent_mmap_failed errno={_ct.get_errno()}")
