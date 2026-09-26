@@ -1,0 +1,24 @@
+﻿run | region | worst src | workers | py_hb | S_main lat | B_MAIN excess | S_child lat | B_CHILD excess | class
+| fx-01 | CLOUD_PROVIDER_OCI/us-chicago-1 | 224 | - | - | - | whole-run 94.749079 | - | whole-run 2.2235760000000004 | CLEAN |
+| fx-02 | CLOUD_PROVIDER_GCP/us-east | 243 | - | - | - | whole-run 293.065637 | - | whole-run 4.033515 | CLEAN |
+| fx-03 | CLOUD_PROVIDER_GCP/northamerica-northeast2 | 277 | [0, 1, 3] | 276 | 7 | 135 | 5 | 24 | CASE 2 (futex late in MAIN pid only) |
+      B_MAIN worst tick: enter=1780 blocking=137ms expected_wake=+2.0ms actual_exit=1917ms retval=-1 errno=110 ticks=37
+      B_CHILD worst tick: enter=1932 blocking=26ms expected_wake=+2.0ms actual_exit=1958ms retval=-1 errno=110 ticks=136
+| fx-04 | CLOUD_PROVIDER_GCP/us-east4 | 219 | - | - | - | whole-run 340.359939 | - | whole-run 2.566231 | CLEAN |
+| fx-05 | CLOUD_PROVIDER_GCP/us-east | 1296 | [0, 1, 2, 3] | 1103 | 1 | 1163 | 1 | 2 | CASE 2 (futex late in MAIN pid only) |
+      B_MAIN worst tick: enter=2245 blocking=1165ms expected_wake=+2.0ms actual_exit=3409ms retval=-1 errno=110 ticks=80
+      B_CHILD worst tick: enter=2451 blocking=4ms expected_wake=+2.0ms actual_exit=2455ms retval=-1 errno=110 ticks=623
+| fx-06 | CLOUD_PROVIDER_UNSPECIFIED/london | 119 | - | - | - | whole-run 52.507986 | - | whole-run 15.069643 | CLEAN |
+| fx-07 | CLOUD_PROVIDER_OCI/us-chicago-1 | 152 | - | - | - | whole-run 50.511409 | - | whole-run 1.3217430000000001 | CLEAN |
+| fx-08 | CLOUD_PROVIDER_GCP/us-west | 160 | - | - | - | whole-run 54.881971 | - | whole-run 1.5060259999999999 | CLEAN |
+| fx-09 | CLOUD_PROVIDER_GCP/us-east4 | 150 | - | - | - | whole-run 61.403228 | - | whole-run 1.2981820000000002 | CLEAN |
+| fx-10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 1980 | [0, 3] | 1953 | 1 | 1952 | 1 | 2 | CASE 2 (futex late in MAIN pid only) |
+      B_MAIN worst tick: enter=5567 blocking=1954ms expected_wake=+2.0ms actual_exit=7522ms retval=-1 errno=110 ticks=57
+      B_CHILD worst tick: enter=6933 blocking=4ms expected_wake=+2.0ms actual_exit=6937ms retval=-1 errno=110 ticks=934
+| fx-11 | CLOUD_PROVIDER_GCP/asia-south2 | 629 | [0, 1, 2, 3] | 403 | 7 | 470 | 2 | 2 | CASE 2 (futex late in MAIN pid only) |
+      B_MAIN worst tick: enter=4965 blocking=472ms expected_wake=+2.0ms actual_exit=5437ms retval=-1 errno=110 ticks=88
+      B_CHILD worst tick: enter=5507 blocking=4ms expected_wake=+2.0ms actual_exit=5512ms retval=-1 errno=110 ticks=319
+
+=== separability ===
+late futex (>100ms) in a CLEAN source run: [('fx-02', 293.065637), ('fx-04', 340.359939)]
+large source episode (>=500ms) with healthy futex: none

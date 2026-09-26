@@ -1041,6 +1041,16 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({ status: "ok", custom_nodes: [] });
   }
 
+  /**
+   * GET /comfymodal/models — remote model-volume inventory. The shared mock
+   * has no remote volume, so return an empty folder map: the wizard's overlay
+   * then leaves every local report state untouched. Specs that need remote
+   * availability override this route in the test.
+   */
+  async function listRemoteModelsMock(route, url, body) {
+    return _json({});
+  }
+
   /** Catch-all: 599 JSON for any unhandled /comfymodal/ request */
   async function catchAll(route, url, body) {
     return _error("unhandled mock endpoint", 599);
@@ -1090,6 +1100,9 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Remote model-volume inventory (wizard Dependencies overlay).
+    ["GET", "/comfymodal/models", listRemoteModelsMock],
 
     // Custom-node registry refresh (wizard post-install best-effort refresh)
     ["POST", "/comfymodal/studio/custom-nodes/refresh", refreshCustomNodesMock],

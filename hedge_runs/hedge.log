@@ -1,0 +1,122 @@
+[hx] schedule seed=20260922 runs=100
+[hx] start hx-H125-001 round=1 pos=1 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-001 gpu=NVIDIA H100 80GB HBM3 region=europe-west2 wall=5021.466379 logical_med=47.2124355 logical_max=2537.305619 log500=5 log1k=1 hedges=2 wins=0 amp=1.0166666666666666
+[hx] start hx-C-002 round=1 pos=2 arm=C hedge_ms=0.0
+[hx] done hx-C-002 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=1494.629095 logical_med=40.704710000000006 logical_max=99.740822 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-003 round=1 pos=3 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-003 gpu=NVIDIA H100 80GB HBM3 region=us-west4 wall=1693.735142 logical_med=44.868633 logical_max=96.719784 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-004 round=1 pos=4 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-004 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=1807.424923 logical_med=44.6652275 logical_max=122.715547 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H125-005 round=2 pos=1 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-005 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=2335.546995 logical_med=65.27357599999999 logical_max=119.17633 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-006 round=2 pos=2 arm=C hedge_ms=0.0
+[hx] done hx-C-006 gpu=NVIDIA H100 80GB HBM3 region=eu-north wall=2979.465762 logical_med=73.1375525 logical_max=235.742288 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-007 round=2 pos=3 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-007 gpu=NVIDIA H100 80GB HBM3 region=europe-west2 wall=1786.335064 logical_med=46.3320585 logical_max=104.922677 log500=0 log1k=0 hedges=2 wins=0 amp=1.0166666666666666
+[hx] start hx-H200-008 round=2 pos=4 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-008 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=1616.22013 logical_med=42.7880245 logical_max=100.864532 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-009 round=3 pos=1 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-009 gpu=NVIDIA H100 80GB HBM3 region=europe-west9 wall=1794.869141 logical_med=47.330309 logical_max=113.463198 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-010 round=3 pos=2 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-010 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=1918.130958 logical_med=42.595220999999995 logical_max=328.924166 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H75-011 round=3 pos=3 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-011 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1876.618017 logical_med=44.585806000000005 logical_max=283.112237 log500=0 log1k=0 hedges=3 wins=1 amp=1.025
+[hx] start hx-C-012 round=3 pos=4 arm=C hedge_ms=0.0
+[hx] done hx-C-012 gpu=NVIDIA H100 80GB HBM3 region=us-east4 wall=2391.928136 logical_med=47.169716 logical_max=661.856444 log500=1 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-013 round=4 pos=1 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-013 gpu=NVIDIA H100 80GB HBM3 region=asia-south2 wall=1634.103328 logical_med=43.179638499999996 logical_max=114.950747 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H125-014 round=4 pos=2 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-014 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=1780.575731 logical_med=49.591989 logical_max=73.191699 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-015 round=4 pos=3 arm=C hedge_ms=0.0
+[hx] done hx-C-015 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1691.005459 logical_med=42.613491499999995 logical_max=105.429972 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-016 round=4 pos=4 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-016 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1552.962088 logical_med=42.061183 logical_max=65.063159 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-017 round=5 pos=1 arm=C hedge_ms=0.0
+[hx] done hx-C-017 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2311.239105 logical_med=39.268483 logical_max=934.481612 log500=1 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-018 round=5 pos=2 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-018 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1686.418223 logical_med=45.9382885 logical_max=98.210045 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-019 round=5 pos=3 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-019 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1842.175106 logical_med=47.886299 logical_max=121.71061 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-020 round=5 pos=4 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-020 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1577.004771 logical_med=39.280007999999995 logical_max=95.011174 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-C-021 round=6 pos=1 arm=C hedge_ms=0.0
+[hx] done hx-C-021 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1610.27472 logical_med=43.397031 logical_max=62.805211 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-022 round=6 pos=2 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-022 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=2879.485184 logical_med=84.874202 logical_max=164.105291 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-023 round=6 pos=3 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-023 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1821.833449 logical_med=48.8242085 logical_max=112.640759 log500=0 log1k=0 hedges=2 wins=0 amp=1.0166666666666666
+[hx] start hx-H125-024 round=6 pos=4 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-024 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1889.742255 logical_med=44.8455735 logical_max=163.947048 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H125-025 round=7 pos=1 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-025 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2344.843408 logical_med=69.79138599999999 logical_max=107.860119 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-026 round=7 pos=2 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-026 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1807.745907 logical_med=43.908182 logical_max=175.635777 log500=0 log1k=0 hedges=3 wins=0 amp=1.025
+[hx] start hx-C-027 round=7 pos=3 arm=C hedge_ms=0.0
+[hx] done hx-C-027 gpu=NVIDIA H100 80GB HBM3 region=eu-north wall=1839.143281 logical_med=45.309754 logical_max=181.158375 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-028 round=7 pos=4 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-028 gpu=NVIDIA H100 80GB HBM3 region=us-chicago-1 wall=1827.338873 logical_med=49.363952499999996 logical_max=112.912372 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-029 round=8 pos=1 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-029 gpu=NVIDIA H100 80GB HBM3 region=eu-north wall=9093.114907 logical_med=35.853356500000004 logical_max=3736.493974 log500=6 log1k=5 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H75-030 round=8 pos=2 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-030 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=12697.394058 logical_med=38.911874499999996 logical_max=3144.489471 log500=9 log1k=5 hedges=3 wins=2 amp=1.025
+[hx] start hx-C-031 round=8 pos=3 arm=C hedge_ms=0.0
+[hx] done hx-C-031 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1588.915135 logical_med=44.216498 logical_max=97.282903 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-032 round=8 pos=4 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-032 gpu=NVIDIA H100 80GB HBM3 region=us-east4 wall=1680.535859 logical_med=45.114668 logical_max=110.575488 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-033 round=9 pos=1 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-033 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1576.699618 logical_med=44.3014425 logical_max=73.743458 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-034 round=9 pos=2 arm=C hedge_ms=0.0
+[hx] done hx-C-034 gpu=NVIDIA H100 80GB HBM3 region=asia-northeast3 wall=1673.760054 logical_med=45.652877000000004 logical_max=102.067188 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-035 round=9 pos=3 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-035 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1688.059917 logical_med=39.109117 logical_max=239.312625 log500=0 log1k=0 hedges=2 wins=1 amp=1.0166666666666666
+[hx] start hx-H125-036 round=9 pos=4 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-036 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1667.83007 logical_med=45.780234500000006 logical_max=106.438837 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-037 round=10 pos=1 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-037 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=2440.194758 logical_med=67.8658555 logical_max=123.459173 log500=0 log1k=0 hedges=17 wins=2 amp=1.1416666666666666
+[hx] start hx-C-038 round=10 pos=2 arm=C hedge_ms=0.0
+[hx] done hx-C-038 gpu=NVIDIA H100 80GB HBM3 region=eu-north1 wall=2889.181716 logical_med=75.08035849999999 logical_max=162.054212 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-039 round=10 pos=3 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-039 gpu=NVIDIA H100 80GB HBM3 region=europe-west2 wall=1814.421659 logical_med=46.103799499999994 logical_max=107.926937 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-040 round=10 pos=4 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-040 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1717.592333 logical_med=46.67716 logical_max=102.805192 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-041 round=11 pos=1 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-041 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=2686.553724 logical_med=44.0652075 logical_max=1137.280367 log500=1 log1k=1 hedges=2 wins=1 amp=1.0166666666666666
+[hx] start hx-C-042 round=11 pos=2 arm=C hedge_ms=0.0
+[hx] done hx-C-042 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1733.795409 logical_med=47.581970999999996 logical_max=90.14115 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-043 round=11 pos=3 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-043 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1743.363371 logical_med=43.9907665 logical_max=92.957315 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-044 round=11 pos=4 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-044 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1698.833381 logical_med=43.733878000000004 logical_max=104.987238 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-045 round=12 pos=1 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-045 gpu=NVIDIA H100 80GB HBM3 region=asia-northeast1 wall=1852.005082 logical_med=47.863185 logical_max=122.326726 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H125-046 round=12 pos=2 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-046 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1574.744406 logical_med=42.3940035 logical_max=99.526848 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-047 round=12 pos=3 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-047 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1586.572721 logical_med=43.110982 logical_max=93.912483 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-048 round=12 pos=4 arm=C hedge_ms=0.0
+[hx] done hx-C-048 gpu=NVIDIA H100 80GB HBM3 region=europe-west2 wall=2628.871875 logical_med=77.108143 logical_max=167.969687 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-049 round=13 pos=1 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-049 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=3226.147944 logical_med=98.125164 logical_max=127.232713 log500=0 log1k=0 hedges=35 wins=12 amp=1.2916666666666667
+[hx] start hx-H200-050 round=13 pos=2 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-050 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=1673.456405 logical_med=41.338913 logical_max=116.84321 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-051 round=13 pos=3 arm=C hedge_ms=0.0
+[hx] done hx-C-051 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1702.614966 logical_med=41.9513485 logical_max=184.154612 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-052 round=13 pos=4 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-052 gpu=NVIDIA H100 80GB HBM3 region=asia-northeast1 wall=1762.435737 logical_med=45.4277695 logical_max=105.742861 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H200-053 round=14 pos=1 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-053 gpu=NVIDIA H100 80GB HBM3 region=ap-south wall=1664.649492 logical_med=43.6727985 logical_max=62.698671 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-H125-054 round=14 pos=2 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-054 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1571.671583 logical_med=42.547703999999996 logical_max=57.492886 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-055 round=14 pos=3 arm=C hedge_ms=0.0
+[hx] done hx-C-055 gpu=NVIDIA H100 80GB HBM3 region=odin wall=7563.858099 logical_med=32.871943 logical_max=2609.305137 log500=7 log1k=5 hedges=0 wins=0 amp=1.0
+[hx] start hx-H75-056 round=14 pos=4 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-056 gpu=NVIDIA H100 80GB HBM3 region=us-east4 wall=1702.068776 logical_med=42.487552 logical_max=90.621539 log500=0 log1k=0 hedges=3 wins=0 amp=1.025
+[hx] start hx-H125-057 round=15 pos=1 arm=H125 hedge_ms=125.0
+[hx] done hx-H125-057 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1989.284714 logical_med=49.9384785 logical_max=125.201127 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H75-058 round=15 pos=2 arm=H75 hedge_ms=75.0
+[hx] done hx-H75-058 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1737.595575 logical_med=46.5681635 logical_max=106.702391 log500=0 log1k=0 hedges=1 wins=0 amp=1.0083333333333333
+[hx] start hx-H200-059 round=15 pos=3 arm=H200 hedge_ms=200.0
+[hx] done hx-H200-059 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1715.392305 logical_med=43.906842 logical_max=89.542186 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-060 round=15 pos=4 arm=C hedge_ms=0.0
+[hx] done hx-C-060 gpu=NVIDIA H100 80GB HBM3 region=us-east1-a wall=1975.512862 logical_med=52.747546 logical_max=129.547291 log500=0 log1k=0 hedges=0 wins=0 amp=1.0
+[hx] start hx-C-061 round=16 pos=1 arm=C hedge_ms=0.0

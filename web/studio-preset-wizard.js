@@ -23,8 +23,10 @@ import {
   applyDependencyInflightBadge,
   applyDependencyStateBadge,
   buildManagerPackIndex,
+  buildRemoteModelIndex,
   matchManagerModel,
   normalizeManagerSavePath,
+  overlayDependencyModels,
   performManagerInstall,
   renderDependencySection,
 } from "./studio-model-library.js";
@@ -36,6 +38,7 @@ import {
   getWorkflowVersion,
   createMapping,
   getVersionDependencies,
+  listRemoteModels,
   batchInstallModels,
   rescanModels,
   refreshCustomNodes,
@@ -283,6 +286,12 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     managerModelsByFilename: null,
     managerPacks: null,
     installingPack: null,
+    // Remote Modal model-volume inventory (GET /comfymodal/models). Loaded
+    // lazily when the Dependencies step is active; remote nonzero size is the
+    // availability authority. Read-only — never downloads to the browser/PC.
+    remoteModelIndex: null,
+    remoteModelsLoaded: false,
+    remoteModelsLoading: false,
     restartRequired: false,
     rebootInFlight: false,
     // Explicit per-row install status lives in wizard state (not just DOM) so
@@ -1062,6 +1071,37 @@ function _rerenderWizard(state) {
   if (panel) renderWizard(panel, state);
 }
 
+/**
+ * Dependency report projected through the remote-availability overlay.
+ * The raw report is kept in state; this returns a copy whose model states and
+ * summary reflect remote nonzero size so the banner and "Download all" count
+ * agree with the rows. A missing index is a no-op (local truth preserved).
+ */
+function _effectiveDependencies(state) {
+  const deps = state && state.dependencies;
+  if (!deps || !state.remoteModelIndex) return deps;
+  return overlayDependencyModels(deps, state.remoteModelIndex);
+}
+
+/**
+ * Load the remote Modal model inventory once per wizard, when the
+ * Dependencies step is active. Best-effort: a failed read leaves the local
+ * report in place (no invented availability) and never retries in a loop.
+ * Refresh clears the loaded flag so the next render re-reads remote truth.
+ */
+function _maybeLoadRemoteModels(state) {
+  if (!state || state.remoteModelsLoaded || state.remoteModelsLoading) return;
+  state.remoteModelsLoading = true;
+  (async () => {
+    const entries = await listRemoteModels(state._apiBase);
+    if (_wizardState !== state) return;
+    state.remoteModelsLoading = false;
+    state.remoteModelsLoaded = true;
+    state.remoteModelIndex = entries ? buildRemoteModelIndex(entries) : null;
+    _rerenderWizard(state);
+  })();
+}
+
 function renderDependenciesStep(body, state) {
   if (!state.isVersionSetup) {
     body.appendChild(el("p", {
@@ -1072,6 +1112,10 @@ function renderDependenciesStep(body, state) {
     return;
   }
 
+  // Remote availability is an input to the report, so start the read as soon
+  // as the step is active (the row render re-runs when it lands).
+  _maybeLoadRemoteModels(state);
+
   if (!state.dependencies) {
     body.appendChild(el("p", {
       class: "comfymodal-studio-wizard-description",
@@ -1081,9 +1125,10 @@ function renderDependenciesStep(body, state) {
     return;
   }
 
+  const deps = _effectiveDependencies(state);
   const managerModels = state.managerModelsByFilename || null;
-  const missingWithUrl = _missingModelsWithUrl(state.dependencies, managerModels);
-  const missingNoUrl = _missingModelsWithoutUrl(state.dependencies, managerModels);
+  const missingWithUrl = _missingModelsWithUrl(deps, managerModels);
+  const missingNoUrl = _missingModelsWithoutUrl(deps, managerModels);
 
   body.appendChild(el("div", { style: "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 8px;" }, [
     el("button", {
@@ -1150,7 +1195,7 @@ function renderDependenciesStep(body, state) {
 
   // Full report: reuse the detail page's renderer so markup/testids stay
   // identical (dependency-status, dependency-model-row, dependency-node-row).
-  const depSection = renderDependencySection(null, state.dependencies, null, {
+  const depSection = renderDependencySection(null, deps, null, {
     apiBase: state._apiBase,
     managerInstalled: state.managerInstalled || [],
     installingPack: state.installingPack,
@@ -1338,6 +1383,10 @@ function _watchInstallFailures(section, state) {
 
 async function prefetchVersionDependencies(state) {
   if (!state || !state.isVersionSetup) return;
+  // A dependency refresh re-reads remote truth too, so the overlay is never
+  // stale after an install (the remote inventory is the availability
+  // authority). The next Dependencies-step render re-fetches it.
+  state.remoteModelsLoaded = false;
   try {
     const resp = await getVersionDependencies(state._apiBase, state.workflowVersionId);
     if (_wizardState !== state) return;
@@ -1351,8 +1400,11 @@ async function prefetchVersionDependencies(state) {
 
 async function downloadMissingModels(state) {
   if (!state || state.dependenciesBusy) return;
+  // Bulk download runs against the overlay projection: a remote-available
+  // model is never downloaded, even when its local placeholder is empty.
+  const deps = _effectiveDependencies(state);
   const managerModels = state.managerModelsByFilename || null;
-  const models = _missingModelsWithUrl(state.dependencies, managerModels);
+  const models = _missingModelsWithUrl(deps, managerModels);
   if (models.length === 0) {
     state.dependenciesMessage = "No missing models with a source URL to download.";
     _rerenderWizard(state);
@@ -1363,7 +1415,7 @@ async function downloadMissingModels(state) {
     filename: m.filename || "",
     save_path: _modelSavePath(m, managerModels),
   }));
-  const skipped = _missingModelsWithoutUrl(state.dependencies, managerModels).length;
+  const skipped = _missingModelsWithoutUrl(deps, managerModels).length;
   state.dependenciesBusy = true;
   // Beside each row: bulk downloads are tracked per model key too, so a
   // re-render during the batch keeps the queued state on the row's badge.

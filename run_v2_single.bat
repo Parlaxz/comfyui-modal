@@ -120,6 +120,15 @@ if "!V2_E37_CLEAN_LANE_ACTIVE!"=="1" (
     if not defined V2_E37_CONDITIONING_NONCE set "V2_E37_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
     echo [v2.e37_clean_lane_validation] run_selector=ACTIVE full_run=1 e19=0 nonce=present
 )
+set "V2_M2_PRODUCTION_ACTIVE=0"
+if /i "%~1"=="M2_PRODUCTION_VALIDATION" set "V2_M2_PRODUCTION_ACTIVE=1"
+if /i "!COMFYMODAL_V2_M2_PRODUCTION_LOADER!"=="1" set "V2_M2_PRODUCTION_ACTIVE=1"
+if "!V2_M2_PRODUCTION_ACTIVE!"=="1" (
+    set "V2_BENCHMARK_MODE=m2_single"
+    set "V2_BENCHMARK_RUNS=1"
+    if not defined V2_M2_CONDITIONING_NONCE set "V2_M2_CONDITIONING_NONCE=%RANDOM%-%RANDOM%-%RANDOM%"
+    echo [v2.m2_production_validation] run_selector=ACTIVE full_run=1 nonce=present
+)
 if not defined V2_E28_VALIDATION set "V2_E28_VALIDATION=0"
 if /i "%~1"=="E28_VALIDATION" set "V2_E28_VALIDATION=1"
 set "V2_E28_VALIDATION_ACTIVE=0"
@@ -162,13 +171,13 @@ if /i "!COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM!"=="on" set "V2_GOLDEN_P1_ACTIV
 if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "%~1"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
-if /i "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
+if /i "!COMFYMODAL_V2CTL_PROFILE:~0,18!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
 if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_ACTIVE=1"
 if /i "!V2_BENCHMARK_MODE!"=="golden_p1_parallel" set "V2_GOLDEN_P1_PARALLEL_ACTIVE=1"
 if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     if not defined COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM set "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM=1"
     if "!V2_GOLDEN_P1_PARALLEL_ACTIVE!"=="1" (
-        if defined COMFYMODAL_V2CTL_PROFILE if /i not "!COMFYMODAL_V2CTL_PROFILE!"=="golden_p1_parallel" (
+        if defined COMFYMODAL_V2CTL_PROFILE if /i not "!COMFYMODAL_V2CTL_PROFILE:~0,18!"=="golden_p1_parallel" (
             echo === ERROR: parallel Golden selector requires COMFYMODAL_V2CTL_PROFILE=golden_p1_parallel ===
             exit /b 1
         )
@@ -536,6 +545,7 @@ REM before capture).  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET=1 is the identity/
 REM reporting gate only.  Provider/region unpinned; the harness hard-stops
 REM at 6 valid, invalid probes never count, no beautification probes.  Runs
 REM ONLY via the explicit opt-in V2_BENCHMARK_MODE=snapshot_restore_only.
+if "!V2_M2_PRODUCTION_ACTIVE!"=="1" goto :m2_direct_run
 if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     echo === Running V2 variance-cold MATRIX - explicit opt-in ===
     set "COMFYMODAL_V2_APP_NAME=stable-modal-comfy-v2-variance-shadow"
@@ -577,6 +587,9 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     REM can never re-enable the production branch and wipe the eviction vars.
     set "COMFYMODAL_V2_ENV_PROFILE=inherit"
     python tools\benchmark_v2_direct.py --snapshot-restore-only %*
+) else if "!V2_M2_PRODUCTION_ACTIVE!"=="1" (
+    echo === Running one M2 production-loader benchmark trial ===
+    python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_M2_CONDITIONING_NONCE!
 ) else if "!V2_GOLDEN_P1_ACTIVE!"=="1" (
     if "!V2_GOLDEN_P1_PARALLEL_ACTIVE!"=="1" (
         echo === Running V2 golden_p1 parallel-Golden generation - explicit opt-in ===
@@ -609,6 +622,7 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     exit /b !BENCHMARK_EXIT_CODE!
     )
 ) else (
+    if "!V2_M2_PRODUCTION_ACTIVE!"=="1" goto :m2_direct_run
     echo === Running one V2 benchmark trial against the existing deployment ===
     echo === Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
     echo === Fail-closed request preflight (local, no spend) ===
@@ -644,6 +658,11 @@ if /i "!V2_BENCHMARK_MODE!"=="variance_matrix" (
     ) else (
         python tools\benchmark_v2_direct.py %*
     )
+)
+:m2_direct_run
+if "!V2_M2_PRODUCTION_ACTIVE!"=="1" (
+    echo === Running one M2 production-loader benchmark trial ===
+    python tools\benchmark_v2_direct.py --run-count 1 --conditioning-cache-nonce !V2_M2_CONDITIONING_NONCE!
 )
 set "BENCHMARK_EXIT_CODE=!errorlevel!"
 for /f %%a in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()"') do set "COMMAND_END_MS=%%a"

@@ -78,6 +78,10 @@ def _load_driver() -> Any:
         "cuCtxDestroy_v2": ([cp], ci),
         "cuCtxPopCurrent_v2": ([ctypes.POINTER(cp)], ci),
         "cuCtxSetCurrent": ([cp], ci),
+        "cuCtxGetCurrent": ([ctypes.POINTER(cp)], ci),
+        "cuCtxGetDevice": ([ctypes.POINTER(ci)], ci),
+        "cuDevicePrimaryCtxRetain": ([ctypes.POINTER(cp), ci], ci),
+        "cuDevicePrimaryCtxRelease": ([ci], ci),
         "cuMemHostRegister_v2": ([cp, cs, cv], ci),
         "cuMemHostUnregister": ([cp], ci),
         "cuMemAlloc_v2": ([ctypes.POINTER(cu64), cs], ci),
@@ -223,6 +227,97 @@ def setup_cuda(staging: dict[str, Any], mode: str, gpu_bytes: int = 0) -> dict[s
     return register_and_alloc(staging, mode, gpu_bytes)
 
 
+def setup_current_torch_context(
+    staging: dict[str, Any], mode: str, gpu_tensor: Any | None = None
+) -> dict[str, Any]:
+    """Use Comfy/PyTorch's current primary context without creating one.
+
+    This is called only after the four CPU-only readers have been forked.  The
+    tensor, when supplied, owns the destination allocation; the driver seam
+    only borrows its data pointer for H2D.
+    """
+    if mode not in ("registered", "h2d"):
+        raise ValueError(f"unsupported current-context mode: {mode}")
+    if mode == "h2d" and gpu_tensor is None:
+        raise ValueError("h2d requires a PyTorch-owned destination tensor")
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_unavailable")
+    device_index = int(torch.cuda.current_device())
+    lib = _load_driver()
+    current = ctypes.c_void_p()
+    _check(lib["cuCtxGetCurrent"](ctypes.byref(current)), "cuCtxGetCurrent")
+    if not current.value:
+        raise RuntimeError("torch_cuda_context_not_current")
+    current_device = ctypes.c_int(-1)
+    _check(lib["cuCtxGetDevice"](ctypes.byref(current_device)), "cuCtxGetDevice")
+    primary = ctypes.c_void_p()
+    _check(
+        lib["cuDevicePrimaryCtxRetain"](ctypes.byref(primary), ctypes.c_int(device_index)),
+        "cuDevicePrimaryCtxRetain",
+    )
+    try:
+        primary_value = int(primary.value or 0)
+        current_value = int(current.value or 0)
+        if int(current_device.value) != device_index:
+            raise RuntimeError(
+                f"torch_driver_device_mismatch:{current_device.value}!={device_index}"
+            )
+        if current_value != primary_value:
+            raise RuntimeError("torch_context_is_not_device_primary")
+    finally:
+        _check(lib["cuDevicePrimaryCtxRelease"](ctypes.c_int(device_index)), "cuDevicePrimaryCtxRelease")
+
+    _check(lib["cuCtxSetCurrent"](current,), "cuCtxSetCurrent")
+    register_start = time.perf_counter()
+    _check(
+        lib["cuMemHostRegister_v2"](
+            ctypes.c_void_p(int(staging["seg_base"])),
+            ctypes.c_size_t(int(staging["bytes"])),
+            ctypes.c_uint(0),
+        ),
+        "cuMemHostRegister",
+    )
+    register_ms = (time.perf_counter() - register_start) * 1000.0
+    info: dict[str, Any] = {
+        "device_name": torch.cuda.get_device_name(device_index),
+        "registered": True,
+        "register_ms": register_ms,
+        "register_bytes": int(staging["bytes"]),
+        "context_source": "torch_current_primary",
+        "current_context": current_value,
+        "primary_context": primary_value,
+        "context_matches_primary": True,
+        "torch_device": f"cuda:{device_index}",
+        "cuda_context_created": False,
+    }
+    if mode == "h2d":
+        assert gpu_tensor is not None
+        stream = ctypes.c_void_p()
+        _check(lib["cuStreamCreate"](ctypes.byref(stream), ctypes.c_uint(1)), "cuStreamCreate")
+        staging["_cuda"] = {
+            "lib": lib,
+            "ctx": current,
+            "device_name": info["device_name"],
+            "stream": stream,
+            "dptr": int(gpu_tensor.data_ptr()),
+            "gpu_bytes": int(gpu_tensor.numel()),
+            "gpu_owner": gpu_tensor,
+        }
+        staging["_gpu_owner"] = gpu_tensor
+        info.update({
+            "gpu_bytes": int(gpu_tensor.numel()),
+            "gpu_alloc": False,
+            "gpu_allocation_owner": "torch_tensor",
+            "stream_created": True,
+        })
+    else:
+        staging["_cuda"] = {"lib": lib, "ctx": current, "device_name": info["device_name"]}
+    staging["_cuda_ready"] = True
+    return info
+
+
 _MEMSET = None
 
 
@@ -302,12 +397,16 @@ def start_consumer(
     mode: str,
     verify: bool = False,
     file_path: str = "",
+    gpu_tensor: Any | None = None,
+    diagnostics: bool = True,
 ) -> tuple[threading.Thread, dict[str, Any]]:
     """Start the parent-side consumer for the requested mode."""
     if mode in ("shared", "registered"):
         return _start_release_thread(staging, int(qd))
     if mode == "h2d":
-        return _start_h2d_thread(staging, int(qd), bool(verify), str(file_path))
+        return _start_h2d_thread(
+            staging, int(qd), bool(verify), str(file_path), gpu_tensor, bool(diagnostics)
+        )
     raise ValueError(f"unsupported staging consumer mode: {mode}")
 
 
@@ -348,6 +447,8 @@ def _start_h2d_thread(
     qd: int,
     verify: bool,
     file_path: str,
+    gpu_tensor: Any | None = None,
+    diagnostics: bool = True,
 ) -> tuple[threading.Thread, dict[str, Any]]:
     """DMA each published block to the GPU on one stream; fresh event per transfer."""
     seg_base = int(staging["seg_base"])
@@ -360,6 +461,7 @@ def _start_h2d_thread(
         "transfers": 0, "h2d_bytes": 0, "h2d_active_ms": 0.0, "h2d_max_ms": 0.0,
         "last_done_ns": None, "coverage_offsets": 0, "coverage_bytes": 0,
         "coverage_exact": None, "verified": False,
+        "gpu_allocation_owner": "torch_tensor" if gpu_tensor is not None else "raw_driver",
     }
 
     def _run() -> None:
@@ -378,6 +480,8 @@ def _start_h2d_thread(
         dptr = int(cuda["dptr"])
         stream = cuda["stream"]
         gpu_bytes = int(cuda["gpu_bytes"])
+        owned_tensor = gpu_tensor if gpu_tensor is not None else staging.get("_gpu_owner")
+        state["gpu_allocation_owner"] = "torch_tensor" if owned_tensor is not None else "raw_driver"
         _check(lib["cuCtxSetCurrent"](ctx), "cuCtxSetCurrent")
         consumed = [0] * qd
         next_issue = [0] * qd
@@ -393,11 +497,13 @@ def _start_h2d_thread(
                     off = int(staging["slot_off"][lane][slot])
                     ln = int(staging["slot_len"][lane][slot])
                     host = seg_base + lane * lane_bytes + slot * read_bytes
-                    start_ev = ctypes.c_void_p()
+                    start_ev = ctypes.c_void_p() if diagnostics else None
                     done_ev = ctypes.c_void_p()
-                    _check(lib["cuEventCreate"](ctypes.byref(start_ev), ctypes.c_uint(0)), "cuEventCreate")
+                    if start_ev is not None:
+                        _check(lib["cuEventCreate"](ctypes.byref(start_ev), ctypes.c_uint(0)), "cuEventCreate")
                     _check(lib["cuEventCreate"](ctypes.byref(done_ev), ctypes.c_uint(0)), "cuEventCreate")
-                    _check(lib["cuEventRecord"](start_ev, stream), "cuEventRecord")
+                    if start_ev is not None:
+                        _check(lib["cuEventRecord"](start_ev, stream), "cuEventRecord")
                     _check(lib["cuMemcpyHtoDAsync_v2"](
                         ctypes.c_uint64(dptr + off), ctypes.c_void_p(host),
                         ctypes.c_size_t(ln), stream), "cuMemcpyHtoDAsync")
@@ -414,14 +520,15 @@ def _start_h2d_thread(
                     state["error"] = f"h2d_event_timeout:lane={lane}:seq={seq}"
                     break
                 elapsed = ctypes.c_float(0.0)
-                if lib["cuEventElapsedTime"](ctypes.byref(elapsed), start_ev, done_ev) == _CUDA_SUCCESS:
+                if start_ev is not None and lib["cuEventElapsedTime"](ctypes.byref(elapsed), start_ev, done_ev) == _CUDA_SUCCESS:
                     state["h2d_active_ms"] += float(elapsed.value)
                     state["h2d_max_ms"] = max(state["h2d_max_ms"], float(elapsed.value))
                 state["last_done_ns"] = time.perf_counter_ns()
                 consumed[lane] = seq + 1
                 staging["consumed"][lane].value = seq + 1
                 state["released"] += 1
-                lib["cuEventDestroy_v2"](start_ev)
+                if start_ev is not None:
+                    lib["cuEventDestroy_v2"](start_ev)
                 lib["cuEventDestroy_v2"](done_ev)
                 continue
             if not issued:
@@ -457,7 +564,8 @@ def _start_h2d_thread(
         if not state.get("error"):
             lib["cuStreamSynchronize"](stream)
             lib["cuStreamDestroy_v2"](stream)
-            lib["cuMemFree_v2"](ctypes.c_uint64(dptr))
+            if owned_tensor is None:
+                lib["cuMemFree_v2"](ctypes.c_uint64(dptr))
             lib["cuMemHostUnregister"](ctypes.c_void_p(seg_base))
 
     thread = threading.Thread(target=_run, name="staging-h2d", daemon=True)

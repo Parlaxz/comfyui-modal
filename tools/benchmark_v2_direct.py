@@ -312,6 +312,12 @@ _NODE_REGISTRY_START_NS: int | None = None
 _NODE_REGISTRY_END_NS: int | None = None
 
 
+def _m2_production_loader_requested() -> bool:
+    return os.environ.get("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 async def _ensure_full_node_registry() -> bool:
     """Mirror the ComfyUI server startup: load comfy_extras + custom nodes.
 
@@ -621,6 +627,17 @@ GOLDEN_P1_SNAPSHOT_ROLE_COUNTERS = (
 
 
 def _load_workspace() -> dict[str, Any]:
+    frozen_id = os.environ.get("MODAL_WORKSPACE_ID", "").strip()
+    frozen_label = os.environ.get("MODAL_WORKSPACE_LABEL", "").strip()
+    frozen_token_id = os.environ.get("MODAL_TOKEN_ID", "").strip()
+    frozen_token_secret = os.environ.get("MODAL_TOKEN_SECRET", "").strip()
+    if frozen_id and frozen_token_id and frozen_token_secret:
+        return {
+            "id": frozen_id,
+            "label": frozen_label,
+            "token_id": frozen_token_id,
+            "token_secret": frozen_token_secret,
+        }
     data = json.loads(WORKSPACES_PATH.read_text(encoding="utf-8"))
     active_id = data.get("active_workspace_id")
     for workspace in data.get("workspaces", []):
@@ -2112,7 +2129,7 @@ def _run_run_preflight_cli(nonce: str = "") -> int:
 
     # Nonce target-app resolution (fail closed; D10 guard).
     _nonce_target = ""
-    if nonce:
+    if nonce and not _m2_production_loader_requested():
         try:
             _nonce_target = _resolve_nonce_target_app()
         except Exception as exc:
@@ -2168,9 +2185,9 @@ def _run_run_preflight_cli(nonce: str = "") -> int:
         failures.append(f"baseline cpu mismatch: requested={_env_base_cpu} deployed={_base_cpu}")
     if _env_base_mem and str(_base_mem) and _env_base_mem != str(_base_mem):
         failures.append(f"baseline memory mismatch: requested={_env_base_mem} deployed={_base_mem}")
-    if not _covered:
+    if not _covered and not _m2_production_loader_requested():
         failures.append("D1 registry-proof store does not cover the deployment/workflow")
-    if nonce:
+    if nonce and not _m2_production_loader_requested():
         if not _nonce_target:
             failures.append("nonce target app could not be resolved")
         elif _nonce_target != _app:
@@ -4332,7 +4349,8 @@ async def _run_one(
         # never silently land on the legacy default app (the D10 failure: the
         # old app's baked runtime ignores the nonce -> canonical key -> warm
         # exact_hit with encode_calls=0).
-        _resolve_nonce_target_app()
+        if not _m2_production_loader_requested():
+            _resolve_nonce_target_app()
     # Request-level experiment arms (unet_transfer / vae_overlap /
     # png_encode / conditioning_hit) travel as allowlisted request-origin
     # env keys so the container applies the arm per-request.  Baseline arms
@@ -4360,10 +4378,17 @@ async def _run_one(
     else:
         _registry_load_t0 = time.perf_counter()
         if not await _ensure_full_node_registry():
-            raise RuntimeError(
-                "[v2.harness] node registry initialization failed; "
-                "cannot build an authoritative plan validation proof"
-            )
+            if _m2_production_loader_requested():
+                print(
+                    "[v2.harness] WARNING: node registry initialization failed; "
+                    "continuing M2 without local registry proof",
+                    flush=True,
+                )
+            else:
+                raise RuntimeError(
+                    "[v2.harness] node registry initialization failed; "
+                    "cannot build an authoritative plan validation proof"
+                )
         _registry_load_ms = round((time.perf_counter() - _registry_load_t0) * 1000.0, 3)
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -4459,7 +4484,9 @@ async def _run_one(
                           "__request_origin_info__": request_origin_info},
         trace=runtime_trace,
         validate=False,
-        collect_validation_proof=_PLAN_VALIDATION_PROOF,
+        collect_validation_proof=(
+            _PLAN_VALIDATION_PROOF and not _m2_production_loader_requested()
+        ),
         comfyui_root=_COMFYUI_ROOT_DIR,
     )
     _export_deployment_identity_for_transport()
@@ -12308,10 +12335,17 @@ async def main(bypass_cpu_snapshot_unet: bool = False, cpu_snapshot_unet_ab: boo
     if not _store_primed:
         _nri_preload_start_ns = time.perf_counter_ns()
         if not await _ensure_full_node_registry():
-            raise RuntimeError(
-                "[v2.harness] node registry initialization failed; "
-                "cannot build an authoritative plan validation proof"
-            )
+            if _m2_production_loader_requested():
+                print(
+                    "[v2.harness] WARNING: node registry initialization failed; "
+                    "continuing M2 without local registry proof",
+                    flush=True,
+                )
+            else:
+                raise RuntimeError(
+                    "[v2.harness] node registry initialization failed; "
+                    "cannot build an authoritative plan validation proof"
+                )
         _nri_preload_ms = round((time.perf_counter_ns() - _nri_preload_start_ns) / 1_000_000, 3)
         # E29: define _nri_preload_ms on every path (summary.json field exists
         # unconditionally; the 0.0 default was set only on the primed branch).

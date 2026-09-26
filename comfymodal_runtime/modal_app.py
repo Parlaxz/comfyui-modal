@@ -4856,6 +4856,45 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH", "0"
         ),
+        "COMFYMODAL_GOLDEN_CLIP_LOADER": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_LOADER", "c0"
+        ),
+        "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING", "posix"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY", "qd4_32"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "preadv"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_HOST_REGISTER": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_HOST_REGISTER", "0"
+        ),
+        "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
+        ),
+        "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE": os.environ.get(
+            "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE", "serial"
+        ),
+        "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME": os.environ.get(
+            "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME", "one_shot_events"
+        ),
         "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
             "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
         ),
@@ -5139,6 +5178,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # fastsafetensors direct-GPU path runs unchanged). ──
         "COMFYMODAL_V2_CLIP_QD_READER": os.environ.get(
             "COMFYMODAL_V2_CLIP_QD_READER", "0"
+        ),
+        "COMFYMODAL_V2_M2_PRODUCTION_LOADER": os.environ.get(
+            "COMFYMODAL_V2_M2_PRODUCTION_LOADER", "0"
         ),
         "COMFYMODAL_V2_CLIP_QD_QD": os.environ.get(
             "COMFYMODAL_V2_CLIP_QD_QD", "4"
@@ -19204,6 +19246,7 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB",
             "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY",
             "COMFYMODAL_V2_CLIP_QD_ARTIFACT",
+            "COMFYMODAL_V2_M2_PRODUCTION_LOADER",
             "COMFYMODAL_RESTORE_CLIP_READ_PROBE",
             "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE",
         )
@@ -20018,6 +20061,112 @@ class ModalRuntimeEntrypoint:
         _result["resolved_path"] = str(_resolved)
         return _result
 
+    def run_source_race_oracle(
+        self,
+        role: str = "clip",
+        model_name: str = "qwen_3_4b.safetensors",
+        race_width: int = 1,
+        logical_qd: int = 2,
+        read_bytes: int = 134217728,
+        max_blocks: int = 0,
+        fd_mode: str = "independent",
+        hash_mode: str = "winners_in_order",
+        attempt_id: str = "",
+    ) -> dict[str, Any]:
+        """Raw-data collector returning descriptive statistics only.
+
+        This probe performs no classification or causal inference; it returns
+        only the collector's descriptive statistics and observed evidence.
+        """
+        _role = str(role or "clip").strip().lower()
+        _model_name = str(model_name or "").strip()
+        _attempt_id = str(attempt_id or "")
+        _requested_gpu = str(os.environ.get("COMFYMODAL_V2_GPU", "") or "").strip()
+        _observed_gpu = ""
+        try:
+            import subprocess as _subprocess
+
+            _completed = _subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            _observed_gpu = next(
+                (line.strip() for line in _completed.stdout.splitlines() if line.strip()),
+                "",
+            )
+        except Exception:
+            _observed_gpu = ""
+        _provider = str(os.environ.get("MODAL_CLOUD_PROVIDER", "") or "")
+        _region = str(os.environ.get("MODAL_REGION", "") or "")
+        _resolved = ""
+        _result: dict[str, Any]
+        try:
+            if _role not in {"clip", "unet"}:
+                raise ValueError(f"unsupported_role:{_role}")
+            if (
+                not _model_name
+                or Path(_model_name).name != _model_name
+                or "/" in _model_name
+                or "\\" in _model_name
+            ):
+                raise ValueError("model_name_must_be_a_basename")
+
+            import folder_paths as _fp_source_race
+
+            _resolver = getattr(_fp_source_race, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_source_race, "get_full_path", None)
+            if not callable(_resolver):
+                raise RuntimeError(
+                    "folder_paths has neither get_full_path_or_raise nor get_full_path"
+                )
+            _folder = "text_encoders" if _role == "clip" else "diffusion_models"
+            _resolved = _resolver(_folder, _model_name) or ""
+            if not _resolved:
+                raise FileNotFoundError("model_path_unresolved")
+
+            from comfymodal_runtime.source_race_oracle import (  # noqa: PLC0415
+                run_race_oracle,
+            )
+
+            _result = run_race_oracle(
+                file_path=str(_resolved),
+                race_width=int(race_width),
+                logical_qd=int(logical_qd),
+                read_bytes=int(read_bytes),
+                fd_mode=str(fd_mode),
+                max_blocks=None if int(max_blocks) == 0 else int(max_blocks),
+                offset_start=0,
+                expected_sha256=None,
+                hash_mode=str(hash_mode),
+                clock_ns=None,
+                read_syscall=None,
+                fd_opener=None,
+                fd_closer=None,
+                requested_gpu=_requested_gpu,
+                observed_gpu=_observed_gpu,
+            )
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+        _result["role"] = _role
+        _result["model_name"] = _model_name
+        _result["attempt_id"] = _attempt_id
+        _result["resolved_path"] = str(_resolved)
+        _result["requested_gpu"] = _requested_gpu
+        _result["observed_gpu"] = _observed_gpu
+        _result["provider"] = _provider
+        _result["region"] = _region
+        _result.setdefault("status", "ok")
+        return _result
+
     def run_e27_followup_probe(
         self,
         kind: str,
@@ -20508,6 +20657,69 @@ class ModalRuntimeEntrypoint:
         except Exception:
             return {"status": "error"}
 
+    async def _run_m2_clip_stream(
+        self,
+        *,
+        request_id: str,
+    ) -> AsyncIterator[dict[str, Any]]:
+        started = time.perf_counter()
+        try:
+            models = getattr(self, "_cpu_snapshot_models", None)
+            clip = getattr(models, "clip", None) if models is not None else None
+            if clip is None:
+                raise RuntimeError("m2_clip_snapshot_model_unavailable")
+            from . import clip_fast_hydration_wiring as _cfhw
+            from . import production_m2_loader as _m2
+
+            paths = _cfhw._clip_file_paths(models)
+            if not paths:
+                raise RuntimeError("m2_clip_checkpoint_path_unavailable")
+            loaded = []
+            load_started = time.perf_counter()
+            for path in paths:
+                loaded.append(_m2.load_m2_safetensors(path))
+            load_wall_ms = (time.perf_counter() - load_started) * 1000.0
+            if len(loaded) != 1:
+                raise RuntimeError("m2_direct_clip_requires_single_safetensors_file")
+            bind = _m2.bind_m2_clip(clip, loaded[0])
+            forward_started = time.perf_counter()
+            tokens = clip.tokenize("a photo of a cat")
+            output = clip.encode_from_tokens(
+                tokens, return_pooled=True, return_dict=True
+            )
+            forward_wall_ms = (time.perf_counter() - forward_started) * 1000.0
+            output_summary = {
+                "type": type(output).__name__,
+                "keys": sorted(output.keys()) if isinstance(output, dict) else [],
+            }
+            yield {
+                "type": "result",
+                "request_id": request_id,
+                "m2_production": {
+                    "status": "ok",
+                    "loader_wall_ms": load_wall_ms,
+                    "source_wall_ms": loaded[0]["timing"].get("source_wall_ms"),
+                    "gpu_ready_wall_ms": loaded[0]["timing"].get("gpu_ready_wall_ms"),
+                    "exposed_h2d_tail_ms": loaded[0]["timing"].get("exposed_h2d_tail_ms"),
+                    "tensor_view_ms": bind.get("tensor_view_ms"),
+                    "comfy_bind_ms": bind.get("comfy_bind_ms"),
+                    "forward_wall_ms": forward_wall_ms,
+                    "output": output_summary,
+                    "timing": loaded[0].get("timing"),
+                    "ownership": loaded[0].get("ownership"),
+                    "source_coverage": loaded[0]["source"].get("coverage"),
+                    "staging": loaded[0].get("staging"),
+                    "restore_timing": dict(getattr(self, "_restore_timing", {}) or {}),
+                    "function_wall_ms": (time.perf_counter() - started) * 1000.0,
+                },
+            }
+        except Exception as exc:
+            yield {
+                "type": "error",
+                "request_id": request_id,
+                "message": f"m2_clip_failed: {type(exc).__name__}: {str(exc)[:500]}",
+            }
+
     async def run_plan_stream(
         self,
         plan_payload: Mapping[str, Any],
@@ -20583,12 +20795,16 @@ class ModalRuntimeEntrypoint:
             _remote_watcher.start()
         terminal_started = False
         try:
-            async for event in self._run_plan_stream_impl(
-                plan_payload, request_id=request_id, cancelled=cancelled,
-                control_queue=control_queue,
-                control_partition=control_partition,
-                _remote_cancel_watcher=_remote_watcher,
-            ):
+            if os.environ.get("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "").strip().lower() in {"1", "true", "yes", "on"}:
+                _stream = self._run_m2_clip_stream(request_id=request_id)
+            else:
+                _stream = self._run_plan_stream_impl(
+                    plan_payload, request_id=request_id, cancelled=cancelled,
+                    control_queue=control_queue,
+                    control_partition=control_partition,
+                    _remote_cancel_watcher=_remote_watcher,
+                )
+            async for event in _stream:
                 if not terminal_started and event.get("type") in {"result", "error", "cancelled"}:
                     terminal_started = True
                     self._terminal_response_delivered = True
@@ -23683,6 +23899,7 @@ def _build_decorated_v2_class() -> type:
         "run_unet_mechanism_probe",
         "run_unet_qd_probe",
         "run_clip_qd_probe",
+        "run_source_race_oracle",
         "run_e27_followup_probe",
         "source_identity_probe",
     )
@@ -23703,6 +23920,7 @@ def _build_decorated_v2_class() -> type:
         "run_unet_mechanism_probe",
         "run_unet_qd_probe",
         "run_clip_qd_probe",
+        "run_source_race_oracle",
         "run_e27_followup_probe",
         "source_identity_probe",
     })
@@ -23835,6 +24053,11 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_clip_qd_probe",
         _modal.method()(cls.run_clip_qd_probe),
+    )
+    setattr(
+        cls,
+        "run_source_race_oracle",
+        _modal.method()(cls.run_source_race_oracle),
     )
     setattr(
         cls,

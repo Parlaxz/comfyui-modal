@@ -683,6 +683,34 @@ owner = "e30"
 description = "Enable the E30 genuine queue-depth CLIP source reader (default OFF; the E28 fastsafetensors path runs unchanged when unset)."
 
 [[flag]]
+name = "COMFYMODAL_V2_M2_PRODUCTION_LOADER"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "m2-production"
+description = "Use the M2 mmap/process CLIP loader with PyTorch-owned contiguous GPU storage (default OFF)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_LOADER"
+type = "enum"
+default = "c0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-io-process-v2"
+enum_values = ["c0", "m2"]
+description = "Select the Golden CLIP transport; M2 replaces only CLIP source/H2D while Golden adoption remains authoritative."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-io-process-v2"
+description = "Overlap weightless CLIP skeleton construction with the selected CLIP source/H2D transport."
+
+[[flag]]
 name = "COMFYMODAL_V2_CLIP_QD_QD"
 type = "int"
 default = "4"
@@ -1148,7 +1176,7 @@ default = "e28_single"
 consumed_at = "harness"
 change_requires = "run"
 owner = "v2-core"
-enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "golden_p1_serial", "golden_p1_parallel", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
+enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "m2_single", "golden_p1_serial", "golden_p1_parallel", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
 description = "Benchmark harness mode selector. Default e28_single = ONE full run_plan_stream generation (the tracer/validation path). snapshot_restore_only (the restore-only PROBE that never generates) is an explicit opt-in ONLY; v2ctl gate/run must never silently fall into it."
 
 [[flag]]

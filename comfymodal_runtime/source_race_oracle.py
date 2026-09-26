@@ -22,6 +22,8 @@ import threading
 import time
 from typing import Any, Callable, Optional, cast
 
+from .m2_source_core import run_mmap_source_probe as _run_m2_source_core
+
 
 def percentile(values: list[float], percent: float) -> float:
     """Return a percentile using linear interpolation between ranks."""
@@ -7576,7 +7578,7 @@ def _mm2_child(args: tuple) -> None:
             pass
 
 
-def run_mmap_source_probe(
+def _legacy_run_mmap_source_probe(
     *,
     file_path: str,
     read_bytes: int,
@@ -11438,3 +11440,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# The oracle keeps the historical implementation name private while all M2
+# callers use the one canonical source core.
+def run_mmap_source_probe(**kwargs: Any) -> dict[str, Any]:
+    return _run_m2_source_core(**kwargs, diagnostics=True)

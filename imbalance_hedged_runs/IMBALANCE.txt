@@ -1,0 +1,219 @@
+==============================================================================================================
+QD4 STATIC-PARTITION WORKER IMBALANCE — main goal
+==============================================================================================================
+hedged cohort (250 ms): 107 runs   |   hedge-off cohort: 16 runs
+
+--- HEDGED 250 ms (primary) (n=107) core source stats ---
+  GB/s    median=5.651 mean=5.461 best=7.059 worst=1.647 SD=0.973
+  wall ms median=1424 mean=1550
+  preadv  median=42.93 mean=44.92 p95=57.30 p99=78.52 worst=89.18
+  reads   >=250=35 >=500=15 >=1000=7
+  conc    eff=3.753 maxActive=6
+
+--- HEDGE OFF (invalid side cohort) (n=16) core source stats ---
+  GB/s    median=5.544 mean=5.226 best=6.513 worst=3.750 SD=0.879
+  wall ms median=1451 mean=1589
+  preadv  median=44.24 mean=47.54 p95=66.23 p99=68.07 worst=68.53
+  reads   >=250=7 >=500=3 >=1000=0
+  conc    eff=3.811 maxActive=4
+
+  baseline reference: QD4 process median GB/s 5.785, preadv median 41.76 ms, eff conc 3.694
+
+==============================================================================================================
+25-RUN AGGREGATE STATISTICS (hedged cohort)
+==============================================================================================================
+full_file_source_wall_ms            min=1139.62 p10=1245.51 p25=1336.03 med=1423.74 mean=1549.94 p75=1576.26 p90=1866.22 p95=2212.37 max=4884.14 SD=478.78
+GB/s                                min=1.65 p10=4.31 p25=5.10 med=5.65 mean=5.46 p75=6.02 p90=6.46 p95=6.76 max=7.06 SD=0.97
+finish_spread_ms                    min=10.37 p10=19.89 p25=28.41 med=39.16 mean=112.70 p75=64.10 p90=202.47 p95=519.75 max=2072.38 SD=264.92
+slowest_minus_second_slowest_ms     min=0.28 p10=4.35 p25=6.79 med=10.61 mean=26.19 p75=24.40 p90=47.42 p95=115.64 max=298.41 SD=44.26
+total_stranded_worker_ms            min=17.32 p10=36.52 p25=52.10 med=72.02 mean=208.68 p75=118.54 p90=450.12 p95=1001.15 max=2796.34 SD=428.05
+stranded_capacity_fraction          min=0.00 p10=0.01 p25=0.01 med=0.01 mean=0.03 p75=0.02 p90=0.05 p95=0.13 max=0.20 SD=0.04
+first_finish_unstarted_bytes        min=0.00 p10=0.00 p25=59027232.00 med=67108864.00 mean=303045423.85 p75=193244960.00 p90=442918502.40 p95=1522000467.20 max=5629062944.00 SD=765250987.94
+first_finish_unstarted_fraction     min=0.00 p10=0.00 p25=0.01 med=0.01 mean=0.04 p75=0.02 p90=0.06 p95=0.19 max=0.70 SD=0.10
+second_finish_unstarted_bytes       min=0.00 p10=0.00 p25=0.00 med=0.00 mean=162184867.89 p75=67108864.00 p90=201326592.00 p95=1112636396.80 max=2944708384.00 SD=441133451.04
+second_finish_unstarted_fraction    min=0.00 p10=0.00 p25=0.00 med=0.00 mean=0.02 p75=0.01 p90=0.03 p95=0.14 max=0.37 SD=0.05
+tail_unstarted_reads                min=0.00 p10=0.00 p25=0.00 med=0.00 mean=0.43 p75=0.00 p90=1.00 p95=3.00 max=7.00 SD=1.19
+tail_unstarted_bytes                min=0.00 p10=0.00 p25=0.00 med=0.00 mean=27944188.41 p75=0.00 p90=67108864.00 p95=193244960.00 max=461680416.00 SD=78043550.17
+remaining_inflight_ms               min=0.28 p10=2.87 p25=5.60 med=9.41 mean=12.45 p75=18.36 p90=27.08 p95=30.45 max=36.14 SD=8.84
+
+==============================================================================================================
+WORKER ACTIVE-SPAN DISTRIBUTION
+==============================================================================================================
+all 428 worker observations: min=1082.80 p10=1214.51 p25=1308.87 med=1388.10 mean=1491.96 p75=1527.36 p90=1788.48 p95=2222.79 max=4884.14 SD=418.73
+
+  worker0: n=107 min=1116.36 p10=1224.62 p25=1305.57 med=1372.96 mean=1453.45 p75=1503.30 p90=1724.44 p95=1839.56 max=3405.22 SD=321.02
+  worker1: n=107 min=1125.62 p10=1213.69 p25=1316.73 med=1388.09 mean=1482.80 p75=1502.58 p90=1772.39 p95=2116.39 max=4032.69 SD=395.32
+  worker2: n=107 min=1099.83 p10=1224.51 p25=1310.67 med=1397.85 mean=1511.50 p75=1558.14 p90=1821.13 p95=2146.96 max=4727.12 SD=456.78
+  worker3: n=107 min=1082.80 p10=1205.32 p25=1297.90 med=1395.52 mean=1520.09 p75=1553.54 p90=1813.63 p95=2204.34 max=4884.14 SD=480.24
+
+==============================================================================================================
+FINISH-ORDER DISTRIBUTION
+==============================================================================================================
+| worker |  first |  second |  third |   last |
+|--------|--------|---------|--------|--------|
+|      0 |     41 |      26 |     20 |     20 |
+|      1 |     17 |      27 |     37 |     26 |
+|      2 |     16 |      28 |     36 |     27 |
+|      3 |     33 |      26 |     14 |     34 |
+
+==============================================================================================================
+TAIL CORRELATION (worst preadv vs imbalance metrics)
+==============================================================================================================
+  worst_preadv vs finish_spread_ms                   pearson=0.906 spearman=0.536
+  worst_preadv vs slowest_minus_second_slowest_ms    pearson=0.620 spearman=0.424
+  worst_preadv vs tail_unstarted_bytes               pearson=0.631 spearman=0.349
+  worst_preadv vs total_stranded_worker_ms           pearson=0.908 spearman=0.513
+
+==============================================================================================================
+PROVIDER BREAKDOWN (hedged)
+==============================================================================================================
+| provider     | runs | med GB/s | med spread | med slow-2nd | med 1st-unstart MiB | med tail-unstart MiB | worst spread |
+|--------------|------|----------|------------|--------------|---------------------|----------------------|--------------|
+| azure        |    3 |    5.256 |       34.2 |          7.8 |               120.3 |                  0.0 |         80.7 |
+| gcp          |   48 |    5.774 |       41.6 |         17.3 |               120.3 |                  0.0 |        644.1 |
+| oci          |   23 |    5.459 |       33.4 |          7.9 |                64.0 |                  0.0 |         83.2 |
+| unspecified  |   33 |    5.650 |       37.5 |          9.8 |                64.0 |                  0.0 |       2072.4 |
+
+==============================================================================================================
+FINAL TABLE — one row per hedged run
+==============================================================================================================
+run       provider/region            GB/s  P0 fin  P1 fin  P2 fin  P3 fin  spread slow-2nd 1stUnst MiB 2ndUnst MiB tailUnst MiB remInfl                     shape
+hn-001.jsonoci:us-ashburn-1          5.644    1419    1425    1406    1379    46.1      6.7       128.0         0.0          0.0     6.7   A_stuck_on_one_inflight
+hn-002.jsonoci:us-ashburn-1          5.444    1395    1466    1478    1463    83.2     11.8       248.3         0.0          0.0    11.8   A_stuck_on_one_inflight
+hn-003.jsonoci:us-ashburn-1          6.784    1175    1181    1186    1167    19.3      5.2         0.0         0.0          0.0     5.2   A_stuck_on_one_inflight
+hn-004.jsonoci:us-ashburn-1          5.291    1513    1516    1500    1521    20.4      4.9         0.0         0.0          0.0     4.9   A_stuck_on_one_inflight
+hn-005.jsonoci:us-ashburn-1          6.889    1157    1162    1167    1168    10.9      1.1         0.0         0.0          0.0     1.1   A_stuck_on_one_inflight
+hn-006.jsongcp:us-west               6.036    1333    1322    1310    1285    48.2     10.6       128.0         0.0          0.0    10.6   A_stuck_on_one_inflight
+hn-007.jsongcp:us-west               4.539    1370    1400    1676    1772   402.5     96.4      1208.3      1080.3        184.3       -          C_only_unstarted
+hn-008.jsongcp:us-west               6.415    1239    1254    1238    1215    39.2     15.1        64.0         0.0          0.0    15.1   A_stuck_on_one_inflight
+hn-009.jsongcp:us-west               5.967    1329    1344    1348    1308    40.5      3.9       128.0         0.0          0.0     3.9   A_stuck_on_one_inflight
+hn-010.jsongcp:us-west               5.712    1343    1395    1407    1408    65.6      1.0       248.3         0.0          0.0     1.0   A_stuck_on_one_inflight
+hn-011.jsongcp:us-west               6.822    1153    1177    1163    1179    26.1      1.8        56.3         0.0          0.0     1.8   A_stuck_on_one_inflight
+hn-012.jsonunspecified:denver        4.495    1765    1790    1780    1778    24.1      9.8         0.0         0.0          0.0     9.8   A_stuck_on_one_inflight
+hn-013.jsongcp:us-west               5.920    1335    1337    1327    1359    31.8     22.0        56.3        56.3          0.0    22.0   A_stuck_on_one_inflight
+hn-014.jsonunspecified:denver        3.234    2234    2457    2252    2488   253.6     31.3       184.3       184.3          0.0    31.3   A_stuck_on_one_inflight
+hn-015.jsongcp:us-west               6.007    1328    1339    1328    1315    24.6     11.0         0.0         0.0          0.0    11.0   A_stuck_on_one_inflight
+hn-016.jsongcp:us-east4              5.831    1364    1380    1377    1365    15.3      2.5         0.0         0.0          0.0     2.5   A_stuck_on_one_inflight
+hn-017.jsonoci:us-chicago-1          5.098    1570    1561    1578    1560    17.9      7.6         0.0         0.0          0.0     7.6   A_stuck_on_one_inflight
+hn-018.jsongcp:us-east               4.404    1265    1610    1452    1827   561.4    216.5      1848.3       952.3        376.3    18.5 B_inflight_plus_unstarted
+hn-019.jsongcp:us-east4              4.657    1346    1363    1610    1727   381.1    117.2      1016.3      1016.3        184.3    27.3 B_inflight_plus_unstarted
+hn-020.jsongcp:us-east4              5.860    1373    1344    1368    1373    29.1      0.3        56.3         0.0          0.0     0.3   A_stuck_on_one_inflight
+hn-021.jsongcp:us-west               5.573    1425    1444    1412    1412    31.6     18.1        64.0         0.0          0.0    18.1   A_stuck_on_one_inflight
+hn-022.jsonunspecified:us-west       5.166    1515    1550    1548    1557    42.7      7.7       120.3         0.0          0.0     7.7   A_stuck_on_one_inflight
+hn-023.jsonunspecified:sea           5.535    1434    1431    1413    1454    40.9     19.7        56.3         0.0          0.0    19.7   A_stuck_on_one_inflight
+hn-024.jsonunspecified:sea           6.286    1280    1249    1260    1273    31.2      7.2       120.3         0.0          0.0     7.2   A_stuck_on_one_inflight
+hn-025.jsonunspecified:sea           6.446    1229    1248    1239    1211    36.5      9.3        64.0         0.0          0.0     9.3   A_stuck_on_one_inflight
+hn-026.jsonunspecified:sea           6.568    1217    1225    1214    1205    20.3      8.3         0.0         0.0          0.0     8.3   A_stuck_on_one_inflight
+hn-027.jsonoci:us-chicago-1          4.903    1641    1622    1613    1617    27.6     19.1         0.0         0.0          0.0    19.1   A_stuck_on_one_inflight
+hn-028.jsongcp:us-east               5.784    1361    1391    1364    1347    44.2     26.8        64.0        64.0          0.0    26.8   A_stuck_on_one_inflight
+hn-029.jsongcp:us-east               5.936    1344    1347    1326    1355    29.3      8.7        56.3         0.0          0.0     8.7   A_stuck_on_one_inflight
+hn-030.jsongcp:us-east               5.258    1416    1422    1414    1530   115.7    108.1       184.3       184.3        184.3     4.3 B_inflight_plus_unstarted
+hn-031.jsonunspecified:eu-north      7.059    1123    1140    1103    1090    49.4     16.7       192.0        64.0          0.0    16.7   A_stuck_on_one_inflight
+hn-032.jsonunspecified:us-central    4.351    1849    1840    1820    1737   111.9      8.6       320.0        64.0          0.0     8.6   A_stuck_on_one_inflight
+hn-033.jsonunspecified:us-west       5.650    1392    1400    1424    1393    32.4     24.4        64.0        64.0          0.0    24.4   A_stuck_on_one_inflight
+hn-034.jsongcp:us-east               4.427    1412    1394    1678    1817   422.7    139.4      1016.3      1016.3        184.3    36.1 B_inflight_plus_unstarted
+hn-035.jsonazure:us-central          5.308    1462    1516    1499    1435    80.7     16.5       192.0       128.0          0.0    16.5   A_stuck_on_one_inflight
+hn-036.jsonunspecified:us-west       6.037    1283    1324    1293    1333    49.5      8.4       120.3       120.3          0.0     8.4   A_stuck_on_one_inflight
+hn-037.jsonunspecified:us-west       6.433    1239    1248    1251    1240    11.2      2.8         0.0         0.0          0.0     2.8   A_stuck_on_one_inflight
+hn-038.jsonoci:us-chicago-1          5.548    1437    1445    1450    1436    13.8      4.7         0.0         0.0          0.0     4.7   A_stuck_on_one_inflight
+hn-039.jsonoci:us-ashburn-1          5.626    1396    1422    1414    1430    33.4      7.9        56.3         0.0          0.0     7.9   A_stuck_on_one_inflight
+hn-040.jsonoci:us-ashburn-1          5.459    1458    1474    1467    1440    33.4      6.7        64.0         0.0          0.0     6.7   A_stuck_on_one_inflight
+hn-041.jsonoci:us-ashburn-1          5.390    1478    1481    1488    1493    15.0      4.4         0.0         0.0          0.0     4.4   A_stuck_on_one_inflight
+hn-042.jsonunspecified:us-central    5.763    1330    1396    1373    1386    66.4      9.6       184.3         0.0          0.0     9.6   A_stuck_on_one_inflight
+hn-043.jsongcp:us-east               4.719    1367    1493    1669    1705   338.1     36.2      1272.3       696.3         56.3    15.8 B_inflight_plus_unstarted
+hn-044.jsonunspecified:eu-north      1.647    3415    4039    4741    4884  1468.9    142.6      3896.3      2808.3        248.3    31.1 B_inflight_plus_unstarted
+hn-045.jsongcp:us-west               5.386    1494    1465    1398    1364   129.9     28.3       320.0       192.0          0.0    28.3   A_stuck_on_one_inflight
+hn-046.jsongcp:us-west               5.694    1377    1359    1337    1413    75.8     35.8       184.3        56.3         56.3    12.0 B_inflight_plus_unstarted
+hn-047.jsongcp:europe-west2          5.474    1453    1436    1408    1470    61.5     16.5       120.3        56.3          0.0    16.5   A_stuck_on_one_inflight
+hn-048.jsongcp:us-east               2.739    2933    2938    2928    2885    52.8      4.6         0.0         0.0          0.0     4.6   A_stuck_on_one_inflight
+hn-049.jsongcp:us-west               5.974    1347    1326    1312    1290    56.8     20.7       128.0        64.0          0.0    20.7   A_stuck_on_one_inflight
+hn-050.jsongcp:us-west               5.759    1364    1366    1397    1368    32.4     29.2        64.0        64.0         64.0     2.1 B_inflight_plus_unstarted
+hn-051.jsongcp:us-west               6.442    1249    1222    1218    1208    41.0     26.7        64.0        64.0          0.0    26.7   A_stuck_on_one_inflight
+hn-052.jsongcp:us-west               6.701    1195    1175    1201    1194    25.5      5.9        64.0         0.0          0.0     5.9   A_stuck_on_one_inflight
+hn-053.jsonoci:us-chicago-1          4.918    1590    1632    1636    1620    45.5      4.3       184.3         0.0          0.0     4.3   A_stuck_on_one_inflight
+hn-054.jsonunspecified:sea           5.974    1309    1347    1336    1336    37.5     10.3       184.3         0.0          0.0    10.3   A_stuck_on_one_inflight
+hn-055.jsonunspecified:eu-north      6.478    1216    1211    1242    1232    31.0      9.8       120.3        64.0          0.0     9.8   A_stuck_on_one_inflight
+hn-056.jsongcp:us-west               5.257    1499    1490    1530    1522    40.0      8.1       120.3        64.0          0.0     8.1   A_stuck_on_one_inflight
+hn-057.jsonunspecified:us-west       5.444    1463    1389    1478    1469    88.4      9.1       312.3         0.0          0.0     9.1   A_stuck_on_one_inflight
+hn-058.jsonunspecified:us-west       5.688    1388    1414    1402    1395    26.3     12.6         0.0         0.0          0.0    12.6   A_stuck_on_one_inflight
+hn-059.jsonunspecified:denver        5.110    1574    1563    1567    1546    28.6      7.1         0.0         0.0          0.0     7.1   A_stuck_on_one_inflight
+hn-060.jsonoci:us-ashburn-1          5.748    1366    1384    1377    1400    33.5     15.2        56.3         0.0          0.0    15.2   A_stuck_on_one_inflight
+hn-061.jsonoci:us-ashburn-1          5.237    1536    1527    1513    1504    32.0      9.4        64.0         0.0          0.0     9.4   A_stuck_on_one_inflight
+hn-062.jsongcp:us-east4              5.926    1343    1314    1348    1358    43.6      9.3       120.3         0.0          0.0     9.3   A_stuck_on_one_inflight
+hn-063.jsonoci:us-ashburn-1          5.741    1394    1371    1401    1381    30.3      7.0        64.0         0.0          0.0     7.0   A_stuck_on_one_inflight
+hn-064.jsonoci:us-ashburn-1          5.200    1547    1498    1530    1466    81.0     16.8       256.0       128.0          0.0    16.8   A_stuck_on_one_inflight
+hn-065.jsonunspecified:us-central    4.442    1811    1784    1796    1770    41.0     15.7        64.0         0.0          0.0    15.7   A_stuck_on_one_inflight
+hn-066.jsonunspecified:denver        3.186    2483    2525    2496    2463    61.8     29.4        64.0        64.0          0.0    29.4   A_stuck_on_one_inflight
+hn-067.jsongcp:us-east               4.110    1352    1565    1939    1957   605.4     18.5      2296.3      1336.3          0.0    18.5   A_stuck_on_one_inflight
+hn-068.jsonoci:us-ashburn-1          4.867    1600    1634    1653    1607    52.6     18.6       128.0        64.0          0.0    18.6   A_stuck_on_one_inflight
+hn-069.jsongcp:us-central            3.770    1527    1490    1835    2134   644.1    298.4      1528.3      1400.3        440.3    31.2 B_inflight_plus_unstarted
+hn-070.jsonunspecified:denver        4.252    1838    1861    1892    1854    54.7     30.8        64.0        64.0          0.0    30.8   A_stuck_on_one_inflight
+hn-071.jsongcp:us-central            5.544    1451    1418    1413    1442    37.9      9.5        64.0        64.0          0.0     9.5   A_stuck_on_one_inflight
+hn-072.jsongcp:us-east               5.517    1381    1451    1412    1458    76.9      6.8       248.3       120.3          0.0     6.8   A_stuck_on_one_inflight
+hn-073.jsonunspecified:eu-north      6.444    1225    1231    1242    1248    23.3      6.5        56.3         0.0          0.0     6.5   A_stuck_on_one_inflight
+hn-074.jsonunspecified:us-central    3.582    2215    2237    2246    2236    30.8      9.4         0.0         0.0          0.0     9.4   A_stuck_on_one_inflight
+hn-075.jsongcp:us-east               4.119    1406    1335    1895    1953   617.7     58.5      1976.3      1656.3         56.3    32.8 B_inflight_plus_unstarted
+hn-076.jsongcp:us-east4              5.528    1428    1455    1434    1437    27.4     18.5        64.0         0.0          0.0    18.5   A_stuck_on_one_inflight
+hn-077.jsongcp:us-east4              5.747    1342    1375    1366    1400    58.2     24.4       120.3        56.3          0.0    24.4   A_stuck_on_one_inflight
+hn-078.jsonunspecified:denver        4.123    1839    1813    1951    1799   152.6    111.9       320.0       192.0        192.0     4.2 B_inflight_plus_unstarted
+hn-079.jsongcp:us-west               6.194    1299    1294    1272    1282    26.4      5.1        64.0         0.0          0.0     5.1   A_stuck_on_one_inflight
+hn-080.jsongcp:us-west               6.243    1244    1217    1289    1204    84.5     44.4       192.0       192.0         64.0    16.2 B_inflight_plus_unstarted
+hn-081.jsongcp:us-west               5.651    1424    1369    1393    1255   168.4     31.1       576.0        64.0         64.0     2.9 B_inflight_plus_unstarted
+hn-082.jsongcp:us-west               5.909    1351    1359    1324    1361    37.3      2.3       120.3         0.0          0.0     2.3   A_stuck_on_one_inflight
+hn-083.jsongcp:us-east               5.765    1365    1366    1395    1353    42.2     29.1        64.0        64.0          0.0    29.1   A_stuck_on_one_inflight
+hn-084.jsonunspecified:denver        4.488    1787    1777    1793    1776    16.4      5.4         0.0         0.0          0.0     5.4   A_stuck_on_one_inflight
+hn-085.jsonunspecified:us-west       5.222    1533    1502    1541    1520    38.5      7.6       128.0         0.0          0.0     7.6   A_stuck_on_one_inflight
+hn-086.jsongcp:us-central            5.982    1339    1320    1345    1332    25.2      5.5         0.0         0.0          0.0     5.5   A_stuck_on_one_inflight
+hn-087.jsongcp:us-west               5.963    1334    1349    1339    1341    15.0      8.4         0.0         0.0          0.0     8.4   A_stuck_on_one_inflight
+hn-088.jsongcp:us-east               5.783    1354    1391    1384    1375    37.4      6.6       128.0         0.0          0.0     6.6   A_stuck_on_one_inflight
+hn-089.jsonunspecified:us-east       2.251    1501    3014    3409    3573  2072.4    164.4      5368.3      1464.3        248.3    27.9 B_inflight_plus_unstarted
+hn-090.jsongcp:us-west               4.912    1522    1566    1586    1638   116.1     52.0       248.3       120.3         56.3    24.9 B_inflight_plus_unstarted
+hn-091.jsonunspecified:US-1          5.718    1383    1389    1370    1407    36.9     17.9        56.3        56.3          0.0    17.9   A_stuck_on_one_inflight
+hn-092.jsonoci:us-chicago-1          6.329    1271    1251    1246    1256    25.5     15.3         0.0         0.0          0.0    15.3   A_stuck_on_one_inflight
+hn-093.jsonunspecified:CANADA-2      6.527    1233    1219    1226    1222    13.8      6.5         0.0         0.0          0.0     6.5   A_stuck_on_one_inflight
+hn-094.jsonoci:us-chicago-1          5.757    1354    1397    1351    1366    46.4     31.0        64.0        64.0         64.0     3.4 B_inflight_plus_unstarted
+hn-095.jsonoci:us-chicago-1          4.587    1697    1717    1754    1679    75.2     37.2       192.0        64.0         64.0     7.4 B_inflight_plus_unstarted
+hn-096.jsonoci:us-chicago-1          6.069    1281    1313    1326    1303    44.7     12.6        64.0         0.0          0.0    12.6   A_stuck_on_one_inflight
+hn-097.jsonazure:us-central          5.145    1529    1544    1563    1564    34.2      0.8       120.3         0.0          0.0     0.8   A_stuck_on_one_inflight
+hn-098.jsonoci:us-ashburn-1          5.058    1550    1591    1585    1564    40.5      5.1       128.0         0.0          0.0     5.1   A_stuck_on_one_inflight
+hn-099.jsonoci:us-ashburn-1          6.198    1298    1235    1265    1258    62.6     32.6       128.0        64.0         64.0     2.8 B_inflight_plus_unstarted
+hn-100.jsonazure:us-central          5.256    1523    1497    1531    1502    34.0      7.8         0.0         0.0          0.0     7.8   A_stuck_on_one_inflight
+hn-101.jsongcp:us-central            6.345    1268    1262    1258    1267    10.4      1.0         0.0         0.0          0.0     1.0   A_stuck_on_one_inflight
+hn-102.jsonunspecified:eu-north      6.690    1203    1174    1177    1181    28.2     21.8        64.0        64.0          0.0    21.8   A_stuck_on_one_inflight
+hn-103.jsonunspecified:eu-north      6.998    1120    1150    1127    1109    40.9     22.7        64.0        64.0          0.0    22.7   A_stuck_on_one_inflight
+hn-104.jsonunspecified:eu-north      7.043    1133    1138    1142    1107    35.5      4.8       192.0         0.0          0.0     4.8   A_stuck_on_one_inflight
+hn-105.jsongcp:us-west               6.057    1302    1328    1309    1304    26.2     19.0         0.0         0.0          0.0    19.0   A_stuck_on_one_inflight
+hn-106.jsongcp:us-west               5.840    1340    1378    1365    1365    37.5     12.7        64.0         0.0          0.0    12.7   A_stuck_on_one_inflight
+hn-107.jsongcp:us-west               6.262    1275    1285    1273    1264    21.0      9.4         0.0         0.0          0.0     9.4   A_stuck_on_one_inflight
+
+==============================================================================================================
+DIRECT ANSWERS (hedged cohort)
+==============================================================================================================
+1.  median worker active span      : 1388.1 ms
+2.  mean worker active span        : 1492.0 ms
+3.  median finish spread           : 39.2 ms
+4.  mean finish spread             : 112.7 ms
+5.  p90/p95/worst finish spread    : 202.5 / 519.8 / 2072.4 ms
+6.  median slowest-minus-2nd       : 10.6 ms
+7.  spread >=100 ms                : 17/107 (16%)
+8.  spread >=250 ms                : 11/107 (10%)
+9.  spread >=500 ms                : 6/107 (6%)
+10. spread >=1000 ms               : 2/107 (2%)
+11. median 1st-finish unstarted    : 64.0 MiB
+12. median 1st-finish unstarted fr : 0.0083
+13. median 2nd-finish unstarted    : 0.0 MiB
+14. median tail unstarted reads    : 0.0 reads
+15. tail shape counts              : {'A_stuck_on_one_inflight': 88, 'B_inflight_plus_unstarted': 18, 'C_only_unstarted': 1}
+    in spread>=250 runs (11): {'B_inflight_plus_unstarted': 8, 'A_stuck_on_one_inflight': 2, 'C_only_unstarted': 1}
+16. stranded capacity median/p90   : 72.0 / 450.1 ms (fraction median 0.0130)
+17. last-finisher counts by worker : [20, 26, 27, 34]
+18. worst_preadv vs spread pearson : 0.906
+
+==============================================================================================================
+SIDE COMPARISON — hedging ON (250 ms) vs OFF  [hedge-off cohort is INVALID for the main result]
+==============================================================================================================
+  HEDGED 250ms n=107  median GB/s=5.651 mean=5.461  median wall=1424 ms  median spread=39.2 ms  median preadv=42.93 ms  reads>=500=15
+  HEDGE OFF    n= 16  median GB/s=5.544 mean=5.226  median wall=1451 ms  median spread=51.3 ms  median preadv=44.24 ms  reads>=500=3
+  hedged: total hedge attempts=108 wins=1 blocks hedged=36 across 16 runs
+          per run: median hedge attempts=0.0 median wins=0.0
+

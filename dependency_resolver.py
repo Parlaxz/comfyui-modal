@@ -295,34 +295,123 @@ def _class_pack_identities_from_graph(
     return out
 
 
-def _group_node_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse per-class rows into one row per pack.
+# Conservative merge order for a physical pack's rows: a pack is only as good
+# as its worst member, so a missing class can never be masked by an installed
+# one, and a revision mismatch is never hidden by a matching class.
+_NODE_STATE_SEVERITY = {"installed": 1, "wrong_revision": 2, "missing": 3}
 
-    Groups by pack identity; merges classes sorted and deduped. First-seen
-    group order is preserved. Row dict shapes are unchanged.
+# Row fields merged across the members of one physical pack. Each keeps the
+# first nonempty value seen; nothing is invented.
+_PACK_MERGE_FIELDS = (
+    "name",
+    "install_path",
+    "installed_commit",
+    "required_revision",
+    "repository_url",
+    "cnr_id",
+    "aux_id",
+    "version",
+)
+
+# Identity fields weaker than a physical install path, strongest first. They
+# group a path-less row and let it join an installed pack it identifies.
+_PACK_IDENTITY_FIELDS = (
+    ("cnr", "cnr_id"),
+    ("aux", "aux_id"),
+    ("repo", "repository_url"),
+)
+
+
+def _normalized_identity(value: Any) -> str:
+    return _identity_text(value).casefold()
+
+
+def _normalized_install_path(value: Any) -> str:
+    text = _identity_text(value).replace("\\", "/")
+    if not text:
+        return ""
+    text = re.sub(r"/+", "/", text)
+    if len(text) > 1:
+        text = text.rstrip("/")
+    return text.casefold()
+
+
+def _pack_group_key(row: dict[str, Any]) -> tuple[str, str]:
+    """Strongest physical-pack identity for one resolved node row.
+
+    The install path names a physical directory, so it dominates: two rows for
+    the same path are one pack even when their stored registry records or
+    metadata-derived cnr/aux ids disagree. Only a path-less row falls back to
+    CNR id, aux id, repository URL, then a stable name. Per-class fields are
+    never part of the key.
     """
+    path = _normalized_install_path(row.get("install_path"))
+    if path:
+        return ("path", path)
+    for kind, field in _PACK_IDENTITY_FIELDS:
+        identity = _normalized_identity(row.get(field))
+        if identity:
+            return (kind, identity)
+    name = _normalized_identity(row.get("name"))
+    return ("name", name) if name else ("row", str(id(row)))
+
+
+def _merge_node_state(current: Any, incoming: Any) -> Any:
+    """Return the more degraded node state (missing > wrong_revision > installed)."""
+    if _NODE_STATE_SEVERITY.get(str(incoming or ""), 0) > _NODE_STATE_SEVERITY.get(
+        str(current or ""), 0
+    ):
+        return incoming
+    return current
+
+
+def _group_node_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse per-class rows into one row per physical pack.
+
+    Groups by strongest pack identity: install path first, then CNR id, aux id,
+    repository URL, or a stable name. A path-less row whose CNR/aux/repo matches
+    an installed pack joins that pack by path. Classes merge sorted and deduped;
+    state degrades conservatively; the first nonempty name/repo/cnr/aux/version/
+    revision is retained. First-seen group order is preserved. Row dict shapes
+    are unchanged.
+    """
+    valid = [row for row in rows if isinstance(row, dict)]
+    # Index installed (path-bearing) packs by identity so a class whose own
+    # registry record is absent still lands on the same physical pack.
+    path_identity: dict[tuple[str, str], tuple[str, str]] = {}
+    for row in valid:
+        key = _pack_group_key(row)
+        if key[0] != "path":
+            continue
+        for kind, field in _PACK_IDENTITY_FIELDS:
+            identity = _normalized_identity(row.get(field))
+            if identity:
+                path_identity.setdefault((kind, identity), key)
+
     grouped: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        key = (
-            str(row.get("name") or ""),
-            str(row.get("state") or ""),
-            str(row.get("install_path") or ""),
-            str(row.get("installed_commit") or ""),
-            str(row.get("required_revision") or ""),
-            str(row.get("repository_url") or ""),
-            str(row.get("cnr_id") or ""),
-            str(row.get("aux_id") or ""),
-        )
+    for row in valid:
+        key = _pack_group_key(row)
+        if key[0] != "path":
+            for kind, field in _PACK_IDENTITY_FIELDS:
+                identity = _normalized_identity(row.get(field))
+                mapped = path_identity.get((kind, identity)) if identity else None
+                if mapped is not None:
+                    key = mapped
+                    break
         if key not in grouped:
-            grouped[key] = dict(row)
-            grouped[key]["classes"] = []
+            merged = dict(row)
+            merged["classes"] = []
+            grouped[key] = merged
             order.append(key)
+        merged = grouped[key]
+        merged["state"] = _merge_node_state(merged.get("state"), row.get("state"))
+        for field in _PACK_MERGE_FIELDS:
+            if not _identity_text(merged.get(field)) and _identity_text(row.get(field)):
+                merged[field] = row.get(field)
         for cls in row.get("classes") or []:
-            if cls not in grouped[key]["classes"]:
-                grouped[key]["classes"].append(cls)
+            if cls not in merged["classes"]:
+                merged["classes"].append(cls)
     for key in order:
         try:
             grouped[key]["classes"] = sorted(grouped[key]["classes"], key=str)

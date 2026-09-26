@@ -1,0 +1,50 @@
+[sn] start sn-r01 diagnostics=True settle_ms=0
+[sn] done sn-r01 status=ok gbps=4.2412514798798 max_ms=298.809386 hb_gap=1007.593598 canary_gap=2.458246
+[sn] running totals: large=0 clean=0
+[sn] start sn-r02 diagnostics=True settle_ms=0
+[sn] done sn-r02 status=ok gbps=1.8794202171040248 max_ms=1582.863136 hb_gap=1541.432777 canary_gap=6.403214
+[sn] running totals: large=1 clean=0
+[sn] start sn-r03 diagnostics=True settle_ms=0
+[sn] done sn-r03 status=ok gbps=3.0064024605513944 max_ms=986.029217 hb_gap=730.550802 canary_gap=6.654864
+[sn] running totals: large=2 clean=0
+[sn] start sn-r04 diagnostics=True settle_ms=0
+[sn] done sn-r04 status=ok gbps=5.088297047594151 max_ms=130.001626 hb_gap=128.926081 canary_gap=3.301366
+[sn] running totals: large=2 clean=1
+[sn] start sn-r05 diagnostics=True settle_ms=0
+[sn] done sn-r05 status=ok gbps=4.905917891580799 max_ms=139.946374 hb_gap=95.937758 canary_gap=2.012031
+[sn] running totals: large=2 clean=2
+[sn] start sn-r06 diagnostics=True settle_ms=0
+[sn] done sn-r06 status=ok gbps=3.735460308405306 max_ms=452.571341 hb_gap=4584.607457 canary_gap=258.662733
+[sn] running totals: large=2 clean=2
+[sn] start sn-r07 diagnostics=True settle_ms=0
+[sn] done sn-r07 status=ok gbps=4.796716892347711 max_ms=237.271571 hb_gap=448.261489 canary_gap=4.549903
+[sn] running totals: large=2 clean=3
+[sn] start sn-r08 diagnostics=True settle_ms=0
+[sn] done sn-r08 status=ok gbps=4.510458218730832 max_ms=228.371581 hb_gap=141.094094 canary_gap=2.1171
+[sn] running totals: large=2 clean=4
+[sn] start sn-r09 diagnostics=True settle_ms=0
+[sn] done sn-r09 status=ok gbps=4.233725129200542 max_ms=256.523685 hb_gap=254.263901 canary_gap=2.412239
+[sn] running totals: large=2 clean=4
+[sn] start sn-r10 diagnostics=True settle_ms=0
+[sn] done sn-r10 status=ok gbps=4.862819600117042 max_ms=143.131662 hb_gap=157.034359 canary_gap=2.038827
+[sn] running totals: large=2 clean=5
+[sn] start sn-r11 diagnostics=True settle_ms=0
+[sn] done sn-r11 status=ok gbps=2.6782366196406437 max_ms=998.321581 hb_gap=1629.187264 canary_gap=11.121767
+[sn] running totals: large=3 clean=5
+[sn] capture goal met; stopping
+
+=== per-run summary ===
+run | region | worst src ms | src gbps | main hb gap | canary gap | canary mode | A sched/lat | B sched/lat | C sched/lat | sent samples
+| sn-r01 | CLOUD_PROVIDER_GCP/us-east | 299 | 4.24 | 1008 | 2 | separate_pid | 982.9/35.7 | 183.0/1007.3 | 203.6/35.6 | 315 |
+| sn-r02 | CLOUD_PROVIDER_GCP/us-west | 1583 | 1.88 | 1541 | 6 | separate_pid | 1579.7/329.9 | 1538.0/329.4 | 1577.2/101.6 | 323 |
+| sn-r03 | CLOUD_PROVIDER_GCP/us-east4 | 986 | 3.01 | 731 | 7 | separate_pid | 711.4/41.1 | 710.6/717.1 | 710.5/41.1 | 321 |
+| sn-r04 | CLOUD_PROVIDER_GCP/us-east5 | 130 | 5.09 | 129 | 3 | separate_pid | 50.3/129.2 | 80.0/129.3 | 50.1/186.2 | 293 |
+| sn-r05 | CLOUD_PROVIDER_GCP/us-west | 140 | 4.91 | 96 | 2 | separate_pid | 83.4/49.6 | 83.6/49.7 | 83.3/24.7 | 314 |
+| sn-r06 | CLOUD_PROVIDER_GCP/asia-south2 | 453 | 3.74 | 4585 | 259 | separate_pid | 4561.9/273.7 | 268.1/4584.3 | 268.2/82.1 | 351 |
+| sn-r07 | CLOUD_PROVIDER_GCP/us-east5 | 237 | 4.80 | 448 | 5 | separate_pid | 423.0/136.4 | 232.2/447.4 | 232.2/17.9 | 310 |
+| sn-r08 | CLOUD_PROVIDER_UNSPECIFIED/us-central | 228 | 4.51 | 141 | 2 | separate_pid | 137.8/31.2 | 16.5/140.7 | 15.2/136.7 | 333 |
+| sn-r09 | CLOUD_PROVIDER_GCP/us-east | 257 | 4.23 | 254 | 2 | separate_pid | 236.8/26.9 | 240.1/48.6 | 236.7/26.8 | 332 |
+| sn-r10 | CLOUD_PROVIDER_GCP/us-west4 | 143 | 4.86 | 157 | 2 | separate_pid | 139.9/157.0 | 101.2/95.2 | 44.1/130.9 | 292 |
+| sn-r11 | CLOUD_PROVIDER_GCP/asia-northeast1 | 998 | 2.68 | 1629 | 11 | separate_pid | 1606.5/149.0 | 829.8/1629.2 | 980.2/44.0 | 336 |
+
+large episodes=3  clean runs=5  total runs=11

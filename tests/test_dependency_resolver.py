@@ -452,6 +452,199 @@ class DependencyResolverTestCase(unittest.TestCase):
         self.assertEqual(kj[0]["classes"], ["SomeCustomClass"])
         self.assertEqual(kj[0]["state"], "installed")
 
+    # ── 21a-2. one physical install path is one row (donutnodes shape) ───
+
+    def test_custom_node_duplicate_records_same_install_path_merge(self):
+        """Distinct registry records that share an install path are one pack.
+
+        The live donutnodes case: separate registry rows for the same physical
+        directory carry different names/repos and metadata-derived cnr/aux ids.
+        Grouping must key on the path, merge the classes, and retain the useful
+        nonempty identity without inventing any.
+        """
+        install_path = str(self.comfyui_root / "custom_nodes" / "donutnodes")
+        self.registry.replace_records(
+            [
+                {
+                    "name": "donutnodes",
+                    "install_path": install_path,
+                    "repo_url": "https://github.com/DonutsDelivery/ComfyUI-DonutNodes",
+                    "installed_commit": "abc1234",
+                    "classes": ["DonutAlpha", "DonutBeta"],
+                },
+                {
+                    "name": "DonutReferenceStudio",
+                    "install_path": install_path,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["DonutGamma"],
+                },
+                {
+                    "name": "donutnodes",
+                    "install_path": install_path,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["DonutDelta"],
+                },
+            ]
+        )
+        version = {
+            "workflow_version_id": "wv_donut_dupes",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": [
+                    "DonutAlpha",
+                    "DonutBeta",
+                    "DonutGamma",
+                    "DonutDelta",
+                ],
+                "custom_node_requirements": {
+                    "DonutAlpha": {"cnr_id": "donutnodes"},
+                    "DonutBeta": {"aux_id": "DonutsDelivery/ComfyUI-DonutNodes"},
+                },
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version)
+        rows = [n for n in nodes if n.get("install_path")]
+        self.assertEqual(len(rows), 1, "one physical install path is one pack")
+        row = rows[0]
+        self.assertEqual(row["name"], "donutnodes")
+        self.assertEqual(row["state"], "installed")
+        self.assertEqual(row["install_path"], install_path)
+        self.assertEqual(row["cnr_id"], "donutnodes")
+        self.assertEqual(row["aux_id"], "DonutsDelivery/ComfyUI-DonutNodes")
+        self.assertEqual(
+            row["repository_url"],
+            "https://github.com/DonutsDelivery/ComfyUI-DonutNodes",
+        )
+        self.assertEqual(
+            row["classes"],
+            ["DonutAlpha", "DonutBeta", "DonutDelta", "DonutGamma"],
+        )
+
+    def test_custom_node_separate_install_paths_stay_separate(self):
+        """A shared cnr_id never merges two genuinely different install paths."""
+        path_a = str(self.comfyui_root / "custom_nodes" / "pack-a")
+        path_b = str(self.comfyui_root / "custom_nodes" / "pack-b")
+        self.registry.replace_records(
+            [
+                {
+                    "name": "pack-a",
+                    "install_path": path_a,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["PackAClass"],
+                },
+                {
+                    "name": "pack-b",
+                    "install_path": path_b,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["PackBClass"],
+                },
+            ]
+        )
+        version = {
+            "workflow_version_id": "wv_separate_paths",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["PackAClass", "PackBClass"],
+                "custom_node_requirements": {
+                    "PackAClass": {"cnr_id": "shared-pack"},
+                    "PackBClass": {"cnr_id": "shared-pack"},
+                },
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version)
+        rows = sorted(
+            (n for n in nodes if n.get("install_path")),
+            key=lambda n: n["install_path"],
+        )
+        self.assertEqual(len(rows), 2, "different install paths are different packs")
+        self.assertEqual({r["install_path"] for r in rows}, {path_a, path_b})
+        self.assertEqual(
+            {tuple(r["classes"]) for r in rows},
+            {("PackAClass",), ("PackBClass",)},
+        )
+        self.assertTrue(all(r["cnr_id"] == "shared-pack" for r in rows))
+
+    def test_custom_node_pack_state_degrades_conservatively(self):
+        """A pack's merged state is its worst member: missing beats
+        wrong_revision beats installed, and a path-less class joins the
+        installed pack it identifies by cnr_id."""
+        install_path = str(self.comfyui_root / "custom_nodes" / "mixed-pack")
+        self.registry.replace_records(
+            [
+                {
+                    "name": "MixedPack",
+                    "install_path": install_path,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["MixedInstalled"],
+                }
+            ]
+        )
+        version = {
+            "workflow_version_id": "wv_mixed_state",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["MixedInstalled", "MixedMissing"],
+                "custom_node_requirements": {
+                    "MixedInstalled": {"cnr_id": "mixed-pack", "revision": "def5678"},
+                    "MixedMissing": {"cnr_id": "mixed-pack"},
+                },
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version)
+        self.assertEqual(len(nodes), 1, "identity links the path-less class to the pack")
+        row = nodes[0]
+        self.assertEqual(row["state"], "missing", "missing is the most degraded state")
+        self.assertEqual(row["install_path"], install_path)
+        self.assertEqual(row["cnr_id"], "mixed-pack")
+        self.assertEqual(row["classes"], ["MixedInstalled", "MixedMissing"])
+
+    def test_custom_node_pack_state_wrong_revision_beats_installed(self):
+        """A matching class never masks another class's revision mismatch."""
+        install_path = str(self.comfyui_root / "custom_nodes" / "rev-pack")
+        self.registry.replace_records(
+            [
+                {
+                    "name": "RevPack",
+                    "install_path": install_path,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["RevPackA"],
+                },
+                {
+                    "name": "RevPack",
+                    "install_path": install_path,
+                    "repo_url": "",
+                    "installed_commit": "abc1234",
+                    "classes": ["RevPackB"],
+                },
+            ]
+        )
+        version = {
+            "workflow_version_id": "wv_rev_merge",
+            "executable_prompt": {},
+            "dependency_metadata": {
+                "model_stack": {},
+                "node_classes": ["RevPackA", "RevPackB"],
+                "custom_node_requirements": {
+                    "RevPackA": {},
+                    "RevPackB": {"revision": "def5678"},
+                },
+            },
+        }
+        nodes = self.resolver.resolve_custom_nodes(version)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["state"], "wrong_revision")
+        self.assertEqual(nodes[0]["required_revision"], "def5678")
+        self.assertEqual(nodes[0]["classes"], ["RevPackA", "RevPackB"])
+
     # ── 21b. captured CNR pack id propagates and groups by pack ──────────
 
     def test_custom_node_cnr_id_propagates_and_groups(self):

@@ -904,6 +904,53 @@ export async function modelDownloadStatus(apiBase, downloadId) {
   return apiFetch(apiBase, `/download/status/${encodeURIComponent(downloadId || "")}`);
 }
 
+// ── Remote Modal model inventory (availability authority) ───────────────
+//
+// GET /comfymodal/models proxies Modal's list_models_cpu over the remote
+// model volume and annotates every entry with local placeholder metadata.
+// The payload is a folder -> entry map: {name,size,folder,local_placeholder}.
+// Remote nonzero size is the ONLY availability authority — a local zero-byte
+// placeholder is intentional and must never read as a present model. Nothing
+// here consults object_info, sync status, runtime state, or local model
+// library records, and no bytes are ever fetched. Fails soft to null so a
+// transport error keeps the caller's local report instead of inventing
+// availability. Read-only: no mutation route is ever issued.
+
+export async function listRemoteModels(apiBase) {
+  const data = await apiFetch(apiBase, "/models");
+  if (data === null) return null; // network/API error
+  if (data && data.status === "error") return null; // remote invocation failed
+  return normalizeRemoteModelInventory(data);
+}
+
+/** Flatten the folder-keyed /comfymodal/models payload into safe entries. */
+export function normalizeRemoteModelInventory(data) {
+  const out = [];
+  if (!data || typeof data !== "object" || Array.isArray(data)) return out;
+  Object.keys(data).forEach((folder) => {
+    const entries = data[folder];
+    if (!Array.isArray(entries)) return;
+    entries.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const name = typeof item.name === "string" ? item.name : "";
+      if (!name) return;
+      const size = Number(item.size);
+      const entryFolder = typeof item.folder === "string" && item.folder ? item.folder : folder;
+      const local = item.local_placeholder && typeof item.local_placeholder === "object"
+        ? item.local_placeholder
+        : null;
+      out.push({
+        name,
+        folder: entryFolder,
+        // Remote size > 0 is the availability signal; coerce junk/negative to 0.
+        size: Number.isFinite(size) && size > 0 ? size : 0,
+        local_placeholder: local,
+      });
+    });
+  });
+  return out;
+}
+
 // ── Studio Workflow Version Dependencies / Compatibility API ────────────
 
 export async function getVersionDependencies(apiBase, versionId) {

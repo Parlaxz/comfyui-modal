@@ -1,0 +1,383 @@
+[ff] skip h100-r32-qd2 (artifact exists)
+[ff] skip rtx-r32-qd2 (artifact exists)
+[ff] skip h100-r32-qd4 (artifact exists)
+[ff] skip rtx-r32-qd4 (artifact exists)
+[ff] skip h100-r32-qd8 (artifact exists)
+[ff] skip rtx-r32-qd8 (artifact exists)
+[ff] skip h100-r64-qd2 (artifact exists)
+[ff] skip rtx-r64-qd2 (artifact exists)
+[ff] skip h100-r64-qd4 (artifact exists)
+[ff] skip rtx-r64-qd4 (artifact exists)
+[ff] skip h100-r64-qd8 (artifact exists)
+[ff] skip rtx-r64-qd8 (artifact exists)
+[ff] skip h100-r128-qd2 (artifact exists)
+[ff] skip rtx-r128-qd2 (artifact exists)
+[ff] skip h100-r128-qd4 (artifact exists)
+[ff] skip rtx-r128-qd4 (artifact exists)
+[ff] skip h100-r128-qd8 (artifact exists)
+[ff] skip rtx-r128-qd8 (artifact exists)
+[ff] skip h100-r256-qd2 (artifact exists)
+[ff] start h100-r256-qd4
+[ff] skip rtx-r256-qd2 (artifact exists)
+[ff] skip rtx-r256-qd4 (artifact exists)
+[ff] skip rtx-r256-qd8 (artifact exists)
+[ff] done h100-r256-qd4 status=ok gbps=0.7041225107074308
+[ff] start h100-r256-qd8
+[ff] done h100-r256-qd8 status=ok gbps=3.218848923572807
+
+GPU | Read MiB | QD | Reads | Full-file wall ms | GB/s | Mean preadv ms | Median | P95 | Max | >=250 | >=500 | >=1000 | Median refill gap
+---|---|---|---|---|---|---|---|---|---|---|---|---|---
+h100 | 32.0 | 2 | 240 | 3916.7 | 2.054 | 30.306 | 16.586 | 21.784 | 1528.824 | 5 | 1 | 1 | 0.007
+h100 | 32.0 | 4 | 240 | 1960.1 | 4.104 | 32.152 | 21.062 | 30.485 | 670.287 | 4 | 4 | 0 | 0.009
+h100 | 32.0 | 8 | 240 | 1972.4 | 4.079 | 62.746 | 59.368 | 100.376 | 303.827 | 2 | 0 | 0 | 0.009
+h100 | 64.0 | 2 | 120 | 2923.1 | 2.752 | 47.950 | 38.291 | 106.905 | 387.123 | 2 | 0 | 0 | 0.006
+h100 | 64.0 | 4 | 120 | 1310.2 | 6.140 | 41.985 | 36.206 | 57.054 | 241.037 | 0 | 0 | 0 | 0.008
+h100 | 64.0 | 8 | 120 | 2063.8 | 3.898 | 131.117 | 128.909 | 242.877 | 488.479 | 6 | 0 | 0 | 0.013
+h100 | 128.0 | 2 | 60 | 2744.5 | 2.931 | 89.858 | 85.930 | 118.444 | 239.300 | 0 | 0 | 0 | 0.007
+h100 | 128.0 | 4 | 60 | 1760.4 | 4.570 | 112.346 | 95.089 | 181.273 | 401.698 | 2 | 0 | 0 | 0.018
+h100 | 128.0 | 8 | 60 | 2370.4 | 3.394 | 267.301 | 200.155 | 766.619 | 1303.486 | 20 | 7 | 2 | 0.016
+h100 | 256.0 | 2 | 30 | 252478.8 | 0.032 | 12692.786 | 8513.502 | 30109.794 | 33588.087 | 21 | 21 | 21 | 0.020
+h100 | 256.0 | 4 | 30 | 11425.5 | 0.704 | 1502.190 | 203.978 | 9864.334 | 10199.678 | 8 | 4 | 4 | 0.012
+h100 | 256.0 | 8 | 30 | 2499.3 | 3.219 | 563.423 | 536.442 | 1219.068 | 1379.620 | 26 | 16 | 3 | 0.011
+rtx | 32.0 | 2 | 240 | 907.9 | 8.861 | 7.482 | 7.081 | 9.777 | 27.607 | 0 | 0 | 0 | 0.004
+rtx | 32.0 | 4 | 240 | 1925.9 | 4.177 | 26.156 | 15.729 | 29.975 | 471.212 | 6 | 0 | 0 | 0.005
+rtx | 32.0 | 8 | 240 | 1444.4 | 5.570 | 39.123 | 26.219 | 127.081 | 386.255 | 3 | 0 | 0 | 0.006
+rtx | 64.0 | 2 | 120 | 3337.4 | 2.411 | 55.432 | 30.877 | 38.750 | 1469.811 | 2 | 2 | 2 | 0.007
+rtx | 64.0 | 4 | 120 | 1180.8 | 6.813 | 36.710 | 34.455 | 58.447 | 79.564 | 0 | 0 | 0 | 0.010
+rtx | 64.0 | 8 | 120 | 1332.0 | 6.040 | 69.617 | 52.497 | 118.481 | 738.965 | 3 | 3 | 0 | 0.013
+rtx | 128.0 | 2 | 60 | 1134.6 | 7.091 | 37.226 | 36.610 | 41.344 | 82.030 | 0 | 0 | 0 | 0.013
+rtx | 128.0 | 4 | 60 | 1250.9 | 6.432 | 78.880 | 80.468 | 117.420 | 138.686 | 0 | 0 | 0 | 0.013
+rtx | 128.0 | 8 | 60 | 1662.0 | 4.841 | 191.313 | 134.138 | 493.941 | 933.764 | 13 | 3 | 0 | 0.013
+rtx | 256.0 | 2 | 30 | 1058.3 | 7.601 | 68.388 | 68.280 | 83.315 | 117.984 | 0 | 0 | 0 | 0.016
+rtx | 256.0 | 4 | 30 | 1208.6 | 6.657 | 137.170 | 140.106 | 188.622 | 253.296 | 1 | 0 | 0 | 0.018
+rtx | 256.0 | 8 | 30 | 1224.7 | 6.569 | 251.812 | 196.090 | 545.539 | 602.878 | 12 | 3 | 0 | 0.014
+
+H100 full-file GB/s:
+| | QD2 | QD4 | QD8 |
+|---|---|---|---|
+| 32 MiB | 2.054 | 4.104 | 4.079 |
+| 64 MiB | 2.752 | 6.140 | 3.898 |
+| 128 MiB | 2.931 | 4.570 | 3.394 |
+| 256 MiB | 0.032 | 0.704 | 3.219 |
+
+RTX full-file GB/s:
+| | QD2 | QD4 | QD8 |
+|---|---|---|---|
+| 32 MiB | 8.861 | 4.177 | 5.570 |
+| 64 MiB | 2.411 | 6.813 | 6.040 |
+| 128 MiB | 7.091 | 6.432 | 4.841 |
+| 256 MiB | 7.601 | 6.657 | 6.569 |
+
+--- h100 read=32.0MiB qd=2 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=chicago
+  container_session_id=ta-01M33ZQXA8YEHYZ3YF3HQ9NT9R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.064
+    first_1gib: reads=32 GBps=0.425 mean=78.982 median=16.681 max=1528.824
+    first_4_reads: reads=4 GBps=0.177 mean=318.919 median=378.751 max=494.512
+    first_read: reads=1 GBps=0.094 mean=357.023 median=357.023 max=357.023
+    quarter_1: reads=60 GBps=0.677 mean=49.554 median=16.395 max=1528.824
+    quarter_2: reads=60 GBps=2.136 mean=15.705 median=15.878 max=18.258
+    quarter_3: reads=60 GBps=0.851 mean=39.400 median=17.825 max=400.478
+    quarter_4: reads=60 GBps=2.017 mean=16.563 median=16.779 max=18.494
+--- h100 read=32.0MiB qd=4 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZR4H6RZRRQ8T0Z0511B9R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=0.053
+    first_1gib: reads=32 GBps=0.813 mean=41.246 median=21.979 max=613.850
+    first_4_reads: reads=4 GBps=0.200 mean=626.423 median=624.898 max=670.287
+    first_read: reads=1 GBps=0.057 mean=585.611 median=585.611 max=585.611
+    quarter_1: reads=60 GBps=1.059 mean=31.674 median=20.831 max=613.850
+    quarter_2: reads=60 GBps=1.037 mean=32.347 median=21.139 max=635.946
+    quarter_3: reads=60 GBps=1.027 mean=32.654 median=21.123 max=670.287
+    quarter_4: reads=60 GBps=1.046 mean=31.932 median=21.003 max=585.611
+--- h100 read=32.0MiB qd=8 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M33ZRAEWHHZ5PVCT7XNQZGBR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.144
+    first_1gib: reads=32 GBps=0.548 mean=68.740 median=59.659 max=266.901
+    first_4_reads: reads=4 GBps=0.742 mean=130.093 median=121.828 max=180.729
+    first_read: reads=1 GBps=0.350 mean=95.988 median=95.988 max=95.988
+    quarter_1: reads=60 GBps=1.027 mean=64.292 median=59.992 max=266.901
+    quarter_2: reads=60 GBps=1.061 mean=62.697 median=59.411 max=179.873
+    quarter_3: reads=60 GBps=1.033 mean=62.764 median=58.181 max=240.976
+    quarter_4: reads=60 GBps=1.017 mean=61.232 median=59.374 max=303.827
+--- h100 read=64.0MiB qd=2 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M33ZRH491EQ4DBZ305RX16CR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.022
+    first_1gib: reads=16 GBps=0.926 mean=72.459 median=40.238 max=367.923
+    first_4_reads: reads=4 GBps=0.566 mean=226.554 median=237.217 max=387.123
+    first_read: reads=1 GBps=1.503 mean=44.660 median=44.660 max=44.660
+    quarter_1: reads=30 GBps=1.187 mean=56.545 median=38.539 max=367.923
+    quarter_2: reads=30 GBps=1.773 mean=37.836 median=38.548 max=43.307
+    quarter_3: reads=30 GBps=1.112 mean=60.336 median=37.819 max=387.123
+    quarter_4: reads=30 GBps=1.802 mean=37.086 median=38.506 max=40.846
+--- h100 read=64.0MiB qd=4 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=chicago
+  container_session_id=ta-01M33ZSMBWE6NB2A9RSDKXDPXR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=0.021
+    first_1gib: reads=16 GBps=1.337 mean=50.175 median=37.478 max=241.037
+    first_4_reads: reads=4 GBps=1.113 mean=171.602 median=169.887 max=241.037
+    first_read: reads=1 GBps=0.636 mean=105.598 median=105.598 max=105.598
+    quarter_1: reads=30 GBps=1.569 mean=42.769 median=34.235 max=241.037
+    quarter_2: reads=30 GBps=1.634 mean=41.053 median=35.169 max=148.877
+    quarter_3: reads=30 GBps=1.537 mean=43.659 median=37.014 max=190.896
+    quarter_4: reads=30 GBps=1.652 mean=40.458 median=37.016 max=105.598
+--- h100 read=64.0MiB qd=8 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZSRZZ589DF7X99DA4C4GR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.038
+    first_1gib: reads=16 GBps=0.520 mean=141.152 median=124.037 max=487.248
+    first_4_reads: reads=4 GBps=0.551 mean=352.579 median=364.096 max=487.248
+    first_read: reads=1 GBps=0.231 mean=291.088 median=291.088 max=291.088
+    quarter_1: reads=30 GBps=0.976 mean=130.295 median=126.962 max=487.248
+    quarter_2: reads=30 GBps=0.976 mean=135.764 median=128.909 max=488.479
+    quarter_3: reads=30 GBps=1.056 mean=123.337 median=126.509 max=290.594
+    quarter_4: reads=30 GBps=0.972 mean=135.073 median=132.114 max=487.379
+--- h100 read=128.0MiB qd=2 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=denver
+  container_session_id=ta-01M33ZTKFJSHTWYP6QPTXPKAHR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.016
+    first_1gib: reads=8 GBps=1.270 mean=105.713 median=84.624 max=239.300
+    first_4_reads: reads=4 GBps=1.672 mean=140.080 median=117.997 max=239.300
+    first_read: reads=1 GBps=1.579 mean=85.023 median=85.023 max=85.023
+    quarter_1: reads=15 GBps=1.325 mean=101.313 median=91.865 max=239.300
+    quarter_2: reads=15 GBps=1.644 mean=81.635 median=81.091 max=103.382
+    quarter_3: reads=15 GBps=1.456 mean=92.162 median=92.670 max=124.748
+    quarter_4: reads=15 GBps=1.585 mean=84.323 median=83.728 max=98.878
+--- h100 read=128.0MiB qd=4 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M33ZV3WE3Q1RZ4R4QCE386GR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=0.050
+    first_1gib: reads=8 GBps=0.998 mean=134.519 median=119.076 max=212.593
+    first_4_reads: reads=4 GBps=1.334 mean=237.198 median=228.255 max=401.698
+    first_read: reads=1 GBps=1.482 mean=90.584 median=90.584 max=90.584
+    quarter_1: reads=15 GBps=1.183 mean=113.417 median=98.087 max=212.593
+    quarter_2: reads=15 GBps=1.144 mean=117.298 median=92.635 max=401.698
+    quarter_3: reads=15 GBps=1.187 mean=113.052 median=101.067 max=276.886
+    quarter_4: reads=15 GBps=1.265 mean=105.616 median=91.722 max=173.639
+--- h100 read=128.0MiB qd=8 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M33ZVA5JAH3F6K8NCSTPA49R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.034
+    first_1gib: reads=8 GBps=0.756 mean=177.502 median=165.407 max=255.573
+    first_4_reads: reads=4 GBps=0.412 mean=579.644 median=419.549 max=1303.486
+    first_read: reads=1 GBps=0.762 mean=176.124 median=176.124 max=176.124
+    quarter_1: reads=15 GBps=0.879 mean=247.311 median=175.994 max=1303.486
+    quarter_2: reads=15 GBps=0.852 mean=289.780 median=202.622 max=862.016
+    quarter_3: reads=15 GBps=0.850 mean=262.416 median=221.323 max=761.598
+    quarter_4: reads=15 GBps=0.876 mean=269.697 median=201.988 max=1017.947
+--- h100 read=256.0MiB qd=2 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZVHBSGRG81XTBDM1D9BAR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.030
+    first_1gib: reads=4 GBps=0.032 mean=8497.727 median=135.048 max=33587.946
+    first_4_reads: reads=4 GBps=0.019 mean=22286.592 median=27711.049 max=33588.087
+    first_read: reads=1 GBps=0.008 mean=33588.087 median=33588.087 max=33588.087
+    quarter_1: reads=8 GBps=0.032 mean=8408.499 median=2806.102 max=33587.946
+    quarter_2: reads=7 GBps=0.031 mean=8719.577 median=5568.279 max=21742.944
+    quarter_3: reads=8 GBps=0.011 mean=24408.755 median=22745.219 max=33588.087
+    quarter_4: reads=7 GBps=0.033 mean=8172.646 median=5907.419 max=23126.823
+--- h100 read=256.0MiB qd=4 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M3405HNACMGM7M09AFZJR0BR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=0.025
+    first_read: reads=1 GBps=0.028 mean=9628.656 median=9628.656 max=9628.656
+    first_4_reads: reads=4 GBps=0.105 mean=9885.531 median=9856.896 max=10199.678
+    first_1gib: reads=4 GBps=0.102 mean=2639.876 median=291.063 max=9782.508
+    quarter_1: reads=8 GBps=0.188 mean=1428.128 median=213.086 max=9782.508
+    quarter_2: reads=7 GBps=0.166 mean=1613.835 median=212.382 max=9931.284
+    quarter_3: reads=8 GBps=0.188 mean=1428.183 median=184.121 max=10199.678
+    quarter_4: reads=7 GBps=0.171 mean=1559.768 median=203.858 max=9628.656
+--- h100 read=256.0MiB qd=8 ---
+  observed_gpu=NVIDIA H100 80GB HBM3 provider=CLOUD_PROVIDER_UNSPECIFIED region=sines-2
+  container_session_id=ta-01M34061C84YA3Z52E33ZG4YSR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.023
+    first_read: reads=1 GBps=0.633 mean=424.070 median=424.070 max=424.070
+    first_4_reads: reads=4 GBps=0.881 mean=932.601 median=1043.592 max=1219.150
+    first_1gib: reads=4 GBps=0.430 mean=624.816 median=580.646 max=1219.150
+    quarter_1: reads=8 GBps=0.859 mean=569.971 median=580.646 max=1219.150
+    quarter_2: reads=7 GBps=0.844 mean=635.769 median=574.032 max=1218.969
+    quarter_3: reads=8 GBps=0.902 mean=470.823 median=378.651 max=868.064
+    quarter_4: reads=7 GBps=0.786 mean=589.422 median=424.070 max=1379.620
+
+--- rtx read=32.0MiB qd=2 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZQXA85DWJRBKXB7BGSKKR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.243
+    first_1gib: reads=32 GBps=3.552 mean=9.411 median=8.989 max=27.607
+    first_4_reads: reads=4 GBps=3.625 mean=16.188 median=13.948 max=27.607
+    first_read: reads=1 GBps=3.083 mean=10.883 median=10.883 max=10.883
+    quarter_1: reads=60 GBps=4.012 mean=8.342 median=7.671 max=27.607
+    quarter_2: reads=60 GBps=5.175 mean=6.481 median=6.537 max=7.514
+    quarter_3: reads=60 GBps=3.973 mean=8.423 median=8.024 max=17.013
+    quarter_4: reads=60 GBps=4.999 mean=6.681 median=6.702 max=7.925
+--- rtx read=32.0MiB qd=4 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZR18T6SVTYF55C1VXT8HR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=0.079
+    first_1gib: reads=32 GBps=1.311 mean=25.582 median=15.472 max=316.247
+    first_4_reads: reads=4 GBps=0.285 mean=241.344 median=238.426 max=471.212
+    first_read: reads=1 GBps=0.074 mean=451.475 median=451.475 max=451.475
+    quarter_1: reads=60 GBps=1.493 mean=22.472 median=16.641 max=316.247
+    quarter_2: reads=60 GBps=1.534 mean=21.875 median=15.940 max=336.505
+    quarter_3: reads=60 GBps=1.190 mean=28.184 median=15.757 max=471.212
+    quarter_4: reads=60 GBps=1.041 mean=32.092 median=14.003 max=451.475
+--- rtx read=32.0MiB qd=8 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZR5WFQAWA90Z2NX13BWKR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=240 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=22.582
+    first_1gib: reads=32 GBps=1.392 mean=25.968 median=25.247 max=37.574
+    first_4_reads: reads=4 GBps=2.886 mean=30.988 median=31.287 max=37.574
+    first_read: reads=1 GBps=1.410 mean=23.805 median=23.805 max=23.805
+    quarter_1: reads=60 GBps=1.482 mean=35.174 median=26.150 max=238.847
+    quarter_2: reads=60 GBps=1.425 mean=42.403 median=24.855 max=327.511
+    quarter_3: reads=60 GBps=1.627 mean=37.779 median=27.487 max=135.173
+    quarter_4: reads=60 GBps=1.388 mean=41.135 median=26.311 max=386.255
+--- rtx read=64.0MiB qd=2 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_AWS region=ap-northeast
+  container_session_id=ta-01M33ZR9SC0W35RBCA9HHBCW4R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.044
+    first_1gib: reads=16 GBps=0.541 mean=124.018 median=34.023 max=1469.561
+    first_4_reads: reads=4 GBps=0.178 mean=754.937 median=755.179 max=1469.811
+    first_read: reads=1 GBps=0.046 mean=1469.811 median=1469.811 max=1469.811
+    quarter_1: reads=30 GBps=0.833 mean=80.561 median=32.338 max=1469.561
+    quarter_2: reads=30 GBps=2.241 mean=29.933 median=30.234 max=32.076
+    quarter_3: reads=30 GBps=0.826 mean=81.241 median=31.480 max=1469.811
+    quarter_4: reads=30 GBps=2.228 mean=29.992 median=30.455 max=32.817
+--- rtx read=64.0MiB qd=4 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZRJPFB74B7V85ZE8JEYKR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=25.963
+    first_1gib: reads=16 GBps=1.630 mean=41.166 median=35.414 max=79.564
+    first_4_reads: reads=4 GBps=3.547 mean=37.749 median=37.685 max=50.207
+    first_read: reads=1 GBps=2.640 mean=25.421 median=25.421 max=25.421
+    quarter_1: reads=30 GBps=1.779 mean=37.702 median=33.712 max=79.564
+    quarter_2: reads=30 GBps=1.888 mean=35.524 median=33.967 max=58.436
+    quarter_3: reads=30 GBps=1.742 mean=37.642 median=34.953 max=66.677
+    quarter_4: reads=30 GBps=1.818 mean=35.971 median=34.898 max=62.983
+--- rtx read=64.0MiB qd=8 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZSK44SK0SJVBSEM09H4HR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=120 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=52.205
+    first_1gib: reads=16 GBps=1.307 mean=57.657 median=52.434 max=118.210
+    first_4_reads: reads=4 GBps=2.266 mean=94.089 median=109.396 max=118.210
+    first_read: reads=1 GBps=0.570 mean=117.829 median=117.829 max=117.829
+    quarter_1: reads=30 GBps=2.120 mean=56.719 median=51.934 max=118.210
+    quarter_2: reads=30 GBps=1.602 mean=76.206 median=44.326 max=738.965
+    quarter_3: reads=30 GBps=1.674 mean=74.459 median=56.196 max=620.810
+    quarter_4: reads=30 GBps=1.555 mean=71.083 median=51.695 max=685.197
+--- rtx read=128.0MiB qd=2 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZSQ0ZGERJTN6WNQ5EGS5R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.089
+    first_1gib: reads=8 GBps=3.087 mean=43.453 median=38.149 max=82.030
+    first_4_reads: reads=4 GBps=4.720 mean=48.909 median=38.338 max=82.030
+    first_read: reads=1 GBps=3.634 mean=36.932 median=36.932 max=36.932
+    quarter_1: reads=15 GBps=3.332 mean=40.265 median=37.337 max=82.030
+    quarter_2: reads=15 GBps=3.798 mean=35.329 median=35.339 max=41.317
+    quarter_3: reads=15 GBps=3.564 mean=37.632 median=37.906 max=40.431
+    quarter_4: reads=15 GBps=3.745 mean=35.680 median=34.962 max=41.858
+--- rtx read=128.0MiB qd=4 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZSTPBDN3RK2DFS8XF3MFR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=1.313
+    first_1gib: reads=8 GBps=1.401 mean=95.806 median=102.061 max=121.189
+    first_4_reads: reads=4 GBps=2.663 mean=85.157 median=69.632 max=136.163
+    first_read: reads=1 GBps=2.049 mean=65.511 median=65.511 max=65.511
+    quarter_1: reads=15 GBps=1.658 mean=80.935 median=80.052 max=121.189
+    quarter_2: reads=15 GBps=1.698 mean=79.016 median=75.179 max=136.163
+    quarter_3: reads=15 GBps=1.756 mean=76.420 median=76.851 max=117.221
+    quarter_4: reads=15 GBps=1.687 mean=79.148 median=84.750 max=138.686
+--- rtx read=128.0MiB qd=8 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east1
+  container_session_id=ta-01M33ZSYD37V72AHV3973FFH2R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=60 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.056
+    first_1gib: reads=8 GBps=0.693 mean=193.704 median=171.264 max=428.158
+    first_4_reads: reads=4 GBps=1.251 mean=289.805 median=262.430 max=428.158
+    first_read: reads=1 GBps=0.651 mean=206.204 median=206.204 max=206.204
+    quarter_1: reads=15 GBps=1.299 mean=186.211 median=217.751 max=428.158
+    quarter_2: reads=15 GBps=1.213 mean=221.658 median=160.302 max=662.695
+    quarter_3: reads=15 GBps=1.212 mean=194.644 median=153.493 max=562.072
+    quarter_4: reads=15 GBps=1.257 mean=162.741 median=97.971 max=933.764
+--- rtx read=256.0MiB qd=2 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZT327D1Y73ANF594QJMKR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=1 qd_max=2 fell_below=True max_refill_gap=0.063
+    first_1gib: reads=4 GBps=3.585 mean=74.843 median=61.431 max=117.984
+    first_4_reads: reads=4 GBps=5.940 mean=76.234 median=67.235 max=117.984
+    first_read: reads=1 GBps=5.115 mean=52.482 median=52.482 max=52.482
+    quarter_1: reads=8 GBps=3.734 mean=71.862 median=66.796 max=117.984
+    quarter_2: reads=7 GBps=3.889 mean=69.006 median=72.031 max=83.559
+    quarter_3: reads=8 GBps=4.183 mean=64.148 median=62.925 max=75.596
+    quarter_4: reads=7 GBps=3.893 mean=68.645 median=70.790 max=83.017
+--- rtx read=256.0MiB qd=4 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZT6GKWRV9TQJD7BF98W3R
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=3 qd_max=4 fell_below=True max_refill_gap=81.212
+    first_1gib: reads=4 GBps=1.429 mean=187.901 median=174.884 max=253.296
+    first_4_reads: reads=4 GBps=5.007 mean=123.526 median=132.556 max=147.065
+    first_read: reads=1 GBps=2.026 mean=132.477 median=132.477 max=132.477
+    quarter_1: reads=8 GBps=1.996 mean=134.439 median=132.341 max=253.296
+    quarter_2: reads=7 GBps=1.724 mean=144.111 median=137.151 max=184.720
+    quarter_3: reads=8 GBps=1.967 mean=133.514 median=144.842 max=191.357
+    quarter_4: reads=7 GBps=1.943 mean=137.527 median=137.594 max=172.243
+--- rtx read=256.0MiB qd=8 ---
+  observed_gpu=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-east
+  container_session_id=ta-01M33ZTA3W913M1ZF02PGAZVBR
+  file=/root/models/text_encoders/qwen_3_4b.safetensors size=8044982048 st_dev=31 st_ino=4
+  syscall=os.preadv reads=30 covered=8044982048 useful=8044982048 once=True nonoverlap=True partial_final=True
+  qd_min=7 qd_max=8 fell_below=True max_refill_gap=0.054
+    first_1gib: reads=4 GBps=1.451 mean=184.997 median=166.181 max=345.115
+    first_4_reads: reads=4 GBps=1.780 mean=214.316 median=98.510 max=602.878
+    first_read: reads=1 GBps=4.679 mean=57.366 median=57.366 max=57.366
+    quarter_1: reads=8 GBps=1.839 mean=238.402 median=178.373 max=545.723
+    quarter_2: reads=7 GBps=1.616 mean=243.938 median=163.149 max=545.313
+    quarter_3: reads=8 GBps=1.938 mean=306.665 median=296.488 max=494.088
+    quarter_4: reads=7 GBps=1.605 mean=212.324 median=150.647 max=602.878

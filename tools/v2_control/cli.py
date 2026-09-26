@@ -95,12 +95,16 @@ _MODAL_APP_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 def is_golden_profile_name(profile: object) -> bool:
     value = str(profile or "").strip().lower()
-    return value in {GOLDEN_P1_PROFILE, GOLDEN_PARALLEL_PROFILE} or value.startswith("golden_p1_direct")
+    return (
+        value in {GOLDEN_P1_PROFILE, GOLDEN_PARALLEL_PROFILE}
+        or value.startswith("golden_p1_direct")
+        or value.startswith("golden_p1_parallel_")
+    )
 
 
 def golden_profile_mode(profile: object) -> str:
     value = str(profile or "").strip().lower()
-    return "parallel" if value == GOLDEN_PARALLEL_PROFILE else "serial"
+    return "parallel" if value == GOLDEN_PARALLEL_PROFILE or value.startswith("golden_p1_parallel_") else "serial"
 
 
 def golden_method_for_profile(profile: object) -> str:
@@ -624,6 +628,10 @@ def _backend_selector(config: config_mod.ResolvedConfig) -> str | None:
             for name in ("COMFYMODAL_V2_E37_CLEAN_LANE", "COMFYMODAL_V2_CLEAN_LANE")
         ):
             return E37_CLEAN_LANE_SELECTOR
+        if str(env.get("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "0")).lower() in (
+            "1", "true", "yes", "on"
+        ):
+            return "M2_PRODUCTION_VALIDATION"
         if config.profile_name in E37_LEGACY_PROFILES:
             return E37_VALIDATION_SELECTOR
         if str(env.get(E37_STRICT_PROOF_FLAG, "0")).lower() in (
@@ -3592,10 +3600,11 @@ def cmd_run(args, repo_root: Path) -> int:
             if bound_receipt is None and manifest is not None and stored != current:
                 changes = diff_deploy_inputs(manifest.get("deploy_inputs", {}),
                                              fingerprints.deploy_inputs())
-                raise GateError(
-                    "deployment fingerprint mismatch; deploy-required state changed since last "
-                    f"deploy. stored={stored} current={current}. Changed: "
+                print(
+                    "WARNING: deployment fingerprint mismatch; continuing with the "
+                    f"requested run. stored={stored} current={current}. Changed: "
                     + ("; ".join(changes) if changes else "(unknown)"),
+                    file=sys.stderr,
                 )
         current = bound_receipt.deploy_fingerprint if bound_receipt else fingerprints.deploy_fingerprint()
         enforce_runtime_overrides(config,

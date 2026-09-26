@@ -71,6 +71,7 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     ),
     # CLIP loader and hydration controls.
     "COMFYMODAL_V2_CLIP_QD_READER": _spec("COMFYMODAL_V2_CLIP_QD_READER", "bool", False, LOADER_SELECTION, "Enable the genuine queue-depth CLIP reader."),
+    "COMFYMODAL_V2_M2_PRODUCTION_LOADER": _spec("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "bool", False, LOADER_SELECTION, "Enable the M2 mmap/process production CLIP loader."),
     "COMFYMODAL_V2_CLIP_QD_QD": _spec("COMFYMODAL_V2_CLIP_QD_QD", "int", 4, LOADER_SELECTION, "CLIP queue depth."),
     "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": _spec("COMFYMODAL_V2_CLIP_QD_BLOCK_MIB", "int", 32, LOADER_SELECTION, "CLIP queue-reader block size in MiB."),
     "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": _spec("COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY", "enum", "restore_earliest", LOADER_SELECTION, "CLIP queue-reader launch boundary.", choices=("restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore")),
@@ -136,6 +137,8 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
     "COMFYMODAL_MINIMAL_RESTORE": _spec("COMFYMODAL_MINIMAL_RESTORE", "bool", True, EXECUTION_POLICY, "Select the E37 minimal restore path."),
     "COMFYMODAL_GOLDEN_MINIMAL_RESTORE": _spec("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel minimal post-snapshot restore. Default OFF."),
     "COMFYMODAL_GOLDEN_IO_PROCESS": _spec("COMFYMODAL_GOLDEN_IO_PROCESS", "bool", False, EXECUTION_POLICY, "Experimental Golden Parallel strict CPU-I/O child process. Default OFF."),
+    "COMFYMODAL_GOLDEN_CLIP_LOADER": _spec("COMFYMODAL_GOLDEN_CLIP_LOADER", "enum", "c0", LOADER_SELECTION, "Golden CLIP transport selector.", choices=("c0", "m2")),
+    "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": _spec("COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP", "bool", False, EXECUTION_POLICY, "Build the weightless CLIP skeleton concurrently with source/H2D."),
     "COMFYMODAL_V2_CLEAN_LANE": _spec("COMFYMODAL_V2_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "Compatibility clean-lane selector."),
     "COMFYMODAL_V2_E37_CLEAN_LANE": _spec("COMFYMODAL_V2_E37_CLEAN_LANE", "bool", False, EXECUTION_POLICY, "E37 clean-lane runtime selector."),
     "COMFYMODAL_V2_E37_STRICT_PROOF": _spec("COMFYMODAL_V2_E37_STRICT_PROOF", "bool", False, DEPRECATED_DIAGNOSTIC, "Enable fail-closed E37 proof validation."),

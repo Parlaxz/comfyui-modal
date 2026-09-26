@@ -1,0 +1,15 @@
+{
+  "hedge_delay_ms": 125.0,
+  "hedge_slots_per_worker": 3,
+  "kind": "qd4_static_partition_imbalance",
+  "min_launch_gap_ms": 4.0,
+  "note": "Static QD4 process regions, unchanged. Delayed hedging ON at 125 ms.",
+  "pinned": false,
+  "qd": 4,
+  "read_mib": 64,
+  "reject_regions": [
+    "odin"
+  ],
+  "slots": 25,
+  "worker_model": "processes_hedge_process"
+}

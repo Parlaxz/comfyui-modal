@@ -30,15 +30,20 @@ import assert from "node:assert/strict";
 import {
   buildManagerModelIndex,
   buildManagerPackIndex,
+  buildRemoteModelIndex,
   managerModelFolder,
   matchManagerModel,
+  matchRemoteModel,
   normalizeManagerSavePath,
+  overlayDependencyModel,
+  overlayDependencyModels,
   parseManagerInstalled,
   performManagerInstall,
   renderModelLibraryView,
   renderDependencySection,
   resolveNodeInstall,
 } from "../web/studio-model-library.js";
+import { listRemoteModels, normalizeRemoteModelInventory } from "../web/studio-backend-api.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB = path.join(ROOT, "web");
@@ -1280,6 +1285,160 @@ async function mountLibrary(router) {
   assert.deepEqual(parseManagerInstalled(null), []);
   assert.deepEqual(parseManagerInstalled([{ module: "raw", enabled: false }]), [{ module: "raw", enabled: false }]);
   section("18. parseManagerInstalled normalizes the dict and preserves disabled truth");
+}
+
+// ── 19. Remote model-volume overlay: basename + role alias, size authority ──
+
+{
+  // Normalization flattens the folder-keyed /comfymodal/models payload and
+  // coerces missing/junk sizes to 0 (remote size is the availability signal).
+  const inventory = normalizeRemoteModelInventory({
+    checkpoints: [
+      {
+        name: "krea2_turbo_bf16.safetensors",
+        size: 26283332608,
+        folder: "unet",
+        local_placeholder: { is_placeholder: true, size: 0, exists: true },
+      },
+      { name: "zero.safetensors", size: 0, folder: "unet" },
+      "not-an-object",
+    ],
+    loras: "not-a-list",
+    vae: [{ name: "", size: 5 }],
+  });
+  assert.equal(inventory.length, 2, "only well-formed named entries survive");
+  assert.equal(inventory[0].size, 26283332608);
+  assert.equal(inventory[0].folder, "unet");
+  assert.equal(inventory[1].size, 0, "zero/junk size coerced to 0");
+  assert.deepEqual(normalizeRemoteModelInventory(null), []);
+
+  const index = buildRemoteModelIndex(inventory);
+  assert.ok(index.get("krea2_turbo_bf16.safetensors"), "basename keyed, lowercased");
+
+  const deps = {
+    status: "ok",
+    models: [
+      {
+        key: "unet|krea2_turbo_bf16.safetensors",
+        role: "unet",
+        filename: "krea2_turbo_bf16.safetensors",
+        state: "missing",
+        folder: "diffusion_models",
+        installed: false,
+        local_placeholder: {
+          is_placeholder: true,
+          size: 0,
+          exists: true,
+          local_path: "C:/models/unet/krea2_turbo_bf16.safetensors",
+        },
+      },
+      {
+        key: "unet|zero.safetensors",
+        role: "unet",
+        filename: "zero.safetensors",
+        state: "missing",
+        folder: "unet",
+        installed: false,
+      },
+      {
+        key: "lora|absent.safetensors",
+        role: "lora",
+        filename: "absent.safetensors",
+        state: "missing",
+        folder: "loras",
+        installed: false,
+      },
+    ],
+    custom_nodes: [{ name: "SomeCustomClass", state: "installed" }],
+    summary: { installed: 1, missing: 3, wrong_version: 0, unknown: 0, attention: 3, ready: false },
+  };
+
+  // Role alias: the dependency records diffusion_models while the remote
+  // volume holds the same basename under unet — one identity for the unet role.
+  assert.ok(matchRemoteModel(deps.models[0], index), "role alias resolves folder mismatch");
+  assert.equal(matchRemoteModel(deps.models[2], index), null, "no remote entry matches");
+
+  const overlaid = overlayDependencyModels(deps, index);
+  assert.notEqual(overlaid, deps, "overlay returns a copy");
+  assert.equal(deps.models[0].state, "missing", "input report is never mutated");
+  const krea = overlaid.models.find((m) => m.filename === "krea2_turbo_bf16.safetensors");
+  assert.equal(krea.state, "installed", "remote nonzero size upgrades the placeholder row");
+  assert.equal(krea.remote_available, true);
+  assert.equal(krea.remote_model.size, 26283332608);
+  assert.equal(krea.remote_model.folder, "unet");
+  assert.equal(krea.local_placeholder.is_placeholder, true, "local placeholder preserved as secondary");
+  const zero = overlaid.models.find((m) => m.filename === "zero.safetensors");
+  assert.equal(zero.state, "missing", "remote size 0 stays missing");
+  assert.equal(zero.remote_available, false);
+  assert.equal(
+    overlaid.models.find((m) => m.filename === "absent.safetensors").state,
+    "missing",
+    "no remote entry stays missing"
+  );
+  // Summary recomputed from overlay state; the Download-all count derives from it.
+  assert.equal(overlaid.summary.installed, 2, "installed = custom node + remote-available model");
+  assert.equal(overlaid.summary.missing, 2);
+  assert.equal(overlaid.summary.attention, 2);
+  assert.equal(overlaid.summary.ready, false);
+
+  // wrong_version keeps its compatibility signal even when remote is present.
+  const wrong = overlayDependencyModel(
+    { filename: "krea2_turbo_bf16.safetensors", role: "unet", state: "wrong_version", folder: "unet" },
+    index
+  );
+  assert.equal(wrong.state, "wrong_version", "remote availability never masks a wrong version");
+  assert.equal(wrong.remote_available, true);
+
+  // Local placeholder detail comes from the remote annotation when the report
+  // row carries none (the real dependency report has no local fields).
+  const noLocal = overlayDependencyModel(
+    { filename: "krea2_turbo_bf16.safetensors", role: "unet", state: "missing", folder: "unet" },
+    index
+  );
+  assert.equal(noLocal.local_placeholder.size, 0, "remote local_placeholder surfaced");
+
+  // A failed remote read keeps local truth: no index is a no-op.
+  assert.equal(overlayDependencyModels(deps, null), deps, "null index preserves local truth");
+  assert.equal(overlayDependencyModel(deps.models[0], null).state, "missing");
+
+  // The overlaid row renders Installed with remote/local secondary detail and
+  // no download/install action.
+  const depSection = renderDependencySection({}, overlaid, null, { apiBase: "/comfymodal" });
+  const rows = findByTestId(depSection, "dependency-model-row");
+  const kreaRow = rows.find(
+    (r) => r.getAttribute("data-model-key") === "unet|krea2_turbo_bf16.safetensors"
+  );
+  assert.ok(kreaRow, "overlaid row rendered");
+  assert.equal(findOneByTestId(kreaRow, "dependency-model-state").textContent, "Installed");
+  const remoteDetail = findOneByTestId(kreaRow, "dependency-model-remote");
+  assert.ok(remoteDetail.textContent.indexOf("remote") !== -1, "remote size shown as secondary info");
+  assert.ok(
+    remoteDetail.textContent.indexOf("local placeholder") !== -1,
+    "local placeholder shown as secondary info"
+  );
+  assert.equal(findByTestId(kreaRow, "dependency-model-queue").length, 0, "no download action");
+  assert.equal(findByTestId(kreaRow, "dependency-model-install-now").length, 0);
+
+  // The read-only API helper parses safely and fails soft to null.
+  {
+    const okNet = installFetch(() => ({
+      checkpoints: [{ name: "krea2_turbo_bf16.safetensors", size: 9, folder: "unet" }],
+    }));
+    const ok = await listRemoteModels("/comfymodal");
+    assert.equal(ok.length, 1, "successful remote read normalized");
+    assert.ok(okNet.calls.every((c) => c.method === "GET"), "remote read is read-only");
+    assert.equal(okNet.calls[0].url, "/comfymodal/models", "reads the remote inventory route");
+
+    installFetch(() => ({ __fail: true, __status: 503, __message: "remote unavailable" }));
+    assert.equal(await listRemoteModels("/comfymodal"), null, "remote error falls back to null");
+  }
+
+  // The helper never routes availability through object_info/sync/runtime.
+  assert.ok(backendApiSource.indexOf('"/models"') !== -1, "listRemoteModels reads GET /models");
+  for (const banned of ['"/object_info"', '"/sync/status"', '"/runtime/state"']) {
+    assert.equal(backendApiSource.indexOf(banned), -1, "remote availability never consults " + banned);
+  }
+  section("19. Remote model-volume overlay: basename + role alias, nonzero size is authority");
 }
 
 console.log("ALL H7 MODEL LIBRARY PARITY UNIT TESTS PASSED");

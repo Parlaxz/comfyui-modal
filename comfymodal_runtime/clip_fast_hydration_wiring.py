@@ -51,10 +51,12 @@ from comfymodal_runtime.env import env_flag
 from comfymodal_runtime import clip_fast_hydration as cfh
 from comfymodal_runtime import gpu_lane_coordination as _gpu_coord
 from comfymodal_runtime import clean_lane
+from comfymodal_runtime import production_m2_loader as _m2_loader
 
 _FLAG_FAST = "COMFYMODAL_V2_CLIP_FAST_HYDRATION"
 _FLAG_STAGED = "COMFYMODAL_V2_CLIP_STAGED_HYDRATION"
 _FLAG_EXCLUDE = "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS"
+_FLAG_M2 = "COMFYMODAL_V2_M2_PRODUCTION_LOADER"
 
 _FASTSAFE_NOGDS = True
 _FASTSAFE_USE_BUF_REGISTER = False
@@ -1421,6 +1423,8 @@ def _try_fast_hydrate(
     _speculative_taken = None
     _speculative_take_reason = ""
     _qd_demand_used = False
+    _m2_demand_used = False
+    _m2_record: dict[str, Any] = {}
     try:
         from .speculative_clip_hydration import (
             take_speculative_read,
@@ -1503,7 +1507,44 @@ def _try_fast_hydrate(
         if "speculative_join_failed_closed" in str(_spec_exc):
             raise
         _speculative_taken = None
-    if clean_lane.enabled() and _speculative_taken is None:
+    if env_flag(_FLAG_M2) and _speculative_taken is None:
+        try:
+            for _file_manifest in files:
+                _path = str(_file_manifest.get("path", ""))
+                _loaded = _m2_loader.load_m2_safetensors(_path, trace=trace)
+                _transformed = _apply_pipeline(
+                    _loaded["sd"], _file_manifest.get("pipeline", []), comfy_utils=comfy_utils
+                )
+                _ok, _detail = _verify_file_against_manifest(
+                    _file_manifest, _transformed
+                )
+                if not _ok:
+                    raise RuntimeError(_detail)
+                per_file_sds.append(_transformed)
+                owners.append((_loaded["owner"], _loaded["owner"]))
+                checkpoint_bytes += int(_file_manifest.get("size_bytes", 0) or 0)
+                file_to_gpu_ms += float(
+                    (_loaded.get("timing") or {}).get("loader_wall_ms", 0.0) or 0.0
+                )
+                _m2_record = {
+                    **_m2_record,
+                    **dict(_loaded.get("timing") or {}),
+                }
+            _m2_demand_used = True
+            _spec_record = {
+                "m2_used": True,
+                "qd": 4,
+                "block_mib": 64,
+                "source_wall_ms": _m2_record.get("source_wall_ms"),
+                "gpu_ready_wall_ms": _m2_record.get("gpu_ready_wall_ms"),
+            }
+        except Exception:
+            _close_source_owners(owners)
+            per_file_sds = []
+            owners = []
+            raise
+
+    if clean_lane.enabled() and not env_flag(_FLAG_M2) and _speculative_taken is None:
         # CLEAN_LANE deliberately has no restore-time speculative read.  Do
         # the QD read synchronously at demand instead of treating the
         # expected empty speculative lane as a quiescence failure.  The QD
@@ -1621,7 +1662,7 @@ def _try_fast_hydrate(
             )
             raise
 
-    if clean_lane.enabled() and _speculative_taken is None and not _qd_demand_used:
+    if clean_lane.enabled() and _speculative_taken is None and not _qd_demand_used and not _m2_demand_used:
         clean_lane.forbidden_activity(
             "clip_forward_hidden_qd_join_or_fastsafe_fallback", trace,
             reason="QD must be complete before bind/forward",
@@ -1953,7 +1994,9 @@ def _try_fast_hydrate(
         bind_ms = (time.perf_counter() - t_bind) * 1000.0
         wall_ms = (time.perf_counter() - t0) * 1000.0
         _loader_arm = (
-            "qd_demand"
+            "m2_demand"
+            if _m2_demand_used
+            else "qd_demand"
             if _qd_demand_used
             else "qd_speculative"
             if bool(_spec_record.get("qd_used", False))
@@ -2144,13 +2187,13 @@ def _try_fast_hydrate(
         )
         result: dict[str, Any] = {
             "ok": True,
-            "mode": cfh.MODE_FASTSAFE,
+            "mode": "m2_mmap_process" if _m2_demand_used else cfh.MODE_FASTSAFE,
             "file_to_gpu_wall_ms": round(file_to_gpu_ms, 3),
             "checkpoint_bytes": checkpoint_bytes,
             "gbps": gbps,
             "bind_wall_ms": round(bind_ms, 3),
             "wall_ms": round(wall_ms, 3),
-            "owner_mode": "fastsafetensors_buf",
+            "owner_mode": "m2_torch_cuda_tensor" if _m2_demand_used else "fastsafetensors_buf",
             "rss_delta_mb": (
                 None if rss_before is None else round((_rss_mb() or rss_before) - rss_before, 3)
             ),
@@ -2184,10 +2227,13 @@ def _try_fast_hydrate(
             "post_forward_stability": None,
             "canonical": {
                 "phase": "execution",
-                "hydration_source": cfh.MODE_FASTSAFE,
+                "hydration_source": "m2_mmap_process" if _m2_demand_used else cfh.MODE_FASTSAFE,
                 "loader_interval": _loader_interval,
             },
         }
+        if _m2_demand_used:
+            result["m2_timing"] = dict(_m2_record)
+            result["m2_source_geometry"] = {"qd": 4, "block_mib": 64, "slots": 1}
         if _e31_bind_record:
             result["cast_once_bind_proof"] = _e31_bind_record
             result["cast_once_owner_transition"] = _e31_owner_record

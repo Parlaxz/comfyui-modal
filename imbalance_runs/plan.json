@@ -1,0 +1,13 @@
+{
+  "kind": "qd4_static_partition_imbalance",
+  "min_launch_gap_ms": 4.0,
+  "note": "No architecture change. Odin invalidated and slot rerun.",
+  "pinned": false,
+  "qd": 4,
+  "read_mib": 64,
+  "reject_regions": [
+    "odin"
+  ],
+  "slots": 25,
+  "worker_model": "processes"
+}

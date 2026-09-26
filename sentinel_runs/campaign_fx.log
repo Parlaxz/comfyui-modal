@@ -1,0 +1,50 @@
+[sn] start fx-01 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-01 status=ok gbps=4.451697205433899 max_ms=224.17342 hb=95.741049 Umain=2.020562 Uchild=2.006868 Smain_sched=0.005568 Smain_lat=1.684402 Schild_sched=0.010299 Schild_lat=1.903358 Bmain_excess=94.749079 Bchild_excess=2.2235760000000004
+[sn] running totals: large=0 clean=1
+[sn] start fx-02 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-02 status=ok gbps=4.667103042451698 max_ms=242.536882 hb=294.953798 Umain=2.004981 Uchild=2.20919 Smain_sched=1.111764 Smain_lat=1.295417 Schild_sched=1.861562 Schild_lat=3.642205 Bmain_excess=293.065637 Bchild_excess=4.033515
+[sn] running totals: large=0 clean=2
+[sn] start fx-03 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-03 status=ok gbps=1.9961783017860815 max_ms=276.855036 hb=275.523437 Umain=3.595256 Uchild=24.269247 Smain_sched=50.193352 Smain_lat=53.192702 Schild_sched=27.704105 Schild_lat=30.703553 Bmain_excess=135.193034 Bchild_excess=49.302591
+[sn] running totals: large=0 clean=2
+[sn] start fx-04 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-04 status=ok gbps=4.682203350873302 max_ms=218.864908 hb=341.987208 Umain=2.819075 Uchild=2.004959 Smain_sched=5.361418 Smain_lat=5.059781 Schild_sched=3.593171 Schild_lat=6.592869 Bmain_excess=340.359939 Bchild_excess=2.566231
+[sn] running totals: large=0 clean=3
+[sn] start fx-05 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-05 status=ok gbps=2.8226737309621885 max_ms=1296.078982 hb=1103.139556 Umain=4.103801 Uchild=2.026828 Smain_sched=53.11782 Smain_lat=56.117107 Schild_sched=3.22527 Schild_lat=4.75482 Bmain_excess=1162.957729 Bchild_excess=4.761538
+[sn] running totals: large=1 clean=3
+[sn] start fx-06 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-06 status=ok gbps=4.6767918546825475 max_ms=119.42737 hb=79.114582 Umain=2.719261 Uchild=3.71958 Smain_sched=1.785886 Smain_lat=3.33108 Schild_sched=6.692163 Schild_lat=5.606837 Bmain_excess=52.507986 Bchild_excess=15.069643
+[sn] running totals: large=1 clean=4
+[sn] start fx-07 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-07 status=ok gbps=4.15808405346729 max_ms=151.60817 hb=151.582509 Umain=2.00691 Uchild=2.003396 Smain_sched=0.010118 Smain_lat=0.203592 Schild_sched=0.023546 Schild_lat=0.583326 Bmain_excess=50.511409 Bchild_excess=1.3217430000000001
+[sn] running totals: large=1 clean=5
+[sn] start fx-08 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-08 status=ok gbps=5.028626731355515 max_ms=159.505682 hb=54.983052 Umain=2.009581 Uchild=2.01862 Smain_sched=0.001144 Smain_lat=0.847667 Schild_sched=0.002041 Schild_lat=0.259697 Bmain_excess=54.881971 Bchild_excess=1.5060259999999999
+[sn] running totals: large=1 clean=6
+[sn] start fx-09 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-09 status=ok gbps=4.923043731468739 max_ms=149.839146 hb=148.267609 Umain=2.000095 Uchild=2.000708 Smain_sched=30.214296 Smain_lat=33.21346 Schild_sched=0.014011 Schild_lat=0.445213 Bmain_excess=61.403228 Bchild_excess=1.2981820000000002
+[sn] running totals: large=1 clean=7
+[sn] start fx-10 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-10 status=ok gbps=1.2872916649381065 max_ms=1979.914668 hb=1953.196682 Umain=2.252491 Uchild=2.034263 Smain_sched=65.329268 Smain_lat=0.704649 Schild_sched=0.100627 Schild_lat=1.745036 Bmain_excess=1952.299533 Bchild_excess=2.158475
+[sn] running totals: large=2 clean=7
+[sn] start fx-11 diagnostics=True settle_ms=0 native_canary=True
+[sn] done fx-11 status=ok gbps=3.0170237503189727 max_ms=628.800113 hb=2618.475825 Umain=28.591491 Uchild=3.687055 Smain_sched=70.102065 Smain_lat=73.10142 Schild_sched=23.147215 Schild_lat=9.909034 Bmain_excess=2614.32304 Bchild_excess=12.449162
+[sn] running totals: large=3 clean=7
+[sn] capture goal met; stopping
+
+=== per-run summary ===
+run | region | worst src ms | src gbps | main hb gap | canary gap | canary mode | A sched/lat | B sched/lat | C sched/lat | sent samples
+| fx-01 | CLOUD_PROVIDER_OCI/us-chicago-1 | 224 | 4.45 | 96 | 2 | separate_pid | 140.2/15.6 | 139.9/15.8 | 137.1/15.8 | 330 |
+| fx-02 | CLOUD_PROVIDER_GCP/us-east | 243 | 4.67 | 295 | 3 | separate_pid | 222.6/345.4 | 222.8/294.6 | 223.7/24.2 | 310 |
+| fx-03 | CLOUD_PROVIDER_GCP/northamerica-northeast2 | 277 | 2.00 | 276 | 26 | separate_pid | 254.3/82.8 | 272.2/114.3 | 275.3/114.1 | 569 |
+| fx-04 | CLOUD_PROVIDER_GCP/us-east4 | 219 | 4.68 | 342 | 8 | separate_pid | 316.5/173.2 | 25.1/341.1 | 173.6/44.8 | 318 |
+| fx-05 | CLOUD_PROVIDER_GCP/us-east | 1296 | 2.82 | 1103 | 4 | separate_pid | 1202.2/56.9 | 1202.6/413.7 | 1197.4/22.3 | 329 |
+| fx-06 | CLOUD_PROVIDER_UNSPECIFIED/london | 119 | 4.68 | 79 | 4 | separate_pid | 130.5/25.8 | 72.0/101.4 | 72.2/52.2 | 319 |
+| fx-07 | CLOUD_PROVIDER_OCI/us-chicago-1 | 152 | 4.16 | 152 | 2 | separate_pid | 41.9/151.3 | 192.7/15.8 | 38.0/150.4 | 342 |
+| fx-08 | CLOUD_PROVIDER_GCP/us-west | 160 | 5.03 | 55 | 2 | separate_pid | 99.8/56.8 | 97.4/57.4 | 93.6/57.3 | 308 |
+| fx-09 | CLOUD_PROVIDER_GCP/us-east4 | 150 | 4.92 | 148 | 2 | separate_pid | 104.0/42.1 | 51.5/52.5 | 51.3/94.5 | 307 |
+| fx-10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 1980 | 1.29 | 1953 | 4 | separate_pid | 1944.3/41.6 | 1944.2/458.5 | 1944.1/20.0 | 396 |
+| fx-11 | CLOUD_PROVIDER_GCP/asia-south2 | 629 | 3.02 | 2618 | 16 | separate_pid | 2593.5/308.5 | 508.5/2616.7 | 508.7/75.4 | 385 |
+
+large episodes=3  clean runs=7  total runs=11

@@ -1,24 +1,28 @@
-// Modal Studio — Live nested-dependency acceptance probe.
+// Modal Studio — Live nested-dependency + remote-availability acceptance probe.
 //
 // Opt-in live test (COMFYMODAL_LIVE_E2E=1) against a real ComfyUI + Studio
-// backend. It proves the backend dependency-source fix: a WorkflowVersion
-// carrying its own top-level `graph_json` nodes must STILL merge the owning
-// Workflow's `static_graph`, because the parent graph records nested model
-// loaders and UI-only / Manager-missing node classes the version capture never
-// contains (inside `definitions.subgraphs` / `extra.groupNodes`).
+// backend. It proves two product contracts at once:
+//
+//   1. Backend dependency-source fix: a WorkflowVersion carrying its own
+//      top-level `graph_json` nodes must STILL merge the owning Workflow's
+//      `static_graph`, because the parent graph records nested model loaders
+//      (inside `definitions.subgraphs` / `extra.groupNodes`) the version
+//      capture never contains.
+//   2. Remote model-volume authority: GET /comfymodal/models (Modal
+//      list_models_cpu) is the availability authority. A dependency row whose
+//      remote entry has size > 0 reads Installed even when the local file is
+//      an intentional 0-byte placeholder; a remote size of 0 stays Missing.
+//      The local placeholder is preserved as secondary information only.
 //
 // The concrete acceptance fixture is the Krea upscale workflow. Naming the
-// fixture workflow here is intentional; production code stays generic.
+// fixture workflow/model here is intentional; production code stays generic.
 //
 // Acceptance assertions (all derived from live data):
-//   * The Model Library is reconciled with disk first (POST models/rescan), so
-//     a real file in any canonical model folder — including models/unet — is
-//     represented by a record. That reconciliation is a scan, not a download.
 //   * `krea2_turbo_bf16.safetensors` appears in the live dependency report (and
 //     in the wizard's Dependencies step) — it only lives in a parent nested
-//     subgraph, so its presence proves the parent graph was merged. Its state
-//     must agree with the local model-library record: Installed for a real
-//     nonzero file, Missing for a zero-byte placeholder.
+//     subgraph, so its presence proves the parent graph was merged.
+//   * The wizard captures a live `/comfymodal/models` response, and the model
+//     row state follows the remote nonzero size, NOT the local placeholder size.
 //   * DonutLatestPreview / DonutModelDownloads / DonutWorkflowPanel never appear
 //     as dependency rows (frontend-only virtual panels).
 //   * A browser reload while on the Dependencies step resumes the same wizard at
@@ -47,14 +51,6 @@ const VIRTUAL_PANEL_CLASSES = [
 ];
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-// Report state -> the exact state badge text rendered by the wizard.
-const STATE_BADGE_TEXT = {
-  installed: "Installed",
-  missing: "Missing",
-  wrong_version: "Wrong version",
-  unknown: "Unknown",
-};
 
 // ── Generic recursive graph walk (mirrors the production iterator) ───────
 
@@ -147,20 +143,39 @@ function classifyUnionNestedOnly(graphs) {
   return { real, virtual };
 }
 
+/** Lowercased basename of a model reference. */
+function basenameOf(name) {
+  const value = String(name || "").replace(/\\/g, "/");
+  return value.slice(value.lastIndexOf("/") + 1).toLowerCase();
+}
+
+/** Flatten the live folder-keyed /comfymodal/models payload into entries. */
+function flattenRemoteInventory(payload) {
+  const out = [];
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return out;
+  for (const folder of Object.keys(payload)) {
+    const entries = payload[folder];
+    if (!Array.isArray(entries)) continue;
+    for (const item of entries) {
+      if (!item || typeof item !== "object") continue;
+      if (typeof item.name !== "string" || !item.name) continue;
+      out.push(item);
+    }
+  }
+  return out;
+}
+
 // ── Suite ────────────────────────────────────────────────────────────────
 
 test.describe("Studio wizard nested dependencies (live)", () => {
   test.skip(!LIVE_ENABLED, "Set COMFYMODAL_LIVE_E2E=1 to enable live tests");
 
-  test("version graph merges parent nested deps and the wizard resumes", async ({
+  test("remote size is the model authority and the wizard resumes", async ({
     page,
     request,
   }, testInfo) => {
     let guard;
-    const evidence = {
-      live: {},
-      mock: {},
-    };
+    const evidence = { live: {}, mock: {} };
 
     try {
       // ── Live backend discovery ───────────────────────────────────────
@@ -190,21 +205,11 @@ test.describe("Studio wizard nested dependencies (live)", () => {
       const versionGraph = ((await ctxRes.json()).version || {}).graph_json || {};
       const parentGraph = workflow.static_graph || {};
 
-      // Reconcile the Model Library with disk before resolving. The
-      // dependency resolver reads records only (it never scans), and the
-      // real unet file is not a synthetic fixture: it must be represented by
-      // a real scan for its row to derive Installed. This is a reconciliation
-      // read of the models tree, not a download or install.
-      const rescanRes = await request.post(
-        `${COMFYUI_URL}/comfymodal/studio/models/rescan`,
-        { data: {} }
-      );
-      expect(rescanRes.ok()).toBeTruthy();
-      const rescanSummary = (await rescanRes.json()).summary || {};
-
       // Recompute the "effective" merge source the fixed route exposes.
-      const sourceGraphs = [versionGraph, parentGraph];
-      const { real: nestedReal, virtual: nestedVirtual } = classifyUnionNestedOnly(sourceGraphs);
+      const { real: nestedReal, virtual: nestedVirtual } = classifyUnionNestedOnly([
+        versionGraph,
+        parentGraph,
+      ]);
 
       const depsRes = await request.get(
         `${COMFYUI_URL}/comfymodal/studio/workflows/versions/${encodeURIComponent(
@@ -217,22 +222,6 @@ test.describe("Studio wizard nested dependencies (live)", () => {
       const nodeRows = Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
       const unresolvable = Array.isArray(deps.unresolvable) ? deps.unresolvable : [];
 
-      // The local model-library record is authoritative for the expected state.
-      // It must exist: an installed (or placeholder) real file in any canonical
-      // model folder, including models/unet, is reconciled into the library.
-      const localRes = await request.get(
-        `${COMFYUI_URL}/comfymodal/studio/models?search=${encodeURIComponent(NESTED_ONLY_MODEL)}`
-      );
-      expect(localRes.ok()).toBeTruthy();
-      const localRecords = ((await localRes.json()).models) || [];
-      const localRecord = localRecords.find((m) => m.filename === NESTED_ONLY_MODEL);
-      expect(
-        localRecord,
-        `model library has no record for ${NESTED_ONLY_MODEL} after rescan`
-      ).toBeTruthy();
-      const localInstalled = !!(localRecord && localRecord.installed);
-      const localIsPlaceholder = !!(localRecord && localRecord.is_placeholder);
-
       // Core fix proof: the parent-only nested model is present.
       const nestedModel = models.find((m) => m.filename === NESTED_ONLY_MODEL);
       expect(
@@ -240,40 +229,60 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         `parent-only nested model '${NESTED_ONLY_MODEL}' missing from dependency report`
       ).toBeTruthy();
 
+      // ── Remote model volume is the availability authority ───────────
+      const modelsRes = await request.get(`${COMFYUI_URL}/comfymodal/models`);
+      expect(modelsRes.ok()).toBeTruthy();
+      const remotePayload = await modelsRes.json();
+      const remoteEntries = flattenRemoteInventory(remotePayload);
+      const remoteEntry = remoteEntries.find((e) => basenameOf(e.name) === basenameOf(NESTED_ONLY_MODEL));
+      expect(
+        remoteEntry,
+        `remote model inventory has no entry for ${NESTED_ONLY_MODEL}`
+      ).toBeTruthy();
+      const remoteSize = Number(remoteEntry.size) || 0;
+      const remoteAvailable = remoteSize > 0;
+      const localPlaceholder = remoteEntry.local_placeholder || null;
+      const localPlaceholderSize = localPlaceholder ? Number(localPlaceholder.size) || 0 : null;
+      // Exact expected UI state: remote size decides, NOT the local placeholder.
+      const expectedBadge = remoteAvailable ? "Installed" : "Missing";
+
+      // Best-effort local library record (secondary evidence only — the local
+      // store is not the authority and may legitimately have no record).
+      let localRecord = null;
+      try {
+        const localRes = await request.get(
+          `${COMFYUI_URL}/comfymodal/studio/models?search=${encodeURIComponent(NESTED_ONLY_MODEL)}`
+        );
+        if (localRes.ok()) {
+          localRecord = (((await localRes.json()).models) || []).find(
+            (m) => m.filename === NESTED_ONLY_MODEL
+          ) || null;
+        }
+      } catch (e) { /* local record is not authoritative */ }
+
       evidence.live = {
-        label: "live",
+        label: "live_remote_authority",
         workflow_id: workflowId,
         version_id: versionId,
-        rescan_summary: rescanSummary,
+        remote_entry_found: !!remoteEntry,
+        remote_entry_size: remoteSize,
+        remote_entry_folder: remoteEntry.folder || "",
+        remote_available: remoteAvailable,
+        local_placeholder: localPlaceholder,
+        local_placeholder_size: localPlaceholderSize,
         local_record_found: !!localRecord,
-        local_record_installed: localInstalled,
-        local_record_is_placeholder: localIsPlaceholder,
         local_record_size: localRecord ? localRecord.size : null,
-        local_record_folder: localRecord ? localRecord.folder : null,
-        nested_model_state: nestedModel.state,
+        local_record_is_placeholder: localRecord ? !!localRecord.is_placeholder : null,
+        nested_model_report_state: nestedModel.state,
+        expected_ui_badge: expectedBadge,
         nested_real_classes: [...nestedReal.keys()].sort(),
         nested_virtual_classes: [...nestedVirtual].sort(),
         report_model_count: models.length,
         report_node_rows: nodeRows.length,
-        report_classes: [...new Set(nodeRows.flatMap((r) => r.classes || []))].sort(),
-        virtual_panel_rows: [],
         unresolvable_contains_virtuals: unresolvable
           .map((u) => u && u.name)
           .filter((name) => VIRTUAL_PANEL_CLASSES.includes(name)),
       };
-
-      // State contract: an existing nonzero file resolves Installed; a 0-byte
-      // placeholder (the live repo carries one) resolves Missing. Either way
-      // the report must agree with the authoritative library record.
-      if (localInstalled) {
-        expect(nestedModel.state).toBe("installed");
-      } else {
-        expect(
-          localIsPlaceholder,
-          "record is neither installed nor a zero-byte placeholder"
-        ).toBe(true);
-        expect(nestedModel.state).toBe("missing");
-      }
 
       // Generic nested-only real classes must have resolved from the union.
       const reportClasses = new Set(nodeRows.flatMap((row) => row.classes || []));
@@ -289,7 +298,16 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         ).toBe(false);
       }
 
-      // ── Intercept every mutation route BEFORE the UI opens ──────────
+      // ── Capture the live remote-inventory read and intercept mutations ──
+      // Passive response capture: read the wizard's own GET without holding
+      // the route open (a retained route callback can outlive the test).
+      const capturedModels = [];
+      page.on("response", (resp) => {
+        let pathname = "";
+        try { pathname = new URL(resp.url()).pathname; } catch (e) { return; }
+        if (pathname !== "/comfymodal/models") return;
+        resp.json().then((j) => capturedModels.push(j)).catch(() => capturedModels.push(null));
+      });
       const seen = { gitUrl: [], reboot: 0, modelInstallPayloads: [], queueInstall: [] };
       await page.route("**/manager/version", (route) =>
         route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ version: "probe" }) })
@@ -298,11 +316,7 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) })
       );
       await page.route("**/customnode/getlist**", (route) =>
-        route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ channel: "default", node_packs: {} }),
-        })
+        route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ channel: "default", node_packs: {} }) })
       );
       await page.route("**/customnode/getmappings**", (route) =>
         route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) })
@@ -360,17 +374,39 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         timeout: 20000,
       });
 
-      // ── The nested parent-only model must be rendered in the UI ─────
+      // The wizard must have read the live remote inventory (read-only GET).
+      // Modal CPU cold start can take a while, so this is generously bounded.
+      await expect
+        .poll(() => capturedModels.length, { timeout: 180000 })
+        .toBeGreaterThanOrEqual(1);
+      const capturedEntry = flattenRemoteInventory(
+        capturedModels[capturedModels.length - 1]
+      ).find((e) => basenameOf(e.name) === basenameOf(NESTED_ONLY_MODEL));
+      expect(capturedEntry, "wizard did not capture the remote model entry").toBeTruthy();
+      expect(Number(capturedEntry.size) || 0).toBe(remoteSize);
+      evidence.live.wizard_captured_remote_size = Number(capturedEntry.size) || 0;
+
+      // ── The nested row state follows remote size, not the placeholder ─
       const modelRows = panel.locator('[data-testid="dependency-model-row"]');
-      await expect(modelRows.first()).toBeVisible({ timeout: 30000 });
+      await expect(modelRows.first()).toBeVisible({ timeout: 60000 });
       const nestedRow = modelRows.filter({ hasText: NESTED_ONLY_MODEL });
       await expect(nestedRow).toHaveCount(1);
       const nestedBadge = nestedRow.locator('[data-testid="dependency-model-state"]');
-      await expect(nestedBadge).toHaveText(STATE_BADGE_TEXT[nestedModel.state] || "Unknown");
-      if (localInstalled) {
-        await expect(nestedBadge).toHaveText("Installed");
-      }
+      await expect(nestedBadge).toHaveText(expectedBadge, { timeout: 180000 });
       evidence.live.ui_nested_model_badge = await nestedBadge.textContent();
+
+      if (remoteAvailable) {
+        // Secondary local detail is preserved beside the Installed state; the
+        // model row offers no download action.
+        const remoteDetail = nestedRow.locator('[data-testid="dependency-model-remote"]');
+        await expect(remoteDetail).toContainText("remote", { timeout: 30000 });
+        if (localPlaceholder && localPlaceholder.is_placeholder) {
+          await expect(remoteDetail).toContainText("local placeholder 0 B", { timeout: 30000 });
+        }
+        await expect(nestedRow.locator('[data-testid="dependency-model-queue"]')).toHaveCount(0);
+        await expect(nestedRow.locator('[data-testid="dependency-model-install-now"]')).toHaveCount(0);
+        evidence.live.ui_nested_model_remote_detail = await remoteDetail.textContent();
+      }
 
       // Virtual panels must never render as dependency rows.
       const nodeRowNames = await panel
@@ -378,12 +414,12 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         .evaluateAll((rows) =>
           rows.map((r) => (r.getAttribute("data-node-name") || "") + "|" + r.textContent)
         );
+      evidence.live.virtual_panel_rows = [];
       for (const cls of VIRTUAL_PANEL_CLASSES) {
         const present = nodeRowNames.some((text) => text.includes(cls));
         if (present) evidence.live.virtual_panel_rows.push(cls);
         expect(present, `virtual panel '${cls}' must not be a dependency row`).toBe(false);
       }
-      expect(evidence.live.virtual_panel_rows).toEqual([]);
 
       // ── Reload on the Dependencies step resumes the same wizard ─────
       await page.reload({ waitUntil: "domcontentloaded" });
@@ -393,39 +429,19 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         })
         .toBe(true);
       evidence.live.reload_hash = await page.evaluate(() => window.location.hash);
-      evidence.live.reload_draft = await page.evaluate(() => {
-        try {
-          return sessionStorage.getItem("comfymodal.studio.wizard.draft.v1");
-        } catch (e) {
-          return null;
-        }
-      });
       await page.evaluate(() => window.open_testing_modal());
       await expect(page.locator('[data-testid="studio-page"]')).toBeVisible({ timeout: 30000 });
-      evidence.live.mounted_hash = await page.evaluate(() => window.location.hash);
-      console.log(
-        "[nested-deps-live] reload diagnostics:",
-        JSON.stringify({
-          reload_hash: evidence.live.reload_hash,
-          reload_draft: evidence.live.reload_draft,
-          mounted_hash: evidence.live.mounted_hash,
-        })
-      );
       await expect(panel.locator('[data-testid="wizard-dependencies-continue"]')).toBeVisible({
-        timeout: 30000,
+        timeout: 60000,
       });
       evidence.live.resumed_step = "dependencies";
-      evidence.live.resumed_after_reload = true;
 
       // ── Queue-state subcase (deterministic mock route override) ─────
-      // The live nested model has no local library source URL, so it exposes no
-      // "Queue install" action. Exercise the queue badge contract with a
-      // deterministic dependencies override instead; everything else (click,
-      // in-flight tracking, badge) runs through the live UI.
-      const mockVersionId = versionId;
+      // A remote-missing model (not in the remote inventory) keeps its Queue
+      // install action; holding the request leaves "Queued for download".
       const mockDeps = {
         status: "ok",
-        version_id: mockVersionId,
+        version_id: versionId,
         models: [
           {
             key: "unet|mock_hold_model.safetensors",
@@ -442,9 +458,7 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         summary: { installed: 0, missing: 1, wrong_version: 0, unknown: 0, attention: 1, ready: false },
       };
       await page.route(
-        new RegExp(
-          `/comfymodal/studio/workflows/versions/${mockVersionId}/dependencies$`
-        ),
+        new RegExp(`/comfymodal/studio/workflows/versions/${versionId}/dependencies$`),
         (route) =>
           route.fulfill({
             status: 200,
@@ -462,7 +476,7 @@ test.describe("Studio wizard nested dependencies (live)", () => {
       const mockRow = panel
         .locator('[data-testid="dependency-model-row"]')
         .filter({ hasText: "mock_hold_model.safetensors" });
-      await expect(mockRow).toHaveCount(1, { timeout: 20000 });
+      await expect(mockRow).toHaveCount(1, { timeout: 30000 });
       const queueBtn = mockRow.locator('[data-testid="dependency-model-queue"]');
       await expect(queueBtn).toBeVisible();
       await queueBtn.click();
@@ -473,7 +487,7 @@ test.describe("Studio wizard nested dependencies (live)", () => {
       evidence.mock = {
         label: "mock_route_override",
         reason:
-          "live nested model has no local library source URL, so the queue action is exercised with a deterministic dependencies response",
+          "a remote-missing model keeps its queue action; the dependencies response is overridden so the queue badge is deterministic",
         queue_badge: "Queued for download",
         model_install_payloads: seen.modelInstallPayloads,
       };

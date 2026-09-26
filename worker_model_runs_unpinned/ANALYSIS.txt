@@ -1,0 +1,275 @@
+============================================================================================
+THREADS vs PROCESSES — matched QD4 / 64 MiB / 4.0 ms global pacer / H100
+============================================================================================
+runs per arm: {'threads': 15, 'processes': 15}
+seed: 20260927
+
+============================================================================================
+VALIDITY CHECK (must hold identically in both arms)
+============================================================================================
+arm         qd  reads        bytes  exact  maxIF  clmGapMin      model  startM PIDs TIDs
+threads      4    120   8044982048   True      4      4.007    threads    1    4
+threads      4    120   8044982048   True      4      4.039    threads    1    4
+threads      4    120   8044982048   True      4      4.016    threads    1    4
+threads      4    120   8044982048   True      4      4.024    threads    1    4
+threads      4    120   8044982048   True      4      4.025    threads    1    4
+threads      4    120   8044982048   True      4      4.006    threads    1    4
+threads      4    120   8044982048   True      4      4.055    threads    1    4
+threads      4    120   8044982048   True      4      4.008    threads    1    4
+threads      4    120   8044982048   True      4      4.070    threads    1    4
+threads      4    120   8044982048   True      4      4.043    threads    1    4
+threads      4    120   8044982048   True      4      4.034    threads    1    4
+threads      4    120   8044982048   True      4      4.045    threads    1    4
+threads      4    120   8044982048   True      4      4.013    threads    1    4
+threads      4    120   8044982048   True      4      4.040    threads    1    4
+threads      4    120   8044982048   True      4      4.007    threads    1    4
+processes    4    120   8044982048   True      4      4.055  processes    4    4
+processes    4    120   8044982048   True      4      4.141  processes    4    4
+processes    4    120   8044982048   True      4      4.030  processes    4    4
+processes    4    120   8044982048   True      4      4.013  processes    4    4
+processes    4    120   8044982048   True      4      4.085  processes    4    4
+processes    4    120   8044982048   True      4      4.005  processes    4    4
+processes    4    120   8044982048   True      4      4.003  processes    4    4
+processes    4    120   8044982048   True      4      4.096  processes    4    4
+processes    4    120   8044982048   True      4      4.018  processes    4    4
+processes    4    120   8044982048   True      4      4.059  processes    4    4
+processes    4    120   8044982048   True      4      4.015  processes    4    4
+processes    4    120   8044982048   True      4      4.039  processes    4    4
+processes    4    120   8044982048   True      4      4.041  processes    4    4
+processes    4    120   8044982048   True      4      4.034  processes    4    4
+processes    4    120   8044982048   True      4      4.112  processes    4    4
+
+ALL VALIDITY CONDITIONS HOLD: True
+identical read count across every run: True
+identical byte count across every run: True
+
+============================================================================================
+PER-RUN
+============================================================================================
+arm        rndprov      region              wall   GB/s   best    p10    med   mean     p95      p99    worst     SD  >250  >500  >1k  conc   ovl  mx  spread
+threads      1gcp       europe-west9        2103  3.826   22.9   40.1   44.8   63.8   145.5    528.9    550.0   81.1     4     3    0 3.641 0.975   4   231.6
+threads      2unspecifiedus-central          1468  5.482   21.5   37.2   41.8   43.7    52.6     84.5    112.6   10.1     0     0    0 3.573 0.975   4   146.2
+threads      3oci       us-chicago-1        1855  4.337   26.7   44.1   52.7   56.1    78.3    139.1    181.6   18.4     0     0    0 3.626 0.975   4   179.2
+threads      4gcp       us-west             1565  5.140   22.9   38.0   46.3   47.0    58.0     97.3    114.1   10.7     0     0    0 3.606 0.983   4   161.3
+threads      5gcp       us-west             2126  3.784   24.0   40.7   45.5   65.3    69.8    612.9    636.3  100.0     4     4    0 3.685 0.975   4   117.8
+threads      6gcp       us-west             1518  5.301   25.7   40.6   44.3   45.6    56.0     94.9    106.1    9.3     0     0    0 3.607 0.983   4   128.4
+threads      7unspecifieddenver              2138  3.763   22.4   47.5   61.4   64.5    95.9    103.9    143.8   18.0     0     0    0 3.622 0.967   4   152.9
+threads      8gcp       us-west             1436  5.604   28.6   37.0   41.9   44.2    57.6     97.8    108.4   11.4     0     0    0 3.696 0.992   4    57.8
+threads      9gcp       us-east             1550  5.189   23.0   40.8   45.4   47.7    58.7    107.6    122.4   12.3     0     0    0 3.694 0.983   4   104.0
+threads     10oci       us-ashburn-1        1776  4.529   28.5   44.6   54.2   55.3    70.7     96.3    137.2   12.4     0     0    0 3.733 0.992   4    72.8
+threads     11oci       us-ashburn-1        1630  4.935   23.6   40.3   46.5   49.3    64.6     97.3    128.8   12.3     0     0    0 3.629 0.983   4   115.3
+threads     12gcp       us-west             1466  5.487   24.6   39.2   42.8   44.4    49.8    108.8    110.3   11.3     0     0    0 3.630 0.983   4   136.1
+threads     13gcp       us-west             1469  5.478   26.3   37.9   42.3   44.4    54.3     89.6    110.1   10.6     0     0    0 3.625 0.983   4    73.8
+threads     14unspecifiedeu-north            1269  6.339   19.1   31.2   36.2   37.1    45.7     81.7    102.6    9.4     0     0    0 3.506 0.967   4   162.8
+threads     15azure     us-central          1476  5.450   23.6   38.4   42.2   43.9    53.7     89.4     96.7    9.1     0     0    0 3.571 0.983   4   118.7
+processes    1gcp       us-east             1391  5.785   24.8   38.7   44.1   45.0    57.9     70.9     73.9    7.6     0     0    0 3.882 0.992   4    30.0
+processes    2oci       us-chicago-1        1436  5.601   24.4   42.5   45.6   46.6    54.0     63.8     71.4    5.4     0     0    0 3.889 0.992   4    46.1
+processes    3unspecifiedeu-north            1138  7.071   20.4   33.1   35.7   35.8    41.0     51.3     52.3    4.1     0     0    0 3.781 0.992   4    20.8
+processes    4unspecifieddenver              1208  6.659   21.3   33.8   37.6   38.3    45.7     59.7     67.5    5.6     0     0    0 3.804 0.992   4    81.3
+processes    5gcp       us-east             1898  4.240   23.9   36.9   42.1   53.3    73.3    318.6    468.2   56.1     4     0    0 3.371 0.942   4   546.6
+processes    6gcp       us-east             1250  6.438   22.8   36.1   39.3   40.2    49.3     53.5     53.9    5.2     0     0    0 3.861 0.992   4    30.0
+processes    7gcp       us-west             1337  6.015   23.6   35.6   40.3   41.9    55.7     57.6     59.0    7.1     0     0    0 3.764 0.983   4    76.9
+processes    8gcp       us-west             1398  5.755   25.3   38.1   44.2   45.0    57.2     65.5     65.9    7.0     0     0    0 3.862 0.992   4    34.3
+processes    9gcp       us-west             1538  5.232   23.4   41.3   46.8   49.0    65.4     68.5     71.4    8.6     0     0    0 3.824 0.992   4    82.6
+processes   10gcp       us-west             1427  5.637   23.2   36.0   40.7   45.9    53.1    191.7    194.4   26.8     0     0    0 3.858 0.992   4    58.0
+processes   11gcp       us-west             1355  5.939   24.9   38.2   41.6   42.7    51.2     62.4     68.6    5.7     0     0    0 3.785 0.983   4    80.0
+processes   12gcp       us-west             1320  6.094   26.8   37.2   41.3   41.8    49.7     60.7     61.1    5.3     0     0    0 3.798 0.992   4    77.6
+processes   13gcp       us-west             1302  6.179   20.7   37.5   40.5   41.8    51.5     62.3     64.6    5.9     0     0    0 3.849 0.992   4    13.3
+processes   14gcp       us-west             3977  2.023   21.5   33.7   38.2   72.4    70.8    670.9   2176.5  209.9     5     2    1 2.185 0.950   4  2776.6
+processes   15unspecifiedeu-north            2833  2.840   50.8   59.7   82.0   92.2   130.3    152.8    173.4   29.7     0     0    0 3.905 0.992   4   172.3
+
+============================================================================================
+HEADLINE AGGREGATE PER ARM
+============================================================================================
+--- GB/s ---
+arm         min/best      p10   median     mean      p90  max/worst       SD
+threads        3.763    3.801    5.189    4.976    5.557      6.339    0.742
+processes      2.023    3.400    5.785    5.434    6.571      7.071    1.339
+
+--- source wall ms ---
+arm         min/best      p10   median     mean      p90  max/worst       SD
+threads     1269.208 1447.829 1550.411 1656.378 2116.838   2138.195  268.796
+processes   1137.776 1224.740 1390.750 1653.820 2458.725   3977.364  737.033
+
+--- pooled preadv latency (ms) ---
+arm            n    best     p10  median    mean      p95       p99     worst      SD
+threads     1800   19.11   37.24   44.80   50.15    73.07    122.40    636.34   36.16
+processes   1800   20.40   35.80   41.76   48.79    72.38    132.31   2176.49   59.04
+
+--- tails ---
+arm         reads>=250  reads>=500  reads>=1000  runs>=250  runs>=500  runs>=1000
+threads              8           7            0          2          2           0
+processes            9           2            1          2          1           1
+
+--- concurrency / pacer ---
+arm         meanEffConc  medEffConc  meanOverlap maxActive  minClaimGap  medClaimGap  lockHoldUs
+threads           3.630       3.626       0.9800         4       4.0062        8.107       8.437
+processes         3.694       3.824       0.9844         4       4.0033        8.873      10.105
+
+--- worker balance ---
+arm         bytes/wkr  wallMed wallSpreadMed  worstPreadvMax  meanPreadvMax
+threads   [2005184288, 2013265920]   1451.2         128.4           636.3           67.4
+processes [2005184288, 2013265920]   1350.0          76.9          2176.5          131.9
+
+============================================================================================
+HEADLINE TABLE
+============================================================================================
+| metric                  |    4 threads / 1 process |   4 processes / 1 reader each |
+|-------------------------|--------------------------|-------------------------------|
+| runs                    |                       15 |                            15 |
+| median GB/s             |                    5.189 |                         5.785 |
+| mean GB/s               |                    4.976 |                         5.434 |
+| best GB/s               |                    6.339 |                         7.071 |
+| worst GB/s              |                    3.763 |                         2.023 |
+| GB/s SD                 |                    0.742 |                         1.339 |
+| median source wall ms   |                     1550 |                          1391 |
+| mean source wall ms     |                     1656 |                          1654 |
+| best source wall ms     |                     1269 |                          1138 |
+| worst source wall ms    |                     2138 |                          3977 |
+| pooled preadv median    |                    44.80 |                         41.76 |
+| pooled preadv mean      |                    50.15 |                         48.79 |
+| preadv p95              |                    73.07 |                         72.38 |
+| preadv p99              |                   122.40 |                        132.31 |
+| worst preadv            |                    636.3 |                        2176.5 |
+| reads >=250             |                        8 |                             9 |
+| reads >=500             |                        7 |                             2 |
+| reads >=1000            |                        0 |                             1 |
+| runs >=500              |                        2 |                             1 |
+| runs >=1000             |                        0 |                             1 |
+| effective concurrency   |                    3.630 |                         3.694 |
+| overlap                 |                   0.9800 |                        0.9844 |
+| max active              |                        4 |                             4 |
+
+PROCESS median GB/s delta   : +0.596  (+11.5%)
+PROCESS mean   GB/s delta   : +0.458  (+9.2%)
+
+============================================================================================
+PROVIDER BREAKDOWN  (no pinning; odin runs invalidated and excluded)
+============================================================================================
+--- ALL: 30 runs / 3600 reads ---
+  GB/s    min=2.023  p10=3.782  median=5.480  mean=5.205  p90=6.349  max=7.071  SD=1.106
+  wall ms best=1138  p10=1267  median=1468  mean=1655  p90=2127  worst=3977  SD=555
+  preadv  n=3600  best=19.11  p10=36.17  median=43.40  mean=49.47  p95=72.87  p99=130.25  worst=2176.49  SD=48.96
+  tails   reads>=250=17  >=500=9  >=1000=1  |  runs>=500=3  runs>=1000=1
+  conc    meanEffConc=3.662  medianEffConc=3.695  overlap=0.9822  maxActive=4
+    threads    n=15  gbps median=5.189 mean=4.976 best=6.339 worst=3.763  |  wall median=1550  |  preadv median=44.80 mean=50.15 worst=636.3  |  reads>=500=7
+    processes  n=15  gbps median=5.785 mean=5.434 best=7.071 worst=2.023  |  wall median=1391  |  preadv median=41.76 mean=48.79 worst=2176.5  |  reads>=500=2
+
+--- AWS: NO RUNS ---
+
+--- GCP: 19 runs / 2280 reads ---
+  GB/s    min=2.023  p10=3.817  median=5.487  mean=5.218  p90=6.111  max=6.438  SD=1.041
+  wall ms best=1250  p10=1316  median=1466  mean=1654  p90=2108  worst=3977  SD=599
+  preadv  n=2280  best=20.65  p10=37.09  median=42.84  mean=48.50  p95=58.74  p99=151.84  worst=2176.49  SD=59.39
+  tails   reads>=250=17  >=500=9  >=1000=1  |  runs>=500=3  runs>=1000=1
+  conc    meanEffConc=3.643  medianEffConc=3.696  overlap=0.9820  maxActive=4
+    threads    n= 8  gbps median=5.245 mean=4.976 best=5.604 worst=3.784  |  wall median=1534  |  preadv median=44.09 mean=50.30 worst=636.3  |  reads>=500=7
+    processes  n=11  gbps median=5.785 mean=5.394 best=6.438 worst=2.023  |  wall median=1391  |  preadv median=41.65 mean=47.18 worst=2176.5  |  reads>=500=2
+
+--- other/azure: 1 runs / 120 reads ---
+  GB/s    min=5.450  p10=5.450  median=5.450  mean=5.450  p90=5.450  max=5.450  SD=0.000
+  wall ms best=1476  p10=1476  median=1476  mean=1476  p90=1476  worst=1476  SD=0
+  preadv  n=120  best=23.61  p10=38.42  median=42.23  mean=43.93  p95=53.74  p99=89.36  worst=96.66  SD=9.08
+  tails   reads>=250=0  >=500=0  >=1000=0  |  runs>=500=0  runs>=1000=0
+  conc    meanEffConc=3.571  medianEffConc=3.571  overlap=0.9833  maxActive=4
+    threads    n= 1  gbps median=5.450 mean=5.450 best=5.450 worst=5.450  |  wall median=1476  |  preadv median=42.23 mean=43.93 worst=96.7  |  reads>=500=0
+
+--- other/oci: 4 runs / 480 reads ---
+  GB/s    min=4.337  p10=4.394  median=4.732  mean=4.850  p90=5.401  max=5.601  SD=0.484
+  wall ms best=1436  p10=1494  median=1703  mean=1674  p90=1832  worst=1855  SD=159
+  preadv  n=480  best=23.62  p10=41.75  median=48.98  mean=51.79  p95=69.87  p99=113.40  worst=181.57  SD=13.57
+  tails   reads>=250=0  >=500=0  >=1000=0  |  runs>=500=0  runs>=1000=0
+  conc    meanEffConc=3.719  medianEffConc=3.681  overlap=0.9854  maxActive=4
+    threads    n= 3  gbps median=4.529 mean=4.600 best=4.935 worst=4.337  |  wall median=1776  |  preadv median=51.21 mean=53.53 worst=181.6  |  reads>=500=0
+    processes  n= 1  gbps median=5.601 mean=5.601 best=5.601 worst=5.601  |  wall median=1436  |  preadv median=45.61 mean=46.55 worst=71.4  |  reads>=500=0
+
+--- other/unspecified: 6 runs / 720 reads ---
+  GB/s    min=2.840  p10=3.301  median=5.910  mean=5.359  p90=6.865  max=7.071  SD=1.554
+  wall ms best=1138  p10=1173  median=1368  mean=1676  p90=2486  worst=2833  SD=615
+  preadv  n=720  best=19.11  p10=33.80  median=40.33  mean=51.94  p95=123.94  p99=130.14  worst=173.43  SD=25.68
+  tails   reads>=250=0  >=500=0  >=1000=0  |  runs>=500=0  runs>=1000=0
+  conc    meanEffConc=3.698  medianEffConc=3.701  overlap=0.9806  maxActive=4
+    threads    n= 3  gbps median=5.482 mean=5.194 best=6.339 worst=3.763  |  wall median=1468  |  preadv median=42.30 mean=48.44 worst=143.8  |  reads>=500=0
+    processes  n= 3  gbps median=6.659 mean=5.523 best=7.071 worst=2.840  |  wall median=1208  |  preadv median=38.75 mean=55.45 worst=173.4  |  reads>=500=0
+
+provider counts: gcp=19, unspecified=6, oci=4, azure=1
+
+============================================================================================
+PAIRED ANALYSIS (temporal pairs from the saved schedule)
+============================================================================================
+| round | threads GB/s | processes GB/s |    delta |  delta % |   tWall |   pWall | wall delta |
+|-------|--------------|----------------|----------|----------|---------|---------|------------|
+|     1 |        3.826 |          5.785 |   +1.959 |   +51.2% |    2103 |    1391 |       -712 |
+|     2 |        5.482 |          5.601 |   +0.119 |    +2.2% |    1468 |    1436 |        -31 |
+|     3 |        4.337 |          7.071 |   +2.734 |   +63.1% |    1855 |    1138 |       -717 |
+|     4 |        5.140 |          6.659 |   +1.519 |   +29.6% |    1565 |    1208 |       -357 |
+|     5 |        3.784 |          4.240 |   +0.456 |   +12.0% |    2126 |    1898 |       -229 |
+|     6 |        5.301 |          6.438 |   +1.138 |   +21.5% |    1518 |    1250 |       -268 |
+|     7 |        3.763 |          6.015 |   +2.253 |   +59.9% |    2138 |    1337 |       -801 |
+|     8 |        5.604 |          5.755 |   +0.150 |    +2.7% |    1436 |    1398 |        -37 |
+|     9 |        5.189 |          5.232 |   +0.043 |    +0.8% |    1550 |    1538 |        -13 |
+|    10 |        4.529 |          5.637 |   +1.108 |   +24.5% |    1776 |    1427 |       -349 |
+|    11 |        4.935 |          5.939 |   +1.003 |   +20.3% |    1630 |    1355 |       -275 |
+|    12 |        5.487 |          6.094 |   +0.608 |   +11.1% |    1466 |    1320 |       -146 |
+|    13 |        5.478 |          6.179 |   +0.701 |   +12.8% |    1469 |    1302 |       -167 |
+|    14 |        6.339 |          2.023 |   -4.316 |   -68.1% |    1269 |    3977 |      +2708 |
+|    15 |        5.450 |          2.840 |   -2.610 |   -47.9% |    1476 |    2833 |      +1357 |
+
+median paired GB/s delta : +0.701 (+12.8%)
+mean   paired GB/s delta : +0.458 (+13.0%)
+median paired wall delta : -229 ms (negative = processes faster)
+pairs PROCESS > THREAD   : 13 / 15
+pairs THREAD > PROCESS   : 2 / 15
+paired bootstrap 95% interval on median delta: [+0.119, +1.519] GB/s (10000 resamples, seed 20260924)
+
+============================================================================================
+REGION STRATIFICATION (Modal placed the arms in different regions)
+============================================================================================
+region          arm          n                             GB/s values   median
+us-west         threads      6           3.78 5.14 5.30 5.48 5.49 5.60    5.389
+us-west         processes    8 2.02 5.23 5.64 5.75 5.94 6.02 6.09 6.18    5.847
+us-east         threads      1                                    5.19    5.189
+us-east         processes    3                          4.24 5.78 6.44    5.785
+eu-north        threads      1                                    6.34    6.339
+eu-north        processes    2                               2.84 7.07    4.955
+us-central      threads      2                               5.45 5.48    5.466
+us-chicago-1    threads      1                                    4.34    4.337
+us-chicago-1    processes    1                                    5.60    5.601
+denver          threads      1                                    3.76    3.763
+denver          processes    1                                    6.66    6.659
+us-ashburn-1    threads      2                               4.53 4.94    4.732
+europe-west9    threads      1                                    3.83    3.826
+
+
+============================================================================================
+MECHANISM CHECK
+============================================================================================
+metric                                   threads     processes       delta
+pooled preadv median ms                    44.80         41.76       -3.04
+pooled preadv mean ms                      50.15         48.79       -1.36
+pooled preadv p95 ms                       73.07         72.38       -0.70
+pooled preadv p99 ms                      122.40        132.31       +9.91
+pooled preadv worst ms                    636.34       2176.49    +1540.15
+effective concurrency                      3.630         3.694      +0.065
+mean overlap                              0.9800        0.9844     +0.0044
+min claim gap ms                          4.0062        4.0033     -0.0030
+median claim gap ms                        8.107         8.873      +0.766
+pacer lock hold median us                  8.437        10.105      +1.668
+completion spread median ms                128.4          76.9       -51.5
+wall p10 ms                                 1448          1225        -223
+wall median ms                              1550          1391        -160
+spawn->all ready median ms                  65.2         107.0       +41.8
+
+============================================================================================
+EXCLUDING THE TWO CATASTROPHIC THREADS RUNS (sensitivity)
+============================================================================================
+excluded threads rounds with any read >=500 ms: [1, 5]
+threads clean-only n=13 median GB/s=5.301 mean=5.156 median wall=1518 ms
+processes      n=15 median GB/s=5.785 mean=5.434
+
+============================================================================================
+OSCILLATION / TAIL SUMMARY
+============================================================================================
+threads    worst run: round=7 region=denver wall=2138 ms max preadv=143.8 ms reads>=500=0
+processes  worst run: round=14 region=us-west wall=3977 ms max preadv=2176.5 ms reads>=500=2
+

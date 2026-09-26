@@ -1995,6 +1995,137 @@ def _stage_diagnostics_enabled() -> bool:
     return stage_diagnostics_enabled()
 
 
+CLIP_SKELETON_OVERLAP_ENV = "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP"
+
+
+def clip_skeleton_overlap_enabled() -> bool:
+    return os.environ.get(CLIP_SKELETON_OVERLAP_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def _clip_te_normalize_sd_keys(sd: dict) -> str:
+    if "transformer.resblocks.0.ln_1.weight" in sd:
+        return "complex_transformers_convert"
+    if "text_projection" in sd:
+        sd["text_projection.weight"] = sd["text_projection"].transpose(0, 1)
+    if "lm_head.weight" in sd:
+        sd["model.lm_head.weight"] = sd.pop("lm_head.weight")
+    return "ok"
+
+
+def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str]:
+    try:
+        from comfymodal_runtime import clip_qd_reader
+        parsed = clip_qd_reader.parse_safetensors_header(str(path))
+        if parsed.get("status") != "ok":
+            return None, f"header:{parsed.get('reason')}"
+        state: dict[str, Any] = {}
+        for key, info in (parsed.get("header") or {}).items():
+            if key == "__metadata__" or not isinstance(info, dict):
+                continue
+            dtype = clip_qd_reader._TORCH_DTYPE.get(str(info.get("dtype") or ""))
+            if dtype is None:
+                return None, f"dtype:{key}"
+            shape = tuple(int(dim) for dim in (info.get("shape") or []))
+            state[str(key)] = torch.empty(shape, dtype=dtype, device="meta")
+        if not state:
+            return None, "empty_header"
+        reason = _clip_te_normalize_sd_keys(state)
+        return (state, "ok") if reason == "ok" else (None, reason)
+    except Exception as exc:
+        return None, f"meta_header:{type(exc).__name__}"
+
+
+class _ClipSkeletonOverlap:
+    def __init__(self, future: Any, executor: Any) -> None:
+        self.future = future
+        self.executor = executor
+
+    def join(self, *, rec: Any = None, source_start_ns: int | None = None,
+             source_end_ns: int | None = None) -> Any:
+        payload = self.future.result()
+        try:
+            self.executor.shutdown(wait=False)
+        except Exception:
+            pass
+        if payload.get("outcome") != "ok":
+            if rec is not None:
+                rec.event("clip_skeleton_overlap_refused", reason=payload.get("reason"))
+            return None
+        if rec is not None:
+            rec.event(
+                "clip_skeleton_overlap_join",
+                thread_construct_ms=round(
+                    (payload["construct_end_ns"] - payload["construct_start_ns"]) / 1e6, 3
+                ),
+                meta_sd_build_ms=round(float(payload["meta_sd_build_ms"]), 3),
+                join_wait_ms=round(float(payload.get("join_wait_ms", 0.0)), 3),
+                source_start_ns=source_start_ns,
+                source_end_ns=source_end_ns,
+                overlapped_with_source=bool(
+                    source_start_ns is not None and source_end_ns is not None
+                    and payload["construct_start_ns"] < source_end_ns
+                    and payload["construct_end_ns"] > source_start_ns
+                ),
+            )
+        return payload["clip"]
+
+
+def _start_clip_skeleton_overlap(session: Any, *, spec: Any, rec: Any) -> Optional[_ClipSkeletonOverlap]:
+    if not clip_skeleton_overlap_enabled() or not getattr(session, "clip_paths", None):
+        return None
+    paths = [str(path) for path in session.clip_paths]
+
+    def build() -> dict[str, Any]:
+        started = time.monotonic_ns()
+        meta = []
+        for path in paths:
+            state, reason = _clip_meta_state_dict_from_header(path)
+            if state is None:
+                return {"outcome": "refused", "reason": reason}
+            meta.append(state)
+        meta_ms = (time.monotonic_ns() - started) / 1e6
+        try:
+            import comfy.sd
+            import folder_paths
+            import comfy.model_management as model_management
+            if spec.require_dynamic_patcher:
+                require_dynamic_core_model_patcher(tag="clip")
+            embedding_directory = (
+                list(spec.embedding_directory)
+                if spec.embedding_directory is not None
+                else folder_paths.get_folder_paths("embeddings")
+            )
+            native_initial = model_management.text_encoder_initial_device
+            construct_start = time.monotonic_ns()
+            model_management.text_encoder_initial_device = (
+                lambda load_device, offload_device, model_size=0: torch.device("meta")
+            )
+            try:
+                clip = comfy.sd.load_text_encoder_state_dicts(
+                    [dict(state) for state in meta],
+                    embedding_directory=embedding_directory,
+                    clip_type=resolve_clip_type(spec.clip_type),
+                    model_options=dict(spec.model_options_overrides or {}),
+                )
+            finally:
+                model_management.text_encoder_initial_device = native_initial
+            return {
+                "outcome": "ok", "clip": clip, "meta_sd_build_ms": meta_ms,
+                "construct_start_ns": construct_start,
+                "construct_end_ns": time.monotonic_ns(),
+            }
+        except Exception as exc:
+            return {"outcome": "refused", "reason": f"construct:{type(exc).__name__}"}
+
+    from concurrent.futures import ThreadPoolExecutor
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-skeleton")
+    future = executor.submit(build)
+    rec.event("clip_skeleton_overlap_start", checkpoints=len(paths), clip_paths=paths)
+    return _ClipSkeletonOverlap(future, executor)
+
+
 def _allocator_state() -> dict[str, Any]:
     """Read cheap allocator counters without realizing any CUDA work."""
     state = {
@@ -8022,9 +8153,9 @@ class GoldenSession:
             )
         return self.transport_resources
 
-    def register_qd_owner(self, owner: GoldenQDOwner) -> None:
+    def register_qd_owner(self, owner: Any) -> None:
         """Make a successful transport owner cleanup-visible immediately."""
-        if not isinstance(owner, GoldenQDOwner):
+        if not callable(getattr(owner, "release_staging", None)):
             raise RuntimeError("qd_owner_invalid")
         owners = getattr(self, "qd_transaction_owners", None)
         if owners is None:
@@ -11008,6 +11139,42 @@ def _transport_read_options(session: GoldenSession, *, role: str) -> dict[str, A
     )
 
 
+def _golden_m2_clip_enabled() -> bool:
+    return os.environ.get("COMFYMODAL_GOLDEN_CLIP_LOADER", "").strip().lower() == "m2"
+
+
+def _read_golden_m2_clip(path: str) -> dict[str, Any]:
+    """Adapt the canonical M2 loader to Golden's transport contract."""
+    from .production_m2_loader import load_m2_safetensors
+
+    loaded = load_m2_safetensors(path)
+    source = loaded["source"]
+    timing = loaded["timing"]
+    stats = dict(loaded["stats"])
+    stats.update({
+        "file_bytes": int(loaded["data_bytes"]),
+        "source_first_submit_ns": source.get("source_first_enter_ns"),
+        "source_last_completion_ns": source.get("source_last_exit_ns"),
+        "source_open_header_layout": {
+            "data_start": int(loaded["data_start"]),
+            "data_bytes": int(loaded["data_bytes"]),
+        },
+        "staging": {
+            "allocation_ns": int(float(timing.get("staging_alloc_ms") or 0.0) * 1e6),
+            "allocated_bytes": 4 * 64 * 1024 * 1024,
+        },
+        "m2_timing": dict(timing),
+    })
+    return {
+        "status": "ok",
+        "sd": loaded["sd"],
+        "owner": loaded["owner"],
+        "stats": stats,
+        "tensor_map": loaded["tensor_map"],
+        "m2_timing": dict(timing),
+    }
+
+
 async def golden_clip_load(
     session: GoldenSession, *, preloaded_transports: Optional[list[dict]] = None
 ) -> Any:
@@ -11091,6 +11258,11 @@ async def golden_clip_load(
         # One QD physical transport PER checkpoint, in spec order; every
         # per-file owner is retained (no reread, no second H2D).
         state_dicts: list[dict] = []
+        overlap_construct = None
+        overlap_source_start_ns = None
+        overlap_source_end_ns = None
+        if _golden_m2_clip_enabled() and preloaded_transports is not None:
+            raise RuntimeError("golden_m2_preloaded_transport_unsupported")
         if preloaded_transports is not None:
             # Loader-process experiment: the worker performed the real QD
             # transport + H2D; the parent binds the CUDA-IPC-mapped views with
@@ -11115,24 +11287,40 @@ async def golden_clip_load(
             # before transport workers begin consuming ranges; their exposed
             # waits are reported separately in the ticket telemetry.
             prefetch.mark_clip_demand()
+        if preloaded_transports is None:
+            overlap_construct = _start_clip_skeleton_overlap(session, spec=spec, rec=rec)
+        overlap_source_start_ns = time.monotonic_ns() if overlap_construct is not None else None
         for index, path in enumerate(
             session.clip_paths if preloaded_transports is None else ()
         ):
             role = "clip" if len(session.clip_paths) == 1 else f"clip{index}"
             with clip_timing.span("source_open_read", boundary_kind="host_observed"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
-                    transport = read_file_qd_gpu(
-                        path,
-                        role=role,
-                        qd=contract.qd,
-                        block_bytes=_session_transport_block_bytes(session),
-                        cpu_prefetch_ticket=getattr(session, "cpu_prefetch_ticket", None),
-                        **_transport_read_options(session, role=role),
-                    )
+                    if _golden_m2_clip_enabled():
+                        transport = _read_golden_m2_clip(path)
+                    else:
+                        transport = read_file_qd_gpu(
+                            path,
+                            role=role,
+                            qd=contract.qd,
+                            block_bytes=_session_transport_block_bytes(session),
+                            cpu_prefetch_ticket=getattr(session, "cpu_prefetch_ticket", None),
+                            **_transport_read_options(session, role=role),
+                        )
             transports.append(transport)
             session.register_qd_owner(transport["owner"])
             state_dicts.append(transport["sd"])
             stats = transport.get("stats") or {}
+            if _golden_m2_clip_enabled():
+                rec.event(
+                    "golden_m2_transport",
+                    timing=dict(transport.get("m2_timing") or {}),
+                    reader_timing=list(stats.get("reader_timing") or []),
+                    staging_wait_ms=stats.get("staging_wait_ms"),
+                    staging_wait_events=stats.get("staging_wait_events"),
+                    source_wall_ms=stats.get("source_wall_ms"),
+                    h2d_completed_bytes=stats.get("h2d_completed_bytes"),
+                )
             source_layout = stats.get("source_open_header_layout") or {}
             staging = stats.get("staging") or {}
             if diagnostics_enabled:
@@ -11181,6 +11369,7 @@ async def golden_clip_load(
             }:
                 owner_fields["transport_timing"] = build_qd_transport_diagnostics(stats)
             rec.event("clip_qd_owner_created", **owner_fields)
+        overlap_source_end_ns = time.monotonic_ns() if overlap_construct is not None else None
         prefetch = getattr(session, "cpu_prefetch_ticket", None)
         if prefetch is not None:
             session.flush_cpu_prefetch_events()
@@ -11392,20 +11581,44 @@ async def golden_clip_load(
         # cannot be misclassified as safe BF16 fallback.
         if clip_transfer is not None:
             set_clip_lifecycle_phase("bind")
-        model_management.text_encoder_initial_device = golden_initial_device
-        try:
-            # Shallow dict copies retain the SAME tensor objects (zero-copy
-            # preserved) while shielding our retained view dicts from upstream
-            # key mutations inside load_text_encoder_state_dicts.
+        clip = None
+        if overlap_construct is not None:
             with clip_timing.span("skeleton_patcher_construction"):
-                clip = comfy.sd.load_text_encoder_state_dicts(
-                    [dict(sd) for sd in transformed_state_dicts],
-                    embedding_directory=embedding_directory,
-                    clip_type=clip_type_value,
-                    model_options=model_options,
+                clip = overlap_construct.join(
+                    rec=rec,
+                    source_start_ns=overlap_source_start_ns,
+                    source_end_ns=overlap_source_end_ns,
                 )
-        finally:
-            model_management.text_encoder_initial_device = native_initial_device
+            if clip is not None:
+                bind_started = time.monotonic_ns()
+                with clip_timing.span("skeleton_bind_assign", level="nested"):
+                    for views in transformed_state_dicts:
+                        bind_sd = dict(views)
+                        reason = _clip_te_normalize_sd_keys(bind_sd)
+                        if reason != "ok":
+                            raise RuntimeError(f"clip_skeleton_overlap_bind_normalize:{reason}")
+                        clip.load_sd(bind_sd)
+                rec.event(
+                    "clip_skeleton_bind",
+                    path="overlap",
+                    wall_ms=round((time.monotonic_ns() - bind_started) / 1e6, 3),
+                    views=len(transformed_state_dicts),
+                )
+        if clip is None:
+            model_management.text_encoder_initial_device = golden_initial_device
+            try:
+                # Shallow dict copies retain the SAME tensor objects (zero-copy
+                # preserved) while shielding our retained view dicts from upstream
+                # key mutations inside load_text_encoder_state_dicts.
+                with clip_timing.span("skeleton_patcher_construction"):
+                    clip = comfy.sd.load_text_encoder_state_dicts(
+                        [dict(sd) for sd in transformed_state_dicts],
+                        embedding_directory=embedding_directory,
+                        clip_type=clip_type_value,
+                        model_options=model_options,
+                    )
+            finally:
+                model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
         if clip_transfer is not None:
@@ -11843,6 +12056,22 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             "clip_first_use_cuda_library_initialization",
             detail="CUDA/library initialization is not separately observable without adding synchronization",
         )
+        # E31 bridge (flag-gated, default off): bracket the actual outer CLIP
+        # forward with the repo-owned ForwardTimer.  The timer owns the single
+        # synchronization inside ForwardTimer.end; no other sync is added here
+        # and flag-off behavior is unchanged.
+        e31_forward_timer = None
+        e31_forward_evidence: Optional[dict[str, Any]] = None
+        e31_failure_evidence: Optional[dict[str, Any]] = None
+        try:
+            _e31_forensics = importlib.import_module(
+                "comfymodal_runtime.clip_forward_forensics"
+            )
+            if _e31_forensics.e31_enabled():
+                e31_forward_timer = _e31_forensics.ForwardTimer()
+                e31_forward_timer.start()
+        except Exception:
+            e31_forward_timer = None
         runner.begin_scope({"clip_forward"})
         try:
             def observe_clip_forward(
@@ -11893,6 +12122,20 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                                 executed = await runner.run_closure(node_map.clip_encode_id, include_target=True)
         finally:
             runner.end_scope()
+        if e31_forward_timer is not None:
+            try:
+                if isinstance(executed, list) and "clip_forward" in [
+                    sc for _n, _c, sc in executed
+                ]:
+                    e31_forward_timer.mark_forward_observed()
+                e31_forward_evidence = dict(e31_forward_timer.end())
+                # Parity with model_preload._version_e31_forward_timing; kept
+                # local so Golden Serial does not import the preload stack.
+                e31_forward_evidence.setdefault("schema", "e31.clip_forward")
+                e31_forward_evidence.setdefault("schema_version", 1)
+                e31_forward_evidence.setdefault("evidence_version", 1)
+            except Exception:
+                e31_forward_evidence = None
         qwen_forwards = list(getattr(clip_timing, "qwen_forwards", []))
         if diagnostics_enabled:
             rec.event(
@@ -12040,6 +12283,11 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             "deferred_forward_materialization": materialization,
         }
         clip_timing_payload = clip_timing.finish() if clip_timing_enabled else {}
+        if e31_forward_evidence is not None:
+            clip_timing_payload = dict(clip_timing_payload)
+            clip_timing_payload["clip_forward_evidence"] = copy.deepcopy(
+                e31_forward_evidence
+            )
         if diagnostics_enabled:
             clip_timing_payload["deferred_forward_materialization"] = materialization
             clip_timing_payload["repeated_cast_work"] = repeated_cast_work
@@ -12061,6 +12309,14 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
         session.clip_forward_timing = clip_timing_payload
         if clip_timing_enabled:
             rec.event("clip_forward_timing", **session.clip_forward_timing)
+        if e31_forward_evidence is not None:
+            session.recorder.clip_forward_timing = copy.deepcopy(
+                session.clip_forward_timing
+            )
+            try:
+                rec.event("clip_forward_evidence", **e31_forward_evidence)
+            except Exception:
+                pass
         if diagnostics_enabled:
             rec.event("clip_page_faults", **clip_page_faults)
             rec.event(
@@ -12090,7 +12346,11 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
             conversion_instrumentation=(
                 dict(conversion_telemetry) if conversion_telemetry is not None else "NOT RUN"
             ),
-            **({"clip_forward_timing": session.clip_forward_timing} if clip_timing_enabled else {}),
+            **(
+                {"clip_forward_timing": session.clip_forward_timing}
+                if clip_timing_enabled or e31_forward_evidence is not None
+                else {}
+            ),
             **({"clip_page_faults": clip_page_faults} if diagnostics_enabled else {}),
         )
         if diagnostics_enabled:
@@ -12111,6 +12371,27 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                 rec.event("clip_forward_timing", **session.clip_forward_timing)
             except Exception:
                 pass
+        if e31_forward_timer is not None and e31_forward_evidence is None:
+            try:
+                e31_failure_evidence = dict(e31_forward_timer.end())
+                e31_failure_evidence.setdefault("schema", "e31.clip_forward")
+                e31_failure_evidence.setdefault("schema_version", 1)
+                e31_failure_evidence.setdefault("evidence_version", 1)
+            except Exception:
+                e31_failure_evidence = None
+            if e31_failure_evidence is not None:
+                try:
+                    _e31_existing = dict(
+                        getattr(session, "clip_forward_timing", {}) or {}
+                    )
+                    _e31_existing["clip_forward_evidence"] = copy.deepcopy(
+                        e31_failure_evidence
+                    )
+                    session.clip_forward_timing = _e31_existing
+                    session.recorder.clip_forward_timing = copy.deepcopy(_e31_existing)
+                    rec.event("clip_forward_evidence", **e31_failure_evidence)
+                except Exception:
+                    pass
         if diagnostics_enabled:
             try:
                 rec.event("clip_page_faults", **clip_page_faults)
@@ -12123,7 +12404,8 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
                     "clip_forward_timing": session.clip_forward_timing,
                     "clip_page_faults": clip_page_faults,
                 }
-                if clip_timing_enabled or diagnostics_enabled else {}
+                if clip_timing_enabled or diagnostics_enabled or e31_failure_evidence is not None
+                else {}
             ),
         )
         if diagnostics_enabled:

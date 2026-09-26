@@ -1,0 +1,9 @@
+[im] qd=4 model=processes read_mib=64 gap=4.0 slots=1..1 pinned=False
+[im] launching 1 slots with parallel=1
+[im] start im-01
+[im] done im-01 provider=gcp region=us-west wall=1211.147785 gbps=6.642444586562158 worst=0.0ms maxIF=4 flags=none
+
+[im] accepted 1 / 1
+  gbps med=6.642 mean=6.642 best=6.642 worst=6.642
+  wall med=1211 mean=1211
+  regions: {'gcp:us-west': 1}

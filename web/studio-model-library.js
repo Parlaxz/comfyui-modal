@@ -1198,6 +1198,167 @@ export async function performManagerInstall(plan) {
   }
 }
 
+// ── Remote Modal model-volume availability overlay ──────────────────────
+//
+// The remote model volume (GET /comfymodal/models -> list_models_cpu) is the
+// availability authority. Local zero-byte files are intentional placeholders:
+// a dependency row is "remote available" only when its remote entry's size is
+// greater than zero, regardless of the local placeholder's size. Availability
+// is derived only from basename + role/folder alias; wrong_version stays a
+// compatibility signal. Nothing here downloads or installs — the overlay is a
+// display projection of the report.
+
+// Mirror of the backend's WORKFLOW_ROLE_FOLDERS aliases (dependency_resolver).
+const _REMOTE_ROLE_FOLDER_ALIASES = {
+  checkpoint: ["checkpoints"],
+  unet: ["unet", "diffusion_models"],
+  clip: ["clip", "text_encoders"],
+  vae: ["vae"],
+  lora: ["loras"],
+  controlnet: ["controlnet"],
+};
+
+/** Lowercased basename of a path-like model reference. */
+function _remoteNameKey(name) {
+  const value = String(name || "").replace(/\\/g, "/");
+  const base = value.slice(value.lastIndexOf("/") + 1);
+  return base.toLowerCase();
+}
+
+/** Folders that satisfy a dependency role, aliases included. */
+function _remoteFolderAliases(role) {
+  return _REMOTE_ROLE_FOLDER_ALIASES[String(role || "").trim().toLowerCase()] || [];
+}
+
+/**
+ * Index a normalized /comfymodal/models inventory by lowercased basename.
+ * @param {Array} inventory - entries from listRemoteModels()
+ * @returns {Map<string, Array<object>>}
+ */
+export function buildRemoteModelIndex(inventory) {
+  const index = new Map();
+  (Array.isArray(inventory) ? inventory : []).forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const key = _remoteNameKey(entry.name);
+    if (!key) return;
+    const list = index.get(key);
+    if (list) list.push(entry);
+    else index.set(key, [entry]);
+  });
+  return index;
+}
+
+/**
+ * Resolve a dependency model row to its remote volume entry, or null.
+ * Exact folder wins, then the role's alias folders (unet/diffusion_models,
+ * clip/text_encoders), then the first basename match.
+ */
+export function matchRemoteModel(model, remoteIndex) {
+  if (!model || !remoteIndex || typeof remoteIndex.get !== "function") return null;
+  const entries = remoteIndex.get(_remoteNameKey(model.filename));
+  if (!entries || !entries.length) return null;
+  const byFolder = (target) => entries.find(
+    (e) => String(e.folder || "").trim().toLowerCase() === target
+  );
+  const folder = String(model.folder || "").trim().toLowerCase();
+  if (folder) {
+    const exact = byFolder(folder);
+    if (exact) return exact;
+  }
+  for (const alias of _remoteFolderAliases(model.role)) {
+    const hit = byFolder(alias);
+    if (hit) return hit;
+  }
+  return entries[0];
+}
+
+/**
+ * Copy a report model row with its remote availability projected on top.
+ * A remote size > 0 upgrades a missing/unknown row to Installed; a remote
+ * size of 0 stays missing. The local placeholder/path is preserved as
+ * secondary detail only. Returns the original row when no remote entry
+ * matches. Never mutates the input.
+ */
+export function overlayDependencyModel(model, remoteIndex) {
+  if (!model || typeof model !== "object") return model;
+  const remote = matchRemoteModel(model, remoteIndex);
+  if (!remote) return model;
+  const size = Number(remote.size);
+  const available = Number.isFinite(size) && size > 0;
+  const merged = Object.assign({}, model, {
+    remote_model: {
+      name: remote.name || model.filename || "",
+      folder: remote.folder || "",
+      size: Number.isFinite(size) ? size : 0,
+    },
+    remote_available: available,
+  });
+  // The report carries no local placement; the remote entry's annotation does.
+  if (model.local_placeholder && typeof model.local_placeholder === "object") {
+    merged.local_placeholder = model.local_placeholder;
+  } else if (remote.local_placeholder && typeof remote.local_placeholder === "object") {
+    merged.local_placeholder = remote.local_placeholder;
+  }
+  if (available && (merged.state === "missing" || merged.state === "unknown")) {
+    merged.state = "installed";
+    merged.installed = true;
+  }
+  return merged;
+}
+
+/**
+ * Project a full dependency report through to the remote overlay, recomputing
+ * the displayed summary (and therefore the "Download all" count) from the
+ * overlay state. Returns a shallow copy; the input report is never mutated.
+ * A null/absent index is a no-op so a failed remote read keeps local truth.
+ */
+export function overlayDependencyModels(deps, remoteIndex) {
+  if (!deps || typeof deps !== "object" || !remoteIndex) return deps;
+  const nodes = Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
+  const models = (Array.isArray(deps.models) ? deps.models : [])
+    .map((m) => overlayDependencyModel(m, remoteIndex));
+  const countModels = (state) => models.filter((m) => m && m.state === state).length;
+  const countNodes = (state) => nodes.filter((n) => n && n.state === state).length;
+  const installed = countModels("installed") + countNodes("installed");
+  const missing = countModels("missing") + countNodes("missing");
+  const wrong_version = countModels("wrong_version") + countNodes("wrong_revision");
+  const unknown = countModels("unknown");
+  const attention = missing + wrong_version + unknown;
+  return Object.assign({}, deps, {
+    models,
+    summary: {
+      installed,
+      missing,
+      wrong_version,
+      unknown,
+      attention,
+      ready: attention === 0,
+    },
+  });
+}
+
+/** Human-readable byte size for the remote-availability detail line. */
+function _formatRemoteSize(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let x = n;
+  while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+  return (i === 0 ? String(n) : x.toFixed(x >= 100 ? 0 : 1)) + " " + units[i];
+}
+
+/** Secondary detail for an installed row: remote size + local placeholder. */
+function _remoteDetailText(m) {
+  const parts = [];
+  const size = _formatRemoteSize(m.remote_model && m.remote_model.size);
+  if (size) parts.push("remote " + size);
+  const lp = m.local_placeholder;
+  if (lp && lp.is_placeholder) parts.push("local placeholder 0 B");
+  else if (lp && lp.exists === false) parts.push("no local copy");
+  return parts.join(" \u00b7 ");
+}
+
 /**
  * Render the version dependency section.
  * @param {object} version - selected workflow version (may carry
@@ -1347,6 +1508,18 @@ function renderDependencyModelRow(m, ctx) {
   row.appendChild(stateBadge);
   if (m.state === "installed") {
     row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: m.local_path || m.folder || "" }));
+    // Remote availability is secondary information: a nonempty remote volume
+    // file is why the row reads Installed, and any local placeholder/path is
+    // shown beside it rather than being mistaken for the model itself.
+    const remoteDetail = _remoteDetailText(m);
+    if (remoteDetail) {
+      row.appendChild(el("span", {
+        class: "comfymodal-studio-dependency-detail",
+        "data-testid": "dependency-model-remote",
+        title: (m.remote_model && m.remote_model.folder) ? ("remote volume folder: " + m.remote_model.folder) : "",
+        text: remoteDetail,
+      }));
+    }
   } else {
     const src = m.source_urls && m.source_urls[0];
     if (src) {

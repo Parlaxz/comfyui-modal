@@ -1,0 +1,39 @@
+{
+ "status": "ok",
+ "attempt_id": "fio-23-pvsync",
+ "ioengine": "pvsync",
+ "fio_version": "fio-3.33",
+ "jobfile": "[global]\nioengine=pvsync\nrw=read\nbs=64m\ndirect=0\ninvalidate=0\nnorandommap=1\ngroup_reporting=1\ntime_based=0\nrandrepeat=0\nthread=0\nfilename=/root/models/text_encoders/qwen_3_4b.safetensors\n\n[job0]\noffset=0\nsize=1946157056\n\n[job1]\noffset=2013265920\nsize=1946157056\n\n[job2]\noffset=4026531840\nsize=1946157056\n\n[job3]\noffset=6039797760\nsize=1946157056\n",
+ "command": "fio --output-format=json /tmp/fio_source.job",
+ "wall_ms": 4545.558144,
+ "returncode": 0,
+ "jobs": [
+  {
+   "jobname": "job0",
+   "bw_bytes_per_s": 1923555281,
+   "bw_mib_per_s": 1834.4452676773071,
+   "iops": 28.663207,
+   "io_bytes": 7784628224,
+   "runtime_ms": 4047,
+   "clat_ns_mean": 132988334.603448,
+   "lat_ns_percentile": {}
+  }
+ ],
+ "aggregate_bw_mib_per_s": 1834.4452676773071,
+ "aggregate_gbps": 1.7125791767234297,
+ "total_io_bytes": 7784628224,
+ "file_size": 8044982048,
+ "identity": {
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "ap-southeast",
+  "image_id": "im-sb7H6kpE40vEfuaOjvUZNd",
+  "container_session_id": "ta-01M37TK1A4ZRD8KJSBCB0BB72R",
+  "hostname": "modal",
+  "requested_gpu": "",
+  "observed_gpu": "",
+  "gpu": ""
+ },
+ "provider": "CLOUD_PROVIDER_GCP",
+ "region": "ap-southeast",
+ "container_session_id": "ta-01M37TK1A4ZRD8KJSBCB0BB72R"
+}

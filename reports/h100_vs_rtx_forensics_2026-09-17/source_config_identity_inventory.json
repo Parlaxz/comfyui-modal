@@ -1,0 +1,500 @@
+{
+  "h100": {
+    "rows": 11,
+    "distinct_deployment_identity": [
+      "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e"
+    ],
+    "distinct_deployment_combined_hash": [
+      "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e"
+    ],
+    "distinct_snapshot_identity": [
+      "38c8a05aaad56ff32f39f7d0920dc753ce7410862da1940907446bb99af56fac"
+    ],
+    "distinct_config_identity": [
+      "ad50bef88b7ff65f1c6e56f9d0eece3b567e37d4c2cef2822ed0bca74da32bac"
+    ],
+    "distinct_image_id": [
+      "im-ZWhbnmH2ESAt0RqaMnZg8Q"
+    ],
+    "distinct_workflow_sha256": [
+      "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab044704c0d3b5"
+    ],
+    "distinct_profile_config_fingerprint": [
+      "a0cdc90cedf0a0393cc7eb4958418c6854b2ee24697f3a5b730337744c504c61"
+    ],
+    "attempt_vs_manifest_deployment_identity": [
+      {
+        "cohort": "cohort_2026-09-17_17-22-42_f841d7",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-24-49_79e86b",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-25-28_068779",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-26-51_c00a60",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-27-27_4437e0",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-29-27_62f388",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-32-08_73af00",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-33-19_10d7a0",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-33-58_b08572",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-34-33_7a773e",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      },
+      {
+        "cohort": "cohort_2026-09-17_17-35-08_fe21e2",
+        "attempt_deployment_identity": "fd5d40120911ee0ceb6799137f318e72a0127e95734a6b91bc1ddd397ddf371e",
+        "manifest_deployment_combined_hash": "668b088e9a8c4d03b2f4c6eda50666e5e85306ac47d7824557e796230a09d1c0",
+        "equal": false
+      }
+    ],
+    "attempt_vs_manifest_note": "The attempt-level frozen deployment identity and the manifest deployment_combined_hash are reported verbatim; they are not assumed to share a hash domain. Disagreement here is recorded, not resolved.",
+    "runtime_shape_fingerprints": [
+      "e1135bf400e915a346e4d0d0"
+    ],
+    "dossier": {
+      "email_dossier_path": ".slim\\worktrees\\authoritative-golden-core-sep14\\H100_GOLDEN_RUNS_EMAIL_2026-09-17.md",
+      "full_dossier_path": ".slim\\worktrees\\authoritative-golden-core-sep14\\H100_GOLDEN_RUNS_FULL_2026-09-17.md",
+      "email_dossier_available": true,
+      "email_dossier_error": null,
+      "summary": {
+        "title": "H100 Golden runs - email dossier",
+        "generated": "2026-09-17",
+        "app": "batch-tripwire-v2-p2hb2",
+        "profile": "golden_p1_parallel",
+        "worktree": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\.slim\\worktrees\\authoritative-golden-core-sep14",
+        "run_count": 11,
+        "hardware": {
+          "gpu": "H100",
+          "memory_mb": 16384
+        },
+        "operator_observation": "CLIP and UNET loading were noticeably slower on H100 than on RTX 6000 Pro runs.",
+        "interpretation": "All populated H100 cohorts were exact-output-invalid because observed H100 SHA differed from the RTX 6000 Pro expected SHA. This is not a valid Golden exactness cohort.",
+        "omissions": "Base64 image bytes, repeated workflow payloads, and duplicated full telemetry arrays are omitted because they are repetitive and not useful in email. All scalar identity, validation, output, restore, CLIP/UNET timing projections, terminal/waterfall fields, event boundary content, and artifact checksums are included."
+      }
+    }
+  },
+  "rtx": {
+    "rows": 84,
+    "distinct_snapshot_identity": [
+      "244af150e38983a7a81db875ac6d2a1b7bc2b50cffdff030e8db236e77df3302",
+      "4ad4ed1cfe7669394193b1cc0fd8b9b2b47f5f7da8722f349fdea9716dd885bb",
+      "b2be422d81cae33f1036bf13de45fabe6639c9a6a91ef5e7a85f187a21b69c50",
+      "c97f34dbe0d7f50b751d3bab98ca669d32a166a989146caa872f6f208ab2b248",
+      "d52f5af2d86e7472acd9dcb61983b7844f54f9b76c0beb57c9630a583434af94"
+    ],
+    "distinct_config_identity": [
+      "05ad04b49f8646d2b684f1d8b4832278491f9b2582940f8bd6d9b99ad10f5c2f",
+      "6393c29c99950a475ff09796321b158aa279b58ea60ae7d4ccf4a622a97e88df",
+      "681cd3bf4e78a85628e06e8779cc1065b21215d63c9058ce570a2ba6332a173f",
+      "8216386389a59f95083ca88794a83a747d851851b04b962b66669fdc2a036955",
+      "d0fb3ec2fc4bc3a2e2fcd64759ed5b3b4bb9a04eda6a51dd243f8359e508bc60"
+    ],
+    "distinct_deployment_fingerprint": [
+      "7d8f0c09631f233fbc4b1df84ee59936afb2757eb5153b246216fa33306af24a",
+      "848c88307569bf50e9e08ad9bca8127ef5ac69a2773ff2c40d83c099270620b8",
+      "a57ed51ed92eb511d5d9d8c0f2d7cd09fe7973094d0e2900cba6b1e273066b07",
+      "b5832bea9e9be0e1ffbf1689d5f66aad4b83dd8b000e4fe34ebd5371e85727e3",
+      "d0413040a1584f873feecf19b5540f72166cf6adc2e6d647ff568c1214928cd6",
+      "f13b06436f3b0bce71c8615deb96493b6204e4f72c2cd49990454b64d06df0e8"
+    ],
+    "distinct_run_fingerprint": [
+      "0535571270ec36d5e7ffad716b3ae77f6b6f1be8a7c9f63f06556e45567cebfb",
+      "1006a35363f2eefabb02dc4351d1e4cc1990f98ed872729bdbde34b35f30076a",
+      "2550fe41f6da27aa55a06148a79aa7b2a34573d191bd0c01786413b35083ef27",
+      "2a966555506dc719446ed1e061cadb6499a2223375488ac98afb7a078f7b2b07",
+      "8724fd132728a6c30413afa697a3ec6e160fc5064719b230a8310ef7639c246f",
+      "e93e80bb71143223397eba15714060e9fdf828248bba0b51e73e07bb832c32bd"
+    ],
+    "distinct_profile_config_fingerprint": [
+      "1591c9c42e3c5f19e92dde20205f6ceedb99a03c5f75d3886dae4d19fbe3295c",
+      "21a46964a580b67c5f9953433945051d06d1aaa7808098736613d4f85b20b7a9",
+      "66786d29ca36d1e619fd7343308b99ec27bcd84e6d87f3ff7cb3610335678032",
+      "8a7bd7aea07e0e611915493b25e7b57176a2b329debef6d19c95dbfbc0a9e805",
+      "b2298ed1393b84cadc3cd9ce7287e84380c28f6f0f9f64612a55e333d9b9e271",
+      "cf24ecde352d7df7b1f9c5098cbf9e326f12ba8e8a6d40a8a6a66001f6ca3b56"
+    ],
+    "distinct_image_id": [
+      "im-PdoEbIwMse9wqNTHloOEhQ",
+      "im-Rk3QrdAM6UzGQAvRPWnZop",
+      "im-Zz5IcyWpzZGYVPGlOF6jbL",
+      "im-iQp2pNumkw79NmaY46mAAP"
+    ],
+    "distinct_commit": [
+      "03ce24916958596717220167db496b1215544d09"
+    ],
+    "distinct_worktree": [
+      "golden-io-v2",
+      "golden-sep14-repro"
+    ],
+    "distinct_profile": [
+      "golden_p1_parallel_io_v2_c0_persistent_fds_preadv_sickness_diag",
+      "golden_p1_parallel_io_v2_c0_persistent_fds_preadv_sickness_v2",
+      "golden_p1_parallel_sep14_v1_preadv_control",
+      "golden_p1_parallel_sep14_v2_preadv"
+    ]
+  },
+  "rtx_preferred_commit": "03ce24916958596717220167db496b1215544d09",
+  "source_context_manifest": {
+    "path": ".slim\\worktrees\\authoritative-golden-core-sep14\\.last_custom_node_context_manifest.json",
+    "available": true,
+    "context_hash": "b604c14479dc289b3ef39fdf8059f3043d02f04cfb3fca51035e77914a6b85ec",
+    "file_count": 228,
+    "total_bytes": 6217574,
+    "node_dirs": 22,
+    "top_20_largest": [
+      {
+        "bytes": 3398949,
+        "path": "comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_gt.json"
+      },
+      {
+        "bytes": 542939,
+        "path": "comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_pred.json"
+      },
+      {
+        "bytes": 84091,
+        "path": "comfyui_sam3/src/sam3/sam3/model/sam3_video_base.py"
+      },
+      {
+        "bytes": 79107,
+        "path": "comfyui_sam3/src/sam3/sam3/model/sam3_video_inference.py"
+      },
+      {
+        "bytes": 68888,
+        "path": "comfyui_sam3/src/sam3/sam3/model/sam3_tracking_predictor.py"
+      },
+      {
+        "bytes": 66050,
+        "path": "comfyui_sam3/src/sam3/sam3/agent/system_prompts/system_prompt.txt"
+      },
+      {
+        "bytes": 63244,
+        "path": "comfyui_sam3/src/sam3/sam3/agent/helpers/visualizer.py"
+      },
+      {
+        "bytes": 59431,
+        "path": "comfyui_sam3/src/sam3/sam3/model/sam3_tracker_base.py"
+      },
+      {
+        "bytes": 54478,
+        "path": "comfyui_sam3/src/sam3/sam3/train/loss/loss_fns.py"
+      },
+      {
+        "bytes": 53796,
+        "path": "comfyui_sam3/src/sam3/sam3/train/transforms/basic_for_api.py"
+      },
+      {
+        "bytes": 44855,
+        "path": "comfyui_sam3/src/sam3/sam3/train/trainer.py"
+      },
+      {
+        "bytes": 43457,
+        "path": "comfyui_sam3/src/sam3/sam3/model/io_utils.py"
+      },
+      {
+        "bytes": 37532,
+        "path": "comfyui_sam3/src/sam3/sam3/model/sam3_image.py"
+      },
+      {
+        "bytes": 37137,
+        "path": "comfyui_sam3/src/sam3/sam3/eval/saco_veval_evaluators.py"
+      },
+      {
+        "bytes": 36674,
+        "path": "comfyui_sam3/src/sam3/sam3/model/decoder.py"
+      },
+      {
+        "bytes": 36475,
+        "path": "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/tao_ow.py"
+      },
+      {
+        "bytes": 36243,
+        "path": "comfyui_sam3/src/sam3/sam3/eval/coco_eval.py"
+      },
+      {
+        "bytes": 34370,
+        "path": "comfyui_sam3/src/sam3/sam3/train/matcher.py"
+      },
+      {
+        "bytes": 33585,
+        "path": "comfyui_sam3/src/sam3/sam3/model/geometry_encoders.py"
+      },
+      {
+        "bytes": 32444,
+        "path": "comfyui_sam3/src/sam3/sam3/model/vitdet.py"
+      }
+    ],
+    "file_hashes": {
+      "ComfyUI-CacheDiT/requirements.txt": "073ca21ec0d5a46a685bd8d6457fa0524b5d00174c278fd25226f175e8b8409e",
+      "ComfyUI-Flux2Klein-Enhancer/pyproject.toml": "796165371a929cc80ecd45ebab4fb1aada8320965ac4c3bd28af4e67559d74bc",
+      "ComfyUI-KJNodes/pyproject.toml": "fda985d2d0a5f7e93f73231d51d50121e09ff4237c51a22722a36768e1d4c620",
+      "ComfyUI-KJNodes/requirements.txt": "e8cc1fb089c6e74bb5f326e949fd89ea7653de0d193d7a385c38af44e66656bd",
+      "ComfyUI-SeedVR2_VideoUpscaler/pyproject.toml": "e3a4a38dbcbc5a228e5c7cefbaa19fbe78fe18c630792e2baf373f638607d5ca",
+      "ComfyUI-SeedVR2_VideoUpscaler/requirements.txt": "2b6052b60344da0b539247ec54609285813a9f4eadd80e5afd1381943685af0e",
+      "ComfyUI_LayerStyle/pyproject.toml": "ee9af09e270a92c96cd11bc3f7bf5d0ac1699d1af5fb5c945605b080186ec1d6",
+      "ComfyUI_LayerStyle/requirements.txt": "0f35512e666f3c5912927cc76e9076b2a77e11e5c614cbd3f1d7cace07f23e69",
+      "RES4LYF/requirements.txt": "7dc40291a9ab8dc0365bc86ea27294a1e1da4f95c6860b5b8e4e7ec1729d963b",
+      "cg-use-everywhere/pyproject.toml": "150c6f4dfc6fbc259bc72b02b963fff3fdea7134f0e076a970976dab744236b7",
+      "comfyui-custom-scripts/pyproject.toml": "4f22f2c2075881cfd27fda80678a70bbb86e4b2445b8bb005f5b768786e1e140",
+      "comfyui-detail-daemon/pyproject.toml": "c84708cca7935c46f85604ccbf3bfe3d375aa51c527ada0a4972026ee8dbaacc",
+      "comfyui-detail-daemon/requirements.txt": "2b15fcd19d49b750303f64b9b70540582f3a8c234f5db2be6e932c350fb4d8be",
+      "comfyui-easy-use/pyproject.toml": "0bc2411cc2531237354fa36a68dd1b8279b0e731d81a31e525caa872ed1538d1",
+      "comfyui-easy-use/requirements.txt": "292b3d278ba23f289f7a68fc1b36499ac5caf3b50a687d88bacd19f6b3105592",
+      "comfyui-impact-pack/install.py": "9520f8f0c099b78d78e47316323e47b31597cb10de3f4017565fc986eabd1e8e",
+      "comfyui-impact-pack/pyproject.toml": "e7ab9656db8ecde6cb5041c35fb211c52b083996221aa45c3c63d31e816d24be",
+      "comfyui-impact-pack/requirements.txt": "a8220b5c17eabc1edb99739679b65907cc17d8d4dd0980f73fe638989b4365a8",
+      "comfyui-levelpixel/pyproject.toml": "38252cf5eebe50b852978e9661e4b59173dd27cc4fa9c528d927963a68874db1",
+      "comfyui-levelpixel/requirements.txt": "89669363f4e419b96cd2658ca59af676252701974e8acab621464eca3756e0fa",
+      "comfyui-lora-manager/pyproject.toml": "fed8b88aa3690930e27fb7bb79b53b08b6bda0d4d6951be264c5734312c6929b",
+      "comfyui-lora-manager/requirements.txt": "a18e66a799423e78073b024c904c9c750a8d2dec7ffabdcb9f3a94cd69b6053f",
+      "comfyui-manager/pyproject.toml": "096b8f539807132e9801dc319aeccc926ab0634e8319d4775a5d5889e82c11b8",
+      "comfyui-manager/requirements.txt": "79e080784300a01c9057d0a1ad55a88d2df56d516fe7b1050663811b818da3d1",
+      "comfyui-workflow-encrypt/pyproject.toml": "13df911702b2e54d757b591679175188792f1373ae1024ed07cdf0a2b8dc50a5",
+      "comfyui-workflow-encrypt/requirements.txt": "e06554818e902b4ba339f066967c0000da3fcda4fd7eb4ef89c124fa78bda419",
+      "comfyui_controlnet_aux/pyproject.toml": "e8ec5486ae4d2fd82192e56efbbcecaa80e27f217ba06c216b10fac6ef147894",
+      "comfyui_controlnet_aux/requirements.txt": "3ed811fd0028017752d455366feee1a22f055885a1cac5ffce837d6dea2a26a3",
+      "comfyui_essentials/pyproject.toml": "1214c1dfc74e36facd99ba1d3aae55581780be06075d52ffd3cc0f9e5a9cb82d",
+      "comfyui_essentials/requirements.txt": "075836eae22a6c13bf4be71e92397096994f3cf8d748038773c681319795bdc3",
+      "comfyui_fill-nodes/pyproject.toml": "367b7cfe742018313ce8f7b73054dd1aa3efda4b390fca3b2d5bb9576e94aa48",
+      "comfyui_fill-nodes/requirements.txt": "19e31fb5d6a80b77819536f9e11bb7ff62e233f82e6ddea81b3ca075ec5d93ca",
+      "comfyui_image_metadata_extension/pyproject.toml": "a7a8b53e7af24f3ecb025ddd15e2acc1b8ba2f503b15c52c7043b0cfa25e2f22",
+      "comfyui_lg_samplingutils/pyproject.toml": "c06ffd2e0020ef5a3f304fb7bb89df12f0e05700c4b96cbc09c76176590f099a",
+      "comfyui_sam3/pyproject.toml": "1c018a8302346bcd56677b6f7908bb2fa1572c53b99db3353175167c8af3cd62",
+      "comfyui_sam3/requirements.txt": "a2a1befb97abf0328e78aaa484a2d497cf96176eeefacf754fdc9fad5127e607",
+      "comfyui_sam3/src/sam3/.gitignore": "df8ee935e4dbf163cd6105a87e8d08b0c0dc7910968dc72ef50459661cfcf4d8",
+      "comfyui_sam3/src/sam3/LICENSE": "4dea99bfaa016e21bc860d73f344236bd1e5c4977d1a9a8fd32f822b500ae1be",
+      "comfyui_sam3/src/sam3/MANIFEST.in": "927a736040f8c4dfdf444530d5a2073af061984c3472395a214a158e72a6a01a",
+      "comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_eval_res.json": "d491596003e0dd7742705ea17ab84375e468d3bca3464b831d9d504e550ff8e8",
+      "comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_gt.json": "4a1a964427d4e4225f883ed3d08ffa1d3613c45ac35dcc9426f2a25031c92a31",
+      "comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_pred.json": "c593f97bb4701a8c34df38bfebaf9091c6ba4f056860a789c38877be6403652e",
+      "comfyui_sam3/src/sam3/pyproject.toml": "2abe503bafac2fc2225b9dfa16e4ec8903cd61d48495633586a06135e35f3fd6",
+      "comfyui_sam3/src/sam3/sam3.egg-info/PKG-INFO": "c59aba3ed71e359f5aaba605d18820ef596f44d2759b78f1e624ea97445e204a",
+      "comfyui_sam3/src/sam3/sam3.egg-info/SOURCES.txt": "2d2765f92616d79cf803144307646a9d40cefa8cd7f6a50e4eea58059c64c0cd",
+      "comfyui_sam3/src/sam3/sam3.egg-info/dependency_links.txt": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "comfyui_sam3/src/sam3/sam3.egg-info/requires.txt": "3fe044745a6bae47bf0b245084a35bafeb354c3e208c1f6207a32c3c9441c1c7",
+      "comfyui_sam3/src/sam3/sam3.egg-info/top_level.txt": "8d91ad180731ebabe4be60a98d0a50e155677c4f296844f06c3e6b1ae3a93c4d",
+      "comfyui_sam3/src/sam3/sam3/__init__.py": "7e0230eec57e2f971e43b01f97d73ce41ad6b7f5ec5e84789c5f1084b18abf57",
+      "comfyui_sam3/src/sam3/sam3/agent/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/agent/agent_core.py": "95c2a2fb9b6d9afc1eb5abe1dc42b3a49b4d9e68f3e60f47d02eccb22a78f46b",
+      "comfyui_sam3/src/sam3/sam3/agent/client_llm.py": "92f0acc229c058799bb27003a2a7c4dc41403cbc1ac52fb36d5c563aca44ca8c",
+      "comfyui_sam3/src/sam3/sam3/agent/client_sam3.py": "99f6a78c11fcba04ef284c0878f042231c75dcf8e47e678517b9930ec828d55d",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/boxes.py": "14cd16491396e2e1b991b57b5fea4055ac5cf7a45e6625d0a79489f7963d7a39",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/color_map.py": "71a5a89d36322305b3283e0108b79086e8a0a3c0fd547dde4385bb2d9d60b955",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/keypoints.py": "ed90285d873b129d4d229aaae0274f453341af3240bfa8d9245a395fe74edaf4",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/mask_overlap_removal.py": "b56ee1c28bda84f0179ff95a43ee505ab6d040ba98901f7799e3ec8cce81eb0d",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/masks.py": "1db297ba220d3cc78c99b9b2935c5af011505a08ef283bc3edad8ca8112ee115",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/memory.py": "0571bec9c72b0b6f7405a5683c9ef013990be4134f11d02bd2080c35224081a9",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/rle.py": "169d1898896c24ffdbb4ddf8424ee456826e430f6e163a3f708f6caa7fd2e262",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/roi_align.py": "e386ce522b277938f064f87294a9fdfcdee5d063acd790d465943cd25c0c0845",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/rotated_boxes.py": "0be2ad99a365beff57e4a4b28d0a273e237bd72491b19dadbca2eeea6490260a",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/som_utils.py": "ac23849884bad12053815e826043f083c06f1807bc183c4eaaad2c02ed726e6a",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/visualizer.py": "c706c0f359ea6de1b3152a3f26b7f18abf8a6053a5b0780cf5e90dbd2f08dac4",
+      "comfyui_sam3/src/sam3/sam3/agent/helpers/zoom_in.py": "1451978dacc0f74db1119ad967d7882f4817c65f50357bc4f29be144a93ea3bc",
+      "comfyui_sam3/src/sam3/sam3/agent/inference.py": "ec79f44298fde6607b1cbf9c38293ced4d5bd3844471c7c337bf013e9deb216a",
+      "comfyui_sam3/src/sam3/sam3/agent/system_prompts/system_prompt.txt": "37009389e2b211d62968a0fd8898e24008830bdbce905e901f764910e9079dec",
+      "comfyui_sam3/src/sam3/sam3/agent/system_prompts/system_prompt_iterative_checking.txt": "6b2e85ec91017d4aafa2787cd769b8d98c1adec99f55f1fba1307354f3d60c05",
+      "comfyui_sam3/src/sam3/sam3/agent/viz.py": "61608cdd9fa91641f40635a338f83cd54ab2658ce4ae9b317544f6738420b35b",
+      "comfyui_sam3/src/sam3/sam3/eval/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/eval/cgf1_eval.py": "a35d79e314bbcbb756102593e8cfc2a2cdec80dd4084c2b3bf6ccca97e9e353c",
+      "comfyui_sam3/src/sam3/sam3/eval/coco_eval.py": "8e3a6371a5e898a35a7b3fba7bfe54892680f9ba78b015672baf5a316189a449",
+      "comfyui_sam3/src/sam3/sam3/eval/coco_eval_offline.py": "b14b16582d690fc73f7b38a0c17811ea305d93d93e231633eb0bc56c07e051c6",
+      "comfyui_sam3/src/sam3/sam3/eval/coco_reindex.py": "8735a90d60d19eb12d22c666fd144d9cd8168c0c705ad32e479b4cfb59c52e2e",
+      "comfyui_sam3/src/sam3/sam3/eval/coco_writer.py": "e5c430db7af53255cdf8e9cc2ce3e045d808aa92152413b46dbb7d051f2b88f1",
+      "comfyui_sam3/src/sam3/sam3/eval/conversion_util.py": "b08e3b293043d96d0bb6052e791860e33dbe4c764b2238c9763ac4862702e58b",
+      "comfyui_sam3/src/sam3/sam3/eval/demo_eval.py": "d7f9eb0e1f2c7283db593a3e7bba373a2ba77e8cf39fb3a2919ea3fd21b14530",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/__init__.py": "ab3f3cdd96b0de714abf67c354c9e0d93b18f45c58eee8ef918c37fd10d3b143",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/run_ytvis_eval.py": "f00044ee2ffcea9ba29f9f723c3bb5a43bc00bef100934703044b2db7a442433",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/__init__.py": "3b2ae56a06e232e2425f6279642376bcb3cd1b774b164c04a553d172b34350f2",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/_timing.py": "454f8714cfe30b971a4918b27b3b9f2e8efde8ce4fbc8de0970b5fea4bdc3857",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/__init__.py": "551a256f6be1c49c965fa09ad8f96edbe7f1743da2d751520306ead848c982b7",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/_base_dataset.py": "367fd0d7eb9310ebffa007a4913e2fe0a2d6be498c452f9c8fbbad27b5d3558b",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/tao_ow.py": "2c39a5b95d2743f652d4c0d1ebb3a3ec23ee650ad5c7c90df9477e4107748477",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/youtube_vis.py": "71367e883b40b5d2f88c30e8ce37880b3f6b1938866330fc28c0664ea59b530d",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/eval.py": "f36d954daa5407e483c16e8e75f85d9990218a12ba5c5d22037e3888f04ad013",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/metrics/__init__.py": "fc96fda4502163ed5718f22a344222f5271cd0cb4afe971137f00c28ead81f43",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/metrics/_base_metric.py": "c9358eae0f1e4d2d98aa19f928b3ca586cb1408d2d9b721b6b78ff8d188df5d9",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/metrics/count.py": "861b5bd039dc0f14f22bdb5af96c8a9f5a0b0fa16ec67dba07f1e61daf1a6380",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/metrics/hota.py": "11e52cddf32be47cdf1d148934de083c248b1c5b9e4cc9b068df53ba00e4d4ad",
+      "comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/utils.py": "1aad242ac06c41e642e81b69021e8fbddb79fc9742604265347ea347bacfa101",
+      "comfyui_sam3/src/sam3/sam3/eval/postprocessors.py": "e3b7033d49832a640a61c1db8dfcedd38d80183623ceaf63c8f9e2838189b3fa",
+      "comfyui_sam3/src/sam3/sam3/eval/saco_veval_eval.py": "4fbbf2fd466fdf9e7a8143a9ec91c46261d96e4f764445f90fd84e1e8b5f361c",
+      "comfyui_sam3/src/sam3/sam3/eval/saco_veval_evaluators.py": "5c0257e3823aeb4538e4067c6fc622987bdc81470f7c1a4a59a5c8dc399a5bda",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/__init__.py": "7e8678ba4a76d5237b2a2299dabaa698a8f807ef7a37e4fefeebb1ca9f6d6688",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/_timing.py": "007e669a566dfc4ee75242e3abed51b0d2dd03e5f0a1fbc7f56053fdfa0df904",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/config.py": "b7aff4d83a4eeb40a0fba83ceb03feb1a92fb7f9643c523f1ddebe8cd1aac2c9",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/datasets/__init__.py": "a52f9e7263ad2c037b565fce40d411701e47c3f50066584903430c4649690716",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/datasets/_base_dataset.py": "420bc51d4dd3d15332fc66bb52a5e1426b87161b30b741713cdbe10439530def",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/datasets/coco.py": "36de1e34f0c4e7c4b021e5db572fb1faa815b14326d593cc29e06c8076ba06b9",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/datasets/tao.py": "55d500b58e1ba43abc1a58e21e9ca19d62e902f7a0f8d0965a5c0a0d34aaf6a8",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/eval.py": "29560bfce95c972258e3ea4e00651f00a18bf84121e2b5be049890290d9ad9ab",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/metrics/__init__.py": "7214ffd9cd6a78e3ba3177403f6fdcee466a449937cf6726512c9f7cbfdb3dc4",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/metrics/_base_metric.py": "7c1bd1f4c33966a31344a0d3d9274b237da802d2c6e7daee1526979e7de3b332",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/metrics/teta.py": "268a7030bc086c5388331ed40b1d14f0b2121062dd24054c3debf9ac3e112cf3",
+      "comfyui_sam3/src/sam3/sam3/eval/teta_eval_toolkit/utils.py": "0d6e3378c7936c75693ca0f32014e35b3e8666414075c4f9e03bd5cdebe7bc4d",
+      "comfyui_sam3/src/sam3/sam3/eval/ytvis_coco_wrapper.py": "724c7e2f97f93ea1b988717f185cc9f221e6eded2df2336bb2e99b04c2420f40",
+      "comfyui_sam3/src/sam3/sam3/eval/ytvis_eval.py": "a5107f58adce8a56f7d6c6d74cae295030754730beda244d9f99b168310b35ec",
+      "comfyui_sam3/src/sam3/sam3/logger.py": "04bb9eb7eeb5079d55a685984a062f0715d76a3d8948f9f1c05a8230b704ded2",
+      "comfyui_sam3/src/sam3/sam3/model/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/model/act_ckpt_utils.py": "3ea2eef843dd933560475d6caadb6b658297e17aee1e846294646b250d552b70",
+      "comfyui_sam3/src/sam3/sam3/model/box_ops.py": "b8eeb15be8835d1caf6bf97cb7b86c78a1678237741f00f72c54caaf6937ce9e",
+      "comfyui_sam3/src/sam3/sam3/model/data_misc.py": "b245774977bbb1ad408023892e235c2130dd1d61806437874aeadf4701ce6670",
+      "comfyui_sam3/src/sam3/sam3/model/decoder.py": "c1a98f1d84c95e1935745c2584e034c5a7ab576e907fc596b79f84d1bb84b458",
+      "comfyui_sam3/src/sam3/sam3/model/edt.py": "e59289d361ee9ade6f9bcbd42dfd834a939b86ee25ee150a799e2857e4bcb986",
+      "comfyui_sam3/src/sam3/sam3/model/encoder.py": "9f8f413c470dcd6c8d5f8e79987e8146c40b169464a07648289794968c109ff1",
+      "comfyui_sam3/src/sam3/sam3/model/geometry_encoders.py": "a1f52402c4f20fcd833b5b9ba375f266354c71cd4dcdeb92ff18b68737272bfc",
+      "comfyui_sam3/src/sam3/sam3/model/io_utils.py": "c77f549b51a4ca85fbe4335f0830f3492ac5ffcb620c3da606d37d9d567523e3",
+      "comfyui_sam3/src/sam3/sam3/model/maskformer_segmentation.py": "bf19bc5a6ffbc9a706a2c7c0eeafafcdd170aa6b44869f3f1326641e25cd10c0",
+      "comfyui_sam3/src/sam3/sam3/model/memory.py": "613864e7e917536e39e7a36ea6439139ad71c9fde8476dd27854ed5e722df02c",
+      "comfyui_sam3/src/sam3/sam3/model/model_misc.py": "2823cbb2448fc450e7b8c11c121343d106edceff2dec9945c6ed39b2ed7f54ae",
+      "comfyui_sam3/src/sam3/sam3/model/necks.py": "d3a96752fbca76588550c3a7b858e1d8b05184c4033e353d97988098e1dbf5b1",
+      "comfyui_sam3/src/sam3/sam3/model/position_encoding.py": "3523232c59e970f8f8b75b226038ff58a8be8454f2eb66f70789ea4361d5c975",
+      "comfyui_sam3/src/sam3/sam3/model/sam1_task_predictor.py": "e62aa62ea32cbe07ea9c1914dd6fe920f8c8ab3de7b4f91207c96760f8a12f1d",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_image.py": "f6a2f74d935d49dedb405611a2848c0d9640a12f5c25a16f9ebd9017212d9daf",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_image_processor.py": "271f25b2d72d4b37579e354a75a52ec96393bb87fe32e1272db3cc2f1e5cee03",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_tracker_base.py": "aa474bdabb431b469976c990082b2d3e06ce912aaf9c285a360b9b9f95e3db2c",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_tracker_utils.py": "b5d15f44eb945d5c130fcde5fac634cc26e2bfa0ca28bcfcf8dc9a8312fed57d",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_tracking_predictor.py": "667c7fa187a0be220771bc687cb6a5bb8ca9fc351d6c1f2532462f16262dc060",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_video_base.py": "c69f00eaa09cb3c5c69893cc0277d68ebaa23fba7cd29c228a27456f1a422db9",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_video_inference.py": "62ad88fc54b8c4d6a60919169d9199e79288e7e5e8bd30ae64b31587a24fd2a2",
+      "comfyui_sam3/src/sam3/sam3/model/sam3_video_predictor.py": "a229bb66a1b3ee4a8db9b51b5a2b9b998cb7b87546cd3cf7612f31e42ce578db",
+      "comfyui_sam3/src/sam3/sam3/model/text_encoder_ve.py": "8b72a73ca67e877fe7cd870c608f7863c51f2015b28c98518cc502233e05966a",
+      "comfyui_sam3/src/sam3/sam3/model/tokenizer_ve.py": "ca5aa97c29b4d12baf0f57533b1afd65315301b107a3deb13af122d2a4ef4cf7",
+      "comfyui_sam3/src/sam3/sam3/model/utils/__init__.py": "2f8defde9c530d8eb9f99cd91b7739a16033148e48f225a8bb7b5a9a059e27ce",
+      "comfyui_sam3/src/sam3/sam3/model/utils/misc.py": "5ce90b3757c048434a3f97b5911a589f9b270d33a4bbaf543cf29cc84727d10d",
+      "comfyui_sam3/src/sam3/sam3/model/utils/sam1_utils.py": "32901c4186c308dab778d621125631acd524ce56f09cfbc15d6894260b7fc40d",
+      "comfyui_sam3/src/sam3/sam3/model/utils/sam2_utils.py": "1ac885372bc4f2ed74de2c53db0d5fcbc050796869ff2e7e3341320b1d960d11",
+      "comfyui_sam3/src/sam3/sam3/model/vitdet.py": "3acb47c3b2bccc03a1227189a40e8ee289f563899ea457ab2f3cd5c78beb684c",
+      "comfyui_sam3/src/sam3/sam3/model/vl_combiner.py": "fa2e91e3438679e16bdbc9b075814a7e671069b332bd7261554278bc312b10a6",
+      "comfyui_sam3/src/sam3/sam3/model_builder.py": "5d27de0645831ffc6c61c1e4b0495bb4de419a702202edfdb7a3bfd9c43381fd",
+      "comfyui_sam3/src/sam3/sam3/perflib/__init__.py": "7cae71169245da70023b817c405d689cc497e7c699851b2ed52fd00d2998c6d6",
+      "comfyui_sam3/src/sam3/sam3/perflib/associate_det_trk.py": "27bff477a4f5aa6ad1d0976b0273742fe2036fdf764eac753b11c5474672154c",
+      "comfyui_sam3/src/sam3/sam3/perflib/compile.py": "ab976a82638e67056c27a9777155f9f281921d677a2bd6a581f68c905d97d8ad",
+      "comfyui_sam3/src/sam3/sam3/perflib/connected_components.py": "ce815603808c9bce30a059f33c5002303a76fbda6d371e00a87bf25a9c91a08a",
+      "comfyui_sam3/src/sam3/sam3/perflib/fa3.py": "eea8ada3bf3f648f8688e9875be13fa656f6a330fb659bcd6dec48a389e33d3e",
+      "comfyui_sam3/src/sam3/sam3/perflib/masks_ops.py": "59a5fb72f9f72d0fa8d1d914ceb6ba8d40508f6d2cc55e56fbae58a05fe95338",
+      "comfyui_sam3/src/sam3/sam3/perflib/nms.py": "0ba03b6c91bc66af4a8ac5d8faaebfcbae49a1e6d2e6767b392ac06cc91d1978",
+      "comfyui_sam3/src/sam3/sam3/perflib/triton/connected_components.py": "63d3a990c4af3ee9647f5883f5c79b59cb2ab16805747f3ca5850e5281fdb018",
+      "comfyui_sam3/src/sam3/sam3/perflib/triton/nms.py": "b09ef33cb5c683b661caa3470b39675cbb87a76022c460ed67047cddc0dce7d3",
+      "comfyui_sam3/src/sam3/sam3/sam/__init__.py": "7981afdea898f8ee6234140e22f6ad97c0c112afa7469d1573ecc0d5949d2d2d",
+      "comfyui_sam3/src/sam3/sam3/sam/common.py": "0125ea461f17391c11bf27768eef955ce9395c90ff9f6f9420e7c1bf35f474c0",
+      "comfyui_sam3/src/sam3/sam3/sam/mask_decoder.py": "c013fd88d0eb13163ccf5a25c8e52ea2304fdbce98fe7a0d468a990fa852dd76",
+      "comfyui_sam3/src/sam3/sam3/sam/prompt_encoder.py": "fe86875fced4729bf90ac1a26e8f3a7c718d183537a61b73966bd7bb35b8fe41",
+      "comfyui_sam3/src/sam3/sam3/sam/rope.py": "c0e5675f65779ce21ffd7bc8f59e87d0ececf4cd742b10b7ec481c0abb558a11",
+      "comfyui_sam3/src/sam3/sam3/sam/transformer.py": "831ed953630dea6e2239fb45ea13b3c6ba3f81ed724ce6ae3da6714216b842be",
+      "comfyui_sam3/src/sam3/sam3/train/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/configs/eval_base.yaml": "780926d7468b7c5629e87f34911fcbfb131d0c0c157a98306fae41a3ef43c8d5",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_attributes.yaml": "53d076657d5e4071dae1f007d52b28f841a0a664632e6e73f67a8a7c0d1240d4",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_crowded.yaml": "9160ee1f3fad8ebcde6fd25fbf90d061bfda48554e585d24f04da2fe1c8a76a4",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_fg_food.yaml": "55a82f314cdd5ee7a28605566da334ff80684a5a7511cb33a942b5049fc17c54",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_fg_sports.yaml": "ae0f34dc883eefa137b90b306c6237262b838eaaeb4383c084a1d73892ee1b2b",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_metaclip_nps.yaml": "7edcae1a5d2873bab720dc551fe68589df9bfa1ce41ad108b8862c4d6f16422d",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_sa1b_nps.yaml": "e877030f2b7f32e46ca8203f2780e5807e232b3604f1ca46c8bc40cdd4c78e23",
+      "comfyui_sam3/src/sam3/sam3/train/configs/gold_image_evals/sam3_gold_image_wiki_common.yaml": "c9fa0a5fc35a2f504573064c50c41986012c8c406393bd738665d4c73ea7bf7c",
+      "comfyui_sam3/src/sam3/sam3/train/configs/odinw13/odinw_text_and_visual.yaml": "cdede5fff11b746a86dca410294b4a75d3f5a5c5580b39b6596e7d8a35773b7a",
+      "comfyui_sam3/src/sam3/sam3/train/configs/odinw13/odinw_text_only.yaml": "6d9534b194d8d9f45dd1edfdf6b08c5c0c86d965ca30d08f7dfc43d0d92ec34e",
+      "comfyui_sam3/src/sam3/sam3/train/configs/odinw13/odinw_text_only_positive.yaml": "2a59bed2106ffe89d98008def54b6364d8b593a104303e897e5320de3c47086f",
+      "comfyui_sam3/src/sam3/sam3/train/configs/odinw13/odinw_text_only_train.yaml": "4b0af1bef754225884a31ac80f12e77e558c84b032b5a561149ec8e9cca66dc9",
+      "comfyui_sam3/src/sam3/sam3/train/configs/odinw13/odinw_visual_only.yaml": "5829d36e1ca74950d9107381b37c46d07fa718457f3780839b1f7963d761635e",
+      "comfyui_sam3/src/sam3/sam3/train/configs/roboflow_v100/roboflow_v100_eval.yaml": "29487ef78f06bc02b23e244378fdc2c152c91432e423d8c3c995110ee55c37b4",
+      "comfyui_sam3/src/sam3/sam3/train/configs/roboflow_v100/roboflow_v100_full_ft_100_images.yaml": "ed4b24796da0c8848213a6d43559e9f20cacd62fb6c61d0efabbfa602e4ea943",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_sav_test.yaml": "f2846773b667c25a1dce9150ef72bfd2b7d4aebd45094dc5c6958703cf2281b6",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_sav_test_noheur.yaml": "d1b90a611ed47af70ec8f96f315e5341b1631627886a7a557e42d3e7400c3bd3",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_sav_val.yaml": "106a2a2a2fef9a476a3e037a6e5a46c646817a13d99620eac625ea98e0563703",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_sav_val_noheur.yaml": "d2b8c37f29bb198fd06987b0f2fdc9b08fd0bf405771301a89fc0f620ceaec47",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_smartglasses_test.yaml": "8197772460ea6c3295e3bc236fa200acb2f4e006dde676c77177cbbdce601fed",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_smartglasses_test_noheur.yaml": "1e4598d4eadb3daf612b5ee87e131cc6d6b60023a2a667ba7e09f90e6e235af4",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_smartglasses_val.yaml": "59777c39b5c66be3f2e98439541ed0a8df53402fff8bb8931644ea97c797eb6f",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_smartglasses_val_noheur.yaml": "230d18eb4975ad8f857cd713d354e54f7459455c112482deb30b6a1f1b9bf5cc",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_yt1b_test.yaml": "611bfb60376fec3d42637c1aef277d24412eb82fb778eedb43c4a90968ad10e1",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_yt1b_test_noheur.yaml": "4273d3e0540dc24eb0643291ba9351f438a4ff545ac44b076d2b0b80431b826a",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_yt1b_val.yaml": "099eb1d10422b4bd225c942c6883e601bfc4f9401d6bbc17e36fe0e044e16bf1",
+      "comfyui_sam3/src/sam3/sam3/train/configs/saco_video_evals/saco_veval_yt1b_val_noheur.yaml": "9425f321ea861a76699efe511dcc03d9818006f30112ed78a76f197bdaa4d7a9",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_bdd100k.yaml": "161331c3d8b2a9a9ba60f924a9a4d5f391bcf5a4b074c450847620a1e0375d04",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_droid.yaml": "34c4ca4377a4a51c43891ed8ee5bc8632b64f0fb2f30ff13748520baf3a9681c",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_ego4d.yaml": "21d41a0eb498a47824754c76f8568f0c80552f9a05f870c5d1a1c5651bff4ea5",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_fathomnet.yaml": "c1ce4df2ed2883f821bb4b709698d68434cd4ae75127bc870bc45893f9ef37f2",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_food_rec.yaml": "30552434937c4077c47240e1e8b14a63f4beeec53bef6b524df2444871cfa35c",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_geode.yaml": "5a5d0914be186d5bd9fcb5f7709da0b3e5bd062768970801f8e5f3e2270b4ba7",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_inaturalist.yaml": "31366b2d378edd3f97fb6625bbedef359a047bfdd8c967bbcacade4b1b3d9a28",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_nga.yaml": "2e1bc73ff85f32c06a5d6b69c8283c8df2149c8d7fd110bda93c445918953c99",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_sav.yaml": "7faa3b8664e2c234bd764b557caad384fac9f29ad6bea91ddb75e1fd20bf98ce",
+      "comfyui_sam3/src/sam3/sam3/train/configs/silver_image_evals/sam3_silver_image_yt1b.yaml": "ca157c7fa6e59866e999f7a9caf9b654902e290d5db36385c691abac50b978a6",
+      "comfyui_sam3/src/sam3/sam3/train/data/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/data/coco_json_loaders.py": "f7bed85a7b27da6fa0fe06f95dd9798372dde45fc50a56a15fc2586ba8b54bdc",
+      "comfyui_sam3/src/sam3/sam3/train/data/collator.py": "62a40478c598192a619190d05d3fdb10065c05a6d91015f3223defe52582e18e",
+      "comfyui_sam3/src/sam3/sam3/train/data/sam3_image_dataset.py": "d29a22a9e3b297cb7791e62f768c90c0e6e12cb723699e3f84b4c0d1b9621856",
+      "comfyui_sam3/src/sam3/sam3/train/data/sam3_video_dataset.py": "92d7e63ef02fa5051f2207e926ab2eb390e68d4735119e159045ec5e0bf238bf",
+      "comfyui_sam3/src/sam3/sam3/train/data/torch_dataset.py": "37bd234835c23c22ca6b63a94462a4e020fd3a270706ca49b560d464dca8563d",
+      "comfyui_sam3/src/sam3/sam3/train/loss/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/loss/loss_fns.py": "ede899a2d326b1e6f8a4ad9c1b86bc913d9495d83b6392f2b8bf8720c3d0c8a0",
+      "comfyui_sam3/src/sam3/sam3/train/loss/mask_sampling.py": "a7580f54a9e7d6d9a5efd313e2230bb2005c308a05a2e290bda1fe33500fa451",
+      "comfyui_sam3/src/sam3/sam3/train/loss/sam3_loss.py": "19a45bde3115896a787ec77d6dcac7983018c17bb394761b7fec1f4361814e3f",
+      "comfyui_sam3/src/sam3/sam3/train/loss/sigmoid_focal_loss.py": "bd02df0750fab1b26a32ff3a87002999eba72812e51315f609257b48499094cc",
+      "comfyui_sam3/src/sam3/sam3/train/masks_ops.py": "e03cc39e9f9d76384def85817389486e6e7f71e330390de5b544a7eed8d409f9",
+      "comfyui_sam3/src/sam3/sam3/train/matcher.py": "6ff91db3aaeb663fa8ca1d3c8767f03647ce1b2ae03a883a930dfe10fd4eb6b7",
+      "comfyui_sam3/src/sam3/sam3/train/nms_helper.py": "0573d5248ae255122b3947b5861f117f814d0f980677fe3cb50ea4d489f3a606",
+      "comfyui_sam3/src/sam3/sam3/train/optim/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/optim/optimizer.py": "9f8f13b2ab0969c3722ca6ba38efe5dceba7379fcf47d6b800b138d38bce9ae1",
+      "comfyui_sam3/src/sam3/sam3/train/optim/schedulers.py": "99b9c814ab233ae04bbeb8c1238013c443080dcb9dcdbaa0f125b2f5d2f519d0",
+      "comfyui_sam3/src/sam3/sam3/train/train.py": "6c7c527523d4cb057fd596fda852a9ec61ed38a0217906a593ab9209c3145e5a",
+      "comfyui_sam3/src/sam3/sam3/train/trainer.py": "daf6f832099986864d87adfec62d69d2127399ca7b96f0ebbd2ce18caab55742",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/basic.py": "1dc3b43616b77150aba735871afef533cb33bb5ed35ff03d1ea46123fe828810",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/basic_for_api.py": "5d5ca500ccb3fddd4bae3731e4bc5a6d7d8eac1860995e80bdc5c2d7be9ad9af",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/filter_query_transforms.py": "206aba759f652674903a7d9b778899ae130cfbf99940d912bb2e3796ec1b3fbc",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/point_sampling.py": "5c8cb12a4f2822cfb38488060982fd8e82932b7a88da12a8c6dbe6591c539797",
+      "comfyui_sam3/src/sam3/sam3/train/transforms/segmentation.py": "10c84b0030275c2c1138247588b67e638de5a04c88daa13cc652f70601c7db2b",
+      "comfyui_sam3/src/sam3/sam3/train/utils/__init__.py": "1fa111b4a36c70d6045443ad170ece96b33f148c21e366ae5e3f5502f9717371",
+      "comfyui_sam3/src/sam3/sam3/train/utils/checkpoint_utils.py": "f7127f9e7f8e25677daf9180fa37cd889098d3c2e9933870db9a3ee48a68097d",
+      "comfyui_sam3/src/sam3/sam3/train/utils/distributed.py": "8937fe092cab7e81146d99f0e7f49b21992139a3d7bcc4e49c57b95052bef37c",
+      "comfyui_sam3/src/sam3/sam3/train/utils/logger.py": "823abbe5c3f5a66bc81ee35ed2d582b92a21abf0ef8a0ceb0d043ea1b38ad08f",
+      "comfyui_sam3/src/sam3/sam3/train/utils/train_utils.py": "25d1a4d87a5d18bd88bf37bc50f6c1f9285d4903cdfa8d1e1263a187c603800c",
+      "comfyui_sam3/src/sam3/sam3/visualization_utils.py": "6928199cc05fb1c7e2f5c765ec3c20b8f376312f493bf00f4a102c4776e181bc",
+      "rgthree-comfy/pyproject.toml": "9cee2c6c6ac87d484a21d9fb04143b3cb08a8cd063d19dffe3dae0c8963c1b2a",
+      "rgthree-comfy/requirements.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

@@ -177,6 +177,31 @@ function _fakeDependenciesPayload() {
   };
 }
 
+// Remote Modal model-volume inventory (GET /comfymodal/models). Mirrors
+// list_models_cpu's folder -> [{name,size,folder,local_placeholder}] shape.
+// The deterministic default is a zero-byte (placeholder) entry: remote size 0
+// must read as missing, so no dependency row is upgraded by default. Specs
+// that need remote availability override this route explicitly.
+function _fakeRemoteModels() {
+  return {
+    checkpoints: [
+      {
+        name: "krea_model.safetensors",
+        size: 0,
+        folder: "checkpoints",
+        local_placeholder: {
+          folder: "checkpoints",
+          filename: "krea_model.safetensors",
+          exists: true,
+          size: 0,
+          is_placeholder: true,
+          is_real_file: false,
+        },
+      },
+    ],
+  };
+}
+
 function _fakeVersion() {
   return {
     workflow_version_id: "wv_fake",
@@ -800,6 +825,9 @@ const ROUTES = [
       : engine.commitFakeManifestImport(res._sid, body || {});
     _json(res, r, r._httpStatus || (r.status === "error" ? 400 : 200));
   }],
+
+  // Remote Modal model volume (availability authority for the wizard).
+  ["GET", "/comfymodal/models", async (res) => _json(res, _fakeRemoteModels())],
 
   // Studio Model Library (deterministic fake dataset).
   ["GET", "/comfymodal/studio/models/types", async (res) => _json(res, {

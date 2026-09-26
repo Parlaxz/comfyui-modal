@@ -1,0 +1,66 @@
+{
+  "tool": "tools/analysis/golden_sickness_forensic.py",
+  "tool_sha256": "269bd2aa5bc15062f39cc5cfc0b99bf977169b4d9f6197c753082ab9350489cc",
+  "corpus_root": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\.slim\\worktrees\\resource-local-carryover-sep14",
+  "evidence_bundles_enumerated": 143,
+  "evidence_bundles_selected": 143,
+  "limit_per_arm": null,
+  "dual_limit": null,
+  "hashing_enabled": false,
+  "events_parsed": true,
+  "plots": {
+    "available": false,
+    "reason": "skipped by flag",
+    "files": []
+  },
+  "outputs": {
+    "dual_transport_decision_ledger.csv": {
+      "size_bytes": 102912,
+      "sha256": "700f07c3bb82f283dc7598fc0bde70a6a19f280eb30bf22865e9f7893afd9c6e"
+    },
+    "field_availability.csv": {
+      "size_bytes": 62480,
+      "sha256": "af0a79d3d07b54fc08e3d06dc5c4dd25659781f950dc7e646b38ef56c8700c5a"
+    },
+    "onset.csv": {
+      "size_bytes": 87167,
+      "sha256": "6660ef84d7ee48ca5a855307a321228648f9b5312d6c7b7509cdfbe761afdc98"
+    },
+    "per_read.csv": {
+      "size_bytes": 21323372,
+      "sha256": "e8d78743ee547b105795af829930855798eb45669a0238ee7e0e0fe02204c6b8"
+    },
+    "per_request.csv": {
+      "size_bytes": 351032,
+      "sha256": "5019f4c371ca78f5375cdb9b2ba8482bda57112d08972a20dcb2759129b33e5f"
+    },
+    "raw_artifact_index.csv": {
+      "size_bytes": 11016271,
+      "sha256": "cd788c77ab350c7c1943f33a0ff989e3f4f7906adaedc2bd2f32319bb45a708b"
+    },
+    "threshold_summary.csv": {
+      "size_bytes": 34263,
+      "sha256": "ff0394ab68dd510d855035bf49d31fac6999519ada13af9aec0fce687496fc06"
+    },
+    "counts.json": {
+      "size_bytes": 641,
+      "sha256": "8f44a09c54ffe2fe9ccb9051fd899da237e9c9bae00376d20683448406ccbf7c"
+    },
+    "exclusions.json": {
+      "size_bytes": 10615,
+      "sha256": "a6a46c0e936a8d357079b047a40cd6706d14075b684dabd58cc87bf3c011ba09"
+    },
+    "per_request.json": {
+      "size_bytes": 68204850,
+      "sha256": "43268100bf31f7e4a17b397ba1c5b908f39cccd4cb8626cc8dffd8323324e377"
+    },
+    "provider_region_summary.json": {
+      "size_bytes": 8765,
+      "sha256": "0f33c6cb0222f88ac434469250993dce09f742419e6f9f442bcbba462ada7e28"
+    },
+    "threshold_summary.json": {
+      "size_bytes": 52105,
+      "sha256": "b58fbc96c96b54425a470877bd4e207633af86bd2f1254ff99b16864756dee10"
+    }
+  }
+}
