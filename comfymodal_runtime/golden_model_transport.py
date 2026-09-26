@@ -249,6 +249,7 @@ class GoldenModelTransport:
             else STAGING_SLOTS
         )
         self.staging_bytes = self.qd * self.staging_slots * self.block_bytes
+        self.staging_backing = "posix" if self.staging_slots > 1 else "anonymous"
         self.staging: dict[str, Any] | None = None
         self._ctx: Any = None
         self._children: list[Any] = []
@@ -278,7 +279,11 @@ class GoldenModelTransport:
                 raise RuntimeError("persistent_m2_requires_fork")
             self._ctx = mp.get_context("fork")
             self.staging = source_race_gpu.build_staging(
-                self.qd, self.staging_slots, self.block_bytes, prefault=False
+                self.qd,
+                self.staging_slots,
+                self.block_bytes,
+                prefault=False,
+                backing=self.staging_backing,
             )
             for reader_id in range(self.qd):
                 parent_conn, child_conn = self._ctx.Pipe(duplex=True)
@@ -729,6 +734,16 @@ class GoldenModelTransport:
                     self.staging["_mm"].close()
                 except BaseException:
                     pass
+                shm = self.staging.get("_shm")
+                if shm is not None:
+                    try:
+                        shm.close()
+                    except BaseException:
+                        pass
+                    try:
+                        shm.unlink()
+                    except BaseException:
+                        pass
             self._closed = True
 
 

@@ -349,6 +349,7 @@ def build_staging(
     slots: int,
     read_bytes: int,
     prefault: bool = True,
+    backing: str = "anonymous",
 ) -> dict[str, Any]:
     """Allocate lazy shared-memory staging (anonymous mmap, no eager zero-fill).
 
@@ -365,8 +366,18 @@ def build_staging(
         raise ValueError("qd, slots and read_bytes must be positive")
     lane_bytes = slots * read_bytes
     total = qd * lane_bytes
-    mm = _mmap.mmap(-1, total, access=_mmap.ACCESS_WRITE)
-    base = int(ctypes.addressof(ctypes.c_char.from_buffer(mm)))
+    backing = str(backing).strip().lower()
+    if backing not in {"anonymous", "posix"}:
+        raise ValueError("unsupported_staging_backing")
+    shm = None
+    if backing == "posix":
+        from multiprocessing import shared_memory
+        shm = shared_memory.SharedMemory(create=True, size=total)
+        mm = shm.buf
+    else:
+        mm = _mmap.mmap(-1, total, access=_mmap.ACCESS_WRITE)
+    mm_obj: Any = mm
+    base = int(ctypes.addressof(ctypes.c_char.from_buffer(mm_obj)))
     staging: dict[str, Any] = {
         "enabled": True,
         "seg_base": base,
@@ -380,6 +391,8 @@ def build_staging(
         "slot_len": [mp.Array("q", slots, lock=False) for _ in range(qd)],
         "alive": mp.Value("i", 1, lock=False),
         "_mm": mm,
+        "_shm": shm,
+        "backing": backing,
         "_prefault_thread": None,
     }
     if prefault:
