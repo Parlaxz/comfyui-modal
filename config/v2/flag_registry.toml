@@ -717,7 +717,7 @@ default = "qd4_64"
 consumed_at = "method_entry"
 change_requires = "deploy"
 owner = "golden-model-transport"
-enum_values = ["qd4_64", "qd2_128", "qd4_64_h2d128"]
+enum_values = ["qd4_64", "qd2_128", "qd4_64_h2d128", "qd4_128"]
 description = "C0 source/H2D scheduling geometry (window usage only; the 512 MiB C0 arena is never resized). qd2_128 requires 128 MiB C0 slots."
 
 [[flag]]

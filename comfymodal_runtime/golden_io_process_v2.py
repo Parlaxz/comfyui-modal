@@ -52,6 +52,10 @@ _SOURCE_GEOMETRIES = {
     # Appended last so the existing ``allowed=qd4_32,qd2_128`` substring in the
     # selector error stays intact for the control contract.
     "qd4_64": (4, 64 * 1024 * 1024),
+    # 128 MiB windows at QD4 over the same 512 MiB arena (4 x 128 MiB slots,
+    # 4 source workers).  Total arena capacity is unchanged; only the slot
+    # split and per-fill window size change.
+    "qd4_128": (4, 128 * 1024 * 1024),
 }
 
 
@@ -1239,11 +1243,11 @@ C0_PREADV_SICKNESS_HYPOTHESIS_STATUSES = (
 C0_ARENA_BYTES = 512 * 1024 * 1024
 
 # Deploy-baked selector -> C0 geometry.  The arena is always exactly 512 MiB;
-# only the slot split and the child source-worker pool change.  Only ``qd4_64``
-# selects the wider treatment arm.  Every other selector -- the explicit
-# control ``qd2_128`` and the default ``qd4_32`` -- preserves the control
-# geometry exactly, so there is no cross-arm fallback and existing control
-# contracts are unchanged.
+# only the slot split and the child source-worker pool change.  ``qd4_64``
+# and ``qd4_128`` select treatment arms.  Every other selector -- the
+# explicit control ``qd2_128`` and the default ``qd4_32`` -- preserves the
+# control geometry exactly, so there is no cross-arm fallback and existing
+# control contracts are unchanged.
 _C0_TREATMENT_SOURCE_GEOMETRY = "qd4_64"
 _C0_TREATMENT_GEOMETRY = {
     "slot_bytes": 64 * 1024 * 1024,
@@ -1251,6 +1255,13 @@ _C0_TREATMENT_GEOMETRY = {
     "source_workers": 4,
     "slot_owners": (0, 0, 1, 1, 2, 2, 3, 3),
     "capacity_class": "c0-qd4-64m",
+}
+_C0_TREATMENT_128_GEOMETRY = {
+    "slot_bytes": 128 * 1024 * 1024,
+    "slot_count": 4,
+    "source_workers": 4,
+    "slot_owners": (0, 1, 2, 3),
+    "capacity_class": "c0-qd4-128m",
 }
 _C0_CONTROL_GEOMETRY = {
     "slot_bytes": 128 * 1024 * 1024,
@@ -1267,16 +1278,20 @@ def resolve_c0_geometry(value: Any = None) -> dict:
     """Resolve the selected C0 arena/slot/worker geometry in one place.
 
     ``value`` (or the deploy-baked environment when omitted) selects exactly one
-    geometry.  ``qd4_64`` maps to the treatment tuple; anything else maps to the
-    control tuple.  There is deliberately no cross-arm fallback, no partial
-    inheritance, and no dependency on the parent H2D QD.
+    geometry.  ``qd4_64`` and ``qd4_128`` map to their treatment tuples;
+    anything else maps to the control tuple.  There is deliberately no
+    cross-arm fallback, no partial inheritance, and no dependency on the
+    parent H2D QD.
     """
     selected = normalize_source_geometry(value)
-    geometry = (
-        _C0_TREATMENT_GEOMETRY
-        if selected == _C0_TREATMENT_SOURCE_GEOMETRY
-        else _C0_CONTROL_GEOMETRY
-    )
+    if selected == "qd4_128":
+        geometry = _C0_TREATMENT_128_GEOMETRY
+    else:
+        geometry = (
+            _C0_TREATMENT_GEOMETRY
+            if selected == _C0_TREATMENT_SOURCE_GEOMETRY
+            else _C0_CONTROL_GEOMETRY
+        )
     resolved = dict(geometry)
     resolved["arena_bytes"] = int(C0_ARENA_BYTES)
     resolved["source_geometry"] = selected
@@ -4734,10 +4749,10 @@ class C0StageReader:
         self._mmap_read_records: list[dict] = []
         self._mmap_minflt: list[int] = []
         self._mmap_majflt: list[int] = []
-        self._mmap_ru_utime_ns: list[int] = []
-        self._mmap_ru_stime_ns: list[int] = []
-        self._mmap_sched_run_ns: list[int] = []
-        self._mmap_sched_wait_ns: list[int] = []
+        # Per-reader-process CPU/scheduler windows: the child reports
+        # cumulative counters, so the parent retains first/last sightings per
+        # (pid, counter) and reports deltas consumed during this load.
+        self._mmap_cpu_windows: dict = {}
         self._mmap_reader_pids: set[int] = set()
         # FIRST_FILL vs REUSED_SLOT split.  The parent classifies every fill
         # from its own slot-fill counter: the first touch of a slot
@@ -4956,14 +4971,28 @@ class C0StageReader:
             ("_mmap_pipe_rtt_ns", "mmap_pipe_rtt_ns"),
             ("_mmap_minflt", "mmap_minflt"),
             ("_mmap_majflt", "mmap_majflt"),
-            ("_mmap_ru_utime_ns", "mmap_ru_utime_ns"),
-            ("_mmap_ru_stime_ns", "mmap_ru_stime_ns"),
-            ("_mmap_sched_run_ns", "mmap_sched_run_ns"),
-            ("_mmap_sched_wait_ns", "mmap_sched_wait_ns"),
         ):
             _value = source.get(_key)
             if _is_plain_int(_value):
                 getattr(self, _attr).append(int(_value))
+        # Cumulative per-process CPU/scheduler counters arrive per fill; fold
+        # them into per-(pid, counter) first/last windows so the summary can
+        # report deltas consumed during this load.  Stored only.
+        _cpu_pid = source.get("reader_pid")
+        if _is_plain_int(_cpu_pid):
+            for _key in (
+                "mmap_ru_utime_ns",
+                "mmap_ru_stime_ns",
+                "mmap_sched_run_ns",
+                "mmap_sched_wait_ns",
+            ):
+                _value = source.get(_key)
+                if not _is_plain_int(_value):
+                    continue
+                _window = self._mmap_cpu_windows.setdefault(
+                    (int(_cpu_pid), str(_key)), [int(_value), int(_value)]
+                )
+                _window[1] = int(_value)
         if str(source.get("source_engine") or "") == "mmap_fresh":
             copy_start = source.get("copy_start_ns")
             copy_end = source.get("copy_end_ns")

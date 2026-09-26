@@ -159,6 +159,34 @@ def test_c0_transport_geometry_h2d128_keeps_64mib_source_windows(monkeypatch):
     assert geo["h2d_target_bytes"] == 128 * 1024 * 1024
 
 
+def test_c0_transport_geometry_qd4_128(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd4_128")
+
+    geo = resolve_c0_transport_geometry()
+
+    assert geo["queue_depth"] == 4
+    assert geo["block_bytes"] == 128 * 1024 * 1024
+    assert geo["producer_workers"] == 4
+    assert geo["aggregation_enabled"] is False
+    assert geo["required_slot_bytes"] == 128 * 1024 * 1024
+    assert geo["capacity_class"] == "c0-qd4-128m"
+
+
+def test_c0_arena_geometry_qd4_128_keeps_512mib():
+    from comfymodal_runtime.golden_io_process_v2 import (
+        C0_ARENA_BYTES,
+        resolve_c0_geometry,
+    )
+
+    resolved = resolve_c0_geometry("qd4_128")
+
+    assert resolved["arena_bytes"] == C0_ARENA_BYTES == 536870912
+    assert resolved["slot_bytes"] == 128 * 1024 * 1024
+    assert resolved["slot_count"] == 4
+    assert resolved["slot_bytes"] * resolved["slot_count"] == 536870912
+    assert resolved["source_geometry"] == "qd4_128"
+
+
 def test_c0_transport_geometry_unknown_fails_closed(monkeypatch):
     monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd8_256")
 
@@ -241,6 +269,27 @@ def test_summarize_c0_reader_collects_phases_and_worst_window():
     assert summary["worst_window"]["source_range"] == [134217728, 201326592]
     assert summary["memcpy_first_ms"] == pytest.approx(200.0)
     assert summary["memcpy_reuse_ms"] == pytest.approx(260.0)
+
+
+def test_summarize_cpu_windows_reports_deltas():
+    from comfymodal_runtime.golden_model_transport import _summarize_cpu_windows
+
+    windows = {
+        (66, "mmap_ru_utime_ns"): [1_000_000_000, 1_500_000_000],
+        (66, "mmap_sched_wait_ns"): [100_000_000, 130_000_000],
+        (67, "mmap_ru_utime_ns"): [2_000_000_000, 2_200_000_000],
+        ("bad",): [1, 2],
+        (68, "mmap_ru_utime_ns"): ["x", 5],
+    }
+
+    summary = _summarize_cpu_windows(windows)
+
+    assert summary["utime_ms"] == pytest.approx(700.0)
+    assert summary["stime_ms"] is None
+    assert summary["sched_wait_ms"] == pytest.approx(30.0)
+    assert summary["per_pid"]["66"]["mmap_ru_utime_ns"] == pytest.approx(500.0)
+    assert _summarize_cpu_windows(None)["utime_ms"] is None
+    assert _summarize_cpu_windows({})["per_pid"] == {}
 
 
 def test_summarize_dispatcher_tolerates_missing_telemetry():

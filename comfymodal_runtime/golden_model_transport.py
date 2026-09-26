@@ -321,7 +321,7 @@ def _parse_layout(path: str, identity: tuple[int, int, int, int]) -> Safetensors
 
 C0_TRANSPORT_GEOMETRY_ENV = "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY"
 C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
-_C0_TRANSPORT_GEOMETRIES = ("qd4_64", "qd2_128", "qd4_64_h2d128")
+_C0_TRANSPORT_GEOMETRIES = ("qd4_64", "qd2_128", "qd4_64_h2d128", "qd4_128")
 _C0_WINDOW_TRACE_LIMIT = 4096
 
 
@@ -370,6 +370,17 @@ def resolve_c0_transport_geometry(value: Any = None) -> dict[str, Any]:
             "capacity_class": "c0-qd4-64m",
             "required_slot_bytes": 64 * 1024 * 1024,
         }
+    if selected == "qd4_128":
+        return {
+            "name": selected,
+            "queue_depth": QD,
+            "block_bytes": 128 * 1024 * 1024,
+            "producer_workers": QD,
+            "aggregation_enabled": False,
+            "h2d_target_bytes": 128 * 1024 * 1024,
+            "capacity_class": "c0-qd4-128m",
+            "required_slot_bytes": 128 * 1024 * 1024,
+        }
     return {
         "name": selected,
         "queue_depth": QD,
@@ -417,6 +428,39 @@ def _mean_ns(values: Any) -> float | None:
     return (sum(samples) / len(samples)) / 1e6
 
 
+def _summarize_cpu_windows(windows: Any) -> dict[str, Any]:
+    """Sum per-(pid, counter) first/last deltas into per-counter totals (ms).
+
+    The child reports cumulative process counters; only the delta consumed
+    during this load is meaningful.  Malformed entries degrade to None.
+    """
+    totals: dict[str, float] = {}
+    per_pid: dict[str, dict[str, float]] = {}
+    if isinstance(windows, dict):
+        for key, bounds in windows.items():
+            if (
+                not isinstance(key, tuple) or len(key) != 2
+                or not isinstance(bounds, (list, tuple)) or len(bounds) != 2
+            ):
+                continue
+            pid, name = key
+            first, last = bounds
+            if not isinstance(first, int) or not isinstance(last, int):
+                continue
+            delta_ms = max(0, last - first) / 1e6
+            totals[str(name)] = totals.get(str(name), 0.0) + delta_ms
+            per_pid.setdefault(str(pid), {})[str(name)] = delta_ms
+    out: dict[str, Any] = {"per_pid": per_pid}
+    for short, full in (
+        ("utime_ms", "mmap_ru_utime_ns"),
+        ("stime_ms", "mmap_ru_stime_ns"),
+        ("sched_run_ms", "mmap_sched_run_ns"),
+        ("sched_wait_ms", "mmap_sched_wait_ns"),
+    ):
+        out[short] = totals.get(full)
+    return out
+
+
 def summarize_c0_reader(source: Any) -> dict[str, Any]:
     """Summarize one load's C0 reader evidence (Stages A-D measurement).
 
@@ -461,6 +505,7 @@ def summarize_c0_reader(source: Any) -> dict[str, Any]:
         "majflt_total": sum(
             int(v) for v in (_get("_mmap_majflt", []) or []) if isinstance(v, int)
         ),
+        "cpu": _summarize_cpu_windows(_get("_mmap_cpu_windows", {})),
         "reader_pids": sorted(int(p) for p in (_get("_mmap_reader_pids", set()) or set())),
     }
     worst: dict[str, Any] | None = None
