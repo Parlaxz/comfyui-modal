@@ -1317,6 +1317,7 @@ class _Telemetry:
     producer_destination_offsets: dict[int, list[int]] | None = None
     producer_destination_offset_monotonic: bool | None = True
     producer_ids: tuple[int, ...] = ()
+    affinity_breaks: int = 0
     poisoned: bool = False
     poison_reason: str | None = None
     coverage_ok: bool | None = None
@@ -1651,7 +1652,8 @@ class _Telemetry:
                 "reader_mode": self.source_read_mode,
                 "direct_readinto_count": self.direct_readinto_count,
                 "static_regions": list(self.static_regions) if self.static_regions is not None else None,
-                "producer_ids": list(self.producer_ids),
+                 "producer_ids": list(self.producer_ids),
+                 "affinity_breaks": self.affinity_breaks,
                 "producer_read_bytes": dict(self.producer_read_bytes or {}),
                 "producer_read_counts": dict(self.producer_read_counts or {}),
                 "producer_offset_monotonic": self.producer_offset_monotonic,
@@ -3227,6 +3229,7 @@ class GoldenQDTransport:
         errors_lock = threading.Lock()
         index = 0
         index_lock = threading.Lock()
+        static_cursors = [0] * producer_count
 
         def note_worker_error(exc: BaseException) -> None:
             with errors_lock:
@@ -3243,13 +3246,26 @@ class GoldenQDTransport:
                     if self.arm == STATIC_E27_ARM and self._static_work is not None
                     else None
                 )
-                local_index = 0
                 while not self._abort_requested:
                     if static_items is not None:
-                        if local_index >= len(static_items):
-                            return
-                        item = static_items[local_index]
-                        local_index += 1
+                        with index_lock:
+                            item = None
+                            if static_cursors[producer_id] < len(static_items):
+                                item = static_items[static_cursors[producer_id]]
+                                static_cursors[producer_id] += 1
+                            else:
+                                # Match M2's affinity_breaks rule: once a
+                                # sticky lane is exhausted, claim the next
+                                # unowned extent from another lane.
+                                for other_id, other_items in enumerate(self._static_work or ()):
+                                    if static_cursors[other_id] < len(other_items):
+                                        item = other_items[static_cursors[other_id]]
+                                        static_cursors[other_id] += 1
+                                        if other_id != producer_id:
+                                            self.telemetry.affinity_breaks += 1
+                                        break
+                            if item is None:
+                                return
                     else:
                         with index_lock:
                             if index >= len(source_ranges):
