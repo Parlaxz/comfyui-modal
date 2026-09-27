@@ -9683,14 +9683,6 @@ async def golden_restore(session: GoldenSession) -> dict:
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise RuntimeError(f"restore_metadata_boundary_invalid:{key}")
         rec.record_external_restore(metadata)
-        if _golden_model_transport_enabled():
-            from .golden_model_transport import get_golden_model_transport
-            transport = get_golden_model_transport()
-            transport.prepare_cpu()
-            transport.initialize_cuda()
-            session.model_transport = transport
-        if not torch.cuda.is_available():
-            raise RuntimeError("cuda_unavailable")
         preload_workers = [
             t.name
             for t in threading.enumerate()
@@ -9699,8 +9691,8 @@ async def golden_restore(session: GoldenSession) -> dict:
         if preload_workers:
             raise RuntimeError(f"restore_preload_workers_present:{preload_workers}")
         baseline = {
-            "device": torch.cuda.get_device_name(torch.cuda.current_device()),
-            "memory_allocated_bytes": int(torch.cuda.memory_allocated()),
+            "device": "deferred_until_model_load",
+            "memory_allocated_bytes": None,
             "thread_names": sorted(t.name for t in threading.enumerate()),
             "request_id": session.request.request_id,
             "observation_only": True,
