@@ -7558,11 +7558,11 @@ def _fd_stat_row(key):
             "producer_id": key[1],
             "fill_count": 0,
             "source_bytes": 0,
-            "fd_open_count": int(fd_open_delta),
-            "fd_reuse_count": int(fd_reuse_delta),
-            "fd_close_count": int(fd_close_delta),
-            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
-            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
+            "fd_open_count": 0,
+            "fd_reuse_count": 0,
+            "fd_close_count": 0,
+            "fd_open_wall_ms": 0.0,
+            "fd_close_wall_ms": 0.0,
         }
         _fd_stats[key] = row
     return row
@@ -7846,16 +7846,23 @@ def _mmap_reader_fill(req):
     fd_key_producer = int(producer_id)
     fd_open_delta = 0
     fd_reuse_delta = 0
+    fd_close_delta = 0
+    fd_open_wall_ns = 0
+    fd_close_wall_ns = 0
     fd_key = (fd_key_path, fd_key_producer)
     requested_identity = req.get("source_identity")
     cached = _mmap_reader_fds.get(fd_key)
     if isinstance(cached, tuple):
         fd, cached_identity = cached
         if requested_identity is not None and tuple(cached_identity or ()) != tuple(requested_identity):
+            close_started = time.monotonic_ns()
             try:
                 os.close(fd)
             except OSError:
                 pass
+            else:
+                fd_close_delta = 1
+                fd_close_wall_ns = max(0, time.monotonic_ns() - close_started)
             cached = None
     else:
         fd = cached
@@ -7864,7 +7871,24 @@ def _mmap_reader_fill(req):
     )
     try:
         if fd is None:
+            open_started = time.monotonic_ns()
             fd = os.open(path, os.O_RDONLY)
+            fd_open_wall_ns = max(0, time.monotonic_ns() - open_started)
+            if not _fd_matches_identity(fd, requested_identity):
+                close_started = time.monotonic_ns()
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                else:
+                    fd_close_delta += 1
+                    fd_close_wall_ns += max(0, time.monotonic_ns() - close_started)
+                error = _FDIdentityMismatchError(fd_key, requested_identity)
+                error.fd_open_count = 1
+                error.fd_close_count = fd_close_delta
+                error.fd_open_wall_ns = fd_open_wall_ns
+                error.fd_close_wall_ns = fd_close_wall_ns
+                raise error
             _mmap_reader_fds[fd_key] = (fd, tuple(requested_identity or ()))
             fd_open_delta = 1
         else:
@@ -8235,6 +8259,11 @@ def _do_fill_mmap(req):
         "source_offset": req.get("source_offset"),
         "destination_offset": req.get("destination_offset"),
     }
+    fd_open_delta = 0
+    fd_reuse_delta = 0
+    fd_close_delta = 0
+    fd_open_wall_ns = 0
+    fd_close_wall_ns = 0
     try:
         if not _mmap_readers:
             raise RuntimeError("mmap_readers_not_started")
@@ -8263,11 +8292,11 @@ def _do_fill_mmap(req):
             "source_engine": "mmap_fresh",
             "producer_id": int(req.get("producer_id") or 0),
             "preadv_diagnostics": [],
-            "fd_open_count": 0,
-            "fd_reuse_count": 0,
-            "fd_close_count": 0,
-            "fd_open_wall_ms": 0.0,
-            "fd_close_wall_ms": 0.0,
+            "fd_open_count": int(fd_open_delta),
+            "fd_reuse_count": int(fd_reuse_delta),
+            "fd_close_count": int(fd_close_delta),
+            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
+            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
         })
         _emit(err)
 
