@@ -1,0 +1,51 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 platform-specific risk matrix",
+    "PHASE_G5 §5 broad semantics"
+  ],
+  "branch_alternatives": {
+    "comfy_cloud_catalog_hit": "low"
+  },
+  "capability_evidence": {
+    "baseten": {
+      "supply_path": "build-time-fetch-with-secrets"
+    },
+    "comfy_cloud": {
+      "catalog_evidence": {
+        "fixture-private-model": "not-in-catalog"
+      },
+      "hf_import": "unavailable-at-audit-time"
+    },
+    "local": {
+      "supply_path": "already-installed-assumption"
+    },
+    "modal": {
+      "supply_path": "secret-mounted-download"
+    },
+    "runcomfy": {
+      "supply_path": "token-attach-supported"
+    },
+    "runpod": {
+      "supply_path": "token-plumbing-required"
+    }
+  },
+  "characteristic": "private_model",
+  "determinism_notes": [
+    "comfy_cloud depends on explicit catalog evidence: supplied evidence is a catalog miss, resolving high; the catalog-hit branch is documented."
+  ],
+  "evidence_id": "target_characteristic_private_model",
+  "expected_target_risk": {
+    "baseten": "medium",
+    "comfy_cloud": "high",
+    "local": "low",
+    "modal": "low",
+    "runcomfy": "medium",
+    "runpod": "medium"
+  },
+  "provider_independent_facts": {
+    "gated_or_private_distribution": true,
+    "hash_pinned": true,
+    "token_flags_boolean_shaped_only": true
+  },
+  "scenario_id": "private_model"
+}

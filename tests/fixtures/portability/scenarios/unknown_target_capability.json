@@ -1,0 +1,11 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §11 unknowns (not guessed)",
+    "PHASE_G5 §5 unknown provider facts stay UNKNOWN"
+  ],
+  "description": "RunComfy native/system dependency support was audited UNKNOWN. A target rule must emit target_capability_unknown rather than assume support or failure.",
+  "evidence_file": "evidence/unknown_target_capability.evidence.json",
+  "kind": "capability",
+  "scenario_id": "unknown_target_capability",
+  "title": "Decision depends on an audited UNKNOWN capability"
+}

@@ -1,0 +1,372 @@
+{
+  "ledger": {
+    "app": "sept-unetclip-04-source-ceiling-oracle",
+    "campaign": "source_h2d_decoupling",
+    "cells": [
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "clip_b32_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "unet_b32_qd1",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 1,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "clip_b32_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "unet_b32_qd2",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 2,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "clip_b32_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "unet_b32_qd4",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 4,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "clip_b32_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 33554432,
+        "block_mib": 32,
+        "cell_id": "unet_b32_qd8",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 8,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "clip_b64_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "unet_b64_qd1",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 1,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "clip_b64_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "unet_b64_qd2",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 2,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "clip_b64_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "unet_b64_qd4",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 4,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "clip_b64_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 67108864,
+        "block_mib": 64,
+        "cell_id": "unet_b64_qd8",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 8,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "clip_b128_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "unet_b128_qd1",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 1,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "clip_b128_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "unet_b128_qd2",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 2,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "clip_b128_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "unet_b128_qd4",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 4,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "clip_b128_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "cell_id": "unet_b128_qd8",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 8,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "clip_b256_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "unet_b256_qd1",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 1,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\07_pure_source_proof_runs\\clip_b256_qd2_R1.json",
+            "attempt_id": "clip_b256_qd2_R1",
+            "campaign_index": 1,
+            "error": null,
+            "finished_at": "2026-09-05T00:10:47.081720+00:00",
+            "round": 1,
+            "started_at": "2026-09-05T00:10:35.027234+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "clip_b256_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\07_pure_source_proof_runs\\unet_b256_qd2_R1.json",
+            "attempt_id": "unet_b256_qd2_R1",
+            "campaign_index": 2,
+            "error": null,
+            "finished_at": "2026-09-05T00:16:02.343901+00:00",
+            "round": 1,
+            "started_at": "2026-09-05T00:10:35.030235+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "unet_b256_qd2",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 2,
+        "role": "unet",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "clip_b256_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "unet_b256_qd4",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 4,
+        "role": "unet",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "clip_b256_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "PENDING"
+      },
+      {
+        "attempts": [],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "cell_id": "unet_b256_qd8",
+        "model": "z_image_turbo_bf16.safetensors",
+        "qd": 8,
+        "role": "unet",
+        "status": "PENDING"
+      }
+    ],
+    "eligibility_arm": "source_only",
+    "historical_integrated_arms": [
+      "static_e27",
+      "fastsafe"
+    ],
+    "phase": "phase_2_source_only",
+    "schedule": [
+      {
+        "campaign_index": 1,
+        "cell_id": "clip_b256_qd2",
+        "round": 1
+      },
+      {
+        "campaign_index": 2,
+        "cell_id": "unet_b256_qd2",
+        "round": 1
+      }
+    ],
+    "status": "RUNNING",
+    "target_rounds": 1,
+    "updated_at": "2026-09-05T00:16:02.346903+00:00",
+    "version": 2
+  }
+}

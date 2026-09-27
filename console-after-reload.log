@@ -1,0 +1,201 @@
+Total messages: 164 (Errors: 90, Warnings: 44)
+Returning 186 messages for level "info"
+
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_04912485_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_05022fd1_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.8220646909147403:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.8220646909147403:0
+[LOG] [KJNodes] Cross-graph Set/Get: frontend native support detected, skipping patch @ http://127.0.0.1:8188/extensions/ComfyUI-KJNodes/js/setgetnodes.js:1585
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [LATENT] for id [92] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1109] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1110] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1112] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1114] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1116] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1118] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1120] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1122] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [HOOKS] for id [1011] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [IMAGE] for id [164] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[WARNING] [ExecutableNodeDTO.resolveOutput] No input types match type [IMAGE] for id [1167] slot [0] ExecutableNodeDTO @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://127.0.0.1:8188/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_04912485_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_05022fd1_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/user.css:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/user.css:0
+[WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[WARNING] [ComfyUI] The legacy queue/history menu is deprecated. Core functionality in this menu may break at any time. Issues and feature requests related to the legacy menu will not be addressed. To switch to the new menu: Settings → search "Use new menu" → change from "Disabled" to "Top". @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:161
+[ERROR] ComfyApp graph accessed before initialization @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:177
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata?dir=subgraphs&recurse=true&split=false&full_info=true:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/comfy.templates.json:0
+[WARNING] Extension pysssss.SnapToGrid is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/extensions/core/clipspace.js:0
+[WARNING] Extension pysssss.FaviconStatus is disabled. @ http://127.0.0.1:8188/assets/useCopyToClipboard-CFKSU8bA.js:0
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-east1-composition/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-agent2/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-vae-snapshot-seed/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-aws-rtx6000/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-sub13-diagnostic/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-persistent-modal-handle/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-agent3/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-vae-runtime-path/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-teardown-billing-tail/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-restore-structure/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-persistent-submission-v2/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-c1-c5-c6-c8-tail/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-agent1-full-trace/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.settings' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-exact-clip-conditioning-cache/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-dc8/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[LOG] [comfymodal.testing] extension module imported @ http://127.0.0.1:8188/extensions/comfyui-modal-pagesfile-probe/modal-testing.js:99
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfymodal.testing-suite' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] [vite:preloadError] {url: null, fileType: unknown, chunkName: null, message: Extension named 'comfyui.modal.comparison' already registered.} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[WARNING] [ComfyUI Notice] "scripts/widgets.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/widgets.js:1
+[WARNING] [ComfyUI Deprecated] Importing from "scripts/ui.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui.js:1
+[ERROR] [vite:preloadError] {url: http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-sam-editor.js, fileType: js, chunkName: impact-sam-editor, message: Failed to fetch dynamically imported module: http:…tensions/ComfyUI-Impact-Pack/impact-sam-editor.js} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[WARNING] [ComfyUI Notice] "scripts/pnginfo.js" is an internal module, not part of the public API. Future updates may break this import. @ http://127.0.0.1:8188/scripts/pnginfo.js:1
+[WARNING] [ComfyUI Deprecated] Importing from "extensions/core/groupNode.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/extensions/core/groupNode.js:1
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/lm/settings:0
+[WARNING] [MaskEditor] ComfyApp.open_maskeditor is deprecated. Plugins should migrate to using the command system or direct node context menu integration. @ http://127.0.0.1:8188/assets/core-CNtDlct3.js:2
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:ImpactSchedulerAdapter:scheduler is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:AnyToText|LP:any_value is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on required input custom_nodes.comfyui-workflow-encrypt:Delay|LP:input is deprecated. Please drop the defaultInput option. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:PipeIn|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any1 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any2 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any3 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any4 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] Use of defaultInput on optional input custom_nodes.comfyui-workflow-encrypt:Pipe|LP:any5 is deprecated. Please use forceInput instead. @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:1
+[WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.GraphArrange")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[WARNING] %c[DEPRECATED]%c Monkey-patching getNodeMenuOptions is deprecated. (Extension: "comfyui.modal.comparison")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[LOG] [comfyui-modal] Extension loaded. Setting up progress bar & patching fetchApi... @ http://127.0.0.1:8188/extensions/comfyui-modal-vae-runtime-path/modal-node.js:27
+[LOG] [comfyui-modal] fetchApi patched. All /prompt POST requests -> Modal GPU. @ http://127.0.0.1:8188/extensions/comfyui-modal-vae-runtime-path/modal-node.js:27
+[LOG] [comfyui-modal] Production mode extension loaded. @ http://127.0.0.1:8188/extensions/comfyui-modal-vae-runtime-path/modal-node.js:27
+[LOG] [comfymodal.testing] extension setup starting @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:528
+[LOG] [comfymodal.testing] api bootstrap status: ready @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:540
+[LOG] [comfymodal.testing] sidebar tab registered @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:560
+[LOG] [comfymodal.testing] modal host mounted @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:224
+[LOG] [comfymodal.testing] extension setup complete @ http://127.0.0.1:8188/extensions/comfyui-modal-memory-regression-fix/modal-testing.js:592
+[WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "pysssss.NodeFinder")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[WARNING] %c[DEPRECATED]%c Monkey-patching getCanvasMenuOptions is deprecated. (Extension: "rgthree.QueueNode")
+Please use the new context menu API instead.
+
+See: https://docs.comfy.org/custom-nodes/js/context-menu-migration color: orange; font-weight: bold color: inherit @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:2
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/pysssss/autocomplete:0
+[WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/button.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/button.js:1
+[LOG] LoRA Manager: using actionBarButtons API (frontend version >= 1.33.9) @ http://127.0.0.1:8188/extensions/comfyui-lora-manager/top_menu_extension.js:164
+[WARNING] [ComfyUI Deprecated] Importing from "scripts/ui/components/buttonGroup.js" is deprecated and will be removed in v1.34. @ http://127.0.0.1:8188/scripts/ui/components/buttonGroup.js:1
+[LOG] Empty components: policy ignored @ http://127.0.0.1:8188/extensions/comfyui-manager/components-manager.js:769
+[WARNING] widget.inputEl is deprecated. Use widget.element instead. undefined @ http://127.0.0.1:8188/assets/api-Bo77DmmK.js:1
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_sdccd_00003_.png&type=temp&subfolder=&rand=0.8700225303784748:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_sdccd_00004_.png&type=temp&subfolder=&rand=0.2336594318531625:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_kaupx_00027_.png&type=temp&subfolder=&rand=0.9643628753522745:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_kaupx_00028_.png&type=temp&subfolder=&rand=0.009572729445437744:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_hools_00009_.png&type=temp&subfolder=&rand=0.939664086995029:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_hools_00010_.png&type=temp&subfolder=&rand=0.3288849112092421:0
+[WARNING] Unsupported color format in color palette: transparent @ http://127.0.0.1:8188/assets/colorUtil-CvxAanvW.js:0
+[WARNING] Unsupported color format in color palette: transparent @ http://127.0.0.1:8188/assets/colorUtil-CvxAanvW.js:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.32102597939601296:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.5238334769242304:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.32102597939601296:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.5238334769242304:0
+[LOG] [FL_WF_Agent] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/wip/fl_wf_agent.js:817
+[LOG] [FL_JS] Event added. @ http://127.0.0.1:8188/extensions/comfyui_fill-nodes/nodes/utility/fl_js.js:670
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_04912485_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_05022fd1_107_b_0.png:0

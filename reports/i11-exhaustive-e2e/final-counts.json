@@ -1,0 +1,65 @@
+{
+  "generated_at": "2026-08-27T05:42:08.120Z",
+  "python": {
+    "run": 2133,
+    "fail": 0,
+    "error": 0,
+    "skip": 0,
+    "note": "Python lane unchanged by I11 (frontend-only). Baseline re-verified via --skip-node lane in I10."
+  },
+  "node_unit": {
+    "files": 30,
+    "run": 30,
+    "fail": 0,
+    "note": "30 Node unit files (I10). No new Node unit added in I11."
+  },
+  "fake_playwright": {
+    "files": 35,
+    "tests": 283,
+    "prev": 275,
+    "added": 8,
+    "spec_added": "studio-fake-i11-gaps.spec.mjs (8 tests)"
+  },
+  "surfaces": {
+    "total": 246,
+    "by_domain": {
+      "SHELL": 13,
+      "ROUTING": 24,
+      "PLAYGROUND": 33,
+      "HISTORY": 35,
+      "COMPARE": 16,
+      "WORKFLOWS": 24,
+      "MODEL_LIBRARY": 14,
+      "PORTABILITY": 11,
+      "BACKEND": 22,
+      "SETTINGS": 17,
+      "CROSS_TAB": 14,
+      "CANVAS_COMPAT": 8,
+      "COMPATIBILITY_API": 15
+    },
+    "by_disposition": {
+      "E2E_COVERED": 226,
+      "LOWER_LEVEL_ONLY_JUSTIFIED": 3,
+      "OUT_OF_SCOPE_EXPLICIT": 4,
+      "RETIRED_UNREACHABLE": 13
+    },
+    "UNKNOWN": 0,
+    "unmapped_interactive_controls": 0,
+    "unclassified_source_actions": 0
+  },
+  "runtime_inventory": {
+    "pages": 6,
+    "total_controls": 265
+  },
+  "source_inventory": {
+    "approx_controls": 441
+  },
+  "coverage": {
+    "E2E_COVERED": 226,
+    "COVERED_BY_PARENT_FLOW": 0,
+    "LOWER_LEVEL_ONLY_JUSTIFIED": 3,
+    "RETIRED_UNREACHABLE": 13,
+    "OUT_OF_SCOPE_EXPLICIT": 4,
+    "TIER3_REQUIRES_AUTHORIZATION": 0
+  }
+}

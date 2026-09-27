@@ -1,0 +1,415 @@
+[v2.host] python_first_line_wall_unix_ns=1786900686844602900
+[v2.conditioning_cache_nonce] nonce=d96c9bee-8f4a-4a21-a27c-589962df3723
+[v2.harness] node_registry_preload_skipped store_generation_entry=yes
+{"guard": {"allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768, "changed_axes": []}, "runtime_shape": {"cpu_request": 12, "malloc_arena_max": null, "memory_request": 32768, "mkl_num_threads": null, "numexpr_num_threads": null, "omp_num_threads": null, "openblas_num_threads": null, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "snapshot_model_order": "O0", "thread_policy": "TBASE", "torch_interop_threads": null, "torch_intraop_threads": null}}
+[v2.harness] registry_load=skipped store_hit=yes
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[v2.plan_proof] schema=1 payload=yes validated=True outputs=2 wf_hash=2e43d4c0ba3b82c0 dep_complete=True reg_proof=1 memo=hit
+cpu_snapshot_unet_mode=reuse
+[v2.benchmark] phase=execute_plan_start
+[active_profile.publish] decision=skipped_inherit_noop requested=inherit container_default=inherit cpu_model_snapshot=0 snapshot_build_phase=0 consumer_requires_publication=0 checker_remote=0 setter_remote=0 active_profile_noop_ms=0.0
+[v2.restore_publish] skipped reason=flag_disabled
+[v2.seed_build] source=invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=2e43d4c0ba3b82c0 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.local_submission_breakdown.pre_dispatch] request_id=v2-benchmark-0-778b3cc0d522 local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=78.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=78.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=19883 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.local_handle] owner_ready pid=21248
+[v2.local_handle] decision=persistent_hit
+[v2.local_submission_breakdown] request_id=v2-benchmark-0-778b3cc0d522 local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=78.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=0.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=78.0 generator_create_ms=0.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=78.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=19883 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.request_origin] request_id=v2-benchmark-0-778b3cc0d522 trigger_source=benchmark local_prompt_enqueued_unix_ns=None local_prompt_ack_ready_unix_ns=None modal_generator_created_unix_ns=1786900687242027200 modal_submission_attempt_unix_ns=1786900687242027200 modal_first_event_received_unix_ns=1786900697644864700 modal_first_iteration_start_unix_ns=1786900687242027200 modal_first_remote_event_unix_ns=1786900697644864700 dispatch_to_modal_entry_ms=9146.658 local_receive_to_actual_submission_ms=78.0 local_receive_to_result_return_ms=20899.537 t0_to_t1_ms=0.5 t1_to_queue_enqueue_ms=None local_receive_to_enqueue_ms=None queue_wait_before_worker_ms=None plan_build_ms=78.0 active_profile_ms=0.0 handle_lookup_ms=0.0 payload_serialize_ms=0.0 local_residual_ms=0.0 clock_reconciliation_residual_ms=0.0 route_unattributed_ms=None worker_unattributed_ms=None reconciliation_status=incomplete missing_stages=local_receive_to_enqueue_ms overlap_error= modal_input_id=in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0 trigger_to_local_receive_ms=0.5 local_receive_to_generator_create_start_ms=76.529 generator_create_ms=2.999 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=10402.838 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=1701.953 restore_end_to_modal_method_entry_ms=899.455 modal_method_entry_to_executor_ms=1282.312 submission_to_remote_python_resume_ms=6545.25 unexplained_pre_remote_ms=7801.43
+[v2.remote_request_origin] request_id=v2-benchmark-0-778b3cc0d522 trigger_source=benchmark ui_trigger_unix_ms=1786900687162 local_receive_wall_unix_ns=1786900687162499584 local_receive_mono_ns=11027765000000 modal_generator_create_start_wall_unix_ns=1786900687239028400 modal_generator_create_start_mono_ns=11027843000000 modal_generator_created_wall_unix_ns=1786900687242027200 modal_generator_created_mono_ns=11027843000000 modal_first_iteration_start_wall_unix_ns=1786900687242027200 modal_first_iteration_start_mono_ns=11027843000000 modal_submission_attempt_wall_unix_ns=1786900687242027200 modal_submission_attempt_mono_ns=11027843000000 modal_first_remote_event_wall_unix_ns=1786900697644864700 modal_first_remote_event_mono_ns=11038250000000 modal_submission_boundary_source=first_iteration_proxy remote_python_resume_wall_unix_ns=1786900693787277568 restore_method_start_wall_unix_ns=1786900693787277568 restore_method_end_wall_unix_ns=1786900695489230592 modal_method_entry_wall_unix_ns=1786900696388685568 prompt_executor_invoke_start_wall_unix_ns=1786900697670997248 trigger_to_local_receive_ms=0.5 local_receive_to_generator_create_start_ms=76.529 generator_create_ms=2.999 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=10402.838 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=1701.953 restore_end_to_modal_method_entry_ms=899.455 modal_method_entry_to_executor_ms=1282.312 submission_to_remote_python_resume_ms=6545.25 unexplained_pre_remote_ms=7801.43 modal_input_id=in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0
+[v2.local_submission_breakdown.final] request_id=v2-benchmark-0-778b3cc0d522 local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=78.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=0.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=78.0 generator_create_ms=0.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=78.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=19883 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent modal_submission_attempt_unix_ns=1786900687242027200 modal_generator_created_unix_ns=1786900687242027200 modal_first_iteration_start_unix_ns=1786900687242027200 modal_first_remote_event_unix_ns=1786900697644864700 dispatch_to_modal_entry_ms=9146.658 local_receive_to_actual_submission_ms=78.0 local_receive_to_result_return_ms=20899.537
+WATERFALL RECONCILIATION (local rebuild) replaced remote PARTIAL report with the full host-reconciled report
+WATERFALL RECONCILIATION (local rebuild)
+  command_to_response_ms            20913.0
+  top_level_accounted_ms            19004.5
+  global_residual_ms                -2.2
+  global_residual_pct               -0.0
+  reconciliation_status             OK
+  controllable_application_wall_ms  14290.0
+  platform_wall_ms                  6545.3
+  modal_restore_begin_unavailable   no
+  OLD vs NEW accounted_ms 14290.0 -> 19004.5 | residual_ms -2.2 -> -2.2
+production_adjusted_total_wall_ms=absent
+[v2.experiment] saved=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-16_17-18-07\run_001_sample.json
+{"run_index": 0, "request_id": "v2-benchmark-0-778b3cc0d522", "identity": {"app_name": "stable-modal-comfy-v2-shadow", "class_name": "ModalRuntimeEntrypoint", "method_name": "run_plan_stream", "gpu": ["RTX-PRO-6000"], "cpu": 12, "memory_mb": 32768, "fingerprint": "15be29af7deb809fd93ae64a2a37c6854f5c6735d191b2b063a5fcbd704ed71e", "runtime_shape": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "stored_snapshot_model_order": "O0", "restore_count": 1, "request_count": 1, "restored_instance_id": "b5b3fc1476604c40aa39d2bb40974350", "restore_session_id": "c0d7634483f246f1948bc26726afae42", "container_task_id": "ta-01M05S9ATQHSYMZT99KB8PW4PR", "modal_container_id": "", "image_id": "im-Z3hBG3elYnLtnl8O93ojIA", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east4", "modal_input_id": "in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0", "container_session_id": "2479fbb94a064950"}, "runtime_shape": {"requested": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "deployed": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "observed": {"stage": "request_entry", "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "thread_policy": "TBASE", "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "native_thread_count": 52, "configured_omp": null, "configured_mkl": null, "configured_openblas": null, "configured_numexpr": null, "malloc_arena_max": null, "native_library_settings": {"OMP_NUM_THREADS": "12", "MKL_NUM_THREADS": "12", "OPENBLAS_NUM_THREADS": "12", "NUMEXPR_NUM_THREADS": null, "MALLOC_ARENA_MAX": null}, "torch_intraop_threads": 12, "torch_interop_threads": 14, "actual_torch_intraop_threads": 12, "actual_torch_interop_threads": 14, "requested_torch_intraop_threads": null, "requested_torch_interop_threads": null, "requested_vs_actual_match": true, "status": "baseline_passthrough", "error": "", "trace_id": "6a8133b33d2644f8", "pid": 2, "thread_native_id": 2, "restored_instance_id": "b5b3fc1476604c40aa39d2bb40974350", "restore_session_id": "c0d7634483f246f1948bc26726afae42", "legacy_container_session_id": "2479fbb94a064950", "container_task_id": "ta-01M05S9ATQHSYMZT99KB8PW4PR", "modal_input_id": "in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0", "image_id": "im-Z3hBG3elYnLtnl8O93ojIA", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east4", "app_name": "stable-modal-comfy-v2-shadow", "class_name": "ModalRuntimeEntrypoint"}, "stored_snapshot_model_order": "O0", "snapshot_target_fingerprint": "15be29af7deb809fd93ae64a2a37c6854f5c6735d191b2b063a5fcbd704ed71e", "guard": {"changed_axes": [], "allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768}, "construction_order_semantics": "model_construction_order_only"}, "timing": {"wall_ms": 20841.3, "handle_lookup_ms": 2.999, "submission_to_first_remote_event_ms": 10402.837, "command_to_response_ms": 20913.0, "submit2entry_ms": 9149.657, "t3b_to_t8_ms": 7477.528, "restore_total_ms": 1695.675, "pre_sampler_ms": 2478.775, "sampler_ms": 3674.721, "vae_decode_ms": 384.255, "output_collection_ms": 7.453, "snapshot_callback_age_at_restore_ms": 245186192.057, "snapshot_callback_to_command_start_ms": 245179566.349, "command_start_to_restore_start_ms": 6625.278, "local_timing": {"t0_to_t1_ms": 0.5, "t1_to_queue_enqueue_ms": null, "local_receive_to_enqueue_ms": null, "local_body_read_ms": null, "local_json_parse_ms": null, "local_preflight_ms": null, "local_queue_lock_wait_ms": null, "local_queue_enqueue_ms": null, "queue_wait_before_worker_ms": null, "plan_build_ms": 78.0, "active_profile_ms": 0.0, "restore_plan_build_ms": null, "restore_publish_ms": null, "handle_lookup_ms": 0.0, "payload_serialize_ms": 0.0, "payload_materialization_ms": 0.0, "payload_size_measurement_ms": 0.0, "generator_create_ms": 2.999, "local_residual_ms": 0.0, "clock_reconciliation_residual_ms": 0.0, "route_unattributed_ms": null, "worker_unattributed_ms": null, "reconciliation_status": "incomplete", "missing_stages": ["local_receive_to_enqueue_ms"], "overlap_error": "", "stage_attribution_residual_ms": {"route_unattributed_ms": null, "worker_unattributed_ms": null, "missing_stages": ["local_receive_to_enqueue_ms"], "reconciliation_status": "incomplete", "overlap_error": ""}, "local_receive_to_generator_create_ms": 78.0, "generator_create_to_first_iteration_ms": 0.0, "first_iteration_to_first_remote_event_ms": 10402.838, "local_receive_to_actual_submission_ms": 78.0, "trigger_to_local_receive_ms": 0.5, "local_receive_to_generator_create_start_ms": 76.529, "generator_created_to_first_iteration_ms": 0.0, "remote_python_resume_to_restore_start_ms": 0.0, "restore_method_ms": 1701.953, "restore_end_to_modal_method_entry_ms": 899.455, "modal_method_entry_to_executor_ms": 1282.312, "submission_to_remote_python_resume_ms": 6545.25, "unexplained_pre_remote_ms": 7801.43, "local_result_received_wall_ns": 1786900708062036400, "local_result_received_mono_ns": 11048671000000, "local_receive_to_result_return_ms": 20899.537, "result_received_to_return_ms": 12.997, "remote_result_emit_wall_unix_ns": 1786900705200902916, "remote_result_emit_to_local_receipt_ms": 2861.133, "caller_return_wall_unix_ns": 1786900708075033700, "caller_return_mono_ns": 11048687000000, "local_result_received_to_caller_return_ms": 16.0, "modal_restore_begin_wall_unix_ns": null}, "restore_breakdown": {"restore_total_ms": 1695.675, "snapshot_callback_age_at_restore_ms": 245186192.057, "models_symlink_ms": 4.0, "manager_offline_ms": 0.91, "reload_models_ms": 122.205, "reload_runtime_state_ms": 963.232, "v2_startup_custom_node_source_copy_ms": 1913.67, "sync_custom_nodes_ms": 1913.82, "install_requirements_ms": 0.02, "v2_startup_comfyui_path_startup_ms": 0.37, "comfyui_path_setup_ms": 0.52, "v2_startup_backend_startup_ms": 23643.61, "backend_startup_ms": 23644.29, "observe_generations_ms": 0.24, "snapshot_restore_ms": 1639.05, "restore_gpu_state_ms": 543.506, "cuda_init_ms": 4.85, "v2_startup_snapshot_execution_seed_ms": 3.37, "initialize_cuda_ms": 4.801, "snapshot_identity_checks_ms": 0.0, "cpu_snapshot_retargeting_ms": 0.0, "folder_warm_ms": 4365.442}, "early_activation_total_ms": null, "queue_delay_ms": null, "cpu_snapshot_wait_ms": null, "dtype_layout_preparation_ms": null, "post_load_bookkeeping_ms": null, "submission_to_remote_python_resume_ms": 6545.25, "remote_python_resume_to_restore_start_ms": 0.0, "restore_to_method_entry_ms": 899.455, "method_entry_to_first_remote_event_ms": 1256.179, "first_remote_event_to_final_result_ms": 10417.172, "transfer_queue_delay_ms": 1.83, "synchronized_transfer_ms": 1214.76, "quiesce_wait_ms": null, "graph_activity_ms": 381.057, "sampler_lane_wait_ms": 796.211, "quiesced_transfer": null}}
+WATERFALL (host-reconciled)
+V2 COLD WATERFALL - run 1 (local reconcile)
+Request:   v2-benchmark-0-778b3cc0d522 | Instance: b5b3fc1476604c40aa39d2bb40974350 | Fresh: YES
+Platform:  GCP/us-east4 | GPU: RTX PRO 6000 Blackwell | VRAM 97,250 MiB | CUDA 13.0 | CC 12.0
+
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   # | Stage                                          |   Duration |       Cum. |        % | Relative wall (non-scheduling)           |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   1 | Modal pre-Python snapshot restoration          |     4.715s |     4.715s |  24.811% | ##########                               |
+|   2 | Python/application restore                     |     1.702s |     6.417s |   8.956% | ####                                     |
+|   3 | Restore-to-method entry                        | 899.452 ms |     7.316s |   4.733% | ##                                       |
+|   4 | Remote method setup                            |     1.282s |     8.598s |   6.748% | ###                                      |
+|     |   method entry to graph start                  |     1.185s |            |          |                                          |
+|     |   method entry to runtime configuration        |     1.185s |            |          |                                          |
+|     |   graph setup                                  |  96.850 ms |            |          |                                          |
+|     |   certificate                                  |  71.036 ms |            |          |                                          |
+|     |   UNET synchronized transfer                   |     1.215s |            |          |                                          |
+|   5 | PromptExecutor/cache setup                     | 224.452 ms |     8.823s |   1.181% | #                                        |
+|     |   cached to first node                         | 216.684 ms |            |          |                                          |
+|   6 | Pre-sampler execution                          | 156.489 ms |     8.979s |   0.824% | #                                        |
+|     |   Conditioning cache exact_hit lookup=9.805ms  |   9.805 ms |            |          |                                          |
+|     |   CLIP encode skipped (cache hit)              |          - |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  68.977 ms |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  67.009 ms |            |          |                                          |
+|     |   Node: ClownsharKSampler_Beta                 | 882.975 ms |            |          |                                          |
+|   7 | Sampler node to sampling                       | 874.952 ms |     9.854s |   4.604% | ##                                       |
+|     |   sampler lane wait                            | 796.211 ms |            |          |                                          |
+|     |   sampler node to lane acquired                | 796.240 ms |            |          |                                          |
+|     |   lane acquired to actual stage                |  78.853 ms |            |          |                                          |
+|   8 | Sampling                                       |     4.898s |    14.752s |  25.775% | ##########                               |
+|   9 | Post-sampling / VAE transition                 | 759.804 ms |    15.512s |   3.998% | ##                                       |
+|  10 | VAE decode                                     | 384.255 ms |    15.896s |   2.022% | #                                        |
+|     |   VAE load/H2D                                 | 795.039 ms |            |          |                                          |
+|  11 | Output encode / descriptor                     | 231.309 ms |    16.127s |   1.217% | #                                        |
+|     |   PNG encode                                   | 168.868 ms |            |          |                                          |
+|  12 | Remote result handoff                          |     2.861s |    18.989s |  15.057% | ######                                   |
+|  13 | Local result handling / caller return          |  16.000 ms |    19.005s |   0.084% | #                                        |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|     | RECONCILIATION                                 |  -2.201 ms |            |          |                                          |
+|     | STATUS                                         |         OK |            |          |                                          |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+COMMAND -> RESPONSE:                     20.913s
+Command (without scheduling) -> Response:   19.002s
+Scheduling time:                          1.911s
+[v2.prompt_executor_breakdown] request_id=v2-benchmark-0-778b3cc0d522 exec_to_cached_ms=7.348 dynamic_prompt_ms=0.003 is_changed_ms=absent signature_keys_ms=absent seed_apply_ms=0.327 clean_unused_ms=0.031 cache_gather_ms=0.103 cleanup_gc_ms=0.984 residual_ms=5.9 c2f_cached_to_first_node_ms=216.684 c2f_topo_walk_ms=216.59 c2f_topo_input_info_ms=216.118 c2f_topo_other_ms=0.472 c2f_stage_ms=0.891 c2f_first_node_prefix_ms=0.094 c2f_residual_ms=-0.891 signature_cache_eligible=True signature_cache_fallback= signature_cache_hit=True signature_cache_key_hash=c14132f9f28027af2f2de527da4f19ed6b96f795351b201629ce621951662e11 signature_cache_requested=True signature_cache_source=volume signature_reuse_ms=3.097
+[v2.conditioning_exact_hit_breakdown] request_id=v2-benchmark-0-778b3cc0d522 decision=exact_hit lookup_wall_ms=9.805 total_ms=9.6 key_build_ms=0.228 lock_wait_ms=0.001 manifest_read_ms=0.0 manifest_bytes=0 manifest_entries=63 entry_lookup_ms=6.118 header_bytes=3752 data_bytes=2900184 lru_touch_ms=2.869 lru_touch_mode=sync children_ms=9.216 residual_ms=0.384 entries_requested=1 hit_count=1 lru_async_batch_size=0 lru_async_batches=0 lru_async_dropped=0 lru_async_enqueued=0 lru_async_failed=0 lru_async_flush_count=0 lru_async_persist_ms=0.0 manifest_memory_hit=1 miss_count=0 normal_lookup_fallback=0 payload_memory_hit=1 payload_memory_source=key_hit prefetch_join_ms=5.493 prefetch_join_timeout=0 prefetch_overlap_ms=14.776 prefetch_payload_entries=3 prefetch_reason=key_build_partial:weight_dtype prefetch_reload=skipped_first prefetch_requested=1 prefetch_source=full prefetch_wall_ms=45.53 volume_reload_ms=0.0
+[v2.folder_warm] request_id=v2-benchmark-0-778b3cc0d522 folder_warm_ms=4365.442 folder_warm_folders=29
+[v2.input_types_warm] request_id=v2-benchmark-0-778b3cc0d522 input_types_warm_ms=267.964 input_types_warm_classes=31
+[v2.png_output] request_id=v2-benchmark-0-778b3cc0d522 compress_level=1 png_encode_ms=168.862 png_compress_ms=161.919 width=1088 height=1920 bytes=3129718 sha=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+[v2.host_submission_breakdown] request_id=v2-benchmark-0-778b3cc0d522 command_start_to_python_first_line_ms=absent python_first_line_to_local_receive_ms=317.897 local_receive_to_registry_start_ms=absent node_registry_init_ms=absent registry_end_to_worker_start_ms=absent node_registry_preload_ms=absent worker_start_to_plan_build_start_ms=0.0 plan_build_ms=78.0 plan_build_to_transport_entry_ms=5.007 transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=2.999 payload_serialize_ms=0.0 generator_create_ms=2.999 generator_created_to_submission_ms=0.0 local_receive_to_submission_ms=78.0 submission_boundary_source=first_anext first_remote_signal_ms=10402.838 scheduling_ms=1830.665 scheduling_source=modal_app_log user_equivalent_trigger_to_modal_submission_ms=absent
+[v2.trigger_to_submission] request_id=v2-benchmark-0-778b3cc0d522 benchmark_iteration_selected_to_local_worker_submit_ms=0.0 local_worker_submit_to_worker_start_ms=0.0 worker_start_to_plan_build_start_ms=0.0 plan_build_ms=78.0 plan_build_end_to_modal_handle_ready_ms=0.0 modal_handle_ready_to_modal_submission_attempt_ms=invalid_negative intentional_cold_wait_before_run_ms=absent trigger_to_submission_ms=78.0 measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete
+[v2.user_trigger] request_id=v2-benchmark-0-778b3cc0d522 process_start_to_response_ms=21230.431 user_equivalent_trigger_to_response_ms=absent user_equivalent_trigger_to_modal_submission_ms=absent registry_store_hit=True registry_load_ms=0.0
+{
+  "output_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-16_17-18-07",
+  "target": {
+    "app_name": "stable-modal-comfy-v2-shadow",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "gpu": "rtx-pro-6000"
+  },
+  "runtime_shape": {
+    "requested": {
+      "thread_policy": "TBASE",
+      "torch_intraop_threads": null,
+      "torch_interop_threads": null,
+      "omp_num_threads": null,
+      "mkl_num_threads": null,
+      "openblas_num_threads": null,
+      "numexpr_num_threads": null,
+      "malloc_arena_max": null,
+      "snapshot_model_order": "O0",
+      "cpu_request": 12,
+      "memory_request": 32768,
+      "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+      "runtime_shape_label": null
+    },
+    "guard": {
+      "changed_axes": [],
+      "allow_multi_axis": false,
+      "baseline_cpu_request": 12,
+      "baseline_memory_request": 32768
+    }
+  },
+  "run_count": 1,
+  "gap_seconds": 20.0,
+  "node_registry_preload_ms": 0.0,
+  "intentional_cold_waits": [],
+  "trace_handoff_errors": 0,
+  "waterfall_runs": 1,
+  "runs": [
+    {
+      "run_index": 0,
+      "request_id": "v2-benchmark-0-778b3cc0d522",
+      "identity": {
+        "app_name": "stable-modal-comfy-v2-shadow",
+        "class_name": "ModalRuntimeEntrypoint",
+        "method_name": "run_plan_stream",
+        "gpu": [
+          "RTX-PRO-6000"
+        ],
+        "cpu": 12,
+        "memory_mb": 32768,
+        "fingerprint": "15be29af7deb809fd93ae64a2a37c6854f5c6735d191b2b063a5fcbd704ed71e",
+        "runtime_shape": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+        "runtime_shape_label": null,
+        "stored_snapshot_model_order": "O0",
+        "restore_count": 1,
+        "request_count": 1,
+        "restored_instance_id": "b5b3fc1476604c40aa39d2bb40974350",
+        "restore_session_id": "c0d7634483f246f1948bc26726afae42",
+        "container_task_id": "ta-01M05S9ATQHSYMZT99KB8PW4PR",
+        "modal_container_id": "",
+        "image_id": "im-Z3hBG3elYnLtnl8O93ojIA",
+        "cloud": "CLOUD_PROVIDER_GCP",
+        "region": "us-east4",
+        "modal_input_id": "in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0",
+        "container_session_id": "2479fbb94a064950"
+      },
+      "runtime_shape": {
+        "requested": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "deployed": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "observed": {
+          "stage": "request_entry",
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null,
+          "thread_policy": "TBASE",
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "native_thread_count": 52,
+          "configured_omp": null,
+          "configured_mkl": null,
+          "configured_openblas": null,
+          "configured_numexpr": null,
+          "malloc_arena_max": null,
+          "native_library_settings": {
+            "OMP_NUM_THREADS": "12",
+            "MKL_NUM_THREADS": "12",
+            "OPENBLAS_NUM_THREADS": "12",
+            "NUMEXPR_NUM_THREADS": null,
+            "MALLOC_ARENA_MAX": null
+          },
+          "torch_intraop_threads": 12,
+          "torch_interop_threads": 14,
+          "actual_torch_intraop_threads": 12,
+          "actual_torch_interop_threads": 14,
+          "requested_torch_intraop_threads": null,
+          "requested_torch_interop_threads": null,
+          "requested_vs_actual_match": true,
+          "status": "baseline_passthrough",
+          "error": "",
+          "trace_id": "6a8133b33d2644f8",
+          "pid": 2,
+          "thread_native_id": 2,
+          "restored_instance_id": "b5b3fc1476604c40aa39d2bb40974350",
+          "restore_session_id": "c0d7634483f246f1948bc26726afae42",
+          "legacy_container_session_id": "2479fbb94a064950",
+          "container_task_id": "ta-01M05S9ATQHSYMZT99KB8PW4PR",
+          "modal_input_id": "in-01M05S9AEK5W7TEJZ82Z1TJWEY:1786900687316-0",
+          "image_id": "im-Z3hBG3elYnLtnl8O93ojIA",
+          "cloud": "CLOUD_PROVIDER_GCP",
+          "region": "us-east4",
+          "app_name": "stable-modal-comfy-v2-shadow",
+          "class_name": "ModalRuntimeEntrypoint"
+        },
+        "stored_snapshot_model_order": "O0",
+        "snapshot_target_fingerprint": "15be29af7deb809fd93ae64a2a37c6854f5c6735d191b2b063a5fcbd704ed71e",
+        "guard": {
+          "changed_axes": [],
+          "allow_multi_axis": false,
+          "baseline_cpu_request": 12,
+          "baseline_memory_request": 32768
+        },
+        "construction_order_semantics": "model_construction_order_only"
+      },
+      "timing": {
+        "wall_ms": 20841.3,
+        "handle_lookup_ms": 2.999,
+        "submission_to_first_remote_event_ms": 10402.837,
+        "command_to_response_ms": 20913.0,
+        "submit2entry_ms": 9149.657,
+        "t3b_to_t8_ms": 7477.528,
+        "restore_total_ms": 1695.675,
+        "pre_sampler_ms": 2478.775,
+        "sampler_ms": 3674.721,
+        "vae_decode_ms": 384.255,
+        "output_collection_ms": 7.453,
+        "snapshot_callback_age_at_restore_ms": 245186192.057,
+        "snapshot_callback_to_command_start_ms": 245179566.349,
+        "command_start_to_restore_start_ms": 6625.278,
+        "local_timing": {
+          "t0_to_t1_ms": 0.5,
+          "t1_to_queue_enqueue_ms": null,
+          "local_receive_to_enqueue_ms": null,
+          "local_body_read_ms": null,
+          "local_json_parse_ms": null,
+          "local_preflight_ms": null,
+          "local_queue_lock_wait_ms": null,
+          "local_queue_enqueue_ms": null,
+          "queue_wait_before_worker_ms": null,
+          "plan_build_ms": 78.0,
+          "active_profile_ms": 0.0,
+          "restore_plan_build_ms": null,
+          "restore_publish_ms": null,
+          "handle_lookup_ms": 0.0,
+          "payload_serialize_ms": 0.0,
+          "payload_materialization_ms": 0.0,
+          "payload_size_measurement_ms": 0.0,
+          "generator_create_ms": 2.999,
+          "local_residual_ms": 0.0,
+          "clock_reconciliation_residual_ms": 0.0,
+          "route_unattributed_ms": null,
+          "worker_unattributed_ms": null,
+          "reconciliation_status": "incomplete",
+          "missing_stages": [
+            "local_receive_to_enqueue_ms"
+          ],
+          "overlap_error": "",
+          "stage_attribution_residual_ms": {
+            "route_unattributed_ms": null,
+            "worker_unattributed_ms": null,
+            "missing_stages": [
+              "local_receive_to_enqueue_ms"
+            ],
+            "reconciliation_status": "incomplete",
+            "overlap_error": ""
+          },
+          "local_receive_to_generator_create_ms": 78.0,
+          "generator_create_to_first_iteration_ms": 0.0,
+          "first_iteration_to_first_remote_event_ms": 10402.838,
+          "local_receive_to_actual_submission_ms": 78.0,
+          "trigger_to_local_receive_ms": 0.5,
+          "local_receive_to_generator_create_start_ms": 76.529,
+          "generator_created_to_first_iteration_ms": 0.0,
+          "remote_python_resume_to_restore_start_ms": 0.0,
+          "restore_method_ms": 1701.953,
+          "restore_end_to_modal_method_entry_ms": 899.455,
+          "modal_method_entry_to_executor_ms": 1282.312,
+          "submission_to_remote_python_resume_ms": 6545.25,
+          "unexplained_pre_remote_ms": 7801.43,
+          "local_result_received_wall_ns": 1786900708062036400,
+          "local_result_received_mono_ns": 11048671000000,
+          "local_receive_to_result_return_ms": 20899.537,
+          "result_received_to_return_ms": 12.997,
+          "remote_result_emit_wall_unix_ns": 1786900705200902916,
+          "remote_result_emit_to_local_receipt_ms": 2861.133,
+          "caller_return_wall_unix_ns": 1786900708075033700,
+          "caller_return_mono_ns": 11048687000000,
+          "local_result_received_to_caller_return_ms": 16.0,
+          "modal_restore_begin_wall_unix_ns": null
+        },
+        "restore_breakdown": {
+          "restore_total_ms": 1695.675,
+          "snapshot_callback_age_at_restore_ms": 245186192.057,
+          "models_symlink_ms": 4.0,
+          "manager_offline_ms": 0.91,
+          "reload_models_ms": 122.205,
+          "reload_runtime_state_ms": 963.232,
+          "v2_startup_custom_node_source_copy_ms": 1913.67,
+          "sync_custom_nodes_ms": 1913.82,
+          "install_requirements_ms": 0.02,
+          "v2_startup_comfyui_path_startup_ms": 0.37,
+          "comfyui_path_setup_ms": 0.52,
+          "v2_startup_backend_startup_ms": 23643.61,
+          "backend_startup_ms": 23644.29,
+          "observe_generations_ms": 0.24,
+          "snapshot_restore_ms": 1639.05,
+          "restore_gpu_state_ms": 543.506,
+          "cuda_init_ms": 4.85,
+          "v2_startup_snapshot_execution_seed_ms": 3.37,
+          "initialize_cuda_ms": 4.801,
+          "snapshot_identity_checks_ms": 0.0,
+          "cpu_snapshot_retargeting_ms": 0.0,
+          "folder_warm_ms": 4365.442
+        },
+        "early_activation_total_ms": null,
+        "queue_delay_ms": null,
+        "cpu_snapshot_wait_ms": null,
+        "dtype_layout_preparation_ms": null,
+        "post_load_bookkeeping_ms": null,
+        "submission_to_remote_python_resume_ms": 6545.25,
+        "remote_python_resume_to_restore_start_ms": 0.0,
+        "restore_to_method_entry_ms": 899.455,
+        "method_entry_to_first_remote_event_ms": 1256.179,
+        "first_remote_event_to_final_result_ms": 10417.172,
+        "transfer_queue_delay_ms": 1.83,
+        "synchronized_transfer_ms": 1214.76,
+        "quiesce_wait_ms": null,
+        "graph_activity_ms": 381.057,
+        "sampler_lane_wait_ms": 796.211,
+        "quiesced_transfer": null
+      }
+    }
+  ]
+}
+WATERFALL (host-reconciled)
+V2 COLD WATERFALL - run 1 (local reconcile)
+Request:   v2-benchmark-0-778b3cc0d522 | Instance: b5b3fc1476604c40aa39d2bb40974350 | Fresh: YES
+Platform:  GCP/us-east4 | GPU: RTX PRO 6000 Blackwell | VRAM 97,250 MiB | CUDA 13.0 | CC 12.0
+
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   # | Stage                                          |   Duration |       Cum. |        % | Relative wall (non-scheduling)           |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   1 | Modal pre-Python snapshot restoration          |     4.715s |     4.715s |  24.811% | ##########                               |
+|   2 | Python/application restore                     |     1.702s |     6.417s |   8.956% | ####                                     |
+|   3 | Restore-to-method entry                        | 899.452 ms |     7.316s |   4.733% | ##                                       |
+|   4 | Remote method setup                            |     1.282s |     8.598s |   6.748% | ###                                      |
+|     |   method entry to graph start                  |     1.185s |            |          |                                          |
+|     |   method entry to runtime configuration        |     1.185s |            |          |                                          |
+|     |   graph setup                                  |  96.850 ms |            |          |                                          |
+|     |   certificate                                  |  71.036 ms |            |          |                                          |
+|     |   UNET synchronized transfer                   |     1.215s |            |          |                                          |
+|   5 | PromptExecutor/cache setup                     | 224.452 ms |     8.823s |   1.181% | #                                        |
+|     |   cached to first node                         | 216.684 ms |            |          |                                          |
+|   6 | Pre-sampler execution                          | 156.489 ms |     8.979s |   0.824% | #                                        |
+|     |   Conditioning cache exact_hit lookup=9.805ms  |   9.805 ms |            |          |                                          |
+|     |   CLIP encode skipped (cache hit)              |          - |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  68.977 ms |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  67.009 ms |            |          |                                          |
+|     |   Node: ClownsharKSampler_Beta                 | 882.975 ms |            |          |                                          |
+|   7 | Sampler node to sampling                       | 874.952 ms |     9.854s |   4.604% | ##                                       |
+|     |   sampler lane wait                            | 796.211 ms |            |          |                                          |
+|     |   sampler node to lane acquired                | 796.240 ms |            |          |                                          |
+|     |   lane acquired to actual stage                |  78.853 ms |            |          |                                          |
+|   8 | Sampling                                       |     4.898s |    14.752s |  25.775% | ##########                               |
+|   9 | Post-sampling / VAE transition                 | 759.804 ms |    15.512s |   3.998% | ##                                       |
+|  10 | VAE decode                                     | 384.255 ms |    15.896s |   2.022% | #                                        |
+|     |   VAE load/H2D                                 | 795.039 ms |            |          |                                          |
+|  11 | Output encode / descriptor                     | 231.309 ms |    16.127s |   1.217% | #                                        |
+|     |   PNG encode                                   | 168.868 ms |            |          |                                          |
+|  12 | Remote result handoff                          |     2.861s |    18.989s |  15.057% | ######                                   |
+|  13 | Local result handling / caller return          |  16.000 ms |    19.005s |   0.084% | #                                        |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|     | RECONCILIATION                                 |  -2.201 ms |            |          |                                          |
+|     | STATUS                                         |         OK |            |          |                                          |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+COMMAND -> RESPONSE:                     20.913s
+Command (without scheduling) -> Response:   19.002s
+Scheduling time:                          1.911s
+[v2.experiment] campaign manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-16_17-18-07\campaign_manifest.json

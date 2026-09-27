@@ -1,0 +1,22 @@
+# Exp07 Phase-3 cell: source 256 MiB, H2D extent 128 MiB, depth 2.
+schema_version = 1
+name = "golden_p1_direct_exp07_b256_h2d128_d2"
+extends = "golden_p1"
+owner = "golden-p1"
+
+[target]
+app = "exp-golden-p1-decoupled"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_serial_stream"
+
+[resources]
+cpu = 4
+memory_mb = 8192
+
+[environment]
+COMFYMODAL_GOLDEN_QD_TRANSPORT = "decoupled"
+COMFYMODAL_GOLDEN_SOURCE_QD = "8"
+COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES = "268435456"
+COMFYMODAL_GOLDEN_H2D_COPY_BYTES = "134217728"
+COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH = "2"
+COMFYMODAL_GOLDEN_SOURCE_CAPACITY = "8"

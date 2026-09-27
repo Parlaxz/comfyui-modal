@@ -1,0 +1,39 @@
+﻿run | region | worst src | workers | py_hb | U_main | S_main sched/lat | U_child | S_child sched/lat | class
+| mx-01 | CLOUD_PROVIDER_GCP/us-east4 | 193 | - | - | - | - | - | - | CLEAN |
+| mx-02 | CLOUD_PROVIDER_GCP/europe-west2 | 604 | [0, 1, 2, 3] | 402.5 | 2.0 | 1.0/2.4 | 2.0 | 7.0/6.6 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=235 S_child=235
+| mx-03 | CLOUD_PROVIDER_GCP/us-east | 243 | - | - | - | - | - | - | CLEAN |
+| mx-04 | CLOUD_PROVIDER_GCP/us-west | 199 | - | - | - | - | - | - | CLEAN |
+| mx-05 | CLOUD_PROVIDER_GCP/us-east | 279 | [2] | 134.6 | 2.0 | 0.4/0.1 | 2.4 | 3.6/1.4 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=126 S_child=127
+| mx-06 | CLOUD_PROVIDER_AWS/us-west | 168 | - | - | - | - | - | - | CLEAN |
+| mx-07 | CLOUD_PROVIDER_GCP/us-west | 191 | - | - | - | - | - | - | CLEAN |
+| mx-08 | CLOUD_PROVIDER_AWS/us-west | 171 | - | - | - | - | - | - | CLEAN |
+| mx-09 | CLOUD_PROVIDER_GCP/us-west | 192 | - | - | - | - | - | - | CLEAN |
+| mx-10 | CLOUD_PROVIDER_AWS/us-west | 162 | - | - | - | - | - | - | CLEAN |
+| mx-11 | CLOUD_PROVIDER_OCI/us-chicago-1 | 239 | - | - | - | - | - | - | CLEAN |
+| mx-12 | CLOUD_PROVIDER_AWS/us-west | 358 | [2] | 198.2 | 2.0 | 0.0/0.2 | 2.0 | 0.0/0.2 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=152 S_child=152
+| mx-13 | CLOUD_PROVIDER_UNSPECIFIED/odin | 188 | - | - | - | - | - | - | CLEAN |
+| mx-14 | CLOUD_PROVIDER_UNSPECIFIED/london | 204 | - | - | - | - | - | - | CLEAN |
+| mx-15 | CLOUD_PROVIDER_GCP/us-west | 241 | - | - | - | - | - | - | CLEAN |
+| mx-16 | CLOUD_PROVIDER_GCP/us-west | 279 | [0] | 119.0 | 2.0 | 0.0/0.3 | 2.0 | 0.8/0.4 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=127 S_child=126
+| mx-17 | CLOUD_PROVIDER_GCP/us-west | 143 | - | - | - | - | - | - | CLEAN |
+| mx-18 | CLOUD_PROVIDER_GCP/us-west1 | 234 | - | - | - | - | - | - | CLEAN |
+| mx-19 | CLOUD_PROVIDER_GCP/us-west | 178 | - | - | - | - | - | - | CLEAN |
+| mx-20 | CLOUD_PROVIDER_GCP/us-west1 | 228 | - | - | - | - | - | - | CLEAN |
+| mx-21 | CLOUD_PROVIDER_GCP/us-west | 205 | - | - | - | - | - | - | CLEAN |
+| mx-22 | CLOUD_PROVIDER_GCP/us-west1 | 161 | - | - | - | - | - | - | CLEAN |
+| mx-23 | CLOUD_PROVIDER_GCP/us-west1 | 286 | [2] | 107.8 | 2.0 | 0.0/2.1 | 2.0 | 0.0/0.4 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=129 S_child=129
+| mx-24 | CLOUD_PROVIDER_GCP/us-west | 622 | [1] | 60.3 | 2.0 | 7.1/5.9 | 2.0 | 0.8/3.6 | no python freeze |
+      ticks in episode: S_main=241 S_child=241
+| mx-25 | CLOUD_PROVIDER_GCP/us-east | 277 | [0, 1, 2] | 277.8 | 2.0 | 5.0/2.3 | 2.0 | 8.1/10.7 | CASE C (trivial syscalls healthy everywhere) |
+      ticks in episode: S_main=126 S_child=126
+
+=== clock / syscall separation (whole-run) ===
+  mx-01: monotonic=36.9 ns/call  SYS_gettid(186)=5500.2 ns/call  ratio=149x
+  mx-02: monotonic=37.2 ns/call  SYS_gettid(186)=4458.2 ns/call  ratio=120x
+  mx-03: monotonic=37.1 ns/call  SYS_gettid(186)=5018.5 ns/call  ratio=135x
+  mx-04: monotonic=33.9 ns/call  SYS_gettid(186)=4555.5 ns/call  ratio=134x

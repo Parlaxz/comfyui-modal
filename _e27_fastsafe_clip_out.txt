@@ -1,0 +1,1416 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "probe": "fastsafe_screen",
+ "path": "/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors",
+ "device": "cuda:0",
+ "status": "ok",
+ "file_size_bytes": 8044982048,
+ "cells": [
+  {
+   "index": 0,
+   "label": "CONTROL T16/B1GiB",
+   "threads": 16,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": true,
+   "first_payload_access": true,
+   "cell_wall_ms": 5382.687,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 3066.583,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 2.6234,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 8046772224,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 5382.633,
+    "cpu_wall_ms": 18390.0
+   }
+  },
+  {
+   "index": 1,
+   "label": "T4/B32MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2552.899,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 603.438,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 13.3319,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2552.841,
+    "cpu_wall_ms": 3160.0
+   }
+  },
+  {
+   "index": 2,
+   "label": "T4/B64MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2668.019,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 571.638,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 14.0736,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2667.629,
+    "cpu_wall_ms": 2990.0
+   }
+  },
+  {
+   "index": 3,
+   "label": "T4/B128MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2626.243,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 531.556,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 15.1348,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2626.177,
+    "cpu_wall_ms": 2790.0
+   }
+  },
+  {
+   "index": 4,
+   "label": "T4/B256MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2523.83,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 551.202,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 14.5953,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2523.771,
+    "cpu_wall_ms": 2640.0
+   }
+  },
+  {
+   "index": 5,
+   "label": "T4/B1024MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2501.295,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 547.386,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 14.6971,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2501.239,
+    "cpu_wall_ms": 2710.0
+   }
+  },
+  {
+   "index": 6,
+   "label": "T8/B32MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2431.0,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 492.208,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 16.3447,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2430.941,
+    "cpu_wall_ms": 3230.0
+   }
+  },
+  {
+   "index": 7,
+   "label": "T8/B64MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2444.234,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 490.661,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 16.3962,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2444.18,
+    "cpu_wall_ms": 3030.0
+   }
+  },
+  {
+   "index": 8,
+   "label": "T8/B128MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2430.177,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 495.61,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 16.2325,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2430.065,
+    "cpu_wall_ms": 3000.0
+   }
+  },
+  {
+   "index": 9,
+   "label": "T8/B256MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2434.953,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 491.343,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 16.3735,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2434.889,
+    "cpu_wall_ms": 3110.0
+   }
+  },
+  {
+   "index": 10,
+   "label": "T8/B1024MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2439.046,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 499.646,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 16.1014,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2438.686,
+    "cpu_wall_ms": 2990.0
+   }
+  },
+  {
+   "index": 11,
+   "label": "T16/B32MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2497.087,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 543.711,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 14.7964,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2497.012,
+    "cpu_wall_ms": 3500.0
+   }
+  },
+  {
+   "index": 12,
+   "label": "T16/B64MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2497.65,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 551.348,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 14.5915,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2497.584,
+    "cpu_wall_ms": 3470.0
+   }
+  },
+  {
+   "index": 13,
+   "label": "T16/B128MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2471.408,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 534.775,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 15.0437,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2471.348,
+    "cpu_wall_ms": 3280.0
+   }
+  },
+  {
+   "index": 14,
+   "label": "T16/B256MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2489.274,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 535.147,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 15.0332,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2489.223,
+    "cpu_wall_ms": 3190.0
+   }
+  },
+  {
+   "index": 15,
+   "label": "T16/B1024MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 2570.058,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 610.692,
+    "tensor_count": 398,
+    "file_size_bytes": 8044982048,
+    "effective_file_gbps": 13.1736,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 8044936192,
+    "cuda_reserved_after": 9604956160,
+    "device": "cuda:0",
+    "first_key": "model.embed_tokens.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     151936,
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "bf18fcf9dd3d78d6"
+     },
+     {
+      "rel_start": 2011234048,
+      "bytes": 262144,
+      "source_sha16": "e2f5887f58158f50"
+     },
+     {
+      "rel_start": 4022468096,
+      "bytes": 262144,
+      "source_sha16": "79675c5da5115310"
+     },
+     {
+      "rel_start": 6033702144,
+      "bytes": 262144,
+      "source_sha16": "90475b1c8a1ac3a7"
+     },
+     {
+      "rel_start": 8044674048,
+      "bytes": 262144,
+      "source_sha16": "7576b4609faf67e7"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "model.embed_tokens.weight",
+      "bytes": 777912320,
+      "device_sha16": "75599dcbc3345b7a",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.input_layernorm.weight",
+      "bytes": 5120,
+      "device_sha16": "9df993c415455e5c",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.down_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "0c2ddfd2f6c6f8a1",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "model.layers.0.mlp.gate_proj.weight",
+      "bytes": 49807360,
+      "device_sha16": "c6ac6d7f3a6760b1",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 2570.002,
+    "cpu_wall_ms": 3270.0
+   }
+  }
+ ],
+ "first_touch": false,
+ "container_session_id": "",
+ "cuda_available": true,
+ "cuda_device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+ "gpu_total_bytes": 101974081536,
+ "gpu_free_bytes_before": 101388779520,
+ "first_touch_cell_index": 0,
+ "kind": "fastsafe_screen",
+ "model_name": "qwen_3_4b.safetensors",
+ "resolved_path": "/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors",
+ "waterfall": {
+  "status": "non_applicable",
+  "method": "run_e27_followup_probe"
+ }
+}

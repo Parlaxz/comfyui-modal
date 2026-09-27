@@ -1,0 +1,29 @@
+schema_version = 1
+name = "source_race_rtx"
+owner = "source-race-rtx"
+
+[target]
+app = "exp-source-race-rtx"
+class = "ModalRuntimeEntrypointV2"
+method = "run_source_race_oracle"
+
+[resources]
+gpu = "rtx-pro-6000"
+# The race oracle allocates logical_qd * race_width * read_bytes of anonymous
+# destination buffers (QD2 x width16 x 128 MiB = 4 GiB) on top of the V2 app
+# footprint. Match golden_p1's provisioning rather than the 8192 base default.
+memory_mb = 16384
+
+[workload]
+fresh_required = true
+run_count = 1
+
+[environment]
+COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"
+# Mirror golden_p1.toml:48-50. comfymodal_runtime/runtime_shape.py fails closed
+# when COMFYMODAL_V2_MEMORY_REQUEST and COMFYMODAL_V2_MEMORY_MB disagree inside
+# the container, and the inherited parent value can differ from this profile's
+# [resources].memory_mb. Pin all three to the same value.
+COMFYMODAL_V2_MEMORY_MB = "16384"
+COMFYMODAL_V2_MEMORY_REQUEST = "16384"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "16384"

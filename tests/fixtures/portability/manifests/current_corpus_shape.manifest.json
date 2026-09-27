@@ -1,0 +1,409 @@
+{
+  "assets": [],
+  "custom_nodes": [
+    {
+      "classes": [
+        "FixtureKJLikeNode"
+      ],
+      "name": "comfyui-fixture-kjlike",
+      "provenance_quality": "exact",
+      "repo_url": "https://example.invalid/git/comfyui-fixture-kjlike",
+      "revision": "9999000011112222333344445555666677778888"
+    },
+    {
+      "classes": [
+        "FixtureRGLikeNode"
+      ],
+      "name": "comfyui-fixture-rglike",
+      "provenance_quality": "declared",
+      "repo_url": "https://example.invalid/git/comfyui-fixture-rglike",
+      "revision": "v1.0.2605082257-declared"
+    },
+    {
+      "classes": [
+        "FixtureFallbackAttributionNode"
+      ],
+      "name": "comfyui-fixture-fallback",
+      "provenance_quality": "inferred",
+      "repo_url": "https://example.invalid/git/comfyui-host-fallback",
+      "revision": "aaaabbbbccccddddeeeeffff0000111122223333"
+    },
+    {
+      "classes": [
+        "FixturePatchLoader"
+      ],
+      "name": "comfyui-fixture-patchloader",
+      "provenance_quality": "exact",
+      "repo_url": "https://example.invalid/git/comfyui-fixture-patchloader",
+      "revision": "11223344556677889900aabbccddeeff00112233"
+    }
+  ],
+  "manifest_version": 1,
+  "mapping": {
+    "entries": {
+      "positive_prompt": {
+        "control_kind": "multiline",
+        "data_type": "STRING",
+        "display_name": "Positive Prompt",
+        "enum_options": [],
+        "input_name": "text",
+        "kind": "node_input",
+        "maximum": null,
+        "minimum": null,
+        "multiline": true,
+        "node_id": "2",
+        "output_name": "",
+        "required": true,
+        "semantic_role": "positive_prompt",
+        "step": null
+      },
+      "seed": {
+        "control_kind": "integer",
+        "data_type": "INT",
+        "display_name": "Seed",
+        "enum_options": [],
+        "input_name": "seed",
+        "kind": "widget",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "multiline": false,
+        "node_id": "3",
+        "output_name": "",
+        "required": false,
+        "semantic_role": "seed",
+        "step": 1
+      }
+    },
+    "mapping_id": "wm_fixture_current_corpus_shape_v1",
+    "output_node_id": "4",
+    "workflow_version_id": "wv_fixture_current_corpus_shape_v1"
+  },
+  "metadata": {
+    "captured_at": "2026-08-23T00:00:00+00:00",
+    "exported_at": "2026-08-23T00:00:00+00:00",
+    "generator": "phase-g8-fixture-corpus",
+    "synthetic": true
+  },
+  "models": [
+    {
+      "filename": "fixture_z_unet.safetensors",
+      "folder": "diffusion_models",
+      "model_type": "unet",
+      "role": "unet"
+    },
+    {
+      "filename": "fixture_qwen_clip.safetensors",
+      "folder": "text_encoders",
+      "model_type": "clip",
+      "role": "clip"
+    },
+    {
+      "filename": "fixture_ae_vae.safetensors",
+      "folder": "vae",
+      "model_type": "vae",
+      "role": "vae"
+    }
+  ],
+  "presets": [],
+  "version": {
+    "created_at": "2026-08-23T00:00:00+00:00",
+    "graph_hash": "d408475b864ab4183bd1e94ea49fa4c34066a6a152c01fdf855bbceb6d6940dd",
+    "immutable": true,
+    "version_number": 1,
+    "workflow_id": "wf_fixture_current_corpus_shape",
+    "workflow_version_id": "wv_fixture_current_corpus_shape_v1"
+  },
+  "workflow": {
+    "display": {
+      "description": "Synthetic Phase-G portability fixture (current_corpus_shape)",
+      "name": "Fixture current_corpus_shape"
+    },
+    "graph": {
+      "config": {},
+      "definitions": {
+        "subgraphs": [
+          {
+            "id": "sg_fixture_corpus",
+            "links": [],
+            "name": "Fixture Corpus Subgraph",
+            "nodes": [
+              {
+                "flags": {},
+                "id": 201,
+                "inputs": [],
+                "mode": 0,
+                "order": 201,
+                "outputs": [],
+                "pos": [
+                  8040,
+                  4020
+                ],
+                "properties": {},
+                "size": [
+                  220,
+                  60
+                ],
+                "type": "PrimitiveString",
+                "widgets_values": [
+                  "inner"
+                ]
+              }
+            ],
+            "version": 0.4
+          }
+        ]
+      },
+      "extra": {},
+      "groups": [],
+      "id": "fixture-graph",
+      "last_link_id": 0,
+      "last_node_id": 27,
+      "links": [],
+      "nodes": [
+        {
+          "flags": {},
+          "id": 1,
+          "inputs": [],
+          "mode": 0,
+          "order": 1,
+          "outputs": [],
+          "pos": [
+            40,
+            20
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "CheckpointLoaderSimple",
+          "widgets_values": [
+            "fixture_z_unet.safetensors"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 18,
+          "inputs": [],
+          "mode": 0,
+          "order": 18,
+          "outputs": [],
+          "pos": [
+            720,
+            360
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "CLIPLoader",
+          "widgets_values": [
+            "fixture_qwen_clip.safetensors"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 19,
+          "inputs": [],
+          "mode": 0,
+          "order": 19,
+          "outputs": [],
+          "pos": [
+            760,
+            380
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "VAELoader",
+          "widgets_values": [
+            "fixture_ae_vae.safetensors"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 20,
+          "inputs": [],
+          "mode": 0,
+          "order": 20,
+          "outputs": [],
+          "pos": [
+            800,
+            400
+          ],
+          "properties": {
+            "aux_id": "fixture-author/comfyui-fixture-kjlike"
+          },
+          "size": [
+            220,
+            60
+          ],
+          "type": "FixtureKJLikeNode",
+          "widgets_values": [
+            "kj-in"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 21,
+          "inputs": [],
+          "mode": 0,
+          "order": 21,
+          "outputs": [],
+          "pos": [
+            840,
+            420
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "FixtureRGLikeNode",
+          "widgets_values": [
+            "rg-in"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 22,
+          "inputs": [],
+          "mode": 0,
+          "order": 22,
+          "outputs": [],
+          "pos": [
+            880,
+            440
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "FixtureFallbackAttributionNode",
+          "widgets_values": [
+            "fb-in"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 23,
+          "inputs": [],
+          "mode": 0,
+          "order": 23,
+          "outputs": [],
+          "pos": [
+            920,
+            460
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "FixturePatchLoader",
+          "widgets_values": [
+            "fixture_patch_union.safetensors"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 24,
+          "inputs": [],
+          "mode": 0,
+          "order": 24,
+          "outputs": [],
+          "pos": [
+            960,
+            480
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "Note",
+          "widgets_values": [
+            "Reference docs: https://example.invalid/docs/fixture-readme"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 25,
+          "inputs": [],
+          "mode": 0,
+          "order": 25,
+          "outputs": [],
+          "pos": [
+            1000,
+            500
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "CLIPTextEncode",
+          "widgets_values": [
+            "fixture corpus prompt"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 26,
+          "inputs": [],
+          "mode": 0,
+          "order": 26,
+          "outputs": [],
+          "pos": [
+            1040,
+            520
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "KSampler",
+          "widgets_values": [
+            7,
+            12
+          ]
+        },
+        {
+          "flags": {},
+          "id": 27,
+          "inputs": [],
+          "mode": 0,
+          "order": 27,
+          "outputs": [],
+          "pos": [
+            1080,
+            540
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "SaveImage",
+          "widgets_values": [
+            "fixture-corpus"
+          ]
+        }
+      ],
+      "revision": 0,
+      "version": 0.4
+    },
+    "graph_hash": "d408475b864ab4183bd1e94ea49fa4c34066a6a152c01fdf855bbceb6d6940dd",
+    "source": {
+      "author": "phase-g8-fixture-corpus",
+      "url": ""
+    },
+    "version_id": "wv_fixture_current_corpus_shape_v1",
+    "workflow_id": "wf_fixture_current_corpus_shape"
+  }
+}

@@ -1,0 +1,212 @@
+[cs] start cs-r01 clean_probe_at=500
+[cs] done cs-r01 status=ok gbps=3.8636745595249775 max_ms=339.346547 probe_sets=2 episodes=1 clean=0
+[cs] start cs-r02 clean_probe_at=500
+[cs] done cs-r02 status=ok gbps=2.380243103105141 max_ms=1079.823495 probe_sets=2 episodes=2 clean=0
+[cs] start cs-r03 clean_probe_at=500
+[cs] done cs-r03 status=ok gbps=3.928411818897434 max_ms=297.391921 probe_sets=2 episodes=3 clean=0
+[cs] start cs-r04 clean_probe_at=0
+[cs] done cs-r04 status=ok gbps=2.0970286892304366 max_ms=990.562345 probe_sets=1 episodes=4 clean=0
+[cs] start cs-r05 clean_probe_at=0
+[cs] done cs-r05 status=ok gbps=3.4532534484242277 max_ms=318.076229 probe_sets=1 episodes=5 clean=0
+[cs] start cs-r06 clean_probe_at=0
+[cs] done cs-r06 status=ok gbps=3.0575233348383297 max_ms=289.83054 probe_sets=1 episodes=6 clean=0
+[cs] start cs-r07 clean_probe_at=0
+[cs] done cs-r07 status=ok gbps=3.0132624670550046 max_ms=298.194394 probe_sets=1 episodes=7 clean=0
+[cs] start cs-r08 clean_probe_at=0
+[cs] done cs-r08 status=ok gbps=2.3057695300282925 max_ms=852.59464 probe_sets=1 episodes=8 clean=0
+[cs] start cs-r09 clean_probe_at=0
+[cs] done cs-r09 status=ok gbps=6.264516124576163 max_ms=198.758511 probe_sets=0 episodes=8 clean=1
+[cs] start cs-r10 clean_probe_at=0
+[cs] done cs-r10 status=ok gbps=3.4305480856098605 max_ms=314.907559 probe_sets=1 episodes=9 clean=1
+[cs] start cs-r11 clean_probe_at=0
+[cs] done cs-r11 status=ok gbps=4.261307980135944 max_ms=239.439518 probe_sets=0 episodes=9 clean=2
+[cs] start cs-r12 clean_probe_at=0
+[cs] done cs-r12 status=ok gbps=2.045818652468627 max_ms=2161.452732 probe_sets=1 episodes=10 clean=2
+[cs] start cs-r13 clean_probe_at=0
+[cs] done cs-r13 status=ok gbps=1.3323019366776159 max_ms=3497.132252 probe_sets=1 episodes=11 clean=2
+[cs] start cs-r14 clean_probe_at=0
+[cs] done cs-r14 status=ok gbps=1.8213771427580914 max_ms=2566.553669 probe_sets=1 episodes=12 clean=2
+[cs] start cs-r15 clean_probe_at=0
+[cs] done cs-r15 status=ok gbps=4.927305787605653 max_ms=221.795591 probe_sets=0 episodes=12 clean=3
+[cs] goal met; stopping
+
+run | region | sick/clean | worst normal ms | workers sick at trigger | same-file ms | same-range ms | other-volume ms | local ms | hb max gap ms | originals exit after trigger ms | classification
+| cs-r01 | CLOUD_PROVIDER_GCP/us-east4 | SICK | 339 | ['0', '1', '2', '3'] | 72.4 | 79.7 | 60.1 | 77.8 | 178.6 | [1826, 1752, 1651, 1796] | CASE6_same_range_escaped |
+| cs-r02 | CLOUD_PROVIDER_GCP/us-east | SICK | 1080 | ['0', '1', '2', '3'] | 129.9 | 227.8 | 168.4 | 58.0 | 909.8 | [2467, 2363, 2276, 2347] | CASE3_volume_path |
+| cs-r03 | CLOUD_PROVIDER_GCP/asia-south2 | SICK | 297 | ['0', '1', '2', '3'] | 138.0 | 52.1 | 70.5 | 0.9 | 210.7 | [1793, 1719, 1687, 1791] | CASE6_same_range_escaped |
+| cs-r04 | CLOUD_PROVIDER_GCP/us-east4 | SICK | 991 | ['0', '1', '2', '3'] | 126.2 | 185.5 | 83.8 | 2.7 | 986.6 | [2979, 2909, 3026, 2880] | CASE2_file_path |
+| cs-r05 | CLOUD_PROVIDER_GCP/us-east4 | SICK | 318 | ['0', '1', '2', '3'] | 225.8 | 47.8 | 111.3 | 55.0 | 181.3 | [2000, 1885, 2041, 2075] | CASE6_same_range_escaped |
+| cs-r06 | CLOUD_PROVIDER_OCI/us-chicago-1 | SICK | 290 | ['0', '1', '2', '3'] | 97.0 | 90.1 | 88.3 | 73.9 | 215.5 | [2297, 2170, 2290, 2375] | CASE6_same_range_escaped |
+| cs-r07 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | SICK | 298 | ['0', '1', '2', '3'] | 182.5 | 100.7 | 278.5 | 69.9 | 271.4 | [2418, 2056, 1981, 2262] | CASE3_volume_path |
+| cs-r08 | CLOUD_PROVIDER_GCP/us-east | SICK | 853 | ['0', '1', '2', '3'] | 198.7 | 72.1 | 57.2 | 96.5 | 921.6 | [3127, 2943, 2975, 3055] | CASE6_same_range_escaped |
+| cs-r09 | CLOUD_PROVIDER_UNSPECIFIED/odin | clean | 199 | - | - | - | - | - | 75.5 | - | - |
+| cs-r10 | CLOUD_PROVIDER_OCI/us-chicago-1 | SICK | 315 | ['0', '1', '2', '3'] | 148.9 | 135.7 | 82.6 | 74.9 | 213.1 | [2060, 2091, 1998, 2021] | CASE2_file_path |
+| cs-r11 | CLOUD_PROVIDER_AWS/us-east | clean | 239 | - | - | - | - | - | 104.9 | - | - |
+| cs-r12 | CLOUD_PROVIDER_GCP/us-east | SICK | 2161 | ['0', '1', '2', '3'] | 258.5 | 93.5 | 110.6 | 1.1 | 1590.6 | [2465, 2352, 2466, 2466] | CASE6_same_range_escaped |
+| cs-r13 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | SICK | 3497 | ['0', '1', '2', '3'] | 852.1 | 93.7 | 57.3 | 57.0 | 1940.1 | [3758, 3598, 3654, 3745] | CASE6_same_range_escaped |
+| cs-r14 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | SICK | 2567 | ['0', '1', '2', '3'] | 57.5 | 116.4 | 47.2 | 1.3 | 2074.1 | [1910, 1727, 1799, 1774] | CASE5_sandbox_stall |
+| cs-r15 | CLOUD_PROVIDER_GCP/us-east | clean | 222 | - | - | - | - | - | 141.0 | - | - |
+
+=== pathological episode detail ===
+
+cs-r01 (CLOUD_PROVIDER_GCP/us-east4) gbps=3.864 max=339 ms
+  w1 gen0 enter=0 exit=339 ms=339.3 off=2013265920
+  trigger at t=256 ms  blocked={'1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 255.730208}, '3': {'offset': 6241124352, 'length': 67108864, 'elapsed_ms': 22.256822}, '2': {'offset': 4160749568, 'length': 67108864, 'elapsed_ms': 19.861001}, '0': {'offset': 134217728, 'length': 67108864, 'elapsed_ms': 16.276813}}
+    A_same_file_fresh_fd: enter=738 latency=72.4 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=992 latency=79.7 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=2013265920 bytes=4194304
+    C_other_volume_file: enter=1112 latency=60.1 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1173 latency=77.8 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r02 (CLOUD_PROVIDER_GCP/us-east) gbps=2.380 max=1080 ms
+  w0 gen0 enter=0 exit=1080 ms=1079.6 off=0
+  w0 gen4 enter=1275 exit=1672 ms=397.7 off=268435456
+  w1 gen0 enter=0 exit=1080 ms=1079.3 off=2013265920
+  w1 gen4 enter=1327 exit=1671 ms=343.8 off=2281701376
+  w2 gen0 enter=0 exit=1080 ms=1079.7 off=4026531840
+  w2 gen4 enter=1321 exit=1725 ms=404.0 off=4294967296
+  w3 gen0 enter=0 exit=1080 ms=1079.8 off=6039797760
+  w3 gen3 enter=1235 exit=1625 ms=390.2 off=6241124352
+  trigger at t=913 ms  blocked={'3': {'offset': 6039797760, 'length': 67108864, 'elapsed_ms': 913.294805}, '0': {'offset': 0, 'length': 67108864, 'elapsed_ms': 913.122289}, '1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 913.101109}, '2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 913.079947}}
+    A_same_file_fresh_fd: enter=1995 latency=129.9 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=2285 latency=227.8 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=6039797760 bytes=4194304
+    C_other_volume_file: enter=2465 latency=168.4 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=2513 latency=58.0 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r03 (CLOUD_PROVIDER_GCP/asia-south2) gbps=3.928 max=297 ms
+  w2 gen0 enter=0 exit=297 ms=297.4 off=4026531840
+  trigger at t=255 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 254.520666}, '0': {'offset': 134217728, 'length': 67108864, 'elapsed_ms': 57.918783}, '3': {'offset': 6241124352, 'length': 67108864, 'elapsed_ms': 57.504746}, '1': {'offset': 2080374784, 'length': 67108864, 'elapsed_ms': 43.487866}}
+    A_same_file_fresh_fd: enter=682 latency=138.0 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=978 latency=52.1 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=1202 latency=70.5 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1203 latency=0.9 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r04 (CLOUD_PROVIDER_GCP/us-east4) gbps=2.097 max=991 ms
+  w0 gen0 enter=0 exit=990 ms=990.1 off=0
+  w0 gen2 enter=1044 exit=1798 ms=754.2 off=134217728
+  w1 gen0 enter=0 exit=991 ms=990.5 off=2013265920
+  w1 gen2 enter=1044 exit=1798 ms=754.1 off=2147483648
+  w2 gen0 enter=0 exit=990 ms=990.4 off=4026531840
+  w2 gen2 enter=1044 exit=1798 ms=753.9 off=4160749568
+  w3 gen0 enter=0 exit=991 ms=990.6 off=6039797760
+  w3 gen2 enter=1044 exit=1797 ms=753.3 off=6174015488
+  trigger at t=810 ms  blocked={'3': {'offset': 6039797760, 'length': 67108864, 'elapsed_ms': 810.474203}, '2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 810.412017}, '0': {'offset': 0, 'length': 67108864, 'elapsed_ms': 810.329243}, '1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 810.295767}}
+    A_same_file_fresh_fd: enter=2349 latency=126.2 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=2350 latency=185.5 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=6039797760 bytes=4194304
+    C_other_volume_file: enter=2680 latency=83.8 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=2678 latency=2.7 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r05 (CLOUD_PROVIDER_GCP/us-east4) gbps=3.453 max=318 ms
+  w2 gen0 enter=0 exit=318 ms=318.1 off=4026531840
+  trigger at t=254 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 254.228654}, '3': {'offset': 6174015488, 'length': 67108864, 'elapsed_ms': 150.373795}, '1': {'offset': 2080374784, 'length': 67108864, 'elapsed_ms': 69.11625}, '0': {'offset': 67108864, 'length': 67108864, 'elapsed_ms': 10.358269}}
+    A_same_file_fresh_fd: enter=1031 latency=225.8 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=1258 latency=47.8 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=1471 latency=111.3 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1472 latency=55.0 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r06 (CLOUD_PROVIDER_OCI/us-chicago-1) gbps=3.058 max=290 ms
+  w2 gen0 enter=0 exit=290 ms=289.8 off=4026531840
+  trigger at t=256 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 256.085014}, '3': {'offset': 6174015488, 'length': 67108864, 'elapsed_ms': 155.477655}, '0': {'offset': 67108864, 'length': 67108864, 'elapsed_ms': 138.599153}, '1': {'offset': 2080374784, 'length': 67108864, 'elapsed_ms': 87.084712}}
+    A_same_file_fresh_fd: enter=928 latency=97.0 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=1025 latency=90.1 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=1303 latency=88.3 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1392 latency=73.9 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r07 (CLOUD_PROVIDER_UNSPECIFIED/CANADA-2) gbps=3.013 max=298 ms
+  w2 gen0 enter=0 exit=298 ms=298.2 off=4026531840
+  trigger at t=252 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 251.812534}, '0': {'offset': 67108864, 'length': 67108864, 'elapsed_ms': 64.783356}, '3': {'offset': 6241124352, 'length': 67108864, 'elapsed_ms': 6.012504}, '1': {'offset': 2147483648, 'length': 67108864, 'elapsed_ms': 3.40684}}
+    A_same_file_fresh_fd: enter=859 latency=182.5 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=1042 latency=100.7 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=1313 latency=278.5 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1313 latency=69.9 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r08 (CLOUD_PROVIDER_GCP/us-east) gbps=2.306 max=853 ms
+  w0 gen0 enter=0 exit=646 ms=646.2 off=0
+  w0 gen2 enter=716 exit=1509 ms=793.0 off=134217728
+  w1 gen0 enter=0 exit=647 ms=646.3 off=2013265920
+  w1 gen2 enter=716 exit=1568 ms=852.6 off=2147483648
+  w2 gen0 enter=0 exit=646 ms=646.0 off=4026531840
+  w2 gen2 enter=716 exit=1509 ms=793.2 off=4160749568
+  w3 gen0 enter=0 exit=647 ms=646.7 off=6039797760
+  w3 gen2 enter=716 exit=1509 ms=792.6 off=6174015488
+  trigger at t=362 ms  blocked={'3': {'offset': 6039797760, 'length': 67108864, 'elapsed_ms': 361.600533}, '0': {'offset': 0, 'length': 67108864, 'elapsed_ms': 361.409987}, '1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 361.37102}, '2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 361.33527}}
+    A_same_file_fresh_fd: enter=1823 latency=198.7 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=2299 latency=72.1 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=6039797760 bytes=4194304
+    C_other_volume_file: enter=2241 latency=57.2 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=2468 latency=96.5 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r10 (CLOUD_PROVIDER_OCI/us-chicago-1) gbps=3.431 max=315 ms
+  w1 gen0 enter=0 exit=315 ms=314.9 off=2013265920
+  trigger at t=254 ms  blocked={'1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 253.866552}, '2': {'offset': 4160749568, 'length': 67108864, 'elapsed_ms': 25.249208}, '0': {'offset': 201326592, 'length': 67108864, 'elapsed_ms': 22.191206}, '3': {'offset': 6241124352, 'length': 67108864, 'elapsed_ms': 21.409437}}
+    A_same_file_fresh_fd: enter=952 latency=148.9 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=1180 latency=135.7 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=2013265920 bytes=4194304
+    C_other_volume_file: enter=1315 latency=82.6 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=1399 latency=74.9 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r12 (CLOUD_PROVIDER_GCP/us-east) gbps=2.046 max=2161 ms
+  w0 gen0 enter=0 exit=1466 ms=1465.8 off=0
+  w0 gen1 enter=1466 exit=2163 ms=696.8 off=67108864
+  w1 gen0 enter=1 exit=2162 ms=2161.5 off=2013265920
+  w2 gen0 enter=0 exit=1594 ms=1593.5 off=4026531840
+  w2 gen1 enter=1594 exit=2163 ms=569.2 off=4093640704
+  w3 gen0 enter=0 exit=1407 ms=1407.4 off=6039797760
+  w3 gen2 enter=1594 exit=2163 ms=568.7 off=6174015488
+  trigger at t=1466 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 1465.928379}, '1': {'offset': 2013265920, 'length': 67108864, 'elapsed_ms': 1465.053876}, '3': {'offset': 6106906624, 'length': 67108864, 'elapsed_ms': 58.571779}, '0': {'offset': 67108864, 'length': 67108864, 'elapsed_ms': 0.042321}}
+    A_same_file_fresh_fd: enter=2458 latency=258.5 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=2717 latency=93.5 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=2949 latency=110.6 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=2993 latency=1.1 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r13 (CLOUD_PROVIDER_UNSPECIFIED/CANADA-2) gbps=1.332 max=3497 ms
+  w0 gen0 enter=0 exit=2241 ms=2241.2 off=0
+  w0 gen1 enter=2241 exit=3497 ms=1255.9 off=67108864
+  w0 gen12 enter=4105 exit=4957 ms=851.6 off=805306368
+  w1 gen0 enter=0 exit=2280 ms=2279.8 off=2013265920
+  w1 gen1 enter=2280 exit=3497 ms=1217.5 off=2080374784
+  w1 gen10 enter=4105 exit=4957 ms=852.2 off=2684354560
+  w2 gen0 enter=0 exit=3497 ms=3497.1 off=4026531840
+  w2 gen8 enter=4105 exit=4925 ms=819.3 off=4563402752
+  w3 gen0 enter=0 exit=2280 ms=2279.8 off=6039797760
+  w3 gen1 enter=2280 exit=3497 ms=1217.3 off=6106906624
+  w3 gen5 enter=3667 exit=3970 ms=303.8 off=6375342080
+  w3 gen9 enter=4105 exit=4957 ms=851.3 off=6643777536
+  trigger at t=2280 ms  blocked={'2': {'offset': 4026531840, 'length': 67108864, 'elapsed_ms': 2279.847928}, '0': {'offset': 67108864, 'length': 67108864, 'elapsed_ms': 38.710702}, '3': {'offset': 6106906624, 'length': 67108864, 'elapsed_ms': 0.256143}, '1': {'offset': 2080374784, 'length': 67108864, 'elapsed_ms': 0.132866}}
+    A_same_file_fresh_fd: enter=4105 latency=852.1 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=5172 latency=93.7 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=4026531840 bytes=4194304
+    C_other_volume_file: enter=5267 latency=57.3 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=5267 latency=57.0 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+cs-r14 (CLOUD_PROVIDER_UNSPECIFIED/eu-north) gbps=1.821 max=2567 ms
+  w0 gen0 enter=1 exit=2567 ms=2566.6 off=0
+  w1 gen0 enter=1 exit=2153 ms=2152.3 off=2013265920
+  w1 gen1 enter=2153 exit=2568 ms=414.5 off=2080374784
+  w2 gen0 enter=1 exit=2233 ms=2231.9 off=4026531840
+  w2 gen1 enter=2233 exit=2568 ms=334.6 off=4093640704
+  w3 gen0 enter=0 exit=2078 ms=2077.6 off=6039797760
+  w3 gen1 enter=2078 exit=2506 ms=428.7 off=6106906624
+  trigger at t=2507 ms  blocked={'0': {'offset': 0, 'length': 67108864, 'elapsed_ms': 2505.767116}, '1': {'offset': 2080374784, 'length': 67108864, 'elapsed_ms': 353.412298}, '2': {'offset': 4093640704, 'length': 67108864, 'elapsed_ms': 273.723172}, '3': {'offset': 6174015488, 'length': 67108864, 'elapsed_ms': 0.210867}}
+    A_same_file_fresh_fd: enter=3112 latency=57.5 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=8040787744 bytes=4194304
+    B_same_range_fresh_fd: enter=3349 latency=116.4 ms path=/root/models/text_encoders/qwen_3_4b.safetensors off=0 bytes=4194304
+    C_other_volume_file: enter=3348 latency=47.2 ms path=/root/models/diffusion_models/z_image_turbo_bf16.safetensors off=0 bytes=4194304
+    D_local_file: enter=3605 latency=1.3 ms path=/tmp/c0_local_probe.bin off=0 bytes=4194304
+
+=== clean-reference probe sets ===
+  cs-r01 (CLOUD_PROVIDER_GCP/us-east4): ['A_same_file_fresh_fd=1.5', 'C_other_volume_file=3.4', 'D_local_file=1.4']
+  cs-r02 (CLOUD_PROVIDER_GCP/us-east): ['A_same_file_fresh_fd=4.2', 'C_other_volume_file=3.4', 'D_local_file=3.3']
+  cs-r03 (CLOUD_PROVIDER_GCP/asia-south2): ['A_same_file_fresh_fd=2.1', 'C_other_volume_file=3.7', 'D_local_file=1.9']
+
+=== heartbeat summary ===
+  cs-r01: samples=168 median_gap=5.45 ms max_gap=178.6 ms
+  cs-r02: samples=126 median_gap=5.55 ms max_gap=909.8 ms
+  cs-r03: samples=152 median_gap=5.41 ms max_gap=210.7 ms
+  cs-r04: samples=170 median_gap=5.49 ms max_gap=986.6 ms
+  cs-r05: samples=135 median_gap=5.46 ms max_gap=181.3 ms
+  cs-r06: samples=208 median_gap=5.39 ms max_gap=215.5 ms
+  cs-r07: samples=177 median_gap=5.57 ms max_gap=271.4 ms
+  cs-r08: samples=148 median_gap=5.46 ms max_gap=921.6 ms
+  cs-r09: samples=213 median_gap=5.37 ms max_gap=75.5 ms
+  cs-r10: samples=150 median_gap=5.39 ms max_gap=213.1 ms
+  cs-r11: samples=317 median_gap=5.46 ms max_gap=104.9 ms
+  cs-r12: samples=163 median_gap=5.42 ms max_gap=1590.6 ms
+  cs-r13: samples=135 median_gap=5.45 ms max_gap=1940.1 ms
+  cs-r14: samples=145 median_gap=5.48 ms max_gap=2074.1 ms
+  cs-r15: samples=280 median_gap=5.39 ms max_gap=141.0 ms

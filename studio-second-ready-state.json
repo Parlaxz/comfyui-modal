@@ -1,0 +1,113 @@
+{
+  "selectors": {
+    "workflow-selector": "wf_9bbcfc104a35412d",
+    "workflow-version-selector": "wv_487585a9c3cb4f32",
+    "workflow-preset-selector": "wpres_8c8d7555c36a4450"
+  },
+  "controls": [
+    {
+      "testid": "workflow-input-guidance",
+      "tag": "INPUT",
+      "value": "1"
+    },
+    {
+      "testid": "workflow-input-scheduler",
+      "tag": "SELECT",
+      "value": "bong_tangent"
+    },
+    {
+      "testid": "workflow-input-prompt",
+      "tag": "INPUT",
+      "value": "A young female warrior with fair skin, dark black straight bangs framing her face, intense blue eyes gazing slightly off-camera with a confident smirk, wearing multiple silver piercings including one on her nose and ornate earrings featuring cross motifs; she has bold black brushstroke-style ink tattoo across her right cheekbone; dressed in form-fitting black leather armor with metallic rivets and zipper details covering her shoulders and upper torso, revealing intricate yellow-and-black traditional Japanese dragon tattoos wrapping around her left arm; holding a katana sword vertically positioned diagonally from bottom-left towards center-right, its hilt wrapped in textured black cordage with geometric cutouts and adorned with golden-yellow flame-like patterns near the scabbard's base, tassel hanging below; close-up portrait framed tightly focusing on head-to-chest area, subject centered against a solid bright yellow studio backdrop creating high contrast; dramatic directional key lighting illuminating front-facing side of her face casting subtle shadows beneath jawline while strong backlight creates faint rim glow along hair strands and shoulder edges enhancing depth; photorealistic hyper-detailed digital painting rendered in ultra-sharp resolution with smooth surface textures mimicking real-world fabric and metal finishes under controlled studio illumination producing crisp highlights and natural shadow transitions; dominant palette consists of vivid yellow contrasting sharply with deep matte blacks accented by glowing gold elements conveying fierce determination and lethal elegance."
+    },
+    {
+      "testid": "workflow-input-sampler",
+      "tag": "SELECT",
+      "value": "exponential/res_2s"
+    },
+    {
+      "testid": "workflow-input-denoise",
+      "tag": "INPUT",
+      "value": "1"
+    },
+    {
+      "testid": "workflow-input-seed",
+      "tag": "INPUT",
+      "value": "1006800347249813"
+    }
+  ],
+  "buttons": [
+    {
+      "i": 0,
+      "text": "Run",
+      "disabled": false,
+      "title": "",
+      "visible": false,
+      "rect": {
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "onclick": "function () {\r\n    btn.disabled = true;\r\n    btn.textContent = \"Running\\u2026\";\r\n    _modernRunSubmit(state, context, actions, btn);\r\n  }"
+    },
+    {
+      "i": 1,
+      "text": "RUN",
+      "disabled": false,
+      "title": "Run failed. Click to try again.",
+      "visible": true,
+      "rect": {
+        "x": 97,
+        "y": 1036.03125,
+        "w": 388,
+        "h": 30
+      },
+      "onclick": "function () {\r\n      doRunSubmit(state, context, actions);\r\n    }"
+    }
+  ],
+  "backendHealth": "preset_8238cf8b69b54b2e",
+  "diagnostics": {
+    "runId": "6f5b7797-5522-45c8-bbd8-8897e492180a",
+    "requestId": "f5758d93-a395-4ebf-9fc5-5c6a587d7ff0",
+    "backendRunId": null,
+    "experimentId": null,
+    "status": "failed",
+    "isTerminal": true,
+    "eventCount": 2,
+    "stage": "created",
+    "sampler": null,
+    "progress": null,
+    "marks": [
+      {
+        "name": "run_click",
+        "wallMs": 1786724311186,
+        "perfMs": 483743.7000000179,
+        "deltaMs": 0
+      },
+      {
+        "name": "http_invoked",
+        "wallMs": 1786724311246,
+        "perfMs": 483803.90000000596,
+        "deltaMs": 60
+      },
+      {
+        "name": "backend_ack",
+        "wallMs": 1786724454704,
+        "perfMs": 627262.099999994,
+        "deltaMs": 143518
+      },
+      {
+        "name": "terminal",
+        "wallMs": 1786724454705,
+        "perfMs": 627262.3000000119,
+        "deltaMs": 143519
+      }
+    ],
+    "cells": {}
+  },
+  "localStorage": {
+    "selection": "{\"workflowId\":\"wf_9bbcfc104a35412d\",\"workflowVersionId\":\"wv_487585a9c3cb4f32\",\"presetId\":\"wpres_8c8d7555c36a4450\",\"workflowName\":\"Smoke Test Workflow\",\"presetName\":\"Smoke Test Preset\"}",
+    "handoff": "{\"workflowId\":\"wf_9bbcfc104a35412d\",\"workflowVersionId\":\"wv_487585a9c3cb4f32\",\"presetId\":\"wpres_8c8d7555c36a4450\",\"workflowName\":\"\",\"presetName\":\"\"}"
+  }
+}

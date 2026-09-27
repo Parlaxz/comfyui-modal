@@ -1,0 +1,5 @@
+[v2.deploy_identity] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 method=get_deployment_identity_static
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+[v2.deploy_identity] state_file=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.deployed_state.json
+[v2.deploy_identity] status=ok deployment_combined_hash=d679332c551f0cad custom_nodes_generation=32ffaf27cac17b3c overall_dependency_hash=be68be1945de2a29 comfyui_version=0.24.0 manifest_classes=2399
+[v2.deploy_identity] host_comfyui_identity=f49bdb655707b979 deployed_comfyui_identity=f49bdb655707b979 comfyui_core_match=1

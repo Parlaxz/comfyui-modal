@@ -1,0 +1,11 @@
+{
+  "attempt_id": "unet_b256_qd8_R1_A2",
+  "block_mib": 256,
+  "campaign_index": 32,
+  "classification": "DNF",
+  "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "qd": 8,
+  "role": "unet",
+  "status": "error"
+}

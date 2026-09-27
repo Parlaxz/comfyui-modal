@@ -1,0 +1,156 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "source": "per_request.json timestamps + per_read.csv syscall times",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "ordering_field": "timestamps.dispatch_unix_ms",
+  "n_with_dispatch": 141,
+  "inter_request_gap_ms": {
+    "n": 140,
+    "min": 50.0,
+    "q1": 19738.0,
+    "median": 46594.5,
+    "q3": 62681.0,
+    "p90": 96957.7,
+    "p95": 236537.65,
+    "p99": 945735.35,
+    "max": 8026986.0,
+    "mean": 127342.95
+  },
+  "manifest_gap_seconds": {
+    "n": 141,
+    "min": 35.0,
+    "q1": 35.0,
+    "median": 35.0,
+    "q3": 35.0,
+    "p90": 35.0,
+    "p95": 35.0,
+    "p99": 35.0,
+    "max": 35.0,
+    "mean": 35.0
+  },
+  "duration_ms": {
+    "n": 141,
+    "min": 23204.701,
+    "q1": 26141.908,
+    "median": 29941.015,
+    "q3": 42605.912,
+    "p90": 113782.091,
+    "p95": 189102.992,
+    "p99": 405497.6328,
+    "max": 979505.585,
+    "mean": 57862.442163
+  },
+  "gap_before_present": 0,
+  "cluster_gap_threshold_ms": 600000.0,
+  "clusters": [
+    {
+      "cluster": 0,
+      "n": 20,
+      "start_dispatch_unix_ms": 1789598082281,
+      "end_dispatch_unix_ms": 1789599759235,
+      "span_ms": 1676954,
+      "arms": {
+        "sham": 10,
+        "split": 10
+      },
+      "providers": {
+        "CLOUD_PROVIDER_AWS": 8,
+        "CLOUD_PROVIDER_GCP": 12
+      },
+      "sick_requests": 4,
+      "sick_rate": 0.2,
+      "both_sick": 1
+    },
+    {
+      "cluster": 1,
+      "n": 64,
+      "start_dispatch_unix_ms": 1789600590316,
+      "end_dispatch_unix_ms": 1789602399632,
+      "span_ms": 1809316,
+      "arms": {
+        "sham": 30,
+        "split": 34
+      },
+      "providers": {
+        "CLOUD_PROVIDER_AWS": 17,
+        "CLOUD_PROVIDER_GCP": 47
+      },
+      "sick_requests": 6,
+      "sick_rate": 0.09375,
+      "both_sick": 3
+    },
+    {
+      "cluster": 2,
+      "n": 2,
+      "start_dispatch_unix_ms": 1789603397368,
+      "end_dispatch_unix_ms": 1789603460938,
+      "span_ms": 63570,
+      "arms": {
+        "split": 2
+      },
+      "providers": {
+        "CLOUD_PROVIDER_AWS": 1,
+        "CLOUD_PROVIDER_GCP": 1
+      },
+      "sick_requests": 0,
+      "sick_rate": 0.0,
+      "both_sick": 0
+    },
+    {
+      "cluster": 3,
+      "n": 20,
+      "start_dispatch_unix_ms": 1789611487924,
+      "end_dispatch_unix_ms": 1789613579250,
+      "span_ms": 2091326,
+      "arms": {
+        "split": 20
+      },
+      "providers": {
+        "CLOUD_PROVIDER_AWS": 4,
+        "CLOUD_PROVIDER_GCP": 16
+      },
+      "sick_requests": 5,
+      "sick_rate": 0.25,
+      "both_sick": 1
+    },
+    {
+      "cluster": 4,
+      "n": 35,
+      "start_dispatch_unix_ms": 1789614443651,
+      "end_dispatch_unix_ms": 1789615910294,
+      "span_ms": 1466643,
+      "arms": {
+        "sham": 15,
+        "split": 20
+      },
+      "providers": {
+        "CLOUD_PROVIDER_AWS": 18,
+        "CLOUD_PROVIDER_GCP": 16,
+        "CLOUD_PROVIDER_UNSPECIFIED": 1
+      },
+      "sick_requests": 5,
+      "sick_rate": 0.142857,
+      "both_sick": 1
+    }
+  ],
+  "n_clusters": 5,
+  "sickness_indicator_lag1_pearson": 0.017029,
+  "sickness_indicator_autocorr_note": "Pearson correlation of adjacent dispatch-ordered sickness indicators; descriptive only, no causal claim.",
+  "syscall_order": {
+    "requests_roles_with_timing": 423,
+    "adjacent_pairs_checked": 87843,
+    "readseq_vs_syscall_enter_inversions": 0
+  }
+}

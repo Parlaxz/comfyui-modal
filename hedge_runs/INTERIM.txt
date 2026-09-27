@@ -1,0 +1,54 @@
+﻿=== INTERIM: completed runs per arm ===
+  C     13
+  H75   13
+  H125  13
+  H200  13
+
+=== ARM SUMMARY (logical accepted reads) ===
+  arm runs wall_med wall_mean  wall_max gbps_med gbps_mean log_med log_mean log_p95  log_p99  log_max  n500  n1k r500  r1k hedges wins    amp
+    C   13     1734      2041      2979    4.640     4.164    45.9     55.5   118.6    137.4      934     2    0    2    0      0    0 1.0000
+  H75   13     1822      2839     12697    4.416     3.897    45.1     60.4   100.9    124.1     3144    10    6    2    2     73   19 1.0468
+ H125   13     1795      2093      5021    4.482     4.197    46.8     53.8    82.1    106.1     2537     5    1    1    1      3    0 1.0019
+ H200   13     1694      2351      9093    4.750     4.326    44.1     54.9    84.7    116.6     3736     6    5    1    1      2    0 1.0013
+
+=== PER-RUN logical max, worst first, per arm ===
+
+  [C]
+    ord 17 wall=    2311ms logMax=    934 l500= 1 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=us-west
+    ord 12 wall=    2392ms logMax=    662 l500= 1 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=us-east4
+    ord  6 wall=    2979ms logMax=    236 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=eu-north
+    ord 51 wall=    1703ms logMax=    184 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=ap-northeast
+    ord 27 wall=    1839ms logMax=    181 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=eu-north
+    ord 48 wall=    2629ms logMax=    168 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=europe-west2
+
+  [H75]
+    ord 30 wall=   12697ms logMax=   3144 l500= 9 l1k= 5 hedges=  3 wins= 2 amp=1.0250 region=US-1
+    ord 41 wall=    2687ms logMax=   1137 l500= 1 l1k= 1 hedges=  2 wins= 1 amp=1.0167 region=ap-northeast
+    ord 11 wall=    1877ms logMax=    283 l500= 0 l1k= 0 hedges=  3 wins= 1 amp=1.0250 region=ap-northeast
+    ord 35 wall=    1688ms logMax=    239 l500= 0 l1k= 0 hedges=  2 wins= 1 amp=1.0167 region=us-west
+    ord 26 wall=    1808ms logMax=    176 l500= 0 l1k= 0 hedges=  3 wins= 0 amp=1.0250 region=ap-northeast
+    ord 49 wall=    3226ms logMax=    127 l500= 0 l1k= 0 hedges= 35 wins=12 amp=1.2917 region=ap-northeast
+
+  [H125]
+    ord  1 wall=    5021ms logMax=   2537 l500= 5 l1k= 1 hedges=  2 wins= 0 amp=1.0167 region=europe-west2
+    ord 24 wall=    1890ms logMax=    164 l500= 0 l1k= 0 hedges=  1 wins= 0 amp=1.0083 region=ap-northeast
+    ord 19 wall=    1842ms logMax=    122 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=ap-northeast
+    ord  5 wall=    2336ms logMax=    119 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=us-central
+    ord  9 wall=    1795ms logMax=    113 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=europe-west9
+    ord 32 wall=    1681ms logMax=    111 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=us-east4
+
+  [H200]
+    ord 29 wall=    9093ms logMax=   3736 l500= 6 l1k= 5 hedges=  1 wins= 0 amp=1.0083 region=eu-north
+    ord 10 wall=    1918ms logMax=    329 l500= 0 l1k= 0 hedges=  1 wins= 0 amp=1.0083 region=us-east
+    ord 22 wall=    2879ms logMax=    164 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=ap-northeast
+    ord 50 wall=    1673ms logMax=    117 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=US-1
+    ord 28 wall=    1827ms logMax=    113 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=us-chicago-1
+    ord 40 wall=    1718ms logMax=    103 l500= 0 l1k= 0 hedges=  0 wins= 0 amp=1.0000 region=ap-northeast
+
+=== HEDGE DETAIL (all arms with hedges) ===
+  H75: logical=1560 eligible=150 launched=73 lane_busy=77 wins=19 win_rate=0.260 launched%=4.68%
+       time_saved_ms: n=19 median=2.0 mean=3.8 max=16.0
+  H125: logical=1560 eligible=5 launched=3 lane_busy=2 wins=0 win_rate=0.000 launched%=0.19%
+       time_saved_ms: (no rescue wins with observed original completion)
+  H200: logical=1560 eligible=2 launched=2 lane_busy=0 wins=0 win_rate=0.000 launched%=0.13%
+       time_saved_ms: (no rescue wins with observed original completion)

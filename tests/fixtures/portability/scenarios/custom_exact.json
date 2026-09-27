@@ -1,0 +1,37 @@
+{
+  "audit_basis": [
+    "PHASE_G5 §6 provenance exact",
+    "PHASE_G2 §5 custom nodes WITH git remotes"
+  ],
+  "description": "One custom node with trusted repo identity plus enforced revision commit; class mapping known. Provenance level exact.",
+  "expected": {
+    "issue_codes": [],
+    "provenance_quality": "exact",
+    "risk_level_hint_nonnormative": "low",
+    "signals": {
+      "custom_node_count": 1,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 1,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/custom_exact.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "46b520783bc8b9834ade070230ccc1a38097690d63cde976e7794e81565f02fc",
+  "scenario_id": "custom_exact",
+  "title": "Custom node with exact provenance"
+}

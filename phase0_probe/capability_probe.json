@@ -1,0 +1,73 @@
+{
+ "status": "ok",
+ "kernel_release": "4.19.0-gvisor",
+ "file": {
+  "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "size": 8044982048,
+  "block_bytes": 67108864
+ },
+ "available": {
+  "os.O_DIRECT": true,
+  "os.preadv": true
+ },
+ "plain_mmap": {
+  "ok": true,
+  "errno": 0
+ },
+ "mincore_before_touch": {
+  "callable": true,
+  "rc": 0,
+  "errno": 0,
+  "pages": 16384,
+  "resident_pages": 16384
+ },
+ "first_memcpy_block_ms": 60.993005000000046,
+ "faults_during_memcpy": {
+  "minor": 0,
+  "major": 0
+ },
+ "mincore_after_touch": {
+  "callable": true,
+  "rc": 0,
+  "errno": 0,
+  "pages": 16384,
+  "resident_pages": 16384
+ },
+ "second_memcpy_block_ms": 5.962484000000101,
+ "madvise_WILLNEED": {
+  "rc": 0,
+  "errno": 0,
+  "accepted": true
+ },
+ "madvise_POPULATE_READ": {
+  "rc": -1,
+  "errno": 22,
+  "accepted": false
+ },
+ "madvise_POPULATE_WRITE": {
+  "rc": -1,
+  "errno": 22,
+  "accepted": false
+ },
+ "readahead": {
+  "rc": -1,
+  "errno": 22
+ },
+ "map_populate_window": {
+  "ok": true,
+  "errno": 0,
+  "map_ms": 4.760619999999882
+ },
+ "mincore_populate_window": {
+  "callable": true,
+  "rc": 0,
+  "errno": 0,
+  "pages": 16384,
+  "resident_pages": 16384
+ },
+ "willneed_functional_test": {
+  "cold_first_touch_ms": 24.749158000000104,
+  "willneed_first_touch_ms": 27.00340400000001,
+  "note": "Same container and file, fresh windows. A real hint would make the advised first touch materially faster than the cold one."
+ }
+}

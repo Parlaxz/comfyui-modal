@@ -1,0 +1,146 @@
+{
+  "arms": [
+    "threads",
+    "processes"
+  ],
+  "min_launch_gap_ms": 4.0,
+  "processes_first": 5,
+  "qd": 4,
+  "read_mib": 64,
+  "rounds": 10,
+  "schedule": [
+    {
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "round": 1,
+      "run_ordinals": {
+        "processes": 1,
+        "threads": 2
+      },
+      "second": "threads"
+    },
+    {
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "round": 2,
+      "run_ordinals": {
+        "processes": 3,
+        "threads": 4
+      },
+      "second": "threads"
+    },
+    {
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "round": 3,
+      "run_ordinals": {
+        "processes": 6,
+        "threads": 5
+      },
+      "second": "processes"
+    },
+    {
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "round": 4,
+      "run_ordinals": {
+        "processes": 8,
+        "threads": 7
+      },
+      "second": "processes"
+    },
+    {
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "round": 5,
+      "run_ordinals": {
+        "processes": 9,
+        "threads": 10
+      },
+      "second": "threads"
+    },
+    {
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "round": 6,
+      "run_ordinals": {
+        "processes": 11,
+        "threads": 12
+      },
+      "second": "threads"
+    },
+    {
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "round": 7,
+      "run_ordinals": {
+        "processes": 14,
+        "threads": 13
+      },
+      "second": "processes"
+    },
+    {
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "round": 8,
+      "run_ordinals": {
+        "processes": 16,
+        "threads": 15
+      },
+      "second": "processes"
+    },
+    {
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "round": 9,
+      "run_ordinals": {
+        "processes": 17,
+        "threads": 18
+      },
+      "second": "threads"
+    },
+    {
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "round": 10,
+      "run_ordinals": {
+        "processes": 20,
+        "threads": 19
+      },
+      "second": "processes"
+    }
+  ],
+  "seed": 20260924,
+  "threads_first": 5,
+  "workers": 4
+}

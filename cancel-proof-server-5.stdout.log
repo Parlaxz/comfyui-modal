@@ -1,0 +1,185 @@
+[START] Security scan
+[DONE] Security scan
+## ComfyUI-Manager: installing dependencies done.
+** ComfyUI startup time: 2026-08-16 14:30:39.514
+** Platform: Windows
+** Python version: 3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]
+** Python executable: C:\Program Files\Python311\python.exe
+** ComfyUI Path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI
+** ComfyUI Base Folder Path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI
+** User directory: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\user
+** ComfyUI-Manager config path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\user\__manager\config.ini
+** Log path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\user\comfyui.log
+Package diffusers installed failed
+Package diffusers installed failed
+[33mModule 'diffusers' load failed. If you don't have it installed, do it:[0m
+[33mpip install diffusers[0m
+[34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+[34m[ComfyUI-Easy-Use] web root: [0mC:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-easy-use\web_version/v2 [92mLoaded[0m
+[exact_prefill.local] enabled=1 source=env
+[timing_trace] module loaded __file__=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\timing_trace.py TRACE_VERSION=2.0.0
+[timing_trace] module directory in sys.path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}
+âš ï¸  SeedVR2 optimizations check: SageAttention âŒ | Flash Attention âŒ | Triton âŒ
+ðŸ’¡ For best performance: pip install sageattention flash-attn triton
+ðŸ“Š Initial CUDA memory: 6.89GB free / 8.00GB total
+### ComfyUI-Workflow-Encrypt: Copy .js from 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-workflow-encrypt\js\comfyui-workflow-encrypt.js' to 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\web\extensions\comfyui-workflow-encrypt'
+# ðŸ˜ºdzNodes: LayerStyle -> [1;33mCannot import name 'guidedFilter' from 'cv2.ximgproc'
+A few nodes cannot works properly, while most nodes are not affected. Please REINSTALL package 'opencv-contrib-python'.
+For detail refer to [4mhttps://github.com/chflame163/ComfyUI_LayerStyle/issues/5[0m[m
+(RES4LYF) Init
+(RES4LYF) Importing beta samplers.
+(RES4LYF) Importing legacy samplers.
+
+[92m[rgthree-comfy] Loaded 48 fantastic nodes. ðŸŽ‰[0m
+
+[33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+FETCH ComfyRegistry Data: 5/173
+FETCH ComfyRegistry Data: 10/173
+FETCH ComfyRegistry Data: 15/173
+FETCH ComfyRegistry Data: 20/173
+FETCH ComfyRegistry Data: 25/173
+FETCH ComfyRegistry Data: 30/173
+FETCH ComfyRegistry Data: 35/173
+FETCH ComfyRegistry Data: 40/173
+FETCH ComfyRegistry Data: 45/173
+FETCH ComfyRegistry Data: 50/173
+FETCH ComfyRegistry Data: 55/173
+FETCH ComfyRegistry Data: 60/173
+FETCH ComfyRegistry Data: 65/173
+FETCH ComfyRegistry Data: 70/173
+FETCH ComfyRegistry Data: 75/173
+FETCH ComfyRegistry Data: 80/173
+FETCH ComfyRegistry Data: 85/173
+FETCH ComfyRegistry Data: 90/173
+FETCH ComfyRegistry Data: 95/173
+FETCH ComfyRegistry Data: 100/173
+FETCH ComfyRegistry Data: 105/173
+FETCH ComfyRegistry Data: 110/173
+FETCH ComfyRegistry Data: 115/173
+FETCH ComfyRegistry Data: 120/173
+FETCH ComfyRegistry Data: 125/173
+FETCH ComfyRegistry Data: 130/173
+FETCH ComfyRegistry Data: 135/173
+FETCH ComfyRegistry Data: 140/173
+FETCH ComfyRegistry Data: 145/173
+FETCH ComfyRegistry Data: 150/173
+FETCH ComfyRegistry Data: 155/173
+FETCH ComfyRegistry Data: 160/173
+FETCH ComfyRegistry Data: 165/173
+FETCH ComfyRegistry Data: 170/173
+FETCH ComfyRegistry Data [DONE]
+FETCH DATA from: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/custom-node-list.json [DONE]
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[v2.restore_publish] skipped reason=flag_disabled
+[v2.seed_build] source=invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=853927e769a20cc6 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.modal_target] app=stable-modal-comfy-v2-cancel-proof-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+[v2.local_submission_breakdown.pre_dispatch] request_id=4b4ed6b73c54 local_receive_to_worker_start_ms=absent worker_start_to_normalize_start_ms=absent normalize_production_options_ms=absent normalize_end_to_trace_construct_start_ms=absent runtime_trace_construct_ms=absent trace_construct_to_options_copy_start_ms=absent benchmark_options_copy_ms=absent options_copy_to_client_id_start_ms=absent client_id_generation_ms=absent client_id_end_to_plan_call_ms=absent plan_call_to_function_entry_ms=absent worker_start_to_plan_build_ms=absent local_receive_to_plan_build_start_ms=absent worker_queue_ms=absent plan_build_ms=absent plan_build_to_execute_plan_entry_ms=absent execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=453.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=absent generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=absent profile_remote_call_performed=absent profile_checker_matched=absent restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=False plan_to_dict_count=1 payload_bytes=18420 active_profile_local_ms=absent active_profile_cache_lookup_ms=absent active_profile_checker_ms=absent active_profile_setter_ms=absent active_profile_total_ms=absent created_modal_client=True performed_cls_from_name=True constructed_instance=True input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.local_submission_breakdown] request_id=4b4ed6b73c54 local_receive_to_worker_start_ms=absent worker_start_to_normalize_start_ms=absent normalize_production_options_ms=absent normalize_end_to_trace_construct_start_ms=absent runtime_trace_construct_ms=absent trace_construct_to_options_copy_start_ms=absent benchmark_options_copy_ms=absent options_copy_to_client_id_start_ms=absent client_id_generation_ms=absent client_id_end_to_plan_call_ms=absent plan_call_to_function_entry_ms=absent worker_start_to_plan_build_ms=absent local_receive_to_plan_build_start_ms=absent worker_queue_ms=absent plan_build_ms=absent plan_build_to_execute_plan_entry_ms=absent execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=453.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=absent generator_create_ms=516.0 generator_created_to_first_iteration_ms=0.0 local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=absent profile_remote_call_performed=absent profile_checker_matched=absent restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=False plan_to_dict_count=1 payload_bytes=18420 active_profile_local_ms=absent active_profile_cache_lookup_ms=absent active_profile_checker_ms=absent active_profile_setter_ms=absent active_profile_total_ms=absent created_modal_client=True performed_cls_from_name=True constructed_instance=True input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[modal-client] phase=cls_create requested_cloud=gcp requested_region=unconstrained
+[comfyui-modal] Generated artifacts detected, attempting auto-migration...
+[comfyui-modal] Auto-migrating 3 generated artifact categories: .playwright-mcp, output, test-results
+  .playwright-mcp/  ->  C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\playwright\mcp/
+    Copied 302 files (5.5 MB)
+    Removed source: .playwright-mcp/
+  output/  ->  C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\outputs/
+    Copied 43 files (215 B)
+    Removed source: output/
+  test-results/  ->  C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\playwright\test-results/
+    Copied 26 files (3.0 MB)
+    Removed source: test-results/
+[comfyui-modal] Auto-migration complete: 371 files, 8881397 bytes migrated
+[comfyui-modal] Auto-migration succeeded, continuing with deploy...
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal] Deploy failed: [...truncated, showing last 2000 chars...]
+w
+    Found existing installation: pillow 12.3.0
+    Uninstalling pillow-12.3.0:
+      Successfully uninstalled pillow-12.3.0
+  Attempting uninstall: nvidia-nvtx
+    Found existing installation: nvidia-nvtx 13.0.85
+    Uninstalling nvidia-nvtx-13.0.85:
+      Successfully uninstalled nvidia-nvtx-13.0.85
+  Attempting uninstall: nvidia-nvshmem-cu13
+    Found existing installation: nvidia-nvshmem-cu13 3.4.5
+    Uninstalling nvidia-nvshmem-cu1
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal] Deploy failed: [...truncated, showing last 2000 chars...]
+======
+[comfyapp] experiment_harness_diag: modal_dir=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[comfyapp] experiment_harness_diag: local_only_dir_exists=1 path=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments
+[comfyapp] experiment_harness_diag: direct_legacy_files_present=[]
+[comfyapp] experiment_harness_diag: com
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal] Deploy failed: [...truncated, showing last 2000 chars...]
+PU_CACHE_HIT=1
+
+=> Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+
+=> Step 18: ENV COMFYMODAL_RUNTIME=1
+
+=> Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+
+=> Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+
+=> Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+
+=> Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+
+=> Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+
+=> Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+
+=> Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+
+=> Ste
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal] Deploy failed: [...truncated, showing last 2000 chars...]
+pp] ===========================================
+[comfyapp] experiment_harness_diag: modal_dir=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[comfyapp] experiment_harness_diag: local_only_dir_exists=1 path=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments
+[comfyapp] experiment_harness_diag: direct_legacy_files_present=[
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal.history-v2] mirror record failed: ImportError: cannot import name 'logical_output_key_from_metadata' from 'history_v2_models' (C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\history_v2_models.py)
+[comfyui-modal] Deploy succeeded (Testing 6 v2.16.30), warmup via /comfymodal/deploy-warmup/run
+[predispatch] phase=recv t=1787068470.2093544
+[predispatch] prompt_bytes=171803
+[comfyui-modal] Starting prompt executionâ€¦
+[comfyui-modal.invoke] prompt_id=5abd65fd invocation_mode=deployed_lookup app_name=comfyui class_name=ComfyAPI_RTX_PRO_6000 method_name=run_prompt_stream deployed_state_path=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.deployed_state.json deployed_state_loaded=1 deployed_state_version=<missing> current_comfyapp_version=2.16.30 version_changed=1 custom_nodes_fingerprint_changed=1 auto_deploy_enabled=0 auto_deploy_started=0 modal_lookup_target=comfyui.ComfyAPI_RTX_PRO_6000.run_prompt_stream modal_call_start=1787068470.237355
+[v2.plan_proof] schema=1 payload=yes validated=True outputs=2 wf_hash=2e43d4c0ba3b82c0 dep_complete=True reg_proof=1 memo=hit
+[v2.restore_publish] skipped reason=flag_disabled
+[v2.seed_build] source=invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=2e43d4c0ba3b82c0 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.local_submission_breakdown.pre_dispatch] request_id=013a48ff-7312-4854-acf5-d7e1c2cccfd4 local_receive_to_worker_start_ms=16.0 worker_start_to_normalize_start_ms=absent normalize_production_options_ms=absent normalize_end_to_trace_construct_start_ms=absent runtime_trace_construct_ms=absent trace_construct_to_options_copy_start_ms=absent benchmark_options_copy_ms=absent options_copy_to_client_id_start_ms=absent client_id_generation_ms=absent client_id_end_to_plan_call_ms=absent plan_call_to_function_entry_ms=absent worker_start_to_plan_build_ms=31.0 local_receive_to_plan_build_start_ms=47.0 worker_queue_ms=31.0 plan_build_ms=31.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=0.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=94.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=absent profile_remote_call_performed=absent profile_checker_matched=absent restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=True plan_to_dict_count=1 payload_bytes=19989 active_profile_local_ms=absent active_profile_cache_lookup_ms=absent active_profile_checker_ms=absent active_profile_setter_ms=absent active_profile_total_ms=absent created_modal_client=False performed_cls_from_name=False constructed_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[comfyui-modal.profile] stage=local_total prompt_id=5abd65fd duration_ms=1118.2 error=TransportError
+[comfyui-modal] FAILURE SUMMARY: run_failed_phase=execution  fatal_error="workspace ac-raHf5BcGLfTL1BESrm4MZR is disabled"  modal_invoked=0
+[comfyui-modal.history-v2] mirror record failed: ImportError: cannot import name 'logical_output_key_from_metadata' from 'history_v2_models' (C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\history_v2_models.py)
+[comfyui-modal.custom_node_filter] action=allow name=ComfyUI-CacheDiT reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=ComfyUI-Flux2Klein-Enhancer reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=ComfyUI-KJNodes reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=ComfyUI-SeedVR2_VideoUpscaler reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=ComfyUI_LayerStyle reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=RES4LYF reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=deny name=__pycache__ reason=generated_or_environment_directory
+[comfyui-modal.custom_node_filter] action=allow name=cg-use-everywhere reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-custom-scripts reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-detail-daemon reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-easy-use reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-impact-pack reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-levelpixel reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-lora-manager reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-manager reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-modal reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui-workflow-encrypt reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_controlnet_aux reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_essentials reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_fill-nodes reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_image_metadata_extension reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_lg_samplingutils reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=comfyui_sam3 reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=masquerade-nodes-comfyui reason=production_custom_node
+[comfyui-modal.custom_node_filter] action=allow name=rgthree-comfy reason=production_custom_node
+[comfyui-modal] Deploying comfyapp.py (modal: C:\Users\parla\AppData\Roaming\Python\Python311\Scripts\modal.EXE)
+[comfyui-modal.history-v2] mirror record failed: ImportError: cannot import name 'logical_output_key_from_metadata' from 'history_v2_models' (C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\history_v2_models.py)
+[comfyui-modal] Deploy succeeded (Testing 6 v2.16.30), warmup via /comfymodal/deploy-warmup/run
+[modal-client] phase=cls_create requested_cloud=gcp requested_region=unconstrained

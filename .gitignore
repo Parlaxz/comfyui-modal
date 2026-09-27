@@ -1,0 +1,113 @@
+__pycache__/
+*.pyc
+*.pyo
+.deployed_version
+.deployed_state.json
+.env
+.hf_token
+.custom_nodes.json
+.deploy_log
+.custom_node_requirements/
+.baked_custom_node_deps/
+*benchmark*/
+optimization_logs/
+latest_benchmark_workflow.json
+
+# Playwright test artifacts
+node_modules/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Experiment runtime data
+.experiments/
+.experiment_leases.db*
+
+# Preset blobs
+.preset_blobs/
+.presets/
+
+# Browser session recordings
+.playwright-mcp/
+
+# Workspace config with API secrets
+.modal_workspaces.json
+
+# Studio runtime artifacts (user-local state, not committed)
+.studio_presets.json
+.studio_snapshots.json
+.studio_backends.json
+# Studio workflow-domain state (user-local, not committed)
+.studio_workflows.json
+.studio_workflow_versions.json
+.studio_workflow_mappings.json
+.studio_workflow_presets.json
+.studio_model_library.json
+.studio_custom_nodes.json
+.studio_workflow_compatibility.json
+.deploy_warmup_state.json
+.run_history/
+# Studio output images (generated at runtime, not source)
+output/studio/
+# Experiment runtime directory
+.comfymodal_experiments/
+# Temp JSON runtime files
+*_runtime.json
+.studio_*.tmp
+
+# Temporary files from atomic writes
+*.tmp
+
+# Audit/backup/patch files
+*.patch
+*.diff
+before_*
+AUDIT_*.md
+
+# Debug screenshots (root-level)
+audit-*.png
+comfyui-home.png
+*-current.png
+*-grid.png
+workflow-cards.png
+workflow-oriented-results.png
+results-page-current.png
+setup-page-current.png
+
+# Debug test output
+compile-*
+modal-body-*.json
+i2i-check.json
+stack-input-values.json
+status-after-*.json
+summary-status-*.json
+setup-body-debug.json
+setup-eval.json
+current-auto-preview.json
+setup-console-errors*.txt
+setup-console-warnings*.txt
+
+# Playwright debug snapshots
+playwright-*.md
+
+# Local orchestrator deepwork state
+.slim/deepwork/
+
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
+
+# Lane A disk-persisted caches
+.cache/
+
+# Runtime-state volume directory (restore-plan + snapshot-seed payloads)
+.runtime_state/
+
+# v2ctl local control-plane state (deploy/run manifests, locks, gates)
+.v2ctl/
+
+# Generated audit/deployment artifacts and temporary workspace bundles
+artifacts/
+.slim/
+*.bundle

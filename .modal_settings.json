@@ -1,0 +1,12 @@
+{
+  "auto_save_local": false,
+  "execution_mode": "v2",
+  "output_format": "original",
+  "preview_codec": "webp",
+  "preview_default": "on",
+  "preview_quality": 70,
+  "quality": 75,
+  "save_folder": "output/modal",
+  "save_metadata_sidecar": true,
+  "webp_lossless_compression": "balanced"
+}

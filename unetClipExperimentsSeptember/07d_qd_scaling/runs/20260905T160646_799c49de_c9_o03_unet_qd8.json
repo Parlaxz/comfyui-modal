@@ -1,0 +1,1566 @@
+{
+  "C9_TOTAL_WALL_MS": 2234.241396,
+  "E27_SOURCE_MECHANISM_PROVEN": "NO",
+  "FILE_TO_CUDA_WALL_MS": null,
+  "PHYSICAL_READ_SPAN_MS": 2232.635248,
+  "SOURCE_SYSCALL_UNION_BUSY_MS": null,
+  "SOURCE_WALL_MS": 2234.241396,
+  "achieved_mean_qd": 8.0,
+  "achieved_source_qd_max": 8,
+  "achieved_source_qd_mean": 8.0,
+  "achieved_source_qd_timeline": [
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 0,
+      "timestamp_ns": 2715285783
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 1,
+      "timestamp_ns": 2737423028
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 2,
+      "timestamp_ns": 2772040394
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 2821139519
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 2886074014
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 2958359214
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 6,
+      "timestamp_ns": 3107091171
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 7,
+      "timestamp_ns": 3207837831
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 2,
+      "timestamp_ns": 4279745667
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 4396421400
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 4416574215
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 1,
+      "timestamp_ns": 4782454124
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 6,
+      "timestamp_ns": 4790495128
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 3,
+      "timestamp_ns": 4841832449
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 4,
+      "timestamp_ns": 4917115874
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 7,
+      "timestamp_ns": 4948121681
+    }
+  ],
+  "active_reader_transitions": [
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 0,
+      "timestamp_ns": 2715285783
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 1,
+      "timestamp_ns": 2737423028
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 2,
+      "timestamp_ns": 2772040394
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 2821139519
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 2886074014
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 2958359214
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 6,
+      "timestamp_ns": 3107091171
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 7,
+      "timestamp_ns": 3207837831
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 2,
+      "timestamp_ns": 4279745667
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 4396421400
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 4416574215
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 1,
+      "timestamp_ns": 4782454124
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 6,
+      "timestamp_ns": 4790495128
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 3,
+      "timestamp_ns": 4841832449
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 4,
+      "timestamp_ns": 4917115874
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 7,
+      "timestamp_ns": 4948121681
+    }
+  ],
+  "actual_source": {},
+  "all_requests_within_buffer": true,
+  "allocation_in_timed_loop": false,
+  "arm": "source_only",
+  "attempt_id": "20260905T160646_799c49de_c9_o03_unet_qd8",
+  "buffer_allocations": {
+    "allocated_before_source_wall": true,
+    "allocation_in_c9_total_wall": false,
+    "bytes_per_worker": 33554432,
+    "count": 8,
+    "is_pinned": true,
+    "released_after_all_workers_join": true,
+    "reusable_lifetime": "worker_source_wall",
+    "reused_for_each_read": true
+  },
+  "buffer_type": "pytorch_pinned_host",
+  "byte_reconciliation": {
+    "expected_payload_bytes": 12309817472,
+    "offsets_recorded_per_physical_read": false,
+    "read_count": 368,
+    "requested_bytes": 12309817472,
+    "returned_bytes": 12309817472,
+    "returned_equals_expected": true
+  },
+  "byte_validation": {
+    "evidence_complete": false,
+    "expected_bytes": 12309817472,
+    "gap_count": 0,
+    "ok": true,
+    "overlap_count": 0,
+    "requested_bytes": 12309817472,
+    "returned_bytes": 12309817472,
+    "source_ranges_exact": true,
+    "syscall_count": 368
+  },
+  "campaign_index": 9,
+  "classification": "ELIGIBLE",
+  "configured_source_capacity": 8,
+  "configured_source_qd": 8,
+  "container_session": {
+    "hostname": "modal",
+    "session_id": "ta-01M1S5A6NTD8QG1HZC9JP9Q27R",
+    "single_use_container": true
+  },
+  "coverage": {
+    "evidence_complete": false,
+    "expected_bytes": 12309817472,
+    "gap_count": 0,
+    "ok": true,
+    "overlap_count": 0,
+    "requested_bytes": 12309817472,
+    "returned_bytes": 12309817472,
+    "syscall_count": 368
+  },
+  "cpu_allocation": {
+    "allocation_match": true,
+    "allocation_match_classification": "match",
+    "cpu_request": 12,
+    "declared_memory_mb": 8192,
+    "declared_modal_function_cpu": 12,
+    "declared_modal_function_cpu_request": 12,
+    "identity_source": "runtime_shape_config.cpu_request",
+    "observed_cpu": 12,
+    "observed_runtime_shape_cpu": 12,
+    "observed_runtime_shape_cpu_request": 12,
+    "production_relevance_classification": "production_relevant",
+    "production_relevant": true,
+    "requested_cpu": 12,
+    "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+    "strict_allocation_classification": "match",
+    "strict_allocation_match": true
+  },
+  "cpu_observed": 12,
+  "cpu_request": 12,
+  "cpu_requested": 12,
+  "cuda_available": true,
+  "cuda_build": "13.0",
+  "cuda_transfer_event_count": 0,
+  "cuda_transfer_events": [],
+  "cuda_used": false,
+  "data_start": 48928,
+  "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "e27_proof_classification": "proof-NO",
+  "e27_source_mechanism_evaluation": {
+    "E27_SOURCE_MECHANISM_PROVEN": "NO",
+    "classification": "proof-NO",
+    "emitted_line": "E27_SOURCE_MECHANISM_PROVEN=NO",
+    "failed_predicates": [
+      "source_only_no_h2d_mechanism"
+    ],
+    "predicates": {
+      "source_only_no_h2d_mechanism": false
+    },
+    "proven": false
+  },
+  "e27_source_mechanism_failed_predicates": [
+    "source_only_no_h2d_mechanism"
+  ],
+  "e27_source_mechanism_line": "E27_SOURCE_MECHANISM_PROVEN=NO",
+  "effective_gbps": 5.50961838503148,
+  "error": null,
+  "execution_arm": "source_only",
+  "execution_contract": {
+    "allocation_in_timed_loop": false,
+    "block_bytes": 33554432,
+    "buffer_allocations": "one reusable Torch tensor per worker",
+    "buffer_type": "pytorch_pinned_host",
+    "cuda_available": true,
+    "cuda_used": false,
+    "dispatcher_participation": false,
+    "fd_topology": "one shared read-only file descriptor; positioned reads",
+    "filesystem_mount": "/root/models",
+    "h2d_used": false,
+    "hashing_in_timed_loop": false,
+    "model_construction": false,
+    "mount_read_only": true,
+    "qd_values": [
+      2,
+      4,
+      8
+    ],
+    "range_geometry": "static contiguous disjoint payload ranges",
+    "source_only": true,
+    "telemetry_in_timed_loop": false,
+    "timing_boundary": {
+      "end": "all worker joins complete",
+      "hashing_included": false,
+      "name": "THREAD_START_TO_JOIN_WALL",
+      "physical_read_span": {
+        "end": "last os.preadv end",
+        "name": "PHYSICAL_READ_SPAN",
+        "start": "first os.preadv begin"
+      },
+      "setup_excluded": [
+        "Torch import",
+        "shared FD open"
+      ],
+      "start": "perf_counter_ns immediately before worker launch"
+    },
+    "torch_imported": true,
+    "workers_per_lane": 1
+  },
+  "experiment": "c9_recovery",
+  "fd_topology": {
+    "close_after_all_workers": true,
+    "mode": "one_shared_fd",
+    "open_count": 1,
+    "positioned_reads": true,
+    "shared_by_workers": true
+  },
+  "file_identity": {
+    "basename": "z_image_turbo_bf16.safetensors",
+    "device": 31,
+    "inode": 4,
+    "mtime_ns": 1787810706829355211,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "size_bytes": 12309866400
+  },
+  "file_size_bytes": 12309866400,
+  "filesystem_identity": {
+    "mount": {
+      "filesystem_type": "9p",
+      "major_minor": "0:31",
+      "mount_id": 36,
+      "mount_options": "rw,nosuid",
+      "mountpoint": "/__modal/volumes",
+      "parent_id": 18,
+      "read_only_observed": false,
+      "root": "/",
+      "source": "none",
+      "super_options": "rw,trans=fd,rfdno=11,wfdno=11,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=0,cache=remote_revalidating,disable_fifo_open,directfs"
+    },
+    "mount_read_only_requested": true,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "stat": {
+      "device": 31,
+      "inode": 4,
+      "mode": 420
+    },
+    "statvfs": {
+      "available_bytes": 409600000000,
+      "filesystem_block_size": 4096,
+      "fragment_size": 4096
+    }
+  },
+  "fixed_config": {
+    "aggregation_enabled": false,
+    "configured_qd": 8,
+    "configured_source_capacity": 8,
+    "configured_source_qd": 8,
+    "cuda_transfer_event_count": 0,
+    "cuda_transfer_events": [],
+    "cuda_used": false,
+    "execution_arm": "source_only",
+    "h2d_dispatcher_participation": false,
+    "h2d_dispatcher_started": false,
+    "h2d_events": [],
+    "h2d_submission_count": 0,
+    "h2d_submit_count": 0,
+    "h2d_target_bytes": null,
+    "h2d_transfer_events": [],
+    "h2d_used": false,
+    "model_construction": false,
+    "no_h2d_dispatcher_participation": true,
+    "producer_count": 8,
+    "source_block_bytes": 33554432,
+    "source_capacity_semantics": "buffering_work_capacity_only"
+  },
+  "fixed_config_expected": {
+    "aggregation_enabled": false,
+    "configured_qd": 8,
+    "configured_source_capacity": 8,
+    "configured_source_qd": 8,
+    "cuda_transfer_event_count": 0,
+    "cuda_transfer_events": [],
+    "cuda_used": false,
+    "execution_arm": "source_only",
+    "h2d_dispatcher_participation": false,
+    "h2d_dispatcher_started": false,
+    "h2d_events": [],
+    "h2d_submission_count": 0,
+    "h2d_submit_count": 0,
+    "h2d_target_bytes": null,
+    "h2d_transfer_events": [],
+    "h2d_used": false,
+    "model_construction": false,
+    "no_h2d_dispatcher_participation": true,
+    "producer_count": 8,
+    "source_block_bytes": 33554432,
+    "source_capacity_semantics": "buffering_work_capacity_only"
+  },
+  "gpu_attachment": {
+    "attached": true,
+    "gpu": "rtx-pro-6000",
+    "reason": "CUDA-enabled Torch environment; source loop performs no CUDA work",
+    "requested": true
+  },
+  "gpu_ready_dependency": false,
+  "gpu_ready_dependency_controlling_source_slot_release": false,
+  "h2d_dispatcher_participation": false,
+  "h2d_dispatcher_started": false,
+  "h2d_events": [],
+  "h2d_submission_count": 0,
+  "h2d_submit_count": 0,
+  "h2d_transfer_event_count": 0,
+  "h2d_transfer_events": [],
+  "h2d_used": false,
+  "hashing_in_timed_loop": false,
+  "header_tensor_count": 453,
+  "identity": {
+    "accelerator": "cuda",
+    "container_session_id": "ta-01M1S5A6NTD8QG1HZC9JP9Q27R",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-o5uyPZaJ9HHf0UjNQCYJsV",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "integrity_verification": {
+    "performed": false,
+    "scope": null
+  },
+  "max_achieved_qd": 8,
+  "max_actual_source_inflight": 8,
+  "max_requested_bytes": 33554432,
+  "metrics": {
+    "C9_TOTAL_WALL_MS": 2234.241396,
+    "FILE_TO_CUDA_WALL_MS": null,
+    "H2D_WALL_MS": null,
+    "PHYSICAL_READ_SPAN_MS": 2232.635248,
+    "SOURCE_WALL_MS": 2234.241396,
+    "cuda_used": false,
+    "effective_gbps": 5.50961838503148,
+    "h2d_used": false,
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1",
+    "source_bytes": 12309817472,
+    "source_read_count": 368,
+    "source_wall_ms": 2234.241396
+  },
+  "model_construction": false,
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "no_h2d_dispatcher_participation": true,
+  "oracle_wall_ms": 4186.2769,
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_bytes": 12309817472,
+  "payload_identity": {
+    "data_start": 48928,
+    "hash_scope": "no payload hashing in the measured source loop",
+    "integrity_verification": "not performed",
+    "payload_bytes": 12309817472
+  },
+  "physical_reads": [],
+  "physical_syscall_provenance": "source_ceiling_oracle._physical_source_read",
+  "physical_syscall_telemetry": [],
+  "pinned_host": true,
+  "pinned_host_evidence": {
+    "buffer_type": "pytorch_pinned_host",
+    "buffers": [
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 0
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 1
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 2
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 3
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 4
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 5
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 6
+      },
+      {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 7
+      }
+    ],
+    "is_pinned": true
+  },
+  "probe": "exp04_source_ceiling_oracle",
+  "provider_region": {
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "qd_telemetry": {
+    "active_interval_end_ns": null,
+    "active_interval_start_ns": null,
+    "max_achieved_qd": 8,
+    "time_at_qd_ms": null,
+    "time_weighted_achieved_qd": 8.0
+  },
+  "read_evidence_complete": false,
+  "read_size_evidence": [
+    {
+      "offset": 48928,
+      "region_id": 0,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 48928,
+      "worker_id": 0
+    },
+    {
+      "offset": 33603360,
+      "region_id": 0,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 33603360,
+      "worker_id": 0
+    },
+    {
+      "offset": 1476443936,
+      "region_id": 0,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 1476443936,
+      "worker_id": 0
+    },
+    {
+      "offset": 1509998368,
+      "region_id": 0,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 1509998368,
+      "worker_id": 0
+    },
+    {
+      "offset": 1538776112,
+      "region_id": 1,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 1538776112,
+      "worker_id": 1
+    },
+    {
+      "offset": 1572330544,
+      "region_id": 1,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 1572330544,
+      "worker_id": 1
+    },
+    {
+      "offset": 3015171120,
+      "region_id": 1,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 3015171120,
+      "worker_id": 1
+    },
+    {
+      "offset": 3048725552,
+      "region_id": 1,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 3048725552,
+      "worker_id": 1
+    },
+    {
+      "offset": 3077503296,
+      "region_id": 2,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 3077503296,
+      "worker_id": 2
+    },
+    {
+      "offset": 3111057728,
+      "region_id": 2,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 3111057728,
+      "worker_id": 2
+    },
+    {
+      "offset": 4553898304,
+      "region_id": 2,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 4553898304,
+      "worker_id": 2
+    },
+    {
+      "offset": 4587452736,
+      "region_id": 2,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 4587452736,
+      "worker_id": 2
+    },
+    {
+      "offset": 4616230480,
+      "region_id": 3,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 4616230480,
+      "worker_id": 3
+    },
+    {
+      "offset": 4649784912,
+      "region_id": 3,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 4649784912,
+      "worker_id": 3
+    },
+    {
+      "offset": 6092625488,
+      "region_id": 3,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 6092625488,
+      "worker_id": 3
+    },
+    {
+      "offset": 6126179920,
+      "region_id": 3,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 6126179920,
+      "worker_id": 3
+    },
+    {
+      "offset": 6154957664,
+      "region_id": 4,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 6154957664,
+      "worker_id": 4
+    },
+    {
+      "offset": 6188512096,
+      "region_id": 4,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 6188512096,
+      "worker_id": 4
+    },
+    {
+      "offset": 7631352672,
+      "region_id": 4,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 7631352672,
+      "worker_id": 4
+    },
+    {
+      "offset": 7664907104,
+      "region_id": 4,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 7664907104,
+      "worker_id": 4
+    },
+    {
+      "offset": 7693684848,
+      "region_id": 5,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 7693684848,
+      "worker_id": 5
+    },
+    {
+      "offset": 7727239280,
+      "region_id": 5,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 7727239280,
+      "worker_id": 5
+    },
+    {
+      "offset": 9170079856,
+      "region_id": 5,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 9170079856,
+      "worker_id": 5
+    },
+    {
+      "offset": 9203634288,
+      "region_id": 5,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 9203634288,
+      "worker_id": 5
+    },
+    {
+      "offset": 9232412032,
+      "region_id": 6,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 9232412032,
+      "worker_id": 6
+    },
+    {
+      "offset": 9265966464,
+      "region_id": 6,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 9265966464,
+      "worker_id": 6
+    },
+    {
+      "offset": 10708807040,
+      "region_id": 6,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 10708807040,
+      "worker_id": 6
+    },
+    {
+      "offset": 10742361472,
+      "region_id": 6,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 10742361472,
+      "worker_id": 6
+    },
+    {
+      "offset": 10771139216,
+      "region_id": 7,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 10771139216,
+      "worker_id": 7
+    },
+    {
+      "offset": 10804693648,
+      "region_id": 7,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 10804693648,
+      "worker_id": 7
+    },
+    {
+      "offset": 12247534224,
+      "region_id": 7,
+      "requested_bytes": 33554432,
+      "retry_number": 0,
+      "returned_bytes": 33554432,
+      "source_offset": 12247534224,
+      "worker_id": 7
+    },
+    {
+      "offset": 12281088656,
+      "region_id": 7,
+      "requested_bytes": 28777744,
+      "retry_number": 0,
+      "returned_bytes": 28777744,
+      "source_offset": 12281088656,
+      "worker_id": 7
+    }
+  ],
+  "regions": [
+    {
+      "end": 1538776112,
+      "producer_id": 0,
+      "region_id": 0,
+      "start": 48928
+    },
+    {
+      "end": 3077503296,
+      "producer_id": 1,
+      "region_id": 1,
+      "start": 1538776112
+    },
+    {
+      "end": 4616230480,
+      "producer_id": 2,
+      "region_id": 2,
+      "start": 3077503296
+    },
+    {
+      "end": 6154957664,
+      "producer_id": 3,
+      "region_id": 3,
+      "start": 4616230480
+    },
+    {
+      "end": 7693684848,
+      "producer_id": 4,
+      "region_id": 4,
+      "start": 6154957664
+    },
+    {
+      "end": 9232412032,
+      "producer_id": 5,
+      "region_id": 5,
+      "start": 7693684848
+    },
+    {
+      "end": 10771139216,
+      "producer_id": 6,
+      "region_id": 6,
+      "start": 9232412032
+    },
+    {
+      "end": 12309866400,
+      "producer_id": 7,
+      "region_id": 7,
+      "start": 10771139216
+    }
+  ],
+  "requested_physical_read_sizes": [
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744
+  ],
+  "resolved_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+  "returned_physical_read_sizes": [
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744,
+    33554432,
+    33554432,
+    33554432,
+    28777744
+  ],
+  "role": "unet",
+  "run_id": "20260905T160646_799c49de",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "source_block_bytes": 33554432,
+  "source_bytes": 12309817472,
+  "source_capacity_semantics": "buffering_work_capacity_only",
+  "source_effective_gbps": 5.50961838503148,
+  "source_only": true,
+  "source_only_proof": {
+    "absence_predicates": {
+      "no_gpu_ready_dependency_controlling_source_slot_release": true
+    },
+    "all": true,
+    "failed_positive_predicates": [],
+    "gpu_ready_dependency_controlling_source_slot_release": false,
+    "no_h2d_dispatcher_participation": true,
+    "source_qd_independent_of_h2d_or_staging_depth": true,
+    "source_workers_release_solely_from_source_completion": true,
+    "source_workers_terminate_solely_from_source_completion": true,
+    "zero_cuda_h2d_submissions": true,
+    "zero_cuda_transfer_events_on_measured_path": true
+  },
+  "source_qd": 8,
+  "source_qd_timeline": [
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 0,
+      "timestamp_ns": 2715285783
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 1,
+      "timestamp_ns": 2737423028
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 2,
+      "timestamp_ns": 2772040394
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 2821139519
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 2886074014
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 2958359214
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 6,
+      "timestamp_ns": 3107091171
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 7,
+      "timestamp_ns": 3207837831
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 2,
+      "timestamp_ns": 4279745667
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 4396421400
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 4416574215
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 1,
+      "timestamp_ns": 4782454124
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 6,
+      "timestamp_ns": 4790495128
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 3,
+      "timestamp_ns": 4841832449
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 4,
+      "timestamp_ns": 4917115874
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 7,
+      "timestamp_ns": 4948121681
+    }
+  ],
+  "source_read_count": 368,
+  "source_requested_bytes": 12309817472,
+  "source_returned_bytes": 12309817472,
+  "source_slot_release_dependency": "source_completion",
+  "source_wall_ms": 2234.241396,
+  "source_worker_release_trigger": "source_completion",
+  "source_worker_termination_trigger": "source_completion",
+  "source_workers_release_solely_from_source_completion": true,
+  "source_workers_terminate_solely_from_source_completion": true,
+  "status": "ok",
+  "telemetry_in_timed_loop": false,
+  "time_at_qd_ms": null,
+  "time_weighted_achieved_qd": 8.0,
+  "timing_boundary": {
+    "end": "all worker joins complete",
+    "hashing_included": false,
+    "name": "THREAD_START_TO_JOIN_WALL",
+    "physical_read_span": {
+      "end": "last os.preadv end",
+      "name": "PHYSICAL_READ_SPAN",
+      "start": "first os.preadv begin"
+    },
+    "setup_excluded": [
+      "Torch import",
+      "shared FD open"
+    ],
+    "start": "perf_counter_ns immediately before worker launch"
+  },
+  "timing_scope": "before worker thread startup -> all worker joins",
+  "torch_imported": true,
+  "transport_stats": {
+    "C9_TOTAL_WALL_MS": 2234.241396,
+    "PHYSICAL_READ_SPAN_MS": 2232.635248,
+    "configured_qd": 8,
+    "configured_source_capacity": 8,
+    "configured_source_qd": 8,
+    "cuda_transfer_event_count": 0,
+    "cuda_used": false,
+    "effective_gbps": 5.50961838503148,
+    "execution_arm": "source_only",
+    "h2d_dispatcher_participation": false,
+    "h2d_submission_count": 0,
+    "h2d_transfer_event_count": 0,
+    "h2d_used": false,
+    "no_h2d_dispatcher_participation": true,
+    "physical_syscall_provenance": "source_ceiling_oracle._physical_source_read",
+    "physical_syscall_telemetry": [],
+    "producer_count": 8,
+    "source_block_bytes": 33554432,
+    "source_bytes": 12309817472,
+    "source_only_proof": {
+      "absence_predicates": {
+        "no_gpu_ready_dependency_controlling_source_slot_release": true
+      },
+      "all": true,
+      "failed_positive_predicates": [],
+      "gpu_ready_dependency_controlling_source_slot_release": false,
+      "no_h2d_dispatcher_participation": true,
+      "source_qd_independent_of_h2d_or_staging_depth": true,
+      "source_workers_release_solely_from_source_completion": true,
+      "source_workers_terminate_solely_from_source_completion": true,
+      "zero_cuda_h2d_submissions": true,
+      "zero_cuda_transfer_events_on_measured_path": true
+    },
+    "source_qd_timeline": [
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 0,
+        "timestamp_ns": 2715285783
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 1,
+        "timestamp_ns": 2737423028
+      },
+      {
+        "delta": 1,
+        "depth": 3,
+        "producer_id": 2,
+        "timestamp_ns": 2772040394
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 3,
+        "timestamp_ns": 2821139519
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 2886074014
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 5,
+        "timestamp_ns": 2958359214
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 6,
+        "timestamp_ns": 3107091171
+      },
+      {
+        "delta": 1,
+        "depth": 8,
+        "producer_id": 7,
+        "timestamp_ns": 3207837831
+      },
+      {
+        "delta": -1,
+        "depth": 7,
+        "producer_id": 2,
+        "timestamp_ns": 4279745667
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 5,
+        "timestamp_ns": 4396421400
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 0,
+        "timestamp_ns": 4416574215
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 1,
+        "timestamp_ns": 4782454124
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 6,
+        "timestamp_ns": 4790495128
+      },
+      {
+        "delta": -1,
+        "depth": 2,
+        "producer_id": 3,
+        "timestamp_ns": 4841832449
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 4,
+        "timestamp_ns": 4917115874
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 7,
+        "timestamp_ns": 4948121681
+      }
+    ],
+    "source_read_count": 368,
+    "source_requested_bytes": 12309817472,
+    "source_returned_bytes": 12309817472,
+    "source_wall_ms": 2234.241396,
+    "topology": {
+      "close_after_all_workers": true,
+      "coverage_exact": true,
+      "fd_topology": "one_shared_fd",
+      "fixed_contiguous_regions": true,
+      "fixed_ownership": true,
+      "monotonic_reads": true,
+      "open_count": 1,
+      "positioned_reads": true,
+      "producer_count": 8,
+      "regions": [
+        {
+          "end": 1538776112,
+          "producer_id": 0,
+          "region_id": 0,
+          "start": 48928
+        },
+        {
+          "end": 3077503296,
+          "producer_id": 1,
+          "region_id": 1,
+          "start": 1538776112
+        },
+        {
+          "end": 4616230480,
+          "producer_id": 2,
+          "region_id": 2,
+          "start": 3077503296
+        },
+        {
+          "end": 6154957664,
+          "producer_id": 3,
+          "region_id": 3,
+          "start": 4616230480
+        },
+        {
+          "end": 7693684848,
+          "producer_id": 4,
+          "region_id": 4,
+          "start": 6154957664
+        },
+        {
+          "end": 9232412032,
+          "producer_id": 5,
+          "region_id": 5,
+          "start": 7693684848
+        },
+        {
+          "end": 10771139216,
+          "producer_id": 6,
+          "region_id": 6,
+          "start": 9232412032
+        },
+        {
+          "end": 12309866400,
+          "producer_id": 7,
+          "region_id": 7,
+          "start": 10771139216
+        }
+      ],
+      "shared_by_workers": true
+    },
+    "wait_dimensions": {
+      "gpu_ready_wait_count": 0,
+      "gpu_ready_wait_ms": 0.0,
+      "h2d_capacity_wait_count": 0,
+      "h2d_capacity_wait_ms": 0.0,
+      "ready_queue_wait_count": 0,
+      "ready_queue_wait_ms": 0.0,
+      "source_capacity_wait_count": 0,
+      "source_capacity_wait_ms": 0.0
+    }
+  },
+  "wait_dimensions": {
+    "gpu_ready_wait_count": 0,
+    "gpu_ready_wait_ms": 0.0,
+    "h2d_capacity_wait_count": 0,
+    "h2d_capacity_wait_ms": 0.0,
+    "ready_queue_wait_count": 0,
+    "ready_queue_wait_ms": 0.0,
+    "source_capacity_wait_count": 0,
+    "source_capacity_wait_ms": 0.0
+  },
+  "worker_errors": [],
+  "workers": [
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 0
+      },
+      "is_pinned": true,
+      "region_end": 1538776112,
+      "region_id": 0,
+      "region_start": 48928,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 0,
+      "worker_started_ns": 2715285783,
+      "worker_terminated_ns": 4416574215,
+      "worker_wall_ms": 1701.288432
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 1
+      },
+      "is_pinned": true,
+      "region_end": 3077503296,
+      "region_id": 1,
+      "region_start": 1538776112,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 1,
+      "worker_started_ns": 2737423028,
+      "worker_terminated_ns": 4782454124,
+      "worker_wall_ms": 2045.031096
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 2
+      },
+      "is_pinned": true,
+      "region_end": 4616230480,
+      "region_id": 2,
+      "region_start": 3077503296,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 2,
+      "worker_started_ns": 2772040394,
+      "worker_terminated_ns": 4279745667,
+      "worker_wall_ms": 1507.705273
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 3
+      },
+      "is_pinned": true,
+      "region_end": 6154957664,
+      "region_id": 3,
+      "region_start": 4616230480,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 3,
+      "worker_started_ns": 2821139519,
+      "worker_terminated_ns": 4841832449,
+      "worker_wall_ms": 2020.69293
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 4
+      },
+      "is_pinned": true,
+      "region_end": 7693684848,
+      "region_id": 4,
+      "region_start": 6154957664,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 4,
+      "worker_started_ns": 2886074014,
+      "worker_terminated_ns": 4917115874,
+      "worker_wall_ms": 2031.04186
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 5
+      },
+      "is_pinned": true,
+      "region_end": 9232412032,
+      "region_id": 5,
+      "region_start": 7693684848,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 5,
+      "worker_started_ns": 2958359214,
+      "worker_terminated_ns": 4396421400,
+      "worker_wall_ms": 1438.062186
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 6
+      },
+      "is_pinned": true,
+      "region_end": 10771139216,
+      "region_id": 6,
+      "region_start": 9232412032,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 6,
+      "worker_started_ns": 3107091171,
+      "worker_terminated_ns": 4790495128,
+      "worker_wall_ms": 1683.403957
+    },
+    {
+      "buffer": {
+        "allocation_exception": null,
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "pinned_host": true,
+        "worker_id": 7
+      },
+      "is_pinned": true,
+      "region_end": 12309866400,
+      "region_id": 7,
+      "region_start": 10771139216,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 1538727184,
+      "status": "ok",
+      "worker_id": 7,
+      "worker_started_ns": 3207837831,
+      "worker_terminated_ns": 4948121681,
+      "worker_wall_ms": 1740.28385
+    }
+  ]
+}

@@ -1,0 +1,5546 @@
+{
+  "batch": "D8",
+  "env": {
+    "torch_version": "2.8.0+cu128",
+    "torch_threads": 6,
+    "torch_interop_threads": 6,
+    "cuda_available": true,
+    "cuda_device_count": 1,
+    "processors": 12,
+    "python": "3.11.9",
+    "platform": "win32",
+    "native_threads_at_start": 28,
+    "rss_start_mb": 649.74
+  },
+  "synthetic": {
+    "header_keys": 479,
+    "n_layers": 32,
+    "dim": 3840
+  },
+  "arms": {
+    "serial_first_vs_steady": {
+      "iters": 5,
+      "first_wall_ms": 21.312,
+      "first_thread_cpu_ms": 15.625,
+      "first_process_cpu_ms": 15.625,
+      "steady_median_wall_ms": 20.4085,
+      "steady_median_thread_cpu_ms": 15.625,
+      "steady_min_wall_ms": 19.058,
+      "steady_max_wall_ms": 194.348,
+      "steady_median_cpu_ms": 15.625,
+      "steady_median_accounted_percent": 93.05,
+      "first_vs_steady_ratio": 1.04,
+      "rows": [
+        {
+          "wall_ms": 21.312,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 20.296,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.058,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 14.879,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.072,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1.048,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 19.057
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.239,
+          "children_wall_sum_ms": 19.057,
+          "accounted_percent": 93.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0219
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.011
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.2456000000000003
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 1.4815000000000011
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1901
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.2014000000000014
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.19189999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.19809999999999994
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0192
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0093
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0398
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0097
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0114
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.017
+              }
+            },
+            "total_wall_ms": 4.655,
+            "count": 594
+          },
+          "gc_wall_ms": 2.194,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 194.348,
+          "thread_cpu_ms": 109.375,
+          "process_cpu_ms": 156.25,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 193.658,
+            "cpu_ms": 109.375,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.046,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 185.452,
+                "cpu_ms": 109.375
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 5.303,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.926,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 191.727
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.932,
+          "children_wall_sum_ms": 191.727,
+          "accounted_percent": 99.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0132
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0074
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.1865999999999999
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.28019999999999995
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.23109999999999992
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.6919000000000004
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.19430000000000003
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.27870000000000006
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0253
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0051
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0423
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0085
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0102
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0086
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0266
+              }
+            },
+            "total_wall_ms": 4.01,
+            "count": 594
+          },
+          "gc_wall_ms": 171.878,
+          "gc_count": 15,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 109.38,
+            "sum_proc_cpu_ms": 109.38,
+            "max_native_threads": 29,
+            "min_native_threads": 29,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 653.48
+          },
+          "index": 1
+        },
+        {
+          "wall_ms": 21.316,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 19.763,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.067,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.225,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.751,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1.91,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 17.953
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.81,
+          "children_wall_sum_ms": 17.953,
+          "accounted_percent": 90.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0241
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0132
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.4873000000000014
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.22869999999999996
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.19049999999999997
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9942999999999987
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.20980000000000004
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.2614
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0296
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0165
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0088
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0101
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0085
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0209
+              }
+            },
+            "total_wall_ms": 3.509,
+            "count": 594
+          },
+          "gc_wall_ms": 0.829,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 2
+        },
+        {
+          "wall_ms": 19.501,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.652,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.084,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.127,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.366,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.871,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.448
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.204,
+          "children_wall_sum_ms": 15.448,
+          "accounted_percent": 92.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0235
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0167
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0354999999999985
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1708999999999999
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.23400000000000004
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.6325000000000083
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.16389999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.16929999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.020399999999999998
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0096
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0137
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.007
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0055
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0123
+              }
+            },
+            "total_wall_ms": 3.522,
+            "count": 594
+          },
+          "gc_wall_ms": 1.104,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 19.058,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 18.249,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.048,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 13.801,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.466,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.71,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 17.025
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.224,
+          "children_wall_sum_ms": 17.025,
+          "accounted_percent": 93.3,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0147
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0073
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.588000000000002
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.2353
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.21989999999999998
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0902999999999998
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.2914999999999999
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.7429
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.02
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0049
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0134
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0567
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0482
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0113
+              }
+            },
+            "total_wall_ms": 4.351,
+            "count": 594
+          },
+          "gc_wall_ms": 1.395,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    }
+  },
+  "config": {
+    "class": "ZImage",
+    "unet_config": {
+      "image_model": "lumina2",
+      "patch_size": "2",
+      "in_channels": "16",
+      "dim": "3840",
+      "cap_feat_dim": "5120",
+      "n_layers": "32",
+      "qk_norm": "True",
+      "n_heads": "30",
+      "n_kv_heads": "30",
+      "axes_dims": "[32, 48, 48]",
+      "axes_lens": "[1536, 512, 512]",
+      "rope_theta": "256.0",
+      "ffn_dim_multiplier": "2.6666666666666665",
+      "z_image_modulation": "True",
+      "time_scale": "1000.0",
+      "allow_fp16": "True",
+      "dtype": "torch.bfloat16"
+    },
+    "diag": {
+      "detect_ms": 2.519,
+      "dtype_resolve_ms": 0.502,
+      "unet_dtype": "torch.bfloat16"
+    }
+  },
+  "inventory": {
+    "modules": 594,
+    "parameters": 477,
+    "param_numel": 6526554688,
+    "param_logical_bytes": 13053109376,
+    "param_physical_bytes": 0,
+    "param_all_meta": true,
+    "buffers": 1,
+    "buffer_numel": 1000,
+    "buffer_all_meta": true,
+    "tensor_objects": 478
+  },
+  "first_row": {
+    "wall_ms": 21.312,
+    "thread_cpu_ms": 15.625,
+    "process_cpu_ms": 15.625,
+    "tree": {
+      "name": "get_model_total",
+      "wall_ms": 20.296,
+      "cpu_ms": 15.625,
+      "children": [
+        {
+          "name": "ops_selection",
+          "wall_ms": 0.058,
+          "cpu_ms": 0.0
+        },
+        {
+          "name": "diffusion_model_construct",
+          "wall_ms": 14.879,
+          "cpu_ms": 15.625
+        },
+        {
+          "name": "archive_dtypes",
+          "wall_ms": 3.072,
+          "cpu_ms": 0.0
+        },
+        {
+          "name": "model_sampling_construct",
+          "wall_ms": 1.048,
+          "cpu_ms": 0.0
+        }
+      ],
+      "children_wall_sum_ms": 19.057
+    },
+    "residual_wall_ms": 1.239,
+    "children_wall_sum_ms": 19.057,
+    "accounted_percent": 93.9,
+    "module_attribution": {
+      "by_class": {
+        "Lumina2": {
+          "count": 1,
+          "wall_ms": 0.0219
+        },
+        "NextDiT": {
+          "count": 1,
+          "wall_ms": 0.011
+        },
+        "Linear": {
+          "count": 220,
+          "wall_ms": 1.2456000000000003
+        },
+        "JointTransformerBlock": {
+          "count": 36,
+          "wall_ms": 1.4815000000000011
+        },
+        "JointAttention": {
+          "count": 36,
+          "wall_ms": 0.1901
+        },
+        "RMSNorm": {
+          "count": 217,
+          "wall_ms": 1.2014000000000014
+        },
+        "FeedForward": {
+          "count": 36,
+          "wall_ms": 0.19189999999999996
+        },
+        "Sequential": {
+          "count": 37,
+          "wall_ms": 0.19809999999999994
+        },
+        "ModuleList": {
+          "count": 3,
+          "wall_ms": 0.0192
+        },
+        "TimestepEmbedder": {
+          "count": 1,
+          "wall_ms": 0.0093
+        },
+        "SiLU": {
+          "count": 2,
+          "wall_ms": 0.0398
+        },
+        "FinalLayer": {
+          "count": 1,
+          "wall_ms": 0.0097
+        },
+        "LayerNorm": {
+          "count": 1,
+          "wall_ms": 0.0114
+        },
+        "EmbedND": {
+          "count": 1,
+          "wall_ms": 0.0069
+        },
+        "ModelSampling": {
+          "count": 1,
+          "wall_ms": 0.017
+        }
+      },
+      "total_wall_ms": 4.655,
+      "count": 594
+    },
+    "gc_wall_ms": 2.194,
+    "gc_count": 16,
+    "sampler": null,
+    "tree_disjoint_errors": []
+  },
+  "post_construction_steps": {
+    "param_validate_ms": 0.669,
+    "sampling_detect_ms": 0.013,
+    "sampling_poisoned": 1,
+    "sampling_fix_ms": 0.198,
+    "sampling_fixed": true
+  },
+  "config_derive_warm_ms": 2.115,
+  "experiments": {
+    "baseline_serial": {
+      "name": "baseline_serial",
+      "iters": 5,
+      "median_wall_ms": 18.078,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 17.336,
+      "max_wall_ms": 55.127,
+      "median_process_cpu_ms": 46.875,
+      "median_accounted_percent": 93.1,
+      "rows": [
+        {
+          "wall_ms": 17.843,
+          "thread_cpu_ms": 31.25,
+          "process_cpu_ms": 31.25,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 17.011,
+            "cpu_ms": 31.25,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.048,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.687,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.78,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.99,
+                "cpu_ms": 15.625
+              }
+            ],
+            "children_wall_sum_ms": 15.504
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.507,
+          "children_wall_sum_ms": 15.504,
+          "accounted_percent": 91.1,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0125
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0113
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.1055000000000004
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1895
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.16469999999999996
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.5094000000000016
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.19839999999999997
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14310000000000003
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.013699999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.005
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.030799999999999998
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0055
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0169
+              }
+            },
+            "total_wall_ms": 3.419,
+            "count": 594
+          },
+          "gc_wall_ms": 0.883,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 55.127,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 46.875,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 54.445,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.043,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.988,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.08,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 37.187,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 53.297
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.148,
+          "children_wall_sum_ms": 53.297,
+          "accounted_percent": 97.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0129
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.009
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.318500000000004
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17900000000000002
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.2009
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.7967000000000057
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1895
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1872999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0167
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0116
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0051
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0188
+              }
+            },
+            "total_wall_ms": 3.964,
+            "count": 594
+          },
+          "gc_wall_ms": 1.043,
+          "gc_count": 15,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 15.62,
+            "sum_proc_cpu_ms": 15.62,
+            "max_native_threads": 29,
+            "min_native_threads": 29,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 662.66
+          },
+          "index": 1
+        },
+        {
+          "wall_ms": 18.078,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 46.875,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 17.426,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.046,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.776,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.721,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.683,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 16.227
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.199,
+          "children_wall_sum_ms": 16.227,
+          "accounted_percent": 93.1,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0161
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.01
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.1017000000000001
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17190000000000003
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1774
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 2.127800000000002
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.25420000000000004
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.19649999999999995
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0363
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0098
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0107
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0242
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0124
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0055
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0134
+              }
+            },
+            "total_wall_ms": 4.168,
+            "count": 594
+          },
+          "gc_wall_ms": 1.446,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 2
+        },
+        {
+          "wall_ms": 54.994,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 46.875,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 54.284,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.592,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.633,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 38.831,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 53.097
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.186,
+          "children_wall_sum_ms": 53.097,
+          "accounted_percent": 97.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0122
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0134
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0041999999999982
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.16849999999999996
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.6601999999999999
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9550999999999991
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.22769999999999993
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1481
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.122
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0108
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0157
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.011
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0072
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0056
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0208
+              }
+            },
+            "total_wall_ms": 3.382,
+            "count": 594
+          },
+          "gc_wall_ms": 0.891,
+          "gc_count": 15,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 15.62,
+            "sum_proc_cpu_ms": 15.62,
+            "max_native_threads": 29,
+            "min_native_threads": 29,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 665.92
+          },
+          "index": 3
+        },
+        {
+          "wall_ms": 17.336,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.463,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.054,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.876,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.356,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.654,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.941
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.523,
+          "children_wall_sum_ms": 14.941,
+          "accounted_percent": 90.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0203
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0131
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.6777000000000017
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.22239999999999988
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.20470000000000005
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0109999999999988
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.17839999999999998
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1505
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0141
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0108
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0079
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0143
+              }
+            },
+            "total_wall_ms": 3.543,
+            "count": 594
+          },
+          "gc_wall_ms": 1.016,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "gil_worker_concurrent": {
+      "name": "gil_worker_concurrent",
+      "iters": 5,
+      "median_wall_ms": 11308.749,
+      "median_thread_cpu_ms": 31.25,
+      "min_wall_ms": 5039.797,
+      "max_wall_ms": 13488.518,
+      "median_process_cpu_ms": 11062.5,
+      "median_accounted_percent": 100.0,
+      "rows": [
+        {
+          "wall_ms": 11308.749,
+          "thread_cpu_ms": 31.25,
+          "process_cpu_ms": 11062.5,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 11249.485,
+            "cpu_ms": 31.25,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.076,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 9775.116,
+                "cpu_ms": 31.25
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.347,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1470.479,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 11248.018
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.467,
+          "children_wall_sum_ms": 11248.018,
+          "accounted_percent": 100.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0345
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.017
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 3.347999999999998
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.35700000000000015
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.33690000000000003
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 3.7637999999999994
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.692
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.6906999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0408
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0083
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0532
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0081
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0108
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.017
+              }
+            },
+            "total_wall_ms": 9.386,
+            "count": 594
+          },
+          "gc_wall_ms": 1.896,
+          "gc_count": 16,
+          "sampler": {
+            "n": 125,
+            "max_proc_cpu_ms_per_15ms": 156.25,
+            "sum_proc_cpu_ms": 10968.6,
+            "max_native_threads": 30,
+            "min_native_threads": 30,
+            "rss_delta_mb": 1.76,
+            "max_rss_mb": 669.71
+          },
+          "index": 0
+        },
+        {
+          "wall_ms": 5039.797,
+          "thread_cpu_ms": 187.5,
+          "process_cpu_ms": 4890.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 4981.119,
+            "cpu_ms": 187.5,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.083,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 4629.547,
+                "cpu_ms": 171.875
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.43,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 347.586,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 4979.646
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.473,
+          "children_wall_sum_ms": 4979.646,
+          "accounted_percent": 100.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0378
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0227
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 3.338799999999999
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.33159999999999995
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.39070000000000005
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 2.687100000000001
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.4885
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.4339999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.031
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0125
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0147
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.007
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0147
+              }
+            },
+            "total_wall_ms": 7.823,
+            "count": 594
+          },
+          "gc_wall_ms": 152.442,
+          "gc_count": 16,
+          "sampler": {
+            "n": 52,
+            "max_proc_cpu_ms_per_15ms": 390.62,
+            "sum_proc_cpu_ms": 4812.51,
+            "max_native_threads": 30,
+            "min_native_threads": 30,
+            "rss_delta_mb": 1.8,
+            "max_rss_mb": 671.55
+          },
+          "index": 1
+        },
+        {
+          "wall_ms": 7768.717,
+          "thread_cpu_ms": 0.0,
+          "process_cpu_ms": 7640.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 7664.701,
+            "cpu_ms": 0.0,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.079,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 7082.292,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 4.55,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 575.825,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 7662.745
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.955,
+          "children_wall_sum_ms": 7662.745,
+          "accounted_percent": 100.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0328
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0141
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 2.3778000000000006
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.35159999999999997
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.25579999999999997
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 2.8147
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.5128
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.6742999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0444
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.012
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.08969999999999999
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0104
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0115
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0079
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.03
+              }
+            },
+            "total_wall_ms": 7.24,
+            "count": 594
+          },
+          "gc_wall_ms": 1.333,
+          "gc_count": 16,
+          "sampler": {
+            "n": 94,
+            "max_proc_cpu_ms_per_15ms": 218.75,
+            "sum_proc_cpu_ms": 7515.54,
+            "max_native_threads": 30,
+            "min_native_threads": 30,
+            "rss_delta_mb": 1.85,
+            "max_rss_mb": 673.41
+          },
+          "index": 2
+        },
+        {
+          "wall_ms": 13488.518,
+          "thread_cpu_ms": 46.875,
+          "process_cpu_ms": 13203.125,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 13368.054,
+            "cpu_ms": 46.875,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.083,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11737.981,
+                "cpu_ms": 31.25
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.987,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1624.96,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13366.011
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 2.042,
+          "children_wall_sum_ms": 13366.011,
+          "accounted_percent": 100.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0392
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0193
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 4.486099999999997
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.34809999999999997
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.2688
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 4.037899999999999
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.8046000000000001
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.7199
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.1303
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.009
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.054900000000000004
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0129
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.01
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0303
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0211
+              }
+            },
+            "total_wall_ms": 10.992,
+            "count": 594
+          },
+          "gc_wall_ms": 1.792,
+          "gc_count": 16,
+          "sampler": {
+            "n": 154,
+            "max_proc_cpu_ms_per_15ms": 218.75,
+            "sum_proc_cpu_ms": 13140.54,
+            "max_native_threads": 32,
+            "min_native_threads": 30,
+            "rss_delta_mb": 2.36,
+            "max_rss_mb": 675.77
+          },
+          "index": 3
+        },
+        {
+          "wall_ms": 12049.486,
+          "thread_cpu_ms": 0.0,
+          "process_cpu_ms": 11843.75,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 11878.223,
+            "cpu_ms": 0.0,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.065,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10823.249,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.82,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1049.13,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 11876.264
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.959,
+          "children_wall_sum_ms": 11876.264,
+          "accounted_percent": 100.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0278
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0146
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 3.6292999999999997
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.4037000000000001
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.34879999999999994
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 3.853600000000001
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.6788
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 1.0541
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0325
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0147
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.036199999999999996
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0111
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0117
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.012
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0262
+              }
+            },
+            "total_wall_ms": 10.155,
+            "count": 594
+          },
+          "gc_wall_ms": 2.172,
+          "gc_count": 16,
+          "sampler": {
+            "n": 149,
+            "max_proc_cpu_ms_per_15ms": 140.62,
+            "sum_proc_cpu_ms": 11749.77,
+            "max_native_threads": 32,
+            "min_native_threads": 32,
+            "rss_delta_mb": 1.82,
+            "max_rss_mb": 677.74
+          },
+          "index": 4
+        }
+      ]
+    },
+    "io_worker_concurrent": {
+      "name": "io_worker_concurrent",
+      "iters": 5,
+      "median_wall_ms": 17.238,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 16.385,
+      "max_wall_ms": 18.496,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 93.1,
+      "rows": [
+        {
+          "wall_ms": 16.825,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.231,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.11,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.201,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.76,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.114
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.117,
+          "children_wall_sum_ms": 15.114,
+          "accounted_percent": 93.1,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0203
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.009
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.025199999999999
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.19649999999999992
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.14089999999999997
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.6317000000000021
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.15330000000000005
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.18139999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0142
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0107
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0068
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.008
+              }
+            },
+            "total_wall_ms": 3.417,
+            "count": 594
+          },
+          "gc_wall_ms": 0.915,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 18.496,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 18.004,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.034,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 13.755,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.263,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.801,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 16.852
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.152,
+          "children_wall_sum_ms": 16.852,
+          "accounted_percent": 93.6,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0107
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0904000000000005
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17550000000000002
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.21569999999999998
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.4993000000000016
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.15819999999999998
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.19680000000000003
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0137
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.037
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.008
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0066
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.01
+              }
+            },
+            "total_wall_ms": 3.44,
+            "count": 594
+          },
+          "gc_wall_ms": 0.879,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 17.238,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.613,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.034,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.918,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.645,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.932,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.529
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.084,
+          "children_wall_sum_ms": 15.529,
+          "accounted_percent": 93.5,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0098
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0061
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.743100000000003
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1423
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1364
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9351999999999988
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.13609999999999994
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1645
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0159
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0093
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0057
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0061
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0115
+              }
+            },
+            "total_wall_ms": 3.334,
+            "count": 594
+          },
+          "gc_wall_ms": 1.084,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 2
+        },
+        {
+          "wall_ms": 17.553,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 17.023,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.036,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.73,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.314,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.768,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.848
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.174,
+          "children_wall_sum_ms": 15.848,
+          "accounted_percent": 93.1,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0104
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0056
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0644000000000002
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.6517000000000001
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1346
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0663999999999998
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1875
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.2201
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0131
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0045
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.014700000000000001
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0142
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0099
+              }
+            },
+            "total_wall_ms": 3.41,
+            "count": 594
+          },
+          "gc_wall_ms": 0.847,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 16.385,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.848,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.035,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.452,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.307,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.931,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.725
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.123,
+          "children_wall_sum_ms": 14.725,
+          "accounted_percent": 92.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0119
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.3759000000000055
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1472
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.15960000000000002
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.8801999999999982
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.16659999999999994
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.15729999999999997
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0346
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0111
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0073
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0105
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0082
+              }
+            },
+            "total_wall_ms": 2.99,
+            "count": 594
+          },
+          "gc_wall_ms": 0.88,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "torch_threads_1": {
+      "name": "torch_threads_1",
+      "iters": 5,
+      "median_wall_ms": 15.709,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 14.565,
+      "max_wall_ms": 200.741,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 92.9,
+      "rows": [
+        {
+          "wall_ms": 15.705,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.061,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.039,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.637,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.694,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.637,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.007
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.054,
+          "children_wall_sum_ms": 14.007,
+          "accounted_percent": 93.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.015
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.01
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9934999999999983
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.18179999999999993
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.19859999999999994
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.2213999999999992
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.17989999999999998
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14769999999999994
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.012199999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0087
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0061
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0067
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0057
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0107
+              }
+            },
+            "total_wall_ms": 3.004,
+            "count": 594
+          },
+          "gc_wall_ms": 1.075,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 15.885,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.298,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.037,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.617,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.427,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.719,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.8
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.498,
+          "children_wall_sum_ms": 13.8,
+          "accounted_percent": 90.2,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0095
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0092
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0465999999999984
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1489
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.14800000000000002
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.4485000000000001
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14079999999999995
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14429999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0151
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0057
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0098
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0052
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0059
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0048
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0134
+              }
+            },
+            "total_wall_ms": 3.156,
+            "count": 594
+          },
+          "gc_wall_ms": 0.76,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 200.741,
+          "thread_cpu_ms": 171.875,
+          "process_cpu_ms": 203.125,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 200.133,
+            "cpu_ms": 171.875,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.049,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 195.794,
+                "cpu_ms": 156.25
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.391,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.639,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 198.873
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.26,
+          "children_wall_sum_ms": 198.873,
+          "accounted_percent": 99.4,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0106
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0602
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 185.35430000000008
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1509
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.16180000000000005
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.016099999999999
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.20859999999999995
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1895
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.014499999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.010700000000000001
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0071
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0073
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0111
+              }
+            },
+            "total_wall_ms": 187.215,
+            "count": 594
+          },
+          "gc_wall_ms": 185.252,
+          "gc_count": 16,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 156.25,
+            "sum_proc_cpu_ms": 156.25,
+            "max_native_threads": 31,
+            "min_native_threads": 31,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 690.53
+          },
+          "index": 2
+        },
+        {
+          "wall_ms": 14.565,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.066,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.037,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.182,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.238,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.531,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 12.988
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.078,
+          "children_wall_sum_ms": 12.988,
+          "accounted_percent": 92.3,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0104
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0093
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.3001000000000054
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.14489999999999995
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.17770000000000005
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9621999999999985
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.13720000000000004
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1556
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.013399999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0052
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0085
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0061
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0092
+              }
+            },
+            "total_wall_ms": 2.951,
+            "count": 594
+          },
+          "gc_wall_ms": 0.798,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 15.709,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.204,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.033,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.361,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.148,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.588,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.129
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.075,
+          "children_wall_sum_ms": 14.129,
+          "accounted_percent": 92.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0099
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0106
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0165999999999975
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.16079999999999994
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1763
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.4404000000000001
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14629999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1587
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0156
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0048
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.009999999999999998
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.01
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0078
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0067
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0074
+              }
+            },
+            "total_wall_ms": 3.182,
+            "count": 594
+          },
+          "gc_wall_ms": 1.067,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "torch_threads_default": {
+      "name": "torch_threads_default",
+      "iters": 5,
+      "median_wall_ms": 14.645,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 14.549,
+      "max_wall_ms": 15.938,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 92.5,
+      "rows": [
+        {
+          "wall_ms": 14.549,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.046,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.03,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.3,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.116,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.54,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 12.986
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.06,
+          "children_wall_sum_ms": 12.986,
+          "accounted_percent": 92.5,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0093
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.4057000000000013
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.14899999999999994
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1578
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9003999999999988
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1397
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.13900000000000007
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0111
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0051
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0092
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0278
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0083
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0072
+              }
+            },
+            "total_wall_ms": 2.982,
+            "count": 594
+          },
+          "gc_wall_ms": 0.744,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 15.362,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.856,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.028,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.878,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.305,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.583,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.794
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.062,
+          "children_wall_sum_ms": 13.794,
+          "accounted_percent": 92.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0095
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.4502000000000055
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.19240000000000002
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.14150000000000004
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9230999999999985
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.18549999999999997
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.2113
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0131
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0055
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0097
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0056
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0047
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0083
+              }
+            },
+            "total_wall_ms": 3.173,
+            "count": 594
+          },
+          "gc_wall_ms": 0.757,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 14.645,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.063,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.036,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.035,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.134,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.803,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.008
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.055,
+          "children_wall_sum_ms": 13.008,
+          "accounted_percent": 92.5,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0107
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.8711999999999983
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.14800000000000002
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.17450000000000004
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9073999999999987
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.12969999999999998
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.13359999999999997
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.011899999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.008199999999999999
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0072
+              }
+            },
+            "total_wall_ms": 2.432,
+            "count": 594
+          },
+          "gc_wall_ms": 1.02,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 2
+        },
+        {
+          "wall_ms": 14.579,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.002,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.035,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 9.9,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.334,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.673,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 12.943
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.059,
+          "children_wall_sum_ms": 12.943,
+          "accounted_percent": 92.4,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0135
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9658999999999982
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1451
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.15129999999999996
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.2700000000000005
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.136
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1415
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.011799999999999998
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0045
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0097
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0125
+              }
+            },
+            "total_wall_ms": 2.887,
+            "count": 594
+          },
+          "gc_wall_ms": 0.675,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 15.938,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.346,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.038,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.079,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.987,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.849,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.952
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.394,
+          "children_wall_sum_ms": 13.952,
+          "accounted_percent": 90.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0101
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0554
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9387999999999983
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17349999999999996
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.12119999999999999
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9372999999999988
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.17779999999999999
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.15870000000000004
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.012100000000000001
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0059
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0091
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0056
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.009
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0061
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0129
+              }
+            },
+            "total_wall_ms": 2.633,
+            "count": 594
+          },
+          "gc_wall_ms": 0.673,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "gc_before": {
+      "name": "gc_before",
+      "iters": 5,
+      "median_wall_ms": 16.048,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 15.412,
+      "max_wall_ms": 17.102,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 92.7,
+      "rows": [
+        {
+          "wall_ms": 16.215,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.444,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.298,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.39,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.605,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.335
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.109,
+          "children_wall_sum_ms": 14.335,
+          "accounted_percent": 92.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0184
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0085
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9625999999999989
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.192
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.19549999999999992
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9787999999999983
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1433
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.15239999999999995
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0211
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.052599999999999994
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0071
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0049
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0093
+              }
+            },
+            "total_wall_ms": 2.758,
+            "count": 594
+          },
+          "gc_wall_ms": 0.786,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 17.102,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.179,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.037,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.646,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.337,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1.011,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.032
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.147,
+          "children_wall_sum_ms": 15.032,
+          "accounted_percent": 92.9,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0176
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0084
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.949299999999999
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1817
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18540000000000004
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9389999999999986
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14399999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.146
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0176
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.044399999999999995
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0051
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0071
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0057
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0183
+              }
+            },
+            "total_wall_ms": 2.677,
+            "count": 594
+          },
+          "gc_wall_ms": 0.837,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 15.696,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.952,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.043,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.691,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.523,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.597,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.854
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.099,
+          "children_wall_sum_ms": 13.854,
+          "accounted_percent": 92.7,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0192
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0089
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9230999999999981
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17109999999999992
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.17329999999999998
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9362999999999988
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14440000000000003
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.1468
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0187
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0417
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0048
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0097
+              }
+            },
+            "total_wall_ms": 2.616,
+            "count": 594
+          },
+          "gc_wall_ms": 0.733,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 2
+        },
+        {
+          "wall_ms": 16.048,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.317,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.038,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.89,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.307,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.619,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.854
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.463,
+          "children_wall_sum_ms": 13.854,
+          "accounted_percent": 90.5,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0174
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0082
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.990999999999998
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1858999999999999
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18130000000000002
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9781999999999982
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1425
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14400000000000002
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0153
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0068
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.046599999999999996
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0093
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0048
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0098
+              }
+            },
+            "total_wall_ms": 2.749,
+            "count": 594
+          },
+          "gc_wall_ms": 0.722,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 15.412,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.662,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.527,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.274,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.71,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.552
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.11,
+          "children_wall_sum_ms": 13.552,
+          "accounted_percent": 92.4,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0184
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0086
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9109999999999987
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1747
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.16960000000000003
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9309999999999989
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14329999999999998
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14899999999999997
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0183
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0487
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0059
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.007
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0057
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0093
+              }
+            },
+            "total_wall_ms": 2.607,
+            "count": 594
+          },
+          "gc_wall_ms": 0.802,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "allocator_trim": {
+      "name": "allocator_trim",
+      "iters": 5,
+      "median_wall_ms": 16.941,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 15.613,
+      "max_wall_ms": 53.922,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 92.7,
+      "rows": [
+        {
+          "wall_ms": 15.613,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 14.853,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.038,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.547,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.386,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.658,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 13.629
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.224,
+          "children_wall_sum_ms": 13.629,
+          "accounted_percent": 91.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0179
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0078
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9405999999999987
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.17879999999999996
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.17469999999999997
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9681999999999983
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1349
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.142
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.018500000000000003
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0323
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0059
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.007
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.008
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0122
+              }
+            },
+            "total_wall_ms": 2.654,
+            "count": 594
+          },
+          "gc_wall_ms": 0.695,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 16.229,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 15.426,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.046,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.552,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.001,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.693,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.293
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.133,
+          "children_wall_sum_ms": 14.293,
+          "accounted_percent": 92.7,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.021
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0103
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9552999999999987
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.21149999999999988
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18000000000000002
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0016999999999983
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.13719999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.14620000000000002
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0146
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0052
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.036000000000000004
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0062
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.015
+              }
+            },
+            "total_wall_ms": 2.752,
+            "count": 594
+          },
+          "gc_wall_ms": 0.738,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 53.922,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 62.5,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 52.967,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.646,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.77,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 38.215,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 51.674
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.293,
+          "children_wall_sum_ms": 51.674,
+          "accounted_percent": 97.6,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0199
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0087
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9457999999999984
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1962
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18450000000000003
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 0.9206999999999982
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.13899999999999993
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.142
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.015099999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0063
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0368
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0059
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0109
+              }
+            },
+            "total_wall_ms": 2.642,
+            "count": 594
+          },
+          "gc_wall_ms": 0.738,
+          "gc_count": 15,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 15.62,
+            "sum_proc_cpu_ms": 15.62,
+            "max_native_threads": 31,
+            "min_native_threads": 31,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 716.02
+          },
+          "index": 2
+        },
+        {
+          "wall_ms": 17.189,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.404,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.036,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.211,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.783,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.809,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 14.839
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.565,
+          "children_wall_sum_ms": 14.839,
+          "accounted_percent": 90.5,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0184
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0111
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9959999999999988
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1931
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18839999999999996
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0004999999999986
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.14089999999999997
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.15639999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.015399999999999999
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0419
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0062
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0072
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0088
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.016
+              }
+            },
+            "total_wall_ms": 2.806,
+            "count": 594
+          },
+          "gc_wall_ms": 0.823,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 16.941,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.15,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.046,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.159,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.179,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.63,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.015
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.135,
+          "children_wall_sum_ms": 15.015,
+          "accounted_percent": 93.0,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0213
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0094
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 0.9987999999999987
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.21099999999999994
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.22719999999999996
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0501999999999996
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.15809999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.17569999999999997
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.016300000000000002
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0055
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.034300000000000004
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0087
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0102
+              }
+            },
+            "total_wall_ms": 2.938,
+            "count": 594
+          },
+          "gc_wall_ms": 1.224,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "config_reuse": {
+      "name": "config_reuse",
+      "iters": 5,
+      "median_wall_ms": 19.061,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 17.73,
+      "max_wall_ms": 58.659,
+      "median_process_cpu_ms": 15.625,
+      "median_accounted_percent": 93.4,
+      "rows": [
+        {
+          "wall_ms": 54.222,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 46.875,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 53.372,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.055,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 11.665,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.813,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 37.599,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 52.132
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.24,
+          "children_wall_sum_ms": 52.132,
+          "accounted_percent": 97.7,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0165
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0209
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.1313000000000006
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.2205
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1714
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.1292000000000002
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.16439999999999996
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.16069999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0179
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0111
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.006
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0089
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0052
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0214
+              }
+            },
+            "total_wall_ms": 3.091,
+            "count": 594
+          },
+          "gc_wall_ms": 0.818,
+          "gc_count": 16,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 15.62,
+            "sum_proc_cpu_ms": 15.62,
+            "max_native_threads": 31,
+            "min_native_threads": 31,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 720.71
+          },
+          "index": 0
+        },
+        {
+          "wall_ms": 19.061,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 18.395,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.064,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 13.895,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.423,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.668,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 17.049
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.347,
+          "children_wall_sum_ms": 17.049,
+          "accounted_percent": 92.7,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0166
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0139
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.762200000000001
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.23949999999999994
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.24869999999999998
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.2359000000000004
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.21559999999999999
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.16989999999999997
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0184
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0084
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0124
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0066
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0103
+              }
+            },
+            "total_wall_ms": 3.971,
+            "count": 594
+          },
+          "gc_wall_ms": 1.046,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 1
+        },
+        {
+          "wall_ms": 58.659,
+          "thread_cpu_ms": 31.25,
+          "process_cpu_ms": 62.5,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 58.009,
+            "cpu_ms": 31.25,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.058,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 14.637,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.861,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 38.798,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 56.353
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.656,
+          "children_wall_sum_ms": 56.353,
+          "accounted_percent": 97.1,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.011
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0552
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.2912999999999983
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.20429999999999998
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1796
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 2.449900000000003
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.25949999999999995
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.22950000000000004
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.020900000000000002
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0052
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.015300000000000001
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0085
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0086
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0095
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.018
+              }
+            },
+            "total_wall_ms": 4.766,
+            "count": 594
+          },
+          "gc_wall_ms": 1.656,
+          "gc_count": 16,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 31.25,
+            "sum_proc_cpu_ms": 31.25,
+            "max_native_threads": 31,
+            "min_native_threads": 31,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 724.16
+          },
+          "index": 2
+        },
+        {
+          "wall_ms": 17.73,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 16.945,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.055,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 10.988,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.224,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 1.017,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 15.285
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.66,
+          "children_wall_sum_ms": 15.285,
+          "accounted_percent": 90.2,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.018
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0082
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0541999999999991
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.1398
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.21679999999999996
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.4319000000000033
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.1777
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.15109999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.0238
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0071
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0137
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0079
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0079
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0069
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.017
+              }
+            },
+            "total_wall_ms": 3.282,
+            "count": 594
+          },
+          "gc_wall_ms": 0.917,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 3
+        },
+        {
+          "wall_ms": 18.093,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 15.625,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 17.356,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.063,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 12.882,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.372,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.897,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 16.214
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.143,
+          "children_wall_sum_ms": 16.214,
+          "accounted_percent": 93.4,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0139
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0088
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.0653999999999988
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.15390000000000006
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.26419999999999993
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.0985999999999996
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.21219999999999994
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.17779999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.054799999999999995
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0058
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0108
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0073
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0053
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0131
+              }
+            },
+            "total_wall_ms": 3.098,
+            "count": 594
+          },
+          "gc_wall_ms": 1.222,
+          "gc_count": 15,
+          "sampler": null,
+          "index": 4
+        }
+      ]
+    },
+    "input_types_warm_concurrent": {
+      "name": "input_types_warm_concurrent",
+      "iters": 3,
+      "median_wall_ms": 30.72,
+      "median_thread_cpu_ms": 15.625,
+      "min_wall_ms": 19.974,
+      "max_wall_ms": 71.975,
+      "median_process_cpu_ms": 31.25,
+      "median_accounted_percent": 93.8,
+      "rows": [
+        {
+          "wall_ms": 30.72,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 31.25,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 28.669,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.042,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 15.988,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 3.488,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 7.346,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 26.864
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.805,
+          "children_wall_sum_ms": 26.864,
+          "accounted_percent": 93.7,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0149
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0065
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.4334999999999993
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.18620000000000003
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.18239999999999998
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.1844000000000003
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.21530000000000002
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.7490999999999999
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.019200000000000002
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0054
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0103
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0374
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0051
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0176
+              }
+            },
+            "total_wall_ms": 4.074,
+            "count": 594
+          },
+          "gc_wall_ms": 1.787,
+          "gc_count": 17,
+          "sampler": null,
+          "index": 0
+        },
+        {
+          "wall_ms": 71.975,
+          "thread_cpu_ms": 31.25,
+          "process_cpu_ms": 93.75,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 70.795,
+            "cpu_ms": 31.25,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.063,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 19.193,
+                "cpu_ms": 31.25
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.765,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 47.042,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 69.063
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.732,
+          "children_wall_sum_ms": 69.063,
+          "accounted_percent": 97.6,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0255
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.0141
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.4689999999999985
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.2623
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.2459
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 2.7686000000000006
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.20660000000000006
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.22199999999999998
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.023600000000000003
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0075
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0159
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0097
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0106
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0093
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.0173
+              }
+            },
+            "total_wall_ms": 5.308,
+            "count": 594
+          },
+          "gc_wall_ms": 3.279,
+          "gc_count": 15,
+          "sampler": {
+            "n": 1,
+            "max_proc_cpu_ms_per_15ms": 46.88,
+            "sum_proc_cpu_ms": 46.88,
+            "max_native_threads": 31,
+            "min_native_threads": 31,
+            "rss_delta_mb": 0.0,
+            "max_rss_mb": 774.96
+          },
+          "index": 1
+        },
+        {
+          "wall_ms": 19.974,
+          "thread_cpu_ms": 15.625,
+          "process_cpu_ms": 31.25,
+          "tree": {
+            "name": "get_model_total",
+            "wall_ms": 19.155,
+            "cpu_ms": 15.625,
+            "children": [
+              {
+                "name": "ops_selection",
+                "wall_ms": 0.05,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "diffusion_model_construct",
+                "wall_ms": 14.771,
+                "cpu_ms": 15.625
+              },
+              {
+                "name": "archive_dtypes",
+                "wall_ms": 2.421,
+                "cpu_ms": 0.0
+              },
+              {
+                "name": "model_sampling_construct",
+                "wall_ms": 0.721,
+                "cpu_ms": 0.0
+              }
+            ],
+            "children_wall_sum_ms": 17.964
+          },
+          "tree_disjoint_errors": [],
+          "residual_wall_ms": 1.191,
+          "children_wall_sum_ms": 17.964,
+          "accounted_percent": 93.8,
+          "module_attribution": {
+            "by_class": {
+              "Lumina2": {
+                "count": 1,
+                "wall_ms": 0.0173
+              },
+              "NextDiT": {
+                "count": 1,
+                "wall_ms": 0.009
+              },
+              "Linear": {
+                "count": 220,
+                "wall_ms": 1.2568000000000004
+              },
+              "JointTransformerBlock": {
+                "count": 36,
+                "wall_ms": 0.20559999999999998
+              },
+              "JointAttention": {
+                "count": 36,
+                "wall_ms": 0.1514
+              },
+              "RMSNorm": {
+                "count": 217,
+                "wall_ms": 1.9340999999999995
+              },
+              "FeedForward": {
+                "count": 36,
+                "wall_ms": 0.17619999999999997
+              },
+              "Sequential": {
+                "count": 37,
+                "wall_ms": 0.17369999999999994
+              },
+              "ModuleList": {
+                "count": 3,
+                "wall_ms": 0.019799999999999998
+              },
+              "TimestepEmbedder": {
+                "count": 1,
+                "wall_ms": 0.0064
+              },
+              "SiLU": {
+                "count": 2,
+                "wall_ms": 0.0123
+              },
+              "FinalLayer": {
+                "count": 1,
+                "wall_ms": 0.0076
+              },
+              "LayerNorm": {
+                "count": 1,
+                "wall_ms": 0.0084
+              },
+              "EmbedND": {
+                "count": 1,
+                "wall_ms": 0.0066
+              },
+              "ModelSampling": {
+                "count": 1,
+                "wall_ms": 0.01
+              }
+            },
+            "total_wall_ms": 3.995,
+            "count": 594
+          },
+          "gc_wall_ms": 1.168,
+          "gc_count": 16,
+          "sampler": null,
+          "index": 2
+        }
+      ],
+      "warm_worker": {
+        "count": 28,
+        "ms": 10.028,
+        "error": null,
+        "wall_ms": 10.0
+      }
+    }
+  }
+}

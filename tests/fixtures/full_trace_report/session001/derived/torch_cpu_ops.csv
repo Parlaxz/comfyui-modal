@@ -1,0 +1,3 @@
+﻿operator,call_count,total_cpu_ms,self_cpu_ms,mean_cpu_ms,max_cpu_ms
+aten::mm,1,5.0,5.0,5.0,5.0
+aten::relu,1,2.0,2.0,2.0,2.0

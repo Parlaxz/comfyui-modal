@@ -1,0 +1,122 @@
+{
+  "block_bytes": 33554432,
+  "cpu": 12,
+  "experiment": "c9_bare_loop_isolation",
+  "gpu": "rtx-pro-6000",
+  "qd": 8,
+  "rows": [
+    {
+      "C9_TOTAL_WALL_MS": 3337.481271,
+      "PHYSICAL_READ_SPAN_MS": 3335.867822,
+      "arm": "bare_loop",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 3.6883555209619634,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 1
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2251.286409,
+      "PHYSICAL_READ_SPAN_MS": 2249.63914,
+      "arm": "bare_loop",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.467903782827839,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 2
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2379.267456,
+      "PHYSICAL_READ_SPAN_MS": 2378.042007,
+      "arm": "bare_loop",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.173784662568007,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 3
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2447.475041,
+      "PHYSICAL_READ_SPAN_MS": 2446.102601,
+      "arm": "bare_loop",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.029598776611181,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 4
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2038.052013,
+      "PHYSICAL_READ_SPAN_MS": 2036.430494,
+      "arm": "source_only",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 6.03999181251514,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 1
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2349.620396,
+      "PHYSICAL_READ_SPAN_MS": 2348.339288,
+      "arm": "source_only",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.239066486210397,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 2
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2169.475577,
+      "PHYSICAL_READ_SPAN_MS": 2168.190077,
+      "arm": "source_only",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.674098202581425,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 3
+    },
+    {
+      "C9_TOTAL_WALL_MS": 2188.266579,
+      "PHYSICAL_READ_SPAN_MS": 2186.661121,
+      "arm": "source_only",
+      "classification": "ELIGIBLE",
+      "effective_gbps": 5.625373795922695,
+      "provider": "CLOUD_PROVIDER_GCP",
+      "region": "us-east1",
+      "run": 4
+    }
+  ],
+  "values": {
+    "bare_loop": {
+      "effective_gbps": [
+        3.6883555209619634,
+        5.467903782827839,
+        5.173784662568007,
+        5.029598776611181
+      ],
+      "median_ms": 2413.3712485,
+      "runs_ms": [
+        3337.481271,
+        2251.286409,
+        2379.267456,
+        2447.475041
+      ]
+    },
+    "source_only": {
+      "effective_gbps": [
+        6.03999181251514,
+        5.239066486210397,
+        5.674098202581425,
+        5.625373795922695
+      ],
+      "median_ms": 2178.871078,
+      "runs_ms": [
+        2038.052013,
+        2349.620396,
+        2169.475577,
+        2188.266579
+      ]
+    }
+  },
+  "workspace": "Testing 7"
+}

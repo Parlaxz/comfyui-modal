@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "current_preset": "baseline_hard_off",
+  "last_applied_at": 1784564188.8667362,
+  "last_apply_result": "ok",
+  "notes": "Managed by apply_experiment_preset.py / run_experiment_stage.py"
+}

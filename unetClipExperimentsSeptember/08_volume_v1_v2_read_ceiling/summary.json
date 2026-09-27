@@ -1,0 +1,62 @@
+{
+  "experiment": "Modal VolumeFS V1 vs V2 absolute safetensors read ceiling",
+  "status": "complete_from_preserved_evidence",
+  "remote_work_during_correction": false,
+  "workspace": {
+    "label": "Testing 7",
+    "id": "ws_eaef96004dac"
+  },
+  "source": {
+    "relative_path": "diffusion_models/z_image_turbo_bf16.safetensors",
+    "bytes": 12309866400,
+    "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6"
+  },
+  "function_shape": {
+    "requested_cpu": 12,
+    "requested_memory_mib": 16384,
+    "requested_gpu": "rtx-pro-6000",
+    "single_use_containers": true,
+    "observed_gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "capability_affinity_counts": [28],
+    "affinity_interpretation": "informational only; not an allocation claim"
+  },
+  "attempts": {
+    "retained": 255,
+    "invalid": 1
+  },
+  "common_optimum": {
+    "block_bytes": 134217728,
+    "block_mib": 128,
+    "qd": 2,
+    "v1_block_search_median_gbps": 7.89934405338589,
+    "v2_block_search_median_gbps": 7.8941296068041105,
+    "v1_confirmation_median_gbps": 7.529004203172803,
+    "v2_confirmation_median_gbps": 7.5002437599308465,
+    "v2_vs_v1_percent": -0.38199531393323155
+  },
+  "fastest_valid_observed_gbps": {
+    "v1": 8.910881540326768,
+    "v2": 9.088984562618203
+  },
+  "full_ram_geometry": {
+    "block_bytes": 134217728,
+    "block_mib": 128,
+    "qd": 2
+  },
+  "secondary_common_geometry": {
+    "block_bytes": 33554432,
+    "block_mib": 32,
+    "qd": 8,
+    "v1_median_gbps": 5.6490654653348855,
+    "v2_median_gbps": 5.152529919020795,
+    "v2_vs_v1_percent": -8.789693611466321
+  },
+  "forty_gbps": {
+    "v1_observed": false,
+    "v2_observed": false,
+    "v1_repeatable": false,
+    "v2_repeatable": false
+  },
+  "evidence_root": "../../../modal-volume-read-ceiling/results",
+  "derived_by": "../../../modal-volume-read-ceiling/analyze.py"
+}

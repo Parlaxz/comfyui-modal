@@ -1,0 +1,16 @@
+{
+  "attempt_id": "20260905T032454_1d7a7c99_c9_o03_unet_qd2",
+  "block_bytes": 33554432,
+  "block_mib": 32,
+  "campaign_index": 14,
+  "cell_id": "unet_qd2",
+  "classification": "DNF",
+  "error": "NotFoundError:Lookup failed for Function 'run_c9_recovery' from the 'sept-unetclip-c9-recovery-source-only' app (in the 'testing3' environment): Environment 'testing3' not found.",
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "observation": 3,
+  "qd": 2,
+  "role": "unet",
+  "run_id": "20260905T032454_1d7a7c99",
+  "source_only": true,
+  "status": "error"
+}

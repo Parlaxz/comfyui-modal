@@ -1,0 +1,66 @@
+[im] qd=4 model=processes read_mib=64 gap=4.0 slots=1..30 pinned=False
+[im] launching 30 slots with parallel=1
+[im] cached im-01 region=ca gbps=6.667336054887694
+[im] start im-02
+[im] done im-02 provider=unspecified region=us-south wall=10594.023939 gbps=0.7593886982248397 worst=0.0ms maxIF=4 flags=none
+[im] start im-03
+[im] done im-03 provider=unspecified region=ca wall=1212.703465 gbps=6.63392352721611 worst=0.0ms maxIF=4 flags=none
+[im] start im-04
+[im] done im-04 provider=gcp region=uk wall=2031.117611 gbps=3.960864700512904 worst=0.0ms maxIF=4 flags=none
+[im] start im-05
+[im] done im-05 provider=unspecified region=CANADA-2 wall=1265.991685 gbps=6.354687904604997 worst=0.0ms maxIF=4 flags=none
+[im] start im-06
+[im] done im-06 provider=gcp region=uk wall=2048.942729 gbps=3.926406499378539 worst=0.0ms maxIF=4 flags=none
+[im] start im-07
+[im] done im-07 provider=gcp region=uk wall=3028.77232 gbps=2.656185806663738 worst=0.0ms maxIF=4 flags=none
+[im] start im-08
+[im] done im-08 provider=gcp region=uk wall=1525.782292 gbps=5.2726932867038405 worst=0.0ms maxIF=4 flags=none
+[im] start im-09
+[im] done im-09 provider=unspecified region=CANADA-2 wall=1238.561035 gbps=6.4954264026237505 worst=0.0ms maxIF=4 flags=none
+[im] start im-10
+[im] done im-10 provider=oci region=us-central wall=1411.965517 gbps=5.69771850030244 worst=0.0ms maxIF=4 flags=none
+[im] start im-11
+[im] done im-11 provider=gcp region=ap-south wall=1445.282943 gbps=5.566371683112018 worst=0.0ms maxIF=4 flags=none
+[im] start im-12
+[im] done im-12 provider=gcp region=asia-northeast1 wall=1526.373237 gbps=5.270651930331245 worst=0.0ms maxIF=4 flags=none
+[im] start im-13
+[im] done im-13 provider=unspecified region=CANADA-2 wall=1217.533309 gbps=6.607607355405831 worst=0.0ms maxIF=4 flags=none
+[im] start im-14
+[im] done im-14 provider=unspecified region=ca wall=1230.166318 gbps=6.539751520005444 worst=0.0ms maxIF=4 flags=none
+[im] start im-15
+[im] done im-15 provider=gcp region=ap-northeast wall=1526.786401 gbps=5.269225638066185 worst=0.0ms maxIF=4 flags=none
+[im] start im-16
+[im] done im-16 provider=unspecified region=ca wall=1106.690129 gbps=7.269407973548484 worst=0.0ms maxIF=4 flags=none
+[im] start im-17
+[im] done im-17 provider=gcp region=ap-northeast wall=1462.551905 gbps=5.5006472047226245 worst=0.0ms maxIF=4 flags=none
+[im] start im-18
+[im] done im-18 provider=unspecified region=ca wall=1141.288677 gbps=7.049033439240894 worst=0.0ms maxIF=4 flags=none
+[im] start im-19
+[im] done im-19 provider=gcp region=eu-west wall=1525.384961 gbps=5.2740667134451975 worst=0.0ms maxIF=4 flags=none
+[im] start im-20
+[im] done im-20 provider=gcp region=asia-northeast1 wall=1508.384404 gbps=5.333509168263716 worst=0.0ms maxIF=4 flags=none
+[im] start im-21
+[im] done im-21 provider=gcp region=ap-northeast wall=1434.806676 gbps=5.607014647038066 worst=0.0ms maxIF=4 flags=none
+[im] start im-22
+[im] done im-22 provider=gcp region=asia-northeast1 wall=1499.447428 gbps=5.365297840905697 worst=0.0ms maxIF=4 flags=none
+[im] start im-23
+[im] done im-23 provider=gcp region=ap-northeast wall=1439.382372 gbps=5.589190339201958 worst=0.0ms maxIF=4 flags=none
+[im] start im-24
+[im] done im-24 provider=gcp region=asia-northeast1 wall=1117.535127 gbps=7.198862795119996 worst=0.0ms maxIF=4 flags=none
+[im] start im-25
+[im] done im-25 provider=unspecified region=CANADA-2 wall=1236.130324 gbps=6.508198926766237 worst=0.0ms maxIF=4 flags=none
+[im] start im-26
+[im] done im-26 provider=unspecified region=ca wall=1216.108458 gbps=6.615349145117122 worst=0.0ms maxIF=4 flags=none
+[im] start im-27
+[im] done im-27 provider=gcp region=eu-west wall=1571.457469 gbps=5.119439887303752 worst=0.0ms maxIF=4 flags=none
+[im] start im-28
+[im] done im-28 provider=gcp region=asia-northeast1 wall=1434.952391 gbps=5.606445271953278 worst=0.0ms maxIF=4 flags=none
+[im] start im-29
+[im] done im-29 provider=gcp region=us-west wall=1181.227746 gbps=6.810695122293546 worst=0.0ms maxIF=4 flags=none
+[im] start im-30
+[im] done im-30 provider=unspecified region=odin wall=1082.209575 gbps=7.433848520514153 worst=0.0ms maxIF=4 flags=['rejected_region=odin']
+
+[im] accepted 30 / 30
+  gbps med=5.607 mean=5.665 best=7.434 worst=0.759
+  wall med=1435 mean=1749
+  regions: {'unspecified:ca': 6, 'unspecified:us-south': 1, 'gcp:uk': 4, 'unspecified:CANADA-2': 4, 'oci:us-central': 1, 'gcp:ap-south': 1, 'gcp:asia-northeast1': 5, 'gcp:ap-northeast': 4, 'gcp:eu-west': 2, 'gcp:us-west': 1, 'unspecified:odin': 1}

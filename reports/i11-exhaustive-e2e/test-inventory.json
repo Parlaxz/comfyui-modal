@@ -1,0 +1,177 @@
+[
+  {
+    "spec": "studio-fake-experiment-gating.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-experiment-gating.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-experiment-v2.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-experiment-v2.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-experiments.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-experiments.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-cancel-menu.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-cancel-menu.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-resume-retry.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-resume-retry.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-v2-annotations.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-v2-annotations.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-v2-download.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-v2-download.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-v2-export.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-v2-export.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history-v2.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history-v2.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-history.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-history.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-i11-gaps.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-i11-gaps.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-lifecycle.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-lifecycle.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-models.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-models.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-modern-experiment-ui.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-modern-experiment-ui.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-persistence.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-persistence.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-e-original.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-e-original.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-e-wave2.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-e-wave2.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-e.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-e.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i10-cross-tab-sync.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i10-cross-tab-sync.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i2-shell-nav-accessibility.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i2-shell-nav-accessibility.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i3-shared-primitives.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i3-shared-primitives.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i4-history-polish.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i4-history-polish.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i5-image-compare-visual.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i5-image-compare-visual.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i5-image-compare.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i5-image-compare.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i6-workflows-models-polish.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i6-workflows-models-polish.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i7-backend-settings-polish.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i7-backend-settings-polish.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i8-playground-polish.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i8-playground-polish.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i9-routing.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i9-routing.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-phase-i9a-convergence.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-phase-i9a-convergence.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-playground.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-playground.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-recent-runs-history-v2.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-recent-runs-history-v2.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-settings.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-settings.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-visual.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-visual.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-workflow-portability.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-workflow-portability.spec.mjs",
+    "registered": true
+  },
+  {
+    "spec": "studio-fake-workflow-run.spec.mjs",
+    "path": "tests/browser/fake/studio-fake-workflow-run.spec.mjs",
+    "registered": true
+  }
+]

@@ -1,0 +1,22 @@
+[v2ctl.doctor] (post-deploy verification)
+git.head=23b42d23f222a23a70479f486bec05c763b10c48
+git.branch=TESTING2
+git.dirty=1
+python=3.11.9
+profile=golden_p1
+target.app=sept-unetclip-00-baseline
+target.class=ModalRuntimeEntrypointV2
+target.method=run_golden_serial_stream
+backend.deploy_and_run_v2_single.exists=1 kind=combined
+backend.deploy_and_run_v2_single_deploy_only.exists=1 kind=deploy_only_via_env
+backend.run_v2_single.exists=1 kind=run
+registry.flags=121
+profiles=e29-tracer,e30-clip-qd,e30-clip-qd-arm-a,e30-clip-qd-arm-b,e31-clip-fp32-fastsafe-arm-a,e31-clip-fp32-fastsafe-arm-b,e31-clip-fp32-qd4-arm-a,e31-clip-fp32-qd4-arm-b,e37-clean-lane-qd4,e37-clip-fastsafe,e37-clip-qd4,golden_p1,production
+runtime_override_policy=forbid
+runtime_overrides.present=0
+deploy.lock=none
+deployment.fingerprint.stored=a21a57b6aafb0863a539a7027fb98c70250438e566bf7d9cd85ef73ce64d2fd0
+deployment.fingerprint.current=a21a57b6aafb0863a539a7027fb98c70250438e566bf7d9cd85ef73ce64d2fd0
+deployment.fingerprint.match=1
+deployment.target.match=1
+[v2ctl.doctor] OK

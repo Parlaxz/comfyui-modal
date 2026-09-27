@@ -1,0 +1,23 @@
+1186. [GET] http://127.0.0.1:8188/comfymodal/run-history?limit=50 => [200] OK
+1232. [GET] http://127.0.0.1:8188/comfymodal/run-history?limit=50 => [200] OK
+1279. [GET] http://127.0.0.1:8188/comfymodal/studio/models => [500] Internal Server Error
+1303. [POST] http://127.0.0.1:8188/comfymodal/studio/run => [500] Internal Server Error
+1328. [GET] http://127.0.0.1:8188/comfymodal/run-history?limit=50 => [200] OK
+1332. [GET] http://127.0.0.1:8188/comfymodal/studio/models => [500] Internal Server Error
+1333. [GET] http://127.0.0.1:8188/comfymodal/run-history?limit=50 => [200] OK
+1346. [GET] http://127.0.0.1:8188/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies => [500] Internal Server Error
+1369. [GET] http://127.0.0.1:8188/comfymodal/history-v2/feed?limit=200&kind=mixed => [200] OK
+1370. [GET] http://127.0.0.1:8188/comfymodal/history-v2/feed?limit=24&kind=mixed&order=newest&statuses=success%2Crunning%2Cpartial%2Cinterrupted => [200] OK
+1371. [GET] http://127.0.0.1:8188/comfymodal/history-v2/generations/gen_7683f89c7587 => [200] OK
+1372. [GET] http://127.0.0.1:8188/comfymodal/studio/models => [500] Internal Server Error
+1373. [GET] http://127.0.0.1:8188/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies => [500] Internal Server Error
+1423. [POST] http://127.0.0.1:8188/comfymodal/studio/run => [400] Bad Request
+1460. [GET] http://127.0.0.1:8188/comfymodal/history-v2/feed?limit=200&kind=mixed => [200] OK
+1461. [GET] http://127.0.0.1:8188/comfymodal/history-v2/feed?limit=24&kind=mixed&order=newest&statuses=success%2Crunning%2Cpartial%2Cinterrupted => [200] OK
+1462. [GET] http://127.0.0.1:8188/comfymodal/history-v2/feed?limit=200&kind=mixed => [200] OK
+1463. [GET] http://127.0.0.1:8188/comfymodal/run-history?limit=50 => [200] OK
+1470. [GET] http://127.0.0.1:8188/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies => [500] Internal Server Error
+1494. [GET] http://127.0.0.1:8188/comfymodal/studio/models => [500] Internal Server Error
+1495. [GET] http://127.0.0.1:8188/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies
+
+Note: 1253 static requests not shown, run with "static" option to see them.

@@ -1,0 +1,18 @@
+# Experimental P1 decoupled transport arm; never use the production app.
+schema_version = 1
+name = "golden_p1_decoupled_experimental"
+extends = "golden_p1"
+owner = "golden-p1"
+
+[target]
+app = "exp-golden-p1-decoupled"
+
+[environment]
+# Explicit conservative geometry: QD4, 32 MiB source/copy extents, four
+# in-flight H2D extents, and an eight-entry source staging capacity.
+COMFYMODAL_GOLDEN_QD_TRANSPORT = "decoupled"
+COMFYMODAL_GOLDEN_SOURCE_QD = "4"
+COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES = "33554432"
+COMFYMODAL_GOLDEN_H2D_COPY_BYTES = "33554432"
+COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH = "4"
+COMFYMODAL_GOLDEN_SOURCE_CAPACITY = "8"

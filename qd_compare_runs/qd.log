@@ -1,0 +1,168 @@
+[qc] start qc-q4-r01 qd=4 gap=4.0
+[qc] done qc-q4-r01 gpu=NVIDIA H100 80GB HBM3 region=eu-north wall=1680.593894 gbps=4.786987550485531 med=40.6 mean=47.4 max=266.090176 ge500=0 ge1k=0 gmin=4.11125 ovl=0.975 conc=3.3859626072162796
+[qc] start qc-q8-r01 qd=8 gap=4.0
+[qc] done qc-q8-r01 gpu=NVIDIA H100 80GB HBM3 region=CANADA-2 wall=1691.76859 gbps=4.7553679005235585 med=82.2 mean=80.0 max=244.897975 ge500=0 ge1k=0 gmin=4.073234 ovl=0.9583333333333334 conc=5.673210406394884
+[qc] start qc-q8-r02 qd=8 gap=4.0
+[qc] done qc-q8-r02 gpu=NVIDIA H100 80GB HBM3 region=us-east4 wall=1737.053994 gbps=4.631394346858743 med=91.9 mean=89.1 max=216.851604 ge500=0 ge1k=0 gmin=4.111032 ovl=0.9833333333333333 conc=6.153879304801852
+[qc] start qc-q4-r02 qd=4 gap=4.0
+[qc] done qc-q4-r02 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=1833.671499 gbps=4.3873627595713645 med=54.7 mean=57.2 max=171.542914 ge500=0 ge1k=0 gmin=4.025693 ovl=0.9833333333333333 conc=3.741593754792826
+[qc] start qc-q4-r03 qd=4 gap=4.0
+[qc] done qc-q4-r03 gpu=NVIDIA H100 80GB HBM3 region=CANADA-2 wall=1232.240199 gbps=6.528745008098864 med=35.4 mean=37.1 max=94.249265 ge500=0 ge1k=0 gmin=4.029371 ovl=0.9833333333333333 conc=3.6117616813765383
+[qc] start qc-q8-r03 qd=8 gap=4.0
+[qc] done qc-q8-r03 gpu=NVIDIA H100 80GB HBM3 region=chicago wall=1451.471982 gbps=5.54263681818696 med=73.6 mean=72.2 max=208.028179 ge500=0 ge1k=0 gmin=4.043496 ovl=0.9833333333333333 conc=5.966857260355991
+[qc] start qc-q8-r04 qd=8 gap=4.0
+[qc] done qc-q8-r04 gpu=NVIDIA H100 80GB HBM3 region=us-west4 wall=2046.60008 gbps=3.9309008763451234 med=122.1 mean=107.3 max=196.390681 ge500=0 ge1k=0 gmin=4.020009 ovl=0.9583333333333334 conc=6.293348394181632
+[qc] start qc-q4-r04 qd=4 gap=4.0
+[qc] done qc-q4-r04 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=2344.443517 gbps=3.431510287905989 med=43.3 mean=60.1 max=828.125712 ge500=2 ge1k=0 gmin=4.007841 ovl=0.9666666666666667 conc=3.0782745882634117
+[qc] start qc-q4-r05 qd=4 gap=4.0
+[qc] done qc-q4-r05 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1482.554648 gbps=5.426432043400805 med=42.4 mean=44.6 max=121.55183 ge500=0 ge1k=0 gmin=4.014725 ovl=0.975 conc=3.608389460190745
+[qc] start qc-q8-r05 qd=8 gap=4.0
+[qc] done qc-q8-r05 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2202.255031 gbps=3.653065578125588 med=110.0 mean=107.3 max=308.278889 ge500=0 ge1k=0 gmin=4.054919 ovl=0.9833333333333333 conc=5.844975840130116
+[qc] start qc-q8-r06 qd=8 gap=4.0
+[qc] done qc-q8-r06 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2248.910782 gbps=3.5772793266816225 med=113.0 mean=103.9 max=469.861947 ge500=0 ge1k=0 gmin=4.027511 ovl=0.975 conc=5.543745915928469
+[qc] start qc-q4-r06 qd=4 gap=4.0
+[qc] done qc-q4-r06 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1982.275174 gbps=4.058458761689561 med=42.3 mean=52.5 max=599.371478 ge500=2 ge1k=0 gmin=4.150876 ovl=0.9666666666666667 conc=3.1805340765469325
+[qc] start qc-q4-r07 qd=4 gap=4.0
+[qc] done qc-q4-r07 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1854.394266 gbps=4.338334191117478 med=41.9 mean=51.7 max=494.963808 ge500=0 ge1k=0 gmin=4.01492 ovl=0.9916666666666667 conc=3.3486482243037736
+[qc] start qc-q8-r07 qd=8 gap=4.0
+[qc] done qc-q8-r07 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2350.853651 gbps=3.4221534992524294 med=119.4 mean=109.9 max=607.506891 ge500=2 ge1k=0 gmin=4.05358 ovl=0.9916666666666667 conc=5.609663827601661
+[qc] start qc-q8-r08 qd=8 gap=4.0
+[qc] done qc-q8-r08 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2813.260711 gbps=2.859664593666591 med=89.3 mean=103.8 max=1154.895461 ge500=2 ge1k=2 gmin=4.007795 ovl=0.975 conc=4.427290960379107
+[qc] start qc-q4-r08 qd=4 gap=4.0
+[qc] done qc-q4-r08 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=2080.999997 gbps=3.865921220373746 med=39.1 mean=53.0 max=796.959024 ge500=2 ge1k=0 gmin=4.027324 ovl=0.9833333333333333 conc=3.055335718964924
+[qc] start qc-q4-r09 qd=4 gap=4.0
+[qc] done qc-q4-r09 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1262.745659 gbps=6.371023325766983 med=37.2 mean=38.3 max=92.922976 ge500=0 ge1k=0 gmin=4.030756 ovl=0.9833333333333333 conc=3.6401209770462573
+[qc] start qc-q8-r09 qd=8 gap=4.0
+[qc] done qc-q8-r09 gpu=NVIDIA H100 80GB HBM3 region=us-chicago-1 wall=1783.053814 gbps=4.511912082985511 med=92.3 mean=90.2 max=206.026435 ge500=0 ge1k=0 gmin=4.049573 ovl=0.9833333333333333 conc=6.07171509575089
+[qc] start qc-q8-r10 qd=8 gap=4.0
+[qc] done qc-q8-r10 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=2508.328532 gbps=3.20730795243372 med=112.4 mean=107.0 max=603.910396 ge500=2 ge1k=0 gmin=4.024704 ovl=0.95 conc=5.12079359905794
+[qc] start qc-q4-r10 qd=4 gap=4.0
+[qc] done qc-q4-r10 gpu=NVIDIA H100 80GB HBM3 region=us-chicago-1 wall=1683.792941 gbps=4.777892727844617 med=49.9 mean=51.5 max=126.474496 ge500=0 ge1k=0 gmin=4.000355 ovl=0.9833333333333333 conc=3.668654762462269
+[qc] start qc-q4-r11 qd=4 gap=4.0
+[qc] done qc-q4-r11 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1953.725215 gbps=4.117765377768337 med=42.2 mean=52.4 max=514.969581 ge500=2 ge1k=0 gmin=4.061182 ovl=0.975 conc=3.2182993650926495
+[qc] start qc-q8-r11 qd=8 gap=4.0
+[qc] done qc-q8-r11 gpu=NVIDIA H100 80GB HBM3 region=europe-west9 wall=1923.716712 gbps=4.181999354591041 med=104.9 mean=96.9 max=213.179145 ge500=0 ge1k=0 gmin=4.024232 ovl=0.9666666666666667 conc=6.045261469870726
+[qc] start qc-q8-r12 qd=8 gap=4.0
+[qc] done qc-q8-r12 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2121.370931 gbps=3.7923504703666557 med=125.1 mean=117.0 max=188.35688 ge500=0 ge1k=0 gmin=4.035427 ovl=0.975 conc=6.616616852755394
+[qc] start qc-q4-r12 qd=4 gap=4.0
+[qc] done qc-q4-r12 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1437.71708 gbps=5.595664237361638 med=39.1 mean=41.9 max=128.721293 ge500=0 ge1k=0 gmin=4.001456 ovl=0.975 conc=3.4958370404836536
+[qc] start qc-q4-r13 qd=4 gap=4.0
+[qc] done qc-q4-r13 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=1877.805336 gbps=4.284247090881629 med=56.1 mean=57.3 max=117.194706 ge500=0 ge1k=0 gmin=4.000572 ovl=0.9833333333333333 conc=3.6624785312677375
+[qc] start qc-q8-r13 qd=8 gap=4.0
+[qc] done qc-q8-r13 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1712.318787 gbps=4.698296899548064 med=81.3 mean=82.8 max=225.842162 ge500=0 ge1k=0 gmin=4.057162 ovl=0.9666666666666667 conc=5.800366430833303
+[qc] start qc-q8-r14 qd=8 gap=4.0
+[qc] done qc-q8-r14 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=2024.839193 gbps=3.9731461519571645 med=114.6 mean=103.8 max=253.375997 ge500=0 ge1k=0 gmin=4.006687 ovl=0.975 conc=6.150913997544298
+[qc] start qc-q4-r14 qd=4 gap=4.0
+[qc] done qc-q4-r14 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2114.742407 gbps=3.804237348894285 med=45.0 mean=58.6 max=519.702461 ge500=1 ge1k=0 gmin=4.0209 ovl=0.9833333333333333 conc=3.3232534415242374
+[qc] start qc-q4-r15 qd=4 gap=4.0
+[qc] done qc-q4-r15 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=1627.399988 gbps=4.943457113998701 med=48.1 mean=50.4 max=144.670394 ge500=0 ge1k=0 gmin=4.083858 ovl=0.9833333333333333 conc=3.7174153162154258
+[qc] start qc-q8-r15 qd=8 gap=4.0
+[qc] done qc-q8-r15 gpu=NVIDIA H100 80GB HBM3 region=europe-west9 wall=2045.382596 gbps=3.9332406874552284 med=114.1 mean=107.8 max=263.385754 ge500=0 ge1k=0 gmin=4.016088 ovl=0.9833333333333333 conc=6.325128494444273
+[qc] start qc-q8-r16 qd=8 gap=4.0
+[qc] done qc-q8-r16 gpu=NVIDIA H100 80GB HBM3 region=us-west4 wall=1964.516408 gbps=4.095146273779557 med=115.5 mean=106.7 max=213.074425 ge500=0 ge1k=0 gmin=4.044397 ovl=0.9916666666666667 conc=6.520090102500177
+[qc] start qc-q4-r16 qd=4 gap=4.0
+[qc] done qc-q4-r16 gpu=NVIDIA H100 80GB HBM3 region=denver wall=2089.229133 gbps=3.8506939813001355 med=60.0 mean=63.5 max=179.460876 ge500=0 ge1k=0 gmin=4.017882 ovl=0.9833333333333333 conc=3.6462797324011853
+[qc] start qc-q4-r17 qd=4 gap=4.0
+[qc] done qc-q4-r17 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1373.257418 gbps=5.858320474042398 med=39.4 mean=41.2 max=105.17097 ge500=0 ge1k=0 gmin=4.014268 ovl=0.9833333333333333 conc=3.599572303930566
+[qc] start qc-q8-r17 qd=8 gap=4.0
+[qc] done qc-q8-r17 gpu=NVIDIA H100 80GB HBM3 region=denver wall=2478.248406 gbps=3.2462371522251674 med=140.4 mean=133.0 max=256.750303 ge500=0 ge1k=0 gmin=4.001019 ovl=0.975 conc=6.438503709462287
+[qc] start qc-q8-r18 qd=8 gap=4.0
+[qc] done qc-q8-r18 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1661.530573 gbps=4.841910331793817 med=87.8 mean=83.5 max=195.782911 ge500=0 ge1k=0 gmin=4.009155 ovl=0.9833333333333333 conc=6.027528280696885
+[qc] start qc-q4-r18 qd=4 gap=4.0
+[qc] done qc-q4-r18 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=1571.332275 gbps=5.119847772489749 med=44.4 mean=47.3 max=147.580299 ge500=0 ge1k=0 gmin=4.063294 ovl=0.9833333333333333 conc=3.6097913670105197
+[qc] start qc-q4-r19 qd=4 gap=4.0
+[qc] done qc-q4-r19 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1475.797163 gbps=5.4512789763372105 med=42.7 mean=44.8 max=109.257187 ge500=0 ge1k=0 gmin=4.073356 ovl=0.975 conc=3.6416080574888596
+[qc] start qc-q8-r19 qd=8 gap=4.0
+[qc] done qc-q8-r19 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1878.86892 gbps=4.281821878239382 med=100.9 mean=94.8 max=157.82935 ge500=0 ge1k=0 gmin=4.056353 ovl=0.9833333333333333 conc=6.05151723836062
+[qc] start qc-q8-r20 qd=8 gap=4.0
+[qc] done qc-q8-r20 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=2498.463413 gbps=3.219971926000743 med=101.8 mean=104.6 max=533.984282 ge500=1 ge1k=0 gmin=4.064145 ovl=0.9666666666666667 conc=5.025274742336201
+[qc] start qc-q4-r20 qd=4 gap=4.0
+[qc] done qc-q4-r20 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1498.603293 gbps=5.368320012092753 med=42.3 mean=45.4 max=121.516629 ge500=0 ge1k=0 gmin=4.019301 ovl=0.9833333333333333 conc=3.6367516569977267
+
+valid H100 runs: 40 / 40
+regions: {'eu-north': 1, 'CANADA-2': 2, 'us-east4': 1, 'us-central': 4, 'chicago': 1, 'us-west4': 2, 'us-east': 2, 'us-west': 19, 'us-west1': 1, 'us-chicago-1': 2, 'europe-west9': 2, 'denver': 2, 'US-1': 1}
+
+=== per-run ===
+run            qd reads   wall   gbps    p10    med   mean     p95      p99   best   worst     SD >250 >500 >1k   gmin   gmed   ovl  conc mx
+qc-q4-r01       4   120   1681  4.787   36.8   40.6   47.4    71.0    203.4   21.0     266   29.5    1    0   0   4.11   7.50 0.975  3.39  4
+qc-q4-r02       4   120   1834  4.387   45.4   54.7   57.2    77.6    107.3   25.4     172   16.2    0    0   0   4.03  11.02 0.983  3.74  4
+qc-q4-r03       4   120   1232  6.529   31.9   35.4   37.1    45.9     88.5   19.1      94    9.8    0    0   0   4.03   7.28 0.983  3.61  4
+qc-q4-r04       4   120   2344  3.432   38.3   43.3   60.1   112.8    667.9   22.0     828   99.1    2    2   0   4.01   7.20 0.967  3.08  4
+qc-q4-r05       4   120   1483  5.426   36.6   42.4   44.6    54.3    102.2   22.4     122   12.1    0    0   0   4.01   7.14 0.975  3.61  4
+qc-q4-r06       4   120   1982  4.058   38.4   42.3   52.5    52.6    500.9   21.8     599   71.4    2    2   0   4.15   8.82 0.967  3.18  4
+qc-q4-r07       4   120   1854  4.338   37.8   41.9   51.7    61.5    418.8   22.7     495   58.4    2    0   0   4.01   8.56 0.992  3.35  4
+qc-q4-r08       4   120   2081  3.866   36.5   39.1   53.0    55.5    627.2   22.6     797   94.4    2    2   0   4.03   5.17 0.983  3.06  4
+qc-q4-r09       4   120   1263  6.371   35.3   37.2   38.3    42.7     86.2   22.8      93    8.5    0    0   0   4.03   5.30 0.983  3.64  4
+qc-q4-r10       4   120   1684  4.778   41.8   49.9   51.5    65.8    104.3   25.2     126   12.3    0    0   0   4.00   7.32 0.983  3.67  4
+qc-q4-r11       4   120   1954  4.118   37.7   42.2   52.4    58.8    434.8   21.5     515   60.8    2    2   0   4.06   9.72 0.975  3.22  4
+qc-q4-r12       4   120   1438  5.596   36.4   39.1   41.9    56.8    123.1   25.9     129   13.9    0    0   0   4.00   6.47 0.975  3.50  4
+qc-q4-r13       4   120   1878  4.284   44.3   56.1   57.3    78.1     99.3   28.9     117   13.1    0    0   0   4.00  11.68 0.983  3.66  4
+qc-q4-r14       4   120   2115  3.804   40.5   45.0   58.6   119.1    428.7   25.5     520   64.7    3    1   0   4.02   7.09 0.983  3.32  4
+qc-q4-r15       4   120   1627  4.943   41.8   48.1   50.4    66.6    101.9   23.0     145   13.3    0    0   0   4.08  11.96 0.983  3.72  4
+qc-q4-r16       4   120   2089  3.851   47.7   60.0   63.5    89.1    154.2   23.9     179   19.3    0    0   0   4.02  12.48 0.983  3.65  4
+qc-q4-r17       4   120   1373  5.858   37.7   39.4   41.2    45.2     97.4   25.3     105    9.9    0    0   0   4.01   6.59 0.983  3.60  4
+qc-q4-r18       4   120   1571  5.120   40.2   44.4   47.3    58.7    109.9   24.0     148   13.8    0    0   0   4.06   9.78 0.983  3.61  4
+qc-q4-r19       4   120   1476  5.451   38.3   42.7   44.8    55.5     96.9   25.2     109   10.4    0    0   0   4.07   9.66 0.975  3.64  4
+qc-q4-r20       4   120   1499  5.368   38.0   42.3   45.4    59.7    106.1   23.7     122   12.5    0    0   0   4.02   9.01 0.983  3.64  4
+qc-q8-r01       8   120   1692  4.755   40.4   82.2   80.0   121.8    161.4   20.2     245   31.0    0    0   0   4.07   6.28 0.958  5.67  8
+qc-q8-r02       8   120   1737  4.631   42.9   91.9   89.1   119.2    195.3   28.0     217   29.9    0    0   0   4.11   7.50 0.983  6.15  8
+qc-q8-r03       8   120   1451  5.543   39.6   73.6   72.2   102.3    142.4   22.8     208   25.2    0    0   0   4.04   4.92 0.983  5.97  8
+qc-q8-r04       8   120   2047  3.931   46.0  122.1  107.3   135.4    170.4   25.7     196   34.1    0    0   0   4.02   9.26 0.958  6.29  8
+qc-q8-r05       8   120   2202  3.653   46.0  110.0  107.3   217.1    272.2   24.5     308   47.1    4    0   0   4.05   7.15 0.983  5.84  8
+qc-q8-r06       8   120   2249  3.577   49.4  113.0  103.9   127.0    414.4   25.1     470   56.8    2    0   0   4.03   6.03 0.975  5.54  8
+qc-q8-r07       8   120   2351  3.422   46.6  119.4  109.9   136.1    455.9   24.7     608   68.1    2    2   0   4.05   7.78 0.992  5.61  8
+qc-q8-r08       8   120   2813  2.860   45.5   89.3  103.8   143.3    967.6   28.0    1155  139.9    2    2   2   4.01   4.96 0.975  4.43  8
+qc-q8-r09       8   120   1783  4.512   48.6   92.3   90.2   141.5    180.9   29.7     206   29.7    0    0   0   4.05   6.11 0.983  6.07  8
+qc-q8-r10       8   120   2508  3.207   42.0  112.4  107.0   144.8    484.3   23.6     604   70.2    2    2   0   4.02   6.30 0.950  5.12  8
+qc-q8-r11       8   120   1924  4.182   45.4  104.9   96.9   133.1    160.7   26.1     213   33.0    0    0   0   4.02   4.93 0.967  6.05  8
+qc-q8-r12       8   120   2121  3.792   86.9  125.1  117.0   140.1    161.4   24.8     188   28.0    0    0   0   4.04   8.63 0.975  6.62  8
+qc-q8-r13       8   120   1712  4.698   41.7   81.3   82.8   127.5    202.7   26.3     226   33.6    0    0   0   4.06   4.90 0.967  5.80  8
+qc-q8-r14       8   120   2025  3.973   46.4  114.6  103.8   150.9    205.3   25.9     253   38.0    1    0   0   4.01   7.67 0.975  6.15  8
+qc-q8-r15       8   120   2045  3.933   44.9  114.1  107.8   142.8    195.1   30.1     263   35.9    1    0   0   4.02   5.27 0.983  6.33  8
+qc-q8-r16       8   120   1965  4.095   60.0  115.5  106.7   143.2    160.6   24.7     213   30.3    0    0   0   4.04  10.48 0.992  6.52  8
+qc-q8-r17       8   120   2478  3.246   63.6  140.4  133.0   196.1    218.9   27.9     257   45.1    1    0   0   4.00   7.50 0.975  6.44  8
+qc-q8-r18       8   120   1662  4.842   35.2   87.8   83.5   138.3    152.7   21.9     196   32.4    0    0   0   4.01   4.78 0.983  6.03  8
+qc-q8-r19       8   120   1879  4.282   43.9  100.9   94.8   138.2    152.4   23.4     158   33.0    0    0   0   4.06   4.88 0.983  6.05  8
+qc-q8-r20       8   120   2498  3.220   48.9  101.8  104.6   191.9    446.4   30.0     534   66.7    3    1   0   4.06   8.02 0.967  5.03  8
+
+=== first launches per run (QD4: 4, QD8: 8) ===
+  qd4 qc-q4-r01      :: #0w3 t=0.0 gap=- lat=215 act=0 | #1w1 t=4.7 gap=4.72 lat=266 act=1 | #2w3 t=215.3 gap=210.56 lat=101 act=1 | #3w0 t=219.7 gap=4.39 lat=153 act=2
+  qd4 qc-q4-r02      :: #0w3 t=0.0 gap=- lat=47 act=0 | #1w1 t=4.0 gap=4.03 lat=91 act=1 | #2w3 t=47.0 gap=42.92 lat=35 act=1 | #3w0 t=51.3 gap=4.38 lat=110 act=2
+  qd4 qc-q4-r03      :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w1 t=4.2 gap=4.18 lat=88 act=1 | #2w0 t=46.4 gap=42.23 lat=89 act=2 | #3w3 t=92.0 gap=45.57 lat=43 act=2
+  qd4 qc-q4-r04      :: #0w3 t=0.0 gap=- lat=779 act=0 | #1w1 t=4.8 gap=4.80 lat=828 act=1 | #2w3 t=778.7 gap=773.85 lat=46 act=1 | #3w2 t=783.0 gap=4.40 lat=112 act=2
+  qd4 qc-q4-r05      :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w0 t=4.6 gap=4.60 lat=95 act=1 | #2w3 t=47.8 gap=43.23 lat=40 act=1 | #3w2 t=52.4 gap=4.52 lat=104 act=2
+  qd4 qc-q4-r06      :: #0w3 t=0.0 gap=- lat=599 act=0 | #1w1 t=5.1 gap=5.08 lat=594 act=1 | #2w2 t=546.3 gap=541.21 lat=104 act=2 | #3w1 t=599.2 gap=52.90 lat=41 act=2
+  qd4 qc-q4-r07      :: #0w3 t=0.0 gap=- lat=495 act=0 | #1w2 t=4.0 gap=4.04 lat=491 act=1 | #2w0 t=445.3 gap=441.29 lat=105 act=2 | #3w2 t=494.9 gap=49.57 lat=41 act=2
+  qd4 qc-q4-r08      :: #0w3 t=0.0 gap=- lat=751 act=0 | #1w0 t=4.1 gap=4.07 lat=797 act=1 | #2w2 t=750.5 gap=746.41 lat=101 act=2 | #3w0 t=801.1 gap=50.58 lat=41 act=1
+  qd4 qc-q4-r09      :: #0w3 t=0.0 gap=- lat=38 act=0 | #1w1 t=4.7 gap=4.70 lat=79 act=1 | #2w3 t=37.7 gap=33.01 lat=34 act=1 | #3w0 t=42.1 gap=4.43 lat=88 act=2
+  qd4 qc-q4-r10      :: #0w3 t=0.0 gap=- lat=45 act=0 | #1w0 t=4.1 gap=4.12 lat=90 act=1 | #2w3 t=44.6 gap=40.47 lat=37 act=1 | #3w1 t=49.0 gap=4.36 lat=108 act=2
+  qd4 qc-q4-r11      :: #0w3 t=0.0 gap=- lat=515 act=0 | #1w1 t=4.2 gap=4.16 lat=511 act=1 | #2w0 t=465.6 gap=461.43 lat=100 act=2 | #3w1 t=514.8 gap=49.24 lat=41 act=2
+  qd4 qc-q4-r12      :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w2 t=4.5 gap=4.50 lat=129 act=1 | #2w3 t=48.4 gap=43.92 lat=35 act=1 | #3w3 t=83.2 gap=34.73 lat=42 act=1
+  qd4 qc-q4-r13      :: #0w3 t=0.0 gap=- lat=44 act=0 | #1w0 t=4.1 gap=4.09 lat=86 act=1 | #2w1 t=43.9 gap=39.82 lat=102 act=2 | #3w0 t=90.1 gap=46.19 lat=38 act=1
+  qd4 qc-q4-r14      :: #0w3 t=0.0 gap=- lat=470 act=0 | #1w0 t=4.0 gap=4.04 lat=520 act=1 | #2w2 t=470.3 gap=466.24 lat=115 act=2 | #3w0 t=523.8 gap=53.49 lat=49 act=1
+  qd4 qc-q4-r15      :: #0w3 t=0.0 gap=- lat=47 act=0 | #1w2 t=4.6 gap=4.63 lat=96 act=1 | #2w3 t=46.8 gap=42.17 lat=48 act=1 | #3w0 t=51.1 gap=4.33 lat=103 act=2
+  qd4 qc-q4-r16      :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w1 t=4.9 gap=4.87 lat=166 act=1 | #2w2 t=48.1 gap=43.21 lat=54 act=2 | #3w2 t=101.7 gap=53.61 lat=56 act=1
+  qd4 qc-q4-r17      :: #0w3 t=0.0 gap=- lat=45 act=0 | #1w0 t=4.2 gap=4.17 lat=85 act=1 | #2w1 t=44.7 gap=40.48 lat=100 act=2 | #3w0 t=89.0 gap=44.37 lat=42 act=1
+  qd4 qc-q4-r18      :: #0w3 t=0.0 gap=- lat=54 act=0 | #1w0 t=4.6 gap=4.55 lat=100 act=1 | #2w2 t=53.7 gap=49.14 lat=112 act=2 | #3w0 t=105.0 gap=51.36 lat=41 act=1
+  qd4 qc-q4-r19      :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w1 t=4.3 gap=4.33 lat=89 act=1 | #2w0 t=48.2 gap=43.92 lat=99 act=2 | #3w1 t=93.8 gap=45.55 lat=50 act=1
+  qd4 qc-q4-r20      :: #0w3 t=0.0 gap=- lat=52 act=0 | #1w2 t=4.4 gap=4.41 lat=99 act=1 | #2w3 t=51.7 gap=47.30 lat=40 act=1 | #3w0 t=56.1 gap=4.41 lat=108 act=2
+  qd8 qc-q8-r01      :: #0w7 t=0.0 gap=- lat=59 act=0 | #1w6 t=4.2 gap=4.17 lat=113 act=1 | #2w1 t=59.2 gap=55.01 lat=122 act=2 | #3w6 t=117.3 gap=58.10 lat=41 act=1
+  qd8 qc-q8-r02      :: #0w7 t=0.0 gap=- lat=105 act=0 | #1w2 t=4.8 gap=4.79 lat=99 act=1 | #2w3 t=52.8 gap=47.99 lat=112 act=2 | #3w2 t=104.3 gap=51.49 lat=48 act=2
+  qd8 qc-q8-r03      :: #0w7 t=0.0 gap=- lat=48 act=0 | #1w5 t=4.1 gap=4.06 lat=90 act=1 | #2w2 t=48.1 gap=44.00 lat=93 act=2 | #3w5 t=94.1 gap=46.07 lat=35 act=1
+  qd8 qc-q8-r04      :: #0w7 t=0.0 gap=- lat=103 act=0 | #1w1 t=4.1 gap=4.08 lat=98 act=1 | #2w6 t=55.3 gap=51.21 lat=99 act=2 | #3w1 t=102.3 gap=47.04 lat=47 act=2
+  qd8 qc-q8-r05      :: #0w7 t=0.0 gap=- lat=262 act=0 | #1w2 t=4.5 gap=4.52 lat=308 act=1 | #2w7 t=261.7 gap=257.14 lat=43 act=1 | #3w4 t=266.1 gap=4.45 lat=270 act=2
+  qd8 qc-q8-r06      :: #0w7 t=0.0 gap=- lat=470 act=0 | #1w2 t=4.3 gap=4.27 lat=465 act=1 | #2w0 t=420.3 gap=416.07 lat=104 act=2 | #3w2 t=469.6 gap=49.25 lat=54 act=2
+  qd8 qc-q8-r07      :: #0w7 t=0.0 gap=- lat=521 act=0 | #1w3 t=4.8 gap=4.84 lat=608 act=1 | #2w6 t=520.1 gap=515.22 lat=47 act=2 | #3w6 t=566.8 gap=46.71 lat=46 act=1
+  qd8 qc-q8-r08      :: #0w7 t=0.0 gap=- lat=1155 act=0 | #1w5 t=4.3 gap=4.31 lat=1151 act=1 | #2w6 t=1106.9 gap=1102.61 lat=96 act=2 | #3w7 t=1154.9 gap=48.01 lat=41 act=2
+  qd8 qc-q8-r09      :: #0w7 t=0.0 gap=- lat=49 act=0 | #1w2 t=4.3 gap=4.28 lat=97 act=1 | #2w7 t=49.0 gap=44.76 lat=44 act=1 | #3w3 t=53.7 gap=4.68 lat=110 act=2
+  qd8 qc-q8-r10      :: #0w7 t=0.0 gap=- lat=548 act=0 | #1w6 t=4.2 gap=4.22 lat=604 act=1 | #2w7 t=547.7 gap=543.46 lat=42 act=1 | #3w5 t=552.3 gap=4.62 lat=117 act=2
+  qd8 qc-q8-r11      :: #0w7 t=0.0 gap=- lat=50 act=0 | #1w0 t=4.1 gap=4.12 lat=99 act=1 | #2w7 t=50.2 gap=46.08 lat=41 act=1 | #3w1 t=54.7 gap=4.47 lat=109 act=2
+  qd8 qc-q8-r12      :: #0w7 t=0.0 gap=- lat=54 act=0 | #1w4 t=4.0 gap=4.05 lat=96 act=1 | #2w5 t=53.4 gap=49.36 lat=95 act=2 | #3w3 t=99.9 gap=46.53 lat=157 act=2
+  qd8 qc-q8-r13      :: #0w7 t=0.0 gap=- lat=49 act=0 | #1w5 t=4.1 gap=4.06 lat=99 act=1 | #2w7 t=49.1 gap=45.04 lat=44 act=1 | #3w2 t=53.5 gap=4.41 lat=112 act=2
+  qd8 qc-q8-r14      :: #0w7 t=0.0 gap=- lat=41 act=0 | #1w3 t=4.0 gap=4.01 lat=93 act=1 | #2w7 t=41.4 gap=37.40 lat=37 act=1 | #3w5 t=45.9 gap=4.51 lat=116 act=2
+  qd8 qc-q8-r15      :: #0w7 t=0.0 gap=- lat=48 act=0 | #1w0 t=4.4 gap=4.44 lat=95 act=1 | #2w7 t=48.3 gap=43.88 lat=51 act=1 | #3w2 t=52.6 gap=4.32 lat=94 act=2
+  qd8 qc-q8-r16      :: #0w7 t=0.0 gap=- lat=103 act=0 | #1w4 t=4.2 gap=4.19 lat=99 act=1 | #2w2 t=49.7 gap=45.54 lat=105 act=2 | #3w6 t=102.5 gap=52.75 lat=109 act=3
+  qd8 qc-q8-r17      :: #0w7 t=0.0 gap=- lat=55 act=0 | #1w1 t=4.3 gap=4.35 lat=95 act=1 | #2w4 t=54.9 gap=50.60 lat=134 act=2 | #3w1 t=99.3 gap=44.33 lat=60 act=1
+  qd8 qc-q8-r18      :: #0w7 t=0.0 gap=- lat=39 act=0 | #1w0 t=4.8 gap=4.78 lat=77 act=1 | #2w6 t=39.2 gap=34.39 lat=89 act=2 | #3w0 t=81.4 gap=42.23 lat=34 act=1
+  qd8 qc-q8-r19      :: #0w7 t=0.0 gap=- lat=45 act=0 | #1w0 t=4.7 gap=4.67 lat=123 act=1 | #2w7 t=44.8 gap=40.13 lat=35 act=1 | #3w7 t=79.4 gap=34.55 lat=45 act=1
+  qd8 qc-q8-r20      :: #0w7 t=0.0 gap=- lat=487 act=0 | #1w4 t=4.7 gap=4.70 lat=534 act=1 | #2w7 t=487.3 gap=482.59 lat=218 act=1 | #3w5 t=491.9 gap=4.65 lat=272 act=2

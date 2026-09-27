@@ -1,0 +1,30 @@
+# v2ctl profile: E31 CLIP FP32 cast-once QD4 ARM A (control).
+# Both arms use the corrected E30 QD4 reader configuration; the E31
+# measurement gate is ON while cast-once remains OFF.
+schema_version = 1
+name = "e31-clip-fp32-qd4-arm-a"
+extends = "e29-tracer"
+owner = "E31"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# Corrected E30 QD4 configuration: four readers, 32 MiB blocks, and
+# restore_earliest launch ordering.  This is identical to ARM B.
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "1"
+COMFYMODAL_V2_CLIP_QD_QD = "4"
+COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
+COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "restore_earliest"
+# E31 evidence/timing gates: synchronized forensics, profiler disabled.
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+COMFYMODAL_V2_E31_FORENSICS = "1"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"

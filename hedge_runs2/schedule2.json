@@ -1,0 +1,133 @@
+{
+  "seed": 20260923,
+  "blocks": 5,
+  "base_per_block": [
+    "H75",
+    "H75",
+    "H150",
+    "H250"
+  ],
+  "runs": [
+    {
+      "ordinal": 1,
+      "block": 1,
+      "position": 1,
+      "arm": "H250"
+    },
+    {
+      "ordinal": 2,
+      "block": 1,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 3,
+      "block": 1,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 4,
+      "block": 1,
+      "position": 4,
+      "arm": "H150"
+    },
+    {
+      "ordinal": 5,
+      "block": 2,
+      "position": 1,
+      "arm": "H250"
+    },
+    {
+      "ordinal": 6,
+      "block": 2,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 7,
+      "block": 2,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 8,
+      "block": 2,
+      "position": 4,
+      "arm": "H150"
+    },
+    {
+      "ordinal": 9,
+      "block": 3,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 10,
+      "block": 3,
+      "position": 2,
+      "arm": "H150"
+    },
+    {
+      "ordinal": 11,
+      "block": 3,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 12,
+      "block": 3,
+      "position": 4,
+      "arm": "H250"
+    },
+    {
+      "ordinal": 13,
+      "block": 4,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 14,
+      "block": 4,
+      "position": 2,
+      "arm": "H250"
+    },
+    {
+      "ordinal": 15,
+      "block": 4,
+      "position": 3,
+      "arm": "H150"
+    },
+    {
+      "ordinal": 16,
+      "block": 4,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 17,
+      "block": 5,
+      "position": 1,
+      "arm": "H150"
+    },
+    {
+      "ordinal": 18,
+      "block": 5,
+      "position": 2,
+      "arm": "H250"
+    },
+    {
+      "ordinal": 19,
+      "block": 5,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 20,
+      "block": 5,
+      "position": 4,
+      "arm": "H75"
+    }
+  ],
+  "note": "generated once; never regenerated"
+}

@@ -1,0 +1,41 @@
+{
+  "audit_basis": [
+    "PHASE_G2 §8 sha256 null in every observed entry",
+    "PHASE_G1 §9 S6 false"
+  ],
+  "description": "Model ref is a standard basename with intentionally absent sha256. Valid manifest that fails structural readiness (missing hash), while portability risk stays a separate dimension.",
+  "expected": {
+    "issue_codes": [
+      "model_hash_unpinned"
+    ],
+    "risk_level_hint_nonnormative": "medium",
+    "semantic_notes": [
+      "manifest_readiness=false coexists with non-HIGH workflow risk hint; concepts stay separately named per PHASE_G5 §3."
+    ],
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": false,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/model_hash_missing.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 1,
+    "ready": false
+  },
+  "manifest_sha256_canonical": "96d2d101596595376140892641c23b3b9dbfc1721681df0ee0a917baced7f8f9",
+  "scenario_id": "model_hash_missing",
+  "title": "Model reference without byte hash"
+}

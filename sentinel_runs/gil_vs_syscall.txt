@@ -1,0 +1,23 @@
+﻿LARGE EPISODES: where is the time spent?
+
+ncr-01 worst=596ms gbps=3.71 native_max_gap=2.794289 hb_max_gap=501.725984
+   w0: n= 30 sick_reads= 1 max_preadv=  502.2ms  refill_gap med=0.010ms max=0.047ms  | refill_gap right after a sick read: none
+   w1: n= 30 sick_reads= 1 max_preadv=  595.7ms  refill_gap med=0.010ms max=35.072ms  | refill_gap right after a sick read: none
+   w2: n= 30 sick_reads= 1 max_preadv=  502.4ms  refill_gap med=0.010ms max=0.034ms  | refill_gap right after a sick read: none
+   w3: n= 30 sick_reads= 1 max_preadv=  502.7ms  refill_gap med=0.010ms max=0.032ms  | refill_gap right after a sick read: none
+   -> after worst read (w1 596ms), next preadv entered 0.012ms later
+
+ncr-10 worst=718ms gbps=2.83 native_max_gap=6.695525 hb_max_gap=523.929431
+   w0: n= 30 sick_reads= 2 max_preadv=  546.9ms  refill_gap med=0.012ms max=0.027ms  | refill_gap right after a sick read: med=0.011 max=0.011ms
+   w1: n= 30 sick_reads= 2 max_preadv=  524.0ms  refill_gap med=0.010ms max=0.023ms  | refill_gap right after a sick read: med=0.017 max=0.017ms
+   w2: n= 30 sick_reads= 2 max_preadv=  555.6ms  refill_gap med=0.012ms max=0.020ms  | refill_gap right after a sick read: med=0.009 max=0.009ms
+   w3: n= 30 sick_reads= 2 max_preadv=  717.5ms  refill_gap med=0.012ms max=76.504ms  | refill_gap right after a sick read: med=0.011 max=0.012ms
+   -> after worst read (w3 718ms), next preadv entered 0.026ms later
+
+ncr-11 worst=534ms gbps=3.51 native_max_gap=2.645221 hb_max_gap=458.403868
+   w0: n= 30 sick_reads= 1 max_preadv=  467.7ms  refill_gap med=0.009ms max=0.027ms  | refill_gap right after a sick read: none
+   w1: n= 30 sick_reads= 1 max_preadv=  533.6ms  refill_gap med=0.008ms max=0.052ms  | refill_gap right after a sick read: none
+   w2: n= 30 sick_reads= 1 max_preadv=  533.0ms  refill_gap med=0.009ms max=0.016ms  | refill_gap right after a sick read: none
+   w3: n= 30 sick_reads= 2 max_preadv=  434.6ms  refill_gap med=0.010ms max=0.038ms  | refill_gap right after a sick read: med=0.008 max=0.008ms
+   -> after worst read (w1 534ms), next preadv entered 0.005ms later
+

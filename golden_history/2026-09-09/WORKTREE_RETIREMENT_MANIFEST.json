@@ -1,0 +1,375 @@
+﻿{
+    "recorded_at":  "2026-09-09T10:13:41.6412340-05:00",
+    "normal_head":  "4421610c1a40794a2414d69f2f383880b100ffe5",
+    "normal_branch":  "TESTING2",
+    "normal_dirty":  [
+                         {
+                             "status":  " M .gitignore",
+                             "path":  ".gitignore",
+                             "sha256":  "16bb1b47491d22a97ad2bd3d23f463e3f73c93cfa4b90d0dd60de62d38e5e42b",
+                             "bytes":  2304
+                         },
+                         {
+                             "status":  " M .ignore",
+                             "path":  ".ignore",
+                             "sha256":  "dc06c87b72fed4f6fb413d671e765c670366ed9de16b2d14102666892ddd71e1",
+                             "bytes":  179
+                         },
+                         {
+                             "status":  " M .scratch/studio-workflow-experiment-friction-reduction/issues/06-field-card-experiment-prototype.md",
+                             "path":  ".scratch/studio-workflow-experiment-friction-reduction/issues/06-field-card-experiment-prototype.md",
+                             "sha256":  "ad4e8a4d7c95b7f9bc2de0564473b5af0ee0cb5a1b0e7783e3879b0e93684a2e",
+                             "bytes":  2590
+                         },
+                         {
+                             "status":  " M .scratch/studio-workflow-experiment-friction-reduction/issues/07-durable-save-import-export-contract.md",
+                             "path":  ".scratch/studio-workflow-experiment-friction-reduction/issues/07-durable-save-import-export-contract.md",
+                             "sha256":  "b885bd1a5e9faeab1655afaf96084d6806c02dd9e0e5ce9e1401be8a96a312e3",
+                             "bytes":  1795
+                         },
+                         {
+                             "status":  " M .scratch/studio-workflow-experiment-friction-reduction/issues/08-implementation-acceptance-contract.md",
+                             "path":  ".scratch/studio-workflow-experiment-friction-reduction/issues/08-implementation-acceptance-contract.md",
+                             "sha256":  "25137bc2d2e86de2ad116fe71fd1b56ac1c7a8fe43a693a917a859a9b2cba684",
+                             "bytes":  511
+                         },
+                         {
+                             "status":  " M .scratch/studio-workflow-experiment-friction-reduction/map.md",
+                             "path":  ".scratch/studio-workflow-experiment-friction-reduction/map.md",
+                             "sha256":  "7d43014a698ff344d4826fda19bf45099e8142e27379803dccd28bea585d9960",
+                             "bytes":  2987
+                         },
+                         {
+                             "status":  " M CONTEXT.md",
+                             "path":  "CONTEXT.md",
+                             "sha256":  "77a459787160346bad759f29d4b1dc45542b9f3b777a046604e3cdf0cb8d4e07",
+                             "bytes":  6632
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_00888fde5b434afe_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_00888fde5b434afe_2026-09-08.md",
+                             "sha256":  "24bd0cf421bc798030f70504b699dcbfca310c8f8f0caa5f2c94ccf31f1f7ee3",
+                             "bytes":  4827299
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_45ddaa7d91944fec_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_45ddaa7d91944fec_2026-09-08.md",
+                             "sha256":  "3f3b9279f1c309fbaa83fa4b28538e2146e9f6da056125b2e988c373763a7b4e",
+                             "bytes":  4825671
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_6f7ec619c9b94362_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_6f7ec619c9b94362_2026-09-08.md",
+                             "sha256":  "1a37164948d8a7e9ba67b8975b86a6eafd3071b9ae4c8571bac2c898675f0988",
+                             "bytes":  4825671
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_73e079cac3ae424f_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_73e079cac3ae424f_2026-09-08.md",
+                             "sha256":  "33a846dde9f5234e678d9073668de59718da6aeadc9ce6831e7174e3ec2dd73a",
+                             "bytes":  4825671
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_85fb99b266714b27_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_85fb99b266714b27_2026-09-08.md",
+                             "sha256":  "5966e0016f05b1c5db5a9ede47a281eb65e32a100c9f02a724c4488cb12fceb5",
+                             "bytes":  4825671
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_8715d67d04e54165_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_8715d67d04e54165_2026-09-08.md",
+                             "sha256":  "9b6a33cb6a487eb435e19da87e2fc9f3f37508be7cf13c4fee7d754911f25992",
+                             "bytes":  4827298
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_8c9c2e23e9e44afc_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_8c9c2e23e9e44afc_2026-09-08.md",
+                             "sha256":  "2d6cba954cb19fb7f57fb9701f3ed6d96b474b9ed6fa7360789059dffaf4a53e",
+                             "bytes":  4827310
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_9dd0ec15fddb4220_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_9dd0ec15fddb4220_2026-09-08.md",
+                             "sha256":  "32df69c58bddd0acccad6a49c0683eae7a0a88d24255909498698824f327be09",
+                             "bytes":  4825670
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_a3570eef01e5448d_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_a3570eef01e5448d_2026-09-08.md",
+                             "sha256":  "a6029eacee84eec6b05a12ee25dde22e90bdb64a891e56191532d3a1c4f013fe",
+                             "bytes":  4827311
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_d10233310d6441a9_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_d10233310d6441a9_2026-09-08.md",
+                             "sha256":  "481701823c23ccbe31238e9ff0b2779337e3d0c782768fcfb95be93918ba83a8",
+                             "bytes":  4827311
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_e63ced59e5144139_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_e63ced59e5144139_2026-09-08.md",
+                             "sha256":  "9cb508e352f3ac8834284ff9bd8609c9f6befc83bb6e382e6d386226138f4960",
+                             "bytes":  4827311
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_e7c202ce749c413d_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_e7c202ce749c413d_2026-09-08.md",
+                             "sha256":  "3cf2055a34b4ab7d3583c40347da3ff45e89a1e84a0aa617474b8b5be3bcd9c0",
+                             "bytes":  4825572
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_f3c36372c70d9abe_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_f3c36372c70d9abe_2026-09-08.md",
+                             "sha256":  "66e1a30602a59bc7e61d67fc827ccb66da9c9b87d193d6d26252971e55364893",
+                             "bytes":  4763800
+                         },
+                         {
+                             "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_fd86a5bc07a5464d_2026-09-08.md",
+                             "path":  "EXPERIMENT_EVIDENCE_golden_p1_fd86a5bc07a5464d_2026-09-08.md",
+                             "sha256":  "317bd42998d61f5f7912eaba43aab2260aaff8a93404db353ed3064c09c4ddaa",
+                             "bytes":  4825671
+                         },
+                         {
+                             "status":  "?? REPORT_GOLDEN_DVVRAM_BEFORE_QD2_2026-09-08.md",
+                             "path":  "REPORT_GOLDEN_DVVRAM_BEFORE_QD2_2026-09-08.md",
+                             "sha256":  "5af681b46329131aab87fc9e082aacf06ce95e12077aac69c4f8400a129d0d65",
+                             "bytes":  9740
+                         },
+                         {
+                             "status":  "?? REPORT_GOLDEN_INDEPENDENT_SAMPLER_LANES_2026-09-09.md",
+                             "path":  "REPORT_GOLDEN_INDEPENDENT_SAMPLER_LANES_2026-09-09.md",
+                             "sha256":  "23238bfdb127977553257647c62b7f64423d3a4d466d8b694a58ad35b886ac1b",
+                             "bytes":  16952
+                         },
+                         {
+                             "status":  "?? REPORT_GOLDEN_QD2_LAZY_BACKING_2026-09-08.md",
+                             "path":  "REPORT_GOLDEN_QD2_LAZY_BACKING_2026-09-08.md",
+                             "sha256":  "ec2edb4db92d5be749118a6167c6cca69c23044876079ad94daba1178bf4a567",
+                             "bytes":  6998
+                         },
+                         {
+                             "status":  "?? REPORT_GOLDEN_STOCK_RES4LYF_GC_SUPPRESSION_2026-09-09.md",
+                             "path":  "REPORT_GOLDEN_STOCK_RES4LYF_GC_SUPPRESSION_2026-09-09.md",
+                             "sha256":  "1f98134393ad7470d50412fbd506c3a57e44aa17199acf803625ea05cb27dd09",
+                             "bytes":  9354
+                         }
+                     ],
+    "stock_res4lyf":  {
+                          "head":  "119679d8d8d26e6db52757e705488abb6399d7d4",
+                          "status":  "?? .slim/"
+                      },
+    "modal_slim_worktrees":  [
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-clip-forward",
+                                     "head":  "a06eef304da3b10db638c22191908627da47ab36",
+                                     "branch":  "omos/golden-clip-forward",
+                                     "status":  "M tests/test_v2_d6_deploy_profile.py\r\n M tools/benchmark_v2_direct.py\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-46-21_408a1c/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-51-15_0bf012/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-58-15_b57453/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-26-11_4515b4/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-27-17_81326b/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-42-28_af5b05/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-44-00_14374f/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-44-24_661857/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-44-51_768d70/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-45-16_ac5d74/",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-gc-suppression-exp3",
+                                     "head":  "4421610c1a40794a2414d69f2f383880b100ffe5",
+                                     "branch":  "omos/golden-gc-suppression-exp3",
+                                     "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_27b771c5c7cb47ea_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_35401f6fa93e4393_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_3e5a665fdad74b3a_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_4f785cbfbd054a4a_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_4f7a7df9e8e945d1_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_90c9816489e64292_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_a5daf49e60ea41fe_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_e0a6c1aa60644d68_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_e9b02248c3084070_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_ec626a60385c47b2_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_f3df09b619664452_2026-09-09.md",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-p4-7",
+                                     "head":  "222b67c1566ab61d8dcab93ee51749c94978fe21",
+                                     "branch":  "omos/golden-p4-7",
+                                     "status":  "?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_00-35-11_8b47c9/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-15-04_d238f3/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-29-32_1ecfe3/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-37-39_ae47ba/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-27-52_ced25b/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-53-08_39c675/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-09-41_64922f/",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-p4-7b",
+                                     "head":  "14a85c030b54017bcf9227e4c3e8f16c762ad9f1",
+                                     "branch":  "omos/golden-p4-7b",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-p4-8-durability",
+                                     "head":  "e5eb5ecba2f4dc7c935513812a6cfd0a3a80564a",
+                                     "branch":  "omos/golden-p4-8-durability",
+                                     "status":  "M .last_custom_node_context_manifest.json\r\n M .last_v2_dependency_cache_identity.json\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-07-46_173039/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-23-14_974c4b/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-31-53_a71c87/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-34-45_5ec524/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-37-10_da8ad1/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-37-42_8ef637/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-39-51_93c128/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-40-18_5e0ec4/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-43-10_b16dd2/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_01-49-41_47c0a9/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-48-16_afd163/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-49-33_2e3fbc/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-50-51_5d4c30/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-51-16_c648ab/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-51-45_b8c95b/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_02-52-11_126faa/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-08-22_47ed5e/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-08-58_bc1952/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-10-12_a1fc36/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-10-38_788e76/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-12-12_0b0f5c/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-15-13_07bac1/",
+                                     "action":  "retain"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-post-loop-tail",
+                                     "head":  "0ea9428636afe06adf3e6a05319898473ebdd64d",
+                                     "branch":  "omos/golden-post-loop-tail",
+                                     "status":  "M comfymodal_runtime/golden_serial.py\r\n?? tests/test_lane_a_sampler_tail.py",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-post-loop-tail-exp2",
+                                     "head":  "6711b6bb4f29027eb972019e9e0af046c278e4c0",
+                                     "branch":  "omos/golden-post-loop-tail-exp2",
+                                     "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_162d8144f76c47e2_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_3ca42217370540dd_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_4443bc194aeb4429_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_4cb4090c30a84365_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_72b7283f888f4b3d_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_77cd6a0875ae4b8d_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_835a3f331a0c49f9_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_a8ada4e81bc24d09_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_bedd28478d384ff2_2026-09-09.md",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-rk-coeff-controller",
+                                     "head":  "0ea9428636afe06adf3e6a05319898473ebdd64d",
+                                     "branch":  "omos/golden-rk-coeff-controller",
+                                     "status":  "M comfymodal_runtime/golden_serial.py\r\n M config/v2/flag_registry.toml\r\n M config/v2/profiles/golden_p1.toml\r\n?? EXPERIMENT_EVIDENCE_golden_p1_0b7ee508d4894bec_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_0e4976de1d98451c_2026-09-08.md\r\n?? tests/test_lane_b_rk_controller.py",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-rk-coeff-controller-exp2",
+                                     "head":  "4577213dc83d1653d5cb9be9b5cb129c0f40457a",
+                                     "branch":  "omos/golden-rk-coeff-controller-exp2",
+                                     "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_219f7a2675b94a55_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_21d77ddee7384958_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_2fa7d6581cd04e18_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_364a5b0d5d1d4d94_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_57fe3366308d49b2_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_6ea1379a172c4d5b_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_7025e5026a2147c3_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_782803d9b2c64ffc_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_78a9edbe0ac6444c_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_ac2dfe74167340fb_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_aeb9e6627fc54d73_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_b0c10d63af934a43_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_bb997485c50e45f9_2026-09-08.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_da94d60a8a46490d_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_efd48c624ffe4108_2026-09-08.md",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-sampler-ab-integration",
+                                     "head":  "f3c5171ddf8f9a1ff1855314d6c29e44e5c1fe3a",
+                                     "branch":  "omos/golden-sampler-ab-integration",
+                                     "status":  "?? EXPERIMENT_EVIDENCE_golden_p1_058d6fca22b3456f_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_0c7b69700bec4218_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_81b90bc056ad4fd4_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_974ddb00554e474a_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_ab31e001becb4004_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_badabfeff8184065_2026-09-09.md\r\n?? EXPERIMENT_EVIDENCE_golden_p1_cc73322568274d0c_2026-09-09.md",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/golden-unet-p4-5",
+                                     "head":  "299dbc782c68b641ba021e7c9f219c8c07d003c7",
+                                     "branch":  "omos/golden-unet-p4-5",
+                                     "status":  "M deploy_and_run_v2_single.bat\r\n M run_v2_single.bat\r\n M tests/test_benchmark_v2_golden_acceptance.py\r\n M tests/test_golden_p1_wiring.py\r\n M tests/test_v2ctl_validation.py\r\n M tools/benchmark_v2_direct.py\r\n M tools/v2_control/cli.py\r\n M tools/v2_control/validation.py\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-25-46_f67082/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-35-02_47b088/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-41-12_ed8499/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-45-24_75115a/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-51-25_e068c2/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-51-58_5efb85/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-52-21_ab3cef/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-52-53_d36a38/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-53-18_3102b8/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-53-42_1b3579/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-56-32_ee7e2d/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-57-44_712e43/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-58-12_d6edf5/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-58-37_3b05f9/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_03-58-59_6d9203/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-11-24_5470e6/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-11-55_58acfd/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-12-54_07d8a5/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-13-21_f4489d/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-14-29_12b705/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-14-55_03d336/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-15-20_c5c92b/",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p0-golden-shared-primitives",
+                                     "head":  "8297a3a437e1dcb09b34c8df481576ff6aa19b3b",
+                                     "branch":  "omos/p0-golden-shared-primitives",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p05-git-evidence-hygiene",
+                                     "head":  "a09e804a60d84ff48beaf7baf2517e2c60017f9b",
+                                     "branch":  "p05/git-evidence-hygiene",
+                                     "status":  "?? ra11f/",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p1-golden-integration",
+                                     "head":  "6f8a38b9889bc715be21337d4374212847cea8a7",
+                                     "branch":  "p1/golden-integration",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p4-2-golden-snapshot-runtime",
+                                     "head":  "8b385860824b52cf84b74f2c22bf65bbe07dcce6",
+                                     "branch":  "omos/p4-2-golden-snapshot-runtime",
+                                     "status":  "M __init__.py\r\n M comfyapp.py\r\n M comfymodal_runtime/modal_app.py\r\n M comfymodal_runtime/restore_state_probe.py\r\n M comfymodal_runtime/runtime_bootstrap.py\r\n M deploy_and_run_v2_single.bat\r\n M tests/test_comfyapp_build_context.py\r\n M tests/test_golden_p1_wiring.py\r\n M tests/test_v2ctl_backend.py\r\n M tests/test_v2ctl_cli.py\r\n M tools/benchmark_v2_direct.py\r\n M tools/publish_custom_nodes_volume.py\r\n M tools/v2_control/backend.py\r\n M tools/v2_control/cli.py\r\n?? P4-2_TELEMETRY_REPORT.md\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-58-23_058c15/\r\n?? tests/test_p4_golden_snapshot_runtime_memory.py",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p4-3-golden-clip-load",
+                                     "head":  "8b385860824b52cf84b74f2c22bf65bbe07dcce6",
+                                     "branch":  "omos/p4-3-golden-clip-load",
+                                     "status":  "M comfymodal_runtime/golden_serial.py\r\n M comfymodal_runtime/modal_app.py\r\n M deploy_and_run_v2_single.bat\r\n M run_v2_single.bat\r\n M tests/test_benchmark_v2_golden_acceptance.py\r\n M tests/test_benchmark_v2_proof_collection.py\r\n M tests/test_golden_p1_wiring.py\r\n M tests/test_p1_golden_serial.py\r\n M tests/test_v2_observability_instrumentation.py\r\n M tests/test_v2ctl_backend.py\r\n M tests/test_v2ctl_cli.py\r\n M tests/test_v2ctl_config.py\r\n M tools/benchmark_v2_direct.py\r\n M tools/v2_control/backend.py\r\n M tools/v2_control/cli.py\r\n M tools/v2_control/config.py\r\n M tools/v2_control/validation.py\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-34-23_148132/",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/p4-6-golden-sampler",
+                                     "head":  "1a66fbdad37b90e89a4ce4667cacd7249a7ebae0",
+                                     "branch":  "omos/p4-6-golden-sampler",
+                                     "status":  "?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_04-52-04_108fbe/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_05-03-19_6d98f7/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_05-11-00_d79eac/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_05-19-58_cded31/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_05-28-47_9a1f74/\r\n?? artifacts/phase_p1_serial_golden_v1/cohort_2026-08-28_05-40-52_7b838c/\r\n?? p4_6_golden_deploy_only.log\r\n?? p4_6_golden_explicit_roots.log\r\n?? p4_6_sampling_diagnostic_failed.log",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx1",
+                                     "head":  "960fee02317d396672f6a537b994295737d0151a",
+                                     "branch":  "omos/rx1-qd4-telemetry-repair",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx2",
+                                     "head":  "90457b43c18826431e2d263893678b8085f4bee5",
+                                     "branch":  "omos/rx2-golden-sampling-decomposition",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx3",
+                                     "head":  "6f889dff2c72655fbe1099ac259dddfae344391a",
+                                     "branch":  "omos/rx3-clip-forward",
+                                     "status":  "D __init__.py",
+                                     "action":  "retain"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx6-golden-log-cleanup",
+                                     "head":  "52adf9f41d788e2c53bf3b000d231688cf402b55",
+                                     "branch":  "omos/rx6-golden-log-cleanup",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx6b-golden-waterfall-routing",
+                                     "head":  "9138522aa416ee4637c2b59e5b9a3bf5ce910abc",
+                                     "branch":  "omos/rx6b-golden-waterfall-routing",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx7",
+                                     "head":  "45a4a583a0261015a64307f058bb0474c12f7d41",
+                                     "branch":  "rx7-static-e27",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx7a-integration",
+                                     "head":  "54017eb8bdc2b303de65c1511608a20f375745a4",
+                                     "branch":  "omos/rx7a-static-e27",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 },
+                                 {
+                                     "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/.slim/worktrees/rx9p-d",
+                                     "head":  "369d60c7a8f47db743defca570c176eb55bdcf35",
+                                     "branch":  "rx9p-d-golden-profiler",
+                                     "status":  "",
+                                     "action":  "remove"
+                                 }
+                             ],
+    "res4lyf_slim_worktrees":  [
+                                   {
+                                       "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/RES4LYF/.slim/worktrees/golden-post-loop-tail-exp2/RES4LYF",
+                                       "head":  "b2108e6d63af647b7d469f8f3f7044cf578e1295",
+                                       "branch":  "omos/golden-post-loop-tail-res4lyf-exp2",
+                                       "status":  "",
+                                       "action":  "remove"
+                                   },
+                                   {
+                                       "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/RES4LYF/.slim/worktrees/golden-post-loop-tail/RES4LYF",
+                                       "head":  "119679d8d8d26e6db52757e705488abb6399d7d4",
+                                       "branch":  "omos/golden-post-loop-tail-res4lyf",
+                                       "status":  "M beta/rk_sampler_beta.py\r\n M beta/samplers.py",
+                                       "action":  "remove"
+                                   },
+                                   {
+                                       "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/RES4LYF/.slim/worktrees/golden-rk-coeff-controller-exp2/RES4LYF",
+                                       "head":  "0311b3754d54268ca6b9bb26cf1b4a3047508ec5",
+                                       "branch":  "omos/golden-rk-coeff-controller-res4lyf-exp2",
+                                       "status":  "",
+                                       "action":  "remove"
+                                   },
+                                   {
+                                       "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/RES4LYF/.slim/worktrees/golden-rk-coeff-controller/RES4LYF",
+                                       "head":  "119679d8d8d26e6db52757e705488abb6399d7d4",
+                                       "branch":  "omos/golden-rk-coeff-controller-res4lyf",
+                                       "status":  "M beta/rk_coefficients_beta.py\r\n M beta/rk_guide_func_beta.py\r\n M beta/rk_method_beta.py\r\n M beta/rk_sampler_beta.py",
+                                       "action":  "remove"
+                                   },
+                                   {
+                                       "path":  "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/RES4LYF/.slim/worktrees/golden-sampler-ab-integration/RES4LYF",
+                                       "head":  "338fd796be794675ecaf1b7141c090fb6b733630",
+                                       "branch":  "omos/golden-sampler-ab-integration-res4lyf",
+                                       "status":  "",
+                                       "action":  "remove"
+                                   }
+                               ]
+}

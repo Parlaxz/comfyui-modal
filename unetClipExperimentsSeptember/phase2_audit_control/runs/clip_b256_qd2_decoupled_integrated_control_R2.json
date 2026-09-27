@@ -1,0 +1,11 @@
+{
+  "arm": "decoupled_integrated_control",
+  "attempt_id": "clip_b256_qd2_decoupled_integrated_control_R2",
+  "block_bytes": 268435456,
+  "classification": "FAILED",
+  "error": "ExtentTransportError:source_worker_join_timeout",
+  "model_name": "qwen_3_4b.safetensors",
+  "qd": 2,
+  "role": "clip",
+  "status": "error"
+}

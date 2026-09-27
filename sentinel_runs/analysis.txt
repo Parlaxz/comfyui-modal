@@ -1,0 +1,120 @@
+﻿
+========================================================================================================
+sn-r01  CLOUD_PROVIDER_GCP/us-east  gbps=4.24 src_max=299ms  window=0..1897ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=1007.6ms canary_max=2.46ms
+  EPISODE#0 t=0..299ms dur=299ms worst=299ms workers=[1]
+     main_hb max_gap_in_episode=205.5ms at t=-1ms   canary max_gap_in_episode=2.00ms at t=224ms   canary cpu_delta=240.0ms
+     A_same_file          n=13 max_sched_delay=   982.9ms max_syscall_latency=  22.33ms
+     B_other_volume_file  n=13 max_sched_delay=   183.0ms max_syscall_latency=1007.33ms
+     C_tmpfs_local        n=12 max_sched_delay=   203.6ms max_syscall_latency=  22.65ms
+
+========================================================================================================
+sn-r02  CLOUD_PROVIDER_GCP/us-west  gbps=1.88 src_max=1583ms  window=0..4281ms  episodes=2  canary=separate_pid
+  whole-run: main_hb_max=1541.4ms canary_max=6.40ms
+  EPISODE#0 t=0..1583ms dur=1583ms worst=1583ms workers=[0, 1, 3]
+     main_hb max_gap_in_episode=1541.4ms at t=-0ms   canary max_gap_in_episode=2.26ms at t=1126ms   canary cpu_delta=1460.0ms
+     A_same_file          n= 9 max_sched_delay=  1579.7ms max_syscall_latency= 329.93ms
+     B_other_volume_file  n= 9 max_sched_delay=  1538.0ms max_syscall_latency= 329.40ms
+     C_tmpfs_local        n= 8 max_sched_delay=  1577.2ms max_syscall_latency=  17.95ms
+  EPISODE#1 t=1659..3132ms dur=1473ms worst=1473ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=1084.2ms at t=2049ms   canary max_gap_in_episode=6.40ms at t=1991ms   canary cpu_delta=1350.0ms
+     A_same_file          n=25 max_sched_delay=  1579.7ms max_syscall_latency=   0.38ms
+     B_other_volume_file  n=25 max_sched_delay=  1538.0ms max_syscall_latency=  41.69ms
+     C_tmpfs_local        n=25 max_sched_delay=  1577.2ms max_syscall_latency=   0.65ms
+
+========================================================================================================
+sn-r03  CLOUD_PROVIDER_GCP/us-east4  gbps=3.01 src_max=986ms  window=0..2676ms  episodes=2  canary=separate_pid
+  whole-run: main_hb_max=730.6ms canary_max=6.65ms
+  EPISODE#0 t=0..438ms dur=438ms worst=438ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=204.7ms at t=2ms   canary max_gap_in_episode=2.00ms at t=276ms   canary cpu_delta=390.0ms
+     A_same_file          n=13 max_sched_delay=   711.4ms max_syscall_latency=  41.08ms
+     B_other_volume_file  n=13 max_sched_delay=   349.5ms max_syscall_latency= 717.13ms
+     C_tmpfs_local        n=12 max_sched_delay=   329.3ms max_syscall_latency=  41.13ms
+  EPISODE#1 t=551..1537ms dur=986ms worst=986ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=730.6ms at t=809ms   canary max_gap_in_episode=6.65ms at t=1378ms   canary cpu_delta=920.0ms
+     A_same_file          n=20 max_sched_delay=   710.9ms max_syscall_latency=   1.03ms
+     B_other_volume_file  n=20 max_sched_delay=   710.6ms max_syscall_latency=   1.89ms
+     C_tmpfs_local        n=20 max_sched_delay=   710.5ms max_syscall_latency=   0.97ms
+
+========================================================================================================
+sn-r04  CLOUD_PROVIDER_GCP/us-east5  gbps=5.09 src_max=130ms  window=0..1581ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=128.9ms canary_max=3.30ms
+
+========================================================================================================
+sn-r05  CLOUD_PROVIDER_GCP/us-west  gbps=4.91 src_max=140ms  window=0..1640ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=95.9ms canary_max=2.01ms
+
+========================================================================================================
+sn-r06  CLOUD_PROVIDER_GCP/asia-south2  gbps=3.74 src_max=453ms  window=0..2154ms  episodes=3  canary=separate_pid
+  whole-run: main_hb_max=4584.6ms canary_max=258.66ms
+  EPISODE#0 t=0..274ms dur=274ms worst=274ms workers=[1, 2, 3]
+     main_hb max_gap_in_episode=209.9ms at t=64ms   canary max_gap_in_episode=2.00ms at t=235ms   canary cpu_delta=240.0ms
+     A_same_file          n= 9 max_sched_delay=  4561.9ms max_syscall_latency= 273.72ms
+     B_other_volume_file  n= 9 max_sched_delay=   268.1ms max_syscall_latency=4584.29ms
+     C_tmpfs_local        n= 8 max_sched_delay=   268.2ms max_syscall_latency=  30.93ms
+  EPISODE#1 t=370..666ms dur=296ms worst=296ms workers=[0]
+     main_hb max_gap_in_episode=9.9ms at t=458ms   canary max_gap_in_episode=4.80ms at t=568ms   canary cpu_delta=230.0ms
+     A_same_file          n=21 max_sched_delay=     3.6ms max_syscall_latency= 273.72ms
+     B_other_volume_file  n=21 max_sched_delay=   268.1ms max_syscall_latency=   0.36ms
+     C_tmpfs_local        n=21 max_sched_delay=   268.2ms max_syscall_latency=   0.34ms
+  EPISODE#2 t=902..1355ms dur=453ms worst=453ms workers=[2]
+     main_hb max_gap_in_episode=10.8ms at t=1242ms   canary max_gap_in_episode=9.46ms at t=1172ms   canary cpu_delta=360.0ms
+     A_same_file          n=27 max_sched_delay=    32.1ms max_syscall_latency=   0.38ms
+     B_other_volume_file  n=27 max_sched_delay=    31.9ms max_syscall_latency=   0.71ms
+     C_tmpfs_local        n=27 max_sched_delay=    31.8ms max_syscall_latency=   0.32ms
+
+========================================================================================================
+sn-r07  CLOUD_PROVIDER_GCP/us-east5  gbps=4.80 src_max=237ms  window=0..1677ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=448.3ms canary_max=4.55ms
+
+========================================================================================================
+sn-r08  CLOUD_PROVIDER_UNSPECIFIED/us-central  gbps=4.51 src_max=228ms  window=0..1784ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=141.1ms canary_max=2.12ms
+
+========================================================================================================
+sn-r09  CLOUD_PROVIDER_GCP/us-east  gbps=4.23 src_max=257ms  window=0..1900ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=254.3ms canary_max=2.41ms
+  EPISODE#0 t=0..257ms dur=257ms worst=257ms workers=[1, 2, 3]
+     main_hb max_gap_in_episode=254.3ms at t=2ms   canary max_gap_in_episode=2.41ms at t=62ms   canary cpu_delta=200.0ms
+     A_same_file          n= 8 max_sched_delay=   236.8ms max_syscall_latency=  26.91ms
+     B_other_volume_file  n= 8 max_sched_delay=   240.1ms max_syscall_latency=  48.56ms
+     C_tmpfs_local        n= 9 max_sched_delay=   236.7ms max_syscall_latency=  26.78ms
+
+========================================================================================================
+sn-r10  CLOUD_PROVIDER_GCP/us-west4  gbps=4.86 src_max=143ms  window=0..1654ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=157.0ms canary_max=2.04ms
+
+========================================================================================================
+sn-r11  CLOUD_PROVIDER_GCP/asia-northeast1  gbps=2.68 src_max=998ms  window=0..3004ms  episodes=3  canary=separate_pid
+  whole-run: main_hb_max=1629.2ms canary_max=11.12ms
+  EPISODE#0 t=0..998ms dur=998ms worst=998ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=777.8ms at t=1ms   canary max_gap_in_episode=7.30ms at t=5ms   canary cpu_delta=940.0ms
+     A_same_file          n=11 max_sched_delay=  1606.5ms max_syscall_latency= 149.03ms
+     B_other_volume_file  n=11 max_sched_delay=   829.8ms max_syscall_latency=1629.19ms
+     C_tmpfs_local        n= 9 max_sched_delay=   980.2ms max_syscall_latency=  21.11ms
+  EPISODE#1 t=1851..2104ms dur=253ms worst=253ms workers=[0]
+     main_hb max_gap_in_episode=9.9ms at t=1931ms   canary max_gap_in_episode=5.84ms at t=1960ms   canary cpu_delta=190.0ms
+     A_same_file          n=18 max_sched_delay=     3.0ms max_syscall_latency=   1.24ms
+     B_other_volume_file  n=18 max_sched_delay=     2.9ms max_syscall_latency=   0.38ms
+     C_tmpfs_local        n=18 max_sched_delay=     2.8ms max_syscall_latency=   1.15ms
+  EPISODE#2 t=2398..2864ms dur=466ms worst=422ms workers=[0, 1, 3]
+     main_hb max_gap_in_episode=367.2ms at t=2453ms   canary max_gap_in_episode=10.15ms at t=2650ms   canary cpu_delta=440.0ms
+     A_same_file          n=12 max_sched_delay=   391.3ms max_syscall_latency=   0.24ms
+     B_other_volume_file  n=12 max_sched_delay=   391.2ms max_syscall_latency=   0.29ms
+     C_tmpfs_local        n=12 max_sched_delay=   346.3ms max_syscall_latency=  44.03ms
+
+
+========================================================================================================
+SUMMARY  (11 runs)
+run | region | gbps | src_max | eps | worst_ep | main_hb_in_ep | canary_in_ep | A sched/lat | B sched/lat | C sched/lat | class
+| sn-r01 | CLOUD_PROVIDER_GCP/us-east | 4.24 | 299 | 1 | 299 | 205 | 2.00 | 983/22.3 | 183/1007.3 | 204/22.6 | CASE B+fs-wide (main proc, all paths) |
+| sn-r02 | CLOUD_PROVIDER_GCP/us-west | 1.88 | 1583 | 2 | 1583 | 1541 | 2.26 | 1580/329.9 | 1538/329.4 | 1577/18.0 | CASE B+fs-wide (main proc, all paths) |
+| sn-r03 | CLOUD_PROVIDER_GCP/us-east4 | 3.01 | 986 | 2 | 986 | 731 | 6.65 | 711/1.0 | 711/1.9 | 711/1.0 | CASE B+fs-wide (main proc, all paths) |
+| sn-r04 | CLOUD_PROVIDER_GCP/us-east5 | 5.09 | 130 | 0 | - | - | separate_pid | - | - | - | CLEAN |
+| sn-r05 | CLOUD_PROVIDER_GCP/us-west | 4.91 | 140 | 0 | - | - | separate_pid | - | - | - | CLEAN |
+| sn-r06 | CLOUD_PROVIDER_GCP/asia-south2 | 3.74 | 453 | 3 | 453 | 11 | 9.46 | 32/0.4 | 32/0.7 | 32/0.3 | unclear |
+| sn-r07 | CLOUD_PROVIDER_GCP/us-east5 | 4.80 | 237 | 0 | - | - | separate_pid | - | - | - | CLEAN |
+| sn-r08 | CLOUD_PROVIDER_UNSPECIFIED/us-central | 4.51 | 228 | 0 | - | - | separate_pid | - | - | - | CLEAN |
+| sn-r09 | CLOUD_PROVIDER_GCP/us-east | 4.23 | 257 | 1 | 257 | 254 | 2.41 | 237/26.9 | 240/48.6 | 237/26.8 | CASE B+fs-wide (main proc, all paths) |
+| sn-r10 | CLOUD_PROVIDER_GCP/us-west4 | 4.86 | 143 | 0 | - | - | separate_pid | - | - | - | CLEAN |
+| sn-r11 | CLOUD_PROVIDER_GCP/asia-northeast1 | 2.68 | 998 | 3 | 998 | 778 | 7.30 | 1606/149.0 | 830/1629.2 | 980/21.1 | CASE B+fs-wide (main proc, all paths) |

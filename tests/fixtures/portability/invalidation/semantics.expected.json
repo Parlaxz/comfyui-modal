@@ -1,0 +1,40 @@
+{
+  "basis": [
+    "PHASE_G5 §11",
+    "portability_contract.invalidation_mismatches"
+  ],
+  "expected_id": "invalidation_semantics",
+  "null_variant": {
+    "nulled_fields": [
+      "dependency_metadata_hash"
+    ],
+    "semantics": "conservative recompute/stale; null is never unchanged-forever",
+    "stamp": "stamp_null_field"
+  },
+  "reusable_pairs": [
+    [
+      "stamp_a",
+      "stamp_a2"
+    ]
+  ],
+  "stale_variants": {
+    "stamp_comfyui_version_changed": [
+      "comfyui_version"
+    ],
+    "stamp_custom_node_registry_generation_changed": [
+      "custom_node_registry_generation"
+    ],
+    "stamp_graph_hash_changed": [
+      "graph_hash"
+    ],
+    "stamp_manifest_version_changed": [
+      "manifest_version"
+    ],
+    "stamp_model_library_generation_changed": [
+      "model_library_generation"
+    ],
+    "stamp_rule_version_changed": [
+      "rule_version"
+    ]
+  }
+}

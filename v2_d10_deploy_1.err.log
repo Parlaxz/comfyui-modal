@@ -1,0 +1,1 @@
+[modal-client] 2026-08-16T11:37:24-0500 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*

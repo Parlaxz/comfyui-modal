@@ -1,0 +1,5 @@
+[ab] running: cmd /c .\deploy_and_run_v2_single.bat (cap 2400s)
+[ab] result=exit=0 elapsed=222.1s log=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\rtx_region_ab\A_20260810_020735\deploy.log
+[ab] deploy verified=True pin={'region': 'us-east-2', 'cloud': 'aws'} error=None
+[ab] notice: per-run placement will be validated from container-reported identity (identity.cloud / identity.region) in each run artifact.
+[ab] running: cmd /c .\run_v2_single.bat (cap 8520s)

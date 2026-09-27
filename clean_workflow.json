@@ -1,0 +1,839 @@
+{
+  "1014": {
+    "_meta": {
+      "title": "Cond Pair Set Props"
+    },
+    "class_type": "PairConditioningSetProperties",
+    "inputs": {
+      "negative_NEW": [
+        "191",
+        0
+      ],
+      "positive_NEW": [
+        "67",
+        0
+      ],
+      "set_cond_area": "default",
+      "strength": 1
+    }
+  },
+  "1045": {
+    "_meta": {
+      "title": "ImpactIfNone"
+    },
+    "class_type": "ImpactIfNone",
+    "inputs": {}
+  },
+  "1049": {
+    "_meta": {
+      "title": "IS CONTROL NET ACTIVE?"
+    },
+    "class_type": "easy showAnything",
+    "inputs": {
+      "anything": [
+        "1045",
+        1
+      ],
+      "text": "False"
+    }
+  },
+  "1052": {
+    "_meta": {
+      "title": "If controlnet is active"
+    },
+    "class_type": "easy ifElse",
+    "inputs": {
+      "boolean": [
+        "1045",
+        1
+      ],
+      "on_false": [
+        "1404",
+        0
+      ],
+      "on_true": [
+        "1254",
+        0
+      ]
+    }
+  },
+  "1063": {
+    "_meta": {
+      "title": "Convert String To Combo [LP]"
+    },
+    "class_type": "StringToCombo|LP",
+    "inputs": {
+      "string": "resample"
+    }
+  },
+  "1064": {
+    "_meta": {
+      "title": "If controlnet is active"
+    },
+    "class_type": "easy ifElse",
+    "inputs": {
+      "boolean": [
+        "1045",
+        1
+      ],
+      "on_false": [
+        "1065",
+        0
+      ],
+      "on_true": [
+        "1063",
+        0
+      ]
+    }
+  },
+  "1065": {
+    "_meta": {
+      "title": "Convert String To Combo [LP]"
+    },
+    "class_type": "StringToCombo|LP",
+    "inputs": {
+      "string": "standard"
+    }
+  },
+  "1066": {
+    "_meta": {
+      "title": "Sampler mode"
+    },
+    "class_type": "easy showAnything",
+    "inputs": {
+      "anything": [
+        "1064",
+        0
+      ],
+      "text": "standard"
+    }
+  },
+  "1067": {
+    "_meta": {
+      "title": "Steps to run"
+    },
+    "class_type": "easy showAnything",
+    "inputs": {
+      "anything": [
+        "1052",
+        0
+      ],
+      "text": "-1"
+    }
+  },
+  "107": {
+    "_meta": {
+      "title": "FINAL RESULT"
+    },
+    "class_type": "Image Comparer (rgthree)",
+    "inputs": {
+      "image_a": [
+        "1178",
+        0
+      ],
+      "image_b": [
+        "1132",
+        0
+      ],
+      "rgthree_comparer": {
+        "images": [
+          {
+            "name": "B",
+            "selected": true,
+            "url": "/api/view?filename=production_4e3a55f3_107_b_0.webp&type=output&subfolder=&rand=0.2064528524613316"
+          }
+        ]
+      }
+    }
+  },
+  "1073": {
+    "_meta": {
+      "title": "MASTER LORA STRENGTH MULTIPLIER"
+    },
+    "class_type": "PrimitiveFloat",
+    "inputs": {
+      "value": 1
+    }
+  },
+  "1094": {
+    "_meta": {
+      "title": "\ud83d\udd27 Simple Math"
+    },
+    "class_type": "SimpleMath+",
+    "inputs": {
+      "a": [
+        "937",
+        0
+      ],
+      "b": [
+        "1299",
+        0
+      ],
+      "value": "a*b"
+    }
+  },
+  "1132": {
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    },
+    "class_type": "Any Switch (rgthree)",
+    "inputs": {
+      "any_01": [
+        "987",
+        0
+      ],
+      "any_02": [
+        "175",
+        0
+      ]
+    }
+  },
+  "1137": {
+    "_meta": {
+      "title": "ImageSize"
+    },
+    "class_type": "easy imageSize",
+    "inputs": {
+      "image": [
+        "1178",
+        0
+      ]
+    }
+  },
+  "1149:1138": {
+    "_meta": {
+      "title": "Index Any"
+    },
+    "class_type": "easy indexAnything",
+    "inputs": {
+      "any": [
+        "1149:1146",
+        0
+      ],
+      "index": [
+        "1149:1147",
+        1
+      ]
+    }
+  },
+  "1149:1146": {
+    "_meta": {
+      "title": "String to Int List"
+    },
+    "class_type": "easy stringToIntList",
+    "inputs": {
+      "string": "640, 848, 1280, 1920, 2560, 3840"
+    }
+  },
+  "1149:1147": {
+    "_meta": {
+      "title": "Custom Combo"
+    },
+    "class_type": "CustomCombo",
+    "inputs": {
+      "choice": "1440p",
+      "index": 4,
+      "option1": "360p",
+      "option2": "480p",
+      "option3": "720p",
+      "option4": "1080p",
+      "option5": "1440p",
+      "option6": "4k",
+      "option7": ""
+    }
+  },
+  "1178": {
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    },
+    "class_type": "Any Switch (rgthree)",
+    "inputs": {
+      "any_02": [
+        "175",
+        0
+      ]
+    }
+  },
+  "1242": {
+    "_meta": {
+      "title": "ClownsharKSampler"
+    },
+    "class_type": "ClownsharKSampler_Beta",
+    "inputs": {
+      "bongmath": true,
+      "cfg": 1,
+      "denoise": 1,
+      "eta": [
+        "1402",
+        0
+      ],
+      "latent_image": [
+        "214",
+        0
+      ],
+      "model": [
+        "1262",
+        0
+      ],
+      "negative": [
+        "1014",
+        1
+      ],
+      "positive": [
+        "1014",
+        0
+      ],
+      "sampler_mode": [
+        "1064",
+        0
+      ],
+      "sampler_name": "exponential/res_2s",
+      "scheduler": "bong_tangent",
+      "seed": 1006800347249818,
+      "steps": [
+        "937",
+        0
+      ],
+      "steps_to_run": [
+        "1052",
+        0
+      ]
+    }
+  },
+  "1254": {
+    "_meta": {
+      "title": "\ud83d\udd27 Simple Math"
+    },
+    "class_type": "SimpleMath+",
+    "inputs": {
+      "a": [
+        "937",
+        0
+      ],
+      "b": [
+        "1094",
+        0
+      ],
+      "value": "a-b"
+    }
+  },
+  "1262": {
+    "_meta": {
+      "title": "\ud83c\udf88LG Noise Injection (Latent)"
+    },
+    "class_type": "LGNoiseInjectionLatent",
+    "inputs": {
+      "end_percent": 0.1,
+      "model": [
+        "1501",
+        0
+      ],
+      "reference_latent": [
+        "214",
+        0
+      ],
+      "start_percent": 0,
+      "strength": 0.25
+    }
+  },
+  "1277": {
+    "_meta": {
+      "title": "Load VAE"
+    },
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "1281": {
+    "_meta": {
+      "title": "LayerUtility: Purge VRAM V2"
+    },
+    "class_type": "LayerUtility: PurgeVRAM V2",
+    "inputs": {
+      "anything": [
+        "1178",
+        0
+      ],
+      "purge_cache": true,
+      "purge_models": true
+    }
+  },
+  "1297": {
+    "_meta": {
+      "title": "CONTROLNET LORA HOOK STRENGTH"
+    },
+    "class_type": "easy float",
+    "inputs": {
+      "value": 0.5
+    }
+  },
+  "1299": {
+    "_meta": {
+      "title": "CONTROLNET/LORA SAMPLING RATIO"
+    },
+    "class_type": "easy float",
+    "inputs": {
+      "value": 0.4
+    }
+  },
+  "1302": {
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    },
+    "class_type": "Any Switch (rgthree)",
+    "inputs": {
+      "any_02": [
+        "1094",
+        0
+      ]
+    }
+  },
+  "137": {
+    "_meta": {
+      "title": "\u26a1 CacheDiT Accelerator"
+    },
+    "class_type": "CacheDiT_Model_Optimizer",
+    "inputs": {
+      "enable": true,
+      "model": [
+        "1484",
+        0
+      ],
+      "model_type": "Z-Image-Turbo",
+      "print_summary": true,
+      "skip_interval": 2,
+      "warmup_steps": 3
+    }
+  },
+  "1402": {
+    "_meta": {
+      "title": "SMOTHNESS LEVEL"
+    },
+    "class_type": "easy float",
+    "inputs": {
+      "value": 0.6
+    }
+  },
+  "1404": {
+    "_meta": {
+      "title": "Int"
+    },
+    "class_type": "easy int",
+    "inputs": {
+      "value": -1
+    }
+  },
+  "1484": {
+    "_meta": {
+      "title": "ModelSamplingAuraFlow"
+    },
+    "class_type": "ModelSamplingAuraFlow",
+    "inputs": {
+      "model": [
+        "66",
+        0
+      ],
+      "shift": 3
+    }
+  },
+  "1497": {
+    "_meta": {
+      "title": "@prompt"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "inputs": {
+      "value": "A young female warrior with fair skin, dark black straight bangs framing her face, intense blue eyes gazing slightly off-camera with a confident smirk, wearing multiple silver piercings including one on her nose and ornate earrings featuring cross motifs; she has bold black brushstroke-style ink tattoo across her right cheekbone; dressed in form-fitting black leather armor with metallic rivets and zipper details covering her shoulders and upper torso, revealing intricate yellow-and-black traditional Japanese dragon tattoos wrapping around her left arm; holding a katana sword vertically positioned diagonally from bottom-left towards center-right, its hilt wrapped in textured black cordage with geometric cutouts and adorned with golden-yellow flame-like patterns near the scabbard\u2019s base, tassel hanging below; close-up portrait framed tightly focusing on head-to-chest area, subject centered against a solid bright yellow studio backdrop creating high contrast; dramatic directional key lighting illuminating front-facing side of her face casting subtle shadows beneath jawline while strong backlight creates faint rim glow along hair strands and shoulder edges enhancing depth; photorealistic hyper-detailed digital painting rendered in ultra-sharp resolution with smooth surface textures mimicking real-world fabric and metal finishes under controlled studio illumination producing crisp highlights and natural shadow transitions; dominant palette consists of vivid yellow contrasting sharply with deep matte blacks accented by glowing gold elements conveying fierce determination and lethal elegance.\n"
+    }
+  },
+  "1499": {
+    "_meta": {
+      "title": "Patch Sage Attention KJ"
+    },
+    "class_type": "PathchSageAttentionKJ",
+    "inputs": {
+      "allow_compile": false,
+      "model": [
+        "137",
+        0
+      ],
+      "sage_attention": "auto"
+    }
+  },
+  "1501": {
+    "_meta": {
+      "title": "Use Sage Attention"
+    },
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "on_false": [
+        "137",
+        0
+      ],
+      "on_true": [
+        "1499",
+        0
+      ],
+      "switch": true
+    }
+  },
+  "151": {
+    "_meta": {
+      "title": "ModelPatchLoader"
+    },
+    "class_type": "ModelPatchLoader",
+    "inputs": {
+      "name": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors"
+    }
+  },
+  "175": {
+    "_meta": {
+      "title": "VAE Decode"
+    },
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "1242",
+        1
+      ],
+      "vae": [
+        "1277",
+        0
+      ]
+    }
+  },
+  "191": {
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    },
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "67",
+        0
+      ]
+    }
+  },
+  "199": {
+    "_meta": {
+      "title": "SystemNotification \ud83d\udc0d"
+    },
+    "class_type": "SystemNotification|pysssss",
+    "inputs": {
+      "any": [
+        "1178",
+        0
+      ],
+      "message": "Image ready",
+      "mode": "on empty queue"
+    }
+  },
+  "202": {
+    "_meta": {
+      "title": "EasyGlobalSeed"
+    },
+    "class_type": "easy globalSeed",
+    "inputs": {
+      "action": "randomize",
+      "last_seed": 1006800347249816,
+      "mode": false,
+      "value": 1111894690380134
+    }
+  },
+  "214": {
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    },
+    "class_type": "Any Switch (rgthree)",
+    "inputs": {
+      "any_02": [
+        "88",
+        0
+      ]
+    }
+  },
+  "62": {
+    "_meta": {
+      "title": "Load CLIP"
+    },
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "device": "default",
+      "type": "lumina2"
+    }
+  },
+  "66": {
+    "_meta": {
+      "title": "Load Diffusion Model"
+    },
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "z_image_turbo_bf16.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "67": {
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "62",
+        0
+      ],
+      "text": [
+        "80",
+        0
+      ]
+    }
+  },
+  "80": {
+    "_meta": {
+      "title": "Join Strings"
+    },
+    "class_type": "JoinStrings",
+    "inputs": {
+      "delimiter": " ",
+      "string1": [
+        "1497",
+        0
+      ]
+    }
+  },
+  "84": {
+    "_meta": {
+      "title": "Anything Everywhere"
+    },
+    "class_type": "Anything Everywhere",
+    "inputs": {
+      "anything": [
+        "62",
+        0
+      ]
+    }
+  },
+  "85": {
+    "_meta": {
+      "title": "Anything Everywhere"
+    },
+    "class_type": "Anything Everywhere",
+    "inputs": {
+      "anything11": [
+        "1277",
+        0
+      ]
+    }
+  },
+  "88": {
+    "_meta": {
+      "title": "IMAGE SIZE"
+    },
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "batch_size": 1,
+      "height": [
+        "935:931",
+        1
+      ],
+      "width": [
+        "935:931",
+        0
+      ]
+    }
+  },
+  "9": {
+    "_meta": {
+      "title": "Save Image"
+    },
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "z-image",
+      "images": [
+        "1178",
+        0
+      ]
+    }
+  },
+  "935:449": {
+    "_meta": {
+      "title": "String to Int List"
+    },
+    "class_type": "easy stringToIntList",
+    "inputs": {
+      "string": "640, 848, 1280, 1920, 2560, 3840"
+    }
+  },
+  "935:481": {
+    "_meta": {
+      "title": "Index Any"
+    },
+    "class_type": "easy indexAnything",
+    "inputs": {
+      "any": [
+        "935:449",
+        0
+      ],
+      "index": [
+        "935:932",
+        1
+      ]
+    }
+  },
+  "935:482": {
+    "_meta": {
+      "title": "Index Any"
+    },
+    "class_type": "easy indexAnything",
+    "inputs": {
+      "any": [
+        "935:933",
+        0
+      ],
+      "index": [
+        "935:932",
+        1
+      ]
+    }
+  },
+  "935:919": {
+    "_meta": {
+      "title": "Custom Combo"
+    },
+    "class_type": "CustomCombo",
+    "inputs": {
+      "choice": "Portrait",
+      "index": 0,
+      "option1": "Portrait",
+      "option2": "Landscape",
+      "option3": ""
+    }
+  },
+  "935:926": {
+    "_meta": {
+      "title": "Empty Image"
+    },
+    "class_type": "EmptyImage",
+    "inputs": {
+      "batch_size": 1,
+      "color": 0,
+      "height": [
+        "935:482",
+        0
+      ],
+      "width": [
+        "935:481",
+        0
+      ]
+    }
+  },
+  "935:928": {
+    "_meta": {
+      "title": "Rotate Image"
+    },
+    "class_type": "ImageRotate",
+    "inputs": {
+      "image": [
+        "935:926",
+        0
+      ],
+      "rotation": "90 degrees"
+    }
+  },
+  "935:929": {
+    "_meta": {
+      "title": "Switch (Any)"
+    },
+    "class_type": "ImpactSwitch",
+    "inputs": {
+      "input1": [
+        "935:928",
+        0
+      ],
+      "input2": [
+        "935:926",
+        0
+      ],
+      "sel_mode": false,
+      "select": [
+        "935:930",
+        0
+      ]
+    }
+  },
+  "935:930": {
+    "_meta": {
+      "title": "\ud83d\udd27 Simple Math"
+    },
+    "class_type": "SimpleMath+",
+    "inputs": {
+      "a": [
+        "935:919",
+        1
+      ],
+      "value": "a+1"
+    }
+  },
+  "935:931": {
+    "_meta": {
+      "title": "ImageSize"
+    },
+    "class_type": "easy imageSize",
+    "inputs": {
+      "image": [
+        "935:929",
+        0
+      ]
+    }
+  },
+  "935:932": {
+    "_meta": {
+      "title": "Custom Combo"
+    },
+    "class_type": "CustomCombo",
+    "inputs": {
+      "choice": "1080p",
+      "index": 3,
+      "option1": "360p",
+      "option2": "480p",
+      "option3": "720p",
+      "option4": "1080p",
+      "option5": "1440p",
+      "option6": "4k",
+      "option7": ""
+    }
+  },
+  "935:933": {
+    "_meta": {
+      "title": "String to Int List"
+    },
+    "class_type": "easy stringToIntList",
+    "inputs": {
+      "string": "360, 480, 720, 1088, 1440, 2160"
+    }
+  },
+  "937": {
+    "_meta": {
+      "title": "SAMPLING STEPS"
+    },
+    "class_type": "easy int",
+    "inputs": {
+      "value": 8
+    }
+  },
+  "987": {
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    },
+    "class_type": "Any Switch (rgthree)",
+    "inputs": {}
+  },
+  "993": {
+    "_meta": {
+      "title": "Combine Hooks [8]"
+    },
+    "class_type": "CombineHooks8",
+    "inputs": {}
+  }
+}

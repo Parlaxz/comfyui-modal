@@ -1,0 +1,11 @@
+{
+  "attempt_id": "clip_b128_qd8_R3_A2",
+  "block_mib": 128,
+  "campaign_index": 87,
+  "classification": "DNF",
+  "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+  "model_name": "qwen_3_4b.safetensors",
+  "qd": 8,
+  "role": "clip",
+  "status": "error"
+}

@@ -1,0 +1,522 @@
+[2026-08-16T02:11:43.891000+00:00] <system_info> Building image im-my7Lto6cvNJIH7jf0c96Q8
+
+[2026-08-16T02:11:48.621000+00:00] <system_info> 
+=> Step 0: FROM base
+
+[2026-08-16T02:11:48.631000+00:00] <system_info> 
+=> Step 1: COPY . /
+
+[2026-08-16T02:11:50.398000+00:00] <system_info> Saving image...
+
+[2026-08-16T02:11:52.917000+00:00] <system_info> Image saved, took 2.52s
+
+[2026-08-16T02:11:52.917000+00:00] <system_info> 
+Built image im-my7Lto6cvNJIH7jf0c96Q8 in 9.03s
+
+
+
+[2026-08-16T02:11:55.157000+00:00] <system_info> Building image im-Mx5jMEBYARswZzLdnHoy3t
+
+[2026-08-16T02:11:56.331000+00:00] <system_info> 
+=> Step 0: FROM base
+
+[2026-08-16T02:11:56.461000+00:00] <system_info> 
+=> Step 1: COPY . /
+
+[2026-08-16T02:11:56.953000+00:00] <system_info> Saving image...
+
+[2026-08-16T02:12:01.159000+00:00] <system_info> Image saved, took 4.21s
+
+[2026-08-16T02:12:01.159000+00:00] <system_info> 
+Built image im-Mx5jMEBYARswZzLdnHoy3t in 6.00s
+
+
+
+[2026-08-16T02:12:02.558000+00:00] <system_info> Building image im-bA4ITDEoGQzM8EBlTVa6dm
+
+[2026-08-16T02:12:03.194000+00:00] <system_info> 
+=> Step 0: FROM base
+
+[2026-08-16T02:12:03.236000+00:00] <system_info> 
+=> Step 1: RUN python -m pip install fastsafetensors==0.3.3
+
+[2026-08-16T02:12:04.392000+00:00] <system_info> Looking in indexes: http://pypi-mirror.modal.local:5555/simple
+
+[2026-08-16T02:12:04.429000+00:00] <system_info> Collecting fastsafetensors==0.3.3
+
+[2026-08-16T02:12:04.429000+00:00] <system_info>   Obtaining dependency information for fastsafetensors==0.3.3 from http://pypi-mirror.modal.local:5555/simple/fastsafetensors/fastsafetensors-0.3.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata
+
+[2026-08-16T02:12:04.438000+00:00] <system_info>   Downloading http://pypi-mirror.modal.local:5555/simple/fastsafetensors/fastsafetensors-0.3.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (3.8 kB)
+
+[2026-08-16T02:12:04.449000+00:00] <system_info> Requirement already satisfied: typer>=0.9.0 in /usr/local/lib/python3.11/site-packages (from fastsafetensors==0.3.3) (0.25.1)
+
+[2026-08-16T02:12:04.453000+00:00] <system_info> Requirement already satisfied: click>=8.2.1 in /usr/local/lib/python3.11/site-packages (from typer>=0.9.0->fastsafetensors==0.3.3) (8.4.1)
+
+[2026-08-16T02:12:04.454000+00:00] <system_info> Requirement already satisfied: shellingham>=1.3.0 in /usr/local/lib/python3.11/site-packages (from typer>=0.9.0->fastsafetensors==0.3.3) (1.5.4)
+
+[2026-08-16T02:12:04.455000+00:00] <system_info> Requirement already satisfied: rich>=13.8.0 in /usr/local/lib/python3.11/site-packages (from typer>=0.9.0->fastsafetensors==0.3.3) (15.0.0)
+
+[2026-08-16T02:12:04.456000+00:00] <system_info> Requirement already satisfied: annotated-doc>=0.0.2 in /usr/local/lib/python3.11/site-packages (from typer>=0.9.0->fastsafetensors==0.3.3) (0.0.4)
+
+[2026-08-16T02:12:04.463000+00:00] <system_info> Requirement already satisfied: markdown-it-py>=2.2.0 in /usr/local/lib/python3.11/site-packages (from rich>=13.8.0->typer>=0.9.0->fastsafetensors==0.3.3) (4.2.0)
+
+[2026-08-16T02:12:04.464000+00:00] <system_info> Requirement already satisfied: pygments<3.0.0,>=2.13.0 in /usr/local/lib/python3.11/site-packages (from rich>=13.8.0->typer>=0.9.0->fastsafetensors==0.3.3) (2.20.0)
+
+[2026-08-16T02:12:04.482000+00:00] <system_info> Requirement already satisfied: mdurl~=0.1 in /usr/local/lib/python3.11/site-packages (from markdown-it-py>=2.2.0->rich>=13.8.0->typer>=0.9.0->fastsafetensors==0.3.3) (0.1.2)
+
+[2026-08-16T02:12:04.493000+00:00] <system_info> Downloading http://pypi-mirror.modal.local:5555/simple/fastsafetensors/fastsafetensors-0.3.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (1.9 MB)
+
+[2026-08-16T02:12:04.504000+00:00] <system_info>    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.9/1.9 MB 274.9 MB/s eta 0:00:00
+[2026-08-16T02:12:04.504000+00:00] <system_info> 
+
+[2026-08-16T02:12:06.489000+00:00] <system_info> Installing collected packages: fastsafetensors
+
+[2026-08-16T02:12:06.659000+00:00] <system_info> Successfully installed fastsafetensors-0.3.3
+
+[2026-08-16T02:12:06.797000+00:00] <system_info> 
+[notice] A new release of pip is available: 23.2.1 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+
+[2026-08-16T02:12:07.493000+00:00] <system_info> Saving image...
+
+[2026-08-16T02:12:09.659000+00:00] <system_info> Image saved, took 2.17s
+
+[2026-08-16T02:12:09.659000+00:00] <system_info> 
+Built image im-bA4ITDEoGQzM8EBlTVa6dm in 7.10s
+
+
+
+[2026-08-16T02:12:13.491000+00:00] <system_info> Creating CPU memory snapshot for Function.
+
+[2026-08-16T02:12:16.747000+00:00] <stdout> [v2.startup_stage] stage=container_python_import event=start wall_unix_ns=1786846336747827956 monotonic_ns=1118892774
+
+[2026-08-16T02:12:17.826000+00:00] <stdout> [critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+
+[2026-08-16T02:12:17.826000+00:00] <stdout> [exact_prefill.remote] enabled=1 source=env
+
+[2026-08-16T02:12:17.831000+00:00] <stdout> [timing_trace] module loaded __file__=/root/timing_trace.py TRACE_VERSION=2.0.0
+[timing_trace] module directory in sys.path: /root
+
+[2026-08-16T02:12:17.874000+00:00] <unknown> [modal-client] 2026-08-16T02:12:17+0000 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+
+[2026-08-16T02:12:17.881000+00:00] <stdout> [v2.region_pin] region=unpinned cloud=unpinned source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD
+[2026-08-16T02:12:17.881000+00:00] <stdout> 
+
+[2026-08-16T02:12:17.883000+00:00] <stdout> [v2.startup_stage] stage=snap_true_enter event=start wall_unix_ns=1786846337883595008 monotonic_ns=2254659325
+
+[2026-08-16T02:12:17.883000+00:00] <stdout> [v2.startup_stage] stage=container_python_import event=end wall_unix_ns=1786846337883624608 monotonic_ns=2254688415 duration_ms=1135.796
+
+[2026-08-16T02:12:17.884000+00:00] <stdout> [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=120.6 process_maxrss_mib=130.7 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+
+[2026-08-16T02:12:19.969000+00:00] <stdout> [v2.runtime_shape] stage=image_runtime_initialization runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+
+[2026-08-16T02:12:19.982000+00:00] <stdout> [v2.startup_stage] stage=snap_true_enter event=end wall_unix_ns=1786846339982192692 monotonic_ns=4353256612 duration_ms=2098.597
+[2026-08-16T02:12:19.982000+00:00] <stdout> 
+
+[2026-08-16T02:12:19.985000+00:00] <stdout> [v2.snapshot_target] static_fingerprint=407733ff920491aa28c4553deec873877f5c7bc90f817df9fd54b938a9acd621 app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 gpu=RTX-PRO-6000 cpu=12 memory=32768 runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 snapshot_model_order=O0
+
+[2026-08-16T02:12:19.985000+00:00] <stdout> [v2.snapshot_runtime] image_id=im-bA4ITDEoGQzM8EBlTVa6dm cloud=CLOUD_PROVIDER_GCP region=us-south1 container_session_id=8ae7c3e577ff4974
+
+[2026-08-16T02:12:19.990000+00:00] <stdout> [v2.manager] network_mode=offline configs=1
+
+[2026-08-16T02:12:20.260000+00:00] <stdout> [v2.startup_stage] stage=custom_node_source_copy event=start wall_unix_ns=1786846340260186996 monotonic_ns=4631251506
+[2026-08-16T02:12:20.260000+00:00] <stdout> 
+
+[2026-08-16T02:12:20.423000+00:00] <stdout> [v2.custom_node_filter] total_source_dirs=25 accepted_dirs=24 duplicate_comfymodal_dirs=0 duplicate_names=[]
+
+[2026-08-16T02:12:20.641000+00:00] <stdout> [v2.custom_node_startup] decision=snapshot_exact_skip callback_called=0 source=persisted_record generation=4ee9e0d0a4a16367
+
+[2026-08-16T02:12:20.643000+00:00] <stdout> [v2.custom_node_generation_parity] baked_generation=4ee9e0d0a4a163674162cec8d8c1ef9b persisted_generation=4ee9e0d0a4a163674162cec8d8c1ef9b pre_sync_actual_generation= post_sync_actual_generation= persisted_source=persisted_record sync_performed=0 sync_direction=none sync_reason=exact_match baked_matches_persisted=1 baked_matches_pre_sync_actual=- baked_matches_post_sync_actual=- persisted_matches_post_sync_actual=- final_authoritative_generation=4ee9e0d0a4a163674162cec8d8c1ef9b final_authority_source=persisted_record proof_freeze_generation=4ee9e0d0a4a163674162cec8d8c1ef9b proof_generation_match=1
+
+[2026-08-16T02:12:20.643000+00:00] <stdout> [v2.startup_stage] stage=custom_node_source_copy event=end wall_unix_ns=1786846340643469223 monotonic_ns=5014534814 duration_ms=383.283
+[2026-08-16T02:12:20.643000+00:00] <stdout> 
+
+[2026-08-16T02:12:20.645000+00:00] <stdout> [v2.models_volume_baseline] source=models_generation_json generation=d9da6b7226a1… read_ms=1.134
+[2026-08-16T02:12:20.645000+00:00] <stdout> 
+
+[2026-08-16T02:12:20.645000+00:00] <stdout> [v2.startup_stage] stage=comfyui_path_startup event=start wall_unix_ns=1786846340645186182 monotonic_ns=5016250354
+
+[2026-08-16T02:12:20.645000+00:00] <stdout> [v2.startup_stage] stage=comfyui_path_startup event=end wall_unix_ns=1786846340645375932 monotonic_ns=5016440514 duration_ms=0.19
+[2026-08-16T02:12:20.645000+00:00] <stdout> 
+
+[2026-08-16T02:12:20.645000+00:00] <stdout> [v2.startup_stage] stage=backend_startup event=start wall_unix_ns=1786846340645599542 monotonic_ns=5016663464
+
+[2026-08-16T02:12:20.646000+00:00] <stdout> [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=13 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+
+[2026-08-16T02:12:28.583000+00:00] <stdout> [comfyapp] total_ram=1024.0G  cache_ram=24.0G
+
+[2026-08-16T02:12:28.583000+00:00] <stdout> [v2.startup_stage] stage=custom_node_import event=start wall_unix_ns=1786846348583450469 monotonic_ns=12954515117
+
+[2026-08-16T02:12:30.795000+00:00] <stdout> [exact_prefill.local] enabled=1 source=env
+
+[2026-08-16T02:12:30.975000+00:00] <stdout> [comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}
+
+[2026-08-16T02:12:31.002000+00:00] <stdout> ### ComfyUI-Workflow-Encrypt: Copy .js from '/root/comfy/ComfyUI/custom_nodes/comfyui-workflow-encrypt/js/comfyui-workflow-encrypt.js' to '/root/comfy/ComfyUI/web/extensions/comfyui-workflow-encrypt'
+[2026-08-16T02:12:31.002000+00:00] <stdout> 
+
+[2026-08-16T02:12:31.887000+00:00] <unknown> WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.config:No valid loras folders found in ComfyUI configuration
+
+[2026-08-16T02:12:31.890000+00:00] <unknown> WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.config:No valid embeddings folders found in ComfyUI configuration
+
+[2026-08-16T02:12:32.254000+00:00] <unknown> WARNING:/root/comfy/ComfyUI/custom_nodes/comfyui-lora-manager.py.vue_widget_builder:Node.js/npm not found. Cannot build Vue widgets. Please install Node.js or build manually: cd vue-widgets && npm run build
+
+[2026-08-16T02:12:34.370000+00:00] <stdout> [33mModule 'diffusers' load failed. If you don't have it installed, do it:[0m
+[2026-08-16T02:12:34.370000+00:00] <stdout> 
+[33mpip install diffusers[0m
+
+[2026-08-16T02:12:34.470000+00:00] <stdout> [34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+
+[2026-08-16T02:12:34.470000+00:00] <stdout> [34m[ComfyUI-Easy-Use] web root: [0m/root/comfy/ComfyUI/custom_nodes/comfyui-easy-use/web_version/v2 [92mLoaded[0m
+
+[2026-08-16T02:12:34.888000+00:00] <unknown> /usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:835: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+[2026-08-16T02:12:34.888000+00:00] <unknown> /usr/local/lib/python3.11/site-packages/sam3/model/sam3_video_inference.py:943: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+[2026-08-16T02:12:35.689000+00:00] <stdout> (RES4LYF) Init
+
+[2026-08-16T02:12:35.690000+00:00] <stdout> (RES4LYF) Importing beta samplers.
+
+[2026-08-16T02:12:35.822000+00:00] <stdout> (RES4LYF) Importing legacy samplers.
+
+[2026-08-16T02:12:36.209000+00:00] <unknown> [36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ckpts path: /root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux/ckpts[0m
+
+[2026-08-16T02:12:36.209000+00:00] <unknown> [36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using symlinks: False[0m
+[36;20m[/root/comfy/ComfyUI/custom_nodes/comfyui_controlnet_aux] | INFO -> Using ort providers: ['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider', 'CoreMLExecutionProvider'][0m
+
+[2026-08-16T02:12:36.303000+00:00] <stdout> DWPose: Onnxruntime with acceleration providers detected
+[2026-08-16T02:12:36.303000+00:00] <stdout> 
+
+[2026-08-16T02:12:36.811000+00:00] <unknown> WARNING:root:[Impact Pack] custom_wildcards path not found: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-impact-pack\custom_wildcards. Using default path.
+
+[2026-08-16T02:12:36.876000+00:00] <stdout> 
+
+[2026-08-16T02:12:36.876000+00:00] <stdout> [92m[rgthree-comfy] Loaded 48 exciting nodes. 🎉[0m
+
+[2026-08-16T02:12:36.876000+00:00] <stdout> 
+
+[2026-08-16T02:12:36.876000+00:00] <stdout> [33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+
+[2026-08-16T02:12:41.122000+00:00] <stdout> warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+
+[2026-08-16T02:12:41.349000+00:00] <stdout> LOADED 5 FONTS
+
+[2026-08-16T02:12:41.830000+00:00] <stdout> 
+
+███╗   ███╗ █████╗  ██████╗██╗  ██╗██╗███╗   ██╗███████╗               
+████╗ ████║██╔══██╗██╔════╝██║  ██║██║████╗  ██║██╔════╝               
+██╔████╔██║███████║██║     ███████║██║██╔██╗ ██║█████╗                 
+██║╚██╔╝██║██╔══██║██║     ██╔══██║██║██║╚██╗██║██╔══╝                 
+██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║██║██║ ╚████║███████╗               
+╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝               
+                                                                       
+██████╗ ███████╗██╗     ██╗   ██╗███████╗██╗ ██████╗ ███╗   ██╗███████╗
+██╔══██╗██╔════╝██║     ██║   ██║██╔════╝██║██╔═══██╗████╗  ██║██╔════╝
+██║  ██║█████╗  ██║     ██║   ██║███████╗██║██║   ██║██╔██╗ ██║███████╗
+██║  ██║██╔══╝  ██║     ██║   ██║╚════██║██║██║   ██║██║╚██╗██║╚════██║
+██████╔╝███████╗███████╗╚██████╔╝███████║██║╚██████╔╝██║ ╚████║███████║
+╚═════╝ ╚══════╝╚══════╝ ╚═════╝ ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝
+                                                                       
+
+
+
+[2026-08-16T02:12:41.873000+00:00] <stdout> ⚠️  SeedVR2 optimizations check: SageAttention ❌ | Flash Attention ❌ | Triton ✅
+
+[2026-08-16T02:12:41.873000+00:00] <stdout> 💡 Optional: pip install sageattention flash-attn
+
+[2026-08-16T02:12:41.896000+00:00] <stdout> ⚠️ Memory check failed: No GPU backend available (CUDA/MPS) - No available backend!
+
+[2026-08-16T02:12:42+00:00] <unknown> WARNING:root:Traceback (most recent call last):
+  File "/root/comfy/ComfyUI/nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/__init__.py", line 7, in <module>
+    from .src.interfaces import comfy_entrypoint, SeedVR2Extension
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/__init__.py", line 8, in <module>
+    from .video_upscaler import SeedVR2VideoUpscaler
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/interfaces/video_upscaler.py", line 10, in <module>
+    from ..utils.downloads import download_weight
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/downloads.py", line 14, in <module>
+    from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/utils/model_registry.py", line 14, in <module>
+    from ..models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+  File "/root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/src/models/video_vae_v3/modules/attn_video_vae.py", line 20, in <module>
+    from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/__init__.py", line 16, in <module>
+    from .autoencoder_kl_temporal_decoder import AutoencoderKLTemporalDecoder
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/autoencoders/autoencoder_kl_temporal_decoder.py", line 26, in <module>
+    from ..unets.unet_3d_blocks import MidBlockTemporalDecoder, UpBlockTemporalDecoder
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/__init__.py", line 8, in <module>
+    from .unet_3d_condition import UNet3DConditionModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/unets/unet_3d_condition.py", line 37, in <module>
+    from ..transformers.transformer_temporal import TransformerTemporalModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/__init__.py", line 20, in <module>
+    from .transformer_bria import BriaTransformer2DModel
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_bria.py", line 14, in <module>
+    from ..attention_dispatch import dispatch_attention_fn
+  File "/usr/local/lib/python3.11/site-packages/diffusers/models/attention_dispatch.py", line 92, in <module>
+    from sageattention import (
+  File "/usr/local/lib/python3.11/site-packages/sageattention/__init__.py", line 1, in <module>
+    from .core import sageattn, sageattn_varlen
+  File "/usr/local/lib/python3.11/site-packages/sageattention/core.py", line 47, in <module>
+    from .quant import per_block_int8 as per_block_int8_cuda
+  File "/usr/local/lib/python3.11/site-packages/sageattention/quant.py", line 20, in <module>
+    from . import _fused
+  File "/root/comfyapp.py", line 17887, in find_spec
+    raise ImportError(
+ImportError: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+
+
+[2026-08-16T02:12:42+00:00] <unknown> WARNING:root:Cannot import /root/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler module for custom nodes: [comfyapp] blocked CUDA module import 'sageattention._fused' during snap=True to keep snapshot clean
+
+[2026-08-16T02:12:42.078000+00:00] <stdout> [v2.startup_stage] stage=custom_node_import event=end wall_unix_ns=1786846362078370054 monotonic_ns=26449431825 duration_ms=13494.917 slow_import_summary_source=comfyui.nodes.init_external_custom_nodes
+[2026-08-16T02:12:42.078000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.092000+00:00] <stdout> [comfyapp] custom_node_import_health: registered=2397 volume_syncable=24 comfy_entries=28 comfy_symlinks=0 failures=0 snapshot_deferred=0
+
+[2026-08-16T02:12:42.092000+00:00] <stdout> [comfyapp] custom_node_import_health: volume_dirs=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+
+[2026-08-16T02:12:42.098000+00:00] <stdout> [comfyapp] sage_policy module=model_optimization_nodes.py found=True patched=True baked_cuda_available=False duration=5.6ms
+
+[2026-08-16T02:12:42.098000+00:00] <stdout> [comfyapp] in-process backend initialized in 21.445s
+[2026-08-16T02:12:42.098000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.098000+00:00] <stdout> [v2.startup_stage] stage=backend_startup event=end wall_unix_ns=1786846362098141927 monotonic_ns=26469207078 duration_ms=21452.544
+[2026-08-16T02:12:42.098000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.106000+00:00] <stdout> [v2.sage_snapshot] action=discover_and_patch module=/root/comfy/ComfyUI/custom_nodes/ComfyUI-KJNodes.nodes.model_optimization_nodes target=patch_kjnodes_get_sage_func.<locals>.wrapped_get_sage_func mode=patched_at_snapshot version=comfymodal-sage-v1
+
+[2026-08-16T02:12:42.109000+00:00] <stdout> [v2.generation_identity] method=startup custom_nodes_generation='4ee9e0d0a4a163674162cec8…' raw_empty=false source=persisted_record runtime_state_generation='' api_object_id=46951900208464 deployment_combined_hash=e8f269ee9e4dcf3b
+
+[2026-08-16T02:12:42.109000+00:00] <stdout> [v2.startup_stage] stage=certificate_snapshot_retention event=start wall_unix_ns=1786846362109903724 monotonic_ns=26480968304
+
+[2026-08-16T02:12:42.110000+00:00] <stdout> [v2.cert_snapshot] status=fallback reason=seed_missing
+[2026-08-16T02:12:42.110000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.110000+00:00] <stdout> [v2.startup_stage] stage=certificate_snapshot_retention event=end wall_unix_ns=1786846362110312073 monotonic_ns=26481376784 duration_ms=0.408 status=fallback reason=seed_missing
+[2026-08-16T02:12:42.110000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.110000+00:00] <stdout> [v2.startup_stage] stage=dependency_validation event=start wall_unix_ns=1786846362110427763 monotonic_ns=26481491774
+[2026-08-16T02:12:42.110000+00:00] <stdout> 
+
+[2026-08-16T02:12:42.110000+00:00] <stdout> [v2.startup_stage] stage=baked_manifest_read event=start wall_unix_ns=1786846362110456283 monotonic_ns=26481520294
+
+[2026-08-16T02:12:42.111000+00:00] <stdout> [v2.startup_stage] stage=baked_manifest_read event=end wall_unix_ns=1786846362111149163 monotonic_ns=26482214404 duration_ms=0.694
+
+[2026-08-16T02:12:43.263000+00:00] <stdout> [dep_manifest] persisted identity=c4139d9b26843f97... combined_hash=e8f269ee9e4dcf3b... elapsed_ms=1151.9
+
+[2026-08-16T02:12:43.263000+00:00] <stdout> [v2.dep_manifest] startup build/persist done in 1152.9ms identity=c4139d9b26843f97 combined_hash=e8f269ee9e4dcf3b cn_gen=4ee9e0d0a4a16367 repair_mode=fail_fast baked_ok=1 ident_ok=1
+
+[2026-08-16T02:12:43.263000+00:00] <stdout> [v2.startup_stage] stage=dependency_validation event=end wall_unix_ns=1786846363263405236 monotonic_ns=27634470128 duration_ms=1152.978
+[2026-08-16T02:12:43.263000+00:00] <stdout> 
+
+[2026-08-16T02:12:43.403000+00:00] <stdout> [v2.deployment_proof] schema=1 complete=True reason=ok dep_hash=e8f269ee9e4dcf3b baked_gen=4ee9e0d0a4a16367 gen_ok=1 reg_fp=True dep_identity=True repair_mode=n/a
+
+[2026-08-16T02:12:43.403000+00:00] <stdout> [comfyapp] snapshot_preload_profile source=none - no warmup profile configured
+
+[2026-08-16T02:12:43.403000+00:00] <stdout> [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=35 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+
+[2026-08-16T02:12:43.405000+00:00] <stdout> [v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786846363405946746 monotonic_ns=27777010711
+
+[2026-08-16T02:12:43.407000+00:00] <stdout> [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=d8bea7a755a04cee restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786846363407271680 start_monotonic_ns=27778334051 start_thread_time_ns=23920000000 start_process_time_ns=27220000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=33 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+
+[2026-08-16T02:12:45.770000+00:00] <stdout> [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=d8bea7a755a04cee restored_instance_id= restore_session_id= complete_wall_unix_ns=1786846365769487104 complete_monotonic_ns=30140548359 complete_thread_time_ns=25390000000 complete_process_time_ns=49120000000 complete_native_tid=2 wall_ms=2362.214 thread_cpu_ms=1470.0 process_cpu_ms=21900.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=33
+[2026-08-16T02:12:45.770000+00:00] <stdout> 
+
+[2026-08-16T02:12:45.770000+00:00] <stdout> [v2.active_read_diag] active_read_id=d8bea7a755a04cee owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=2362.214 thread_cpu_ms=1470.0 process_cpu_ms=21900.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+[2026-08-16T02:12:45.770000+00:00] <stdout> 
+
+[2026-08-16T02:12:46.465000+00:00] <stdout> [v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786846366465320080 monotonic_ns=30836386730 duration_ms=3059.376
+[2026-08-16T02:12:46.465000+00:00] <stdout> 
+
+[2026-08-16T02:12:47.245000+00:00] <stdout> [v2.startup_stage] stage=unet_snapshot_load event=start wall_unix_ns=1786846367245275172 monotonic_ns=31616339231
+[2026-08-16T02:12:47.245000+00:00] <stdout> 
+
+[2026-08-16T02:12:47.249000+00:00] <stdout> [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=b4758fbfd3e74d42 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786846367248454400 start_monotonic_ns=31619517430 start_thread_time_ns=26790000000 start_process_time_ns=54690000000 native_tid=2 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=38 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+
+[2026-08-16T02:12:51.318000+00:00] <stdout> [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=b4758fbfd3e74d42 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786846371318015744 complete_monotonic_ns=35689076669 complete_thread_time_ns=28640000000 complete_process_time_ns=88350000000 complete_native_tid=2 wall_ms=4069.559 thread_cpu_ms=1850.0 process_cpu_ms=33660.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=38
+[2026-08-16T02:12:51.318000+00:00] <stdout> 
+[v2.active_read_diag] active_read_id=b4758fbfd3e74d42 owner=graph_loader request_id= restore_session_id= path_hash=8d2256b3cff6bbd2 wall_ms=4069.559 thread_cpu_ms=1850.0 process_cpu_ms=33660.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+
+[2026-08-16T02:12:51.698000+00:00] <stdout> [v2.startup_stage] stage=unet_snapshot_load event=end wall_unix_ns=1786846371698173950 monotonic_ns=36069239149 duration_ms=4452.9
+[2026-08-16T02:12:51.698000+00:00] <stdout> 
+
+[2026-08-16T02:12:52.395000+00:00] <stdout> [v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786846372395491020 monotonic_ns=36766554968
+[2026-08-16T02:12:52.395000+00:00] <stdout> 
+
+[2026-08-16T02:12:52.398000+00:00] <stdout> [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=6c4699a828494e6e restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786846372398219520 start_monotonic_ns=36769281797 start_thread_time_ns=29670000000 start_process_time_ns=92670000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=40 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+
+[2026-08-16T02:12:52.456000+00:00] <stdout> [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=6c4699a828494e6e restored_instance_id= restore_session_id= complete_wall_unix_ns=1786846372456579328 complete_monotonic_ns=36827640437 complete_thread_time_ns=29730000000 complete_process_time_ns=93280000000 complete_native_tid=2 wall_ms=58.359 thread_cpu_ms=60.0 process_cpu_ms=610.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=40
+
+[2026-08-16T02:12:52.456000+00:00] <stdout> [v2.active_read_diag] active_read_id=6c4699a828494e6e owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=58.359 thread_cpu_ms=60.0 process_cpu_ms=610.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+
+[2026-08-16T02:12:52.507000+00:00] <stdout> [v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786846372507153931 monotonic_ns=36878218969 duration_ms=111.664
+[2026-08-16T02:12:52.507000+00:00] <stdout> 
+
+[2026-08-16T02:12:53.956000+00:00] <stdout> [v2.vae_snapshot] status=retained vae_identity=ae.safetensors object_type=VAE object_id=46956045531664 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 storage_bytes=167639366 floating_parameter_count=244 mismatched_parameter_buffer_count=0
+[2026-08-16T02:12:53.956000+00:00] <stdout> 
+
+[2026-08-16T02:12:53.957000+00:00] <stdout> [v2.unet_runtime_state] stage=snapshot_created unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_snapshot_weight_dtype=bfloat16 effective_snapshot_compute_dtype=bfloat16 effective_snapshot_manual_cast_dtype=none effective_weight_dtype=bfloat16 dtype_resolution_source=target_gpu_policy target_gpus=RTX-PRO-6000 state={"current_device":"cpu","diffusion_model_object_id":"46956468542416","diffusion_model_type":"NextDiT","effective_snapshot_compute_dtype":"bfloat16","effective_snapshot_manual_cast_dtype":"none","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cpu","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cpu","loaded_models_member":"absent","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"46956468539600","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cpu","param_distribution":{"param_count":453,"param_dev_dtype_count":{"cpu|torch.bfloat16":453},"param_dev_dtype_numel":{"cpu|torch.bfloat16":6154908736},"param_distribution_hash":"96e377c80251860d5549077cedd369a544935a81bfbda9128343843e9dd54c80","total_param_numel":6154908736},"patch_count":0,"patcher_object_id":"46956473678160","patcher_type":"ModelPatcher","transformer_options_keys":[],"weight_dtype":"absent"}
+
+[2026-08-16T02:12:54.026000+00:00] <stdout> [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=17260.4 process_maxrss_mib=35738.5 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[2026-08-16T02:12:54.026000+00:00] <stdout> 
+
+[2026-08-16T02:12:54.026000+00:00] <stdout> [v2.startup_stage] stage=cachedit_preparation event=start wall_unix_ns=1786846374026886651 monotonic_ns=38397951524
+
+[2026-08-16T02:12:54.029000+00:00] <stdout> [cachedit.startup] preimport transformers version=4.55.2 path=/usr/local/lib/python3.11/site-packages/transformers/__init__.py
+
+[2026-08-16T02:12:54.030000+00:00] <stdout> [cachedit.startup] preimport diffusers version=0.36.0 path=/usr/local/lib/python3.11/site-packages/diffusers/__init__.py
+
+[2026-08-16T02:12:54.398000+00:00] <unknown> /usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:168: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.float32)
+
+[2026-08-16T02:12:54.398000+00:00] <unknown> /usr/local/lib/python3.11/site-packages/diffusers/models/transformers/transformer_kandinsky.py:272: UserWarning: CUDA is not available or torch_xla is imported. Disabling autocast.
+  @torch.autocast(device_type="cuda", dtype=torch.float32)
+
+[2026-08-16T02:12:54.469000+00:00] <stdout> [cachedit.startup] preimport cache_dit version=1.2.3 path=/usr/local/lib/python3.11/site-packages/cache_dit/__init__.py
+
+[2026-08-16T02:12:54.469000+00:00] <stdout> [cachedit.startup] cache_dit metadata={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+
+[2026-08-16T02:12:54.469000+00:00] <stdout> [v2.startup_stage] stage=cachedit_preparation event=end wall_unix_ns=1786846374469383053 monotonic_ns=38840447982 duration_ms=442.496
+
+[2026-08-16T02:12:54.469000+00:00] <stdout> [cachedit.startup] preimport ok transformers=4.55.2 diffusers=0.36.0 cache_dit=1.2.3 cache_dit_info={'__version__': '1.2.3', 'top_level_classes': ['BasicCacheConfig', 'BlockAdapter', 'CacheType', 'CalibratorConfig', 'DBCacheConfig', 'DBPruneConfig', 'FoCaCalibratorConfig', 'ForwardPattern', 'ParallelismBackend', 'ParallelismConfig', 'ParamsModifier', 'PatchFunctor', 'ProfilerContext', 'TaylorSeerCalibratorConfig']}
+
+[2026-08-16T02:12:54.469000+00:00] <stdout> [v2.snapshot_pools] stage=before_snapshot_capture legacy_threads_joined=0 legacy_worker_refs_removed=0 coordinator_closed=1 native_thread_count=46
+[2026-08-16T02:12:54.469000+00:00] <stdout> 
+
+[2026-08-16T02:12:54.471000+00:00] <stdout> [v2.snapshot_model_eviction_memory] stage=full_models_loaded vm_rss_mib=17286.078125 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10473
+
+[2026-08-16T02:12:56.717000+00:00] <stdout> [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=insufficient_rss_drop clip_original_id=46955215886736 unet_original_id=46956473678160 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 bridge_active_preparation=0 bridge_active_preparation_before_clear=0 rss_before_mib=17286.078125 rss_after_gc_mib=17046.265625 rss_after_trim_mib=16256.59375 full_eviction_rss_drop_mib=1029.5 anonymous_before_mib=absent anonymous_after_mib=absent private_dirty_before_mib=absent private_dirty_after_mib=absent malloc_trim_status=applied malloc_trim_result=1
+[2026-08-16T02:12:56.717000+00:00] <stdout> 
+[v2.snapshot_model_eviction_memory] stage=after_full_eviction vm_rss_mib=16256.59375 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10473
+[v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=full_eviction_complete retain_role=clip_vae clip_original_id=46955215886736 unet_original_id=46956473678160 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 full_eviction_rss_drop_mib=1029.5 rss_before_mib=17286.078125 rss_after_eviction_mib=16256.59375 malloc_trim_status=applied malloc_trim_result=1
+
+[2026-08-16T02:12:56.718000+00:00] <stdout> [v2.runtime_shape] stage=snapshot_pre_capture runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=46 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error= before={'torch_intraop_threads': 12, 'torch_interop_threads': 14}
+[2026-08-16T02:12:56.718000+00:00] <stdout> 
+
+[2026-08-16T02:12:56.718000+00:00] <stdout> [v2.startup_stage] stage=clip_snapshot_load event=start wall_unix_ns=1786846376718229169 monotonic_ns=41089293918
+[2026-08-16T02:12:56.718000+00:00] <stdout> 
+
+[2026-08-16T02:12:56.721000+00:00] <stdout> [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=e62ce5120f6c4ba5 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786846376720529664 start_monotonic_ns=41091591877 start_thread_time_ns=33720000000 start_process_time_ns=97820000000 native_tid=2 active_read_path_hash=18da7c5b6a0c3132 active_read_file_size=8044982048 active_read_st_dev=30 active_read_st_ino=33 active_read_governor_enabled=0 active_read_priority=80 active_read_size_bytes=8044982048 active_read_size_mb=7672.3 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[2026-08-16T02:12:56.721000+00:00] <stdout> 
+
+[2026-08-16T02:12:57.444000+00:00] <stdout> [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/text_encoders/qwen_3_4b.safetensors active_read_id=e62ce5120f6c4ba5 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786846377443680768 complete_monotonic_ns=41814741328 complete_thread_time_ns=34390000000 complete_process_time_ns=106040000000 complete_native_tid=2 wall_ms=723.149 thread_cpu_ms=670.0 process_cpu_ms=8220.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=18da7c5b6a0c3132 file_size=8044982048 st_dev=30 st_ino=33
+
+[2026-08-16T02:12:57.444000+00:00] <stdout> [v2.active_read_diag] active_read_id=e62ce5120f6c4ba5 owner=graph_loader request_id= restore_session_id= path_hash=18da7c5b6a0c3132 wall_ms=723.149 thread_cpu_ms=670.0 process_cpu_ms=8220.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+
+[2026-08-16T02:12:58.266000+00:00] <stdout> [v2.startup_stage] stage=clip_snapshot_load event=end wall_unix_ns=1786846378266615866 monotonic_ns=42637682682 duration_ms=1548.389
+[2026-08-16T02:12:58.266000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.267000+00:00] <stdout> [v2.startup_stage] stage=vae_snapshot_load event=start wall_unix_ns=1786846378267095816 monotonic_ns=42638159772
+
+[2026-08-16T02:12:58.270000+00:00] <stdout> [active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=0c781282b43c4c85 restored_instance_id= restore_session_id= request_id= start_wall_unix_ns=1786846378269419776 start_monotonic_ns=42640482331 start_thread_time_ns=35160000000 start_process_time_ns=112420000000 native_tid=2 active_read_path_hash=4c78afa4b05fac11 active_read_file_size=335304388 active_read_st_dev=30 active_read_st_ino=40 active_read_governor_enabled=0 active_read_priority=40 active_read_size_bytes=335304388 active_read_size_mb=319.8 active_read_is_large=0 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=0 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[2026-08-16T02:12:58.270000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.314000+00:00] <stdout> [active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/vae/ae.safetensors active_read_id=0c781282b43c4c85 restored_instance_id= restore_session_id= complete_wall_unix_ns=1786846378314036480 complete_monotonic_ns=42685097897 complete_thread_time_ns=35210000000 complete_process_time_ns=112910000000 complete_native_tid=2 wall_ms=44.616 thread_cpu_ms=50.0 process_cpu_ms=490.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=4c78afa4b05fac11 file_size=335304388 st_dev=30 st_ino=40
+
+[2026-08-16T02:12:58.314000+00:00] <stdout> [v2.active_read_diag] active_read_id=0c781282b43c4c85 owner=graph_loader request_id= restore_session_id= path_hash=4c78afa4b05fac11 wall_ms=44.616 thread_cpu_ms=50.0 process_cpu_ms=490.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=2
+
+[2026-08-16T02:12:58.345000+00:00] <stdout> [v2.startup_stage] stage=vae_snapshot_load event=end wall_unix_ns=1786846378345471009 monotonic_ns=42716536416 duration_ms=78.377
+[2026-08-16T02:12:58.345000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.363000+00:00] <stdout> [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=non_fatal_floor_failure retain_role=clip_vae floor=full_eviction_rss_drop threshold_mib=8192 actual_mib=1029.5 actual_bytes=? selected_reload_rss_rise_mib=10021.5 final_reduction_from_full_mib=-8992.0 selected_storage_total_bytes=8380214928 after_full_eviction_rss_mib=16256.59375 after_selected_reload_rss_mib=26278.05078125 full_models_rss_mib=17286.078125 malloc_trim_status=applied malloc_trim_result=1
+[v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=non_fatal_floor_failure retain_role=clip_vae floor=final_reduction threshold_mib=4096 actual_mib=-8992.0 actual_bytes=? selected_reload_rss_rise_mib=10021.5 final_reduction_from_full_mib=-8992.0 selected_storage_total_bytes=8380214928 after_full_eviction_rss_mib=16256.59375 after_selected_reload_rss_mib=26278.05078125 full_models_rss_mib=17286.078125 malloc_trim_status=applied malloc_trim_result=1
+[2026-08-16T02:12:58.363000+00:00] <stdout> 
+[v2.snapshot_model_eviction_memory] stage=after_selected_reload vm_rss_mib=26278.05078125 vm_hwm_mib=absent smaps_rss_mib=absent smaps_pss_mib=absent smaps_private_clean_mib=absent smaps_private_dirty_mib=absent smaps_shared_clean_mib=absent smaps_shared_dirty_mib=absent smaps_anonymous_mib=absent native_thread_count=46 torch_intraop_threads=12 torch_interop_threads=14 loaded_module_count=10473
+
+[2026-08-16T02:12:58.364000+00:00] <stdout> [v2.snapshot_model_eviction] stage=snapshot_pre_capture enabled=1 status=ready floor_failures=2 floor_failures_details=full_eviction_rss_drop=1029.5;final_reduction=-8992.0 retain_role=clip_vae retained_model_present=0 retained_model_id=46955224497808 retained_model_type=CLIP retained_weakref_alive=1 original_clip_alive_after_full_eviction=0 original_unet_alive_after_full_eviction=0 original_vae_alive_after_full_eviction=0 reloaded_model_present=0 reloaded_model_id=46955224497808 reloaded_model_is_new_object=1 clip_original_id=46955215886736 unet_original_id=46956473678160 vae_original_id=46956045531664 container_retained=1 normal_cpu_snapshot_models_present=1 clip_present=1 vae_present=1 unet_present=0 full_eviction_rss_drop_mib=1029.5 selected_reload_rss_rise_mib=10021.5 final_reduction_from_full_mib=-8992.0 selected_storage_count=399 selected_storage_total_bytes=8380214928 selected_storage_total_mib=7991.996 full_models_rss_mib=17286.078125 after_full_eviction_rss_mib=16256.59375 after_selected_reload_rss_mib=26278.05078125 bridge_active_preparation=0 bridge_active_preparation_before_clear=0 snapshot_loader_output_count=0 snapshot_seed_present=0 native_threads=46 torch_intraop=12 torch_interop=14 patcher_cleanup_count=3 patcher_detach_count=2 patcher_cleanup_errors=1 malloc_trim_status=applied malloc_trim_result=1
+[2026-08-16T02:12:58.364000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.364000+00:00] <stdout> [v2.startup_stage] stage=vae_preparation event=start wall_unix_ns=1786846378364063452 monotonic_ns=42735128680 status=skipped reason=vae_not_part_of_cpu_snapshot
+
+[2026-08-16T02:12:58.364000+00:00] <stdout> [v2.startup_stage] stage=vae_preparation event=end wall_unix_ns=1786846378364150602 monotonic_ns=42735214440 status=skipped reason=vae_not_part_of_cpu_snapshot duration_ms=0.0
+[2026-08-16T02:12:58.364000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.396000+00:00] <stdout> [restore_memory_arm] freeze stored source=nvidia-smi vram_mib=97887 gpu_name='NVIDIA RTX PRO 6000 Blackwell Server Edition'
+[2026-08-16T02:12:58.396000+00:00] <stdout> 
+[restore_memory_arm] freeze status=ok path=/mnt/comfymodal_runtime_state/gpu_capacity_frozen.json gpu_name=NVIDIA RTX PRO 6000 Blackwell Server Edition vram_mib=97887 file_written=1
+[2026-08-16T02:12:58.396000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.399000+00:00] <stdout> [v2.runtime_state_generation_baseline] source=runtime_config_generation_json generation=29963e66e53d… files=2 write_ms=3.313
+[2026-08-16T02:12:58.399000+00:00] <stdout> 
+
+[2026-08-16T02:12:58.399000+00:00] <stdout> [v2.startup_stage] stage=snapshot_startup_callback event=return wall_unix_ns=1786846378399562880 monotonic_ns=42770626818 status=ready
+
+[2026-08-16T02:12:58.399000+00:00] <stdout> [v2.lifecycle] method=startup snap=True container_session=8ae7c3e577ff4974 restore_total_ms=36141.709 status=ready
+
+[2026-08-16T02:13:26.443000+00:00] <system_info> Snapshot created. Restoring Function from memory snapshot.
+
+[2026-08-16T02:13:26.727000+00:00] <system_info> Restoring Function from memory snapshot.
+
+[2026-08-16T02:13:29.454000+00:00] <stdout> [v2.startup_stage] stage=post_snapshot_restore event=start wall_unix_ns=1786846409454868655 monotonic_ns=73825936975
+
+[2026-08-16T02:13:29.455000+00:00] <stdout> [v2.snapshot_timing] snapshot_callback_age_at_restore_ms=31055.421 snapshot_callback_to_command_start_ms=unavailable command_start_to_restore_start_ms=unavailable request_latency_included=0 source=snapshot_callback_return_to_restore_start
+[2026-08-16T02:13:29.455000+00:00] <stdout> 
+
+[2026-08-16T02:13:29.468000+00:00] <stdout> [v2.snapshot_model_eviction] stage=restore_observed marker=1 cpu_snapshot_models_present=1 clip_present=1 unet_present=0 retained_role=clip_vae retained_model_id=0 retained_model_type= rss_after_restore_mib=11452.421875 native_thread_count=46 torch_intraop=12 torch_interop=14 wall_unix_ns=1786846409468206830
+
+[2026-08-16T02:13:29.468000+00:00] <stdout> [v2.snapshot_model_eviction] stage=restore_release_retained retain_role=clip_vae status=container_retained container_present=1 clip_present=1 vae_present=1 unet_present=0 retained_slot_release=0 retained_model_id=0 retained_alive_after_release=0 rss_before_release_mib=absent rss_after_gc_mib=absent rss_after_trim_mib=absent rss_drop_mib=absent malloc_trim_status=absent malloc_trim_result=absent restore_release_start_wall_unix_ns=1786846409468310830 restore_release_end_wall_unix_ns=1786846409468310830 wall_unix_ns=1786846409468310830
+
+[2026-08-16T02:13:29.468000+00:00] <stdout> [v2.residency_config] enabled=0
+
+[2026-08-16T02:13:29.472000+00:00] <stdout> [v2.host_memory] stage=restore_start current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=11736.2 process_maxrss_mib=35738.5 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[2026-08-16T02:13:29.472000+00:00] <stdout> 
+
+[2026-08-16T02:13:29.477000+00:00] <stdout> [v2.runtime_shape] stage=after_restore runtime_shape_fingerprint=f504e296c398bdcb2c4c07e2 runtime_shape_label=None thread_policy=TBASE snapshot_model_order=O0 cpu_request=12 memory_request=32768 native_thread_count=48 configured_omp=None configured_mkl=None configured_openblas=None configured_numexpr=None malloc_arena_max=None native_library_settings={'OMP_NUM_THREADS': '12', 'MKL_NUM_THREADS': '12', 'OPENBLAS_NUM_THREADS': '12', 'NUMEXPR_NUM_THREADS': None, 'MALLOC_ARENA_MAX': None} torch_intraop_threads=12 torch_interop_threads=14 actual_torch_intraop_threads=12 actual_torch_interop_threads=14 requested_torch_intraop_threads=None requested_torch_interop_threads=None requested_vs_actual_match=True status=baseline_passthrough error=
+[2026-08-16T02:13:29.477000+00:00] <stdout> 
+
+[2026-08-16T02:13:29.711000+00:00] <stdout> [comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 207.4ms
+[2026-08-16T02:13:29.711000+00:00] <stdout> 
+
+[2026-08-16T02:13:29.798000+00:00] <stdout> [restore.cuda_context] available=1 device_index=0 device=NVIDIA RTX PRO 6000 Blackwell Server Edition sync_ms=86.032 total_ms=86.232
+
+[2026-08-16T02:13:29.827000+00:00] <stdout> [v2.sage_restore] decision=snapshot_exact_skip discovery_called=0 verify_ms=0.252
+[2026-08-16T02:13:29.827000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.163000+00:00] <stdout> [v2.runtime_state_volume_restore] decision=reloaded_generation_mismatch reason=generation_mismatch callback_called=1 runtime_state_reload_invoked=1 check_ms=1.325
+[2026-08-16T02:13:30.163000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.164000+00:00] <stdout> [v2.models_volume_restore] decision=skipped_generation_match reason=exact_match callback_called=0 check_ms=1.601
+
+[2026-08-16T02:13:30.165000+00:00] <stdout> [v2.custom_node_restore] decision=snapshot_exact_skip callback_called=0 source=persisted_record check_ms=0.931
+
+[2026-08-16T02:13:30.165000+00:00] <stdout> [v2.startup_stage] stage=snapshot_execution_seed event=start wall_unix_ns=1786846410165956710 monotonic_ns=74537026010
+
+[2026-08-16T02:13:30.169000+00:00] <stdout> [v2.seed_restore] source=startup_minimal schema=2 topology_available=0 workflow_hash= loader_signatures=0
+[2026-08-16T02:13:30.169000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.169000+00:00] <stdout> [v2.startup_stage] stage=snapshot_execution_seed event=end wall_unix_ns=1786846410169238889 monotonic_ns=74540307879 duration_ms=3.282
+[2026-08-16T02:13:30.169000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.187000+00:00] <stdout> [v2.host_hardware_fingerprint] cpu_vendor=AuthenticAMD cpu_model_name=unknown cpu_family=191 cpu_model=2 cpu_count_os=28 cpu_identity_confidence=virtualized_or_inconsistent gpu_name=NVIDIA RTX PRO 6000 Blackwell Server Edition provider=CLOUD_PROVIDER_GCP region=us-south1 probe_wall_ms=4.35
+[2026-08-16T02:13:30.187000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.188000+00:00] <stdout> [v2.generation_identity] method=restore custom_nodes_generation='4ee9e0d0a4a163674162cec8…' raw_empty=false source=persisted_record runtime_state_generation='' api_object_id=46951900208464 deployment_combined_hash=e8f269ee9e4dcf3b
+
+[2026-08-16T02:13:30.188000+00:00] <stdout> [v2.prefill_config] env=critical parsed=critical cpu_snapshot_container_active=0 native_fast_disk_unet_execution_active=0
+
+[2026-08-16T02:13:30.190000+00:00] <stdout> [v2.restore_breakdown] bootstrap_ms=684.463 unet_cache_patch_ms=None clip_prepare_submit_ms=None clip_worker_wait_ms=None unet_spec_extract_ms=None bg_unet_submit_ms=None restore_finalize_ms=0.214
+[2026-08-16T02:13:30.190000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.190000+00:00] <stdout> [v2.restore_deep] identity_capture_ms=0.074 configure_runtime_ms=0.008 torch_thread_apply_ms=1.287 host_memory_probe_ms=3.489 teardown_diag_setup_ms=0.021 bootstrap_restore_ms=684.493 preload_bridge_prep_ms=0.097 restore_finalize_ms=1.775 residual_ms=29.072
+[2026-08-16T02:13:30.190000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.190000+00:00] <stdout> [v2.clip_stages] worker_queue_ms=None load_torch_file_ms=None read_to_ready_ms=None post_read_cpu_prepare_ms=None gpu_wait_ms=None gpu_commit_ms=None read_end_to_ready_ms=None worker_total_ms=None worker_close_wait_ms=None restore_finalization_ms=0.214
+
+[2026-08-16T02:13:30.191000+00:00] <stdout> [v2.restoration_identity] restored_instance_id=2797c21d4ebc42ad8114325aad0bfa3b restore_session_id=3bfef14cfba544e094f8cce0fe818ed7 container_session_id=8ae7c3e577ff4974 modal_task_id=ta-01M045EHRKN2CQAP574SF3YCSR modal_image_id=im-bA4ITDEoGQzM8EBlTVa6dm modal_cloud=CLOUD_PROVIDER_GCP modal_region=us-south1 pid=2 hostname=modal restore_total_ms=720.316 remote_python_resume_wall_unix_ns=1786846409454822400 restore_method_start_wall_unix_ns=1786846409454822400 restore_method_end_wall_unix_ns=1786846410189102592 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success 
+[2026-08-16T02:13:30.191000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.191000+00:00] <stdout> [v2.lifecycle] method=restore snap=False container_session=8ae7c3e577ff4974 restore_count=1 restore_total_ms=720.316 remote_python_resume_wall_unix_ns=1786846409454822400 restore_method_start_wall_unix_ns=1786846409454822400 restore_method_end_wall_unix_ns=1786846410189102592 modal_method_entry_wall_unix_ns=absent restore_status=success restore_method_status=success status=restored
+[2026-08-16T02:13:30.191000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.191000+00:00] <stdout> [v2.host_memory] stage=restore_complete current_mib=absent peak_mib=absent limit_mib=absent process_rss_mib=13298.9 process_maxrss_mib=35738.5 oom_count=absent oom_kill_count=absent status=ok cgroup_path=absent cgroup_mount=absent
+[2026-08-16T02:13:30.191000+00:00] <stdout> 
+
+[2026-08-16T02:13:30.192000+00:00] <stdout> [v2.gpu_allocation] cuda_version=13.0 gpu_actual_name=NVIDIA RTX PRO 6000 Blackwell Server Edition gpu_compute_capability=12.0 gpu_requested_order=RTX-PRO-6000 gpu_vram_total_mib=97250 torch_version=2.13.0+cu130
+
+[2026-08-16T02:13:30.193000+00:00] <stdout> [v2.startup_stage] stage=post_snapshot_restore event=end wall_unix_ns=1786846410193399081 monotonic_ns=74564467461 duration_ms=738.53
+
+[2026-08-16T02:13:54.647000+00:00] <stdout> [v2.clip_conditioning_cache] event=mode flag=COMFYMODAL_V2_CLIP_CONDITIONING_CACHE enabled=1 root=/root/prompt_cache_vol/exact_conditioning max_entries=64 max_bytes=536870912

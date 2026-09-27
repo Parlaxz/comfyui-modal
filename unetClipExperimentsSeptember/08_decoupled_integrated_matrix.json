@@ -1,0 +1,16 @@
+{
+  "experiment": "decoupled_integrated_source_to_cuda_matrix",
+  "status": "NOT_RUN",
+  "reason": "collection stopped after sufficient pure-source data; no decoupled integrated observations were collected",
+  "requested": {
+    "source_configurations_per_model": 2,
+    "h2d_extent_mib": [128, 256],
+    "h2d_inflight_depth": [1, 2],
+    "observations_per_cell": 10
+  },
+  "historical_comparison_only": [
+    "unetClipExperimentsSeptember/05_qd2_qd4_qd8_additional10.json",
+    "unetClipExperimentsSeptember/06_source_block_qd_matrix.md"
+  ],
+  "raw_evidence_root": "unetClipExperimentsSeptember/07_decoupled_integrated_runs"
+}

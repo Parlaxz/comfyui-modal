@@ -1,0 +1,31 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2ctl.py", line 14, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\cli.py", line 1257, in main
+    return args.func(args, repo_root)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\cli.py", line 995, in cmd_source_probe
+    exit_code, report = sp.run_source_probe(repo_root, workspace=workspace, gpu=str(gpu))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\source_probe.py", line 290, in run_source_probe
+    probe = call_remote_source_probe(repo_root, workspace=workspace, gpu=gpu or "rtx-pro-6000")
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\source_probe.py", line 270, in call_remote_source_probe
+    result = asyncio.run(result)
+             ^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\modal\_object.py", line 45, in wrapped
+    await self.hydrate()
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\modal\cls.py", line 421, in method_loader
+    raise NotFoundError(
+modal.exception.NotFoundError: Class has no method source_identity_probe, and attributes can't be accessed for `Cls.from_name` instances

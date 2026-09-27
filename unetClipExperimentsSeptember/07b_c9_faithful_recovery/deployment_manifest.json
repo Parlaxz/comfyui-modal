@@ -1,0 +1,54 @@
+{
+  "status": "DEPLOYED",
+  "created_at": "2026-09-05T04:28:42.267864+00:00",
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "workspace": {
+    "id": "ws_eaef96004dac",
+    "label": "Testing 7"
+  },
+  "environment": "main",
+  "cpu_requested": 12,
+  "memory_mb": 8192,
+  "source_files_sha256": {
+    "c9_recovery_modal.py": "05d2b44d1b5610387b72ec7e34b95e4d8ba93fdb916e967d30be1c9a70389342",
+    "comfymodal_runtime/source_ceiling_oracle.py": "ca612ba40ead4875566767ac2932769ec6223284e56d3ddf3d0db7a87861deb4",
+    "tools/run_c9_recovery.py": "0077c07ca406666c77e551718ccd0168df74b54f77c0799f5059e79272f41d4e"
+  },
+  "git_head": "eeb06cb0149910f68f42349dbcb036843a753095",
+  "git_branch": "TESTING2",
+  "dirty_worktree": true,
+  "dirty_file_count": 5,
+  "deploy_attempts": [
+    {
+      "at": "2026-09-05T04:29:38.504134+00:00",
+      "workspace_label": "Testing 7",
+      "environment": "main",
+      "cli_encoding": "utf-8"
+    },
+    {
+      "at": "2026-09-05T04:36:33.117519+00:00",
+      "workspace_label": "Testing 7",
+      "environment": "main",
+      "reason": "preserve_oracle_error"
+    },
+    {
+      "at": "2026-09-05T04:52:16.735353+00:00",
+      "workspace_label": "Testing 7",
+      "environment": "main",
+      "reason": "mlock_no_gpu_repair"
+    }
+  ],
+  "deployed_at": "2026-09-05T04:52:43.702247+00:00",
+  "deployment_url": "https://modal.com/apps/testing7/main/deployed/sept-unetclip-c9-recovery-source-only",
+  "deployment_image_ids": [
+    "im-XG3kYfsWFvWUL3bconV41b",
+    "im-AGFkT67xkHdFfpm54xEq2I",
+    "im-vfjXz39gzwS2Cm9VEW4lNl",
+    "im-JM2vjkd0vaWqzDq5QYEMuF",
+    "im-hgg4cVWWmDDSghzXBMbyuf",
+    "im-FGVu57nnhCx8Ci66VUvxiv",
+    "im-pRuoShxQdHkBw9S8WDefq2"
+  ],
+  "function": "run_c9_recovery",
+  "deploy_log": "redeploy_mlock_utf8.log"
+}

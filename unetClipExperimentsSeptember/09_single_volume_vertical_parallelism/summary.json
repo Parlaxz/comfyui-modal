@@ -1,0 +1,3503 @@
+{
+  "NINETY_CLASS_REPEATABLE": {
+    "by_volume": {
+      "v1": {
+        "at_least_80": 0,
+        "median_gb_per_s": 2.3545027198872823,
+        "n": 6,
+        "repeatable": false,
+        "status": "observed"
+      },
+      "v2": {
+        "at_least_80": 0,
+        "median_gb_per_s": 2.2619611750242394,
+        "n": 6,
+        "repeatable": false,
+        "status": "observed"
+      }
+    },
+    "criterion": "SHARDS_PROCESSES median >=80 and >=4/6 >=80 per backend",
+    "name": "NINETY_CLASS_REPEATABLE",
+    "status": "observed"
+  },
+  "NINETY_OBSERVED_FIRST_TOUCH": {
+    "max": 21.09843895292223,
+    "median": 2.2297763470837486,
+    "metric": "aggregate_gb_per_s",
+    "n": 60,
+    "name": "NINETY_OBSERVED_FIRST_TOUCH",
+    "status": "observed",
+    "threshold_gbps": 90,
+    "values": [
+      1.7113980153546817,
+      1.8582231022608073,
+      1.702790522560041,
+      2.409936079696539,
+      2.481175488636046,
+      7.2595425094697275,
+      1.5733350564900606,
+      1.5169313490526841,
+      1.5232529733751452,
+      7.295365120970926,
+      1.8465017625695614,
+      2.3882537517568303,
+      2.264520762604992,
+      1.8963811980208163,
+      1.8999122714861985,
+      2.241790217889386,
+      2.3134264214534688,
+      2.5285525330276264,
+      2.242308902505576,
+      2.3805061189233974,
+      4.790285617474531,
+      2.460766337599179,
+      2.4650451596238305,
+      1.9089325103944415,
+      2.4361282545393785,
+      1.272849086186256,
+      1.5270416762436283,
+      2.0684072084512097,
+      1.0771679772712268,
+      2.6326774906583172,
+      2.0753322117728583,
+      1.9649718349349423,
+      1.8217071871677348,
+      1.941830359676326,
+      2.279421930665509,
+      1.9855402153232922,
+      2.3408961986476906,
+      1.8772055547063975,
+      1.6428096141643214,
+      21.09843895292223,
+      2.3681092411268736,
+      2.501683240577269,
+      1.0968866125247716,
+      1.1514126741647783,
+      2.4395055471042277,
+      2.0902580494409,
+      2.4336643006075787,
+      2.444782194052966,
+      1.5852817811112432,
+      2.425668357005931,
+      2.2622624502991444,
+      1.9815623017873911,
+      1.8431547016554672,
+      2.3351229135617255,
+      2.492137577427605,
+      2.341126770987174,
+      2.217762476278111,
+      2.0301262711427897,
+      1.8409963985038569,
+      2.3337382019990107
+    ]
+  },
+  "NINETY_WARM_ONLY": {
+    "max": null,
+    "median": null,
+    "metric": "aggregate_gb_per_s",
+    "n": 0,
+    "name": "NINETY_WARM_ONLY",
+    "status": "unknown",
+    "threshold_gbps": 90,
+    "values": []
+  },
+  "app_name": "workspace3-testing7-clean-single-volume-validation",
+  "arm_volume_summary": [
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.744231773119436,
+        "max": 7.2595425094697275,
+        "mean": 2.9038442863296403,
+        "median": 2.134079590978673,
+        "min": 1.702790522560041,
+        "n": 6,
+        "range": 5.556751986909687,
+        "sample_sd": 2.1611331820778514
+      },
+      "arm": "BASELINE_OPT",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r6-attempt001.json"
+      ],
+      "volume_slot": "v1",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.7635813611559145,
+          "max": 39.9701226,
+          "mean": 18.33385605,
+          "median": 10.23705855,
+          "min": 7.7981288,
+          "n": 6,
+          "range": 32.1719938,
+          "sample_sd": 13.999390757895599
+        },
+        "coordinated_wall_s": {
+          "cv": 0.3838491208840023,
+          "max": 7.229231216,
+          "mean": 5.468598009333333,
+          "median": 5.8662500815000005,
+          "min": 1.695680738,
+          "n": 6,
+          "range": 5.5335504779999996,
+          "sample_sd": 2.099116538350605
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.3838491208840023,
+          "max": 7.229231216,
+          "mean": 5.468598009333333,
+          "median": 5.8662500815000005,
+          "min": 1.695680738,
+          "n": 6,
+          "range": 5.5335504779999996,
+          "sample_sd": 2.099116538350605
+        },
+        "practical_total_wall_s": {
+          "cv": 0.3838491208840023,
+          "max": 7.229231216,
+          "mean": 5.468598009333333,
+          "median": 5.8662500815000005,
+          "min": 1.695680738,
+          "n": 6,
+          "range": 5.5335504779999996,
+          "sample_sd": 2.099116538350605
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.5249177064331914,
+          "max": 1.5785666941023082,
+          "mean": 0.9937531337714676,
+          "median": 1.2024862384320276,
+          "min": 0.30797669857535037,
+          "n": 6,
+          "range": 1.270589995526958,
+          "sample_sd": 0.5216386157401152
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.744231773119436,
+          "max": 7.2595425094697275,
+          "mean": 2.9038442863296403,
+          "median": 2.134079590978673,
+          "min": 1.702790522560041,
+          "n": 6,
+          "range": 5.556751986909687,
+          "sample_sd": 2.1611331820778514
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.744231773119436,
+          "max": 7.2595425094697275,
+          "mean": 2.9038442863296403,
+          "median": 2.134079590978673,
+          "min": 1.702790522560041,
+          "n": 6,
+          "range": 5.556751986909687,
+          "sample_sd": 2.1611331820778514
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.744231773119436,
+          "max": 7.2595425094697275,
+          "mean": 2.9038442863296403,
+          "median": 2.134079590978673,
+          "min": 1.702790522560041,
+          "n": 6,
+          "range": 5.556751986909687,
+          "sample_sd": 2.1611331820778514
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.7442343943439023,
+          "max": 7.2597982343469525,
+          "mean": 2.9039459240103493,
+          "median": 2.134235952514214,
+          "min": 1.7028002528724828,
+          "n": 6,
+          "range": 5.55699798147447,
+          "sample_sd": 2.161216435963286
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.3838615646504996,
+          "max": 7.229189906,
+          "mean": 5.468444554333334,
+          "median": 5.8658872665,
+          "min": 1.695621008,
+          "n": 6,
+          "range": 5.533568898,
+          "sample_sd": 2.0991256828308975
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.8474618915296208,
+        "max": 7.295365120970926,
+        "mean": 2.690606669035868,
+        "median": 1.709918409529811,
+        "min": 1.5169313490526841,
+        "n": 6,
+        "range": 5.778433771918242,
+        "sample_sd": 2.280186617103349
+      },
+      "arm": "BASELINE_OPT",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r6-attempt001.json"
+      ],
+      "volume_slot": "v2",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.23093726428811953,
+          "max": 11.582522,
+          "mean": 9.656958316666667,
+          "median": 10.247873049999999,
+          "min": 5.6277419,
+          "n": 6,
+          "range": 5.954780100000001,
+          "sample_sd": 2.230151534995404
+        },
+        "coordinated_wall_s": {
+          "cv": 0.4012975190925971,
+          "max": 8.114979236,
+          "mean": 6.2547699615,
+          "median": 7.245323504,
+          "min": 1.687354395,
+          "n": 6,
+          "range": 6.427624841,
+          "sample_sd": 2.510023668044849
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.4012975190925971,
+          "max": 8.114979236,
+          "mean": 6.2547699615,
+          "median": 7.245323504,
+          "min": 1.687354395,
+          "n": 6,
+          "range": 6.427624841,
+          "sample_sd": 2.510023668044849
+        },
+        "practical_total_wall_s": {
+          "cv": 0.4012975190925971,
+          "max": 8.114979236,
+          "mean": 6.2547699615,
+          "median": 7.245323504,
+          "min": 1.687354395,
+          "n": 6,
+          "range": 6.427624841,
+          "sample_sd": 2.510023668044849
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.3144101062793879,
+          "max": 2.18735446982741,
+          "mean": 1.3552346390751888,
+          "median": 1.2046833008114488,
+          "min": 1.062796720783263,
+          "n": 6,
+          "range": 1.124557749044147,
+          "sample_sd": 0.42609946690513806
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.8474618915296208,
+          "max": 7.295365120970926,
+          "mean": 2.690606669035868,
+          "median": 1.709918409529811,
+          "min": 1.5169313490526841,
+          "n": 6,
+          "range": 5.778433771918242,
+          "sample_sd": 2.280186617103349
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.8474618915296208,
+          "max": 7.295365120970926,
+          "mean": 2.690606669035868,
+          "median": 1.709918409529811,
+          "min": 1.5169313490526841,
+          "n": 6,
+          "range": 5.778433771918242,
+          "sample_sd": 2.280186617103349
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.8474618915296208,
+          "max": 7.295365120970926,
+          "mean": 2.690606669035868,
+          "median": 1.709918409529811,
+          "min": 1.5169313490526841,
+          "n": 6,
+          "range": 5.778433771918242,
+          "sample_sd": 2.280186617103349
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.8476693130363527,
+          "max": 7.297862351401927,
+          "mean": 2.691103773082442,
+          "median": 1.7100424378900734,
+          "min": 1.5169479205594307,
+          "n": 6,
+          "range": 5.780914430842497,
+          "sample_sd": 2.2811660866383305
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.4013449846422341,
+          "max": 8.114890586,
+          "mean": 6.2544020898333335,
+          "median": 7.244809759000001,
+          "min": 1.686777005,
+          "n": 6,
+          "range": 6.428113581,
+          "sample_sd": 2.510172910690516
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.11337298943257038,
+        "max": 2.5285525330276264,
+        "mean": 2.1907639007470814,
+        "median": 2.253155490247189,
+        "min": 1.8963811980208163,
+        "n": 6,
+        "range": 0.6321713350068101,
+        "sample_sd": 0.2483734525686555
+      },
+      "arm": "ONEFILE_PROCESSES",
+      "backend": "processes",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r6-attempt001.json"
+      ],
+      "volume_slot": "v1",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 1.2705083181719157,
+          "max": 65.8057589,
+          "mean": 18.318216216666666,
+          "median": 8.78939015,
+          "min": 8.1334954,
+          "n": 6,
+          "range": 57.6722635,
+          "sample_sd": 23.27344607734668
+        },
+        "coordinated_wall_s": {
+          "cv": 0.11621776590549913,
+          "max": 6.491240481,
+          "mean": 5.681145489333334,
+          "median": 5.463528668,
+          "min": 4.868345126,
+          "n": 6,
+          "range": 1.6228953549999998,
+          "sample_sd": 0.6602500365544237
+        },
+        "full_process_wall_s": {
+          "cv": 0.11398349548083879,
+          "max": 6.596542194,
+          "mean": 5.7869819455,
+          "median": 5.569053310499999,
+          "min": 4.979464567,
+          "n": 6,
+          "range": 1.6170776270000005,
+          "sample_sd": 0.6596204304325949
+        },
+        "parent_wall_s": {
+          "cv": 0.11621776590549913,
+          "max": 6.491240481,
+          "mean": 5.681145489333334,
+          "median": 5.463528668,
+          "min": 4.868345126,
+          "n": 6,
+          "range": 1.6228953549999998,
+          "sample_sd": 0.6602500365544237
+        },
+        "practical_total_wall_s": {
+          "cv": 0.11398349548083879,
+          "max": 6.596542194,
+          "mean": 5.7869819455,
+          "median": 5.569053310499999,
+          "min": 4.979464567,
+          "n": 6,
+          "range": 1.6170776270000005,
+          "sample_sd": 0.6596204304325949
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.421638180406013,
+          "max": 1.5134780060243227,
+          "mean": 1.2002992797196566,
+          "median": 1.4005475734283914,
+          "min": 0.1870636644234491,
+          "n": 6,
+          "range": 1.3264143416008736,
+          "sample_sd": 0.506092004243644
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.11337298943257038,
+          "max": 2.5285525330276264,
+          "mean": 2.1907639007470814,
+          "median": 2.253155490247189,
+          "min": 1.8963811980208163,
+          "n": 6,
+          "range": 0.6321713350068101,
+          "sample_sd": 0.2483734525686555
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": 0.11111273176935767,
+          "max": 2.472126517694327,
+          "mean": 2.1497802993065487,
+          "median": 2.2104578399694317,
+          "min": 1.8661089458651008,
+          "n": 6,
+          "range": 0.606017571829226,
+          "sample_sd": 0.238867961759898
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.11337298943257038,
+          "max": 2.5285525330276264,
+          "mean": 2.1907639007470814,
+          "median": 2.253155490247189,
+          "min": 1.8963811980208163,
+          "n": 6,
+          "range": 0.6321713350068101,
+          "sample_sd": 0.2483734525686555
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.11111273176935767,
+          "max": 2.472126517694327,
+          "mean": 2.1497802993065487,
+          "median": 2.2104578399694317,
+          "min": 1.8661089458651008,
+          "n": 6,
+          "range": 0.606017571829226,
+          "sample_sd": 0.238867961759898
+        },
+        "rate_for_startup_wall_s": {
+          "cv": 0.02692066651603216,
+          "max": 129.12899043593814,
+          "mean": 123.8738774013913,
+          "median": 124.1908052250473,
+          "min": 118.8097840600535,
+          "n": 6,
+          "range": 10.319206375884633,
+          "sample_sd": 3.3347673435707077
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.11342635308854142,
+          "max": 2.529328885312071,
+          "mean": 2.191200132358723,
+          "median": 2.253481311467227,
+          "min": 1.8966618941662146,
+          "n": 6,
+          "range": 0.6326669911458562,
+          "sample_sd": 0.2485398399005792
+        },
+        "startup_wall_s": {
+          "cv": 0.026912810294343642,
+          "max": 0.103609871,
+          "mean": 0.09943419383333334,
+          "median": 0.0991206295,
+          "min": 0.095329998,
+          "n": 6,
+          "range": 0.008279873000000007,
+          "sample_sd": 0.0026760535954074944
+        },
+        "worker_envelope_s": {
+          "cv": 0.11626410930292945,
+          "max": 6.490279811,
+          "mean": 5.680068681,
+          "median": 5.462739508,
+          "min": 4.866850836,
+          "n": 6,
+          "range": 1.6234289749999995,
+          "sample_sd": 0.6603881259759303
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.38443047870581254,
+        "max": 4.790285617474531,
+        "mean": 2.7079741077534925,
+        "median": 2.420636228261288,
+        "min": 1.9089325103944415,
+        "n": 6,
+        "range": 2.8813531070800895,
+        "sample_sd": 1.0410277825666208
+      },
+      "arm": "ONEFILE_PROCESSES",
+      "backend": "processes",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r6-attempt001.json"
+      ],
+      "volume_slot": "v2",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.14886568226464408,
+          "max": 11.9433827,
+          "mean": 9.472218116666667,
+          "median": 8.920383900000001,
+          "min": 8.2850139,
+          "n": 6,
+          "range": 3.6583688000000016,
+          "sample_sd": 1.4100882124971055
+        },
+        "coordinated_wall_s": {
+          "cv": 0.2598102229577473,
+          "max": 6.448560299,
+          "mean": 4.945911422833333,
+          "median": 5.0867827405,
+          "min": 2.569756249,
+          "n": 6,
+          "range": 3.8788040500000003,
+          "sample_sd": 1.2849983494955974
+        },
+        "full_process_wall_s": {
+          "cv": 0.2543592876566769,
+          "max": 6.543538688,
+          "mean": 5.049603244,
+          "median": 5.189496239,
+          "min": 2.671459201,
+          "n": 6,
+          "range": 3.872079487,
+          "sample_sd": 1.2844134840926849
+        },
+        "parent_wall_s": {
+          "cv": 0.2598102229577473,
+          "max": 6.448560299,
+          "mean": 4.945911422833333,
+          "median": 5.0867827405,
+          "min": 2.569756249,
+          "n": 6,
+          "range": 3.8788040500000003,
+          "sample_sd": 1.2849983494955974
+        },
+        "practical_total_wall_s": {
+          "cv": 0.2543592876566769,
+          "max": 6.543538688,
+          "mean": 5.049603244,
+          "median": 5.189496239,
+          "min": 2.671459201,
+          "n": 6,
+          "range": 3.872079487,
+          "sample_sd": 1.2844134840926849
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.13301031371158928,
+          "max": 1.4857991246097972,
+          "mean": 1.3212804375711171,
+          "median": 1.3800490154576281,
+          "min": 1.0306850838833121,
+          "n": 6,
+          "range": 0.4551140407264851,
+          "sample_sd": 0.17574392550232024
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.38443047870581254,
+          "max": 4.790285617474531,
+          "mean": 2.7079741077534925,
+          "median": 2.420636228261288,
+          "min": 1.9089325103944415,
+          "n": 6,
+          "range": 2.8813531070800895,
+          "sample_sd": 1.0410277825666208
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": 0.3726316264670075,
+          "max": 4.607918547059255,
+          "mean": 2.640813260605316,
+          "median": 2.37272881391105,
+          "min": 1.8812246686299412,
+          "n": 6,
+          "range": 2.726693878429314,
+          "sample_sd": 0.9840505404950002
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.38443047870581254,
+          "max": 4.790285617474531,
+          "mean": 2.7079741077534925,
+          "median": 2.420636228261288,
+          "min": 1.9089325103944415,
+          "n": 6,
+          "range": 2.8813531070800895,
+          "sample_sd": 1.0410277825666208
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.3726316264670075,
+          "max": 4.607918547059255,
+          "mean": 2.640813260605316,
+          "median": 2.37272881391105,
+          "min": 1.8812246686299412,
+          "n": 6,
+          "range": 2.726693878429314,
+          "sample_sd": 0.9840505404950002
+        },
+        "rate_for_startup_wall_s": {
+          "cv": 0.05777272513054182,
+          "max": 138.04243077887548,
+          "mean": 126.94412936877029,
+          "median": 127.45591014466363,
+          "min": 117.60113886522802,
+          "n": 6,
+          "range": 20.44129191364746,
+          "sample_sd": 7.333908292957907
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.3845351640088697,
+          "max": 4.791865236927713,
+          "mean": 2.708543282343551,
+          "median": 2.421042455812219,
+          "min": 1.9091746119590731,
+          "n": 6,
+          "range": 2.8826906249686397,
+          "sample_sd": 1.0415301353010997
+        },
+        "startup_wall_s": {
+          "cv": 0.05735094798075287,
+          "max": 0.104674721,
+          "mean": 0.097238876,
+          "median": 0.0966158255,
+          "min": 0.089174512,
+          "n": 6,
+          "range": 0.015500209000000001,
+          "sample_sd": 0.005576741719182879
+        },
+        "worker_envelope_s": {
+          "cv": 0.25985907375189543,
+          "max": 6.44774256,
+          "mean": 4.94506742,
+          "median": 5.0859279355,
+          "min": 2.568909139,
+          "n": 6,
+          "range": 3.878833421,
+          "sample_sd": 1.2850206394018753
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.34772507960113835,
+        "max": 2.6326774906583172,
+        "mean": 1.8357119488916696,
+        "median": 1.797724442347419,
+        "min": 1.0771679772712268,
+        "n": 6,
+        "range": 1.5555095133870904,
+        "sample_sd": 0.6383230835531166
+      },
+      "arm": "ONEFILE_THREADS",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r6-attempt001.json"
+      ],
+      "volume_slot": "v1",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.277260637391429,
+          "max": 14.3118004,
+          "mean": 11.1406426,
+          "median": 11.17020095,
+          "min": 7.7033349,
+          "n": 6,
+          "range": 6.608465499999999,
+          "sample_sd": 3.0888616682261065
+        },
+        "coordinated_wall_s": {
+          "cv": 0.3630870901989161,
+          "max": 11.427991418,
+          "mean": 7.473428690166667,
+          "median": 7.0063129195,
+          "min": 4.675797337,
+          "n": 6,
+          "range": 6.752194081,
+          "sample_sd": 2.713505476921712
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.3630870901989161,
+          "max": 11.427991418,
+          "mean": 7.473428690166667,
+          "median": 7.0063129195,
+          "min": 4.675797337,
+          "n": 6,
+          "range": 6.752194081,
+          "sample_sd": 2.713505476921712
+        },
+        "practical_total_wall_s": {
+          "cv": 0.3630870901989161,
+          "max": 11.427991418,
+          "mean": 7.473428690166667,
+          "median": 7.0063129195,
+          "min": 4.675797337,
+          "n": 6,
+          "range": 6.752194081,
+          "sample_sd": 2.713505476921712
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.2825269309586813,
+          "max": 1.5979918515550973,
+          "mean": 1.1817013388498367,
+          "median": 1.1423386971184064,
+          "min": 0.8601200447149892,
+          "n": 6,
+          "range": 0.7378718068401081,
+          "sample_sd": 0.33386245257500907
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.34772507960113835,
+          "max": 2.6326774906583172,
+          "mean": 1.8357119488916696,
+          "median": 1.797724442347419,
+          "min": 1.0771679772712268,
+          "n": 6,
+          "range": 1.5555095133870904,
+          "sample_sd": 0.6383230835531166
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.34772507960113835,
+          "max": 2.6326774906583172,
+          "mean": 1.8357119488916696,
+          "median": 1.797724442347419,
+          "min": 1.0771679772712268,
+          "n": 6,
+          "range": 1.5555095133870904,
+          "sample_sd": 0.6383230835531166
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.34772507960113835,
+          "max": 2.6326774906583172,
+          "mean": 1.8357119488916696,
+          "median": 1.797724442347419,
+          "min": 1.0771679772712268,
+          "n": 6,
+          "range": 1.5555095133870904,
+          "sample_sd": 0.6383230835531166
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.34774291276332064,
+          "max": 2.632995226319077,
+          "mean": 1.8358641978671644,
+          "median": 1.7979106388395882,
+          "min": 1.0771884521619597,
+          "n": 6,
+          "range": 1.5558067741571173,
+          "sample_sd": 0.6384087636042249
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.36311430035778774,
+          "max": 11.427774198,
+          "mean": 7.472913905833333,
+          "median": 7.005741315,
+          "min": 4.675233087,
+          "n": 6,
+          "range": 6.752541111,
+          "sample_sd": 2.7135219045506536
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.07688016927824828,
+        "max": 2.279421930665509,
+        "mean": 2.0114672899234436,
+        "median": 1.9752560251291174,
+        "min": 1.8217071871677348,
+        "n": 6,
+        "range": 0.45771474349777397,
+        "sample_sd": 0.15464194574697365
+      },
+      "arm": "ONEFILE_THREADS",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r6-attempt001.json"
+      ],
+      "volume_slot": "v2",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 1.0448966588813382,
+          "max": 69.5034337,
+          "mean": 29.519579733333334,
+          "median": 9.93259555,
+          "min": 9.241133,
+          "n": 6,
+          "range": 60.262300700000004,
+          "sample_sd": 30.844910234941263
+        },
+        "coordinated_wall_s": {
+          "cv": 0.0738100628352472,
+          "max": 6.757324386,
+          "mean": 6.148832407333333,
+          "median": 6.2322048105,
+          "min": 5.400433432,
+          "n": 6,
+          "range": 1.3568909539999998,
+          "sample_sd": 0.4538457063486776
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.0738100628352472,
+          "max": 6.757324386,
+          "mean": 6.148832407333333,
+          "median": 6.2322048105,
+          "min": 5.400433432,
+          "n": 6,
+          "range": 1.3568909539999998,
+          "sample_sd": 0.4538457063486776
+        },
+        "practical_total_wall_s": {
+          "cv": 0.0738100628352472,
+          "max": 6.757324386,
+          "mean": 6.148832407333333,
+          "median": 6.2322048105,
+          "min": 5.400433432,
+          "n": 6,
+          "range": 1.3568909539999998,
+          "sample_sd": 0.4538457063486776
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.6256036212245628,
+          "max": 1.3320732858189577,
+          "mean": 0.9140981635208166,
+          "median": 1.239368855101601,
+          "min": 0.1771116295222692,
+          "n": 6,
+          "range": 1.1549616562966885,
+          "sample_sd": 0.5718631212533455
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.07688016927824828,
+          "max": 2.279421930665509,
+          "mean": 2.0114672899234436,
+          "median": 1.9752560251291174,
+          "min": 1.8217071871677348,
+          "n": 6,
+          "range": 0.45771474349777397,
+          "sample_sd": 0.15464194574697365
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.07688016927824828,
+          "max": 2.279421930665509,
+          "mean": 2.0114672899234436,
+          "median": 1.9752560251291174,
+          "min": 1.8217071871677348,
+          "n": 6,
+          "range": 0.45771474349777397,
+          "sample_sd": 0.15464194574697365
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.07688016927824828,
+          "max": 2.279421930665509,
+          "mean": 2.0114672899234436,
+          "median": 1.9752560251291174,
+          "min": 1.8217071871677348,
+          "n": 6,
+          "range": 0.45771474349777397,
+          "sample_sd": 0.15464194574697365
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.07686107770295518,
+          "max": 2.2794623878755886,
+          "mean": 2.0115414984600912,
+          "median": 1.9752914654940577,
+          "min": 1.8218524994191037,
+          "n": 6,
+          "range": 0.457609888456485,
+          "sample_sd": 0.15460924741585996
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.0737896505136228,
+          "max": 6.756785417,
+          "mean": 6.148590352499999,
+          "median": 6.2320934855,
+          "min": 5.400337582,
+          "n": 6,
+          "range": 1.356447835,
+          "sample_sd": 0.4537023332624078
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 1.459833866810442,
+        "max": 21.09843895292223,
+        "mean": 5.304857133690797,
+        "median": 2.3545027198872823,
+        "min": 1.6428096141643214,
+        "n": 6,
+        "range": 19.45562933875791,
+        "sample_sd": 7.7442101023527945
+      },
+      "arm": "SHARDS_PROCESSES",
+      "backend": "processes",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r6-attempt001.json"
+      ],
+      "volume_slot": "v1",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.3320909937655895,
+          "max": 12.3077837,
+          "mean": 8.5441002,
+          "median": 8.6124408,
+          "min": 3.5975118,
+          "n": 6,
+          "range": 8.7102719,
+          "sample_sd": 2.837418726250772
+        },
+        "coordinated_wall_s": {
+          "cv": 0.47529695904464575,
+          "max": 7.493178938,
+          "mean": 5.0019343743333335,
+          "median": 5.2283980865,
+          "min": 0.583449156,
+          "n": 6,
+          "range": 6.909729781999999,
+          "sample_sd": 2.3774041974615163
+        },
+        "full_process_wall_s": {
+          "cv": 0.4659992763981538,
+          "max": 7.617497123,
+          "mean": 5.1044917315000005,
+          "median": 5.322120029500001,
+          "min": 0.689604749,
+          "n": 6,
+          "range": 6.927892374,
+          "sample_sd": 2.3786894532593594
+        },
+        "parent_wall_s": {
+          "cv": 0.47529695904464575,
+          "max": 7.493178938,
+          "mean": 5.0019343743333335,
+          "median": 5.2283980865,
+          "min": 0.583449156,
+          "n": 6,
+          "range": 6.909729781999999,
+          "sample_sd": 2.3774041974615163
+        },
+        "practical_total_wall_s": {
+          "cv": 0.4659992763981538,
+          "max": 7.617497123,
+          "mean": 5.1044917315000005,
+          "median": 5.322120029500001,
+          "min": 0.689604749,
+          "n": 6,
+          "range": 6.927892374,
+          "sample_sd": 2.3786894532593594
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.5252363751707418,
+          "max": 3.421772348321415,
+          "mean": 1.6689480450646503,
+          "median": 1.4300236479257626,
+          "min": 1.0001692181184496,
+          "n": 6,
+          "range": 2.4216031302029655,
+          "sample_sd": 0.8765922215380528
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 1.459833866810442,
+          "max": 21.09843895292223,
+          "mean": 5.304857133690797,
+          "median": 2.3545027198872823,
+          "min": 1.6428096141643214,
+          "n": 6,
+          "range": 19.45562933875791,
+          "sample_sd": 7.7442101023527945
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": 1.3597721368940967,
+          "max": 17.850611408710005,
+          "mean": 4.732129533093886,
+          "median": 2.3130489064715656,
+          "min": 1.615998824972579,
+          "n": 6,
+          "range": 16.234612583737427,
+          "sample_sd": 6.4346178872747375
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 1.459833866810442,
+          "max": 21.09843895292223,
+          "mean": 5.304857133690797,
+          "median": 2.3545027198872823,
+          "min": 1.6428096141643214,
+          "n": 6,
+          "range": 19.45562933875791,
+          "sample_sd": 7.7442101023527945
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 1.3597721368940967,
+          "max": 17.850611408710005,
+          "mean": 4.732129533093886,
+          "median": 2.3130489064715656,
+          "min": 1.615998824972579,
+          "n": 6,
+          "range": 16.234612583737427,
+          "sample_sd": 6.4346178872747375
+        },
+        "rate_for_startup_wall_s": {
+          "cv": 0.11299718528356106,
+          "max": 145.33546717866864,
+          "mean": 129.5320766774256,
+          "median": 130.8430242203108,
+          "min": 106.73071018076104,
+          "n": 6,
+          "range": 38.6047569979076,
+          "sample_sd": 14.6367600684835
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 1.4608115919240587,
+          "max": 21.13471700341993,
+          "mean": 5.3113042901859515,
+          "median": 2.3549833871615524,
+          "min": 1.6432011597161011,
+          "n": 6,
+          "range": 19.49151584370383,
+          "sample_sd": 7.758814875339623
+        },
+        "startup_wall_s": {
+          "cv": 0.11980292023431664,
+          "max": 0.115335749,
+          "mean": 0.096113014,
+          "median": 0.094312589,
+          "min": 0.084699672,
+          "n": 6,
+          "range": 0.030636076999999998,
+          "sample_sd": 0.011514619749721759
+        },
+        "worker_envelope_s": {
+          "cv": 0.4753761915944108,
+          "max": 7.491393447,
+          "mean": 5.0006756245,
+          "median": 5.227332127,
+          "min": 0.582447657,
+          "n": 6,
+          "range": 6.90894579,
+          "sample_sd": 2.377202133773812
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.3338442915383918,
+        "max": 2.444782194052966,
+        "mean": 1.9427515629825372,
+        "median": 2.2619611750242394,
+        "min": 1.0968866125247716,
+        "n": 6,
+        "range": 1.3478955815281946,
+        "sample_sd": 0.6485765191790085
+      },
+      "arm": "SHARDS_PROCESSES",
+      "backend": "processes",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r6-attempt001.json"
+      ],
+      "volume_slot": "v2",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.2923296083284739,
+          "max": 18.0467443,
+          "mean": 12.18200745,
+          "median": 11.9278701,
+          "min": 8.5222866,
+          "n": 6,
+          "range": 9.524457700000001,
+          "sample_sd": 3.5611614665130507
+        },
+        "coordinated_wall_s": {
+          "cv": 0.4144348607342368,
+          "max": 11.22255141,
+          "mean": 7.157030134666666,
+          "median": 5.473661164,
+          "min": 5.035158727,
+          "n": 6,
+          "range": 6.187392683,
+          "sample_sd": 2.9661227871313156
+        },
+        "full_process_wall_s": {
+          "cv": 0.4095597916001122,
+          "max": 11.326689474,
+          "mean": 7.251683681333333,
+          "median": 5.57092398,
+          "min": 5.114262156,
+          "n": 6,
+          "range": 6.2124273180000005,
+          "sample_sd": 2.9699980572768143
+        },
+        "parent_wall_s": {
+          "cv": 0.4144348607342368,
+          "max": 11.22255141,
+          "mean": 7.157030134666666,
+          "median": 5.473661164,
+          "min": 5.035158727,
+          "n": 6,
+          "range": 6.187392683,
+          "sample_sd": 2.9661227871313156
+        },
+        "practical_total_wall_s": {
+          "cv": 0.4095597916001122,
+          "max": 11.326689474,
+          "mean": 7.251683681333333,
+          "median": 5.57092398,
+          "min": 5.114262156,
+          "n": 6,
+          "range": 6.2124273180000005,
+          "sample_sd": 2.9699980572768143
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.2767333427685724,
+          "max": 1.4444323428409462,
+          "mean": 1.0813058621783778,
+          "median": 1.0332261520371024,
+          "min": 0.6821100911813772,
+          "n": 6,
+          "range": 0.762322251659569,
+          "sample_sd": 0.2992333857958758
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.3338442915383918,
+          "max": 2.444782194052966,
+          "mean": 1.9427515629825372,
+          "median": 2.2619611750242394,
+          "min": 1.0968866125247716,
+          "n": 6,
+          "range": 1.3478955815281946,
+          "sample_sd": 0.6485765191790085
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": 0.3306371143511237,
+          "max": 2.406968204701472,
+          "mean": 1.9121537672065445,
+          "median": 2.2218764250858447,
+          "min": 1.0868017904310738,
+          "n": 6,
+          "range": 1.3201664142703984,
+          "sample_sd": 0.6322290037848022
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.3338442915383918,
+          "max": 2.444782194052966,
+          "mean": 1.9427515629825372,
+          "median": 2.2619611750242394,
+          "min": 1.0968866125247716,
+          "n": 6,
+          "range": 1.3478955815281946,
+          "sample_sd": 0.6485765191790085
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.3306371143511237,
+          "max": 2.406968204701472,
+          "mean": 1.9121537672065445,
+          "median": 2.2218764250858447,
+          "min": 1.0868017904310738,
+          "n": 6,
+          "range": 1.3201664142703984,
+          "sample_sd": 0.6322290037848022
+        },
+        "rate_for_startup_wall_s": {
+          "cv": 0.11093993709153924,
+          "max": 170.92298064421334,
+          "mean": 140.83977990187836,
+          "median": 138.17084358417364,
+          "min": 126.29661166316005,
+          "n": 6,
+          "range": 44.62636898105329,
+          "sample_sd": 15.624756322300618
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.33385391435722117,
+          "max": 2.4450368340623347,
+          "mean": 1.9430138332573335,
+          "median": 2.262356035402606,
+          "min": 1.0969667872582205,
+          "n": 6,
+          "range": 1.3480700468041142,
+          "sample_sd": 0.6486827738831898
+        },
+        "startup_wall_s": {
+          "cv": 0.0987756120661325,
+          "max": 0.097467907,
+          "mean": 0.08820561233333334,
+          "median": 0.0890916415,
+          "min": 0.072019961,
+          "n": 6,
+          "range": 0.025447946000000013,
+          "sample_sd": 0.008712563345893007
+        },
+        "worker_envelope_s": {
+          "cv": 0.4144643337019764,
+          "max": 11.22173118,
+          "mean": 7.156159992166667,
+          "median": 5.4726781255,
+          "min": 5.034634337,
+          "n": 6,
+          "range": 6.187096843000001,
+          "sample_sd": 2.965973083018098
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.15681525802580787,
+        "max": 2.425668357005931,
+        "mean": 2.0721754175701506,
+        "median": 2.1219123760432677,
+        "min": 1.5852817811112432,
+        "n": 6,
+        "range": 0.8403865758946878,
+        "sample_sd": 0.32494872278099934
+      },
+      "arm": "SHARDS_THREADS",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r6-attempt001.json"
+      ],
+      "volume_slot": "v1",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.8006430426213882,
+          "max": 39.402052,
+          "mean": 15.350823733333332,
+          "median": 9.57309405,
+          "min": 8.0895589,
+          "n": 6,
+          "range": 31.312493099999998,
+          "sample_sd": 12.290530220600616
+        },
+        "coordinated_wall_s": {
+          "cv": 0.16929451528120676,
+          "max": 7.765096746,
+          "mean": 6.073973068833333,
+          "median": 5.826799401000001,
+          "min": 5.074834886,
+          "n": 6,
+          "range": 2.6902618600000006,
+          "sample_sd": 1.0282903265192431
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.16929451528120676,
+          "max": 7.765096746,
+          "mean": 6.073973068833333,
+          "median": 5.826799401000001,
+          "min": 5.074834886,
+          "n": 6,
+          "range": 2.6902618600000006,
+          "sample_sd": 1.0282903265192431
+        },
+        "practical_total_wall_s": {
+          "cv": 0.16929451528120676,
+          "max": 7.765096746,
+          "mean": 6.073973068833333,
+          "median": 5.826799401000001,
+          "min": 5.074834886,
+          "n": 6,
+          "range": 2.6902618600000006,
+          "sample_sd": 1.0282903265192431
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.4489914555689365,
+          "max": 1.5216980990150155,
+          "mean": 1.109500257325923,
+          "median": 1.3050115700959255,
+          "min": 0.3124168863083578,
+          "n": 6,
+          "range": 1.2092812127066577,
+          "sample_sd": 0.49815613549087573
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.15681525802580787,
+          "max": 2.425668357005931,
+          "mean": 2.0721754175701506,
+          "median": 2.1219123760432677,
+          "min": 1.5852817811112432,
+          "n": 6,
+          "range": 0.8403865758946878,
+          "sample_sd": 0.32494872278099934
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.15681525802580787,
+          "max": 2.425668357005931,
+          "mean": 2.0721754175701506,
+          "median": 2.1219123760432677,
+          "min": 1.5852817811112432,
+          "n": 6,
+          "range": 0.8403865758946878,
+          "sample_sd": 0.32494872278099934
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.15681525802580787,
+          "max": 2.425668357005931,
+          "mean": 2.0721754175701506,
+          "median": 2.1219123760432677,
+          "min": 1.5852817811112432,
+          "n": 6,
+          "range": 0.8403865758946878,
+          "sample_sd": 0.32494872278099934
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.1568113752244126,
+          "max": 2.4257339089215577,
+          "mean": 2.0722378499517853,
+          "median": 2.121969985590229,
+          "min": 1.5853645212041074,
+          "n": 6,
+          "range": 0.8403693877174503,
+          "sample_sd": 0.32495046704301944
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.16928661747990487,
+          "max": 7.764691486,
+          "mean": 6.0737805455,
+          "median": 5.826648486,
+          "min": 5.074697746,
+          "n": 6,
+          "range": 2.6899937400000002,
+          "sample_sd": 1.0282097638629464
+        }
+      }
+    },
+    {
+      "aggregate_gb_per_s": {
+        "cv": 0.10724207483048877,
+        "max": 2.492137577427605,
+        "mean": 2.2093146160564245,
+        "median": 2.275750339138561,
+        "min": 1.8409963985038569,
+        "n": 6,
+        "range": 0.651141178923748,
+        "sample_sd": 0.23693148337921566
+      },
+      "arm": "SHARDS_THREADS",
+      "backend": "threads",
+      "n": 6,
+      "raw_artifacts": [
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r1-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r2-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r3-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r4-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r5-attempt001.json",
+        "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r6-attempt001.json"
+      ],
+      "volume_slot": "v2",
+      "walls_and_rates": {
+        "client_invocation_wall_s": {
+          "cv": 0.18476147349555422,
+          "max": 13.0283912,
+          "mean": 9.658374783333333,
+          "median": 8.98246425,
+          "min": 8.0898079,
+          "n": 6,
+          "range": 4.9385832999999995,
+          "sample_sd": 1.7844955565409708
+        },
+        "coordinated_wall_s": {
+          "cv": 0.11380806654770838,
+          "max": 6.68652389,
+          "mean": 5.628836197666667,
+          "median": 5.4126605195,
+          "min": 4.939481075,
+          "n": 6,
+          "range": 1.7470428150000004,
+          "sample_sd": 0.6406069645701978
+        },
+        "full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "parent_wall_s": {
+          "cv": 0.11380806654770838,
+          "max": 6.68652389,
+          "mean": 5.628836197666667,
+          "median": 5.4126605195,
+          "min": 4.939481075,
+          "n": 6,
+          "range": 1.7470428150000004,
+          "sample_sd": 0.6406069645701978
+        },
+        "practical_total_wall_s": {
+          "cv": 0.11380806654770838,
+          "max": 6.68652389,
+          "mean": 5.628836197666667,
+          "median": 5.4126605195,
+          "min": 4.939481075,
+          "n": 6,
+          "range": 1.7470428150000004,
+          "sample_sd": 0.6406069645701978
+        },
+        "rate_for_client_invocation_wall_s": {
+          "cv": 0.15583580702177002,
+          "max": 1.5216512619539457,
+          "mean": 1.3055745597346506,
+          "median": 1.3712116595630397,
+          "min": 0.9448493072575224,
+          "n": 6,
+          "range": 0.5768019546964234,
+          "sample_sd": 0.2034552651433414
+        },
+        "rate_for_coordinated_wall_s": {
+          "cv": 0.10724207483048877,
+          "max": 2.492137577427605,
+          "mean": 2.2093146160564245,
+          "median": 2.275750339138561,
+          "min": 1.8409963985038569,
+          "n": 6,
+          "range": 0.651141178923748,
+          "sample_sd": 0.23693148337921566
+        },
+        "rate_for_full_process_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_parent_wall_s": {
+          "cv": 0.10724207483048877,
+          "max": 2.492137577427605,
+          "mean": 2.2093146160564245,
+          "median": 2.275750339138561,
+          "min": 1.8409963985038569,
+          "n": 6,
+          "range": 0.651141178923748,
+          "sample_sd": 0.23693148337921566
+        },
+        "rate_for_practical_total_wall_s": {
+          "cv": 0.10724207483048877,
+          "max": 2.492137577427605,
+          "mean": 2.2093146160564245,
+          "median": 2.275750339138561,
+          "min": 1.8409963985038569,
+          "n": 6,
+          "range": 0.651141178923748,
+          "sample_sd": 0.23693148337921566
+        },
+        "rate_for_startup_wall_s": {
+          "cv": null,
+          "max": null,
+          "mean": null,
+          "median": null,
+          "min": null,
+          "n": 0,
+          "range": null,
+          "sample_sd": null
+        },
+        "rate_for_worker_envelope_s": {
+          "cv": 0.10724757326448896,
+          "max": 2.4922003985755987,
+          "mean": 2.209359161854227,
+          "median": 2.2757892466872427,
+          "min": 1.841010900215914,
+          "n": 6,
+          "range": 0.6511894983596846,
+          "sample_sd": 0.2369484085785311
+        },
+        "startup_wall_s": {
+          "cv": null,
+          "max": 0.0,
+          "mean": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "n": 6,
+          "range": 0.0,
+          "sample_sd": 0.0
+        },
+        "worker_envelope_s": {
+          "cv": 0.11381453061213676,
+          "max": 6.68647122,
+          "mean": 5.628728903,
+          "median": 5.412568090500001,
+          "min": 4.939356565,
+          "n": 6,
+          "range": 1.7471146549999998,
+          "sample_sd": 0.6406311380379124
+        }
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "delta_percent": -15.761134216976602,
+      "left": "BASELINE_OPT",
+      "left_median_gb_per_s": 2.134079590978673,
+      "right": "ONEFILE_THREADS",
+      "right_median_gb_per_s": 1.797724442347419,
+      "status": "observed",
+      "volume_slot": "v1"
+    },
+    {
+      "delta_percent": 15.517560026286178,
+      "left": "BASELINE_OPT",
+      "left_median_gb_per_s": 1.709918409529811,
+      "right": "ONEFILE_THREADS",
+      "right_median_gb_per_s": 1.9752560251291174,
+      "status": "observed",
+      "volume_slot": "v2"
+    },
+    {
+      "delta_percent": 25.333751779281634,
+      "left": "ONEFILE_THREADS",
+      "left_median_gb_per_s": 1.797724442347419,
+      "right": "ONEFILE_PROCESSES",
+      "right_median_gb_per_s": 2.253155490247189,
+      "status": "observed",
+      "volume_slot": "v1"
+    },
+    {
+      "delta_percent": 22.54797340021061,
+      "left": "ONEFILE_THREADS",
+      "left_median_gb_per_s": 1.9752560251291174,
+      "right": "ONEFILE_PROCESSES",
+      "right_median_gb_per_s": 2.420636228261288,
+      "status": "observed",
+      "volume_slot": "v2"
+    },
+    {
+      "delta_percent": 18.033238357294234,
+      "left": "ONEFILE_THREADS",
+      "left_median_gb_per_s": 1.797724442347419,
+      "right": "SHARDS_THREADS",
+      "right_median_gb_per_s": 2.1219123760432677,
+      "status": "observed",
+      "volume_slot": "v1"
+    },
+    {
+      "delta_percent": 15.212929877776288,
+      "left": "ONEFILE_THREADS",
+      "left_median_gb_per_s": 1.9752560251291174,
+      "right": "SHARDS_THREADS",
+      "right_median_gb_per_s": 2.275750339138561,
+      "status": "observed",
+      "volume_slot": "v2"
+    },
+    {
+      "delta_percent": 4.498013123318651,
+      "left": "ONEFILE_PROCESSES",
+      "left_median_gb_per_s": 2.253155490247189,
+      "right": "SHARDS_PROCESSES",
+      "right_median_gb_per_s": 2.3545027198872823,
+      "status": "observed",
+      "volume_slot": "v1"
+    },
+    {
+      "delta_percent": -6.555097018895024,
+      "left": "ONEFILE_PROCESSES",
+      "left_median_gb_per_s": 2.420636228261288,
+      "right": "SHARDS_PROCESSES",
+      "right_median_gb_per_s": 2.2619611750242394,
+      "status": "observed",
+      "volume_slot": "v2"
+    },
+    {
+      "delta_percent": 10.328721095520386,
+      "left": "BASELINE_OPT",
+      "left_median_gb_per_s": 2.134079590978673,
+      "right": "SHARDS_PROCESSES",
+      "right_median_gb_per_s": 2.3545027198872823,
+      "status": "observed",
+      "volume_slot": "v1"
+    },
+    {
+      "delta_percent": 32.28474308585447,
+      "left": "BASELINE_OPT",
+      "left_median_gb_per_s": 1.709918409529811,
+      "right": "SHARDS_PROCESSES",
+      "right_median_gb_per_s": 2.2619611750242394,
+      "status": "observed",
+      "volume_slot": "v2"
+    }
+  ],
+  "complete": true,
+  "decision_arm_configs": {
+    "BASELINE_OPT": {
+      "backend": "threads",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "file_count": 1,
+      "layout": "one_file",
+      "qd": 2,
+      "worker_count": 2
+    },
+    "ONEFILE_PROCESSES": {
+      "backend": "processes",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "file_count": 1,
+      "layout": "one_file",
+      "qd": 8,
+      "worker_count": 8
+    },
+    "ONEFILE_THREADS": {
+      "backend": "threads",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "file_count": 1,
+      "layout": "one_file",
+      "qd": 8,
+      "worker_count": 8
+    },
+    "SHARDS_PROCESSES": {
+      "backend": "processes",
+      "block_size_mib": 4,
+      "fd_policy": "one_per_worker",
+      "file_count": 8,
+      "layout": "eight_shards",
+      "qd": 8,
+      "worker_count": 8
+    },
+    "SHARDS_THREADS": {
+      "backend": "threads",
+      "block_size_mib": 4,
+      "fd_policy": "one_per_worker",
+      "file_count": 8,
+      "layout": "eight_shards",
+      "qd": 8,
+      "worker_count": 8
+    }
+  },
+  "diagnostic_passes": [
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-1-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 1,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "745cb05dccb1475bb2b38899158b9303",
+      "corpus_family": "A",
+      "corpus_id": "746fb6760bad4e2cb7a2f373575097f4",
+      "timing": {
+        "aggregate_gb_per_s": 2.262812078142787,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 5.565061062,
+        "coordinated_wall_s": 5.440074551,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 5.548398422,
+        "parent_wall_s": 5.565061062,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.102498301,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 5.438598771,
+        "worker_first_begin_ns": 821083638,
+        "worker_last_end_ns": 6259682409
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 821389738,
+          "bytes": 1538733300,
+          "end_ns": 5802341887,
+          "read_wall_s": 4.980952149,
+          "worker": 0,
+          "worker_begin_ns": 821389738,
+          "worker_end_ns": 5802341887
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821218818,
+          "bytes": 1538733300,
+          "end_ns": 5664464367,
+          "read_wall_s": 4.843245549,
+          "worker": 1,
+          "worker_begin_ns": 821218818,
+          "worker_end_ns": 5664464367
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821098718,
+          "bytes": 1538733300,
+          "end_ns": 5767654817,
+          "read_wall_s": 4.946556099,
+          "worker": 2,
+          "worker_begin_ns": 821098718,
+          "worker_end_ns": 5767654817
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821323278,
+          "bytes": 1538733300,
+          "end_ns": 5645078697,
+          "read_wall_s": 4.823755419,
+          "worker": 3,
+          "worker_begin_ns": 821323278,
+          "worker_end_ns": 5645078697
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821422038,
+          "bytes": 1538733300,
+          "end_ns": 5556194297,
+          "read_wall_s": 4.734772259,
+          "worker": 4,
+          "worker_begin_ns": 821422038,
+          "worker_end_ns": 5556194297
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821083638,
+          "bytes": 1538733300,
+          "end_ns": 5695264847,
+          "read_wall_s": 4.874181209,
+          "worker": 5,
+          "worker_begin_ns": 821083638,
+          "worker_end_ns": 5695264847
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821612888,
+          "bytes": 1538733300,
+          "end_ns": 5838488147,
+          "read_wall_s": 5.016875259,
+          "worker": 6,
+          "worker_begin_ns": 821612888,
+          "worker_end_ns": 5838488147
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 821280908,
+          "bytes": 1538733300,
+          "end_ns": 6259682409,
+          "read_wall_s": 5.438401501,
+          "worker": 7,
+          "worker_begin_ns": 821280908,
+          "worker_end_ns": 6259682409
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-1-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 1,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "745cb05dccb1475bb2b38899158b9303",
+      "corpus_family": "A",
+      "corpus_id": "746fb6760bad4e2cb7a2f373575097f4",
+      "timing": {
+        "aggregate_gb_per_s": 69.36849225895014,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 0.272348743,
+        "coordinated_wall_s": 0.177456162,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 0.270178303,
+        "parent_wall_s": 0.272348743,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.087789671,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 0.176456722,
+        "worker_first_begin_ns": 6357511320,
+        "worker_last_end_ns": 6533968042
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A2",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6357876770,
+          "bytes": 1538733300,
+          "end_ns": 6512375882,
+          "read_wall_s": 0.154499112,
+          "worker": 0,
+          "worker_begin_ns": 6357876770,
+          "worker_end_ns": 6512375882
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357859000,
+          "bytes": 1538733300,
+          "end_ns": 6511094492,
+          "read_wall_s": 0.153235492,
+          "worker": 1,
+          "worker_begin_ns": 6357859000,
+          "worker_end_ns": 6511094492
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357987240,
+          "bytes": 1538733300,
+          "end_ns": 6517653912,
+          "read_wall_s": 0.159666672,
+          "worker": 2,
+          "worker_begin_ns": 6357987240,
+          "worker_end_ns": 6517653912
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357832700,
+          "bytes": 1538733300,
+          "end_ns": 6533968042,
+          "read_wall_s": 0.176135342,
+          "worker": 3,
+          "worker_begin_ns": 6357832700,
+          "worker_end_ns": 6533968042
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6358001120,
+          "bytes": 1538733300,
+          "end_ns": 6516910432,
+          "read_wall_s": 0.158909312,
+          "worker": 4,
+          "worker_begin_ns": 6358001120,
+          "worker_end_ns": 6516910432
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357816540,
+          "bytes": 1538733300,
+          "end_ns": 6513180752,
+          "read_wall_s": 0.155364212,
+          "worker": 5,
+          "worker_begin_ns": 6357816540,
+          "worker_end_ns": 6513180752
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357544750,
+          "bytes": 1538733300,
+          "end_ns": 6510410442,
+          "read_wall_s": 0.152865692,
+          "worker": 6,
+          "worker_begin_ns": 6357544750,
+          "worker_end_ns": 6510410442
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6357511320,
+          "bytes": 1538733300,
+          "end_ns": 6523808562,
+          "read_wall_s": 0.166297242,
+          "worker": 7,
+          "worker_begin_ns": 6357511320,
+          "worker_end_ns": 6523808562
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-1-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 1,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "745cb05dccb1475bb2b38899158b9303",
+      "corpus_family": "B",
+      "corpus_id": "6877298d39f349d5b8ef3f96690f55df",
+      "timing": {
+        "aggregate_gb_per_s": 2.2730201356069433,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 5.51462562,
+        "coordinated_wall_s": 5.415643358,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 5.512297959,
+        "parent_wall_s": 5.51462562,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.091107901,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 5.415067378,
+        "worker_first_begin_ns": 6634660773,
+        "worker_last_end_ns": 12049728151
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "B1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6635043403,
+          "bytes": 1538733300,
+          "end_ns": 11676278878,
+          "read_wall_s": 5.041235475,
+          "worker": 0,
+          "worker_begin_ns": 6635043403,
+          "worker_end_ns": 11676278878
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6634684483,
+          "bytes": 1538733300,
+          "end_ns": 11127649833,
+          "read_wall_s": 4.49296535,
+          "worker": 1,
+          "worker_begin_ns": 6634684483,
+          "worker_end_ns": 11127649833
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6635921273,
+          "bytes": 1538733300,
+          "end_ns": 12049728151,
+          "read_wall_s": 5.413806878,
+          "worker": 2,
+          "worker_begin_ns": 6635921273,
+          "worker_end_ns": 12049728151
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6635121543,
+          "bytes": 1538733300,
+          "end_ns": 11872843920,
+          "read_wall_s": 5.237722377,
+          "worker": 3,
+          "worker_begin_ns": 6635121543,
+          "worker_end_ns": 11872843920
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6635389573,
+          "bytes": 1538733300,
+          "end_ns": 11741104888,
+          "read_wall_s": 5.105715315,
+          "worker": 4,
+          "worker_begin_ns": 6635389573,
+          "worker_end_ns": 11741104888
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6634660773,
+          "bytes": 1538733300,
+          "end_ns": 11212661973,
+          "read_wall_s": 4.5780012,
+          "worker": 5,
+          "worker_begin_ns": 6634660773,
+          "worker_end_ns": 11212661973
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6635082123,
+          "bytes": 1538733300,
+          "end_ns": 11600765437,
+          "read_wall_s": 4.965683314,
+          "worker": 6,
+          "worker_begin_ns": 6635082123,
+          "worker_end_ns": 11600765437
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6634936463,
+          "bytes": 1538733300,
+          "end_ns": 11646419137,
+          "read_wall_s": 5.011482674,
+          "worker": 7,
+          "worker_begin_ns": 6634936463,
+          "worker_end_ns": 11646419137
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-2-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 2,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "c71c2fd590fd462a93a2d53351d46eaf",
+      "corpus_family": "A",
+      "corpus_id": "fb68c02676ce435fa0de3977797d5bf7",
+      "timing": {
+        "aggregate_gb_per_s": 2.294381797496118,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 5.475802956,
+        "coordinated_wall_s": 5.365221435,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 5.457820764,
+        "parent_wall_s": 5.475802956,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.086841081,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 5.364070635,
+        "worker_first_begin_ns": 760894692,
+        "worker_last_end_ns": 6124965327
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 761079872,
+          "bytes": 1538733300,
+          "end_ns": 5376491277,
+          "read_wall_s": 4.615411405,
+          "worker": 0,
+          "worker_begin_ns": 761079872,
+          "worker_end_ns": 5376491277
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 760894692,
+          "bytes": 1538733300,
+          "end_ns": 5671015497,
+          "read_wall_s": 4.910120805,
+          "worker": 1,
+          "worker_begin_ns": 760894692,
+          "worker_end_ns": 5671015497
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 761194812,
+          "bytes": 1538733300,
+          "end_ns": 5003139492,
+          "read_wall_s": 4.24194468,
+          "worker": 2,
+          "worker_begin_ns": 761194812,
+          "worker_end_ns": 5003139492
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 761156392,
+          "bytes": 1538733300,
+          "end_ns": 5355802686,
+          "read_wall_s": 4.594646294,
+          "worker": 3,
+          "worker_begin_ns": 761156392,
+          "worker_end_ns": 5355802686
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 761112282,
+          "bytes": 1538733300,
+          "end_ns": 5587161284,
+          "read_wall_s": 4.826049002,
+          "worker": 4,
+          "worker_begin_ns": 761112282,
+          "worker_end_ns": 5587161284
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 761036502,
+          "bytes": 1538733300,
+          "end_ns": 6124965327,
+          "read_wall_s": 5.363928825,
+          "worker": 5,
+          "worker_begin_ns": 761036502,
+          "worker_end_ns": 6124965327
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 760938662,
+          "bytes": 1538733300,
+          "end_ns": 5257368490,
+          "read_wall_s": 4.496429828,
+          "worker": 6,
+          "worker_begin_ns": 760938662,
+          "worker_end_ns": 5257368490
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 760990262,
+          "bytes": 1538733300,
+          "end_ns": 5223960985,
+          "read_wall_s": 4.462970723,
+          "worker": 7,
+          "worker_begin_ns": 760990262,
+          "worker_end_ns": 5223960985
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-2-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 2,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "c71c2fd590fd462a93a2d53351d46eaf",
+      "corpus_family": "A",
+      "corpus_id": "fb68c02676ce435fa0de3977797d5bf7",
+      "timing": {
+        "aggregate_gb_per_s": 72.4612345258561,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 0.255790369,
+        "coordinated_wall_s": 0.169882096,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 0.253144011,
+        "parent_wall_s": 0.255790369,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.077501137,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 0.168832937,
+        "worker_first_begin_ns": 6213561889,
+        "worker_last_end_ns": 6382394826
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A2",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6213746309,
+          "bytes": 1538733300,
+          "end_ns": 6365545893,
+          "read_wall_s": 0.151799584,
+          "worker": 0,
+          "worker_begin_ns": 6213746309,
+          "worker_end_ns": 6365545893
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6213658069,
+          "bytes": 1538733300,
+          "end_ns": 6377560108,
+          "read_wall_s": 0.163902039,
+          "worker": 1,
+          "worker_begin_ns": 6213658069,
+          "worker_end_ns": 6377560108
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6213741439,
+          "bytes": 1538733300,
+          "end_ns": 6367796392,
+          "read_wall_s": 0.154054953,
+          "worker": 2,
+          "worker_begin_ns": 6213741439,
+          "worker_end_ns": 6367796392
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6213561889,
+          "bytes": 1538733300,
+          "end_ns": 6371234801,
+          "read_wall_s": 0.157672912,
+          "worker": 3,
+          "worker_begin_ns": 6213561889,
+          "worker_end_ns": 6371234801
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6214108769,
+          "bytes": 1538733300,
+          "end_ns": 6378874038,
+          "read_wall_s": 0.164765269,
+          "worker": 4,
+          "worker_begin_ns": 6214108769,
+          "worker_end_ns": 6378874038
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6214016089,
+          "bytes": 1538733300,
+          "end_ns": 6360778885,
+          "read_wall_s": 0.146762796,
+          "worker": 5,
+          "worker_begin_ns": 6214016089,
+          "worker_end_ns": 6360778885
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6213868899,
+          "bytes": 1538733300,
+          "end_ns": 6382394826,
+          "read_wall_s": 0.168525927,
+          "worker": 6,
+          "worker_begin_ns": 6213868899,
+          "worker_end_ns": 6382394826
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6213721009,
+          "bytes": 1538733300,
+          "end_ns": 6369700102,
+          "read_wall_s": 0.155979093,
+          "worker": 7,
+          "worker_begin_ns": 6213721009,
+          "worker_end_ns": 6369700102
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-2-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 2,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "c71c2fd590fd462a93a2d53351d46eaf",
+      "corpus_family": "B",
+      "corpus_id": "66402a8c0f9a403487cc4ebb983b21ee",
+      "timing": {
+        "aggregate_gb_per_s": 2.029653201266599,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 6.153036106,
+        "coordinated_wall_s": 6.065009723,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 6.150740256,
+        "parent_wall_s": 6.153036106,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.080995695,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 6.064023404,
+        "worker_first_begin_ns": 6474356286,
+        "worker_last_end_ns": 12538379690
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "B1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6474356286,
+          "bytes": 1538733300,
+          "end_ns": 10254167844,
+          "read_wall_s": 3.779811558,
+          "worker": 0,
+          "worker_begin_ns": 6474356286,
+          "worker_end_ns": 10254167844
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474803456,
+          "bytes": 1538733300,
+          "end_ns": 10723536056,
+          "read_wall_s": 4.2487326,
+          "worker": 1,
+          "worker_begin_ns": 6474803456,
+          "worker_end_ns": 10723536056
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474755856,
+          "bytes": 1538733300,
+          "end_ns": 10848260431,
+          "read_wall_s": 4.373504575,
+          "worker": 2,
+          "worker_begin_ns": 6474755856,
+          "worker_end_ns": 10848260431
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474686066,
+          "bytes": 1538733300,
+          "end_ns": 10965340769,
+          "read_wall_s": 4.490654703,
+          "worker": 3,
+          "worker_begin_ns": 6474686066,
+          "worker_end_ns": 10965340769
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474615426,
+          "bytes": 1538733300,
+          "end_ns": 11109239595,
+          "read_wall_s": 4.634624169,
+          "worker": 4,
+          "worker_begin_ns": 6474615426,
+          "worker_end_ns": 11109239595
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474695226,
+          "bytes": 1538733300,
+          "end_ns": 12538379690,
+          "read_wall_s": 6.063684464,
+          "worker": 5,
+          "worker_begin_ns": 6474695226,
+          "worker_end_ns": 12538379690
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474769156,
+          "bytes": 1538733300,
+          "end_ns": 10870287821,
+          "read_wall_s": 4.395518665,
+          "worker": 6,
+          "worker_begin_ns": 6474769156,
+          "worker_end_ns": 10870287821
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6474398606,
+          "bytes": 1538733300,
+          "end_ns": 10519115677,
+          "read_wall_s": 4.044717071,
+          "worker": 7,
+          "worker_begin_ns": 6474398606,
+          "worker_end_ns": 10519115677
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-3-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 3,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "e0938fad2ce54aa88b45c0b8790f907d",
+      "corpus_family": "A",
+      "corpus_id": "180a6167ea5f43a2913b1a79adacd072",
+      "timing": {
+        "aggregate_gb_per_s": 2.367243774475912,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 5.321467545,
+        "coordinated_wall_s": 5.200083968,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 5.306255905,
+        "parent_wall_s": 5.321467545,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.099212698,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 5.199347578,
+        "worker_first_begin_ns": 804783156,
+        "worker_last_end_ns": 6004130734
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 804783156,
+          "bytes": 1538733300,
+          "end_ns": 5315043663,
+          "read_wall_s": 4.510260507,
+          "worker": 0,
+          "worker_begin_ns": 804783156,
+          "worker_end_ns": 5315043663
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805444926,
+          "bytes": 1538733300,
+          "end_ns": 6004130734,
+          "read_wall_s": 5.198685808,
+          "worker": 1,
+          "worker_begin_ns": 805444926,
+          "worker_end_ns": 6004130734
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805745056,
+          "bytes": 1538733300,
+          "end_ns": 5758952661,
+          "read_wall_s": 4.953207605,
+          "worker": 2,
+          "worker_begin_ns": 805745056,
+          "worker_end_ns": 5758952661
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805336746,
+          "bytes": 1538733300,
+          "end_ns": 5824286739,
+          "read_wall_s": 5.018949993,
+          "worker": 3,
+          "worker_begin_ns": 805336746,
+          "worker_end_ns": 5824286739
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805204786,
+          "bytes": 1538733300,
+          "end_ns": 5804679659,
+          "read_wall_s": 4.999474873,
+          "worker": 4,
+          "worker_begin_ns": 805204786,
+          "worker_end_ns": 5804679659
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805343516,
+          "bytes": 1538733300,
+          "end_ns": 5999211364,
+          "read_wall_s": 5.193867848,
+          "worker": 5,
+          "worker_begin_ns": 805343516,
+          "worker_end_ns": 5999211364
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805071276,
+          "bytes": 1538733300,
+          "end_ns": 5575494516,
+          "read_wall_s": 4.77042324,
+          "worker": 6,
+          "worker_begin_ns": 805071276,
+          "worker_end_ns": 5575494516
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 805030526,
+          "bytes": 1538733300,
+          "end_ns": 5617830054,
+          "read_wall_s": 4.812799528,
+          "worker": 7,
+          "worker_begin_ns": 805030526,
+          "worker_end_ns": 5617830054
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-3-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 3,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "e0938fad2ce54aa88b45c0b8790f907d",
+      "corpus_family": "A",
+      "corpus_id": "180a6167ea5f43a2913b1a79adacd072",
+      "timing": {
+        "aggregate_gb_per_s": 73.57490042312124,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 0.259080686,
+        "coordinated_wall_s": 0.167310677,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 0.256388096,
+        "parent_wall_s": 0.259080686,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.083558839,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 0.166452507,
+        "worker_first_begin_ns": 6099294312,
+        "worker_last_end_ns": 6265746819
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "A2",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6099588742,
+          "bytes": 1538733300,
+          "end_ns": 6255060259,
+          "read_wall_s": 0.155471517,
+          "worker": 0,
+          "worker_begin_ns": 6099588742,
+          "worker_end_ns": 6255060259
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099325142,
+          "bytes": 1538733300,
+          "end_ns": 6265736359,
+          "read_wall_s": 0.166411217,
+          "worker": 1,
+          "worker_begin_ns": 6099325142,
+          "worker_end_ns": 6265736359
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099524972,
+          "bytes": 1538733300,
+          "end_ns": 6261954159,
+          "read_wall_s": 0.162429187,
+          "worker": 2,
+          "worker_begin_ns": 6099524972,
+          "worker_end_ns": 6261954159
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099745572,
+          "bytes": 1538733300,
+          "end_ns": 6261720549,
+          "read_wall_s": 0.161974977,
+          "worker": 3,
+          "worker_begin_ns": 6099745572,
+          "worker_end_ns": 6261720549
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099294312,
+          "bytes": 1538733300,
+          "end_ns": 6257688659,
+          "read_wall_s": 0.158394347,
+          "worker": 4,
+          "worker_begin_ns": 6099294312,
+          "worker_end_ns": 6257688659
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099331122,
+          "bytes": 1538733300,
+          "end_ns": 6256286949,
+          "read_wall_s": 0.156955827,
+          "worker": 5,
+          "worker_begin_ns": 6099331122,
+          "worker_end_ns": 6256286949
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099656142,
+          "bytes": 1538733300,
+          "end_ns": 6265746819,
+          "read_wall_s": 0.166090677,
+          "worker": 6,
+          "worker_begin_ns": 6099656142,
+          "worker_end_ns": 6265746819
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6099444202,
+          "bytes": 1538733300,
+          "end_ns": 6256318869,
+          "read_wall_s": 0.156874667,
+          "worker": 7,
+          "worker_begin_ns": 6099444202,
+          "worker_end_ns": 6256318869
+        }
+      ]
+    },
+    {
+      "artifact_path": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-3-v1-r0-attempt001.json",
+      "attempt_spec": {
+        "architecture": "SHARDS_PROCESSES",
+        "arm": "SHARDS_PROCESSES",
+        "backend": "processes",
+        "block_size_mib": 4,
+        "corpus_families": [
+          "A",
+          "B"
+        ],
+        "corpus_policy": "fresh_unique_A_and_B_per_triplet",
+        "diagnostic_container_index": 3,
+        "diagnostic_variants": [
+          "A1",
+          "A2",
+          "B1"
+        ],
+        "fd_policy": "one_per_worker",
+        "file_count": 8,
+        "first_touch": true,
+        "layout": "eight_shards",
+        "no_measured_overlap": true,
+        "phase": "diagnostics",
+        "qd": 8,
+        "reader_container_count": 1,
+        "shared_container_session_intentional": true,
+        "volume_slot": "v1",
+        "worker_count": 8,
+        "workspace": "Testing 7"
+      },
+      "bytes": {
+        "expected": 12309866400,
+        "total": 12309866400
+      },
+      "container_session_uuid": "e0938fad2ce54aa88b45c0b8790f907d",
+      "corpus_family": "B",
+      "corpus_id": "c3f15c6e509c4fdb98f8ad4922c8d7c4",
+      "timing": {
+        "aggregate_gb_per_s": 2.1056077023961586,
+        "byte_reconciled": true,
+        "client_wall_boundary": "pass envelope in diagnostic reader",
+        "client_wall_s": 5.943940743,
+        "coordinated_wall_s": 5.846229754,
+        "expected_bytes": 12309866400,
+        "full_process_wall_s": 5.941415113,
+        "parent_wall_s": 5.943940743,
+        "parent_worker_reconciled": true,
+        "startup_wall_s": 0.089707209,
+        "timer_reconciled": true,
+        "timer_tolerance_s": 0.002,
+        "worker_bytes": 12309866400,
+        "worker_envelope_s": 5.845446814,
+        "worker_first_begin_ns": 6365550158,
+        "worker_last_end_ns": 12210996972
+      },
+      "topology": {
+        "arm": "SHARDS_PROCESSES",
+        "block_size_mib": 4,
+        "files": 8,
+        "processes": 8,
+        "workers": 8
+      },
+      "validation": {
+        "byte_reconciled": true,
+        "timer_reconciled": true,
+        "valid": true
+      },
+      "variant": "B1",
+      "workers": [
+        {
+          "api": "os.read",
+          "begin_ns": 6365799878,
+          "bytes": 1538733300,
+          "end_ns": 11517075744,
+          "read_wall_s": 5.151275866,
+          "worker": 0,
+          "worker_begin_ns": 6365799878,
+          "worker_end_ns": 11517075744
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6365995358,
+          "bytes": 1538733300,
+          "end_ns": 11323443507,
+          "read_wall_s": 4.957448149,
+          "worker": 1,
+          "worker_begin_ns": 6365995358,
+          "worker_end_ns": 11323443507
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6365550158,
+          "bytes": 1538733300,
+          "end_ns": 11030629332,
+          "read_wall_s": 4.665079174,
+          "worker": 2,
+          "worker_begin_ns": 6365550158,
+          "worker_end_ns": 11030629332
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6365954488,
+          "bytes": 1538733300,
+          "end_ns": 11635769862,
+          "read_wall_s": 5.269815374,
+          "worker": 3,
+          "worker_begin_ns": 6365954488,
+          "worker_end_ns": 11635769862
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6365899878,
+          "bytes": 1538733300,
+          "end_ns": 12210996972,
+          "read_wall_s": 5.845097094,
+          "worker": 4,
+          "worker_begin_ns": 6365899878,
+          "worker_end_ns": 12210996972
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6366009038,
+          "bytes": 1538733300,
+          "end_ns": 11493063404,
+          "read_wall_s": 5.127054366,
+          "worker": 5,
+          "worker_begin_ns": 6366009038,
+          "worker_end_ns": 11493063404
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6366140418,
+          "bytes": 1538733300,
+          "end_ns": 11486484574,
+          "read_wall_s": 5.120344156,
+          "worker": 6,
+          "worker_begin_ns": 6366140418,
+          "worker_end_ns": 11486484574
+        },
+        {
+          "api": "os.read",
+          "begin_ns": 6365676588,
+          "bytes": 1538733300,
+          "end_ns": 11355828067,
+          "read_wall_s": 4.990151479,
+          "worker": 7,
+          "worker_begin_ns": 6365676588,
+          "worker_end_ns": 11355828067
+        }
+      ]
+    }
+  ],
+  "evidence_root": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation",
+  "invalid_artifacts": 0,
+  "ninety_gbps_verdict": {
+    "reason": "No valid clean first-touch decision observation reached 90 GB/s.",
+    "status": "not_reached"
+  },
+  "old_report_classification": "SUPERSEDED FOR DECISION-MAKING",
+  "parent_git": {
+    "root": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI",
+    "status": "repository"
+  },
+  "phase_counts": {
+    "decision_matrix": {
+      "attempted": 60,
+      "complete": true,
+      "expected": 60,
+      "invalid": 0,
+      "valid": 60
+    },
+    "diagnostics": {
+      "attempted_containers": 3,
+      "attempted_read_events": 9,
+      "complete": true,
+      "expected": 9,
+      "valid_containers": 3,
+      "valid_read_events": 9
+    }
+  },
+  "questions": [
+    {
+      "answer": "BASELINE_OPT is compared with all fixed 4 MiB arms; evidence status is complete.",
+      "number": 1,
+      "question": "What does BASELINE_OPT measure versus the four 4 MiB decision arms?"
+    },
+    {
+      "answer": "The shared versus independent FD effect is the BASELINE_OPT\u2192ONEFILE_THREADS comparison.",
+      "number": 2,
+      "question": "What is the effect of shared-FD versus independent-FD threads?"
+    },
+    {
+      "answer": "ONEFILE_THREADS versus ONEFILE_PROCESSES isolates backend at one file and eight workers.",
+      "number": 3,
+      "question": "What is the one-file threads versus one-file processes comparison?"
+    },
+    {
+      "answer": "ONEFILE_THREADS versus SHARDS_THREADS isolates layout for threads.",
+      "number": 4,
+      "question": "What is the one-file versus eight-shard comparison for threads?"
+    },
+    {
+      "answer": "ONEFILE_PROCESSES versus SHARDS_PROCESSES isolates layout for processes.",
+      "number": 5,
+      "question": "What is the one-file versus eight-shard comparison for processes?"
+    },
+    {
+      "answer": "SHARDS_PROCESSES is compared directly with BASELINE_OPT at each Volume.",
+      "number": 6,
+      "question": "Does SHARDS_PROCESSES improve on BASELINE_OPT at the measured geometry?"
+    },
+    {
+      "answer": "V1/V2 deltas are reported for every arm in the comparison table.",
+      "number": 7,
+      "question": "How do V1 and V2 compare for every decision arm?"
+    },
+    {
+      "answer": "Each complete arm/Volume row reports coordinated, worker-envelope, parent, client, startup, and practical-total walls plus a rate derived from each wall; worker rates are never summed.",
+      "number": 8,
+      "question": "What do the six walls and their derived rates say about each arm?"
+    },
+    {
+      "answer": "Each complete arm/Volume row reports raw six-run values, mean, median, min, max, range, sample SD, and CV.",
+      "number": 9,
+      "question": "What are the per-arm sample SD and CV over six repetitions?"
+    },
+    {
+      "answer": "Fastest V1: SHARDS_PROCESSES (2.3545027198872823 GB/s); fastest V2: ONEFILE_PROCESSES (2.420636228261288 GB/s).",
+      "number": 10,
+      "question": "Which arm is fastest for V1 and for V2?"
+    },
+    {
+      "answer": "Process startup is retained separately from the coordinated read wall.",
+      "number": 11,
+      "question": "What startup cost is attributable to process workers?"
+    },
+    {
+      "answer": "Practical total uses full-process wall for processes and coordinated wall for threads.",
+      "number": 12,
+      "question": "What is the practical total wall, including startup where applicable?"
+    },
+    {
+      "answer": "NINETY_OBSERVED_FIRST_TOUCH status: observed.",
+      "number": 13,
+      "question": "Was 90 GB/s observed on a valid first-touch read?"
+    },
+    {
+      "answer": "NINETY_CLASS_REPEATABLE status: observed; criterion is median >=80 and >=4/6 >=80 for SHARDS_PROCESSES per backend.",
+      "number": 14,
+      "question": "Is 90 GB/s repeatable for SHARDS_PROCESSES (median >=80 and >=4/6 >=80) per backend?"
+    },
+    {
+      "answer": "NINETY_WARM_ONLY status: unknown; the clean plan contains no warm-only arm.",
+      "number": 15,
+      "question": "Is any 90 GB/s result warm-only rather than first-touch evidence?"
+    },
+    {
+      "answer": "Old claims are SUPERSEDED FOR DECISION-MAKING; only current clean diagnostics and decision rows are decision evidence.",
+      "number": 16,
+      "question": "How are old claims classified against this clean evidence?"
+    },
+    {
+      "answer": "The campaign stops at exactly 69 full-size timed reads; no additional phase is included.",
+      "number": 17,
+      "question": "What is the clean stopping point and recommended architecture after 69 reads?"
+    }
+  ],
+  "raw_artifacts": [
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-1-v1-r0-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-2-v1-r0-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/diagnostics/diagnostics-3-v1-r0-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v1-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-BASELINE_OPT-v2-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v1-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_PROCESSES-v2-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v1-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-ONEFILE_THREADS-v2-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v1-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_PROCESSES-v2-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v1-r6-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r1-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r2-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r3-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r4-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r5-attempt001.json",
+    "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/modal-single-volume-parallelism/results_clean_validation/decision_matrix/decision_matrix-SHARDS_THREADS-v2-r6-attempt001.json"
+  ],
+  "schema": "workspace3.clean_validation.summary.v2",
+  "scope": {
+    "decision_specs": 60,
+    "diagnostic_containers": 3,
+    "diagnostic_read_events": 9,
+    "total_full_size_timed_reads": 69
+  },
+  "valid_artifacts": 63,
+  "volume_comparisons": [
+    {
+      "arm": "BASELINE_OPT",
+      "delta_percent_v2_vs_v1": -19.875602730184248,
+      "status": "observed",
+      "v1_median_gb_per_s": 2.134079590978673,
+      "v2_median_gb_per_s": 1.709918409529811
+    },
+    {
+      "arm": "ONEFILE_THREADS",
+      "delta_percent_v2_vs_v1": 9.875350114830864,
+      "status": "observed",
+      "v1_median_gb_per_s": 1.797724442347419,
+      "v2_median_gb_per_s": 1.9752560251291174
+    },
+    {
+      "arm": "ONEFILE_PROCESSES",
+      "delta_percent_v2_vs_v1": 7.433163789141115,
+      "status": "observed",
+      "v1_median_gb_per_s": 2.253155490247189,
+      "v2_median_gb_per_s": 2.420636228261288
+    },
+    {
+      "arm": "SHARDS_THREADS",
+      "delta_percent_v2_vs_v1": 7.249967757017155,
+      "status": "observed",
+      "v1_median_gb_per_s": 2.1219123760432677,
+      "v2_median_gb_per_s": 2.275750339138561
+    },
+    {
+      "arm": "SHARDS_PROCESSES",
+      "delta_percent_v2_vs_v1": -3.9304072185345853,
+      "status": "observed",
+      "v1_median_gb_per_s": 2.3545027198872823,
+      "v2_median_gb_per_s": 2.2619611750242394
+    }
+  ],
+  "workspace": "Testing 7"
+}
