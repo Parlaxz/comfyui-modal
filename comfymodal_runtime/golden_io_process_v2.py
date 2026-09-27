@@ -2838,12 +2838,13 @@ class C0SourceSession:
                 published = C0ControlLayout._U64.unpack_from(self.shm.buf, base)[0]
                 consumed = C0ControlLayout._U64.unpack_from(self.shm.buf, base + 8)[0]
                 crc_ok = C0ControlLayout.request_crc_valid(self.shm.buf, ticket.lane)
+                heartbeat = C0ControlLayout._U64.unpack_from(self.shm.buf, 40)[0]
                 with self._lock:
                     self.closed = True
                 raise C0ProtocolError(
                     f"c0_control_fill_timeout:{ticket.request_id}:"
                     f"lane={ticket.lane}:state={state}:published={published}:"
-                    f"consumed={consumed}:crc={int(bool(crc_ok))}"
+                    f"consumed={consumed}:crc={int(bool(crc_ok))}:heartbeat={heartbeat}"
                 )
             time.sleep(0.0005)
 
