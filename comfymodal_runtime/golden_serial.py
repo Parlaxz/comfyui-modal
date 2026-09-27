@@ -12074,6 +12074,18 @@ async def golden_clip_load(
                 full_load_minus_source_ms=session.model_transport_records[-1].get(
                     "full_load_minus_source_ms"
                 ),
+                completion_timestamps=[
+                    {
+                        key: record.get(key)
+                        for key in (
+                            "source_final_byte_complete_ns", "final_h2d_submit_ns",
+                            "final_h2d_completion_observed_ns", "gpu_ready_ns",
+                            "views_ready_ns", "adoption_start_ns", "adoption_end_ns",
+                            "load_exit_ns",
+                        )
+                    }
+                    for record in session.model_transport_records[-len(transports):]
+                ],
             )
         return clip
     except BaseException as exc:
@@ -13268,6 +13280,15 @@ async def golden_unet_load(
                 role="unet",
                 full_load_ms=full_load_ms,
                 full_load_minus_source_ms=record["full_load_minus_source_ms"],
+                completion_timestamps={
+                    key: record.get(key)
+                    for key in (
+                        "source_final_byte_complete_ns", "final_h2d_submit_ns",
+                        "final_h2d_completion_observed_ns", "gpu_ready_ns",
+                        "views_ready_ns", "adoption_start_ns", "adoption_end_ns",
+                        "load_exit_ns",
+                    )
+                },
             )
         return patcher
     except BaseException as exc:

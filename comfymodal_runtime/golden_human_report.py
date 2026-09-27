@@ -1369,6 +1369,12 @@ def render_parallel_console_gantt(
             parts.append(f"src={source_ms:.1f}ms")
         if full_ms is not None:
             parts.append(f"full={full_ms:.1f}ms")
+        ready_ms = _parallel_gantt_ms(record.get("gpu_ready_wall_ms"))
+        tail_ms = _parallel_gantt_ms(record.get("gpu_ready_tail_ms"))
+        if ready_ms is not None:
+            parts.append(f"ready={ready_ms:.1f}ms")
+        if tail_ms is not None:
+            parts.append(f"tail={tail_ms:.1f}ms")
         engine = record.get("source_engine")
         if engine:
             parts.append(f"eng={engine}")
