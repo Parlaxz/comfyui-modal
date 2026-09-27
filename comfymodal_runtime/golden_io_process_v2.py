@@ -2412,6 +2412,7 @@ class C0FillRequest:
     # every pre-existing call shape valid.
     record_id: str | int | None = None
     fill_index: int | None = None
+    source_identity: tuple[int, int, int, int] | None = None
 
     def as_message(self) -> dict:
         return {
@@ -2428,6 +2429,7 @@ class C0FillRequest:
             "producer_id": int(self.producer_id),
             "record_id": self.record_id,
             "fill_index": self.fill_index,
+            "source_identity": self.source_identity,
         }
 
 
@@ -2502,6 +2504,12 @@ def validate_fill_request(request: C0FillRequest) -> None:
         raise C0ProtocolError(f"c0_invalid_record_id:{request.record_id!r}")
     if request.fill_index is not None:
         _require_plain_int(request.fill_index, "fill_index")
+    if request.source_identity is not None:
+        if len(request.source_identity) != 4 or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in request.source_identity
+        ):
+            raise C0ProtocolError(f"c0_invalid_source_identity:{request.source_identity!r}")
     slot_index = _require_plain_int(request.slot_index, "slot_index")
     if slot_index >= C0_SLOT_COUNT:
         raise C0ProtocolError(f"c0_slot_out_of_range:{slot_index}")
@@ -3866,8 +3874,14 @@ class SharedArenaRing:
             backing_buffer=self._tensor,
         )
 
-    def stage_reader(self, *, role: str, pool: Any, source: str) -> "C0StageReader":
-        reader = C0StageReader(self, role=role, pool=pool, source=source)
+    def stage_reader(
+        self, *, role: str, pool: Any, source: str,
+        source_identity: tuple[int, int, int, int] | None = None,
+    ) -> "C0StageReader":
+        reader = C0StageReader(
+            self, role=role, pool=pool, source=source,
+            source_identity=source_identity,
+        )
         # Retain the reader so its child-reported per-(path, producer)
         # descriptor lifecycle survives into arena teardown evidence.
         self._stage_readers[str(role)] = reader
@@ -4715,13 +4729,17 @@ class C0StageReader:
     actual_source_telemetry = None
     child_owned_physical_reads = True
 
-    def __init__(self, ring: SharedArenaRing, *, role: str, pool: Any, source: str) -> None:
+    def __init__(
+        self, ring: SharedArenaRing, *, role: str, pool: Any, source: str,
+        source_identity: tuple[int, int, int, int] | None = None,
+    ) -> None:
         if role not in C0_VALID_ROLES:
             raise C0ProtocolError(f"c0_invalid_role:{role!r}")
         self._ring = ring
         self._role = role
         self._pool = pool
         self._source = os.path.abspath(str(source))
+        self._source_identity = source_identity
         self.open_count = 0
         self.fill_wall_ns = 0
         self.fills = 0
@@ -4875,6 +4893,7 @@ class C0StageReader:
             # child can correlate each physical read with its submission.
             record_id=declared.record_id,
             fill_index=int(self.fills),
+            source_identity=self._source_identity,
         )
         validate_fill_request(request)
         started = time.monotonic_ns()
@@ -7493,6 +7512,19 @@ def _fd_key(path, producer_id):
     return (os.path.normpath(str(path)), int(producer_id))
 
 
+def _fd_matches_identity(fd, identity):
+    if identity is None:
+        return True
+    try:
+        observed = os.fstat(int(fd))
+        return (
+            int(observed.st_dev), int(observed.st_ino),
+            int(observed.st_size), int(observed.st_mtime_ns),
+        ) == tuple(int(value) for value in identity)
+    except BaseException:
+        return False
+
+
 def _fd_stat_row(key):
     row = _fd_stats.get(key)
     if row is None:
@@ -7529,7 +7561,7 @@ def _close_fd(key, fd):
     return True, close_wall_ns
 
 
-def _acquire_fd(path, producer_id):
+def _acquire_fd(path, producer_id, identity=None):
     # Return (key, fd, opened_here, open_wall_ns, reused,
     #         open_delta, reuse_delta, close_delta, close_wall_ns).
     # The deltas describe exactly the descriptor lifecycle this call performed.
@@ -7552,10 +7584,13 @@ def _acquire_fd(path, producer_id):
     with _fd_lock:
         fd = _fd_cache.get(key)
         if fd is not None:
-            _fd_reuse_count += 1
-            row = _fd_stat_row(key)
-            row["fd_reuse_count"] += 1
-            return key, fd, False, 0, True, 0, 1, 0, 0
+            if _fd_matches_identity(fd, identity):
+                _fd_reuse_count += 1
+                row = _fd_stat_row(key)
+                row["fd_reuse_count"] += 1
+                return key, fd, False, 0, True, 0, 1, 0, 0
+            _fd_cache.pop(key, None)
+            _close_fd(key, fd)
     # Open outside the lock so one slow open cannot stall the other producer.
     t0 = time.monotonic_ns()
     fd = os.open(path, os.O_RDONLY)
@@ -7775,11 +7810,26 @@ def _mmap_reader_fill(req):
     fd_key_producer = int(producer_id)
     fd_open_delta = 0
     fd_reuse_delta = 0
-    fd = _mmap_reader_fds.get((fd_key_path, fd_key_producer))
+    fd_key = (fd_key_path, fd_key_producer)
+    requested_identity = req.get("source_identity")
+    cached = _mmap_reader_fds.get(fd_key)
+    if isinstance(cached, tuple):
+        fd, cached_identity = cached
+        if requested_identity is not None and tuple(cached_identity or ()) != tuple(requested_identity):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            cached = None
+    else:
+        fd = cached
+    fd = cached if cached is not None and not isinstance(cached, tuple) else (
+        cached[0] if isinstance(cached, tuple) else None
+    )
     try:
         if fd is None:
             fd = os.open(path, os.O_RDONLY)
-            _mmap_reader_fds[(fd_key_path, fd_key_producer)] = fd
+            _mmap_reader_fds[fd_key] = (fd, tuple(requested_identity or ()))
             fd_open_delta = 1
         else:
             fd_reuse_delta = 1
@@ -8304,7 +8354,7 @@ def _do_fill(req):
             (
                 fd_key, fd, opened_here, open_wall_ns, reused,
                 fd_open_delta, fd_reuse_delta, fd_close_delta, fd_close_wall_ns,
-            ) = _acquire_fd(path, producer_id)
+            ) = _acquire_fd(path, producer_id, req.get("source_identity"))
             fd_open_wall_ns = open_wall_ns
             # Passive correlation context threaded onto every per-syscall diagnostic.
             read_diag_context = {

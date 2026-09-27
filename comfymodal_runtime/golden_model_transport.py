@@ -1093,6 +1093,7 @@ class GoldenModelTransport:
                 role="model",
                 pool=pool,
                 source=layout.path,
+                source_identity=tuple(int(value) for value in layout.identity),
             )
             result = dispatcher.execute(
                 ranges,
