@@ -524,4 +524,61 @@ control timeout.
 The custom hash-bar renderer was removed in `384e315`. Production logs now use
 the existing `modal_app` waterfall plus `gantt_telemetry`/`gantt_canonical`
 renderers: boxed stage tables and square-block remote Gantt windows. The
-`golden_parallel` path no longer emits a competing hash-bar chart.
+The `golden_parallel` path no longer emits a competing hash-bar chart.
+
+### 11.9 Fresh 15-Run Region Cohort
+
+Collected as 15 serial `v2ctl` Golden requests on one frozen deployment. The
+first occurrence of each provider/region is `FIRST`; later occurrences are
+`NONFIRST`. Ten non-first rows and the remaining five rows are listed below.
+All attempts were structurally VALID; the 971.315-second row is retained as
+material evidence of the earlier runner-heartbeat failure mode.
+
+#### NONFIRST — 10 rows
+
+| Run | Region | Occ. | Duration ms | Restore ms | CLIP src ms | CLIP GB/s | UNET src ms | UNET GB/s | CLIP tail ms | UNET tail ms | Affinity C/U |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3 | ca | 2 | 14628.154 | 2.281 | 1513.666 | 5.315 | 2176.238 | 5.656 | 2.316 | 1.706 | 5/6 |
+| 4 | ca | 3 | 14571.179 | 2.999 | 1531.156 | 5.254 | 2329.069 | 5.285 | 3.459 | 2.454 | 4/4 |
+| 5 | eu-south | 2 | 18124.455 | 42.751 | 2408.280 | 3.341 | 3042.904 | 4.045 | 1.782 | 1.809 | 13/21 |
+| 6 | ca | 4 | 43977.579 | 2.549 | 1479.041 | 5.439 | 2047.348 | 6.013 | 2.132 | 1.415 | 2/4 |
+| 7 | ca | 5 | 18123.296 | 3.675 | 1599.197 | 5.031 | 3875.790 | 3.176 | 2.027 | 1.802 | 2/67 |
+| 9 | eu-north | 2 | 23603.462 | 554.328 | 4311.006 | 1.866 | 6564.663 | 1.875 | 1.562 | 1.824 | 53/84 |
+| 10 | eu-north | 3 | 15618.806 | 2.572 | 1339.752 | 6.005 | 1871.736 | 6.577 | 1.901 | 1.718 | 4/4 |
+| 11 | ca | 6 | 15730.250 | 2.515 | 1436.392 | 5.601 | 2247.816 | 5.476 | 1.658 | 4.599 | 2/2 |
+| 12 | ca | 7 | 15113.793 | 3.075 | 1634.611 | 4.922 | 2250.130 | 5.471 | 1.546 | 2.329 | 2/5 |
+| 13 | eu-north | 4 | 19780.167 | 2.868 | 3696.989 | 2.176 | 2109.214 | 5.836 | 1.785 | 72.166 | 48/7 |
+
+| Metric | Mean | Median | Min | Max | Sample SD | P90 |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration ms | 19927.114 | 16926.773 | 14571.179 | 43977.579 | 8910.503 | 23603.462 |
+| Restore ms | 61.961 | 2.933 | 2.281 | 554.328 | 173.455 | 42.751 |
+| CLIP source GB/s | 4.495 | 5.142 | 1.866 | 6.005 | 1.481 | 5.601 |
+| UNET source GB/s | 4.941 | 5.474 | 1.875 | 6.577 | 1.458 | 6.013 |
+| CLIP GPU-ready tail ms | 2.017 | 1.843 | 1.546 | 3.459 | 0.564 | 2.316 |
+| UNET GPU-ready tail ms | 9.182 | 1.816 | 1.415 | 72.166 | 22.149 | 4.599 |
+
+#### REST — remaining 5 rows
+
+| Run | Region | Occ. | Duration ms | Restore ms | CLIP src ms | CLIP GB/s | UNET src ms | UNET GB/s | CLIP tail ms | UNET tail ms | Affinity C/U |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | eu-south | 1 | 971315.256 | 2.631 | 2207.777 | 3.644 | 5041.158 | 2.442 | 1.487 | 1.392 | 4/16 |
+| 2 | ca | 1 | 14971.275 | 2.780 | 1534.087 | 5.244 | 2275.875 | 5.409 | 2.792 | 1.299 | 4/5 |
+| 8 | eu-north | 1 | 18868.690 | 3.135 | 1496.986 | 5.374 | 3662.658 | 3.361 | 2.552 | 1.807 | 2/68 |
+| 14 | uk | 1 | 68901.527 | 4.447 | 1648.126 | 4.881 | 2358.922 | 5.218 | 2.780 | 2.106 | 4/4 |
+| 15 | eu-south | 3 | 18841.491 | 3.045 | 1875.453 | 4.290 | 2841.359 | 4.332 | 2.007 | 168.082 | 7/8 |
+
+| Metric | Mean | Median | Min | Max | Sample SD | P90 |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration ms | 218579.648 | 18868.690 | 14971.275 | 971315.256 | 421381.835 | 68901.527 |
+| Restore ms | 3.208 | 3.045 | 2.631 | 4.447 | 0.722 | 3.135 |
+| CLIP source GB/s | 4.687 | 4.881 | 3.644 | 5.374 | 0.719 | 5.244 |
+| UNET source GB/s | 4.152 | 4.332 | 2.442 | 5.409 | 1.255 | 5.218 |
+| CLIP GPU-ready tail ms | 2.324 | 2.552 | 1.487 | 2.792 | 0.566 | 2.780 |
+| UNET GPU-ready tail ms | 34.937 | 1.807 | 1.299 | 168.082 | 74.431 | 2.106 |
+
+Important variance findings: the 971.315-second first-row duration is the
+retained historical runner-heartbeat outlier and dominates REST mean/SD; the
+554.328 ms restore row is a separate restore outlier; the lowest source rates
+are CLIP `1.866 GB/s` and UNET `1.875 GB/s`; UNET tails reached `72.166 ms`
+and `168.082 ms` while most tails stayed near single-digit milliseconds.
