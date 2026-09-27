@@ -1,0 +1,10 @@
+﻿modal : +- Error ---------------------------------------------------------------------+
+At line:1 char:397
++ ...  }; $i++ }; modal app logs stable-modal-comfy-v2-restore-only-shadow  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (+- Error ------...--------------+:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+| 'charmap' codec can't encode characters in position 10103-10104: character  |
+| maps to <undefined>                                                         |
++-----------------------------------------------------------------------------+

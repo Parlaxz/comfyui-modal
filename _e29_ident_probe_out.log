@@ -1,0 +1,34 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+Traceback (most recent call last):
+  File "C:\Users\parla\AppData\Local\Temp\commandcode\C--Users-parla-OneDrive-Documents-AI-HUB-ComfyUI-June-Install-ComfyUI-custom-nodes-comfyui-modal\23b2bc9a-d4a3-413d-85ef-546c4b2aa42f\scratchpad\e29_ident_probe.py", line 23, in main
+    res = await asyncio.to_thread(fn)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'Function' object is not callable
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\parla\AppData\Local\Temp\commandcode\C--Users-parla-OneDrive-Documents-AI-HUB-ComfyUI-June-Install-ComfyUI-custom-nodes-comfyui-modal\23b2bc9a-d4a3-413d-85ef-546c4b2aa42f\scratchpad\e29_ident_probe.py", line 39, in <module>
+    asyncio.run(main())
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\parla\AppData\Local\Temp\commandcode\C--Users-parla-OneDrive-Documents-AI-HUB-ComfyUI-June-Install-ComfyUI-custom-nodes-comfyui-modal\23b2bc9a-d4a3-413d-85ef-546c4b2aa42f\scratchpad\e29_ident_probe.py", line 26, in main
+    res = await asyncio.to_thread(fn, request_id="x")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'Function' object is not callable

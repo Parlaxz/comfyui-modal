@@ -1,0 +1,69 @@
+[h2] schedule seed=20260923 runs=20
+[h2] start h2-H250-001 block=1 pos=1 arm=H250 hedge_ms=250.0 slots/worker=3
+[h2] done h2-H250-001 gpu=NVIDIA H100 80GB HBM3 region=uk wall=1689.060016 logMed=45.928555 logMax=102.145022 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-002 block=1 pos=2 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-002 gpu=NVIDIA H100 80GB HBM3 region=us-central wall=1553.633156 logMed=40.9763115 logMax=111.103741 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H75-003 block=1 pos=3 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-003 gpu=NVIDIA H100 80GB HBM3 region=uk wall=1640.595778 logMed=43.272846 logMax=107.64849 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H150-004 block=1 pos=4 arm=H150 hedge_ms=150.0 slots/worker=3
+[h2] done h2-H150-004 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=1594.775848 logMed=40.241994 logMax=92.170978 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H250-005 block=2 pos=1 arm=H250 hedge_ms=250.0 slots/worker=3
+[h2] done h2-H250-005 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1583.96561 logMed=43.113727499999996 logMax=66.252777 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-006 block=2 pos=2 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-006 gpu=NVIDIA H100 80GB HBM3 region=us-east wall=1569.429314 logMed=42.239580000000004 logMax=100.462267 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H75-007 block=2 pos=3 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-007 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1661.090672 logMed=44.088387499999996 logMax=108.217753 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H150-008 block=2 pos=4 arm=H150 hedge_ms=150.0 slots/worker=3
+[h2] done h2-H150-008 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1710.376563 logMed=45.7119805 logMax=111.918573 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-009 block=3 pos=1 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-009 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1635.420432 logMed=46.081564 logMax=59.071692 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H150-010 block=3 pos=2 arm=H150 hedge_ms=150.0 slots/worker=3
+[h2] done h2-H150-010 gpu=NVIDIA H100 80GB HBM3 region=US-1 wall=10050.765699 logMed=44.063463 logMax=3119.315595 l500=8 l1k=3 launched=5 wins=2 SUPPRESSED=0 amp=1.0416666666666667
+[h2] start h2-H75-011 block=3 pos=3 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-011 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1604.551374 logMed=43.3037315 logMax=69.232894 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H250-012 block=3 pos=4 arm=H250 hedge_ms=250.0 slots/worker=3
+[h2] done h2-H250-012 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1551.478075 logMed=41.276873 logMax=95.966622 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-013 block=4 pos=1 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-013 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1559.161196 logMed=43.423493 logMax=97.75412 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H250-014 block=4 pos=2 arm=H250 hedge_ms=250.0 slots/worker=3
+[h2] done h2-H250-014 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1529.650764 logMed=42.307137 logMax=65.334767 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H150-015 block=4 pos=3 arm=H150 hedge_ms=150.0 slots/worker=3
+[h2] done h2-H150-015 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1630.795193 logMed=42.861461000000006 logMax=101.694143 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-016 block=4 pos=4 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-016 gpu=NVIDIA H100 80GB HBM3 region=asia-northeast1 wall=1634.353651 logMed=43.427337 logMax=94.989606 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+[h2] start h2-H150-017 block=5 pos=1 arm=H150 hedge_ms=150.0 slots/worker=3
+[h2] done h2-H150-017 gpu=NVIDIA H100 80GB HBM3 region=us-east1-a wall=1730.028057 logMed=50.6838315 logMax=138.180873 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H250-018 block=5 pos=2 arm=H250 hedge_ms=250.0 slots/worker=3
+[h2] done h2-H250-018 gpu=NVIDIA H100 80GB HBM3 region=ap-northeast wall=1726.250972 logMed=46.86956 logMax=107.525561 l500=0 l1k=0 launched=0 wins=0 SUPPRESSED=0 amp=1.0
+[h2] start h2-H75-019 block=5 pos=3 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-019 gpu=NVIDIA H100 80GB HBM3 region=us-west wall=1913.482821 logMed=48.8719045 logMax=250.994679 l500=0 l1k=0 launched=2 wins=0 SUPPRESSED=0 amp=1.0166666666666666
+[h2] start h2-H75-020 block=5 pos=4 arm=H75 hedge_ms=75.0 slots/worker=3
+[h2] done h2-H75-020 gpu=NVIDIA H100 80GB HBM3 region=us-west1 wall=1548.827091 logMed=42.3995675 logMax=100.733717 l500=0 l1k=0 launched=1 wins=0 SUPPRESSED=0 amp=1.0083333333333333
+
+[h2] valid runs: 20 / 20
+
+[h2] VALIDITY: hedge_suppressed_resource_busy total = 0 (PASS)
+[h2] hedge eligible=14 launched=14 wins=2
+
+=== per-run (schedule order) ===
+ ord blk pos   arm    wall  logMed  logMean  logMax >500 >1k elig launch wins supp    amp  gapmin  mx
+   1   1   1  H250    1689    45.9     46.8     102    0   0    0      0    0    0 1.0000    4.05   4
+   2   1   2   H75    1554    41.0     42.5     111    0   0    1      1    0    0 1.0083    4.26   5
+   3   1   3   H75    1641    43.3     45.0     108    0   0    1      1    0    0 1.0083    4.07   5
+   4   1   4  H150    1595    40.2     41.8      92    0   0    0      0    0    0 1.0000    4.03   4
+   5   2   1  H250    1584    43.1     44.1      66    0   0    0      0    0    0 1.0000    4.02   4
+   6   2   2   H75    1569    42.2     43.2     100    0   0    1      1    0    0 1.0083    4.21   5
+   7   2   3   H75    1661    44.1     45.5     108    0   0    1      1    0    0 1.0083    4.15   5
+   8   2   4  H150    1710    45.7     47.3     112    0   0    0      0    0    0 1.0000    4.04   4
+   9   3   1   H75    1635    46.1     45.9      59    0   0    0      0    0    0 1.0000    4.01   4
+  10   3   2  H150   10051    44.1    133.8    3119    8   3    5      5    2    0 1.0417    4.13   6
+  11   3   3   H75    1605    43.3     44.4      69    0   0    0      0    0    0 1.0000    4.24   4
+  12   3   4  H250    1551    41.3     42.0      96    0   0    0      0    0    0 1.0000    4.10   4
+  13   4   1   H75    1559    43.4     43.9      98    0   0    1      1    0    0 1.0083    4.07   5
+  14   4   2  H250    1530    42.3     42.9      65    0   0    0      0    0    0 1.0000    4.06   4
+  15   4   3  H150    1631    42.9     43.2     102    0   0    0      0    0    0 1.0000    4.07   4
+  16   4   4   H75    1634    43.4     43.9      95    0   0    1      1    0    0 1.0083    4.17   5
+  17   5   1  H150    1730    50.7     53.0     138    0   0    0      0    0    0 1.0000    4.09   4
+  18   5   2  H250    1726    46.9     47.5     108    0   0    0      0    0    0 1.0000    4.08   4
+  19   5   3   H75    1913    48.9     51.6     251    0   0    2      2    0    0 1.0167    4.05   5
+  20   5   4   H75    1549    42.4     43.3     101    0   0    1      1    0    0 1.0083    4.06   5

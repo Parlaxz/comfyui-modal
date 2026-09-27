@@ -1,0 +1,42 @@
+{
+  "arm": "source_only",
+  "attempt_id": "stale_clip_first_access_8b9b45e102a3",
+  "cuda_used": false,
+  "error": "ValueError:unsupported_block_bytes:4194304",
+  "h2d_used": false,
+  "identity": {
+    "accelerator": "none",
+    "container_session_id": "ta-01M1TC3P3530J0HN8K7EP1BDHR",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": null,
+    "hostname": "modal",
+    "image_id": "im-wlUl4rkFstj7cJsCjolu6h",
+    "provider": "CLOUD_PROVIDER_AWS",
+    "region": "ap-southeast-3"
+  },
+  "model_construction": false,
+  "model_name": "qwen_3_4b.safetensors",
+  "oracle_wall_ms": 0.1569,
+  "probe": "exp04_source_ceiling_oracle",
+  "role": "clip",
+  "status": "error",
+  "torch_imported": false
+}\n

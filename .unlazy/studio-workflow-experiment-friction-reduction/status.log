@@ -1,0 +1,93 @@
+2026-09-10T04:56:16.743Z dispatch ready-1 opened: leaf-1.1.1, leaf-1.1.2
+2026-09-10T05:02:41.739Z dispatch ready-1 started leaf-1.1.1 as ses_f76533469ffexvQbMDF3Hg9lMv
+2026-09-10T05:02:41.813Z dispatch ready-1 started leaf-1.1.2 as ses_f76533453ffeUOjB1cRZ0KANjF
+2026-09-10T05:02:41.889Z dispatch ready-1 sealed
+2026-09-10T05:02:55.548Z dispatch ready-1 returned leaf-1.1.1
+2026-09-10T05:14:21.084Z dispatch ready-1 returned leaf-1.1.2
+leaf-1.1.1 verified
+leaf-1.1.1 lease released
+leaf-1.1.2 verified
+leaf-1.1.2 lease released
+node-1.1 verified
+2026-09-10T05:27:59.343Z dispatch ready-2 opened: leaf-1.2.1
+2026-09-10T05:29:03.017Z dispatch ready-2 started leaf-1.2.1 as ses_f76363d0affeO5JjCBu3rJPdvU
+2026-09-10T05:29:03.096Z dispatch ready-2 sealed
+leaf-1.2.1 dispatched in wave ready-2
+2026-09-10T05:59:33.976Z dispatch ready-2 returned leaf-1.2.1
+leaf-1.2.1 wave ready-2 returned without result (worker stalled 25min, zero owned-path progress); redispatching narrowed picker-only slice in wave ready-2b
+2026-09-10T05:59:48.582Z dispatch ready-2b opened: leaf-1.2.1
+2026-09-10T06:00:12.303Z dispatch ready-2b started leaf-1.2.1 as ses_f76192d11ffeUDtxCklBuGRC7x
+2026-09-10T06:00:12.377Z dispatch ready-2b sealed
+leaf-1.2.1 narrowed picker slice dispatched in wave ready-2b
+2026-09-10T06:04:17.055Z dispatch ready-2b returned leaf-1.2.1
+leaf-1.2.1 slice ready-2b returned partial (picker+imports wired, wizard/specs remaining); syntax verified
+2026-09-10T06:04:34.357Z dispatch ready-2c opened: leaf-1.2.1
+2026-09-10T06:04:57.008Z dispatch ready-2c started leaf-1.2.1 as ses_f7614c6d6ffeijJF8UJPWNZBXC
+2026-09-10T06:04:57.079Z dispatch ready-2c sealed
+leaf-1.2.1 wizard-bindings follow-up dispatched in wave ready-2c
+2026-09-10T06:20:01.459Z dispatch ready-2c returned leaf-1.2.1
+plan amendment rev2: leaf-1.2.1 ownership extended with tests/browser/studio-workflows-mock.mjs and tests/browser/studio-mock-api.mjs for mock-harness repair (no other lane owns them; single-writer sequential)
+2026-09-10T06:21:52.808Z dispatch ready-2d opened: leaf-1.2.1
+2026-09-10T06:22:52.498Z dispatch ready-2d started leaf-1.2.1 as ses_f7604f349ffe6O6ezerFpXDrFt
+2026-09-10T06:22:52.561Z dispatch ready-2d sealed
+leaf-1.2.1 harness-repair lane dispatched in wave ready-2d
+2026-09-10T06:33:50.558Z dispatch ready-2d returned leaf-1.2.1
+leaf-1.2.1 wave ready-2d returned partial: harness fixed, spec 16 passed with 6 failures all in workflows.js/picker runtime paths (T6/T8/T11/T12/T17/T19); dispatching final runtime-path slice in wave ready-2e
+2026-09-10T06:34:15.003Z dispatch ready-2e opened: leaf-1.2.1
+2026-09-10T06:34:42.322Z dispatch ready-2e started leaf-1.2.1 as ses_f75f99a7fffeVF7ohaptEiOYMO
+2026-09-10T06:34:42.388Z dispatch ready-2e sealed
+leaf-1.2.1 runtime-path repair dispatched in wave ready-2e
+2026-09-10T06:53:04.259Z dispatch ready-2e returned leaf-1.2.1
+leaf-1.2.1 wave ready-2e returned partial: spec 17 passed with 5 failures attributed to stale sibling extension installs (trace evidence); parent reviewed workflows.js diff (picker wiring, import entry, version merge, recursion guard all sound); dispatching read-only mount trace before final fix
+mount trace: mocked spec uses shared ComfyUI at 8188 with no webServer; sibling copies shadow primary extension name; tests 20/21 prefer resource-derived bases so siblings win; smallest pin is spec-only primary-base pinning; opening pinning wave ready-2f
+2026-09-10T06:56:31.958Z dispatch ready-2f opened: leaf-1.2.1
+2026-09-10T06:56:57.928Z dispatch ready-2f started leaf-1.2.1 as ses_f75e52c96ffeYW9IlDpAY0VHzi
+2026-09-10T06:56:57.994Z dispatch ready-2f sealed
+leaf-1.2.1 mount-pinning lane dispatched in wave ready-2f
+2026-09-10T07:05:37.585Z dispatch ready-2f returned leaf-1.2.1
+leaf-1.2.1 focused diagnostic: 4 of 5 pass with pin active, only test 12 fails (incomplete-reasons shown correctly, but .comfymodal-studio-notice never renders on blocked save); opening final single-test fix wave ready-2g
+2026-09-10T07:10:39.683Z dispatch ready-2g opened: leaf-1.2.1
+2026-09-10T07:11:01.525Z dispatch ready-2g started leaf-1.2.1 as ses_f75d847ddffeJvPy2MnNbplO0t
+2026-09-10T07:11:01.591Z dispatch ready-2g sealed
+leaf-1.2.1 test-12 notice fix dispatched in wave ready-2g
+2026-09-10T07:14:24.258Z dispatch ready-2g returned leaf-1.2.1
+leaf-1.2.1 verified (ALL MET on parent reverify + manual G3)
+leaf-1.2.1 lease released
+2026-09-10T07:17:34.152Z dispatch ready-3 opened: leaf-1.2.2
+2026-09-10T07:18:03.463Z dispatch ready-3 started leaf-1.2.2 as ses_f75d1e7a1ffehQsvOtsofCbcYW
+2026-09-10T07:18:03.557Z dispatch ready-3 sealed
+leaf-1.2.2 Shelf Playground flow dispatched in wave ready-3
+2026-09-10T10:57:17.394Z dispatch ready-3 returned leaf-1.2.2
+leaf-1.2.2 diagnosis: playground/experiment specs lack the primary-extension request pin (only workflows spec has it), so pages load stale sibling copies and no Shelf cards render; plus test 4 uses lexicographic sort on numbers; opening pinning wave ready-3b
+2026-09-10T11:12:16.664Z dispatch ready-3b opened: leaf-1.2.2
+2026-09-10T11:12:40.091Z dispatch ready-3b started leaf-1.2.2 as ses_f74fb0e12ffeDvVAI5EE70wCk9
+2026-09-10T11:12:40.158Z dispatch ready-3b sealed
+leaf-1.2.2 spec-pinning lane dispatched in wave ready-3b
+2026-09-10T11:18:50.154Z dispatch ready-3b returned leaf-1.2.2
+leaf-1.2.2 diagnosis: timing card reads direct-result timings only (playground.js ~2702-2731, 3908); same run's history entry carries canonical timings but is never consulted; opening same-run timings fallback wave ready-3c
+2026-09-10T11:21:46.739Z dispatch ready-3c opened: leaf-1.2.2
+2026-09-10T11:22:08.403Z dispatch ready-3c started leaf-1.2.2 as ses_f74f26375ffeI78cIEY6ejOaxz
+2026-09-10T11:22:08.467Z dispatch ready-3c sealed
+leaf-1.2.2 timings-fallback lane dispatched in wave ready-3c
+2026-09-10T11:32:32.280Z dispatch ready-3c returned leaf-1.2.2
+leaf-1.2.2 verified (ALL MET on parent reverify + manual G3)
+leaf-1.2.2 lease released
+plan amendment rev3: N1 nested timeout 300->600 to match leaf approvals; N4 scoped to affected siblings (manifest/run-identity/portability) with rx9p failures handed off to sibling lane owner
+node-1.2 verified (ALL MET)
+2026-09-10T12:04:39.038Z dispatch ready-4 opened: leaf-1.3.1
+2026-09-10T12:05:14.585Z dispatch ready-4 started leaf-1.3.1 as ses_f74caf9e6ffeT1GIE0pl0ycJh7
+2026-09-10T12:05:14.648Z dispatch ready-4 sealed
+leaf-1.3.1 legacy cleanup dispatched in wave ready-4
+2026-09-10T12:09:37.979Z dispatch ready-4 returned leaf-1.3.1
+leaf-1.3.1 verified (ALL MET: scoped regression green, keep-mapping reviewed, no migration)
+leaf-1.3.1 lease released
+scope complete: root ALL MET (G1 branches reverified, G2 scoped regression green, G3 attested); 5 leaves + 2 branches verified; zero abandonments
+reopening leaf-1.2.1: import and Set-up-Mapping still land outside the wizard (button opens legacy mapping editor); dispatching import/setup-to-wizard wiring defect fix
+2026-09-10T15:11:50.680Z dispatch ready-5 opened: leaf-1.2.1
+2026-09-10T15:12:34.928Z dispatch ready-5 started leaf-1.2.1 as ses_f741f87abffen97XeVJC6eZHRW
+2026-09-10T15:12:34.995Z dispatch ready-5 sealed
+leaf-1.2.1 import/setup-to-wizard wiring dispatched in wave ready-5
+2026-09-10T15:43:09.370Z dispatch ready-5 returned leaf-1.2.1
+leaf-1.2.2 G1 given --retries=1 for shared-server first-load flake parity with N2/N3 (genuine breakage still fails repeatedly)
+post-completion wiring defect closed: import + Set-up-Mapping now open the wizard (journey tests green); root re-verified ALL MET
+leaf-1.2.1 lease released after wiring re-verification; scope complete

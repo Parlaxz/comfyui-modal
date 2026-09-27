@@ -1,0 +1,39 @@
+{
+ "status": "ok",
+ "attempt_id": "fio-06-mmap",
+ "ioengine": "mmap",
+ "fio_version": "fio-3.33",
+ "jobfile": "[global]\nioengine=mmap\nrw=read\nbs=64m\ndirect=0\ninvalidate=0\nnorandommap=1\ngroup_reporting=1\ntime_based=0\nrandrepeat=0\nthread=0\nfilename=/root/models/text_encoders/qwen_3_4b.safetensors\n\n[job0]\noffset=0\nsize=1946157056\n\n[job1]\noffset=2013265920\nsize=1946157056\n\n[job2]\noffset=4026531840\nsize=1946157056\n\n[job3]\noffset=6039797760\nsize=1946157056\n",
+ "command": "fio --output-format=json /tmp/fio_source.job",
+ "wall_ms": 2754.820229,
+ "returncode": 0,
+ "jobs": [
+  {
+   "jobname": "job0",
+   "bw_bytes_per_s": 3418809057,
+   "bw_mib_per_s": 3260.430390357971,
+   "iops": 50.944225,
+   "io_bytes": 7784628224,
+   "runtime_ms": 2277,
+   "clat_ns_mean": 75522263.181034,
+   "lat_ns_percentile": {}
+  }
+ ],
+ "aggregate_bw_mib_per_s": 3260.430390357971,
+ "aggregate_gbps": 2.825820771189059,
+ "total_io_bytes": 7784628224,
+ "file_size": 8044982048,
+ "identity": {
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "eu-west",
+  "image_id": "im-sb7H6kpE40vEfuaOjvUZNd",
+  "container_session_id": "ta-01M37TC9GFNGB3XGMGGWTQGXGR",
+  "hostname": "modal",
+  "requested_gpu": "",
+  "observed_gpu": "",
+  "gpu": ""
+ },
+ "provider": "CLOUD_PROVIDER_AZURE",
+ "region": "eu-west",
+ "container_session_id": "ta-01M37TC9GFNGB3XGMGGWTQGXGR"
+}

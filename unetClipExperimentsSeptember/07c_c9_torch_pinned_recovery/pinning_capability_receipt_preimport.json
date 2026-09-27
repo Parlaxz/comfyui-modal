@@ -1,0 +1,73 @@
+{
+  "buffer_bytes": 33554432,
+  "buffers": [
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 0
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 1
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 2
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 3
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 4
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 5
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 6
+    },
+    {
+      "buffer_type": "pytorch_pinned_host",
+      "bytes": 33554432,
+      "is_pinned": true,
+      "worker_id": 7
+    }
+  ],
+  "cpu_requested": 12,
+  "cuda_available": true,
+  "cuda_build": "13.0",
+  "device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_requested": "rtx-pro-6000",
+  "h2d_pipeline_initialized": false,
+  "memory_requested_mb": 8192,
+  "model_read": false,
+  "operation": "c9_capability_smoke_0",
+  "resource_contract": {
+    "cpu": 12,
+    "gpu": "rtx-pro-6000",
+    "memory_mb": 8192
+  },
+  "single_use_container": true,
+  "status": "ok",
+  "torch_imported": true,
+  "torch_version": "2.14.0+cu130",
+  "wall_ms": 2223.437802,
+  "worker_count": 8
+}

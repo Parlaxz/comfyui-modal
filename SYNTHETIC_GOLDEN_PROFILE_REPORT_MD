@@ -1,0 +1,36 @@
+GOLDEN_PROFILE_COMPLETE=YES
+GOLDEN_PROFILE_REASON=complete
+GOLDEN_PROFILE_TORCH=DISABLED
+GOLDEN_PROFILE_ROOT_NAME=golden_serial_execute
+GOLDEN_PROFILE_ROOT_WALL_MS=1200.0
+GOLDEN_PROFILE_SPAN_COUNT=11
+GOLDEN_PROFILE_NEEDS_DECOMPOSITION=True
+# Golden execution profile
+
+## Summary
+- Root: golden_serial_execute
+- Required canonical stages: golden_restore, golden_request_setup, golden_clip_load, golden_clip_forward, golden_unet_load, golden_sampler_prepare, golden_vae_load, golden_sampling, golden_sampler_tail, golden_vae_decode, golden_output
+- Observed canonical stages: golden_clip_forward, golden_clip_load, golden_output, golden_request_setup, golden_restore, golden_sampler_prepare, golden_sampler_tail, golden_sampling, golden_unet_load, golden_vae_decode, golden_vae_load
+
+## Spans over 50.000 ms
+
+| Name | Kind | Source | Start offset (ms) | Wall (ms) | Direct child sum (ms) | Direct child union (ms) | Child overlap (ms) | Residual (ms) | Coverage (%) | Thread/task | Completeness |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| golden_serial_execute | python | viztracer | 0.0 | 1200.0 | 660.0 | 660.0 | 0.0 | 540.0 | 55.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_restore | python | viztracer | 100.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_request_setup | python | viztracer | 200.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_clip_load | python | viztracer | 300.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_clip_forward | python | viztracer | 400.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_unet_load | python | viztracer | 500.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_sampler_prepare | python | viztracer | 600.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_vae_load | python | viztracer | 700.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_sampling | python | viztracer | 800.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_sampler_tail | python | viztracer | 900.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_vae_decode | python | viztracer | 1000.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+|   golden_output | python | viztracer | 1100.0 | 60.0 | 0 | 0.0 | 0.0 | 60.0 | 0.0 | 1:1 | complete NEEDS_DECOMPOSITION (subthreshold_children_union_ms=0.0) |
+
+Residual is not causal. child_overlap=child_sum-child_union; exclusive_residual=parent_wall-direct_child_union.
+
+## Torch analysis
+
+Torch CPU/CUDA clock alignment is unproven; the Gantt keeps those lanes in a separate table.

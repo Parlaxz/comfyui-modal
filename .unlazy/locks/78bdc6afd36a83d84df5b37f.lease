@@ -1,0 +1,16 @@
+{
+  "scope": "studio-workflow-legacy-absorption",
+  "leaf": "leaf-abs-2",
+  "globs": [
+    "web/studio-backend-api.js",
+    "web/studio-backend.js",
+    "web/studio-backend-presets.js",
+    "web/studio-preset-wizard.js",
+    "web/studio-workflows.js",
+    "tests/browser/studio-workflows.spec.mjs",
+    "tests/browser/fake/fake-server.mjs",
+    "tests/browser/studio-workflows-mock.mjs",
+    "tests/browser/studio-mock-api.mjs"
+  ],
+  "pid": 24580
+}

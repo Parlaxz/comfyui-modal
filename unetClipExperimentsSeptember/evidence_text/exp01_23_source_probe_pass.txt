@@ -1,0 +1,27 @@
+Exp01 source-probe after operator publication (no flag; probe has no flag interface).
+Command: python tools/v2ctl.py --profile golden_p1 --app sept-unetclip-01-transport-core source-probe
+Result: PASS, verdict=MATCH on all 11 modules. MATCH evidence bound to receipt f6b59e42 written.
+
+[v2ctl.source-probe] WARNING: local deploy identity drifted after deployment; binding the immutable remote receipt (source drift is warning-only)
+[v2.modal_target] app=sept-unetclip-01-transport-core class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+[v2ctl.source-probe] profile=golden_p1
+[v2ctl.source-probe] git_head=c4bee234b871
+[v2ctl.source-probe] target app=sept-unetclip-01-transport-core class=ModalRuntimeEntrypointV2 gpu=rtx-pro-6000
+[v2ctl.source-probe] remote class=ModalRuntimeEntrypointV2 image=im-ePFELJ6kupZheff9gMDgEC container=d0a119fd473d4a70
+[v2ctl.source-probe] remote deployment_combined_hash=efb36dc72c51590e
+[v2ctl.source-probe] remote cwd=/root/comfymodal_runtime
+[v2ctl.source-probe] remote comfymodal_runtime __file__=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/modal_app.py: MATCH remote_sha=c156c662172d0803 expected_sha=c156c662172d0803 path=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/critical_path_ledger.py: MATCH remote_sha=d001f24678843afc expected_sha=d001f24678843afc path=/root/comfymodal_runtime/critical_path_ledger.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_bootstrap.py: MATCH remote_sha=624dcd50c26f55b5 expected_sha=624dcd50c26f55b5 path=/root/comfymodal_runtime/runtime_bootstrap.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_executor.py: MATCH remote_sha=ab0651bf2de41e7d expected_sha=ab0651bf2de41e7d path=/root/comfymodal_runtime/runtime_executor.py
+[v2ctl.source-probe]   comfymodal_runtime/gantt_telemetry.py: MATCH remote_sha=bf61c7db3a931120 expected_sha=bf61c7db3a931120 path=/root/comfymodal_runtime/gantt_telemetry.py
+[v2ctl.source-probe]   comfymodal_runtime/model_preload.py: MATCH remote_sha=4affe1e06a3acc24 expected_sha=4affe1e06a3acc24 path=/root/comfymodal_runtime/model_preload.py
+[v2ctl.source-probe]   comfymodal_runtime/clip_fast_hydration_wiring.py: MATCH remote_sha=a84bae8030a79dab expected_sha=a84bae8030a79dab path=/root/comfymodal_runtime/clip_fast_hydration_wiring.py
+[v2ctl.source-probe]   comfymodal_runtime/registry_proof_store.py: MATCH remote_sha=9e4692fddc14ad91 expected_sha=9e4692fddc14ad91 path=/root/comfymodal_runtime/registry_proof_store.py
+[v2ctl.source-probe]   comfymodal_runtime/golden_serial.py: MATCH remote_sha=89d3017ae80fbf39 expected_sha=89d3017ae80fbf39 path=/root/comfymodal_runtime/golden_serial.py
+[v2ctl.source-probe]   comfymodal_runtime/golden_qd_transport.py: MATCH remote_sha=166a4ef3ce15a64b expected_sha=166a4ef3ce15a64b path=/root/comfymodal_runtime/golden_qd_transport.py
+[v2ctl.source-probe]   comfymodal_runtime/output_durability.py: MATCH remote_sha=f4a95d4e0348df27 expected_sha=f4a95d4e0348df27 path=/root/comfymodal_runtime/output_durability.py
+[v2ctl.source-probe] ledger flag=COMFYMODAL_V2_CRITICAL_PATH_LEDGER enabled=True record_event=True
+[v2ctl.source-probe] verdict=MATCH
+[v2ctl.source-probe] RESULT=PASS source_identity=MATCH

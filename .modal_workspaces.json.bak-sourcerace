@@ -1,0 +1,119 @@
+{
+  "active_workspace_id": "ws_175a616152c5",
+  "deploy_state_by_workspace": {
+    "ws-test-1": {
+      "comfyapp_version": "2.16.24",
+      "custom_nodes_fingerprint": "fp123",
+      "deployed_at": "2026-07-18T20:49:46Z",
+      "deployment_command": "\"/usr/bin/modal\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_175a616152c5": {
+      "comfyapp_version": "2.16.30",
+      "custom_nodes_fingerprint": null,
+      "deployed_at": "2026-08-22T19:05:34Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_228aedb01781": {
+      "comfyapp_version": "2.16.30",
+      "custom_nodes_fingerprint": "af1892b20deaf7d0176807ce70ad56948dbac01fc95141607ead6461dee06d27",
+      "deployed_at": "2026-08-09T14:59:35Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_32ea683e1b7c": {
+      "comfyapp_version": "2.16.24",
+      "custom_nodes_fingerprint": null,
+      "deployed_at": "2026-07-18T14:21:58Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_c1487d319820": {
+      "comfyapp_version": "2.16.26",
+      "custom_nodes_fingerprint": null,
+      "deployed_at": "2026-07-27T01:56:17Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_e677ab553606": {
+      "comfyapp_version": "2.16.30",
+      "custom_nodes_fingerprint": "a66a6c0411ae86c76c96b37e7608f4a3cb776f4827dd2da40ed25520cabc0f84",
+      "deployed_at": "2026-08-06T17:19:10Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_eaef96004dac": {
+      "comfyapp_version": "2.16.30",
+      "custom_nodes_fingerprint": null,
+      "deployed_at": "2026-08-27T05:53:21Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    },
+    "ws_f1a4990a74fd": {
+      "comfyapp_version": "2.16.30",
+      "custom_nodes_fingerprint": "b68385d0ee88bab920a8a36ec9652703751558c16203130f407567327bdeb982",
+      "deployed_at": "2026-08-12T16:06:00Z",
+      "deployment_command": "\"C:\\Users\\parla\\AppData\\Roaming\\Python\\Python311\\Scripts\\modal.EXE\" deploy \"C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\comfyapp.py\""
+    }
+  },
+  "version": 1,
+  "workspaces": [
+    {
+      "id": "ws_32ea683e1b7c",
+      "label": "Legacy Modal Token",
+      "last_deploy_status": "idle",
+      "last_used_at": 1784436530.2409842,
+      "notes": "",
+      "token_id": "ak-mHZvldvoWN2FnZtLoO3K9Q",
+      "token_secret": "as-oycSdUweeVKIKcewqzrEwO"
+    },
+    {
+      "id": "ws_228aedb01781",
+      "label": "Testing 2",
+      "last_deploy_status": "idle",
+      "last_used_at": 1786287684.4674938,
+      "notes": "",
+      "token_id": "ak-V2PkvfnxuXeV19sSNZAIBc",
+      "token_secret": "as-r4GNkQKC0WovsYO4tIUoCs"
+    },
+    {
+      "id": "ws_f1a4990a74fd",
+      "label": "Testing 4",
+      "last_deploy_status": "idle",
+      "last_used_at": 1786550861.8467252,
+      "notes": "",
+      "token_id": "ak-0OsSvlSEGdkwwrM7135KY4",
+      "token_secret": "as-zcpuIJpSUV7LPjekKONDLZ"
+    },
+    {
+      "id": "ws_e677ab553606",
+      "label": "Testing 1",
+      "last_deploy_status": "idle",
+      "last_used_at": 1787809356.6644351,
+      "notes": "",
+      "token_id": "ak-D5NwnUkyvFKWA135D42d5u",
+      "token_secret": "as-p3L4zT5Ki8bFBnghxXToxk"
+    },
+    {
+      "id": "ws_c1487d319820",
+      "label": "Testing5",
+      "last_deploy_status": "idle",
+      "last_used_at": 1785116289.4434822,
+      "notes": "",
+      "token_id": "ak-7pdoPk6hD8Qcqia2bVXGHn",
+      "token_secret": "as-DCuWsKcLnQjNofgNrIpWjD"
+    },
+    {
+      "id": "ws_175a616152c5",
+      "label": "Testing 6",
+      "last_deploy_status": "idle",
+      "last_used_at": 1787071634.1706185,
+      "notes": "",
+      "token_id": "ak-1YzZKt3z3tRTEH4r7HuGQx",
+      "token_secret": "as-unjjEsXVMc4ByIJDH387WC"
+    },
+    {
+      "id": "ws_eaef96004dac",
+      "label": "Testing 7",
+      "last_deploy_status": "idle",
+      "last_used_at": 1787809358.9804006,
+      "notes": "",
+      "token_id": "ak-LS8JXbyA7vAhj0XguK5Ts2",
+      "token_secret": "as-kdhHu1DlbiW4yyy1iLgeOz"
+    }
+  ]
+}

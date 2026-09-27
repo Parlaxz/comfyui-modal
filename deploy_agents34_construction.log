@@ -1,0 +1,319 @@
+=== Loading active workspace ===
+=== Active workspace: Testing 2 ===
+=== Extracting warmup profile from benchmark workflow ===
+=== Warmup profile loaded ===
+[v2.env_profile]
+env_profile=inherit
+thread_policy=TBASE
+snapshot_model_order=O0
+baseline_cpu_request=12
+baseline_memory_request=32768
+memory_request_mb=32768
+vae_policy=v1
+release_gpu_after_request=1
+cpu_model_snapshot=1
+native_fast_disk_unet=1
+publish_restore_plan=0
+vae_snapshot=1
+clip_conditioning_cache=1
+unet_activation_mode=late
+vae_activation_mode=sampling_end
+persistent_local_handle=1
+full_trace=0
+residency_diagnostics=0
+deep_model_diag=0
+pagefault_tracking=0
+eviction_enabled=1
+eviction_role=clip_vae
+eviction_idle_seconds=0
+prefill_lanes=critical
+prefill_wait_for_unet=0
+restore_torch_threads=none
+variance_pretouch=0
+variance_mode=0
+volume_read_run_count=3
+restore_only_mode=1
+restore_only_app=stable-modal-comfy-v2-restore-only-shadow
+restore_only_run_count=6
+restore_only_max_attempts=40
+snapshot_exclude_unet=1
+snapshot_construction=1
+=== Checking for existing V1 deployment: comfyui ===
+=== V1 comfyui already deployed. Deploying V2 only ===
+
+=== V2 deploy log ===
+[v2.startup_stage] stage=container_python_import event=start wall_unix_ns=1786513791199192700 monotonic_ns=114259656000000
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[exact_prefill.remote] enabled=1 source=env
+[timing_trace] module loaded __file__=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\timing_trace.py TRACE_VERSION=2.0.0
+[modal-client] 2026-08-12T00:49:54-0500 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+[comfyapp] custom_node_filter: excluding ComfyModal duplicate dirs from image (14): ['comfyui-modal-aws-rtx6000', 'comfyui-modal-c1-c5-c6-c8-tail', 'comfyui-modal-east1-composition', 'comfyui-modal-exact-clip-conditioning-cache', 'comfyui-modal-memory-regression-fix', 'comfyui-modal-pagesfile-probe', 'comfyui-modal-persistent-modal-handle', 'comfyui-modal-persistent-submission-v2', 'comfyui-modal-restore-structure', 'comfyui-modal-sub13-diagnostic', 'comfyui-modal-teardown-billing-tail', 'comfyui-modal-vae-runtime-path', 'comfyui-modal-vae-snapshot-seed', 'comyui-modal-pagesfile-probe']
+[comfyapp] custom_node_copy_mode=combined nodes=24 layers=1 src=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes dst=/root/comfy/ComfyUI/custom_nodes
+[comfyapp] build-context: comfyapp_dir=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[comfyapp] build-context: local_source=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[comfyapp] build-context: local_syncable_nodes=24 nodes_with_dep_files=22
+[comfyapp] build-context: local_node_names=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-modal', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'masquerade-nodes-comfyui', 'rgthree-comfy']
+[comfyapp] build-context: nodes_with_dep_files=22 dep_nodes=['ComfyUI-CacheDiT', 'ComfyUI-Flux2Klein-Enhancer', 'ComfyUI-KJNodes', 'ComfyUI-SeedVR2_VideoUpscaler', 'ComfyUI_LayerStyle', 'RES4LYF', 'cg-use-everywhere', 'comfyui-custom-scripts', 'comfyui-detail-daemon', 'comfyui-easy-use', 'comfyui-impact-pack', 'comfyui-levelpixel', 'comfyui-lora-manager', 'comfyui-manager', 'comfyui-workflow-encrypt', 'comfyui_controlnet_aux', 'comfyui_essentials', 'comfyui_fill-nodes', 'comfyui_image_metadata_extension', 'comfyui_lg_samplingutils', 'comfyui_sam3', 'rgthree-comfy']
+[comfyapp] build-context: staged_requirements=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.custom_node_requirements staged_nodes=22
+[comfyapp] baked manifest generated: nodes=24 deps_nodes=22 hash=be68be1945de2a29...
+[comfyapp] === Requirements Context Diagnostics ===
+[comfyapp] COMFYAPP_VERSION=2.16.30
+[comfyapp] source_root=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[comfyapp] requirements_dir=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.custom_node_requirements
+[comfyapp] MODAL_FORCE_BUILD=''
+[comfyapp] MODAL_IGNORE_CACHE=''
+[comfyapp] FORCE_BUILD=''
+[comfyapp.custom_node_filter] begin
+[comfyapp.custom_node_filter] action=allow name=ComfyUI-CacheDiT reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=ComfyUI-Flux2Klein-Enhancer reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=ComfyUI-KJNodes reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=ComfyUI-SeedVR2_VideoUpscaler reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=ComfyUI_LayerStyle reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=RES4LYF reason=production_custom_node
+[comfyapp.custom_node_filter] action=deny name=__pycache__ reason=generated_or_environment_directory
+[comfyapp.custom_node_filter] action=allow name=cg-use-everywhere reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-custom-scripts reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-detail-daemon reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-easy-use reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-impact-pack reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-levelpixel reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-lora-manager reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-manager reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui-modal reason=production_custom_node
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-agent1-full-trace reason=local_agent_or_worktree_clone
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-agent2 reason=local_agent_or_worktree_clone
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-agent3 reason=local_agent_or_worktree_clone
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-aws-rtx6000 reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-c1-c5-c6-c8-tail reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-dc8 reason=local_agent_or_worktree_clone
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-east1-composition reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-exact-clip-conditioning-cache reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-memory-regression-fix reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-pagesfile-probe reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-persistent-modal-handle reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-persistent-submission-v2 reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-restore-structure reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-sub13-diagnostic reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-teardown-billing-tail reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-vae-runtime-path reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=deny name=comfyui-modal-vae-snapshot-seed reason=comfymodal_duplicate_worktree
+[comfyapp.custom_node_filter] action=allow name=comfyui-workflow-encrypt reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_controlnet_aux reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_essentials reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_fill-nodes reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_image_metadata_extension reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_lg_samplingutils reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=comfyui_sam3 reason=production_custom_node
+[comfyapp.custom_node_filter] action=deny name=comyui-modal-pagesfile-probe reason=comfymodal_duplicate_typo
+[comfyapp.custom_node_filter] action=allow name=masquerade-nodes-comfyui reason=production_custom_node
+[comfyapp.custom_node_filter] action=allow name=rgthree-comfy reason=production_custom_node
+[comfyapp.custom_node_filter] end
+[comfyapp] source_copy_node_count=24
+[comfyapp] source_copy_top_20_largest_nodes (best-effort bytes after ignore):
+  RES4LYF: 226995248 bytes (216.5 MB)
+  comfyui_sam3: 76440192 bytes (72.9 MB)
+  ComfyUI_LayerStyle: 64481435 bytes (61.5 MB)
+  comfyui_controlnet_aux: 48934318 bytes (46.7 MB)
+  comfyui-modal: 29235660 bytes (27.9 MB)
+  comfyui-lora-manager: 28287211 bytes (27.0 MB)
+  comfyui-manager: 11106247 bytes (10.6 MB)
+  comfyui_fill-nodes: 7006848 bytes (6.7 MB)
+  rgthree-comfy: 6655317 bytes (6.3 MB)
+  ComfyUI-SeedVR2_VideoUpscaler: 6018438 bytes (5.7 MB)
+  comfyui-easy-use: 5985826 bytes (5.7 MB)
+  comfyui-impact-pack: 4098609 bytes (3.9 MB)
+  comfyui_lg_samplingutils: 3559342 bytes (3.4 MB)
+  ComfyUI-CacheDiT: 2722461 bytes (2.6 MB)
+  ComfyUI-KJNodes: 2597698 bytes (2.5 MB)
+  cg-use-everywhere: 2300265 bytes (2.2 MB)
+  ComfyUI-Flux2Klein-Enhancer: 1938744 bytes (1.8 MB)
+  comfyui_image_metadata_extension: 1350229 bytes (1.3 MB)
+  comfyui-levelpixel: 869871 bytes (0.8 MB)
+  comfyui-custom-scripts: 385487 bytes (0.4 MB)
+[comfyapp] custom_node_requirements_context_hash=b604c14479dc289b...
+[comfyapp] requirements_context_file_count=228
+[comfyapp] requirements_context_total_bytes=6217574
+[comfyapp] requirements_context_node_dirs=22
+[comfyapp] requirements_context_top_20_largest:
+  comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_gt.json: 3398949 bytes
+  comfyui_sam3/src/sam3/assets/veval/toy_gt_and_pred/toy_saco_veval_sav_test_pred.json: 542939 bytes
+  comfyui_sam3/src/sam3/sam3/model/sam3_video_base.py: 84091 bytes
+  comfyui_sam3/src/sam3/sam3/model/sam3_video_inference.py: 79107 bytes
+  comfyui_sam3/src/sam3/sam3/model/sam3_tracking_predictor.py: 68888 bytes
+  comfyui_sam3/src/sam3/sam3/agent/system_prompts/system_prompt.txt: 66050 bytes
+  comfyui_sam3/src/sam3/sam3/agent/helpers/visualizer.py: 63244 bytes
+  comfyui_sam3/src/sam3/sam3/model/sam3_tracker_base.py: 59431 bytes
+  comfyui_sam3/src/sam3/sam3/train/loss/loss_fns.py: 54478 bytes
+  comfyui_sam3/src/sam3/sam3/train/transforms/basic_for_api.py: 53796 bytes
+  comfyui_sam3/src/sam3/sam3/train/trainer.py: 44855 bytes
+  comfyui_sam3/src/sam3/sam3/model/io_utils.py: 43457 bytes
+  comfyui_sam3/src/sam3/sam3/model/sam3_image.py: 37532 bytes
+  comfyui_sam3/src/sam3/sam3/eval/saco_veval_evaluators.py: 37137 bytes
+  comfyui_sam3/src/sam3/sam3/model/decoder.py: 36674 bytes
+  comfyui_sam3/src/sam3/sam3/eval/hota_eval_toolkit/trackeval/datasets/tao_ow.py: 36475 bytes
+  comfyui_sam3/src/sam3/sam3/eval/coco_eval.py: 36243 bytes
+  comfyui_sam3/src/sam3/sam3/train/matcher.py: 34370 bytes
+  comfyui_sam3/src/sam3/sam3/model/geometry_encoders.py: 33585 bytes
+  comfyui_sam3/src/sam3/sam3/model/vitdet.py: 32444 bytes
+[comfyapp] dependency_manifest_hash=be68be1945de2a29...
+[v2.dependency_cache]
+dependency_key=1f8b9d8d610849a8553c50ecd61027064976b959c6504c605d9ea735eb20905c
+base_key=5bcfb0d47e431370db7434945f13d7372a7c8183ade97eef1be49b724b6513a2
+requirements_key=b604c14479dc289b3ef39fdf8059f3043d02f04cfb3fca51035e77914a6b85ec
+cachedit_lock_key=1548d5f36612f3e82d8e7bf1b3a3266c778eaf8dc677de2ebe3d05a9f0a6545e
+installer_key=20da617e65903391ce1e690a560347ea68c43190344c5bd15ebafe536113ff7a
+runtime_revision=6618a3590c28010a
+runtime_revision_part_of_dependency_key=0
+decision=expected_hit
+reason=dependency_inputs_unchanged
+[comfyapp] requirements_context_unchanged=1
+[comfyapp] local_editable_path_dependencies (1):
+  node=comfyui_sam3 req=comfyui_sam3/requirements.txt line=./src/sam3 files=474 bytes=59191335 cache_risk=high
+[comfyapp] raw_build_file_contributors (21):
+  node=ComfyUI-Flux2Klein-Enhancer file=pyproject.toml hash=bb3bfbbc5b7f12c2 size=1476 has_reqtxt=False
+  node=ComfyUI-KJNodes file=pyproject.toml hash=29d4abe790344793 size=519 has_reqtxt=True
+  node=ComfyUI-SeedVR2_VideoUpscaler file=pyproject.toml hash=d58460c6c1b81734 size=1184 has_reqtxt=True
+  node=ComfyUI_LayerStyle file=pyproject.toml hash=6552c33a99d638ab size=771 has_reqtxt=True
+  node=cg-use-everywhere file=pyproject.toml hash=150c6f4dfc6fbc25 size=683 has_reqtxt=False
+  node=comfyui-custom-scripts file=pyproject.toml hash=4f22f2c2075881cf size=358 has_reqtxt=False
+  node=comfyui-detail-daemon file=pyproject.toml hash=9885af96b61896ee size=643 has_reqtxt=True
+  node=comfyui-easy-use file=pyproject.toml hash=0bc2411cc2531237 size=660 has_reqtxt=True
+  node=comfyui-impact-pack file=pyproject.toml hash=e7ab9656db8ecde6 size=745 has_reqtxt=True
+  node=comfyui-impact-pack file=install.py hash=9520f8f0c099b78d size=3971 has_reqtxt=True
+  node=comfyui-levelpixel file=pyproject.toml hash=38252cf5eebe50b8 size=1430 has_reqtxt=True
+  node=comfyui-lora-manager file=pyproject.toml hash=fed8b88aa3690930 size=746 has_reqtxt=True
+  node=comfyui-manager file=pyproject.toml hash=02cbb46cea068ab9 size=626 has_reqtxt=True
+  node=comfyui-workflow-encrypt file=pyproject.toml hash=51359ec908a41777 size=424 has_reqtxt=True
+  node=comfyui_controlnet_aux file=pyproject.toml hash=e8ec5486ae4d2fd8 size=655 has_reqtxt=True
+  node=comfyui_essentials file=pyproject.toml hash=1214c1dfc74e36fa size=498 has_reqtxt=True
+  node=comfyui_fill-nodes file=pyproject.toml hash=367b7cfe74201831 size=1267 has_reqtxt=True
+  node=comfyui_image_metadata_extension file=pyproject.toml hash=a7a8b53e7af24f3e size=483 has_reqtxt=False
+  node=comfyui_lg_samplingutils file=pyproject.toml hash=c06ffd2e0020ef5a size=464 has_reqtxt=False
+  node=comfyui_sam3 file=pyproject.toml hash=1c018a8302346bcd size=2227 has_reqtxt=True
+  node=rgthree-comfy file=pyproject.toml hash=9cee2c6c6ac87d48 size=351 has_reqtxt=True
+[comfyapp] custom_node_copy_mode=combined
+[comfyapp] syncable_custom_nodes=24
+[comfyapp] source_copy_layers=1
+[comfyapp] local_custom_node_root=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes
+[comfyapp] comfyui_modal_excluded_custom_node_requirements=check_logs
+[comfyapp] comfyui_modal_excluded_baked_custom_node_deps=check_logs
+[comfyapp] build_order:
+  1. base CUDA image (nvidia/cuda:13.0.0-devel-ubuntu24.04)
+  2. comfy-cli install
+  3. PyTorch CUDA reinstall (cu130)
+  4. triton install
+  5. SageAttention build
+  6. env vars
+  7. add .custom_node_requirements (as local_dir)
+  8. run custom-node prereq pip loop
+  9. add custom-node source (mode=combined, layers=1)
+  10. generate/add baked dependency manifest
+  11. add helper Python sources
+[comfyapp] ===========================================
+[comfyapp] experiment_harness_diag: modal_dir=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[comfyapp] experiment_harness_diag: local_only_dir_exists=1 path=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments
+[comfyapp] experiment_harness_diag: direct_legacy_files_present=[]
+[comfyapp] experiment_harness_diag: combined_ignore_has_local_only_dir=1
+[comfyapp] experiment_harness_diag: modal_ignore_has_local_only_dir=1
+[comfyapp] experiment_harness_diag: mutable_state_location=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.comfymodal_experiments\comfymodal_experiment_state.json
+[comfyapp] experiment_harness_diag: state_inside_ignored_dir=1
+[v2.region_pin] region=unpinned cloud=unpinned source=COMFYMODAL_V2_REGION/COMFYMODAL_V2_CLOUD
+Building image im-v9D5VhutNFoy0HSwJQSE9o
+
+=> Step 0: FROM base
+
+=> Step 1: ENV TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache
+
+=> Step 2: ENV TORCHINDUCTOR_FX_GRAPH_CACHE=1
+
+=> Step 3: ENV TRITON_CACHE_DIR=/tmp/triton_cache
+
+=> Step 4: ENV TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1
+
+=> Step 5: ENV TORCHINDUCTOR_COMPILE_THREADS=1
+
+=> Step 6: ENV COMFYMODAL_ENABLE_TORCH_COMPILE=0
+
+=> Step 7: ENV COMFYMODAL_ENABLE_GPU_SNAPSHOT=0
+
+=> Step 8: ENV COMFYMODAL_WARMUP_TEXT=warmup
+
+=> Step 9: ENV COMFYMODAL_SAGE_RUNTIME_MODE=baked_cuda
+
+=> Step 10: ENV COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE=0
+
+=> Step 11: ENV COMFYMODAL_PRELOAD_MODE=clip_only
+
+=> Step 12: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_UNET=0
+
+=> Step 13: ENV COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP=1
+
+=> Step 14: ENV COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE=1
+
+=> Step 15: ENV COMFYMODAL_EXACT_CLIP_PREFILL=1
+
+=> Step 16: ENV COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT=1
+
+=> Step 17: ENV COMFYMODAL_SAFETENSORS_READ_MODE=normal
+
+=> Step 18: ENV COMFYMODAL_RUNTIME=1
+
+=> Step 19: ENV PROMPT_ASYNC_PRELOAD=0
+
+=> Step 20: ENV PROMPT_PRELOAD_WORKERS=2
+
+=> Step 21: ENV PROMPT_ASYNC_ACTUAL_LOAD=1
+
+=> Step 22: ENV PROMPT_ASYNC_ACTUAL_LOAD_UNET=1
+
+=> Step 23: ENV ACTUAL_LOAD_MODE=unet_vae_only
+
+=> Step 24: ENV DISABLE_CACHEDIT_FOR_Z_IMAGE=0
+
+=> Step 25: ENV DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE=0
+
+=> Step 26: ENV COMFYMODAL_REQUIREMENTS_REPAIR_MODE=fail_fast
+
+=> Step 27: ENV COMFYMODAL_PRELOAD_UNKNOWN_PROFILES=0
+
+=> Step 28: ENV COMFYMODAL_PRELOAD_MAX_TOTAL_GB=12
+
+=> Step 29: ENV COMFYMODAL_PRELOAD_MAX_FILE_GB=10
+
+=> Step 30: ENV COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS=0.5
+
+=> Step 31: ENV COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS=10
+
+=> Step 32: ENV COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY=0
+
+=> Step 33: ENV COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE=0
+
+=> Step 34: ENV COMFYMODAL_RESTORE_BACKGROUND_UNET=0
+
+=> Step 35: ENV COMFYMODAL_V2_RUNTIME_REVISION=6618a3590c28010a
+
+=> Step 36: ENV COMFYMODAL_V2_PREFILL_LANES=critical
+
+=> Step 37: ENV COMFYMODAL_V2_NATIVE_FAST_DISK_UNET=1
+
+=> Step 38: ENV COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+
+=> Step 39: ENV COMFYMODAL_V2_THREAD_POLICY=TBASE
+
+=> Step 40: ENV COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER=O0
+
+=> Step 41: ENV COMFYMODAL_V2_CPU_REQUEST=12
+
+=> Step 42: ENV COMFYMODAL_V2_MEMORY_REQUEST=32768
+
+=> Step 43: ENV COMFYMODAL_V2_MEMORY_MB=32768
+
+=> Step 44: ENV COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT=f504e296c398bdcb2c4c07e2
+Saving image...
+Terminating task due to error: could not read bytes for base index BlobHash("379985c88583c9cb3929c76609dc706c83f530fc710f442d96f3862b026968c1"): timeout
+┌─ Error ─────────────────────────────────────────────────────────────────────┐
+│ Image build for im-v9D5VhutNFoy0HSwJQSE9o failed. See build logs for more   │
+│ details.                                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+=== ERROR: V2 deploy failed with exit code 1 ===

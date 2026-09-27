@@ -1,0 +1,4 @@
+ERROR: deploy reported success but the app's deployment version did NOT advance — the deployed code was NOT updated. Refusing to treat this deploy as valid.
+[v2ctl.deploy] profile=e29-tracer deploy_fingerprint=9c1b18ac561e08400cc16399fa2d6bbbc56205dcfec5bb88ae32fd6538a87b82
+[v2ctl.deploy] command="C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\deploy_and_run_v2_single.bat" E28_VALIDATION
+[v2ctl.deploy] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260819-173320_9c1b18ac.json

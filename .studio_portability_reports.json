@@ -1,0 +1,448 @@
+[
+  {
+    "cache_format_version": 1,
+    "reports": {
+      "wv_3f7e1ec12fe14545": {
+        "report": {
+          "version_id": "wv_3f7e1ec12fe14545",
+          "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "risk_level": "unknown",
+          "rule_version": "portability-rules-v1",
+          "issue_count": 7,
+          "counts": {
+            "high": 0,
+            "medium": 7,
+            "low": 0
+          },
+          "issues": [
+            {
+              "code": "analysis_unavailable",
+              "severity": "medium",
+              "message": "Analysis unavailable: no executable prompt available for analysis.",
+              "subject": "graph",
+              "fix_hint": "Supply readable evidence and re-run analysis.",
+              "evidence": {
+                "reason": "no executable prompt available for analysis"
+              }
+            },
+            {
+              "code": "baseten_deployment_embedding_required",
+              "severity": "medium",
+              "message": "Baseten embeds the workflow into a deployment; free arbitrary graph-per-request dispatch is not the default model.",
+              "subject": "target",
+              "fix_hint": "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+            },
+            {
+              "code": "baseten_frontend_setup_required",
+              "severity": "medium",
+              "message": "The baseten image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "comfy_cloud_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "comfy_cloud frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runcomfy_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "runcomfy frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runpod_frontend_setup_required",
+              "severity": "medium",
+              "message": "The runpod image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "target_capability_unknown",
+              "severity": "medium",
+              "message": "A provider capability this readiness decision depends on is unverified.",
+              "subject": "target",
+              "fix_hint": "Verify the provider capability before relying on this target."
+            }
+          ],
+          "signals": {},
+          "targets": {
+            "local": {
+              "risk_level": "low",
+              "issue_codes": [],
+              "advice": []
+            },
+            "modal": {
+              "risk_level": "low",
+              "issue_codes": [],
+              "advice": []
+            },
+            "runpod": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "runpod_frontend_setup_required"
+              ],
+              "advice": [
+                "Ship a subgraph-capable ComfyUI frontend in the worker image."
+              ]
+            },
+            "runcomfy": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "runcomfy_subgraph_support_unknown",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Verify subgraph execution in a RunComfy session first."
+              ]
+            },
+            "comfy_cloud": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "comfy_cloud_subgraph_support_unknown",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Confirm Comfy Cloud catalog/frontend support before exporting there."
+              ]
+            },
+            "baseten": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "baseten_deployment_embedding_required",
+                "baseten_frontend_setup_required"
+              ],
+              "advice": [
+                "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+              ]
+            }
+          },
+          "environment": {
+            "risk_level": "unknown",
+            "issues": [
+              {
+                "code": "analysis_unavailable",
+                "severity": "medium",
+                "message": "Analysis unavailable: all environment dimensions unknown.",
+                "subject": "environment",
+                "fix_hint": "Supply prepared environment facts and re-run."
+              }
+            ],
+            "source": "current_studio_environment"
+          },
+          "stale": false,
+          "invalidation": {
+            "workflow_version_id": "wv_3f7e1ec12fe14545",
+            "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "dependency_metadata_hash": "898364f57b37b38003f6c2a37641cfaa2e95936af2143b50568053cee38546f6",
+            "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+            "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+            "rule_version": "portability-rules-v1",
+            "manifest_version": 1,
+            "comfyui_version": "0.24.0"
+          },
+          "analyzed_at": "2026-09-10T15:06:59.492341+00:00"
+        },
+        "stamp": {
+          "workflow_version_id": "wv_3f7e1ec12fe14545",
+          "graph_hash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "dependency_metadata_hash": "898364f57b37b38003f6c2a37641cfaa2e95936af2143b50568053cee38546f6",
+          "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+          "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+          "rule_version": "portability-rules-v1",
+          "manifest_version": 1,
+          "comfyui_version": "0.24.0"
+        }
+      },
+      "wv_c8d58c7220db4650": {
+        "report": {
+          "version_id": "wv_c8d58c7220db4650",
+          "graph_hash": "ce03721076d1d1dc0746cdb47522ce7717c782ac735366708b7ba529dd7a8a2a",
+          "risk_level": "high",
+          "rule_version": "portability-rules-v1",
+          "issue_count": 13,
+          "counts": {
+            "high": 2,
+            "medium": 10,
+            "low": 1
+          },
+          "issues": [
+            {
+              "code": "dependency_source_unresolved",
+              "severity": "high",
+              "message": "Remote provisioning cannot reproduce an unpinned dependency source: DonutEditStudio, DonutImageSave, DonutLatestPreview, DonutModelDownloads, DonutReferenceStudio; and 1 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Provide a pinned source (repo URL + commit) before provisioning this dependency.",
+              "evidence": {
+                "count": 6,
+                "names": [
+                  "DonutEditStudio",
+                  "DonutImageSave",
+                  "DonutLatestPreview",
+                  "DonutModelDownloads",
+                  "DonutReferenceStudio",
+                  "DonutWorkflowPanel"
+                ]
+              }
+            },
+            {
+              "code": "unresolved_node_type",
+              "severity": "high",
+              "message": "9 required node class(es) have no usable identity evidence: 5067b898-1594-4938-b15c-b60d6869cffe, 5186050a-13ae-4d2e-bfd6-359e1311b90e, DonutEditStudio, DonutImageSave, DonutLatestPreview, DonutModelDownloads and 3 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Install or map the owning node package, then re-run analysis.",
+              "evidence": {
+                "classes": [
+                  "5067b898-1594-4938-b15c-b60d6869cffe",
+                  "5186050a-13ae-4d2e-bfd6-359e1311b90e",
+                  "DonutEditStudio",
+                  "DonutImageSave",
+                  "DonutLatestPreview"
+                ],
+                "count": 9
+              }
+            },
+            {
+              "code": "baseten_deployment_embedding_required",
+              "severity": "medium",
+              "message": "Baseten embeds the workflow into a deployment; free arbitrary graph-per-request dispatch is not the default model.",
+              "subject": "target",
+              "fix_hint": "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+            },
+            {
+              "code": "baseten_frontend_setup_required",
+              "severity": "medium",
+              "message": "The baseten image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "comfy_cloud_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "comfy_cloud frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "custom_node_unpinned",
+              "severity": "medium",
+              "message": "9 custom node class(es) lack trusted revision pinning: 5067b898-1594-4938-b15c-b60d6869cffe, 5186050a-13ae-4d2e-bfd6-359e1311b90e, DonutEditStudio, DonutImageSave, DonutLatestPreview, DonutModelDownloads and 3 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Pin exact trusted repo revisions for each custom node.",
+              "evidence": {
+                "classes": [
+                  "5067b898-1594-4938-b15c-b60d6869cffe",
+                  "5186050a-13ae-4d2e-bfd6-359e1311b90e",
+                  "DonutEditStudio",
+                  "DonutImageSave",
+                  "DonutLatestPreview"
+                ],
+                "count": 9
+              }
+            },
+            {
+              "code": "dependency_missing",
+              "severity": "medium",
+              "message": "Required dependencies are missing (custom nodes: DonutLatestPreview, DonutModelDownloads, DonutReferenceStudio, DonutWorkflowPanel, donutnodes).",
+              "subject": "custom_nodes",
+              "fix_hint": "Install the missing dependencies on the target or attach source references.",
+              "evidence": {
+                "models_without_source": [],
+                "count": 5
+              }
+            },
+            {
+              "code": "local_dependency_provenance_unresolved",
+              "severity": "medium",
+              "message": "Local provenance could not be established for: DonutEditStudio, DonutImageSave, DonutLatestPreview, DonutModelDownloads, DonutReferenceStudio; and 1 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Identify the source repository and revision locally.",
+              "evidence": {
+                "count": 6,
+                "names": [
+                  "DonutEditStudio",
+                  "DonutImageSave",
+                  "DonutLatestPreview",
+                  "DonutModelDownloads",
+                  "DonutReferenceStudio",
+                  "DonutWorkflowPanel"
+                ]
+              }
+            },
+            {
+              "code": "modal_dependency_revision_unresolved",
+              "severity": "medium",
+              "message": "Modal deploy bake cannot pin a revision for: DonutEditStudio, DonutImageSave, DonutLatestPreview, DonutModelDownloads, DonutReferenceStudio; and 1 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Resolve repo URL and commit before redeploying the Modal app.",
+              "evidence": {
+                "count": 6,
+                "names": [
+                  "DonutEditStudio",
+                  "DonutImageSave",
+                  "DonutLatestPreview",
+                  "DonutModelDownloads",
+                  "DonutReferenceStudio",
+                  "DonutWorkflowPanel"
+                ]
+              }
+            },
+            {
+              "code": "runcomfy_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "runcomfy frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runpod_frontend_setup_required",
+              "severity": "medium",
+              "message": "The runpod image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "target_capability_unknown",
+              "severity": "medium",
+              "message": "A provider capability this readiness decision depends on is unverified.",
+              "subject": "target",
+              "fix_hint": "Verify the provider capability before relying on this target."
+            },
+            {
+              "code": "subgraph_frontend_requirement",
+              "severity": "low",
+              "message": "Graph defines 4 subgraph definition(s); loading requires a frontend >= 1.44.",
+              "subject": "frontend",
+              "fix_hint": "Ensure the target frontend >= 1.44 or flatten subgraphs.",
+              "evidence": {
+                "count": 4
+              }
+            }
+          ],
+          "signals": {
+            "has_absolute_path": false,
+            "has_unresolved_node_type": true,
+            "unresolved_node_count": 9,
+            "custom_node_count": 9,
+            "custom_repo_count": 0,
+            "custom_node_revision_pinned": false,
+            "model_ref_basename_only": true,
+            "model_hash_pinned": true,
+            "model_extraction_gap": false,
+            "requires_input_asset": false,
+            "has_external_endpoint": false,
+            "uses_subgraphs": true,
+            "exact_roundtrip_proven": true,
+            "env_bound_registry_leak": false
+          },
+          "targets": {
+            "local": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "local_dependency_provenance_unresolved",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": []
+            },
+            "modal": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "modal_dependency_revision_unresolved",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Resolve repo URL and commit before redeploying the Modal app."
+              ]
+            },
+            "runpod": {
+              "risk_level": "high",
+              "issue_codes": [
+                "dependency_source_unresolved",
+                "runpod_frontend_setup_required",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Provide a pinned source (repo URL + commit) for every baked dependency.",
+                "Ship a subgraph-capable ComfyUI frontend in the worker image."
+              ]
+            },
+            "runcomfy": {
+              "risk_level": "high",
+              "issue_codes": [
+                "dependency_source_unresolved",
+                "runcomfy_subgraph_support_unknown",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Verify subgraph execution in a RunComfy session first."
+              ]
+            },
+            "comfy_cloud": {
+              "risk_level": "high",
+              "issue_codes": [
+                "comfy_cloud_subgraph_support_unknown",
+                "dependency_source_unresolved",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Confirm Comfy Cloud catalog/frontend support before exporting there."
+              ]
+            },
+            "baseten": {
+              "risk_level": "high",
+              "issue_codes": [
+                "baseten_deployment_embedding_required",
+                "baseten_frontend_setup_required",
+                "dependency_source_unresolved",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+              ]
+            }
+          },
+          "environment": {
+            "risk_level": "high",
+            "issues": [
+              {
+                "code": "custom_node_source_unpinned",
+                "severity": "high",
+                "message": "Custom-node sources are deployed without recorded/enforced revisions.",
+                "subject": "environment",
+                "fix_hint": ""
+              }
+            ],
+            "source": "current_studio_environment"
+          },
+          "stale": false,
+          "invalidation": {
+            "workflow_version_id": "wv_c8d58c7220db4650",
+            "graph_hash": "ce03721076d1d1dc0746cdb47522ce7717c782ac735366708b7ba529dd7a8a2a",
+            "dependency_metadata_hash": "6dd1bbe0a811952b9ec2bf2588ca340c78c47ef32ff316af9345e25bb28f4eed",
+            "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+            "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+            "rule_version": "portability-rules-v1",
+            "manifest_version": 1,
+            "comfyui_version": "0.34.2"
+          },
+          "analyzed_at": "2026-09-14T03:58:45.421612+00:00"
+        },
+        "stamp": {
+          "workflow_version_id": "wv_c8d58c7220db4650",
+          "graph_hash": "ce03721076d1d1dc0746cdb47522ce7717c782ac735366708b7ba529dd7a8a2a",
+          "dependency_metadata_hash": "6dd1bbe0a811952b9ec2bf2588ca340c78c47ef32ff316af9345e25bb28f4eed",
+          "model_library_generation": "2ff98258bdb5018e9280155ea8e74dbe1077b874e047454138b780e81cf2396b",
+          "custom_node_registry_generation": "d41d37a010001899325d9b60b7f734bebf404f779e1baddd1a648539d87820e5",
+          "rule_version": "portability-rules-v1",
+          "manifest_version": 1,
+          "comfyui_version": "0.34.2"
+        }
+      }
+    }
+  }
+]

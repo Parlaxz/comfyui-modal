@@ -1,0 +1,28 @@
+{
+  "total_records": 142,
+  "sham": {
+    "attempts": 56,
+    "computed_valid": 55,
+    "raw_valid_label": 56,
+    "hard_sick_clip": 8,
+    "hard_sick_unet": 8
+  },
+  "split": {
+    "attempts": 86,
+    "computed_valid": 86,
+    "raw_valid_label": 86,
+    "hard_sick_clip": 6,
+    "hard_sick_unet": 4
+  },
+  "unclassified_arm": 0,
+  "evidence_bundles_enumerated": 143,
+  "evidence_bundles_selected": 143,
+  "decision_files_inspected": 121,
+  "decision_files_parsed": 121,
+  "parse_failures": 0,
+  "exclusions": 2,
+  "raw_artifact_rows": 31722,
+  "per_read_rows": 88892,
+  "onset_rows": 426,
+  "field_paths": 961
+}

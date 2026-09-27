@@ -1,0 +1,3 @@
+﻿pid,tid,thread_key,first_call_ms,last_call_ms,call_count
+1,1,1:1,100.0,9150.0,6
+1,2,1:2,500.0,6000.0,1

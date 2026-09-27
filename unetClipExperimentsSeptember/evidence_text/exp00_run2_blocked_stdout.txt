@@ -1,0 +1,10 @@
+[v2ctl.run] WARNING: local deploy identity drifted after deployment; binding the immutable remote receipt (source drift is warning-only)
+ERROR: publisher preflight is not ready for consumer deploy: decision=publish_required bootstrap_required=False
+Second serial invocation (35s gap observed) produced no backend execution, no run manifest, and no
+request. The control plane refused fail-closed because the local tree no longer matched the frozen
+deployment source: a concurrent lane modified tracked runtime files at 10:32:54-10:34:02 local time
+(modal_app.py, golden_serial.py, full_trace_report.py, sampling_deep_profile.py, plus untracked
+comfymodal_runtime/golden_human_report.py) while this baseline cohort owned the single deployment.
+Per the source-freeze rule (any deploy-relevant change -> stop, no second deployment in this task),
+remote execution stopped here. This blocked attempt is retained as evidence; nothing was silently
+discarded.

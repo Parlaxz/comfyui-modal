@@ -1,0 +1,23 @@
+﻿[v2ctl.golden.status]
+schema_version=2
+profile=golden_p1
+target={'app': 'sept-unetclip-02-h2d-aggregation', 'class': 'ModalRuntimeEntrypointV2', 'method': 'run_golden_serial_stream'}
+deployment_manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260903-192325_e5d2e9dd.json
+deployment_fingerprint_current=e5d2e9ddbb852e6c8ec70e59eaf85fc07ffc4015fb471b961a63daf85801b003
+deployment_fingerprint_stored=e5d2e9ddbb852e6c8ec70e59eaf85fc07ffc4015fb471b961a63daf85801b003
+deployment_fingerprint_match=True
+deployment_target_match=True
+deployed_state_present=True
+deployed_state_target_match=False
+deployed_state_app=batch-ra2-active-patcher
+deployed_state_class=ModalRuntimeEntrypointV2
+deployed_state_combined_hash=d25161544d2d2d7461d32a1b2f99ea381c6cf7a108d3c9b2481037192fbeac96
+deployed_state_error=
+runtime_health_status=unverified
+source_identity_status=unverified
+runtime_overrides_present=0
+deploy_lock_active=False
+capture_guard={'schema_version': 2, 'state': 'idle', 'post_capture_guard_pending': False, 'last_snapshot_capture_request_id': '', 'last_snapshot_capture_at': '', 'guard_armed_by_request_id': '', 'last_guard_consumed_by_request_id': '', 'last_guard_consumed_at': '', 'capture_identity': '', 'capture_request_id': '', 'capture_at': '', 'deployment_identity': '{"app_name":"sept-unetclip-02-h2d-aggregation","class_name":"ModalRuntimeEntrypointV2","deploy_fingerprint":"e5d2e9ddbb852e6c8ec70e59eaf85fc07ffc4015fb471b961a63daf85801b003","deployment_combined_hash":"e5d2e9ddbb852e6c8ec70e59eaf85fc07ffc4015fb471b961a63daf85801b003","gpu":"rtx-pro-6000"}', 'last_transition_reason': 'initial'}
+next_request_guarded=False
+remote_checks=not_performed
+ready=False

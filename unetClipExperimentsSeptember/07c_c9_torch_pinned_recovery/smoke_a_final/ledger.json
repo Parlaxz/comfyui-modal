@@ -1,0 +1,78 @@
+{
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "arm": "source_only",
+  "attempts": [
+    {
+      "artifact": "unetClipExperimentsSeptember\\07c_c9_torch_pinned_recovery\\smoke_a_final\\runs\\20260905T060858_0998a3f2_c9_o01_unet_qd8.json",
+      "attempt_id": "20260905T060858_0998a3f2_c9_o01_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 1,
+      "cell_id": "unet_qd8",
+      "error": "effective_gbps_missing",
+      "finished_at": "2026-09-05T06:10:07.801305+00:00",
+      "finished_monotonic_ns": 230433406000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 1,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T060858_0998a3f2",
+      "started_at": "2026-09-05T06:08:58.638874+00:00",
+      "started_monotonic_ns": 230364250000000,
+      "status": "INVALID",
+      "wall_ms": 69156.0
+    },
+    {
+      "artifact": "unetClipExperimentsSeptember\\07c_c9_torch_pinned_recovery\\smoke_a_final\\runs\\20260905T060858_0998a3f2_c9_o02_unet_qd8.json",
+      "attempt_id": "20260905T060858_0998a3f2_c9_o02_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 2,
+      "cell_id": "unet_qd8",
+      "error": "effective_gbps_missing",
+      "finished_at": "2026-09-05T06:10:15.846760+00:00",
+      "finished_monotonic_ns": 230441453000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 2,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T060858_0998a3f2",
+      "started_at": "2026-09-05T06:10:07.806301+00:00",
+      "started_monotonic_ns": 230433421000000,
+      "status": "INVALID",
+      "wall_ms": 8032.0
+    }
+  ],
+  "experiment": "c9_recovery",
+  "geometry": {
+    "block_bytes": 33554432,
+    "expected_attempts_per_run": 2,
+    "models": {
+      "unet": "z_image_turbo_bf16.safetensors"
+    },
+    "observations_per_model_qd": 2,
+    "qd_values": [
+      8
+    ],
+    "roles": [
+      "unet"
+    ]
+  },
+  "runs": [
+    {
+      "attempt_ids": [
+        "20260905T060858_0998a3f2_c9_o01_unet_qd8",
+        "20260905T060858_0998a3f2_c9_o02_unet_qd8"
+      ],
+      "completed_attempts": 2,
+      "expected_attempts": 2,
+      "finished_at": "2026-09-05T06:10:15.852757+00:00",
+      "run_id": "20260905T060858_0998a3f2",
+      "started_at": "2026-09-05T06:08:58.080542+00:00",
+      "status": "COMPLETE_WITH_FAILURES"
+    }
+  ],
+  "status": "COMPLETE_WITH_FAILURES",
+  "updated_at": "2026-09-05T06:10:15.852757+00:00",
+  "version": 1
+}

@@ -1,0 +1,193 @@
+{
+  "benchmark": "e27_provenance_tracker",
+  "marker": "benchmark.physical_syscall",
+  "event_counts": [
+    47,
+    123,
+    243,
+    370
+  ],
+  "repetitions": 7,
+  "rows": [
+    {
+      "events": 47,
+      "legacy_ns": [
+        3402400,
+        3418900,
+        3828900,
+        2900600,
+        2406900,
+        3555300,
+        3729900
+      ],
+      "fixed_ns": [
+        335100,
+        301500,
+        282800,
+        276400,
+        275200,
+        338000,
+        305400
+      ],
+      "legacy_median_ns": 3418900,
+      "fixed_median_ns": 301500,
+      "legacy_to_fixed_median_ratio": 11.339635157545604,
+      "legacy_cpu_ns": [
+        0,
+        0,
+        15625000,
+        0,
+        0,
+        0,
+        0
+      ],
+      "fixed_cpu_ns": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "legacy_cpu_median_ns": 0,
+      "fixed_cpu_median_ns": 0,
+      "legacy_to_fixed_cpu_median_ratio": null
+    },
+    {
+      "events": 123,
+      "legacy_ns": [
+        26477200,
+        24328900,
+        25066900,
+        22980700,
+        24512700,
+        25929700,
+        26316000
+      ],
+      "fixed_ns": [
+        674200,
+        629300,
+        633000,
+        611000,
+        721700,
+        893800,
+        816600
+      ],
+      "legacy_median_ns": 25066900,
+      "fixed_median_ns": 674200,
+      "legacy_to_fixed_median_ratio": 37.18021358647286,
+      "legacy_cpu_ns": [
+        31250000,
+        31250000,
+        15625000,
+        31250000,
+        0,
+        31250000,
+        31250000
+      ],
+      "fixed_cpu_ns": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "legacy_cpu_median_ns": 31250000,
+      "fixed_cpu_median_ns": 0,
+      "legacy_to_fixed_cpu_median_ratio": null
+    },
+    {
+      "events": 243,
+      "legacy_ns": [
+        84258300,
+        83172400,
+        73693500,
+        73026300,
+        69251900,
+        78700800,
+        70812700
+      ],
+      "fixed_ns": [
+        1646400,
+        1358900,
+        1368600,
+        1116900,
+        1270800,
+        1170200,
+        916900
+      ],
+      "legacy_median_ns": 73693500,
+      "fixed_median_ns": 1270800,
+      "legacy_to_fixed_median_ratio": 57.989848914069874,
+      "legacy_cpu_ns": [
+        62500000,
+        93750000,
+        78125000,
+        62500000,
+        78125000,
+        78125000,
+        62500000
+      ],
+      "fixed_cpu_ns": [
+        0,
+        0,
+        0,
+        15625000,
+        0,
+        0,
+        0
+      ],
+      "legacy_cpu_median_ns": 78125000,
+      "fixed_cpu_median_ns": 0,
+      "legacy_to_fixed_cpu_median_ratio": null
+    },
+    {
+      "events": 370,
+      "legacy_ns": [
+        172375500,
+        162447600,
+        165356800,
+        196230800,
+        191039500,
+        218639600,
+        187774900
+      ],
+      "fixed_ns": [
+        1579900,
+        1861200,
+        1790400,
+        1501300,
+        1342100,
+        1837400,
+        1683800
+      ],
+      "legacy_median_ns": 187774900,
+      "fixed_median_ns": 1683800,
+      "legacy_to_fixed_median_ratio": 111.51852951656966,
+      "legacy_cpu_ns": [
+        171875000,
+        156250000,
+        171875000,
+        171875000,
+        203125000,
+        203125000,
+        187500000
+      ],
+      "fixed_cpu_ns": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "legacy_cpu_median_ns": 171875000,
+      "fixed_cpu_median_ns": 0,
+      "legacy_to_fixed_cpu_median_ratio": null
+    }
+  ]
+}

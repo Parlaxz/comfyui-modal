@@ -1,0 +1,25 @@
+﻿git rev-parse HEAD
+fe05aa7eadd06281ca8501a19aa38065fbd5999f
+
+git status --short
+(empty at initial capture)
+
+git diff --stat
+(empty at initial capture)
+
+git log -15 --oneline
+fe05aa7 Separate runtime config from model volume
+4f0bd0d Pin RTX PRO 6000 scheduling to GCP
+5ed8d15 revert comfyapp.py
+7a1c0f4 Restore canonical remote timing path
+c0fa6f0 hash
+1b0c68a horrible
+f85d2ee more mostly working
+1406163 mostly working
+486c9b4 more
+4213480 why
+eefe88c improved production mode
+00db1c1 newest
+abbad61 post-fixes 2
+b20e356 post-fixes
+632e586 updated production mode

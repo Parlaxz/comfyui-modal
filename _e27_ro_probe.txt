@@ -1,0 +1,85 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "status": "ok",
+ "mode": "snapshot_restore_only",
+ "request_id": "stable-modal-comfy-v2-restore-only-shadow-snapshot-probe",
+ "start_ts": "2026-08-18T22:42:56.230151+00:00",
+ "entry_wall_unix_ns": 1787092976230138816,
+ "entry_mono_ns": 177237846172,
+ "end_wall_unix_ns": 1787092976236474015,
+ "end_ts": "2026-08-18T22:42:56.236478+00:00",
+ "graph_executed": false,
+ "unet_loaded": false,
+ "vae_decoded": false,
+ "volume_read": false,
+ "placement": {
+  "cloud": "CLOUD_PROVIDER_GCP",
+  "region": "us-east4",
+  "gpu": "rtx-pro-6000",
+  "cpu_request": "16",
+  "memory_request_mb": "49152"
+ },
+ "identity": {
+  "restored_instance_id": "61b8bee7b8d549e4b2e0bdfaf5792a69",
+  "restore_count": 1,
+  "request_count": 1,
+  "container_session_id": "d2567fef233b4446",
+  "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+  "class_name": "ModalRuntimeEntrypoint",
+  "modal_input_id": "in-01M0BGN9Y19N70QAH0N7QNTQGH:1787092969410-0",
+  "container_task_id": "ta-01M0BGNAKKRWPMM0VGTRZN8K1R",
+  "image_id": "im-HIdIchSDQGmjySP8sp9Gce",
+  "cloud": "CLOUD_PROVIDER_GCP",
+  "region": "us-east4",
+  "runtime_mode": "1"
+ },
+ "snapshot_identity": "5f793dab31de9a78ad936700093c1e8e781ae11f7902b65cd3e5224f072bce66",
+ "snapshot_identity_source": "cpu_snapshot_models.model_key.stable_hash",
+ "invariant": {
+  "unet_present": 0,
+  "retained_unet_payload": 0,
+  "reconstructed_unet_present": 0,
+  "cpu_snapshot_models_present": 1,
+  "container_retained": 1,
+  "clip_present": 1,
+  "vae_present": 1,
+  "cpu_snapshot_models_active": 0,
+  "snapshot_exclude_unet_gate": 1,
+  "eviction_retained_role": "clip_vae",
+  "retained_unet_runtime_state_present": 0,
+  "retained_eviction_model_present": 0,
+  "model_key_unet_identity": "z_image_turbo_bf16.safetensors"
+ },
+ "restore_timing": {
+  "remote_python_resume_wall_unix_ns": 1787092974854696448,
+  "restore_method_start_wall_unix_ns": 1787092974854696448,
+  "restore_method_end_wall_unix_ns": 1787092976216515328,
+  "restore_total_ms": 976.619,
+  "restore_session_id": "842a1774af6e48a79700d65ff3be726f",
+  "restore_count": 1,
+  "restored_instance_id": "61b8bee7b8d549e4b2e0bdfaf5792a69",
+  "container_session_id": "d2567fef233b4446",
+  "lifecycle_status": "ok",
+  "lifecycle_method": "restore"
+ },
+ "rss": {
+  "capture_wall_unix_ns": 1787092976234743576,
+  "rss_mib": null,
+  "pss_mib": null,
+  "anonymous_mib": null,
+  "private_clean_mib": null,
+  "private_dirty_mib": null,
+  "shared_clean_mib": null,
+  "shared_dirty_mib": null,
+  "swap_mib": null,
+  "status_vmrss_mib": 7630.5,
+  "status_vmhwm_mib": null,
+  "cgroup_current_mib": 7513.7,
+  "cgroup_peak_mib": null,
+  "source": "unavailable"
+ },
+ "waterfall": {
+  "status": "non_applicable",
+  "method": "run_snapshot_restore_only_probe"
+ }
+}

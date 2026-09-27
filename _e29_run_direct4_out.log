@@ -1,0 +1,30 @@
+exit: 0
+elapsed: 42.7
+stdout tail:
+   |
+|     |   Node: ClownsharKSampler_Beta                 |  60.912 ms |            |          |                                          |
+|     |   Checkpoint read                              | 239.971 ms |            |          |                                          |
+|   7 | Sampler node to sampling                       |  52.580 ms |    13.772s |   0.221% | #                                        |
+|     |   lane acquired to actual stage                |  52.561 ms |            |          |                                          |
+|   8 | Sampling                                       |     4.749s |    18.522s |  20.001% | ########                                 |
+|   9 | Post-sampling / VAE transition                 | 897.644 ms |    19.419s |   3.780% | ##                                       |
+|  10 | VAE decode                                     | 365.037 ms |    19.784s |   1.537% | #                                        |
+|  11 | Output encode / descriptor                     |     1.705s |    21.489s |   7.179% | ###                                      |
+|     |   PNG encode                                   | 176.619 ms |            |          |                                          |
+|  12 | Remote result handoff                          |     2.235s |    23.724s |   9.414% | ####                                     |
+|  13 | Local result handling / caller return          |  16.000 ms |    23.740s |   0.067% | #                                        |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|     | RECONCILIATION                                 |   4.121 ms |            |          |                                          |
+|     | STATUS                                         |         OK |            |          |                                          |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+COMMAND -> RESPONSE:                     35.455s
+Command (without scheduling) -> Response:   23.744s
+Scheduling time:                         11.710s
+[v2.experiment] campaign manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-19_23-52-01\campaign_manifest.json
+=== Single V2 benchmark completed ===
+=== Total command-to-response time: 41.903s ===
+
+stderr tail:
+[modal-client] 2026-08-19T18:52:00-0500 Warning: function name 'ComfyAPI_H100.*' collision! Overriding existing function [comfyapp].ComfyAPI_H100.* with new function [comfyapp].ComfyAPI_H100.*
+WARNING:root:WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
+

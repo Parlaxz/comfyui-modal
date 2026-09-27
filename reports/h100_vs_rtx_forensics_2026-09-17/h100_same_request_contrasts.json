@@ -1,0 +1,341 @@
+{
+  "generated_by": "tools/analysis/h100_vs_rtx_forensics.py",
+  "units": "gbps fields are decimal GB/s (10^9 bytes/s); load in milliseconds",
+  "source_evidence": {
+    "field": "golden_telemetry.stages[*].details.transport_stats",
+    "roles": [
+      "clip",
+      "unet"
+    ]
+  },
+  "definitions": {
+    "source_gbps_decimal": "transport source_bytes / SOURCE_TOTAL_WALL_MS",
+    "active_h2d_gbps_decimal": "GPU_COPY_BYTES / GPU_COPY_ACTIVE_UNION_MS",
+    "load_ms": "enclosing golden_<role>_load stage wall",
+    "reversal_factor": "max over the three CLIP/UNET ratios of max(r, 1/r)",
+    "dramatic_reversal": "any axis ratio magnitude >= 2.0",
+    "role_order_reversal_dimensions": "axis pairs whose faster role differs within the same request"
+  },
+  "dramatic_reversal_factor": 2.0,
+  "counts": {
+    "n_requests": 11,
+    "n_dramatic_reversal": 3,
+    "n_role_order_reversal": 7
+  },
+  "dramatic_reversal_requests": [
+    {
+      "request_id": "golden-p1-0-bd8ea2348bd5",
+      "cohort": "cohort_2026-09-17_17-24-49_79e86b",
+      "reversal_factor": 6.069225,
+      "dramatic_reversal_dimensions": [
+        "source",
+        "load"
+      ],
+      "source_faster_role": "unet",
+      "clip_source_gbps_decimal": 1.030787,
+      "unet_source_gbps_decimal": 6.256078,
+      "clip_active_h2d_gbps_decimal": 43.843602,
+      "unet_active_h2d_gbps_decimal": 46.311511
+    },
+    {
+      "request_id": "golden-p1-0-94a52e483709",
+      "cohort": "cohort_2026-09-17_17-27-27_4437e0",
+      "reversal_factor": 6.195044,
+      "dramatic_reversal_dimensions": [
+        "source",
+        "load"
+      ],
+      "source_faster_role": "clip",
+      "clip_source_gbps_decimal": 6.033954,
+      "unet_source_gbps_decimal": 0.973997,
+      "clip_active_h2d_gbps_decimal": 32.726739,
+      "unet_active_h2d_gbps_decimal": 43.394996
+    },
+    {
+      "request_id": "golden-p1-0-bf1abb3bd594",
+      "cohort": "cohort_2026-09-17_17-35-08_fe21e2",
+      "reversal_factor": 2.121727,
+      "dramatic_reversal_dimensions": [
+        "source"
+      ],
+      "source_faster_role": "unet",
+      "clip_source_gbps_decimal": 1.378015,
+      "unet_source_gbps_decimal": 2.923771,
+      "clip_active_h2d_gbps_decimal": 43.581155,
+      "unet_active_h2d_gbps_decimal": 39.583846
+    }
+  ],
+  "per_request": [
+    {
+      "request_id": "golden-p1-0-a4f66843ed5b",
+      "cohort": "cohort_2026-09-17_17-22-42_f841d7",
+      "clip_source_gbps_decimal": 2.70605,
+      "unet_source_gbps_decimal": 3.551461,
+      "source_ratio_clip_over_unet": 0.761954,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 13.587683,
+      "unet_active_h2d_gbps_decimal": 13.480237,
+      "active_h2d_ratio_clip_over_unet": 1.007971,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 2.735805,
+      "unet_h2d_span_gbps_decimal": 3.580607,
+      "clip_load_ms": 5384.788675,
+      "unet_load_ms": 5486.526158,
+      "load_ratio_clip_over_unet": 0.981457,
+      "load_faster_role": "clip",
+      "reversal_factor": 1.312415,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "source_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-bd8ea2348bd5",
+      "cohort": "cohort_2026-09-17_17-24-49_79e86b",
+      "clip_source_gbps_decimal": 1.030787,
+      "unet_source_gbps_decimal": 6.256078,
+      "source_ratio_clip_over_unet": 0.164766,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 43.843602,
+      "unet_active_h2d_gbps_decimal": 46.311511,
+      "active_h2d_ratio_clip_over_unet": 0.946711,
+      "active_h2d_faster_role": "unet",
+      "clip_h2d_span_gbps_decimal": 1.034816,
+      "unet_h2d_span_gbps_decimal": 6.318973,
+      "clip_load_ms": 8891.598984,
+      "unet_load_ms": 2280.597415,
+      "load_ratio_clip_over_unet": 3.898803,
+      "load_faster_role": "unet",
+      "reversal_factor": 6.069225,
+      "dramatic_reversal": true,
+      "dramatic_reversal_dimensions": [
+        "source",
+        "load"
+      ],
+      "role_order_reversal_dimensions": []
+    },
+    {
+      "request_id": "golden-p1-0-a157324ed1d0",
+      "cohort": "cohort_2026-09-17_17-25-28_068779",
+      "clip_source_gbps_decimal": 5.016031,
+      "unet_source_gbps_decimal": 5.000013,
+      "source_ratio_clip_over_unet": 1.003204,
+      "source_faster_role": "clip",
+      "clip_active_h2d_gbps_decimal": 24.174674,
+      "unet_active_h2d_gbps_decimal": 26.621281,
+      "active_h2d_ratio_clip_over_unet": 0.908096,
+      "active_h2d_faster_role": "unet",
+      "clip_h2d_span_gbps_decimal": 5.088389,
+      "unet_h2d_span_gbps_decimal": 5.051262,
+      "clip_load_ms": 2632.040262,
+      "unet_load_ms": 2783.818204,
+      "load_ratio_clip_over_unet": 0.945479,
+      "load_faster_role": "clip",
+      "reversal_factor": 1.101205,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-4a3a9df54ab7",
+      "cohort": "cohort_2026-09-17_17-26-51_c00a60",
+      "clip_source_gbps_decimal": 5.704933,
+      "unet_source_gbps_decimal": 5.840479,
+      "source_ratio_clip_over_unet": 0.976792,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 24.737603,
+      "unet_active_h2d_gbps_decimal": 25.442357,
+      "active_h2d_ratio_clip_over_unet": 0.9723,
+      "active_h2d_faster_role": "unet",
+      "clip_h2d_span_gbps_decimal": 5.809935,
+      "unet_h2d_span_gbps_decimal": 5.90987,
+      "clip_load_ms": 2512.366847,
+      "unet_load_ms": 2431.845244,
+      "load_ratio_clip_over_unet": 1.033111,
+      "load_faster_role": "unet",
+      "reversal_factor": 1.033111,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": []
+    },
+    {
+      "request_id": "golden-p1-0-94a52e483709",
+      "cohort": "cohort_2026-09-17_17-27-27_4437e0",
+      "clip_source_gbps_decimal": 6.033954,
+      "unet_source_gbps_decimal": 0.973997,
+      "source_ratio_clip_over_unet": 6.195044,
+      "source_faster_role": "clip",
+      "clip_active_h2d_gbps_decimal": 32.726739,
+      "unet_active_h2d_gbps_decimal": 43.394996,
+      "active_h2d_ratio_clip_over_unet": 0.754159,
+      "active_h2d_faster_role": "unet",
+      "clip_h2d_span_gbps_decimal": 6.210204,
+      "unet_h2d_span_gbps_decimal": 0.975918,
+      "clip_load_ms": 2453.972408,
+      "unet_load_ms": 12950.693993,
+      "load_ratio_clip_over_unet": 0.189486,
+      "load_faster_role": "clip",
+      "reversal_factor": 6.195044,
+      "dramatic_reversal": true,
+      "dramatic_reversal_dimensions": [
+        "source",
+        "load"
+      ],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-f98520a50bf1",
+      "cohort": "cohort_2026-09-17_17-29-27_62f388",
+      "clip_source_gbps_decimal": 2.24423,
+      "unet_source_gbps_decimal": 3.517595,
+      "source_ratio_clip_over_unet": 0.638001,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 45.226745,
+      "unet_active_h2d_gbps_decimal": 45.140803,
+      "active_h2d_ratio_clip_over_unet": 1.001904,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 2.272765,
+      "unet_h2d_span_gbps_decimal": 3.754863,
+      "clip_load_ms": 5089.124817,
+      "unet_load_ms": 4031.521265,
+      "load_ratio_clip_over_unet": 1.262334,
+      "load_faster_role": "unet",
+      "reversal_factor": 1.567395,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-2a264d69ee85",
+      "cohort": "cohort_2026-09-17_17-32-08_73af00",
+      "clip_source_gbps_decimal": 4.546533,
+      "unet_source_gbps_decimal": 4.480861,
+      "source_ratio_clip_over_unet": 1.014656,
+      "source_faster_role": "clip",
+      "clip_active_h2d_gbps_decimal": 24.396565,
+      "unet_active_h2d_gbps_decimal": 24.991707,
+      "active_h2d_ratio_clip_over_unet": 0.976186,
+      "active_h2d_faster_role": "unet",
+      "clip_h2d_span_gbps_decimal": 4.610583,
+      "unet_h2d_span_gbps_decimal": 4.522043,
+      "clip_load_ms": 2917.315763,
+      "unet_load_ms": 3105.45741,
+      "load_ratio_clip_over_unet": 0.939416,
+      "load_faster_role": "clip",
+      "reversal_factor": 1.064491,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-207a82424ea6",
+      "cohort": "cohort_2026-09-17_17-33-19_10d7a0",
+      "clip_source_gbps_decimal": 5.719661,
+      "unet_source_gbps_decimal": 5.464404,
+      "source_ratio_clip_over_unet": 1.046713,
+      "source_faster_role": "clip",
+      "clip_active_h2d_gbps_decimal": 26.550872,
+      "unet_active_h2d_gbps_decimal": 26.397966,
+      "active_h2d_ratio_clip_over_unet": 1.005792,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 5.851705,
+      "unet_h2d_span_gbps_decimal": 5.531326,
+      "clip_load_ms": 2535.403847,
+      "unet_load_ms": 2576.342809,
+      "load_ratio_clip_over_unet": 0.98411,
+      "load_faster_role": "clip",
+      "reversal_factor": 1.046713,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": []
+    },
+    {
+      "request_id": "golden-p1-0-5ad28bce7dd5",
+      "cohort": "cohort_2026-09-17_17-33-58_b08572",
+      "clip_source_gbps_decimal": 4.174389,
+      "unet_source_gbps_decimal": 3.970762,
+      "source_ratio_clip_over_unet": 1.051282,
+      "source_faster_role": "clip",
+      "clip_active_h2d_gbps_decimal": 45.417434,
+      "unet_active_h2d_gbps_decimal": 29.759578,
+      "active_h2d_ratio_clip_over_unet": 1.526145,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 4.288397,
+      "unet_h2d_span_gbps_decimal": 4.131275,
+      "clip_load_ms": 3673.497133,
+      "unet_load_ms": 4301.226567,
+      "load_ratio_clip_over_unet": 0.854058,
+      "load_faster_role": "clip",
+      "reversal_factor": 1.526145,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": []
+    },
+    {
+      "request_id": "golden-p1-0-65b7ddf18846",
+      "cohort": "cohort_2026-09-17_17-34-33_7a773e",
+      "clip_source_gbps_decimal": 2.303631,
+      "unet_source_gbps_decimal": 4.055408,
+      "source_ratio_clip_over_unet": 0.568039,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 42.225473,
+      "unet_active_h2d_gbps_decimal": 38.732599,
+      "active_h2d_ratio_clip_over_unet": 1.090179,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 2.438774,
+      "unet_h2d_span_gbps_decimal": 4.090051,
+      "clip_load_ms": 4788.771508,
+      "unet_load_ms": 3343.69169,
+      "load_ratio_clip_over_unet": 1.432181,
+      "load_faster_role": "unet",
+      "reversal_factor": 1.760442,
+      "dramatic_reversal": false,
+      "dramatic_reversal_dimensions": [],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    },
+    {
+      "request_id": "golden-p1-0-bf1abb3bd594",
+      "cohort": "cohort_2026-09-17_17-35-08_fe21e2",
+      "clip_source_gbps_decimal": 1.378015,
+      "unet_source_gbps_decimal": 2.923771,
+      "source_ratio_clip_over_unet": 0.471314,
+      "source_faster_role": "unet",
+      "clip_active_h2d_gbps_decimal": 43.581155,
+      "unet_active_h2d_gbps_decimal": 39.583846,
+      "active_h2d_ratio_clip_over_unet": 1.100983,
+      "active_h2d_faster_role": "clip",
+      "clip_h2d_span_gbps_decimal": 1.559516,
+      "unet_h2d_span_gbps_decimal": 3.440198,
+      "clip_load_ms": 7806.582359,
+      "unet_load_ms": 4871.311759,
+      "load_ratio_clip_over_unet": 1.602563,
+      "load_faster_role": "unet",
+      "reversal_factor": 2.121727,
+      "dramatic_reversal": true,
+      "dramatic_reversal_dimensions": [
+        "source"
+      ],
+      "role_order_reversal_dimensions": [
+        "source_vs_active_h2d",
+        "active_h2d_vs_load"
+      ]
+    }
+  ]
+}

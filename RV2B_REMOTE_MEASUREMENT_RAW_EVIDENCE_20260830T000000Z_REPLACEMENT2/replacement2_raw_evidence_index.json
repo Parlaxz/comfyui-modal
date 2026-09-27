@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "experiment": "RV2B",
+  "replacement_deployment_number": 2,
+  "deployment_counts": {
+    "app_deployments_total": 2,
+    "this_replacement": 1
+  },
+  "target": {
+    "app": "batch-rv2b-golden-measurement",
+    "profile": "golden_p1",
+    "class": "ModalRuntimeEntrypointV2",
+    "method": "run_golden_serial_stream",
+    "gpu": "rtx-pro-6000",
+    "provider": "not reported by source-probe",
+    "region": "provider default; no region override",
+    "production_app_touched": false
+  },
+  "source_identity": {
+    "git_head": "7f9a19ef9bf88c1424340897cdf723748b1341dc",
+    "branch": "TESTING2",
+    "working_tree_dirty": true,
+    "deploy_relevant_source_frozen": true,
+    "deploy_inputs_git_dirty": false,
+    "note": "Dirty entries were evidence/report files only; no deploy-relevant source/configuration was edited."
+  },
+  "replacement_deployment": {
+    "manifest": ".v2ctl/deployments/deploy_20260830-214021_32dd57ed.json",
+    "manifest_copy": "RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z_REPLACEMENT2/replacement_deployment_2_manifest.json",
+    "deployment_fingerprint": "32dd57ed54eaddc337af6d790e722c6b8cdc7241e7f64e72a14a6e54d973a4d1",
+    "deployment_combined_hash": "aaba80156dc559e5",
+    "profile_config_fingerprint": "7d64609fa4c0bc3c18b06ace3240dfaa91c447269304ef26c86a545371ce17b8",
+    "deployed_run_fingerprint": "0d97fdc9614c499e51a5a83adeb54fdb1bfa2587a0c572c78cc324e2d0bfdc41",
+    "image": "im-23xv0uKAkaifNqXoGRtIpj",
+    "source_probe_container": "2849896541934921",
+    "snapshot_identity": "not available before a request",
+    "workflow_identity": "not available; no request executed",
+    "model_identity": "not available; no request executed",
+    "custom_nodes_full_content_generation": "f4c12e9b7573fb5d45d0a4b5a83fa33dccc788f6ff07edf859055588ae8f1014",
+    "custom_nodes_publication": "skip_exact",
+    "selectors": {
+      "profile": "golden_p1",
+      "deployment": "native Modal deploy; no generic selector",
+      "request": "golden_p1 serial request not reached"
+    },
+    "required_diagnostics": {
+      "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS": "1",
+      "COMFYMODAL_SAMPLING_DEEP_PROFILE": "off",
+      "runtime_overrides": 0,
+      "ra6_blocks_arm": "not run"
+    }
+  },
+  "remote_checks": {
+    "source_probe": "PASS / MATCH",
+    "post_deploy_doctor": "OK",
+    "post_deploy_status": "not ready: runtime health unverified; no request was permitted",
+    "remote_source_modules": "all reported MATCH",
+    "remote_request_count": 0
+  },
+  "attempt_counts": {
+    "backend_measurement_attempts": 0,
+    "control_plane_run_attempts": 2,
+    "snapshot_captures": 0,
+    "invalid_directly_following_captures": 0,
+    "failures_or_dnf": 0,
+    "slow_outliers": 0,
+    "eligible_runs": 0,
+    "eligible_required": 5,
+    "same_deployment_status": "no measurement cohort"
+  },
+  "ra_completeness": {
+    "RA3": "unavailable; no Golden request",
+    "RA7": "unavailable; no Golden request",
+    "RA8": "unavailable; no Golden request",
+    "RA6": "deployment effective mode off recorded; request-level proof unavailable"
+  },
+  "stop_reason": "The required diagnostic flag is not registered in the current v2ctl profile/registry. Passing it to golden run is rejected as an unregistered run-only override; omitting it makes the current deployment fingerprint stale. No backend request was started, and no further redeploy was performed.",
+  "raw_artifacts": [
+    "000_preflight_status.stdout-stderr.log",
+    "001_preflight_doctor.stdout-stderr.log",
+    "002_replacement_deployment_2.golden-deploy.stdout-stderr.log",
+    "003_postdeploy_source-probe.stdout-stderr.log",
+    "004_postdeploy_status.stdout-stderr.log",
+    "005_postdeploy_doctor.stdout-stderr.log",
+    "006_run_semantics_dryrun_with_required_diagnostics.stdout-stderr.log",
+    "007_run_semantics_without_diagnostic_override.stdout-stderr.log",
+    "008_source_freeze_identity.stdout-stderr.log",
+    "009_resolved_config_with_required_diagnostics.stdout-stderr.log",
+    "replacement_deployment_2_manifest.json"
+  ]
+}

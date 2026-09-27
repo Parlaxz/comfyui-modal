@@ -1,0 +1,156 @@
+import importlib
+import asyncio
+import os
+import sys
+import unittest
+from types import ModuleType, SimpleNamespace
+
+from gpu_catalog import _clear_hidden_cache
+
+
+class ModalClientGpuConfigTests(unittest.TestCase):
+    _ENV_KEY = "COMFYMODAL_HIDE_GPUS"
+
+    def setUp(self):
+        self._old_modal = sys.modules.get("modal")
+        self._old_module = sys.modules.get("modal_client")
+        self._old_env = os.environ.get(self._ENV_KEY)
+
+    def tearDown(self):
+        _clear_hidden_cache()
+        if self._old_modal is None:
+            sys.modules.pop("modal", None)
+        else:
+            sys.modules["modal"] = self._old_modal
+        if self._old_module is None:
+            sys.modules.pop("modal_client", None)
+        else:
+            sys.modules["modal_client"] = self._old_module
+        if self._old_env is None:
+            os.environ.pop(self._ENV_KEY, None)
+        else:
+            os.environ[self._ENV_KEY] = self._old_env
+
+    def load_module(self):
+        fake_modal = ModuleType("modal")
+        setattr(fake_modal, "Cls", SimpleNamespace(from_name=lambda app, cls: lambda: f"{app}:{cls}"))
+        setattr(fake_modal, "Function", SimpleNamespace(from_name=lambda app, fn: f"{app}:{fn}"))
+        sys.modules["modal"] = fake_modal
+        sys.modules.pop("modal_client", None)
+        return importlib.import_module("modal_client")
+
+    def test_set_gpu_accepts_supported_value(self):
+        mod = self.load_module()
+        mod.set_gpu("L4")
+        self.assertEqual(mod.get_gpu(), "l4")
+
+    def test_set_gpu_rejects_unsupported_value(self):
+        mod = self.load_module()
+        with self.assertRaises(ValueError):
+            mod.set_gpu("bogus")
+
+    def test_available_gpus_come_from_catalog(self):
+        mod = self.load_module()
+        self.assertIn("h200", mod.get_supported_gpus())
+
+    def test_available_gpu_options_expose_label_and_value(self):
+        mod = self.load_module()
+        self.assertIn({"value": "b200", "label": "B200"}, mod.get_available_gpus())
+
+    # ── hidden GPU behaviour ─────────────────────────────────────────
+    def test_hidden_gpu_rejected_by_set_gpu(self):
+        os.environ[self._ENV_KEY] = "t4"
+        _clear_hidden_cache()
+        mod = self.load_module()
+        with self.assertRaises(ValueError):
+            mod.set_gpu("t4")
+        mod.set_gpu("a10g")
+
+    def test_hidden_gpu_excluded_from_apis(self):
+        os.environ[self._ENV_KEY] = "l4,l40s"
+        _clear_hidden_cache()
+        mod = self.load_module()
+        self.assertNotIn("l4", mod._apis)
+        self.assertNotIn("l40s", mod._apis)
+        self.assertIn("a10g", mod._apis)
+
+    def test_hidden_gpu_excluded_from_available_gpus(self):
+        os.environ[self._ENV_KEY] = "h100"
+        _clear_hidden_cache()
+        mod = self.load_module()
+        gpus = mod.get_available_gpus()
+        self.assertNotIn("h100", [g["value"] for g in gpus])
+
+    def test_hidden_gpu_excluded_from_supported_gpus(self):
+        os.environ[self._ENV_KEY] = "b200"
+        _clear_hidden_cache()
+        mod = self.load_module()
+        self.assertNotIn("b200", mod.get_supported_gpus())
+
+    def test_run_prompt_can_target_explicit_gpu_without_global_mutation(self):
+        calls = []
+
+        class FakeRemote:
+            def __init__(self, gpu):
+                self.gpu = gpu
+
+            def remote(self, workflow, input_images, trace, modal_options):
+                calls.append((self.gpu, workflow, input_images, trace, modal_options))
+                return {"gpu": self.gpu}
+
+        class FakeAPI:
+            def __init__(self, gpu):
+                self.run_prompt = FakeRemote(gpu)
+
+        fake_modal = ModuleType("modal")
+        setattr(
+            fake_modal,
+            "Cls",
+            SimpleNamespace(from_name=lambda app, cls: lambda: FakeAPI(cls)),
+        )
+        setattr(fake_modal, "Function", SimpleNamespace(from_name=lambda app, fn: f"{app}:{fn}"))
+        sys.modules["modal"] = fake_modal
+        sys.modules.pop("modal_client", None)
+        mod = importlib.import_module("modal_client")
+
+        mod.set_gpu("a10g")
+        result = asyncio.run(mod.run_prompt({"prompt": 1}, {}, {}, gpu="l4"))
+
+        self.assertEqual(result, {"gpu": "ComfyAPI_L4"})
+        self.assertEqual(calls[0][0], "ComfyAPI_L4")
+        self.assertEqual(mod.get_gpu(), "a10g")
+
+    def test_lookup_target_reports_deployed_class_method(self):
+        mod = self.load_module()
+        self.assertEqual(mod.get_modal_app_name(), "comfyui")
+        self.assertEqual(mod.get_modal_class_name("l4"), "ComfyAPI_L4")
+        self.assertEqual(mod.get_modal_lookup_target("l4", "run_prompt_stream"), "comfyui.ComfyAPI_L4.run_prompt_stream")
+
+    def test_set_active_warmup_profile_calls_modal_function(self):
+        calls = []
+
+        class FakeFunctionRemote:
+            def remote(self, payload):
+                calls.append(payload)
+                return {"status": "ok", "payload": payload}
+
+        fake_modal = ModuleType("modal")
+        setattr(fake_modal, "Cls", SimpleNamespace(from_name=lambda app, cls: lambda: f"{app}:{cls}"))
+        setattr(
+            fake_modal,
+            "Function",
+            SimpleNamespace(from_name=lambda app, fn: SimpleNamespace(remote=FakeFunctionRemote().remote)),
+        )
+        sys.modules["modal"] = fake_modal
+        sys.modules.pop("modal_client", None)
+        mod = importlib.import_module("modal_client")
+
+        payload = {"profile_token": "tok-1", "workflow_hash": "hash-1"}
+        result = asyncio.run(mod.set_active_warmup_profile(payload))
+
+        self.assertEqual(calls, [payload])
+        self.assertEqual(result["status"], "ok")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,503 @@
+{
+  "C9_TOTAL_WALL_MS": 3337.481271,
+  "FILE_TO_CUDA_WALL_MS": null,
+  "PHYSICAL_READ_SPAN_MS": 3335.867822,
+  "SOURCE_WALL_MS": 3337.481271,
+  "active_reader_transitions": [],
+  "allocation_in_timed_loop": false,
+  "arm": "bare_loop",
+  "arm_requested": "bare_loop",
+  "attempt_id": "bare_loop_R1",
+  "buffer_allocations": {
+    "bytes_per_worker": 33554432,
+    "count": 8,
+    "reused_for_each_read": true
+  },
+  "buffer_type": "pytorch_pinned_host",
+  "byte_reconciliation": {
+    "expected_payload_bytes": 12309817472,
+    "offsets_recorded_per_physical_read": false,
+    "read_count": 368,
+    "requested_bytes": 12309817472,
+    "returned_bytes": 12309817472,
+    "returned_equals_expected": true
+  },
+  "classification": "ELIGIBLE",
+  "configured_source_qd": 8,
+  "container_session": {
+    "hostname": "modal",
+    "session_id": "ta-01M1S5YC7XM23KFCDSBD19QFQR",
+    "single_use_container": true
+  },
+  "coverage": {
+    "expected_bytes": 12309817472,
+    "ok": true,
+    "returned_bytes": 12309817472
+  },
+  "cpu_allocation": {
+    "allocation_match": true,
+    "allocation_match_classification": "match",
+    "cpu_request": 12,
+    "declared_memory_mb": 8192,
+    "declared_modal_function_cpu": 12,
+    "declared_modal_function_cpu_request": 12,
+    "identity_source": "runtime_shape_config.cpu_request",
+    "observed_cpu": 12,
+    "observed_runtime_shape_cpu": 12,
+    "observed_runtime_shape_cpu_request": 12,
+    "production_relevance_classification": "production_relevant",
+    "production_relevant": true,
+    "requested_cpu": 12,
+    "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+    "strict_allocation_classification": "match",
+    "strict_allocation_match": true
+  },
+  "cpu_observed": 12,
+  "cpu_request": 12,
+  "cpu_requested": 12,
+  "cuda_used": false,
+  "data_start": 48928,
+  "effective_gbps": 3.6883555209619634,
+  "error": null,
+  "execution_arm": "bare_loop",
+  "execution_contract": {
+    "allocation_in_timed_loop": false,
+    "block_bytes": 33554432,
+    "buffer_allocations": "one reusable Torch tensor per worker",
+    "buffer_type": "pytorch_pinned_host",
+    "cuda_available": null,
+    "cuda_used": false,
+    "dispatcher_participation": false,
+    "fd_topology": "one shared read-only file descriptor; positioned reads",
+    "filesystem_mount": "/root/models",
+    "h2d_used": false,
+    "hashing_in_timed_loop": false,
+    "model_construction": false,
+    "mount_read_only": true,
+    "qd_values": [
+      2,
+      4,
+      8
+    ],
+    "range_geometry": "static contiguous disjoint payload ranges",
+    "source_only": true,
+    "telemetry_in_timed_loop": false,
+    "timing_boundary": {
+      "end": "all worker joins complete",
+      "name": "THREAD_START_TO_JOIN_WALL",
+      "start": "perf_counter_ns immediately before worker launch"
+    },
+    "torch_imported": true,
+    "workers_per_lane": 1
+  },
+  "experiment": "c9_recovery",
+  "fd_topology": {
+    "close_after_all_workers": true,
+    "mode": "one_shared_fd",
+    "open_count": 1,
+    "shared_by_workers": true
+  },
+  "file_identity": {
+    "basename": "z_image_turbo_bf16.safetensors",
+    "device": 31,
+    "inode": 4,
+    "mtime_ns": 1787810706829355211,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "size_bytes": 12309866400
+  },
+  "file_size_bytes": 12309866400,
+  "filesystem_identity": {
+    "mount": {
+      "filesystem_type": "9p",
+      "major_minor": "0:31",
+      "mount_id": 36,
+      "mount_options": "rw,nosuid",
+      "mountpoint": "/__modal/volumes",
+      "parent_id": 18,
+      "read_only_observed": false,
+      "root": "/",
+      "source": "none",
+      "super_options": "rw,trans=fd,rfdno=11,wfdno=11,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=0,cache=remote_revalidating,disable_fifo_open,directfs"
+    },
+    "mount_read_only_requested": true,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "stat": {
+      "device": 31,
+      "inode": 4,
+      "mode": 420
+    },
+    "statvfs": {
+      "available_bytes": 409600000000,
+      "filesystem_block_size": 4096,
+      "fragment_size": 4096
+    }
+  },
+  "fixed_config": {
+    "aggregation_enabled": false,
+    "configured_qd": 8,
+    "cuda_used": false,
+    "execution_arm": "bare_loop",
+    "h2d_target_bytes": null,
+    "h2d_used": false,
+    "model_construction": false,
+    "producer_count": 8,
+    "source_block_bytes": 33554432
+  },
+  "gpu_attachment": {
+    "attached": true,
+    "gpu": "rtx-pro-6000",
+    "reason": "CUDA-enabled Torch environment; source loop performs no CUDA work",
+    "requested": true
+  },
+  "h2d_used": false,
+  "hashing_in_timed_loop": false,
+  "identity": {
+    "accelerator": "cuda",
+    "container_session_id": "ta-01M1S5YC7XM23KFCDSBD19QFQR",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-AJAxbqyzjaGoRXLkg6r7em",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "max_achieved_qd": null,
+  "model_construction": false,
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "oracle_wall_ms": 5508.1773,
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_bytes": 12309817472,
+  "payload_identity": {
+    "data_start": 48928,
+    "hash_scope": "no payload hashing in the measured source loop",
+    "integrity_verification": "not performed",
+    "payload_bytes": 12309817472
+  },
+  "physical_reads": [],
+  "pinned_host": true,
+  "pinned_host_evidence": {
+    "buffer_type": "pytorch_pinned_host",
+    "buffers": [
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 0
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 1
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 2
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 3
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 4
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 5
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 6
+      },
+      {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 7
+      }
+    ],
+    "is_pinned": true
+  },
+  "probe": "exp04_source_ceiling_oracle",
+  "provider_region": {
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "qd_telemetry": {
+    "active_interval_end_ns": null,
+    "active_interval_start_ns": null,
+    "max_achieved_qd": null,
+    "time_at_qd_ms": null,
+    "time_weighted_achieved_qd": null
+  },
+  "read_size_evidence": [],
+  "regions": [
+    {
+      "end": 1538776112,
+      "producer_id": 0,
+      "region_id": 0,
+      "start": 48928
+    },
+    {
+      "end": 3077503296,
+      "producer_id": 1,
+      "region_id": 1,
+      "start": 1538776112
+    },
+    {
+      "end": 4616230480,
+      "producer_id": 2,
+      "region_id": 2,
+      "start": 3077503296
+    },
+    {
+      "end": 6154957664,
+      "producer_id": 3,
+      "region_id": 3,
+      "start": 4616230480
+    },
+    {
+      "end": 7693684848,
+      "producer_id": 4,
+      "region_id": 4,
+      "start": 6154957664
+    },
+    {
+      "end": 9232412032,
+      "producer_id": 5,
+      "region_id": 5,
+      "start": 7693684848
+    },
+    {
+      "end": 10771139216,
+      "producer_id": 6,
+      "region_id": 6,
+      "start": 9232412032
+    },
+    {
+      "end": 12309866400,
+      "producer_id": 7,
+      "region_id": 7,
+      "start": 10771139216
+    }
+  ],
+  "resolved_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+  "role": "unet",
+  "run": 1,
+  "runner_started_at_epoch": 1788625235.22806,
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "source_block_bytes": 33554432,
+  "source_bytes": 12309817472,
+  "source_effective_gbps": 3.6883555209619634,
+  "source_only": true,
+  "source_qd": 8,
+  "source_read_count": 368,
+  "source_requested_bytes": 12309817472,
+  "source_returned_bytes": 12309817472,
+  "source_wall_ms": 3337.481271,
+  "status": "ok",
+  "telemetry_in_timed_loop": false,
+  "time_at_qd_ms": null,
+  "time_weighted_achieved_qd": null,
+  "timing_boundary": {
+    "end": "all worker joins complete",
+    "name": "THREAD_START_TO_JOIN_WALL",
+    "start": "perf_counter_ns immediately before worker launch"
+  },
+  "torch_imported": true,
+  "worker_errors": [],
+  "workers": [
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 0
+      },
+      "is_pinned": true,
+      "region_end": 1538776112,
+      "region_id": 0,
+      "region_start": 48928,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 0,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 1
+      },
+      "is_pinned": true,
+      "region_end": 3077503296,
+      "region_id": 1,
+      "region_start": 1538776112,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 1,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 2
+      },
+      "is_pinned": true,
+      "region_end": 4616230480,
+      "region_id": 2,
+      "region_start": 3077503296,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 2,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 3
+      },
+      "is_pinned": true,
+      "region_end": 6154957664,
+      "region_id": 3,
+      "region_start": 4616230480,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 3,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 4
+      },
+      "is_pinned": true,
+      "region_end": 7693684848,
+      "region_id": 4,
+      "region_start": 6154957664,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 4,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 5
+      },
+      "is_pinned": true,
+      "region_end": 9232412032,
+      "region_id": 5,
+      "region_start": 7693684848,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 5,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 6
+      },
+      "is_pinned": true,
+      "region_end": 10771139216,
+      "region_id": 6,
+      "region_start": 9232412032,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 6,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    },
+    {
+      "buffer": {
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 33554432,
+        "is_pinned": true,
+        "worker_id": 7
+      },
+      "is_pinned": true,
+      "region_end": 12309866400,
+      "region_id": 7,
+      "region_start": 10771139216,
+      "source_bytes": 1538727184,
+      "source_read_count": 46,
+      "source_requested_bytes": 0,
+      "status": "ok",
+      "worker_id": 7,
+      "worker_started_ns": null,
+      "worker_terminated_ns": null,
+      "worker_wall_ms": null
+    }
+  ]
+}

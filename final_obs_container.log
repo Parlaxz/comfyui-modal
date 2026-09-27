@@ -1,0 +1,184 @@
+[active_read] registered owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=4862d83ff2604550 restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 request_id= start_wall_unix_ns=1786593763068563712 start_monotonic_ns=569448368254 start_thread_time_ns=10000000 start_process_time_ns=112470000000 native_tid=78 active_read_path_hash=8d2256b3cff6bbd2 active_read_file_size=12309866400 active_read_st_dev=30 active_read_st_ino=104 active_read_governor_enabled=0 active_read_priority=100 active_read_size_bytes=12309866400 active_read_size_mb=11739.6 active_read_is_large=1 active_read_classification_source=file_size active_read_queue_enter_ms=0.0 active_read_queue_exit_ms=0.0 active_read_queue_wait_ms=0.0 active_read_large_slots_used_at_enter=0 active_read_large_slots_used_at_start=0 active_read_concurrent_large_reads_at_start=1 active_read_attached_existing_future=0 active_read_duplicate_prevented=0
+[v2.generation_identity] custom_nodes_generation='4beea0bbdb2a3e74517b90a3…' raw_empty=false source=persisted_record runtime_state_generation='' api_object_id=46801135318544 deployment_combined_hash=7a9dfb40a7cb2979
+[v2.plan_proof] decision=plan_validation_fast_path consumed=1 workflow_hash_match=1 validation_hash_match=1 plan_complete=1 snapshot_complete=1 snapshot_valid=1 dep_match=1 gen_match=1 wf_reg_match=1 dependency_match=1 repair_changed=0 outputs_nonempty=1 eligible=1
+[v2.startup_stage] stage=first_prompt_executor_invocation event=start wall_unix_ns=1786593763097409552 monotonic_ns=569477215854
+[v2.clip_conditioning_cache] decision=miss key_hash=18aca23f6ed3d5e1a24fc064905f09f51f9655ea8b7e47a4519565f3ce35f57d identity_status=valid schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs hit_count=0 miss_count=1 entries=1 lookup_wall_ms=23.04 request_id=v2-benchmark-0-f6598f71a74a
+[v2.unet_early_activation] event=mode mode=late env_raw=late restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=not_observed gpu_allocated_before=0 gpu_reserved_before=0
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 caller_classification=not_observed wall_ms=1.838 gpu_allocated_after=0 gpu_allocated_delta_bytes=0
+[active_read] completed owner=graph_loader key=/__modal/volumes/vo-QI6fCKykvocVkUBVGsuZgm/diffusion_models/z_image_turbo_bf16.s active_read_id=4862d83ff2604550 restored_instance_id=8a6000bd24694ba3 restore_session_id=13b44028096747f0ae2c8dd685deeaf4 complete_wall_unix_ns=1786593765042232832 complete_monotonic_ns=571422036512 complete_thread_time_ns=1670000000 complete_process_time_ns=115170000000 complete_native_tid=78 wall_ms=1973.668 thread_cpu_ms=1660.0 process_cpu_ms=2700.0 majf=None minf=None inblock=None nvcsw=None nivcsw=None read_bytes=None rchar=None path_hash=8d2256b3cff6bbd2 file_size=12309866400 st_dev=30 st_ino=104
+[v2.active_read_diag] active_read_id=4862d83ff2604550 owner=graph_loader request_id= restore_session_id=13b44028096747f0ae2c8dd685deeaf4 path_hash=8d2256b3cff6bbd2 wall_ms=1973.668 thread_cpu_ms=1660.0 process_cpu_ms=2700.0 read_bytes=not_observed_in_this_thread rchar=not_observed_in_this_thread minor_faults=None major_faults=None context_switches=None/None counter_status=unsupported legacy_counter_status=unsupported thread_cpu_status=unsupported process_cpu_status=unsupported io_status=unsupported page_fault_status=unsupported block_input_status=unsupported context_switch_status=unsupported native_thread_id=78
+[v2.native_fast_disk_unet] decision=defer reason=ok stage=to patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cpu': 453} cpu_params=453 cpu_buffers=1 get_model_ms=275.072 ctor_ms=0.57 bind_ms=None to_wall_ms=None to_device_ms=None to_device_ms_label=unavailable
+[v2.vae_early_activation] event=mode mode=sampling_end env_raw=sampling_end restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4
+[v2.native_fast_disk_unet] decision=complete reason=ok stage=load_model_weights patcher_class=comfy.model_patcher.ModelPatcher patcher_dynamic=0 param_count=453 parameter_bytes=12309817472 dtype_distribution={'torch.bfloat16': 453} device_distribution={'cuda': 453} cpu_params=0 cpu_buffers=0 get_model_ms=275.072 ctor_ms=0.57 bind_ms=89.953 to_wall_ms=3542.091 to_device_ms=3542.12 to_device_ms_label=synchronized_device
+[v2.unet_runtime_state] stage=normal_loader_ready unet_identity=z_image_turbo_bf16.safetensors requested_weight_dtype=default effective_weight_dtype=default state={"current_device":"cuda:0","diffusion_model_object_id":"46805770169488","diffusion_model_type":"NextDiT","first_buffer_device":"absent","first_buffer_dtype":"absent","first_parameter_device":"cuda:0","first_parameter_dtype":"torch.bfloat16","forward_module":"NextDiT","forward_qualname":"NextDiT.forward","load_device":"cuda:0","loaded_models_member":"0","manual_cast_dtype":"absent","model_dtype":"torch.bfloat16","model_loaded_weight_memory":"0","model_lowvram":"False","model_lowvram_patch_counter":"0","model_object_id":"46804484475280","model_options_keys":["transformer_options"],"model_type":"Lumina2","object_patch_count":0,"offload_device":"cuda:0","patch_count":0,"patcher_object_id":"46804538019408","patcher_type":"ModelPatcher","transformer_options_keys":["wrappers"],"weight_dtype":"absent"}
+[v2.clip_conditioning_cache] decision=miss_stored key_hash=18aca23f6ed3d5e1a24fc064905f09f51f9655ea8b7e47a4519565f3ce35f57d identity_status=valid encode_calls=1 encode_loop_wall_ms=6376.448 cache_store_wall_ms=9.293 cache_store_calls=1 store_diagnostics={'store_calls': 1, 'store_failed': 0, 'key_build_digest_ms': 0.201, 'serialization_ms': 8.362, 'materialize_ms': 4.7989999999999995, 'checksum_ms': 2.925, 'serialized_payload_bytes': 2900184, 'enqueue_ms': 0.636, 'lock_wait_ms': 0.0, 'total_ms': 9.263, 'measured_children_ms': 9.208, 'residual_ms': 0.055, 'store_reason': '', 'materialize_bytes': 2900184, 'enqueued': 1, 'persisted': 0, 'persist_failed': 0, 'commit_failed': 0, 'queue_depth': 1, 'queue_deduped': 0, 'queue_full_dropped': 0, 'batch_size': 0, 'batch_count': 0, 'persistence_queue_wait_ms': 0.0, 'file_write_ms': 0.0, 'manifest_ms': 0.0, 'reload_ms': 0.0, 'commit_ms': 0.0, 'unindexed_files_removed': 0, 'last_flush_ms': 0.0, 'last_flush_status': '', 'flush_count': 0, 'fallback_sync_stores': 0} schema_version=1 validation_scope=clip_model_workflow_custom_nodes_schema_format_side_conditioning_inputs enqueued=1 persisted=0 persist_failed=0 entries=1 request_id=v2-benchmark-0-f6598f71a74a
+[v2.cpu_owner] operation=CLIPTextEncode role=CLIP wall_ms=4150.713 process_cpu_ms=6920.000 effective_cores=1.667 native_threads_start=52 native_threads_peak=53 native_threads_end=53
+standard
+WARNING:root:[FeatureInjLatent] Reference latent: shape=torch.Size([1, 16, 240, 136])
+[v2.sampler_boundary] event=sampler_lane_requested sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta blocking_owner=absent
+[v2.sampler_boundary] event=sampler_lane_acquired sampler_node_id=1242 sampler_node_class=ClownsharKSampler_Beta wait_ms=0.237 blocking_owner=absent
+[CacheDiT] Transformer class: NextDiT (module: comfy.ldm.lumina.model)
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=UNET model_count=1 contains_registered_unet=1 caller_classification=graph_model_loading gpu_allocated_before=12445630464 gpu_reserved_before=13008633856
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=UNET model_count=1 caller_classification=graph_model_loading wall_ms=71.179 gpu_allocated_after=12445634560 gpu_allocated_delta_bytes=4096
+[v2.cpu_owner] operation=load_models_gpu role=other wall_ms=73.042 process_cpu_ms=70.000 effective_cores=0.958 native_threads_start=53 native_threads_peak=54 native_threads_end=53
+[v2.unet_identity_chain] check=stage_pair stage_a=bridge stage_b=sampler request_id=v2-benchmark-0-f6598f71a74a patcher_a_object_id=46804538019408 diffusion_a_object_id=46805770169488 patcher_b_object_id=46804538502160 diffusion_b_object_id=46805770169488 ok=1 reason=ok
+[v2.unet_gpu_residency] sampler_wrapper_before_sample request_id=v2-benchmark-0-f6598f71a74a enforce=0 status=gpu_resident unet_object_id=46804538502160 parameter_count=453 gpu_parameter_count=453 cpu_parameter_count=0 meta_parameter_count=0 unknown_parameter_count=0 gpu_parameter_fraction=1.0 load_device=cuda:0 current_device=absent diffusion_model_current_device=absent model_cache_size=2 unet_in_model_cache=1 gpu_allocated_bytes=12450117120 gpu_reserved_bytes=12815695872
+[v2.sampler_stall_watchdog] stage=armed request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad sampler_node_id=1242 sampler_class=ClownsharKSampler_Beta patcher_object_id=46804538502160 diffusion_model_object_id=46805770169488 unet_object_id=46804538502160 first_forward_timeout_s=5.0 first_step_timeout_s=15.0
+[v2.sampler_boundary] event=sampling_start request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46804538502160 diffusion_model_object_id=46805770169488 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12450117120 gpu_reserved_bytes=12815695872
+(RES4LYF) rk_type: res_2s
+
+[v2.unet_forward_boundary] event=first_unet_forward request_id=v2-benchmark-0-f6598f71a74a diffusion_model_object_id=46805770169488 patcher_object_id=46804538019408 model_object_id=46804484475280 x_device=cuda:0 x_dtype=torch.bfloat16 elapsed_ms=120.991
+[v2.sampler_parity] UNET weight_dtype=torch.bfloat16 UNET compute_dtype=torch.bfloat16 manual_cast_dtype=None CacheDiT target=NextDiT CacheDiT attachment_count=1 CacheDiT fallback=0
+[1A  0%|          | 0/8 [00:00<?, ?it/s]WARNING:root:[FeatureInjLatent] step=1 | progress=0.00 | eff_str=0.250 | no mask
+WARNING:root:[FeatureInjLatent] step=2 | progress=0.01 | eff_str=0.214 | no mask
+[v2.sampler_boundary] event=first_sampler_step request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46804538502160 diffusion_model_object_id=46805770169488 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12450117120 gpu_reserved_bytes=12815695872
+
+[1A 12%|█▎        | 1/8 [00:01<00:07,  1.10s/it]WARNING:root:[FeatureInjLatent] step=3 | progress=0.03 | eff_str=0.178 | no mask
+
+[1A 25%|██▌       | 2/8 [00:02<00:05,  1.01it/s]
+[1A 38%|███▊      | 3/8 [00:02<00:03,  1.32it/s]
+[1A 50%|█████     | 4/8 [00:02<00:02,  1.56it/s]
+[1A 62%|██████▎   | 5/8 [00:03<00:01,  1.72it/s]
+[1A 75%|███████▌  | 6/8 [00:03<00:01,  1.86it/s]
+[1A 88%|████████▊ | 7/8 [00:04<00:00,  1.96it/s]
+[1A100%|██████████| 8/8 [00:04<00:00,  2.03it/s]100%|██████████| 8/8 [00:04<00:00,  1.67it/s]
+[v2.sampler_boundary] event=sampling_end request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad node_id=1242 node_class=ClownsharKSampler_Beta steps=8 patcher_object_id=46804538502160 diffusion_model_object_id=46805770169488 diffusion_model_device=absent diffusion_model_current_device=absent gpu_allocated_bytes=12450117120 gpu_reserved_bytes=12815695872 duration_ms=4829.768
+[v2.vae_early_activation] event=scheduled request_id=v2-benchmark-0-f6598f71a74a mode=sampling_end trigger=sampling_end key_hash=988dd0fbad7947c478e7708c source=snapshot_vae vae_identity_hash=dd8f11d04333e24d vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 torch=2.13.0+cu130 cuda=13.0 arch=sm_75;sm_80;sm_86;sm_90;sm_100;sm_120 restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4
+[v2.vae_early_activation] event=load_start request_id=v2-benchmark-0-f6598f71a74a mode=sampling_end key_hash=988dd0fbad7947c478e7708c source=snapshot_vae vae_object_id=46804152446032 vae_patcher_object_id=46804776087504
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=absent restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=restore_vae_preparation gpu_allocated_before=12484945408 gpu_reserved_before=14787018752
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=absent restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 caller_classification=restore_vae_preparation wall_ms=762.633 gpu_allocated_after=12657776128 gpu_allocated_delta_bytes=172830720
+[v2.vae_early_activation] event=terminal request_id=v2-benchmark-0-f6598f71a74a mode=sampling_end key_hash=988dd0fbad7947c478e7708c status=ready reason=ok error=absent transfer_count=1 vae_policy_version=1 vae_weight_dtype=bfloat16 vae_compute_dtype=bfloat16_native vae_memory_format=contiguous vae_prefetch_mode=off c5_impl_version=1.0.0 source=snapshot_vae
+[v2.vae_early_activation] event=consumed request_id=v2-benchmark-0-f6598f71a74a mode=sampling_end key_hash=988dd0fbad7947c478e7708c join_wait_ms=38.776 status=ready source=snapshot_vae
+[v2.gpu_load_boundary] event=load_models_gpu_start request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 contains_registered_unet=0 caller_classification=graph_model_loading gpu_allocated_before=12657776128 gpu_reserved_before=12859736064
+[v2.gpu_load_boundary] event=load_models_gpu_end request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 roles=modelpatcher model_count=1 caller_classification=graph_model_loading wall_ms=28.352 gpu_allocated_after=12657776128 gpu_allocated_delta_bytes=0
+[production.rgthree.encode] side=b (B-only) shape=(1, 1920, 1088, 3) dtype=torch.uint8
+[v2.opt.output_encode] total_ms=566.042 png_compress_ms=556.344 gpu_to_cpu_ms=0.137
+[production.rgthree] node_id=107 a_count=0 b_count=1 encoded_unique=1 logical_outputs=1 return_a=0 temp_files_written=0 encode_ms=569.4
+[v2.startup_stage] stage=first_prompt_executor_invocation event=end wall_unix_ns=1786593776415214394 monotonic_ns=582795020742 duration_ms=13317.805
+[v2.pre_sampler_stages] request_id=v2-benchmark-0-f6598f71a74a restored_instance_id=8a6000bd24694ba3b3b53e3b5225faad restore_session_id=13b44028096747f0ae2c8dd685deeaf4 container_session_id=a95b4ebdbe5f451c modal_input_id=in-01KZWMJDK9TJTP3GX41KXKMEWP:1786593752682-0 modal_task_id=ta-01KZWMJEH7YNC4J83TC3GRDMGR pid=2 boot_id=601f51c5-357f-4637-9153-ee4c49ac261c hostname=modal total_nodes=43 first_output_node=107:ComfyModalProductionImageComparerOutput first_executing_node=987:Any Switch (rgthree) sampler_stage_status=sampler_active method_entry_to_graph_start_ms=24.169 graph_setup_ms=54.246 certificate_ms=0.0 cert_identity_build_ms=0.0 cert_cache_hit=0 cert_volume_reload_ms=0.0 cert_file_read_ms=0.0 cert_json_parse_validate_ms=0.0 cert_total_ms=0.0 legacy_preflight_ms=0.0 prompt_validation_ms=0.0 certificate_skipped_preflight=1 certificate_skipped_prompt_validation=1 preflight_ms=0.0 validation_ms=0.0 missing_node_repair_ms=0.097 production_registry_setup_ms=0.036 production_registry_profile_setup_ms=0.036 pregraph_setup_ms=0.475 executor_reset_ms=0.264 sampler_lane_wait_ms=0.246 residual_before_invoke_ms=0.159 method_entry_to_runtime_configuration_ms=24.129 call_to_exec_start_ms=0.699 exec_start_to_cached_ms=2108.282 cached_to_first_executing_ms=180.002 call_to_cached_ms=2108.981 call_to_first_node_ms=2288.983 first_node_to_clip_ms=4.424 clip_to_sampler_node_ms=4275.119 sampler_node_to_sampler_start_ms=138.783 sampler_node_to_lane_acquired_ms=0.253 lane_acquired_to_actual_stage_ms=138.53 pre_sampler_total_ms=6785.708 measured_children_ms=6708.127 residual_ms=77.581 reconciliation_status=ok add_message=True send_sync=True has_sampler=True sampler_count=1 lane_acquired=True
+[v2.opt.output_delivery] hash_ms=1.451 descriptor_ms=None
+[v2.opt.output_delivery] hash_ms=1.451 descriptor_ms=0.027
+[v2.startup_stage] stage=first_durable_result event=ready wall_unix_ns=1786593776425053330 monotonic_ns=582804859669 output_persisted=1
+[v2.output] hashes=1 base64_encode=0 base64_decode=0 commit_ms=0.0 commit_status=skipped overlap_ms=0.0 serialized_bytes=2215
+[v2.activation_diagnosis] request_id=v2-benchmark-0-f6598f71a74a cpu_snapshot_container_active=True execution_prefill_scheduled=True residency_diagnostics_enabled=0 clip_encode_calls=1 clip_encode_graph_calls=0 clip_encode_prefill_calls=1 clip_encode_wall_ms=6365.669 clip_encode_graph_wall_ms=0 clip_encode_prefill_wall_ms=6365.669 clip_encode_process_cpu_ms=9980.0 load_models_gpu_calls=2 unet_gpu_load_calls=1 load_models_gpu_wall_ms=99.531 activation_receipt_count=4 gpu_allocated_delta_bytes=4096 cpu_peak_cores=absent cpu_above_16_ms=absent cpu_above_19_ms=absent cpu_longest_above_19_ms=absent cpu_overlap_graph_clip_ms=absent cpu_overlap_prefill_clip_ms=absent cpu_overlap_gpu_load_ms=absent clip_to_sampler_node_ms=4275.119 sampler_node_to_sampler_start_ms=138.783 diagnostic_accounted_ms=absent diagnostic_unattributed_ms=absent restore_requested_torch_intraop_threads=absent restore_actual_torch_intraop_threads=12 restore_torch_interop_threads=14 restore_torch_thread_limit_status=baseline_passthrough
+[v2.process_cpu_spike] status=ok peak_effective_cores=7.345 duration_above_16_ms=0.000 duration_above_19_ms=0.000 longest_above_19_ms=0.000 sample_count=242
+[v2.critical_path] python_resume_to_restore_enter_ms=0.0 restore_total_ms=430.611 restore_exit_to_run_enter_ms=17.041 run_enter_to_plan_received_ms=21.731 plan_received_to_executor_invoke_ms=56.668 executor_invoke_to_first_node_ms=2288.897 first_node_to_sampler_node_ms=4279.505 sampler_node_to_sampler_start_ms=138.783 pre_sampler_unattributed_ms=absent
+[v2.cgroup_cpu_spike] source=process_cpu_fallback peak_effective_cores=7.255 interval_count=0
+V2 COLD WATERFALL - REMOTE/PARTIAL (awaiting host reconciliation)
+Request: v2-benchmark-0-f6598f71a74a  Instance: 8a6000bd24694ba3b3b53e3b5225faad  GPU: ['RTX-PRO-6000']  Fresh: YES
+TOTAL WALL:        -   (command->response minus Modal scheduling)
+SCHEDULING:        -   (informational - excluded from % and bars)
+COMMAND->RESPONSE:  40.840s
+
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+ # | Stage                                          | Duration |     Cum. |      % | Relative wall time
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+  1 | Local preparation                              |     0.001s |     0.001s |       - |                                      
+  2 | Modal handle and submission                    |          - |          - |       - |                                      
+  3 | Modal scheduling + pre-Python restore (awai... |          - |          - |       - |                                      
+  4 | Modal pre-Python snapshot restoration          |          - |          - |       - |                                      
+  5 | Python/application restore                     |     0.602s |     0.603s |       - |                                      
+  6 | Restore-to-method entry                        |     0.017s |     0.620s |       - |                                      
+  7 | ~ Method entry to UNET ownership claim         |          - |          - |       - |                                      
+  8 | ~ UNET claim to ready (worker load)            |          - |          - |       - |                                      
+  9 | Remote method setup                            |     0.078s |     0.699s |       - |                                      
+ 10 | PromptExecutor/cache setup                     |     2.289s |     2.988s |       - |                                      
+ 11 | First node to CLIP                             |     0.004s |     2.992s |       - |                                      
+ 12 | CLIP to sampler node                           |     4.275s |     7.267s |       - |                                      
+ 13 | Sampler graph-join wait                        |          - |          - |       - |                                      
+ 14 | Sampler node to sampling                       |     0.139s |     7.406s |       - |                                      
+ 15 | Sampling                                       |     4.830s |    12.235s |       - |                                      
+ 16 | Post-sampling transition                       |     0.729s |    12.964s |       - |                                      
+ 17 | VAE                                            |     0.481s |    13.445s |       - |                                      
+ 18 | Output encode / descriptor                     |     0.580s |    14.025s |       - |                                      
+ 19 | Remote result handoff                          |          - |          - |       - |                                      
+ 20 | Remote/local return                            |     0.029s |    14.055s |       - |                                      
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+
+Expanded diagnostics
+[PromptExecutor]
+  detail: method entry to graph start                        0.024s
+  detail: method entry to runtime configuration              0.024s
+  detail: runtime configuration                              0.000s
+  detail: graph setup                                        0.054s
+  detail: certificate                                        0.000s
+  detail: preflight                                          0.000s
+  detail: validation                                         0.000s
+  detail: legacy runtime resolution                          0.000s
+  detail: preload check                                      0.002s
+  detail: missing-node repair                                0.000s
+  detail: production registry setup                          0.000s
+  detail: pregraph setup                                     0.000s
+  detail: executor reset                                     0.000s
+  detail: residual before executor invoke                    0.000s
+  detail: pre-sampler total                                  6.786s
+  detail: measured pre-sampler children                      6.708s
+  detail: pre-sampler residual                               0.078s
+  detail: PromptExecutor invoke to execution                 0.001s
+  detail: execution to cached                                2.108s
+  detail: cached to first node                               0.180s
+  detail: graph/prefill activity                           -
+  detail: PromptExecutor internal/unattributed             -
+[Sampler]
+  detail: sampler lane wait                                  0.000s
+  detail: sampler node to lane acquired                      0.000s
+  detail: lane acquired to actual stage                      0.139s
+[Output]
+  detail: output encode                                    -
+  detail: output commit                                    -
+  detail: VAE end ? output encode start                      0.001s
+  detail: PNG encode                                         0.573s
+  detail: Descriptor/materialization                         0.007s
+  detail: Remote result emitted                            -
+  detail: Deferred persistence after yield                 -
+[UNET]
+  detail: UNET quiesce wait (diagnostic)                   -
+  detail: UNET transfer queue delay                        -
+  detail: UNET synchronized transfer                       -
+  detail: UNET scheduled ? worker start                    -
+  detail: Worker start ? checkpoint read start             -
+  overlap: Checkpoint read (overlap: H2D span fallback)       3.550s
+  detail: Read end ? construction done                       0.276s
+  detail: Bind                                               0.090s
+  detail: Synchronized H2D                                   3.542s
+  detail: H2D end ? UNET ready                               0.002s
+  detail: UNET ready ? sampler demand                      -
+  detail: Sampler demand ? join complete                   -
+  detail: Join complete ? sampling                         -
+[CPU ownership]
+  detail: CPU owner: CLIPTextEncode [CLIP]                   4.151s
+  detail: CPU owner: load_models_gpu [other]                 0.073s
+[Node timings]
+  detail: Node: CLIPLoader                                   0.001s
+  detail: Node: CLIPTextEncode                               4.151s
+  detail: Node: ImpactSwitch                                 0.064s
+  detail: Node: UNETLoader                                   0.002s
+  detail: Node: ImpactSwitch                                 0.035s
+  detail: Node: ClownsharKSampler_Beta                       0.146s
+[VAE]
+  detail: Sampling end ? VAE scheduled                       0.000s
+  detail: VAE scheduled ? worker/load start                  0.002s
+  detail: VAE load/H2D                                       0.765s
+  detail: VAE ready ? consumed                               0.000s
+  detail: Consumed ? decode start                          -
+[Return]
+  detail: Local receipt ? caller return                    -
+
+    | ACCOUNTED     |    14.055s |            |       - | .....................................
+    | RECONCILIATION |    26.786s |            |            | .....................................
+    | TOTAL WALL |          - |            |       - |                                      
+    | COMMAND -> RESPONSE |    40.840s |            |       - |                                      
+    | TOP-LEVEL ACCOUNTED |    14.055s |            |       - | .....................................
+    | GLOBAL RESIDUAL |    26.786s |            |            | .....................................
+    | RESIDUAL %     |    65.587% |            |            | .....................................
+    | RECONCILIATION STATUS | EXCEEDS_TOLERANCE |            |            | .....................................
+    | CONTROLLABLE APPLICATION WALL |    14.055s |            |            | .....................................
+    | PLATFORM/MODAL WALL |     0.000s |            |            | .....................................
+Pending host reconciliation: command start -> Python resume = 26785.660 ms - classification = scheduling + pre-Python restore (unresolved platform interval)
+Boundary flags: modal_restore_begin_unavailable (modal_scheduling covers submission->python_resume combined), submission_boundary_unavailable (submission boundary absent; scheduling spans cannot start at the local submit)
+REMOTE/PARTIAL WATERFALL - awaiting host reconciliation (missing: missing_submission, missing_modal_restore_begin, missing_local_result_receipt)
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+Warnings:
+  - global residual 26785.874ms (65.59%) of command-to-response unaccounted
+  - reconciliation exceeds tolerance: 26785.874ms > 102.101ms

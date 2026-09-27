@@ -1,0 +1,27 @@
+{
+  "arm": "qd1",
+  "attempt_id": "unet_b128_qd1_R1",
+  "campaign_index": 18,
+  "classification": "DNF",
+  "error": "RuntimeError:static_e27_qd_must_be_2_4_or_8",
+  "identity": {
+    "container_session_id": "ta-01M1PSE4MMCZ5SW8H6M4TKX7SR",
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-wB4OigJuYJ6uLNwDQHOiFD",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "model_construction": false,
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "oracle_wall_ms": 3460.2998,
+  "path_resolution": "fixed_read_only_models_mount",
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+  "role": "unet",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "status": "error"
+}

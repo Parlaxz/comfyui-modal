@@ -1,0 +1,428 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "source": "per_read.csv producer_id/region_id/slot_index/source_offset/destination_offset (computed_valid rows only)",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "missingness": {
+    "slot_index": "empty string for every canonical per_read row (100% missing); derived valid-only statistics cover computed_valid requests only",
+    "region_id": "identical to producer_id for every row; not separable",
+    "physical_provenance": "constant 'golden_serial._read_at' for every row"
+  },
+  "by_arm_role": {
+    "sham": {
+      "clip": {
+        "n_requests": 55,
+        "total_reads": 13365,
+        "producer_count": {
+          "n": 55,
+          "min": 4.0,
+          "q1": 4.0,
+          "median": 4.0,
+          "q3": 4.0,
+          "p90": 4.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0,
+          "mean": 4.0
+        },
+        "producer_hhi": {
+          "n": 55,
+          "min": 0.250013,
+          "q1": 0.250013,
+          "median": 0.250013,
+          "q3": 0.250013,
+          "p90": 0.250013,
+          "p95": 0.250013,
+          "p99": 0.250013,
+          "max": 0.250013,
+          "mean": 0.250013
+        },
+        "producer_top_share": {
+          "n": 55,
+          "min": 0.251029,
+          "q1": 0.251029,
+          "median": 0.251029,
+          "q3": 0.251029,
+          "p90": 0.251029,
+          "p95": 0.251029,
+          "p99": 0.251029,
+          "max": 0.251029,
+          "mean": 0.251029
+        },
+        "producer_alternations": {
+          "n": 55,
+          "min": 98.0,
+          "q1": 221.0,
+          "median": 238.0,
+          "q3": 240.0,
+          "p90": 241.0,
+          "p95": 241.0,
+          "p99": 242.0,
+          "max": 242.0,
+          "mean": 222.454545
+        },
+        "source_offset_distinct": {
+          "n": 55,
+          "min": 243.0,
+          "q1": 243.0,
+          "median": 243.0,
+          "q3": 243.0,
+          "p90": 243.0,
+          "p95": 243.0,
+          "p99": 243.0,
+          "max": 243.0,
+          "mean": 243.0
+        },
+        "destination_offset_distinct": {
+          "n": 55,
+          "min": 243.0,
+          "q1": 243.0,
+          "median": 243.0,
+          "q3": 243.0,
+          "p90": 243.0,
+          "p95": 243.0,
+          "p99": 243.0,
+          "max": 243.0,
+          "mean": 243.0
+        },
+        "slot_index_present_total": 0,
+        "slot_index_missing_total": 13365
+      },
+      "unet": {
+        "n_requests": 55,
+        "total_reads": 20350,
+        "producer_count": {
+          "n": 55,
+          "min": 4.0,
+          "q1": 4.0,
+          "median": 4.0,
+          "q3": 4.0,
+          "p90": 4.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0,
+          "mean": 4.0
+        },
+        "producer_hhi": {
+          "n": 55,
+          "min": 0.250007,
+          "q1": 0.250007,
+          "median": 0.250007,
+          "q3": 0.250007,
+          "p90": 0.250007,
+          "p95": 0.250007,
+          "p99": 0.250007,
+          "max": 0.250007,
+          "mean": 0.250007
+        },
+        "producer_top_share": {
+          "n": 55,
+          "min": 0.251351,
+          "q1": 0.251351,
+          "median": 0.251351,
+          "q3": 0.251351,
+          "p90": 0.251351,
+          "p95": 0.251351,
+          "p99": 0.251351,
+          "max": 0.251351,
+          "mean": 0.251351
+        },
+        "producer_alternations": {
+          "n": 55,
+          "min": 170.0,
+          "q1": 331.0,
+          "median": 363.0,
+          "q3": 364.0,
+          "p90": 367.0,
+          "p95": 367.0,
+          "p99": 369.0,
+          "max": 369.0,
+          "mean": 343.327273
+        },
+        "source_offset_distinct": {
+          "n": 55,
+          "min": 370.0,
+          "q1": 370.0,
+          "median": 370.0,
+          "q3": 370.0,
+          "p90": 370.0,
+          "p95": 370.0,
+          "p99": 370.0,
+          "max": 370.0,
+          "mean": 370.0
+        },
+        "destination_offset_distinct": {
+          "n": 55,
+          "min": 370.0,
+          "q1": 370.0,
+          "median": 370.0,
+          "q3": 370.0,
+          "p90": 370.0,
+          "p95": 370.0,
+          "p99": 370.0,
+          "max": 370.0,
+          "mean": 370.0
+        },
+        "slot_index_present_total": 0,
+        "slot_index_missing_total": 20350
+      }
+    },
+    "split": {
+      "clip": {
+        "n_requests": 86,
+        "total_reads": 20898,
+        "producer_count": {
+          "n": 86,
+          "min": 4.0,
+          "q1": 4.0,
+          "median": 4.0,
+          "q3": 4.0,
+          "p90": 4.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0,
+          "mean": 4.0
+        },
+        "producer_hhi": {
+          "n": 86,
+          "min": 0.250013,
+          "q1": 0.250013,
+          "median": 0.250013,
+          "q3": 0.250013,
+          "p90": 0.250013,
+          "p95": 0.250013,
+          "p99": 0.250013,
+          "max": 0.250013,
+          "mean": 0.250013
+        },
+        "producer_top_share": {
+          "n": 86,
+          "min": 0.251029,
+          "q1": 0.251029,
+          "median": 0.251029,
+          "q3": 0.251029,
+          "p90": 0.251029,
+          "p95": 0.251029,
+          "p99": 0.251029,
+          "max": 0.251029,
+          "mean": 0.251029
+        },
+        "producer_alternations": {
+          "n": 86,
+          "min": 143.0,
+          "q1": 236.0,
+          "median": 239.0,
+          "q3": 240.0,
+          "p90": 241.0,
+          "p95": 241.0,
+          "p99": 242.0,
+          "max": 242.0,
+          "mean": 231.837209
+        },
+        "source_offset_distinct": {
+          "n": 86,
+          "min": 243.0,
+          "q1": 243.0,
+          "median": 243.0,
+          "q3": 243.0,
+          "p90": 243.0,
+          "p95": 243.0,
+          "p99": 243.0,
+          "max": 243.0,
+          "mean": 243.0
+        },
+        "destination_offset_distinct": {
+          "n": 86,
+          "min": 243.0,
+          "q1": 243.0,
+          "median": 243.0,
+          "q3": 243.0,
+          "p90": 243.0,
+          "p95": 243.0,
+          "p99": 243.0,
+          "max": 243.0,
+          "mean": 243.0
+        },
+        "slot_index_present_total": 0,
+        "slot_index_missing_total": 20898
+      },
+      "unet": {
+        "n_requests": 86,
+        "total_reads": 31820,
+        "producer_count": {
+          "n": 86,
+          "min": 4.0,
+          "q1": 4.0,
+          "median": 4.0,
+          "q3": 4.0,
+          "p90": 4.0,
+          "p95": 4.0,
+          "p99": 4.0,
+          "max": 4.0,
+          "mean": 4.0
+        },
+        "producer_hhi": {
+          "n": 86,
+          "min": 0.250007,
+          "q1": 0.250007,
+          "median": 0.250007,
+          "q3": 0.250007,
+          "p90": 0.250007,
+          "p95": 0.250007,
+          "p99": 0.250007,
+          "max": 0.250007,
+          "mean": 0.250007
+        },
+        "producer_top_share": {
+          "n": 86,
+          "min": 0.251351,
+          "q1": 0.251351,
+          "median": 0.251351,
+          "q3": 0.251351,
+          "p90": 0.251351,
+          "p95": 0.251351,
+          "p99": 0.251351,
+          "max": 0.251351,
+          "mean": 0.251351
+        },
+        "producer_alternations": {
+          "n": 86,
+          "min": 150.0,
+          "q1": 363.0,
+          "median": 366.0,
+          "q3": 368.0,
+          "p90": 368.5,
+          "p95": 369.0,
+          "p99": 369.0,
+          "max": 369.0,
+          "mean": 358.232558
+        },
+        "source_offset_distinct": {
+          "n": 86,
+          "min": 370.0,
+          "q1": 370.0,
+          "median": 370.0,
+          "q3": 370.0,
+          "p90": 370.0,
+          "p95": 370.0,
+          "p99": 370.0,
+          "max": 370.0,
+          "mean": 370.0
+        },
+        "destination_offset_distinct": {
+          "n": 86,
+          "min": 370.0,
+          "q1": 370.0,
+          "median": 370.0,
+          "q3": 370.0,
+          "p90": 370.0,
+          "p95": 370.0,
+          "p99": 370.0,
+          "max": 370.0,
+          "mean": 370.0
+        },
+        "slot_index_present_total": 0,
+        "slot_index_missing_total": 31820
+      }
+    }
+  },
+  "by_sickness_class_role": {
+    "BOTH_SICK": {
+      "clip": {
+        "n_requests": 6,
+        "producer_hhi_median": 0.250013,
+        "producer_alternations_median": 184.5,
+        "source_offset_distinct_median": 243.0,
+        "destination_offset_distinct_median": 243.0
+      },
+      "unet": {
+        "n_requests": 6,
+        "producer_hhi_median": 0.250007,
+        "producer_alternations_median": 296.5,
+        "source_offset_distinct_median": 370.0,
+        "destination_offset_distinct_median": 370.0
+      }
+    },
+    "CLIP_SICK_ONLY": {
+      "clip": {
+        "n_requests": 8,
+        "producer_hhi_median": 0.250013,
+        "producer_alternations_median": 211.0,
+        "source_offset_distinct_median": 243.0,
+        "destination_offset_distinct_median": 243.0
+      },
+      "unet": {
+        "n_requests": 8,
+        "producer_hhi_median": 0.250007,
+        "producer_alternations_median": 359.5,
+        "source_offset_distinct_median": 370.0,
+        "destination_offset_distinct_median": 370.0
+      }
+    },
+    "NEITHER": {
+      "clip": {
+        "n_requests": 121,
+        "producer_hhi_median": 0.250013,
+        "producer_alternations_median": 239.0,
+        "source_offset_distinct_median": 243.0,
+        "destination_offset_distinct_median": 243.0
+      },
+      "unet": {
+        "n_requests": 121,
+        "producer_hhi_median": 0.250007,
+        "producer_alternations_median": 365.0,
+        "source_offset_distinct_median": 370.0,
+        "destination_offset_distinct_median": 370.0
+      }
+    },
+    "UNET_SICK_ONLY": {
+      "clip": {
+        "n_requests": 6,
+        "producer_hhi_median": 0.250013,
+        "producer_alternations_median": 198.0,
+        "source_offset_distinct_median": 243.0,
+        "destination_offset_distinct_median": 243.0
+      },
+      "unet": {
+        "n_requests": 6,
+        "producer_hhi_median": 0.250007,
+        "producer_alternations_median": 278.5,
+        "source_offset_distinct_median": 370.0,
+        "destination_offset_distinct_median": 370.0
+      }
+    }
+  },
+  "severity_correlations": {
+    "clip_producer_hhi": {
+      "spearman": null,
+      "perm_p": null,
+      "n": 141
+    },
+    "clip_producer_alternations": {
+      "spearman": -0.490497,
+      "perm_p": 0.0002,
+      "n": 141
+    },
+    "unet_producer_hhi": {
+      "spearman": null,
+      "perm_p": null,
+      "n": 141
+    },
+    "unet_producer_alternations": {
+      "spearman": -0.340742,
+      "perm_p": 0.0002,
+      "n": 141
+    }
+  }
+}

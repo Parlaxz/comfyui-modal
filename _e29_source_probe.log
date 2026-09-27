@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2ctl.py", line 14, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\cli.py", line 1232, in main
+    return args.func(args, repo_root)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\cli.py", line 970, in cmd_source_probe
+    exit_code, report = sp.run_source_probe(repo_root, workspace=workspace, gpu=str(gpu))
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\source_probe.py", line 284, in run_source_probe
+    probe = call_remote_source_probe(repo_root, workspace=workspace, gpu=gpu or "rtx-pro-6000")
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\v2_control\source_probe.py", line 243, in call_remote_source_probe
+    from comfymodal_runtime.modal_transport import ModalTransport
+ModuleNotFoundError: No module named 'comfymodal_runtime'

@@ -1,0 +1,626 @@
+{
+  "generatedAt": "2026-08-25T15:47:53.239Z",
+  "viewports": [
+    [
+      1440,
+      900
+    ],
+    [
+      1024,
+      768
+    ],
+    [
+      768,
+      900
+    ],
+    [
+      480,
+      800
+    ]
+  ],
+  "pages": {
+    "playground": {
+      "overflow_1440": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_1024": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_768": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_480": {
+        "doc": 0,
+        "page": 0
+      },
+      "structure": {
+        "headings": [],
+        "nav": [
+          {
+            "tag": "button",
+            "text": "Playground",
+            "dataPage": "playground",
+            "ariaCurrent": null,
+            "className": "active"
+          },
+          {
+            "tag": "button",
+            "text": "History",
+            "dataPage": "history",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Workflows",
+            "dataPage": "workflows",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Backend",
+            "dataPage": "backend",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Settings",
+            "dataPage": "settings",
+            "ariaCurrent": null,
+            "className": ""
+          }
+        ],
+        "navElementTag": "div",
+        "navRole": null,
+        "chipClasses": {
+          "comfymodal-studio-carousel-exp-badge": 1
+        },
+        "loadingTexts": [],
+        "buttonsWithoutName": [],
+        "duplicateButtonNames": {
+          "Preset A - completed - Click to view": 4
+        },
+        "ariaExpandedCount": 0,
+        "roleAttrCount": 0,
+        "clickableNonButtons": 6,
+        "horizontalOverflow": {
+          "docOverflow": 0,
+          "pageOverflow": 0
+        }
+      }
+    },
+    "history": {
+      "overflow_1440": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_1024": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_768": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_480": {
+        "doc": 0,
+        "page": 0
+      },
+      "structure": {
+        "headings": [],
+        "nav": [
+          {
+            "tag": "button",
+            "text": "Playground",
+            "dataPage": "playground",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "History",
+            "dataPage": "history",
+            "ariaCurrent": null,
+            "className": "active"
+          },
+          {
+            "tag": "button",
+            "text": "Workflows",
+            "dataPage": "workflows",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Backend",
+            "dataPage": "backend",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Settings",
+            "dataPage": "settings",
+            "ariaCurrent": null,
+            "className": ""
+          }
+        ],
+        "navElementTag": "div",
+        "navRole": null,
+        "chipClasses": {
+          "comfymodal-studio-history-v2-chip": 7
+        },
+        "loadingTexts": [],
+        "buttonsWithoutName": [],
+        "duplicateButtonNames": {
+          "Add to favorites": 7
+        },
+        "ariaExpandedCount": 0,
+        "roleAttrCount": 16,
+        "clickableNonButtons": 84,
+        "horizontalOverflow": {
+          "docOverflow": 0,
+          "pageOverflow": 0
+        }
+      }
+    },
+    "workflows": {
+      "overflow_1440": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_1024": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_768": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_480": {
+        "doc": 0,
+        "page": 0
+      },
+      "structure": {
+        "headings": [
+          {
+            "level": "h2",
+            "text": "Workflows"
+          },
+          {
+            "level": "h3",
+            "text": "Fake Workflow"
+          },
+          {
+            "level": "h3",
+            "text": "Text2Img Workflow"
+          },
+          {
+            "level": "h3",
+            "text": "Incomplete Workflow"
+          },
+          {
+            "level": "h3",
+            "text": "Fail Workflow"
+          },
+          {
+            "level": "h3",
+            "text": "Cancel Workflow"
+          },
+          {
+            "level": "h3",
+            "text": "Interrupt Workflow"
+          }
+        ],
+        "nav": [
+          {
+            "tag": "button",
+            "text": "Playground",
+            "dataPage": "playground",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "History",
+            "dataPage": "history",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Workflows",
+            "dataPage": "workflows",
+            "ariaCurrent": null,
+            "className": "active"
+          },
+          {
+            "tag": "button",
+            "text": "Backend",
+            "dataPage": "backend",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Settings",
+            "dataPage": "settings",
+            "ariaCurrent": null,
+            "className": ""
+          }
+        ],
+        "navElementTag": "div",
+        "navRole": null,
+        "chipClasses": {
+          "comfymodal-studio-status-badge": 6,
+          "comfymodal-studio-portability-chip": 6,
+          "comfymodal-studio-wf-chip": 1
+        },
+        "loadingTexts": [],
+        "buttonsWithoutName": [],
+        "duplicateButtonNames": {
+          "Add to favorites": 6,
+          "Portability: Not analyzed. Opens the portability panel.": 4
+        },
+        "ariaExpandedCount": 0,
+        "roleAttrCount": 6,
+        "clickableNonButtons": 42,
+        "horizontalOverflow": {
+          "docOverflow": 0,
+          "pageOverflow": 0
+        }
+      }
+    },
+    "backend": {
+      "overflow_1440": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_1024": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_768": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_480": {
+        "doc": 0,
+        "page": 0
+      },
+      "structure": {
+        "headings": [],
+        "nav": [
+          {
+            "tag": "button",
+            "text": "Playground",
+            "dataPage": "playground",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "History",
+            "dataPage": "history",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Workflows",
+            "dataPage": "workflows",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Backend",
+            "dataPage": "backend",
+            "ariaCurrent": null,
+            "className": "active"
+          },
+          {
+            "tag": "button",
+            "text": "Settings",
+            "dataPage": "settings",
+            "ariaCurrent": null,
+            "className": ""
+          }
+        ],
+        "navElementTag": "div",
+        "navRole": null,
+        "chipClasses": {},
+        "loadingTexts": [],
+        "buttonsWithoutName": [],
+        "duplicateButtonNames": {},
+        "ariaExpandedCount": 0,
+        "roleAttrCount": 0,
+        "clickableNonButtons": 0,
+        "horizontalOverflow": {
+          "docOverflow": 0,
+          "pageOverflow": 0
+        }
+      }
+    },
+    "settings": {
+      "overflow_1440": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_1024": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_768": {
+        "doc": 0,
+        "page": 0
+      },
+      "overflow_480": {
+        "doc": 0,
+        "page": 0
+      },
+      "structure": {
+        "headings": [
+          {
+            "level": "h3",
+            "text": "General"
+          },
+          {
+            "level": "h3",
+            "text": "Generation"
+          },
+          {
+            "level": "h3",
+            "text": "Outputs"
+          },
+          {
+            "level": "h3",
+            "text": "History"
+          },
+          {
+            "level": "h3",
+            "text": "Experiments"
+          },
+          {
+            "level": "h3",
+            "text": "Interface"
+          },
+          {
+            "level": "h3",
+            "text": "Advanced"
+          },
+          {
+            "level": "h4",
+            "text": "Runtime & Backend"
+          }
+        ],
+        "nav": [
+          {
+            "tag": "button",
+            "text": "Playground",
+            "dataPage": "playground",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "History",
+            "dataPage": "history",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Workflows",
+            "dataPage": "workflows",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Backend",
+            "dataPage": "backend",
+            "ariaCurrent": null,
+            "className": ""
+          },
+          {
+            "tag": "button",
+            "text": "Settings",
+            "dataPage": "settings",
+            "ariaCurrent": null,
+            "className": "active"
+          }
+        ],
+        "navElementTag": "div",
+        "navRole": null,
+        "chipClasses": {
+          "comfymodal-settings-restart-badge": 1
+        },
+        "loadingTexts": [],
+        "buttonsWithoutName": [],
+        "duplicateButtonNames": {
+          "Reset section": 5
+        },
+        "ariaExpandedCount": 0,
+        "roleAttrCount": 0,
+        "clickableNonButtons": 0,
+        "horizontalOverflow": {
+          "docOverflow": 0,
+          "pageOverflow": 0
+        }
+      }
+    }
+  },
+  "keyboard": {
+    "playgroundTabStops": [
+      {
+        "tag": "button",
+        "cls": "",
+        "testid": null,
+        "text": "History",
+        "page": "topnav"
+      },
+      {
+        "tag": "button",
+        "cls": "",
+        "testid": null,
+        "text": "Workflows",
+        "page": "topnav"
+      },
+      {
+        "tag": "button",
+        "cls": "",
+        "testid": null,
+        "text": "Backend",
+        "page": "topnav"
+      },
+      {
+        "tag": "button",
+        "cls": "",
+        "testid": null,
+        "text": "Settings",
+        "page": "topnav"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-secondary-btn",
+        "testid": "experiment-toggle",
+        "text": "Experiment",
+        "page": "content"
+      },
+      {
+        "tag": "select",
+        "cls": "comfymodal-input comfymodal-studio-select",
+        "testid": "backend-select",
+        "text": "Select a backendâ€¦Default Preset (fake)",
+        "page": "content"
+      },
+      {
+        "tag": "select",
+        "cls": "comfymodal-input comfymodal-studio-select",
+        "testid": "workflow-selector",
+        "text": "Select a workflow…Fake Workflow (v1)Text",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-reset-link",
+        "testid": null,
+        "text": "Reset to defaults",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-feature-tab active",
+        "testid": "feature-tab-txt2img",
+        "text": "Txt2Img",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-feature-tab",
+        "testid": "feature-tab-object_remove",
+        "text": "Object Remove",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-feature-tab",
+        "testid": "feature-tab-object_replace",
+        "text": "Object Replace",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-carousel-btn danger",
+        "testid": null,
+        "text": "Clear",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-carousel-btn close-btn",
+        "testid": null,
+        "text": "✕",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-carousel-item completed",
+        "testid": null,
+        "text": "",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-carousel-item completed",
+        "testid": null,
+        "text": "",
+        "page": "content"
+      },
+      {
+        "tag": "button",
+        "cls": "comfymodal-studio-carousel-item completed",
+        "testid": null,
+        "text": "",
+        "page": "content"
+      }
+    ],
+    "navButtonFocusVisible": {
+      "matchesFocusVisible": true,
+      "outlineStyle": "solid",
+      "outlineWidth": "2px",
+      "boxShadow": "none"
+    }
+  },
+  "historyDetail": {
+    "generationOverlay": {
+      "role": "dialog",
+      "ariaModal": "true",
+      "imageCount": 3,
+      "images": [
+        {
+          "src": "/comfymodal/history-v2/assets/gen_phase_e_preview_only_o0_preview",
+          "alt": "phase e preview only",
+          "w": 4,
+          "h": 4
+        },
+        {
+          "src": "/comfymodal/history-v2/assets/gen_phase_e_preview_only_o0_thumb",
+          "alt": "Output 1",
+          "w": 60,
+          "h": 60
+        },
+        {
+          "src": "/comfymodal/history-v2/assets/gen_phase_e_preview_only_o0_preview",
+          "alt": "Preview",
+          "w": 229,
+          "h": 229
+        }
+      ],
+      "buttons": [
+        "Close",
+        "Output 1 actions",
+        "Download Preview",
+        "Export Preview",
+        "Save note",
+        "Add to favorites",
+        "Generate Original"
+      ],
+      "hasZoomViewer": false,
+      "headings": []
+    },
+    "focusInsideOverlay": false,
+    "afterEscape": {
+      "overlayGone": true,
+      "activeElement": "DIV.comfymodal-studio-history-v2-card comfymodal-studi"
+    },
+    "experimentOverlay": null
+  },
+  "notes": []
+}

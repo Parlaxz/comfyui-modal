@@ -1,0 +1,194 @@
+# V2 Batch C1 — Immutable Plan/Snapshot Deployment Identity
+
+Status: implemented, tests green, **no deploy, no Modal run, no commit**.
+Date: 2026-08-14.
+
+## Problem restated
+
+Batch-B data run #2 showed a host-side identity divergence:
+
+- deploy #2 snapshot proof froze `custom_nodes_generation=6d27025c563e5293c315906f6a533cfe`
+  and a `deployment_combined_hash`; the deployment hash never changed.
+- AFTER deploy, a concurrent worker regenerated the mutable local
+  `.baked_custom_node_deps/custom_node_deps_baked.json` (the image-build bake
+  code `comfyapp.py` writes this file on every build-context generation).
+- The host plan builder then read the NEW baked manifest, so plan
+  `custom_nodes_generation` / dependency identity changed while the deployed
+  snapshot proof stayed frozen.
+- `evaluate_plan_snapshot_parity` correctly rejected the fast path
+  (`custom_nodes_generation_mismatch,dependency_proof_mismatch`) and runtime
+  fell back to legacy validation / certificate volume_read.
+
+The runtime comparison was CORRECT. The host identity source was wrong.
+
+## Old identity source chain (host plan build)
+
+`canonical_execution._collect_plan_deployment_identity` (per request, via
+`build_execution_plan`):
+
+1. `deployment_combined_hash`:
+   `request_metadata["deployment_combined_hash"]` →
+   env `COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH` →
+   `.deployed_state.json["deployment_combined_hash"]` (persisted) →
+   `unavailable`. Host mirror (`_compute_host_deployment_combined_hash`)
+   is diagnostic only and never grants identity.
+2. `custom_nodes_generation`:
+   `.baked_custom_node_deps/custom_node_deps_baked.json["production_custom_node_generation"]`
+   → `request_metadata["custom_node_generation"]` fallback.
+3. `overall_dependency_hash` (dependency-proof input):
+   `.baked_custom_node_deps/custom_node_deps_baked.json["overall_dependency_hash"]`.
+4. `dependency_manifest_identity` =
+   `build_identity(combined_hash, {"overall_dependency_hash": _overall},
+   custom_node_generation, repair_mode, schema_version)`.
+5. `complete` = dep && gen && registry_proof_complete.
+
+**Flaw:** for an already-deployed runtime the generation and the dependency
+hash were sourced from the MUTABLE construction-time baked manifest, not from
+the deploy-frozen record. The deploy-frozen record
+(`.deployed_state.json`, written by `tools/record_deployment_identity.py` from
+the container readback) already carried `deployment_combined_hash` +
+`custom_nodes_generation` — but NOT `overall_dependency_hash`, so the
+dependency axis could not be derived from frozen state.
+
+## New identity source chain
+
+### Deploy time (freezing)
+
+`tools/record_deployment_identity.py` (runs post-deploy from
+`deploy_and_run_v2_single.bat`) calls the deployed container's
+`ModalRuntimeEntrypointV2.get_deployment_identity_static`, which now returns
+`overall_dependency_hash` (read from the image-baked manifest
+`/opt/comfymodal/custom_node_deps_baked.json` — immutable image content)
+alongside `deployment_combined_hash` and `custom_nodes_generation`. The tool:
+
+- FAILS CLOSED (exit 1, named reason) if any of
+  `deployment_combined_hash` / `custom_nodes_generation` /
+  `overall_dependency_hash` is empty
+  (`empty_deployment_combined_hash`, `empty_custom_nodes_generation`,
+  `empty_overall_dependency_hash`);
+- writes all three into `.deployed_state.json` (`source: "container_readback"`).
+
+The deploy-frozen record is therefore the full identity triple
+(`deployment_combined_hash`, `custom_nodes_generation`,
+`overall_dependency_hash`) as observed in the DEPLOYED IMAGE.
+
+### Plan build time (consuming)
+
+`canonical_execution._collect_plan_deployment_identity`:
+
+1. `deployment_combined_hash` chain unchanged (metadata → env → persisted →
+   unavailable).
+2. When the hash source is `persisted` (an already-deployed runtime),
+   `custom_nodes_generation` and `overall_dependency_hash` are read
+   EXCLUSIVELY from `_read_frozen_deployed_identity()`
+   (`.deployed_state.json` via the new `_DEPLOY_STATE_JSON_LOCAL` constant).
+   The mutable baked manifest is NOT consulted at all in this mode.
+3. Non-persisted sources (metadata/env override, or no deployed record) keep
+   the legacy baked-manifest provenance — construction/dev workflows
+   unaffected.
+4. New plan fields: `deployment_identity_frozen` (bool) and
+   `deployment_identity_fail_closed_reason` (str, "" when healthy).
+5. `complete` now additionally requires no fail-closed reason:
+   `bool(_dep and _gen and _reg_proof_complete and not _identity_fail_closed_reason)`.
+
+### Why this source is deploy-frozen
+
+- `.deployed_state.json` in the `container_readback` shape is written by the
+  deploy pipeline from the LIVE deployed container's O(1) static readback,
+  which reads the image-baked manifest — content baked into the immutable
+  image layer. It cannot drift when the local working tree changes.
+- The local `.baked_custom_node_deps/custom_node_deps_baked.json` is a
+  CONSTRUCTION-time artifact regenerated by every image-build context pass
+  (`comfyapp.py` `_maybe_write_baked_manifest`); it is excluded from the
+  deployment source hash, so regenerating it never changes
+  `deployment_combined_hash` — it only drifted the manifest-derived axes.
+- No new cache was invented: the existing deploy-frozen record
+  (`.deployed_state.json`, tool shape) was extended with the one missing
+  frozen field.
+
+## Behavior under post-deploy baked-manifest regeneration
+
+- Deploy freezes triple A into `.deployed_state.json`; snapshot proof freezes
+  A. A concurrent worker regenerates the baked manifest to B.
+- Plan builds: hash source `persisted` → frozen mode → gen/overall come from
+  the frozen record (A). Plan identity == A. Parity with the proof (A) is
+  ELIGIBLE — the fast path is no longer lost to a spurious mismatch.
+- Even DELETING the baked manifest cannot change the plan identity of an
+  already-deployed runtime.
+- The baked manifest itself is untouched: regeneration continues to work for
+  image build / construction workflows (requirement 4).
+
+## Fail-closed semantics (requirement 5)
+
+| Frozen record state | Plan outcome |
+|---|---|
+| Missing file / unreadable / corrupt JSON | hash source `unavailable`, identity incomplete (unchanged legacy behavior — no false parity) |
+| Hash present, `custom_nodes_generation` missing | `deployment_identity_fail_closed_reason="deploy_frozen_custom_nodes_generation_missing"`, gen/overall empty, `complete=False`, plan parity ineligible (`plan_identity_incomplete`) — baked manifest NOT substituted |
+| Hash + generation present, `overall_dependency_hash` missing | `deployment_identity_fail_closed_reason="deploy_frozen_overall_dependency_hash_missing"`, dependency identity empty, `complete=False` — baked manifest NOT substituted |
+| Full triple present | frozen identity used, `complete=True` when registry proof complete |
+
+No path silently substitutes the mutable manifest when frozen identity is
+missing/inconsistent. The reason string is carried on the plan
+(`deployment_identity_fail_closed_reason`) for per-request diagnostics.
+
+Operational note: the CURRENT on-disk `.deployed_state.json` (deploy #2,
+written before this change) lacks `overall_dependency_hash`, so until the
+next deployment runs the updated record tool, plans for that deployment will
+fail closed with `deploy_frozen_overall_dependency_hash_missing` (legacy
+validation path, exactly the state the runtime already fell back to — now
+deterministic and self-diagnosing). The next explicit deployment freezes the
+full triple and restores fast-path eligibility.
+
+## Constraints honored
+
+- No remote I/O added to per-request plan construction (requirement 6):
+  `_read_frozen_deployed_identity` is pure local file I/O; the identity
+  collection path imports no modal/transport/client modules (test G).
+- Runtime snapshot-proof comparison semantics UNCHANGED (requirement 7):
+  `comfymodal_runtime/contracts.py:evaluate_plan_snapshot_parity` untouched.
+- Baked-manifest regeneration NOT disabled (requirement 4).
+- Scope discipline: `tools/batch_b_acceptance.py`, `tools/benchmark_v2_direct.py`,
+  waterfall rendering, VAE activation, snapshot hygiene untouched.
+
+## Test matrix
+
+`tests/test_batch_c1_immutable_plan_identity.py` (10 tests, all local — no
+Modal/network/ComfyUI imports; frozen record + baked manifest materialized in
+tmp dirs, module path constants patched):
+
+| # | Scenario | Test | Assertions |
+|---|---|---|---|
+| A | deployment identity A + baked manifest A | `test_plan_carries_deploy_frozen_identity` | plan dep/gen/dependency-identity == A, `complete=True`, parity eligible against proof A |
+| B | post-deploy baked regeneration A→B, state stays A | `test_baked_regeneration_does_not_change_plan_identity` | plan still A; dep identity ≠ build_identity(B); parity with proof A still eligible |
+| B' | baked manifest DELETED after deploy | `test_baked_manifest_deletion_does_not_change_plan_identity` | plan still A, `complete=True` |
+| C | new explicit deployment B | `test_new_explicit_deployment_establishes_new_identity` | plan carries B; parity with B eligible, with A ineligible |
+| D1 | frozen record missing generation | `test_missing_frozen_generation_fails_closed` | gen empty (not baked gen-X), reason `deploy_frozen_custom_nodes_generation_missing`, `complete=False`, parity ineligible |
+| D2 | frozen record missing dependency hash | `test_missing_frozen_dependency_hash_fails_closed` | dep identity empty, reason `deploy_frozen_overall_dependency_hash_missing`, `complete=False` |
+| D3 | corrupt frozen record | `test_corrupt_frozen_record_fails_closed` | hash source `unavailable`, `complete=False`, no false parity |
+| E | dependency-identity lockstep | `test_dependency_identity_lockstep_with_frozen_generation` | dep identity follows the frozen (generation, overall) pair; baked regen can never decouple them |
+| F | deployment_combined_hash behavior | `test_metadata_env_persisted_precedence_preserved` | metadata > env > persisted precedence unchanged; non-persisted sources keep legacy baked-manifest provenance |
+| G | no remote I/O | `test_no_remote_io_in_plan_building` | forbidden-import finder (modal/modal_client/modal_transport/modal_app) + `modal not in sys.modules`; identity still collected |
+
+Preserved suites re-run green: `test_step3_final_parity.py`,
+`test_step3_fast_path.py`, `test_plan_validation_proof.py`,
+`test_deployment_proof.py`, `test_canonical_execution.py` — 128 passed
+(baseline was 128).
+
+## Changed files
+
+| File | Change |
+|---|---|
+| `canonical_execution.py` | `_DEPLOY_STATE_JSON_LOCAL` constant; `_read_frozen_deployed_identity()`; `_read_persisted_deployment_combined_hash` delegates to it; `_collect_plan_deployment_identity` frozen-record branch with fail-closed reasons; `deployment_identity_frozen` / `deployment_identity_fail_closed_reason` plan fields; `complete` gated on no fail-closed reason; docstrings/comments |
+| `comfymodal_runtime/modal_app.py` | `get_deployment_identity_static` additionally returns `overall_dependency_hash` from the image-baked manifest (success + error dicts) |
+| `tools/record_deployment_identity.py` | reads `overall_dependency_hash`; fails closed on empty gen/overall; writes the triple into `.deployed_state.json`; prints the new field; docstring |
+| `tests/test_batch_c1_immutable_plan_identity.py` | NEW — scenarios A–G, 10 tests |
+
+Untouched: `comfymodal_runtime/contracts.py`, `tools/batch_b_acceptance.py`,
+`tools/benchmark_v2_direct.py`, `__init__.py`, `comfyapp.py`, waterfall/VAE/
+snapshot-hygiene code.
+
+## Verification
+
+- `python -m pytest tests/test_batch_c1_immutable_plan_identity.py -q` → 10 passed
+- `python -m pytest tests/test_step3_final_parity.py tests/test_step3_fast_path.py tests/test_plan_validation_proof.py tests/test_deployment_proof.py tests/test_canonical_execution.py -q` → 128 passed
+- No deploy, no Modal runs, no commit.

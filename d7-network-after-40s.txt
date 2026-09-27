@@ -1,0 +1,55 @@
+484. [GET] http://127.0.0.1:8190/api/jobs?status=in_progress,pending&limit=200&offset=0 => [200] OK
+485. [GET] http://127.0.0.1:8190/api/jobs?status=completed,failed,cancelled&limit=64&offset=0 => [200] OK
+504. [GET] http://127.0.0.1:8190/api/experiment/models/checkpoints => [200] OK
+505. [GET] http://127.0.0.1:8190/api/experiment/models/loras => [200] OK
+506. [GET] http://127.0.0.1:8190/api/experiment/models/diffusion_models => [200] OK
+512. [GET] http://127.0.0.1:8190/api/comfymodal/config => [200] OK
+513. [GET] http://127.0.0.1:8190/api/comfymodal/config => [200] OK
+522. [POST] http://127.0.0.1:8190/api/comfymodal/config => [200] OK
+532. [GET] http://127.0.0.1:8190/api/lm/checkpoints/relative-paths?search=v1-5-pruned-emaonly-fp16.safetensors&limit=2 => [200] OK
+536. [GET] http://127.0.0.1:8190/api/experiment/models => [200] OK
+540. [HEAD] https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors => [302] 
+541. [HEAD] https://us.aws.cdn.hf.co/xet-bridge-us/66d0dccb3866d4d3087d3a9f/908c39bfdfec888e295ba04e974b6342f3c15776760edd46838240a8d455525d?response-content-disposition=inline%3B+filename*%3DUTF-8%27%27v1-5-pruned-emaonly-fp16.safetensors%3B+filename%3D%22v1-5-pruned-emaonly-fp16.safetensors%22%3B&user_id=public&X-Xet-Cas-Uid=public&Expires=1786929904&Policy=eyJTdGF0ZW1lbnQiOlt7IlJlc291cmNlIjoiaHR0cHM6Ly91cy5hd3MuY2RuLmhmLmNvL3hldC1icmlkZ2UtdXMvNjZkMGRjY2IzODY2ZDRkMzA4N2QzYTlmLzkwOGMzOWJmZGZlYzg4OGUyOTViYTA0ZTk3NGI2MzQyZjNjMTU3NzY3NjBlZGQ0NjgzODI0MGE4ZDQ1NTUyNWRcXD9yZXNwb25zZS1jb250ZW50LWRpc3Bvc2l0aW9uPWlubGluZSUzQitmaWxlbmFtZSUyQSUzRFVURi04JTI3JTI3djEtNS1wcnVuZWQtZW1hb25seS1mcDE2LnNhZmV0ZW5zb3JzJTNCK2ZpbGVuYW1lJTNEJTIydjEtNS1wcnVuZWQtZW1hb25seS1mcDE2LnNhZmV0ZW5zb3JzJTIyJTNCJnVzZXJfaWQ9cHVibGljJlgtWGV0LUNhcy1VaWQ9cHVibGljIiwiQ29uZGl0aW9uIjp7IkRhdGVMZXNzVGhhbiI6eyJFcG9jaFRpbWUiOjE3ODY5Mjk5MDR9fX1dfQ__&Signature=MEUCIQD6tn9VJkL5ZuaI30JOOOwn8DUqL0IYxuzPaheDuZywrAIgXp1bnTMHAIyA0R2uv6urpIkvahStOUIbc9CZtsLTqZk_&Key-Pair-Id=01KXEF4KZ1B6FV465MAWR4M21F => [200] 
+542. [GET] http://127.0.0.1:8190/api/experiment/models => [200] OK
+544. [GET] http://127.0.0.1:8190/api/jobs?status=completed,failed,cancelled&limit=200&offset=0 => [200] OK
+545. [GET] http://127.0.0.1:8190/api/jobs?status=completed,failed,cancelled&limit=200&offset=0 => [200] OK
+546. [GET] http://127.0.0.1:8190/comfymodal/studio/presets => [200] OK
+547. [GET] http://127.0.0.1:8190/comfymodal/studio/presets => [200] OK
+548. [GET] http://127.0.0.1:8190/comfymodal/studio/presets => [200] OK
+549. [GET] http://127.0.0.1:8190/comfymodal/run-history?limit=50 => [200] OK
+550. [GET] http://127.0.0.1:8190/comfymodal/experiments => [200] OK
+551. [GET] http://127.0.0.1:8190/comfymodal/history?page=1&page_size=50 => [200] OK
+553. [GET] http://127.0.0.1:8190/comfymodal/studio/presets => [200] OK
+554. [GET] http://127.0.0.1:8190/comfymodal/studio/workflows => [200] OK
+555. [GET] http://127.0.0.1:8190/comfymodal/run-history?limit=50 => [200] OK
+556. [GET] http://127.0.0.1:8190/comfymodal/experiments => [200] OK
+557. [GET] http://127.0.0.1:8190/comfymodal/history?page=1&page_size=50 => [200] OK
+624. [GET] http://127.0.0.1:8190/comfymodal/studio/workflows/wf_9bbcfc104a35412d/versions => [200] OK
+625. [GET] http://127.0.0.1:8190/comfymodal/studio/workflows/wf_9bbcfc104a35412d/run-context?version_id=wv_487585a9c3cb4f32 => [200] OK
+626. [GET] http://127.0.0.1:8190/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/presets => [200] OK
+627. [GET] http://127.0.0.1:8190/comfymodal/studio/models => [200] OK
+748. [POST] http://127.0.0.1:8190/comfymodal/studio/experiment-v2 => [200] OK
+749. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+750. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+751. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+752. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+753. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+754. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+755. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+756. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+757. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+758. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+759. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+760. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+761. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+762. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+763. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+764. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+765. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+766. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+767. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+768. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+769. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+770. [GET] http://127.0.0.1:8190/comfymodal/history-v2/experiments/exp_v2_9c30f5999c7d/status => [200] OK
+
+Note: 593 static requests not shown, run with "static" option to see them.

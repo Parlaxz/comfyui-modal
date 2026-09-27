@@ -1,0 +1,6 @@
+{
+  "attempt_id": "wm-threads-r06",
+  "error": "TimeoutError:",
+  "status": "error",
+  "worker_model": "threads"
+}

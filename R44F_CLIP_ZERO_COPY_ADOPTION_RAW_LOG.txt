@@ -1,0 +1,325 @@
+R44F_CLIP_ZERO_COPY_ADOPTION_RAW_LOG
+Concise immutable transcription of the key JSON evidence for independent verification.
+All payloads verbatim from persisted artifacts; source file and line ranges labeled.
+Worktree: ../comfyui-modal-r42 · Branch r42-golden-reconciliation · HEAD 0c59f46e3238f421378e8852ebc548da815b70af (no commits)
+
+VERDICT: exactly ONE cold R44F gate run; gate_valid = false → INVALID for the requested CLIP
+zero-copy proof. CLIP native same-storage adoption was NOT exercised (eligibility skip:
+native_adoption_ineligible / dtype_parity_mismatch:file_0:BF16). No CLIP zero-copy success is
+claimed. UNET control evidence in the same request is valid but does NOT rescue the CLIP gate.
+
+====================================================================================================
+A. GATE RESULT — .v2ctl/gates/gate_20260824-050525_ff132f65.json, lines 190-231 (verbatim)
+====================================================================================================
+
+  "created_at": "2026-08-24T05:05:25.021556+00:00",
+  "gate_valid": false,
+  "profile": "r44-request-fastsafe",
+  "profile_config_fingerprint": "32f5ff7ce616ad92024135690879df58e78042f34cf0537512e35648f61a43f5",
+  "provenance_validation_status": "validated",
+  "reasons": [
+    "[structural] runtime_status_not_nominal:DEGRADED",
+    "[structural] loader_unobserved_clip",
+    "[structural] loader_observed_mismatch_clip"
+  ],
+  "request_id": "v2-benchmark-0-cb40e0c40c4c",
+  ... run block ...
+    "backend_exit_code": 0,
+    "backend_ok": true,
+    "deploy_fingerprint": "5944480788bd446939160bd2f22bd9751462eea96196bc0cdb97069c2d755c82",
+    "expected_output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+    "fresh_required": true,
+    "output_sha": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+    "profile": "r44-request-fastsafe",
+    "provenance_validation_status": "validated",
+    "request_id": "v2-benchmark-0-cb40e0c40c4c",
+    "run_fingerprint": "ff132f65299ec78d673d2c0bcb6cc159f5cf44efa43fccef5ec127e541ed89f5",
+
+Gate telemetry (same file, lines 236-268 subset):
+  "BASELINE_CPU": "12 == deployed 12",
+  "BASELINE_MEMORY": "32768 == deployed 32768",
+  "RUNTIME_FINGERPRINT": "f504e296c398bdcb2c4c07e2 == deployed f504e296c398bdcb2c4c07e2",
+  "RUN_COUNT": "1",
+  "TARGET_MATCH": "YES",
+  "canonical_ledger": "present",
+  "canonical_ledger_endpoint_status": "ok",
+  "canonical_ledger_status": "ok",
+  "canonical_ledger_zero_gap": "True",
+
+Run dir: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-24_05-04-36
+
+====================================================================================================
+B. ROOT CAUSE — clip_fastsafe_skip event
+   run_0.json lines 5257-5289 (verbatim)
+====================================================================================================
+
+        {
+          "name": "clip_fastsafe_skip",
+          "process": "remote",
+          "phase": "execution",
+          "wall_unix_ns": 1787547884634740989,
+          "monotonic_ns": 208554274087,
+          "request_id": "v2-benchmark-0-cb40e0c40c4c",
+          "container_session_id": "71da5778bf7f4d1c",
+          "trace_id": "118757149a0341b3",
+          "metadata": {
+            "reason": "native_adoption_ineligible",
+            "detail": "dtype_parity_mismatch:file_0:BF16",
+            "gates": {
+              "device_arg": "default",
+              "expected_te_dtype": "torch.float16",
+              "te_device": "cuda:0",
+              "file_0_dtypes": [
+                "BF16"
+              ]
+            },
+            ...
+            "cloud": "CLOUD_PROVIDER_AWS",
+            "region": "us-east-2",
+            "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+            "class_name": "ModalRuntimeEntrypoint"
+          }
+        }
+
+MEANING: the CLIP FastSafe arm skipped itself at eligibility time because on-disk file dtypes
+(BF16) do not match expected_te_dtype torch.float16. Native CLIP adoption was never attempted;
+no CLIP bind_mode / storage-count / CUDA-closure telemetry exists for this run. None is invented.
+
+====================================================================================================
+C. LOADER SELECTION + RUNTIME STATUS — run_0.json lines 10366-10397 (verbatim)
+====================================================================================================
+
+    "loader_selection": {
+      "clip": {
+        "requested": "fastsafetensors_direct_gpu",
+        "effective": "fastsafetensors_direct_gpu",
+        "observed": "",
+        "fallback_attempted": false,
+        "fallback_loader": "",
+        "fallback_reason": ""
+      },
+      "unet": {
+        "requested": "fastsafetensors",
+        "effective": "fastsafetensors",
+        "observed": "fastsafetensors",
+        "fallback_attempted": false,
+        "fallback_loader": "",
+        "fallback_reason": ""
+      },
+      "vae": {
+        "requested": "native_comfy",
+        "effective": "native_comfy",
+        "observed": "native_comfy",
+        "fallback_attempted": false,
+        "fallback_loader": "",
+        "fallback_reason": ""
+      }
+    },
+    "runtime_status": {
+      "status": "DEGRADED",
+      "reasons": [
+        "loader_unobserved_clip"
+      ]
+    },
+
+CLIP observed = "" (empty) → structural reason loader_unobserved_clip and
+loader_observed_mismatch_clip at the gate.
+
+====================================================================================================
+D. GPU LOADING OBSERVED + STAGE DELTAS + BACKEND — run_0.json lines 7358-7467 (verbatim excerpts)
+====================================================================================================
+
+        "gpu_loading_observed": [
+          "not_observed"
+        ],
+        "caller_return_wall_unix_ns": 1787547901589766200,
+        "caller_return_mono_ns": 10165203000000
+
+      "backend": {
+        "requested": "in_process",
+        "selected": "in_process",
+        "selection_reason": "runner_available",
+        "fallback_attempted": false,
+        "fallback_reason": "",
+        "fallback_result": "",
+        "elapsed_ms": 0.0
+      },
+
+      "deltas_ms": {                                   [subset relevant to CLIP]
+        "clip_tokenize": 48.64,
+        "clip_gpu_prepare": 2301.41,
+        "clip_forward": 2451.3,
+        "clip_raw_encode": 4763.4,
+        "clip_scheduled_conditioning": 4776.85,
+        "unet_gpu_gate_wait": 0.04,
+        "unet_gpu_transfer": 763.37,
+
+====================================================================================================
+E. CPU OWNER RECORDS (CLIP fallback path) — run_0.json lines 848-883 (verbatim)
+====================================================================================================
+
+      "cpu_owner_records": [
+        {
+          "operation": "load_models_gpu",
+          "role": "CLIP",
+          "wall_ms": 2299.661,
+          "process_cpu_ms": 8890.0,
+          "effective_cores": 3.866,
+          "native_threads_start": 57,
+          "native_threads_peak": 58,
+          "native_threads_end": 57,
+          "cuda_allocated_delta_bytes": 8101709312,
+          "cuda_reserved_delta_bytes": 8103395328
+        },
+        {
+          "operation": "CLIP.encode_from_tokens",
+          "role": "CLIP",
+          "wall_ms": 4773.834,
+          "process_cpu_ms": 14960.0,
+          "effective_cores": 3.134,
+          "native_threads_start": 56,
+          "native_threads_peak": 58,
+          "native_threads_end": 51,
+          "cuda_allocated_delta_bytes": 8135263744,
+          "cuda_reserved_delta_bytes": 8342470656
+        },
+        {
+          "operation": "CLIPTextEncode",
+          "role": "CLIP",
+          "wall_ms": 4880.77,
+          "process_cpu_ms": 15150.0,
+          "effective_cores": 3.104,
+          "native_threads_start": 50,
+          "native_threads_peak": 58,
+          "native_threads_end": 50,
+          "cuda_allocated_delta_bytes": 8135263744,
+          "cuda_reserved_delta_bytes": 8342470656
+
+NOTE: load_models_gpu(CLIP) again allocated a model-sized ~8.10 GB on device — the second
+materialization R44F set out to eliminate. This is the FALLBACK native path; no zero-copy claim.
+
+====================================================================================================
+F. CONTROL EVIDENCE (valid, but does NOT rescue the CLIP gate) — unet_fastsafe_pipeline
+   run_0.json lines 6152-6190 (verbatim)
+====================================================================================================
+
+        {
+          "name": "unet_fastsafe_pipeline",
+          "process": "remote",
+          "phase": "execution",
+          "wall_unix_ns": 1787547894389694107,
+          "monotonic_ns": 218309227136,
+          "request_id": "v2-benchmark-0-cb40e0c40c4c",
+          "container_session_id": "71da5778bf7f4d1c",
+          "trace_id": "118757149a0341b3",
+          "metadata": {
+            "status": "ok",
+            "phase": "request",
+            "file_to_gpu_wall_ms": 629.2175,
+            "prepare_join_ms": 0.044,
+            "adopt_ms": 123.22,
+            "storage_identity_matched": 453,
+            "storage_identity_total": 453,
+            "owner_retained": true,
+            "ordering": "after_clip",
+            "fastsafe_setup_wall_ms": 9.9753,
+            "fastsafe_copy_wall_ms": 629.2175,
+            "fastsafe_instantiate_wall_ms": 0.4387,
+            "header_detect_wall_ms": 5.201,
+            "skeleton_wall_ms": 89.953,
+            "bind_wall_ms": 15.574,
+            "identity_validation_wall_ms": 12.468,
+            "gate_wait_ms": 0.102,
+            "copied_count": 0,
+            "bind_mode": "same_storage",
+            "final_validation_all_params_on_target": true,
+            "clip_forward_start_mono_ns": 212501191418,
+            "clip_forward_end_mono_ns": 217379643713,
+            "prep_armed_at_mono_ns": 212501202091,
+            "prep_start_mono_ns": 212501202091,
+            "prep_join_start_mono_ns": 217544509924,
+            "prep_join_end_mono_ns": 217544555576,
+            "unet_prep_overlap_ms": 4878.441622,
+            "unet_prep_overlap_pct_of_prep": 96.73,
+            "unet_prep_tail_at_forward_end_ms": 164.912,
+            "unet_prep_tail_at_demand_ms": 164.866,
+
+This proves the harness/deployment/ledger and the UNET same-storage mechanism worked in THIS
+request. The gate reasons are CLIP-specific and remain unresolved → verdict stays INVALID.
+
+====================================================================================================
+G. SUMMARY IDENTITY — summary.json lines 284-289 (verbatim)
+====================================================================================================
+
+  "v2ctl_invocation_id": "fdeccefcd4014c48a5fdd3f309906b2e",
+  "profile": "r44-request-fastsafe",
+  "profile_name": "r44-request-fastsafe",
+  "profile_config_fingerprint": "32f5ff7ce616ad92024135690879df58e78042f34cf0537512e35648f61a43f5",
+  "deploy_fingerprint": "5944480788bd446939160bd2f22bd9751462eea96196bc0cdb97069c2d755c82",
+  "run_fingerprint": "ff132f65299ec78d673d2c0bcb6cc159f5cf44efa43fccef5ec127e541ed89f5"
+
+====================================================================================================
+H. CANONICAL LEDGER + CONDITIONING CACHE — run_001_sample.json (verbatim excerpts)
+====================================================================================================
+
+canonical ledger (lines 464-469):
+      ],
+      "start_mono_ns": 206383778881,
+      "total_ms": 18527.938,
+      "unattributed_ms": 77.777,
+      "zero_gap": true
+
+ledger status (lines 817-818):
+  "canonical_ledger_error": null,
+  "canonical_ledger_status": "ok",
+
+conditioning cache decision (lines 137-143):
+        "metadata": {
+          "decision": "forced_miss",
+          "encode_calls": 1,
+          "source": "pre_sampler_structured_report"
+        },
+        "mono_ns": 224862680694,
+        "name": "clip_conditioning_cache_decision"
+
+Forced-miss conditioning path intact (decision forced_miss, encode_calls 1) — unrelated control
+evidence preserved; does not affect the CLIP gate verdict.
+
+====================================================================================================
+I. COLD GATE / RUNTIME CONTEXT (healthy except structural telemetry)
+====================================================================================================
+
+GPU rtx-pro-6000 · CPU 12 == deployed 12 · memory 32768 MB == deployed 32768 ·
+runtime shape f504e296c398bdcb2c4c07e2 (match) · RUN_COUNT 1 (one run) ·
+backend in_process requested==selected, runner_available, no fallback · endpoint/backend ok ·
+canonical ledger ok / zero_gap true · provenance validated · output SHA exact match.
+Only failures: the three structural gate reasons caused by the CLIP eligibility skip.
+
+====================================================================================================
+J. ARTIFACT PATHS
+====================================================================================================
+
+Gate           : ../comfyui-modal-r42/.v2ctl/gates/gate_20260824-050525_ff132f65.json
+Deploy manifest: ../comfyui-modal-r42/.v2ctl/deployments/deploy_20260824-000339_59444807.json
+run_0.json     : ...\comfymodal-data\benchmarks\runs\v2_2026-08-24_05-04-36\run_0.json
+run_001_sample : ...\comfymodal-data\benchmarks\runs\v2_2026-08-24_05-04-36\run_001_sample.json
+summary.json   : ...\comfymodal-data\benchmarks\runs\v2_2026-08-24_05-04-36\summary.json
+Source         : ../comfyui-modal-r42/comfymodal_runtime/request_clip_fastsafe.py
+                 (~line 559 dtype parity check; ~line 1100 native_adoption_ineligible skip)
+Control source : ../comfyui-modal-r42/comfymodal_runtime/request_unet_fastsafe.py
+Tests          : ../comfyui-modal-r42/tests/test_r44f_clip_zero_copy.py
+                 (test_gates_reject_dtype_parity_mismatch, line 564)
+
+====================================================================================================
+K. STOP RULE
+====================================================================================================
+
+Exactly ONE deployment (59444807…). Exactly ONE paid cold request (gate above, gate_valid=false).
+No second paid request. No redeploy. No code change after the cold gate.
+Next action: investigate/resolve the CLIP dtype eligibility mismatch
+(dtype_parity_mismatch:file_0:BF16 vs expected_te_dtype torch.float16) BEFORE any future proof.
+No fix is prescribed in this log.
+
+*** STOP ***
+
+— R44F raw log end —

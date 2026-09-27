@@ -1,0 +1,224 @@
+[size] start control-r01 arm=control primer_mib=0
+[size] done control-r01 status=ok measured_gbps=6.003015190303804 total_wall=1340.15687
+[size] start p1-r01 arm=primed primer_mib=1
+[size] done p1-r01 status=ok measured_gbps=5.707605462405298 total_wall=1419.089496
+[size] start p4-r01 arm=primed primer_mib=4
+[size] done p4-r01 status=ok measured_gbps=0.7433874050445631 total_wall=11305.28413
+[size] start p16-r01 arm=primed primer_mib=16
+[size] done p16-r01 status=ok measured_gbps=2.1955866835874978 total_wall=3703.480322
+[size] start p64-r01 arm=primed primer_mib=64
+[size] done p64-r01 status=ok measured_gbps=6.332964205984392 total_wall=1359.744133
+[size] start p1-r02 arm=primed primer_mib=1
+[size] done p1-r02 status=ok measured_gbps=1.897294216315096 total_wall=4296.427802
+[size] start p4-r02 arm=primed primer_mib=4
+[size] done p4-r02 status=ok measured_gbps=5.240882311000804 total_wall=4019.469765
+[size] start p16-r02 arm=primed primer_mib=16
+[size] done p16-r02 status=ok measured_gbps=5.685528452562276 total_wall=1445.462141
+[size] start p64-r02 arm=primed primer_mib=64
+[size] done p64-r02 status=ok measured_gbps=6.270678655297913 total_wall=1374.836789
+[size] start control-r02 arm=control primer_mib=0
+[size] done control-r02 status=ok measured_gbps=5.195853160511582 total_wall=1548.346691
+[size] start p4-r03 arm=primed primer_mib=4
+[size] done p4-r03 status=ok measured_gbps=6.116440624007341 total_wall=1328.348839
+[size] start p16-r03 arm=primed primer_mib=16
+[size] done p16-r03 status=ok measured_gbps=5.281515195576927 total_wall=1565.6333539999998
+[size] start p64-r03 arm=primed primer_mib=64
+[size] done p64-r03 status=ok measured_gbps=5.711013679882328 total_wall=1498.589688
+[size] start control-r03 arm=control primer_mib=0
+[size] done control-r03 status=ok measured_gbps=1.2427437537195332 total_wall=6473.564662
+[size] start p1-r03 arm=primed primer_mib=1
+[size] done p1-r03 status=ok measured_gbps=4.832731736784429 total_wall=1674.4898400000002
+[size] start p16-r04 arm=primed primer_mib=16
+[size] done p16-r04 status=ok measured_gbps=6.438569660803073 total_wall=4952.80592
+[size] start p64-r04 arm=primed primer_mib=64
+[size] done p64-r04 status=ok measured_gbps=5.271474154391666 total_wall=1626.6463139999998
+[size] start control-r04 arm=control primer_mib=0
+[size] done control-r04 status=ok measured_gbps=6.540673874913492 total_wall=1229.992842
+[size] start p1-r04 arm=primed primer_mib=1
+[size] done p1-r04 status=ok measured_gbps=4.648377292934219 total_wall=1740.554851
+[size] start p4-r04 arm=primed primer_mib=4
+[size] done p4-r04 status=ok measured_gbps=6.020724529589658 total_wall=1348.696893
+[size] start p64-r05 arm=primed primer_mib=64
+[size] done p64-r05 status=ok measured_gbps=5.243593136435888 total_wall=1647.271679
+[size] start control-r05 arm=control primer_mib=0
+[size] done control-r05 status=ok measured_gbps=6.0515423278776845 total_wall=1329.410192
+[size] start p1-r05 arm=primed primer_mib=1
+[size] done p1-r05 status=ok measured_gbps=6.067315296171528 total_wall=1335.468869
+[size] start p4-r05 arm=primed primer_mib=4
+[size] done p4-r05 status=ok measured_gbps=4.943370646019194 total_wall=1646.1179100000002
+[size] start p16-r05 arm=primed primer_mib=16
+[size] done p16-r05 status=ok measured_gbps=4.762424589910552 total_wall=4951.958406
+[size] start control-r06 arm=control primer_mib=0
+[size] done control-r06 status=ok measured_gbps=5.649642830889992 total_wall=1423.980646
+[size] start p1-r06 arm=primed primer_mib=1
+[size] done p1-r06 status=ok measured_gbps=1.2209405372313862 total_wall=7042.206316000001
+[size] start p4-r06 arm=primed primer_mib=4
+[size] done p4-r06 status=ok measured_gbps=4.8029786495874855 total_wall=1710.497974
+[size] start p16-r06 arm=primed primer_mib=16
+[size] done p16-r06 status=ok measured_gbps=5.56980293650223 total_wall=1484.870108
+[size] start p64-r06 arm=primed primer_mib=64
+[size] done p64-r06 status=ok measured_gbps=4.754458770157116 total_wall=1807.58228
+[size] start p1-r07 arm=primed primer_mib=1
+[size] done p1-r07 status=ok measured_gbps=2.484354746630058 total_wall=3730.813545
+[size] start p4-r07 arm=primed primer_mib=4
+[size] done p4-r07 status=ok measured_gbps=4.35876310754915 total_wall=1862.669662
+[size] start p16-r07 arm=primed primer_mib=16
+[size] done p16-r07 status=ok measured_gbps=5.342447912338328 total_wall=1786.576085
+[size] start p64-r07 arm=primed primer_mib=64
+[size] done p64-r07 status=ok measured_gbps=5.368640723517182 total_wall=1602.501491
+[size] start control-r07 arm=control primer_mib=0
+[size] done control-r07 status=ok measured_gbps=0.2560589350975353 total_wall=31418.478113
+[size] start p4-r08 arm=primed primer_mib=4
+[size] done p4-r08 status=ok measured_gbps=4.685619702265357 total_wall=1738.426851
+[size] start p16-r08 arm=primed primer_mib=16
+[size] done p16-r08 status=ok measured_gbps=5.306668574083481 total_wall=4362.1327679999995
+[size] start p64-r08 arm=primed primer_mib=64
+[size] done p64-r08 status=ok measured_gbps=4.898325462801907 total_wall=1718.236135
+[size] start control-r08 arm=control primer_mib=0
+[size] done control-r08 status=ok measured_gbps=2.040872013238218 total_wall=3941.933642
+[size] start p1-r08 arm=primed primer_mib=1
+[size] done p1-r08 status=ok measured_gbps=5.214175888163623 total_wall=1552.330156
+[size] start p16-r09 arm=primed primer_mib=16
+[size] done p16-r09 status=ok measured_gbps=5.319573097673677 total_wall=1551.1682799999999
+[size] start p64-r09 arm=primed primer_mib=64
+[size] done p64-r09 status=ok measured_gbps=5.653902510060043 total_wall=1508.582698
+[size] start control-r09 arm=control primer_mib=0
+[size] done control-r09 status=ok measured_gbps=6.269641261907205 total_wall=1283.164652
+[size] start p1-r09 arm=primed primer_mib=1
+[size] done p1-r09 status=ok measured_gbps=6.236038145480097 total_wall=1299.081124
+[size] start p4-r09 arm=primed primer_mib=4
+[size] done p4-r09 status=ok measured_gbps=6.393800295448118 total_wall=1273.633116
+[size] start p64-r10 arm=primed primer_mib=64
+[size] done p64-r10 status=ok measured_gbps=6.9127271450914165 total_wall=1244.402544
+[size] start control-r10 arm=control primer_mib=0
+[size] done control-r10 status=ok measured_gbps=4.911361801984364 total_wall=1638.034902
+[size] start p1-r10 arm=primed primer_mib=1
+[size] done p1-r10 status=ok measured_gbps=4.884602474122429 total_wall=1656.391273
+[size] start p4-r10 arm=primed primer_mib=4
+[size] done p4-r10 status=ok measured_gbps=5.866310749811222 total_wall=1385.801862
+[size] start p16-r10 arm=primed primer_mib=16
+[size] done p16-r10 status=ok measured_gbps=5.448838909824504 total_wall=1510.082593
+[size] start control-r11 arm=control primer_mib=0
+[size] done control-r11 status=ok measured_gbps=6.15932929625108 total_wall=1306.145793
+[size] start p1-r11 arm=primed primer_mib=1
+[size] done p1-r11 status=ok measured_gbps=4.955199142632962 total_wall=1631.506382
+[size] start p4-r11 arm=primed primer_mib=4
+[size] done p4-r11 status=ok measured_gbps=6.168014293522178 total_wall=1318.812858
+[size] start p16-r11 arm=primed primer_mib=16
+[size] done p16-r11 status=ok measured_gbps=5.150947650213913 total_wall=1587.673791
+[size] start p64-r11 arm=primed primer_mib=64
+[size] done p64-r11 status=ok measured_gbps=6.018064366183332 total_wall=1423.223282
+[size] start p1-r12 arm=primed primer_mib=1
+[size] done p1-r12 status=ok measured_gbps=1.2490684624964854 total_wall=6447.347307
+[size] start p4-r12 arm=primed primer_mib=4
+[size] done p4-r12 status=ok measured_gbps=6.201921398698733 total_wall=1311.036284
+[size] start p16-r12 arm=primed primer_mib=16
+[size] done p16-r12 status=ok measured_gbps=2.0457897760051766 total_wall=5640.9614010000005
+[size] start p64-r12 arm=primed primer_mib=64
+[size] done p64-r12 status=ok measured_gbps=6.0996180896483985 total_wall=1419.4135039999999
+[size] start control-r12 arm=control primer_mib=0
+[size] done control-r12 status=ok measured_gbps=5.570523763028717 total_wall=1444.205678
+
+arm | rep | region | primer wall ms | max primer ms | primer>=1000 | measured GB/s | total source wall ms | effective total GB/s | measured median | measured max | ge250 | ge500 | ge1000 | QD ok?
+| control | control-r01 | CLOUD_PROVIDER_UNSPECIFIED/chicago | 0.0 | 0.0 | 0 | 6.003 | 1340.2 | 6.003 | 36.0 | 223 | 0 | 0 | 0 | True |
+| control | control-r02 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 0.0 | 0.0 | 0 | 5.196 | 1548.3 | 5.196 | 45.4 | 142 | 0 | 0 | 0 | True |
+| control | control-r03 | CLOUD_PROVIDER_GCP/us-east | 0.0 | 0.0 | 0 | 1.243 | 6473.6 | 1.243 | 36.9 | 3791 | 6 | 6 | 5 | True |
+| control | control-r04 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 0.0 | 0.0 | 0 | 6.541 | 1230.0 | 6.541 | 34.7 | 149 | 0 | 0 | 0 | True |
+| control | control-r05 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 0.0 | 0.0 | 0 | 6.052 | 1329.4 | 6.052 | 38.9 | 145 | 0 | 0 | 0 | True |
+| control | control-r06 | CLOUD_PROVIDER_UNSPECIFIED/odin | 0.0 | 0.0 | 0 | 5.650 | 1424.0 | 5.650 | 40.9 | 163 | 0 | 0 | 0 | True |
+| control | control-r07 | CLOUD_PROVIDER_GCP/us-east4 | 0.0 | 0.0 | 0 | 0.256 | 31418.5 | 0.256 | 39.8 | 5597 | 13 | 13 | 13 | True |
+| control | control-r08 | CLOUD_PROVIDER_UNSPECIFIED/ca | 0.0 | 0.0 | 0 | 2.041 | 3941.9 | 2.041 | 34.2 | 2250 | 10 | 6 | 6 | True |
+| control | control-r09 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 0.0 | 0.0 | 0 | 6.270 | 1283.2 | 6.270 | 38.8 | 92 | 0 | 0 | 0 | True |
+| control | control-r10 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | 0.0 | 0.0 | 0 | 4.911 | 1638.0 | 4.911 | 48.5 | 217 | 0 | 0 | 0 | True |
+| control | control-r11 | CLOUD_PROVIDER_UNSPECIFIED/ca | 0.0 | 0.0 | 0 | 6.159 | 1306.1 | 6.159 | 38.3 | 152 | 0 | 0 | 0 | True |
+| control | control-r12 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 0.0 | 0.0 | 0 | 5.571 | 1444.2 | 5.571 | 45.0 | 112 | 0 | 0 | 0 | True |
+| p1 | p1-r01 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 9.6 | 3.9 | 0 | 5.708 | 1419.1 | 5.669 | 39.6 | 218 | 0 | 0 | 0 | True |
+| p1 | p1-r02 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | 56.2 | 20.7 | 0 | 1.897 | 4296.4 | 1.872 | 130.8 | 555 | 4 | 1 | 0 | True |
+| p1 | p1-r03 | CLOUD_PROVIDER_GCP/us-east4 | 9.8 | 4.1 | 0 | 4.833 | 1674.5 | 4.804 | 46.3 | 253 | 1 | 0 | 0 | True |
+| p1 | p1-r04 | CLOUD_PROVIDER_GCP/us-west | 9.8 | 4.3 | 0 | 4.648 | 1740.6 | 4.622 | 53.6 | 152 | 0 | 0 | 0 | True |
+| p1 | p1-r05 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 9.5 | 4.1 | 0 | 6.067 | 1335.5 | 6.024 | 39.1 | 132 | 0 | 0 | 0 | True |
+| p1 | p1-r06 | CLOUD_PROVIDER_UNSPECIFIED/london | 453.0 | 250.4 | 0 | 1.221 | 7042.2 | 1.142 | 46.0 | 5234 | 7 | 5 | 4 | True |
+| p1 | p1-r07 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 492.6 | 222.5 | 0 | 2.484 | 3730.8 | 2.156 | 36.3 | 1828 | 4 | 4 | 4 | True |
+| p1 | p1-r08 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 9.4 | 4.1 | 0 | 5.214 | 1552.3 | 5.183 | 46.3 | 154 | 0 | 0 | 0 | True |
+| p1 | p1-r09 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 9.0 | 3.6 | 0 | 6.236 | 1299.1 | 6.193 | 36.6 | 147 | 0 | 0 | 0 | False |
+| p1 | p1-r10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 9.4 | 4.3 | 0 | 4.885 | 1656.4 | 4.857 | 50.2 | 162 | 0 | 0 | 0 | True |
+| p1 | p1-r11 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 8.0 | 3.6 | 0 | 4.955 | 1631.5 | 4.931 | 49.2 | 235 | 0 | 0 | 0 | True |
+| p1 | p1-r12 | CLOUD_PROVIDER_GCP/us-east4 | 6.6 | 2.6 | 0 | 1.249 | 6447.3 | 1.248 | 42.1 | 5179 | 4 | 3 | 3 | True |
+| p4 | p4-r01 | CLOUD_PROVIDER_GCP/us-west | 483.2 | 203.1 | 0 | 0.743 | 11305.3 | 0.712 | 40.5 | 5708 | 11 | 10 | 8 | True |
+| p4 | p4-r02 | CLOUD_PROVIDER_UNSPECIFIED/ca | 2484.4 | 1565.8 | 1 | 5.241 | 4019.5 | 2.002 | 41.8 | 306 | 2 | 0 | 0 | True |
+| p4 | p4-r03 | CLOUD_PROVIDER_UNSPECIFIED/ca | 13.0 | 4.6 | 0 | 6.116 | 1328.3 | 6.056 | 37.1 | 106 | 0 | 0 | 0 | True |
+| p4 | p4-r04 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 12.5 | 4.2 | 0 | 6.021 | 1348.7 | 5.965 | 39.7 | 127 | 0 | 0 | 0 | True |
+| p4 | p4-r05 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 18.7 | 6.8 | 0 | 4.943 | 1646.1 | 4.887 | 48.4 | 250 | 1 | 0 | 0 | True |
+| p4 | p4-r06 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | 35.5 | 21.1 | 0 | 4.803 | 1710.5 | 4.703 | 48.0 | 243 | 0 | 0 | 0 | True |
+| p4 | p4-r07 | CLOUD_PROVIDER_UNSPECIFIED/denver | 17.0 | 6.1 | 0 | 4.359 | 1862.7 | 4.319 | 54.2 | 219 | 0 | 0 | 0 | True |
+| p4 | p4-r08 | CLOUD_PROVIDER_GCP/asia-south2 | 21.5 | 7.0 | 0 | 4.686 | 1738.4 | 4.628 | 51.1 | 291 | 1 | 0 | 0 | True |
+| p4 | p4-r09 | CLOUD_PROVIDER_UNSPECIFIED/ca | 15.4 | 5.8 | 0 | 6.394 | 1273.6 | 6.317 | 36.2 | 147 | 0 | 0 | 0 | False |
+| p4 | p4-r10 | CLOUD_PROVIDER_UNSPECIFIED/ca | 14.4 | 4.8 | 0 | 5.866 | 1385.8 | 5.805 | 39.8 | 150 | 0 | 0 | 0 | True |
+| p4 | p4-r11 | CLOUD_PROVIDER_UNSPECIFIED/ca | 14.5 | 5.1 | 0 | 6.168 | 1318.8 | 6.100 | 35.7 | 156 | 0 | 0 | 0 | True |
+| p4 | p4-r12 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 13.9 | 5.0 | 0 | 6.202 | 1311.0 | 6.136 | 39.6 | 104 | 0 | 0 | 0 | True |
+| p16 | p16-r01 | CLOUD_PROVIDER_GCP/asia-northeast3 | 66.2 | 28.9 | 0 | 2.196 | 3703.5 | 2.156 | 120.7 | 418 | 1 | 0 | 0 | True |
+| p16 | p16-r02 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 40.9 | 15.0 | 0 | 5.686 | 1445.5 | 5.525 | 42.1 | 189 | 0 | 0 | 0 | True |
+| p16 | p16-r03 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 53.6 | 20.1 | 0 | 5.282 | 1565.6 | 5.101 | 44.1 | 234 | 0 | 0 | 0 | True |
+| p16 | p16-r04 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 3712.5 | 2097.3 | 1 | 6.439 | 4952.8 | 1.612 | 37.4 | 179 | 0 | 0 | 0 | True |
+| p16 | p16-r05 | CLOUD_PROVIDER_UNSPECIFIED/sines-2 | 3275.1 | 1988.1 | 2 | 4.762 | 4952.0 | 1.613 | 48.5 | 203 | 0 | 0 | 0 | True |
+| p16 | p16-r06 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 51.1 | 21.6 | 0 | 5.570 | 1484.9 | 5.378 | 42.1 | 235 | 0 | 0 | 0 | True |
+| p16 | p16-r07 | CLOUD_PROVIDER_GCP/us-west | 291.8 | 132.0 | 0 | 5.342 | 1786.6 | 4.470 | 44.7 | 208 | 0 | 0 | 0 | True |
+| p16 | p16-r08 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 2857.2 | 1575.7 | 2 | 5.307 | 4362.1 | 1.831 | 43.8 | 168 | 0 | 0 | 0 | True |
+| p16 | p16-r09 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 49.9 | 20.2 | 0 | 5.320 | 1551.2 | 5.148 | 43.7 | 252 | 1 | 0 | 0 | True |
+| p16 | p16-r10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 44.5 | 15.5 | 0 | 5.449 | 1510.1 | 5.288 | 44.1 | 211 | 0 | 0 | 0 | True |
+| p16 | p16-r11 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 37.3 | 14.1 | 0 | 5.151 | 1587.7 | 5.030 | 47.3 | 139 | 0 | 0 | 0 | True |
+| p16 | p16-r12 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 1737.4 | 696.8 | 0 | 2.046 | 5641.0 | 1.416 | 33.4 | 1743 | 8 | 7 | 4 | True |
+| p64 | p64-r01 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 130.5 | 51.0 | 0 | 6.333 | 1359.7 | 5.725 | 40.9 | 80 | 0 | 0 | 0 | True |
+| p64 | p64-r02 | CLOUD_PROVIDER_UNSPECIFIED/ca | 133.4 | 47.9 | 0 | 6.271 | 1374.8 | 5.662 | 38.9 | 79 | 0 | 0 | 0 | True |
+| p64 | p64-r03 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 135.5 | 57.0 | 0 | 5.711 | 1498.6 | 5.195 | 44.9 | 87 | 0 | 0 | 0 | True |
+| p64 | p64-r04 | CLOUD_PROVIDER_GCP/us-west | 149.9 | 56.9 | 0 | 5.271 | 1626.6 | 4.786 | 48.0 | 85 | 0 | 0 | 0 | True |
+| p64 | p64-r05 | CLOUD_PROVIDER_GCP/us-west | 162.7 | 60.8 | 0 | 5.244 | 1647.3 | 4.726 | 48.6 | 89 | 0 | 0 | 0 | True |
+| p64 | p64-r06 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | 170.3 | 58.4 | 0 | 4.754 | 1807.6 | 4.307 | 55.6 | 87 | 0 | 0 | 0 | True |
+| p64 | p64-r07 | CLOUD_PROVIDER_GCP/asia-south2 | 152.5 | 58.8 | 0 | 5.369 | 1602.5 | 4.858 | 45.5 | 108 | 0 | 0 | 0 | True |
+| p64 | p64-r08 | CLOUD_PROVIDER_UNSPECIFIED/eu-north | 129.0 | 50.0 | 0 | 4.898 | 1718.2 | 4.531 | 52.3 | 89 | 0 | 0 | 0 | True |
+| p64 | p64-r09 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 131.7 | 50.3 | 0 | 5.654 | 1508.6 | 5.160 | 46.2 | 92 | 0 | 0 | 0 | True |
+| p64 | p64-r10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 118.3 | 45.5 | 0 | 6.913 | 1244.4 | 6.256 | 35.0 | 56 | 0 | 0 | 0 | True |
+| p64 | p64-r11 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 129.7 | 49.5 | 0 | 6.018 | 1423.2 | 5.470 | 42.2 | 75 | 0 | 0 | 0 | True |
+| p64 | p64-r12 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 143.2 | 58.9 | 0 | 6.100 | 1419.4 | 5.484 | 40.0 | 93 | 0 | 0 | 0 | True |
+
+=== per-arm summary (n=12) ===
+
+control (0 MiB): n=12
+  primer wall median=0.0 p95=0.0 pathological_primer_runs=0
+  measured GB/s median=5.610 mean=4.658 min=0.256 max=6.541 sd=2.179
+  total wall median=1434.1 mean=4531.5 min=1230.0 max=31418.5
+  effective total GB/s median=5.610 mean=4.658 min=0.256 max=6.541
+  runs with measured >=250/500/1000: 3/3/3  total measured >=250/500/1000: 29/25/24  worst measured 5597 ms
+  regions(7): CLOUD_PROVIDER_GCP/us-east, CLOUD_PROVIDER_GCP/us-east4, CLOUD_PROVIDER_UNSPECIFIED/CANADA-2, CLOUD_PROVIDER_UNSPECIFIED/ca, CLOUD_PROVIDER_UNSPECIFIED/chicago, CLOUD_PROVIDER_UNSPECIFIED/eu-north, CLOUD_PROVIDER_UNSPECIFIED/odin
+
+p1 (1 MiB): n=12
+  primer wall median=9.5 p95=453.0 pathological_primer_runs=0
+  measured GB/s median=4.859 mean=4.116 min=1.221 max=6.236 sd=1.866
+  total wall median=1665.4 mean=2818.8 min=1299.1 max=7042.2
+  effective total GB/s median=4.831 mean=4.059 min=1.142 max=6.193
+  runs with measured >=250/500/1000: 5/4/3  total measured >=250/500/1000: 20/13/11  worst measured 5234 ms
+  regions(5): CLOUD_PROVIDER_GCP/us-east4, CLOUD_PROVIDER_GCP/us-west, CLOUD_PROVIDER_UNSPECIFIED/CANADA-2, CLOUD_PROVIDER_UNSPECIFIED/eu-north, CLOUD_PROVIDER_UNSPECIFIED/london
+
+p4 (4 MiB): n=12
+  primer wall median=16.2 p95=483.2 pathological_primer_runs=1
+  measured GB/s median=5.554 mean=5.129 min=0.743 max=6.394 sd=1.547
+  total wall median=1516.0 mean=2520.7 min=1273.6 max=11305.3
+  effective total GB/s median=5.346 mean=4.803 min=0.712 max=6.317
+  runs with measured >=250/500/1000: 4/1/1  total measured >=250/500/1000: 15/10/8  worst measured 5708 ms
+  regions(6): CLOUD_PROVIDER_GCP/asia-south2, CLOUD_PROVIDER_GCP/us-west, CLOUD_PROVIDER_UNSPECIFIED/CANADA-2, CLOUD_PROVIDER_UNSPECIFIED/ca, CLOUD_PROVIDER_UNSPECIFIED/denver, CLOUD_PROVIDER_UNSPECIFIED/eu-north
+
+p16 (16 MiB): n=12
+  primer wall median=59.9 p95=3275.1 pathological_primer_runs=3
+  measured GB/s median=5.313 mean=4.879 min=2.046 max=6.439 sd=1.347
+  total wall median=1687.1 mean=2878.6 min=1445.5 max=5641.0
+  effective total GB/s median=4.750 mean=3.714 min=1.416 max=5.525
+  runs with measured >=250/500/1000: 3/1/1  total measured >=250/500/1000: 10/7/4  worst measured 1743 ms
+  regions(4): CLOUD_PROVIDER_GCP/asia-northeast3, CLOUD_PROVIDER_GCP/us-west, CLOUD_PROVIDER_UNSPECIFIED/CANADA-2, CLOUD_PROVIDER_UNSPECIFIED/sines-2
+
+p64 (64 MiB): n=12
+  primer wall median=134.5 p95=162.7 pathological_primer_runs=0
+  measured GB/s median=5.682 mean=5.711 min=4.754 max=6.913 sd=0.639
+  total wall median=1503.6 mean=1519.3 min=1244.4 max=1807.6
+  effective total GB/s median=5.177 mean=5.180 min=4.307 max=6.256
+  runs with measured >=250/500/1000: 0/0/0  total measured >=250/500/1000: 0/0/0  worst measured 108 ms
+  regions(5): CLOUD_PROVIDER_GCP/asia-south2, CLOUD_PROVIDER_GCP/us-west, CLOUD_PROVIDER_UNSPECIFIED/CANADA-2, CLOUD_PROVIDER_UNSPECIFIED/ca, CLOUD_PROVIDER_UNSPECIFIED/eu-north

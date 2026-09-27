@@ -1,0 +1,13 @@
+FULL LINES: 18
+ZOOM LINES: 7
+gantt_render_wall_ms: 0.0
+gantt_log_payload_bytes: 6291
+
+=== ZOOM ===
+V2 MODEL-READY ZOOM  origin=remote_python_resume  scale=60.6948 ms/char
+                    0s              1s              2s              3s              4s
+                    |------------------------------------------------------------------
+method entry         █  start=+0.000486s end=+0.000486s dur=0.000ms
+method_setup         ████████████  start=+0.000486s end=+0.729003s dur=728.517ms
+clip_source_read             █████████████████████████████████████████████████████████  start=+0.515897s end=+4.000000s dur=6069.478ms
+CLIP GPU hydration                              ██████████████████████████████████████  start=+1.690041s end=+4.000000s dur=5685.298ms

@@ -1,0 +1,53 @@
+[arm] start control-rep1
+[arm] done control-rep1 status=ok wall_ms=8384.780305 gbps=0.9594743994905421
+[arm] start control-rep2
+[arm] done control-rep2 status=ok wall_ms=1467.450522 gbps=5.482285042929713
+[arm] start control-rep3
+[arm] done control-rep3 status=ok wall_ms=3896.584604 gbps=2.064623988849492
+[arm] start control-rep4
+[arm] done control-rep4 status=ok wall_ms=1425.702926 gbps=5.642817940039775
+[arm] start control-rep5
+[arm] done control-rep5 status=ok wall_ms=1347.114903 gbps=5.97200879456086
+[arm] start staggered-rep1
+[arm] done staggered-rep1 status=ok wall_ms=2997.977314 gbps=2.6834699550364904
+[arm] start staggered-rep2
+[arm] done staggered-rep2 status=ok wall_ms=2124.075349 gbps=3.7875219689299255
+[arm] start staggered-rep3
+[arm] done staggered-rep3 status=ok wall_ms=2142.46029 gbps=3.755020377997298
+[arm] start staggered-rep4
+[arm] done staggered-rep4 status=ok wall_ms=1878.295913 gbps=4.283128122847596
+[arm] start staggered-rep5
+[arm] done staggered-rep5 status=ok wall_ms=1972.473606 gbps=4.078625956529022
+[arm] start primed-rep1
+[arm] done primed-rep1 status=ok wall_ms=1203.983113 gbps=6.4657287464795195
+[arm] start primed-rep2
+[arm] done primed-rep2 status=ok wall_ms=1270.977264 gbps=6.124915405253071
+[arm] start primed-rep3
+[arm] done primed-rep3 status=ok wall_ms=1366.576415 gbps=5.6964456129590095
+[arm] start primed-rep4
+[arm] done primed-rep4 status=ok wall_ms=1507.903521 gbps=5.162550597956989
+[arm] start primed-rep5
+[arm] done primed-rep5 status=ok wall_ms=1531.3051 gbps=5.083655911548914
+
+arm | run | region | GB/s | median preadv | max preadv | ge250 | ge500 | ge1000 | bad? | QD ok?
+|---|---|---|---|---|---|---|---|---|---|---|
+| control | control-rep1 | CLOUD_PROVIDER_GCP/us-west | 0.959 | 36.3 | 4676 | 10 | 6 | 6 | BAD | True |
+| control | control-rep2 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 5.482 | 41.0 | 195 | 0 | 0 | 0 | ok | True |
+| control | control-rep3 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 2.065 | 43.1 | 2670 | 4 | 4 | 4 | ok | True |
+| control | control-rep4 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 5.643 | 41.4 | 160 | 0 | 0 | 0 | ok | True |
+| control | control-rep5 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 5.972 | 40.0 | 194 | 0 | 0 | 0 | ok | True |
+| staggered | staggered-rep1 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 2.683 | 38.3 | 575 | 5 | 3 | 0 | ok | True |
+| staggered | staggered-rep2 | CLOUD_PROVIDER_GCP/us-west | 3.788 | 42.0 | 108 | 0 | 0 | 0 | ok | True |
+| staggered | staggered-rep3 | CLOUD_PROVIDER_GCP/us-east | 3.755 | 46.4 | 115 | 0 | 0 | 0 | ok | True |
+| staggered | staggered-rep4 | CLOUD_PROVIDER_UNSPECIFIED/chicago | 4.283 | 37.5 | 90 | 0 | 0 | 0 | ok | True |
+| staggered | staggered-rep5 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 4.079 | 37.5 | 80 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep1 | CLOUD_PROVIDER_UNSPECIFIED/chicago | 6.466 | 38.3 | 79 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep2 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 6.125 | 41.8 | 67 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep3 | CLOUD_PROVIDER_GCP/us-east | 5.696 | 43.8 | 82 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep4 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | 5.163 | 45.0 | 186 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep5 | CLOUD_PROVIDER_GCP/us-east4 | 5.084 | 50.6 | 103 | 0 | 0 | 0 | ok | True |
+
+=== per-arm summary ===
+control: median 5.482 GB/s | mean 4.024 | min 0.959 | max 5.972 | bad 1/5 | runs>=1000 2 | total>=1000 10 | worst preadv 4676 ms
+staggered: median 3.788 GB/s | mean 3.718 | min 2.683 | max 4.283 | bad 0/5 | runs>=1000 0 | total>=1000 0 | worst preadv 575 ms
+primed: median 5.696 GB/s | mean 5.707 | min 5.084 | max 6.466 | bad 0/5 | runs>=1000 0 | total>=1000 0 | worst preadv 186 ms

@@ -1,0 +1,21 @@
+[v2.modal_target] app=e27-followup-b-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\_e27_probe.py", line 46, in <module>
+    asyncio.run(_main())
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 190, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\asyncio\base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\_e27_probe.py", line 41, in _main
+    result = await result
+             ^^^^^^^^^^^^
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\modal\_object.py", line 45, in wrapped
+    await self.hydrate()
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\modal\cls.py", line 668, in _load_remote
+    raise NotFoundError(
+modal.exception.NotFoundError: Lookup failed for Cls 'ModalRuntimeEntrypointV2' from the 'e27-followup-b-shadow' app: App 'e27-followup-b-shadow' not found in environment 'main'.
