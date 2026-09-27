@@ -37,6 +37,15 @@ _GANTT_FLAG = "COMFYMODAL_V2_GANTT_TELEMETRY"
 _ENABLED: bool = env_flag(_GANTT_FLAG, default=False)
 """Frozen at import time, matching the runtime convention."""
 
+
+def _gantt_enabled() -> bool:
+    """Read the deploy-baked gate at emission time.
+
+    Modal applies the runtime environment after module import; an import-time
+    snapshot would silently suppress the configured remote Gantt.
+    """
+    return env_flag(_GANTT_FLAG, default=_ENABLED)
+
 # ── Lane taxonomy (used by span records that carry an explicit lane) ──────
 LANES: tuple[str, ...] = ("RESTORE", "MAIN", "STORAGE", "CPU", "GPU",
                           "MODEL-MGMT", "OUTPUT")
@@ -128,7 +137,7 @@ def register_gantt_span(
     No-op when the gate is off.  Bounded: silently drops beyond
     ``_MAX_EXTRA_SPANS`` (never raises, never perturbs the critical path).
     """
-    if not _ENABLED:
+    if not _gantt_enabled():
         return
     try:
         start_mono_ns = int(start_mono_ns)
@@ -717,7 +726,7 @@ def emit_gantt_records(trace: Any, *, request_id: str = "") -> None:
     ``gantt_log_payload_bytes`` / window count / max physical line length) so
     logging cost is measured, not guessed.
     """
-    if not _ENABLED:
+    if not _gantt_enabled():
         return
     try:
         rid = str(getattr(trace, "request_id", "") or request_id or "")

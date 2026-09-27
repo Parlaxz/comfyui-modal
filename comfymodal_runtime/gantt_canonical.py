@@ -28,6 +28,11 @@ from .env import env_flag
 _GANTT_FLAG = "COMFYMODAL_V2_GANTT_TELEMETRY"
 _ENABLED: bool = env_flag(_GANTT_FLAG, default=False)
 
+
+def _gantt_enabled() -> bool:
+    """Evaluate the deploy-baked Gantt gate after Modal env injection."""
+    return env_flag(_GANTT_FLAG, default=_ENABLED)
+
 # ── Semantic row order (full overview) ────────────────────────────────────
 _SEMANTIC_LANES: tuple[str, ...] = (
     "RESTORE",
@@ -295,7 +300,7 @@ def render_canonical_gantt(
 
 def emit_canonical_gantt(ledger: Any, *, request_id: str = "") -> None:
     """Print the canonical Gantt as one coherent log block (gated)."""
-    if not _ENABLED:
+    if not _gantt_enabled():
         return
     try:
         rid = str(request_id or "")
