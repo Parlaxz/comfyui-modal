@@ -45,3 +45,17 @@ def test_child_program_exceeds_argv_spawn_but_file_spawn_has_no_argv():
     argv = ["python", "<child-file>", "shm-name", "1", "2", "3", "4"]
     assert max(len(part) for part in argv) < 4096
     assert os.path.basename(c0.__file__) == "golden_io_process_v2.py"
+
+
+def test_c0_fd_identity_rejects_replaced_checkpoint(tmp_path):
+    path = tmp_path / "checkpoint.safetensors"
+    path.write_bytes(b"old")
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        stat = os.fstat(fd)
+        identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        assert c0._fd_matches_identity(fd, identity)
+        path.write_bytes(b"new-content")
+        assert not c0._fd_matches_identity(fd, identity)
+    finally:
+        os.close(fd)

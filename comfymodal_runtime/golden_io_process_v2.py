@@ -2383,6 +2383,20 @@ class C0ProtocolError(RuntimeError):
     """Fail-closed error for any invalid C0 child-fill request or reply."""
 
 
+def _fd_matches_identity(fd: int, identity: tuple[int, int, int, int] | None) -> bool:
+    """Check one open descriptor against the source identity captured at load."""
+    if identity is None:
+        return True
+    try:
+        observed = os.fstat(int(fd))
+        return (
+            int(observed.st_dev), int(observed.st_ino),
+            int(observed.st_size), int(observed.st_mtime_ns),
+        ) == tuple(int(value) for value in identity)
+    except BaseException:
+        return False
+
+
 @dataclass(frozen=True)
 class C0FillRequest:
     """One lease-aware child-fill command.
