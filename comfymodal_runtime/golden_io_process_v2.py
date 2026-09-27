@@ -7855,6 +7855,7 @@ def _mmap_reader_fill(req):
     if isinstance(cached, tuple):
         fd, cached_identity = cached
         if requested_identity is not None and tuple(cached_identity or ()) != tuple(requested_identity):
+            _mmap_reader_fds.pop(fd_key, None)
             close_started = time.monotonic_ns()
             try:
                 os.close(fd)
@@ -8020,9 +8021,9 @@ def _mmap_reader_fill(req):
             "fd_key_producer": fd_key_producer,
             "fd_open_count": int(fd_open_delta),
             "fd_reuse_count": int(fd_reuse_delta),
-            "fd_close_count": 0,
-            "fd_open_wall_ms": 0.0,
-            "fd_close_wall_ms": 0.0,
+            "fd_close_count": int(fd_close_delta),
+            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
+            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
             "source_engine": "mmap_fresh",
             "reader_pid": os.getpid(),
             "reader_index": int(req.get("_reader_index") or 0),
@@ -8091,9 +8092,9 @@ def _mmap_reader_fill(req):
             "fd_key_producer": fd_key_producer,
             "fd_open_count": int(fd_open_delta),
             "fd_reuse_count": int(fd_reuse_delta),
-            "fd_close_count": 0,
-            "fd_open_wall_ms": 0.0,
-            "fd_close_wall_ms": 0.0,
+            "fd_close_count": int(fd_close_delta),
+            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
+            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
             "source_engine": "mmap_fresh",
             "reader_pid": os.getpid(),
         })
