@@ -52,6 +52,7 @@ def test_control_descriptor_crc_and_stale_identity_fail_closed():
         ticket = session.submit(_request(1))
         assert C0ControlLayout.request_crc_valid(session.shm.buf, ticket.lane)
         base = C0ControlLayout.lane_offset(ticket.lane)
+        assert C0ControlLayout._U64.unpack_from(session.shm.buf, base + 8)[0] == 0
         C0ControlLayout._U64.pack_into(session.shm.buf, base + 24, 999)
         assert not C0ControlLayout.request_crc_valid(session.shm.buf, ticket.lane)
     finally:

@@ -2672,7 +2672,6 @@ class C0ControlLayout:
         role = request.role.encode("ascii")[:15]
         buf[base + 208 : base + 224] = role + b"\0" * (16 - len(role))
         buf[base + 224 : base + 224 + cls.PATH_BYTES] = path
-        cls._U64.pack_into(buf, base + 8, int(sequence))
         cls._U64.pack_into(buf, base + 0, int(sequence))
         cls._U32.pack_into(buf, base + 16, cls.STATE_REQUESTED)
 
@@ -3526,7 +3525,7 @@ class SharedArenaRing:
         slot_count: int = C0_SLOT_COUNT,
         slot_bytes: int = C0_SLOT_BYTES,
         device_index: int = 0,
-        control_session: bool = False,
+        control_session: bool = True,
     ) -> None:
         if int(size_bytes) != int(slot_count) * int(slot_bytes):
             raise ValueError("c0_arena_geometry_mismatch")
