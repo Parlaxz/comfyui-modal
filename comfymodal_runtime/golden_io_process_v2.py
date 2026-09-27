@@ -7539,6 +7539,17 @@ def _fd_matches_identity(fd, identity):
         return False
 
 
+class _FDIdentityMismatchError(OSError):
+    def __init__(self, key, identity):
+        super().__init__("c0_fd_identity_mismatch:%s" % (key,))
+        self.fd_key = key
+        self.fd_open_count = 0
+        self.fd_reuse_count = 0
+        self.fd_close_count = 0
+        self.fd_open_wall_ns = 0
+        self.fd_close_wall_ns = 0
+
+
 def _fd_stat_row(key):
     row = _fd_stats.get(key)
     if row is None:
@@ -7547,11 +7558,11 @@ def _fd_stat_row(key):
             "producer_id": key[1],
             "fill_count": 0,
             "source_bytes": 0,
-            "fd_open_count": 0,
-            "fd_reuse_count": 0,
-            "fd_close_count": 0,
-            "fd_open_wall_ms": 0.0,
-            "fd_close_wall_ms": 0.0,
+            "fd_open_count": int(fd_open_delta),
+            "fd_reuse_count": int(fd_reuse_delta),
+            "fd_close_count": int(fd_close_delta),
+            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
+            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
         }
         _fd_stats[key] = row
     return row
@@ -7584,6 +7595,8 @@ def _acquire_fd(path, producer_id, identity=None):
     # than vanishing from telemetry.
     global _fd_open_count, _fd_reuse_count, _fd_open_wall_ns
     key = _fd_key(path, producer_id)
+    stale_close_delta = 0
+    stale_close_wall_ns = 0
     if not persistent_fds:
         t0 = time.monotonic_ns()
         fd = os.open(path, os.O_RDONLY)
@@ -7604,36 +7617,45 @@ def _acquire_fd(path, producer_id, identity=None):
                 row["fd_reuse_count"] += 1
                 return key, fd, False, 0, True, 0, 1, 0, 0
             _fd_cache.pop(key, None)
-            _close_fd(key, fd)
+            closed, close_wall_ns = _close_fd(key, fd)
+            stale_close_delta = int(bool(closed))
+            stale_close_wall_ns = int(close_wall_ns)
     # Open outside the lock so one slow open cannot stall the other producer.
     t0 = time.monotonic_ns()
     fd = os.open(path, os.O_RDONLY)
     open_wall_ns = max(0, time.monotonic_ns() - t0)
+    with _fd_lock:
+        _fd_open_count += 1
+        _fd_open_wall_ns += open_wall_ns
+        row = _fd_stat_row(key)
+        row["fd_open_count"] += 1
+        row["fd_open_wall_ms"] = round(row["fd_open_wall_ms"] + open_wall_ns / 1e6, 4)
+    if not _fd_matches_identity(fd, identity):
+        closed, close_wall_ns = _close_fd(key, fd)
+        error = _FDIdentityMismatchError(key, identity)
+        error.fd_open_count = 1
+        error.fd_close_count = int(bool(closed))
+        error.fd_open_wall_ns = int(open_wall_ns)
+        error.fd_close_wall_ns = int(close_wall_ns)
+        raise error
     with _fd_lock:
         existing = _fd_cache.get(key)
         if existing is not None:
             # Lost the open race; keep the cached winner and discard ours.
             # Account for this descriptor's physical open and immediate close
             # before counting the reuse of the winner.
-            _fd_open_count += 1
-            _fd_open_wall_ns += open_wall_ns
             row = _fd_stat_row(key)
-            row["fd_open_count"] += 1
-            row["fd_open_wall_ms"] = round(row["fd_open_wall_ms"] + open_wall_ns / 1e6, 4)
             _fd_reuse_count += 1
             row["fd_reuse_count"] += 1
             closed, close_wall_ns = _close_fd(key, fd)
             return (
                 key, existing, False, open_wall_ns, True,
-                1, 1, 1 if closed else 0, close_wall_ns,
+                1, 1, stale_close_delta + (1 if closed else 0),
+                stale_close_wall_ns + close_wall_ns,
             )
         _fd_cache[key] = fd
-        _fd_open_count += 1
-        _fd_open_wall_ns += open_wall_ns
         row = _fd_stat_row(key)
-        row["fd_open_count"] += 1
-        row["fd_open_wall_ms"] = round(row["fd_open_wall_ms"] + open_wall_ns / 1e6, 4)
-        return key, fd, True, open_wall_ns, False, 1, 0, 0, 0
+        return key, fd, True, open_wall_ns, False, 1, 0, stale_close_delta, stale_close_wall_ns
 
 
 def _finish_fd(key, fd, opened_here, ok):
@@ -8031,6 +8053,11 @@ def _mmap_reader_fill(req):
         return result
     except BaseException as exc:
         err = dict(base)
+        fd_open_delta = int(getattr(exc, "fd_open_count", fd_open_delta) or fd_open_delta)
+        fd_reuse_delta = int(getattr(exc, "fd_reuse_count", fd_reuse_delta) or fd_reuse_delta)
+        fd_close_delta = int(getattr(exc, "fd_close_count", fd_close_delta) or fd_close_delta)
+        fd_open_wall_ns = int(getattr(exc, "fd_open_wall_ns", fd_open_wall_ns) or fd_open_wall_ns)
+        fd_close_wall_ns = int(getattr(exc, "fd_close_wall_ns", fd_close_wall_ns) or fd_close_wall_ns)
         err.update({
             "op": "error",
             "error": ("%s:%s" % (type(exc).__name__, exc))[:200],
@@ -8225,6 +8252,11 @@ def _do_fill_mmap(req):
         _emit(result)
     except BaseException as exc:
         err = dict(base)
+        fd_open_delta = int(getattr(exc, "fd_open_count", fd_open_delta) or fd_open_delta)
+        fd_reuse_delta = int(getattr(exc, "fd_reuse_count", fd_reuse_delta) or fd_reuse_delta)
+        fd_close_delta = int(getattr(exc, "fd_close_count", fd_close_delta) or fd_close_delta)
+        fd_open_wall_ns = int(getattr(exc, "fd_open_wall_ns", fd_open_wall_ns) or fd_open_wall_ns)
+        fd_close_wall_ns = int(getattr(exc, "fd_close_wall_ns", fd_close_wall_ns) or fd_close_wall_ns)
         err.update({
             "op": "error",
             "error": ("%s:%s" % (type(exc).__name__, exc))[:200],
@@ -8475,15 +8507,19 @@ def _do_fill(req):
             "error": ("%s:%s" % (type(exc).__name__, exc))[:200],
             "producer_id": int(producer_id),
             "preadv_diagnostics": preadv_diagnostics,
+            "fd_open_count": int(getattr(exc, "fd_open_count", fd_open_delta) or fd_open_delta),
+            "fd_reuse_count": int(getattr(exc, "fd_reuse_count", fd_reuse_delta) or fd_reuse_delta),
+            "fd_close_count": int(getattr(exc, "fd_close_count", fd_close_delta) or fd_close_delta),
+            "fd_open_wall_ms": round(
+                int(getattr(exc, "fd_open_wall_ns", fd_open_wall_ns) or fd_open_wall_ns) / 1e6, 4
+            ),
+            "fd_close_wall_ms": round(
+                int(getattr(exc, "fd_close_wall_ns", fd_close_wall_ns) or fd_close_wall_ns) / 1e6, 4
+            ),
             "fd_key_path": (
                 fd_key[0] if fd_key else os.path.normpath(str(req.get("path") or ""))
             ),
             "fd_key_producer": fd_key[1] if fd_key else int(producer_id),
-            "fd_open_count": int(fd_open_delta),
-            "fd_reuse_count": int(fd_reuse_delta),
-            "fd_close_count": int(fd_close_delta),
-            "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
-            "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
             "child_read_start_ns": int(read_start_ns) if read_start_ns is not None else None,
             "child_read_end_ns": int(read_end_ns) if read_end_ns is not None else None,
             "read_duration_ns": (
