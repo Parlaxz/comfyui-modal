@@ -1,0 +1,14 @@
+{
+  "/comfymodal/health": {
+    "status": 200,
+    "text": "{\"status\": \"ok\", \"mode\": \"deploy\"}"
+  },
+  "/comfymodal/studio/models": {
+    "status": 500,
+    "text": "{\"status\": \"error\", \"message\": \"Internal error\"}"
+  },
+  "/comfymodal/studio/workflows/versions/wv_487585a9c3cb4f32/dependencies": {
+    "status": 500,
+    "text": "{\"status\": \"error\", \"message\": \"Internal error\"}"
+  }
+}

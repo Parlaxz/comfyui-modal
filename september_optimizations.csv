@@ -1,0 +1,22 @@
+optimization,evidence_tier,evidence_of_win,commit_or_worktree,artifact,present_in_current_TESTING2,present_in_Golden_baseline,later_reverted_or_superseded,risk_of_losing_it
+processes not threads (4 independent reader processes),PROVEN,+10-12% median within matched provider analysis,local TESTING2 + source-race harness,SOURCE_IO_LEDGER.md,yes (harness),yes (harness),no,low
+persistent FD per reader,PROVEN,removes open churn; cleanliness not a cure,local,SOURCE_IO_LEDGER.md,yes (harness),yes (harness),no,low
+eager workers (ready before timing),PROVEN,removed ~3.4 s first-start serialization,local,SOURCE_IO_LEDGER.md,yes (harness),yes (harness),no,low
+self-service allocator,PROVEN,bubble 0.1095 ms/block vs 1.4290 greedy (18x),local,exp1/EXP1_REPORT.md,yes (harness),yes (harness),no,low
+fresh-window mmap MAP_PRIVATE 64MiB QD4 4ms (FROZEN BASELINE),PROVEN,"median ~6.2 GB/s, 0 ops >=250ms on RTX/H100",local,FINAL_MMAP_OPTS_REPORT.md,yes (harness),yes (harness),no,low
+"mmap(PROT_READ, MAP_PRIVATE)",PROVEN,works; MAP_SHARED rejected (-12.1%),local,FINAL_MAPSHARE_CPU_REPORT.md,yes (harness),yes (harness),no,low
+Golden static E27 scheduling arm,PROVEN,accepted; integrated into TESTING2,rx7-static-e27 / omos/rx7a-static-e27 (083629f),V2_BATCH_E27_*,yes (TESTING2),UNKNOWN,no,med
+Golden waterfall console routing restore,PROVEN,integrated into TESTING2,3f03032 / 17bf190,RX6B report,yes (TESTING2),UNKNOWN,no,low
+Golden minimal restore (deferred GPU-repair not invoked),PROVEN,proven under minimal restore,exp/golden-minimal-restore (7152cca),GOLDEN_MINIMAL_RESTORE_IMPLEMENTATION_2026-09-11.md,UNKNOWN,UNKNOWN,no,high
+Golden P4-8 durable commit lane,PROVEN,complete,omos/golden-p4-8-durability (e5eb5ec),V2_BATCH_P4_8_*,UNKNOWN,UNKNOWN,no,high
+Golden host path isolation / memory-scaling battery,PROVEN,diagnostic battery added,exp/golden-host-path-isolation-sep18 (1af62a1),reports/golden_*,UNKNOWN,UNKNOWN,no,med
+Golden striped source probe (A/C/D + decoupled B),PROVEN,diagnostic probe added,exp/golden-striped-source-sep19 (3ebbfad),report,UNKNOWN,UNKNOWN,no,med
+Golden Volume v1-vs-v2 paired source probe (H100),PROVEN,diagnostic probe added,exp/golden-volume-v1-v2-h100-sep19 (7ba393b),report,UNKNOWN,UNKNOWN,no,med
+CUDA event per-transfer causality + CUDA-vs-no-CUDA source causality,PROVEN,cohort analysed,exp/cuda-event-per-transfer-causality-sep20 (d642e97); exp/cuda-vs-no-cuda-source-causality-sep20 (a7b62e6),report: analyze CUDA source causality cohort,UNKNOWN,UNKNOWN,no,high
+Golden Q2/128 resource failover,PROVEN,audit: final31 R2 usage cache gap + contention forensics,exp/golden-q2-128-resource-failover-sep18 (618c592),audit report,UNKNOWN,UNKNOWN,no,high
+Golden pretouch A/B (control vs pretouch),PROVEN,control arm 03ce2491; pretouch arm a94c149,exp/pretouch-ab-* (dirs GONE),report,no (dirs gone),UNKNOWN,no,high
+Golden sickness native preadv timer,PROVEN,gated native preadv timer for C0 source reads,exp/golden-sickness-native (d8b4a13),GOLDEN_SICKNESS_FORENSIC_REPORT_2026-09-17.md,UNKNOWN,UNKNOWN,no,med
+Golden restore lifecycle finalization + H100 Sep14 C0 profile,PROVEN,d9504d16 -> d95e4347,"diag/c0-arm1-join; golden-best-00{1,2}-archival",restore reports,UNKNOWN,UNKNOWN,no,high
+Golden I/O process v2,PROVEN,diag: count live Wave-A probes,exp/golden-io-process-v2 (b6ecd06),V2_BATCH_*,UNKNOWN,UNKNOWN,no,high
+Golden best-001/002/003 archival (RTX PRO 6000 15x15 byte-exact source/config),PROVEN,archival provenance records,golden-best-001/002/003 tags + branches,archival docs,UNKNOWN,UNKNOWN,no,high
+v2ctl canonical control plane (E32),PROVEN,canonical deploy/run tooling,tools/v2_control/*,V2_BATCH_E32_*,yes (TESTING2),UNKNOWN,no,low

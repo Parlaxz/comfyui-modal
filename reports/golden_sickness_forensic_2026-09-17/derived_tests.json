@@ -1,0 +1,82 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "method": {
+    "fisher": "two-sided exact Fisher test, deterministic",
+    "bootstrap": {
+      "iters": 2000,
+      "seed": 20260917,
+      "interval": "percentile 2.5/97.5 of rate(second)-rate(first)"
+    },
+    "permutation": {
+      "iters": 5000,
+      "seed": 20260917
+    }
+  },
+  "arm_clip_sickness": {
+    "sham": {
+      "sick": 8,
+      "n": 55
+    },
+    "split": {
+      "sick": 6,
+      "n": 86
+    },
+    "fisher_p": 0.159044,
+    "bootstrap_rate_diff": {
+      "observed_diff": -0.075687,
+      "ci95_low": -0.189852,
+      "ci95_high": 0.031961,
+      "iters": 2000,
+      "seed": 20260917
+    }
+  },
+  "arm_unet_sickness": {
+    "sham": {
+      "sick": 8,
+      "n": 55
+    },
+    "split": {
+      "sick": 4,
+      "n": 86
+    },
+    "fisher_p": 0.060913,
+    "bootstrap_rate_diff": {
+      "observed_diff": -0.098943,
+      "ci95_low": -0.209604,
+      "ci95_high": 0.003594,
+      "iters": 2000,
+      "seed": 20260917
+    }
+  },
+  "arm_both_sickness": {
+    "sham": {
+      "sick": 5,
+      "n": 55
+    },
+    "split": {
+      "sick": 1,
+      "n": 86
+    },
+    "fisher_p": 0.033491,
+    "bootstrap_rate_diff": {
+      "observed_diff": -0.079281,
+      "ci95_low": -0.163636,
+      "ci95_high": -0.006554,
+      "iters": 2000,
+      "seed": 20260917
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "audit_basis": [
+    "PHASE_G2 §1/§11 HIGH dependency-side risk",
+    "PHASE_G5 §2 frozen resolution",
+    "PHASE_G5 §7.3 environment section"
+  ],
+  "description": "Prepared environment evidence representing the audited G2 debt: ComfyUI core commit-pinned but locally patched; torch stack unpinned; base-image digest unpinned; working-tree custom-node provenance incomplete; plugin worktree dirty; model hash coverage missing. This NEVER dictates workflow or target risk (POLICY_ENVIRONMENT_ISOLATION).",
+  "evidence_file": "evidence/environment_repro_high.evidence.json",
+  "kind": "environment",
+  "scenario_id": "environment_repro_high",
+  "title": "Source-environment reproducibility debt (HIGH)"
+}

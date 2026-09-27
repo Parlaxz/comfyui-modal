@@ -1,0 +1,39 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 private/gated models row",
+    "PHASE_G2 §2.3 requires_*_token flags"
+  ],
+  "description": "Model record pins a fake hash but points at a gated source on a synthetic host. Token flags stay boolean-shaped facts; no credential values exist here.",
+  "expected": {
+    "issue_codes": [],
+    "risk_level_hint_nonnormative": "medium",
+    "semantic_notes": [
+      "Access-controlled distribution; target matrix PRIVATE MODEL applies."
+    ],
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/private_model.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "7ecbdbb491676a9696f7a4b5c386f899eea23bcbe2d2fd5e77c7eb2779326e50",
+  "scenario_id": "private_model",
+  "title": "Private/gated model reference"
+}

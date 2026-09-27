@@ -1,0 +1,5 @@
+{"name":"restore_complete","wall_unix_ms":1000.0,"duration_ms":0,"pid":1,"tid":1}
+{"name":"request_entry","wall_unix_ms":2000.0,"duration_ms":0,"pid":1,"tid":1}
+{"name":"prompt_executor_invoke","wall_unix_ms":3000.0,"duration_ms":0,"pid":1,"tid":1}
+{"name":"sampling_start","wall_unix_ms":5000.0,"duration_ms":0,"pid":1,"tid":2}
+{"name":"trace_stop","wall_unix_ms":10000.0,"duration_ms":0,"pid":1,"tid":2}

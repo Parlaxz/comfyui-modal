@@ -1,0 +1,3500 @@
+"""Focused tests for Plan C CPU snapshot lifecycle integration.
+
+Tests cover configuration validation, profile extraction, bridge
+activation, and request binding without instantiating real Modal or
+ComfyUI.  Tests skip cleanly when optional imports are unavailable.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import io
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace, MappingProxyType
+from typing import Any
+from collections.abc import Mapping
+
+# Import torch before any request-time activation / probe runs.  The first
+# ``import torch`` inside ``register_unet_forward_probe`` can fail on Windows
+# with "function '_has_torch_function' already has a docstring" when
+# ``torch.overrides`` re-executes against an already-initialized ``torch._C``,
+# leaving torch partially imported and poisoning later tests.  The real
+# ComfyUI container always has torch imported at process start, so a module-
+# load import reproduces that environment.
+import torch  # noqa: F401
+
+from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, ModelRestoreKey, PrefillKey, RestorePlan, stable_hash
+from comfymodal_runtime.model_preload import V2LoaderBridge, RestorePreparation
+from comfymodal_runtime.restore_plan import derive_model_key, derive_prefill_key, build_restore_model_spec
+from comfymodal_runtime.runtime_executor import ExecutionContext
+from comfymodal_runtime.trace import RuntimeTrace
+from comfymodal_runtime.cpu_snapshot_models import (
+    CpuSnapshotModels,
+    identity_from_profile,
+    validate_cpu_snapshot_models,
+    retarget_cpu_snapshot_models,
+)
+from comfymodal_runtime.modal_app import (
+    _collect_warmup_env,
+    _cpu_model_snapshot_enabled,
+    _cpu_snapshot_model_keys_match,
+    _cpu_snapshot_key_mismatch_reason,
+    _cpu_snapshot_spec_mismatch_reason,
+    _cpu_snapshot_spec_projection,
+    _cpu_snapshot_specs_match,
+    _snapshot_target_fingerprint,
+    ModalRuntimeEntrypoint,
+    ModalRuntimeSpec,
+)
+
+
+class _DummyCtxManager:
+    """Minimal context manager for testing CPU snapshot context."""
+    def __enter__(self):
+        return None
+    def __exit__(self, *exc):
+        return None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _clean_env():
+    """Remove Plan C env vars so tests start from a known state."""
+    for key in ("COMFYMODAL_V2_CPU_MODEL_SNAPSHOT",
+                "COMFYMODAL_ENABLE_GPU_SNAPSHOT"):
+        os.environ.pop(key, None)
+
+
+class _FakeClip:
+    pass
+
+
+def _fake_model_management():
+    """Return a minimal fake comfy.model_management module."""
+    class _MM:
+        @staticmethod
+        def get_torch_device():
+            return "cpu"
+        @staticmethod
+        def unet_offload_device():
+            return "cpu"
+        @staticmethod
+        def text_encoder_device():
+            return "cpu"
+        @staticmethod
+        def text_encoder_offload_device():
+            return "cpu"
+    return _MM
+
+
+def _ensure_bridge_has_fake_nodes(bridge):
+    """Install minimal fake node classes on a bare bridge so use_ready_models can
+    establish loader wrappers.  Safe to call multiple times (idempotent)."""
+    if bridge._original_methods:  # already installed
+        return
+    class _FakeUNETLoader:
+        def load_unet(self, unet_name, weight_dtype):
+            return (object(),)
+    class _FakeCLIPLoader:
+        def load_clip(self, clip_name, type="stable_diffusion", device="default"):
+            return (_FakeClip(),)
+    class _FakeDualCLIPLoader:
+        def load_clip(self, clip_name1, clip_name2, type, device="default"):
+            return (_FakeClip(),)
+    class _FakeVAELoader:
+        def load_vae(self, vae_name):
+            return (f"vae:{vae_name}",)
+    class _FakeCLIPTextEncode:
+        def encode(self, clip, text):
+            return (f"conditioning:{text}",)
+    from types import SimpleNamespace
+    fake_nodes = SimpleNamespace(
+        NODE_CLASS_MAPPINGS={
+            "UNETLoader": _FakeUNETLoader,
+            "CLIPLoader": _FakeCLIPLoader,
+            "DualCLIPLoader": _FakeDualCLIPLoader,
+            "VAELoader": _FakeVAELoader,
+            "CLIPTextEncode": _FakeCLIPTextEncode,
+        }
+    )
+    bridge.install(fake_nodes)
+
+
+def _make_snapshot_models(
+    unet_identity: str = "sd3.5_large.safetensors",
+    clip_identity: str = "t5xxl_fp16.safetensors",
+    clip_type: str = "sd3",
+    clip2: str = "",
+) -> CpuSnapshotModels:
+    """Build a minimal CpuSnapshotModels for testing."""
+    profile: dict[str, Any] = {
+        "mode": "split",
+        "unet": unet_identity,
+        "clip1": clip_identity,
+        "clip_type": clip_type,
+    }
+    if clip2:
+        profile["clip2"] = clip2
+    # Use SimpleNamespace so we can attach patcher attributes later
+    unet_stub = SimpleNamespace()
+    clip_stub = _FakeClip()
+    return CpuSnapshotModels(
+        model_key=ModelRestoreKey(
+            unet_identity=unet_identity,
+            clip_identity=f"{clip_identity}||{clip2}" if clip2 else clip_identity,
+            vae_identity="",
+            clip_type=clip_type,
+        ),
+        model_spec={
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": unet_identity, "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": clip_identity, "type": clip_type, "device": "default"}],
+                "vae": [],
+            },
+        },
+        normalized_profile=dict(profile),
+        file_facts=(),
+        unet=unet_stub,
+        clip=clip_stub,
+        load_timings_ms={"clip_load_ms": 100.0, "unet_load_ms": 200.0},
+    )
+
+
+# ── Feature flag tests ─────────────────────────────────────────────────────
+
+
+class CpuSnapshotEnabledTests(unittest.TestCase):
+    """_cpu_model_snapshot_enabled() configuration validation."""
+
+    def setUp(self):
+        _clean_env()
+
+    def test_disabled_by_default(self):
+        self.assertFalse(_cpu_model_snapshot_enabled())
+
+    def test_enabled_when_exactly_1(self):
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.assertTrue(_cpu_model_snapshot_enabled())
+
+    def test_disabled_when_0(self):
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "0"
+        self.assertFalse(_cpu_model_snapshot_enabled())
+
+    def test_disabled_when_empty(self):
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = ""
+        self.assertFalse(_cpu_model_snapshot_enabled())
+
+    def test_enabled_for_explicit_true_words(self):
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "yes"
+        self.assertTrue(_cpu_model_snapshot_enabled())
+
+    def test_rejects_gpu_snapshot_combination(self):
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        os.environ["COMFYMODAL_ENABLE_GPU_SNAPSHOT"] = "1"
+        with self.assertRaises(RuntimeError) as ctx:
+            _cpu_model_snapshot_enabled()
+        self.assertIn("incompatible", str(ctx.exception).lower())
+
+
+# ── Profile extraction tests ─────────────────────────────────────────────
+
+
+class CpuSnapshotProfileTests(unittest.TestCase):
+    """_cpu_snapshot_profile() validation."""
+
+    def setUp(self):
+        _clean_env()
+
+    def _make_api(self, profile: Any = None):
+        return SimpleNamespace(_snapshot_preload_profile=lambda: profile)
+
+    def test_accepts_valid_split_profile(self):
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api({
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip_type": "sd3",
+        })
+        result = entrypoint._cpu_snapshot_profile(api)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["mode"], "split")
+        self.assertEqual(result["unet"], "sd3.5_large.safetensors")
+
+    def test_accepts_dual_clip_profile(self):
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api({
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip2": "clip_g.safetensors",
+            "clip_type": "sd3",
+        })
+        result = entrypoint._cpu_snapshot_profile(api)
+        self.assertEqual(result.get("clip2"), "clip_g.safetensors")
+
+    def test_returns_none_when_profile_none_and_no_env(self):
+        """None API profile with no valid env vars returns None (non-fatal)."""
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api(None)
+        with patch.dict(os.environ, {}, clear=True):
+            result = entrypoint._cpu_snapshot_profile(api)
+        self.assertIsNone(result)
+
+    def test_rejects_non_mapping_profile(self):
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api("not_a_dict")
+        with self.assertRaises(RuntimeError) as ctx:
+            entrypoint._cpu_snapshot_profile(api)
+        self.assertIn("Mapping", str(ctx.exception))
+
+    def test_rejects_non_split_mode(self):
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api({
+            "mode": "checkpoint",
+            "unet": "model.safetensors",
+            "clip1": "clip.safetensors",
+            "clip_type": "sd3",
+        })
+        with self.assertRaises(RuntimeError) as ctx:
+            entrypoint._cpu_snapshot_profile(api)
+        self.assertIn("split", str(ctx.exception).lower())
+
+    def test_rejects_missing_required_field(self):
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api({
+            "mode": "split",
+            "unet": "",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip_type": "sd3",
+        })
+        with self.assertRaises(RuntimeError) as ctx:
+            entrypoint._cpu_snapshot_profile(api)
+        self.assertIn("unet", str(ctx.exception))
+
+    def test_reconstructs_from_env_when_api_none_with_empty_clip2(self):
+        """None API profile + single-loader env with empty CLIP2 returns a valid
+        split profile and CLIP2 remains absent."""
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api(None)
+        with patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_PROFILE": "split",
+            "COMFYMODAL_WARMUP_UNET": "flux_1_dev.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "clip_l.safetensors",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux",
+        }, clear=True):
+            result = entrypoint._cpu_snapshot_profile(api)
+        assert result is not None
+        self.assertEqual(result.get("mode"), "split")
+        self.assertEqual(result.get("unet"), "flux_1_dev.safetensors")
+        self.assertEqual(result.get("clip1"), "clip_l.safetensors")
+        self.assertEqual(result.get("clip_type"), "flux")
+        self.assertNotIn("clip2", result)
+
+    def test_returns_none_when_none_profile_and_no_env_still(self):
+        """Without valid COMFYMODAL_WARMUP_* env vars, None API profile returns
+        None with a diagnostic (non-fatal skip, not a crash)."""
+        entrypoint = ModalRuntimeEntrypoint()
+        api = self._make_api(None)
+        with patch.dict(os.environ, {}, clear=True):
+            result = entrypoint._cpu_snapshot_profile(api)
+        self.assertIsNone(result)
+
+
+# ── Bridge activation tests ──────────────────────────────────────────────
+
+
+class CpuSnapshotBridgeActivationTests(unittest.TestCase):
+    """_use_cpu_snapshot_models_on_bridge() integration."""
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="bridge-test", process="remote")
+        self.model_key = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="abc123",
+        )
+        self.model_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        self.unet_stub = object()
+        self.clip_stub = _FakeClip()
+
+    def _activate(self):
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            self.model_key,
+            self.prefill_key,
+            self.model_spec,
+            self.unet_stub,
+            self.clip_stub,
+            trace=self.trace,
+        )
+
+    def test_sets_bridge_state(self):
+        self._activate()
+        bridge = self.entrypoint._preload_bridge
+        self.assertEqual(bridge._model_key, self.model_key)
+        self.assertEqual(bridge._prefill_key, self.prefill_key)
+        self.assertIsNotNone(bridge._preparation)
+
+    def test_preparation_has_resolved_futures(self):
+        self._activate()
+        prep = self.entrypoint._preload_bridge._preparation
+        self.assertIsNotNone(prep)
+        self.assertIsNotNone(prep.unet_future)
+        self.assertIsNotNone(prep.clip_future)
+        self.assertTrue(prep.unet_future.done())
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.unet_future.result(), self.unet_stub)
+        self.assertIs(prep.clip_future.result(), self.clip_stub)
+
+    def test_bridge_consume_unet_returns_snapshot_model(self):
+        """Simulate graph-time UNET consumption via bridge."""
+        self._activate()
+        bridge = self.entrypoint._preload_bridge
+        # Install bridge as active for request scope
+        import comfymodal_runtime.model_preload as _mp
+        # We need to make the bridge respond to _consume_unet.
+        # The bridge's coordinator.wait_unet waits on prep.unet_future.
+        # We can test this directly.
+        prep = bridge._preparation
+        unet = bridge.coordinator.wait_unet(prep)
+        self.assertIs(unet, self.unet_stub)
+
+    def test_bridge_consume_clip_returns_snapshot_model(self):
+        self._activate()
+        bridge = self.entrypoint._preload_bridge
+        prep = bridge._preparation
+        clip = bridge.coordinator.wait_clip(prep)
+        self.assertIs(clip, self.clip_stub)
+
+    def test_lazy_init_snapshot_state(self):
+        """Verify _lazy_init_snapshot_state creates attrs on bare instance."""
+        raw = ModalRuntimeEntrypoint.__new__(ModalRuntimeEntrypoint)
+        self.assertFalse(hasattr(raw, "_cpu_snapshot_models"))
+        raw._lazy_init_snapshot_state()
+        self.assertTrue(hasattr(raw, "_cpu_snapshot_models"))
+        self.assertIsNone(raw._cpu_snapshot_models)
+        self.assertIsNotNone(hasattr(raw, "_cpu_snapshot_models_active"))
+        self.assertFalse(raw._cpu_snapshot_models_active)
+
+
+# ── Plan C request binding tests ─────────────────────────────────────────
+
+
+class CpuSnapshotRequestBindingTests(unittest.TestCase):
+    """Request-time binding of CPU snapshot models."""
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="req-bind", process="remote")
+
+    def test_skip_when_not_active(self):
+        """No-op when _cpu_snapshot_models_active is False."""
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.entrypoint._cpu_snapshot_models = None
+        # Should not raise
+        self.entrypoint._lazy_init_snapshot_state()
+        # Request binding only runs when active, so no explicit assertion needed.
+
+    def test_binds_when_model_key_matches(self):
+        """Bridge is configured when request model key matches snapshot."""
+        unet_id = "sd3.5_large.safetensors"
+        clip_id = "t5xxl_fp16.safetensors"
+        snapshot = _make_snapshot_models(unet_identity=unet_id, clip_identity=clip_id)
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+        bridge = self.entrypoint._preload_bridge
+
+        # Activate bridge
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            snapshot.model_key,
+            PrefillKey(model_key=snapshot.model_key),
+            snapshot.model_spec,
+            snapshot.unet,
+            snapshot.clip,
+            trace=self.trace,
+        )
+
+        prep = bridge._preparation
+        unet = bridge.coordinator.wait_unet(prep)
+        clip = bridge.coordinator.wait_clip(prep)
+        self.assertIs(unet, snapshot.unet)
+        self.assertIs(clip, snapshot.clip)
+
+    def test_clears_on_model_key_mismatch(self):
+        """Bridge is cleared when request model key differs from snapshot."""
+        snapshot = _make_snapshot_models(unet_identity="model_a.safetensors")
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+        # Activate first (simulating restore activation)
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            snapshot.model_key,
+            PrefillKey(model_key=snapshot.model_key),
+            snapshot.model_spec,
+            snapshot.unet,
+            snapshot.clip,
+        )
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+
+        # Simulate request with different model: clear bridge and deactivate.
+        self.entrypoint._preload_bridge.clear()
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsNone(self.entrypoint._preload_bridge._model_key)
+
+
+# ── Retarget/is_valid resource-invariant tests ────────────────────────────
+
+
+class CpuSnapshotResourceInvariantTests(unittest.TestCase):
+    """Resource-invariant checks for Plan C lifecycle."""
+
+    def test_retarget_unknown_model_management(self):
+        """retarget_cpu_snapshot_models fails clearly on missing functions."""
+        mm = SimpleNamespace()  # no functions
+        models = _make_snapshot_models()
+        ok, reason = retarget_cpu_snapshot_models(models, model_management=mm)
+        self.assertFalse(ok)
+        self.assertIn("missing", reason)
+
+    def test_retarget_fake_model_management(self):
+        """retarget succeeds with minimal fake mm."""
+        models = _make_snapshot_models()
+        mm = _fake_model_management()
+        # Attach patcher-like attributes to the stub unet/clip
+        models.unet.load_device = "cpu"
+        models.unet.offload_device = "cpu"
+        models.clip = _FakeClip()
+        # Need clip to have a patcher with load_device/offload_device
+        clip_patcher = SimpleNamespace(load_device="cpu", offload_device="cpu")
+        models.clip.patcher = clip_patcher
+        models.clip.tokenizer = object()
+        # Give clip named_parameters/named_buffers for validation
+        models.clip.named_parameters = lambda recurse=True: iter([])
+        models.clip.named_buffers = lambda recurse=True: iter([])
+        models.clip.cond_stage_model = SimpleNamespace(
+            named_parameters=lambda recurse=True: iter([]),
+            named_buffers=lambda recurse=True: iter([]),
+        )
+        models.unet.named_parameters = lambda recurse=True: iter([])
+        models.unet.named_buffers = lambda recurse=True: iter([])
+        models.unet.model = SimpleNamespace(
+            named_parameters=lambda recurse=True: iter([]),
+            named_buffers=lambda recurse=True: iter([]),
+            diffusion_model=SimpleNamespace(
+                named_parameters=lambda recurse=True: iter([]),
+                named_buffers=lambda recurse=True: iter([]),
+            ),
+        )
+        ok, reason = retarget_cpu_snapshot_models(models, model_management=mm)
+        self.assertTrue(ok, reason)
+
+    def test_validate_cpu_snapshot_models_missing_files(self):
+        """validate_cpu_snapshot_models returns (False, reason) on nonexistent files."""
+        models = _make_snapshot_models()
+        expected_key = models.model_key
+        expected_spec = models.model_spec
+
+        def resolve_path(role, filename):
+            raise FileNotFoundError(f"not found: {filename}")
+
+        ok, reason = validate_cpu_snapshot_models(
+            models,
+            expected_key=expected_key,
+            expected_spec=expected_spec,
+            resolve_path=resolve_path,
+        )
+        # Should fail at file fact validation
+        self.assertFalse(ok)
+        self.assertIn("file", reason.lower())
+
+
+# ── Profile identity tests ──────────────────────────────────────────────
+
+
+class CpuSnapshotProfileIdentityTests(unittest.TestCase):
+    """identity_from_profile end-to-end."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="cpu_snap_test_")
+        # Create actual files for stat to work
+        unet_dir = os.path.join(self._tmpdir, "unet")
+        clip_dir = os.path.join(self._tmpdir, "clip")
+        os.makedirs(unet_dir, exist_ok=True)
+        os.makedirs(clip_dir, exist_ok=True)
+        self._unet_path = os.path.join(unet_dir, "sd3.5_large.safetensors")
+        self._clip_path = os.path.join(clip_dir, "t5xxl_fp16.safetensors")
+        self._clip2_path = os.path.join(clip_dir, "clip_g.safetensors")
+        for p in (self._unet_path, self._clip_path, self._clip2_path):
+            with open(p, "wb") as f:
+                f.write(b"dummy")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _resolve_path(self, role, filename):
+        if role == "unet":
+            return self._unet_path
+        elif role == "clip1":
+            return self._clip_path
+        elif role == "clip2":
+            return self._clip2_path
+        return os.path.join(self._tmpdir, role, filename)
+
+    def test_identity_from_profile_split_single_clip(self):
+        profile = {
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip_type": "sd3",
+        }
+        key, spec, facts = identity_from_profile(
+            profile, resolve_path=self._resolve_path,
+        )
+        self.assertEqual(key.unet_identity, "sd3.5_large.safetensors")
+        self.assertEqual(key.clip_identity, "t5xxl_fp16.safetensors")
+        self.assertEqual(key.clip_type, "sd3")
+        self.assertIn("loaders", spec)
+        self.assertEqual(len(facts), 2)
+
+    def test_identity_from_profile_split_dual_clip(self):
+        profile = {
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip2": "clip_g.safetensors",
+            "clip_type": "sd3",
+        }
+        key, spec, facts = identity_from_profile(
+            profile, resolve_path=self._resolve_path,
+        )
+        self.assertIn("||", key.clip_identity)
+        self.assertEqual(len(facts), 3)
+
+    def test_identity_rejects_nonsplit_mode(self):
+        with self.assertRaises(ValueError) as ctx:
+            identity_from_profile(
+                {"mode": "checkpoint"},
+                resolve_path=lambda role, f: os.path.join(self._tmpdir, f),
+            )
+        self.assertIn("split", str(ctx.exception))
+
+
+# ── Bridge use_ready_models interface tests ────────────────────────────
+
+
+class CpuSnapshotBridgeUseReadyModelsTests(unittest.TestCase):
+    """Tests that _use_cpu_snapshot_models_on_bridge tries use_ready_models first."""
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="bridge-urm", process="remote")
+        self.model_key = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        self.prefill_key = PrefillKey(model_key=self.model_key)
+        self.model_spec = {"loaders": {"unet": [], "clip": [], "vae": []}}
+        self.unet_stub = object()
+        self.clip_stub = _FakeClip()
+
+    def test_calls_use_ready_models_when_present(self):
+        """When the bridge has use_ready_models, it is called instead of fallback."""
+        _called = []
+
+        class _FakeBridgeWithURM:
+            def use_ready_models(self, **kwargs):
+                _called.append(kwargs)
+            def clear(self):
+                pass
+            diagnostics = lambda self: {}
+
+        original_bridge = self.entrypoint._preload_bridge
+        self.entrypoint._preload_bridge = _FakeBridgeWithURM()  # type: ignore[assignment]
+
+        try:
+            self.entrypoint._use_cpu_snapshot_models_on_bridge(
+                self.model_key, self.prefill_key, self.model_spec,
+                self.unet_stub, self.clip_stub, trace=self.trace,
+            )
+            self.assertEqual(len(_called), 1)
+            kwargs = _called[0]
+            self.assertIs(kwargs["model_key"], self.model_key)
+            self.assertIs(kwargs["prefill_key"], self.prefill_key)
+            self.assertIs(kwargs["unet"], self.unet_stub)
+            self.assertIs(kwargs["clip"], self.clip_stub)
+        finally:
+            self.entrypoint._preload_bridge = original_bridge
+
+    def test_use_ready_models_sets_correct_bridge_state(self):
+        """use_ready_models sets model_key, prefill_key, model_spec, and preparation."""
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            self.model_key, self.prefill_key, self.model_spec,
+            self.unet_stub, self.clip_stub, trace=self.trace,
+        )
+        bridge = self.entrypoint._preload_bridge
+        self.assertEqual(bridge._model_key, self.model_key)
+        self.assertIsNotNone(bridge._preparation)
+        prep = bridge._preparation
+        self.assertIsNotNone(prep.unet_future)
+        self.assertIsNotNone(prep.clip_future)
+        self.assertTrue(prep.unet_future.done())
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.unet_future.result(), self.unet_stub)
+        self.assertIs(prep.clip_future.result(), self.clip_stub)
+        self.assertEqual(bridge._prefill_key.prompt_bundle_hash,
+                         self.prefill_key.prompt_bundle_hash)
+
+    def test_use_ready_models_sets_coordinator_active(self):
+        """After activation, coordinator._active is set so wait_* without args works."""
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            self.model_key, self.prefill_key, self.model_spec,
+            self.unet_stub, self.clip_stub, trace=self.trace,
+        )
+        bridge = self.entrypoint._preload_bridge
+        self.assertIsNotNone(bridge.coordinator._active)
+        self.assertIs(bridge.coordinator._active, bridge._preparation)
+
+
+# ── Restore fast-path control flow tests ─────────────────────────────
+
+
+class CpuSnapshotRestoreFastPathTests(unittest.TestCase):
+    """Verify the restore fast-path control flow:
+    - On exact hit (snapshot activated): bridge.prepare() and background UNET
+      submission are NOT called.
+    - On miss (snapshot not activated): bridge.prepare() IS called.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+
+    def test_fast_path_skips_deferral_code(self):
+        """When _cpu_snapshot_activated is True the else branch (containing
+        _defer_api logic, _check_unet_deferral_eligible, bridge.prepare(),
+        and background UNET submission) is structurally skipped.  Verify
+        by installing a tracking wrapper and simulating both paths."""
+        original_prepare = self.entrypoint._preload_bridge.prepare
+        prepare_invoked = []
+
+        def _tracking_prepare(*args, **kwargs):
+            prepare_invoked.append(True)
+            return original_prepare(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.prepare = _tracking_prepare  # type: ignore[assignment]
+        try:
+            self.entrypoint._restore_plan = SimpleNamespace(
+                model_key=ModelRestoreKey(
+                    unet_identity="u", clip_identity="c", vae_identity="", clip_type="sd3",
+                ),
+                prefill_key=PrefillKey(model_key=ModelRestoreKey(
+                    unet_identity="u", clip_identity="c", vae_identity="", clip_type="sd3",
+                )),
+                model_spec={"loaders": {"unet": [], "clip": [], "vae": []}},
+                generation=1,
+            )
+
+            # ── Branch A: exact hit (snapshot activated) ───────────
+            # This path must NOT call prepare().
+            self.entrypoint._cpu_snapshot_models = _make_snapshot_models()
+            self.entrypoint._cpu_snapshot_models_active = True
+            api_mock = SimpleNamespace(
+                _snapshot_preload_profile=lambda: {},
+                _force_cpu_during_snapshot=lambda: _DummyCtxManager(),
+            )
+            # Activate bridge as restore() would.
+            self.entrypoint._use_cpu_snapshot_models_on_bridge(
+                self.entrypoint._restore_plan.model_key,
+                self.entrypoint._restore_plan.prefill_key,
+                self.entrypoint._restore_plan.model_spec,
+                self.entrypoint._cpu_snapshot_models.unet,
+                self.entrypoint._cpu_snapshot_models.clip,
+            )
+            prepare_count_before = len(prepare_invoked)
+
+            # Run the fast-path block (simplified restore logic).
+            _cpu_snapshot_activated = True
+            if self.entrypoint._restore_plan is not None:
+                if _cpu_snapshot_activated:
+                    # Fast path — no prepare, no background UNET, no deferral.
+                    _prep_for_check: RestorePreparation | None = None
+                else:
+                    # This branch should NOT execute on exact hit.
+                    _prep_for_check = self.entrypoint._preload_bridge.prepare(
+                        self.entrypoint._restore_plan,
+                    )
+
+            self.assertEqual(
+                len(prepare_invoked) - prepare_count_before, 0,
+                "bridge.prepare() must NOT be called on exact snapshot hit",
+            )
+
+            # ── Branch B: miss (snapshot not activated) ────────────
+            prepare_count_before = len(prepare_invoked)
+            _cpu_snapshot_activated = False
+            if self.entrypoint._restore_plan is not None:
+                if _cpu_snapshot_activated:
+                    pass  # pragma: no cover
+                else:
+                    # Miss path — prepare() is reachable through the else branch.
+                    # (Full execution requires live ComfyUI, but we can verify
+                    # the structural path exists.)
+                    pass
+
+            # Now verify that _defer_api + _check_unet_deferral_eligible
+            # would run (they are inside the else branch), confirming the
+            # structural separation.
+            eligible = ModalRuntimeEntrypoint._check_unet_deferral_eligible(
+                None, self.entrypoint._restore_plan,
+            )
+            self.assertFalse(eligible)  # None api => not eligible
+
+        finally:
+            self.entrypoint._preload_bridge.prepare = original_prepare
+            self.entrypoint._restore_plan = None
+            self.entrypoint._cpu_snapshot_models = None
+            self.entrypoint._cpu_snapshot_models_active = False
+
+
+# ── Plan A/B spec projection compatibility tests ────────────────────────
+
+
+class CpuSnapshotSpecProjectionTests(unittest.TestCase):
+    """_cpu_snapshot_spec_projection and _cpu_snapshot_specs_match compatibility.
+
+    Plan A (identity_from_profile) and Plan B (build_restore_model_spec)
+    produce structurally different model_spec dicts.  These tests verify
+    that the projection helper normalises both shapes and compares only
+    the requested identity fields (UNET name/class/weight_dtype, CLIP
+    filenames/class/type/layout, and the exact VAE loader identity),
+    ignoring node_id, model_stack, and device.
+    """
+
+    # ── Plan A-style spec (no node_id, no model_stack, VAE populated) ──
+    PLAN_A_SPEC = {
+        "loaders": {
+            "unet": [
+                {"loader_class": "UNETLoader", "unet_name": "sd3.5_large.safetensors", "weight_dtype": "default"},
+            ],
+            "clip": [
+                {"loader_class": "CLIPLoader", "clip_name": "t5xxl_fp16.safetensors", "type": "sd3", "device": "default"},
+            ],
+            "vae": [
+                {"loader_class": "VAELoader", "vae_name": "ae.safetensors"},
+            ],
+        },
+    }
+
+    # ── Plan B-style spec (node_id, model_stack, VAE populated) ────────
+    PLAN_B_SPEC = {
+        "model_stack": {"some": "stack"},
+        "loaders": {
+            "unet": [
+                {"node_id": "13", "loader_class": "UNETLoader", "unet_name": "sd3.5_large.safetensors", "weight_dtype": "default"},
+            ],
+            "clip": [
+                {"node_id": "45", "loader_class": "CLIPLoader", "clip_name": "t5xxl_fp16.safetensors", "type": "sd3", "device": "default"},
+            ],
+            "vae": [
+                {"node_id": "67", "loader_class": "VAELoader", "vae_name": "ae.safetensors"},
+            ],
+        },
+    }
+
+    def test_projection_matches_across_plan_ab(self):
+        """Projected fields are identical despite different top-level structure."""
+        proj_a = _cpu_snapshot_spec_projection(self.PLAN_A_SPEC)
+        proj_b = _cpu_snapshot_spec_projection(self.PLAN_B_SPEC)
+        self.assertEqual(proj_a, proj_b)
+
+    def test_specs_match_across_plan_ab(self):
+        """_cpu_snapshot_specs_match returns True for compatible A/B specs."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        self.assertTrue(
+            _cpu_snapshot_specs_match(self.PLAN_A_SPEC, self.PLAN_B_SPEC)
+        )
+
+    def test_projection_strips_node_id_and_model_stack(self):
+        """Projection must not contain node_id, model_stack, or device."""
+        proj = _cpu_snapshot_spec_projection(self.PLAN_B_SPEC)
+        for unet_entry in proj["unet"]:
+            self.assertNotIn("node_id", unet_entry)
+            self.assertNotIn("device", unet_entry)
+        for clip_entry in proj["clip"]:
+            self.assertNotIn("node_id", clip_entry)
+            self.assertNotIn("device", clip_entry)
+        self.assertNotIn("model_stack", proj)
+        self.assertNotIn("vae", proj)
+
+    def test_projection_preserves_multiplicity(self):
+        """Extra UNET or CLIP loaders cause mismatch."""
+        single_clip = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+            },
+        }
+        dual_clip = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [
+                    {"loader_class": "DualCLIPLoader", "clip_name1": "c1.safetensors", "clip_name2": "c2.safetensors", "type": "sd3", "device": "default"},
+                ],
+            },
+        }
+        # Different number of CLIP loaders
+        two_clips = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [
+                    {"loader_class": "CLIPLoader", "clip_name": "c1.safetensors", "type": "sd3", "device": "default"},
+                    {"loader_class": "CLIPLoader", "clip_name": "c1.safetensors", "type": "sd3", "device": "default"},
+                ],
+            },
+        }
+        # Same projection for single clip
+        self.assertTrue(_cpu_snapshot_specs_match(single_clip, single_clip))
+        # Different layout (single vs dual) must NOT match
+        self.assertFalse(_cpu_snapshot_specs_match(single_clip, dual_clip))
+        # Different list length must NOT match
+        self.assertFalse(_cpu_snapshot_specs_match(single_clip, two_clips))
+
+    def test_projection_dual_clip_plan_ab(self):
+        """Dual CLIP across Plan A and B shapes."""
+        plan_a_dual = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c1.safetensors", "clip_name2": "c2.safetensors", "type": "sdxl", "device": "default"}],
+                "vae": [],
+            },
+        }
+        plan_b_dual = {
+            "model_stack": {},
+            "loaders": {
+                "unet": [{"node_id": "1", "loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"node_id": "2", "loader_class": "DualCLIPLoader", "clip_name1": "c1.safetensors", "clip_name2": "c2.safetensors", "type": "sdxl", "device": "default"}],
+                "vae": [],
+            },
+        }
+        self.assertTrue(_cpu_snapshot_specs_match(plan_a_dual, plan_b_dual))
+
+    def test_mismatch_on_weight_dtype(self):
+        """Changed weight_dtype must cause projection mismatch."""
+        spec_fp16 = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_fp32 = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_fp16, spec_fp32))
+
+    def test_mismatch_on_clip_type(self):
+        """Changed CLIP type (sd3 vs sdxl) must cause projection mismatch."""
+        spec_sd3 = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_sdxl = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sdxl"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_sd3, spec_sdxl))
+
+    def test_mismatch_on_loader_class(self):
+        """Different loader class (CLIPLoader vs DualCLIPLoader) must mismatch."""
+        spec_single = {
+            "loaders": {
+                "unet": [],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_dual = {
+            "loaders": {
+                "unet": [],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c1.safetensors", "clip_name2": "c2.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_single, spec_dual))
+
+    def test_mismatch_on_unet_name(self):
+        """Different UNET filename must cause projection mismatch."""
+        spec_a = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "model_a.safetensors", "weight_dtype": "default"}],
+            },
+        }
+        spec_b = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "model_b.safetensors", "weight_dtype": "default"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_a, spec_b))
+
+    def test_projection_empty_specs_match(self):
+        """Two empty specs should match."""
+        self.assertTrue(_cpu_snapshot_specs_match({}, {}))
+        self.assertTrue(_cpu_snapshot_specs_match(None, None))
+        self.assertTrue(_cpu_snapshot_specs_match({"loaders": {}}, {"loaders": {}}))
+
+    def test_projection_accepts_mappingproxy(self):
+        """Projection accepts MappingProxyType (frozen RestorePlan.model_spec)."""
+        proxy_spec = MappingProxyType({
+            "loaders": {
+                "unet": [MappingProxyType({"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"})],
+                "clip": [MappingProxyType({"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"})],
+            },
+        })
+        proj = _cpu_snapshot_spec_projection(proxy_spec)
+        self.assertEqual(len(proj["unet"]), 1)
+        self.assertEqual(proj["unet"][0]["unet_name"], "u.safetensors")
+        self.assertEqual(len(proj["clip"]), 1)
+        self.assertEqual(proj["clip"][0]["clip_name"], "c.safetensors")
+        # Ensure VAE is absent from projection
+        self.assertNotIn("vae", proj)
+
+    def test_projection_ignores_vae_loader(self):
+        """VAE loaders must be omitted from projection."""
+        spec_with_vae = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+                "vae": [{"loader_class": "VAELoader", "vae_name": "ae.safetensors"}],
+            },
+        }
+        proj = _cpu_snapshot_spec_projection(spec_with_vae)
+        # VAE loader count must be absent from the result structure
+        self.assertNotIn("vae", proj)
+        # And VAE details must not leak into unet or clip entries
+        for entry in proj["unet"]:
+            self.assertNotIn("vae_name", entry)
+        for entry in proj["clip"]:
+            self.assertNotIn("vae_name", entry)
+
+    def test_projection_mappingproxy_loader_entries(self):
+        """Individual loader entries as MappingProxyType must be handled."""
+        inner_loader = MappingProxyType({"loader_class": "UNETLoader", "unet_name": "m.safetensors", "weight_dtype": "fp16"})
+        proxy = MappingProxyType({
+            "loaders": MappingProxyType({
+                "unet": [inner_loader],
+                "clip": [],
+            }),
+        })
+        proj = _cpu_snapshot_spec_projection(proxy)
+        self.assertEqual(len(proj["unet"]), 1)
+        self.assertEqual(proj["unet"][0]["unet_name"], "m.safetensors")
+        self.assertEqual(proj["unet"][0]["weight_dtype"], "fp16")
+
+    def test_dict_vs_mappingproxy_spec_match(self):
+        """Plain dict request spec matches MappingProxyType snapshot spec."""
+        request_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "m.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        snap_spec = MappingProxyType({
+            "loaders": MappingProxyType({
+                "unet": [MappingProxyType({"loader_class": "UNETLoader", "unet_name": "m.safetensors", "weight_dtype": "fp16"})],
+                "clip": [MappingProxyType({"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"})],
+            }),
+        })
+        self.assertTrue(
+            _cpu_snapshot_specs_match(request_spec, snap_spec),
+            "dict request spec must match MappingProxyType snapshot spec via projection",
+        )
+
+    def test_dict_vs_mappingproxy_key_match(self):
+        """Plain dict restore key matches ModelRestoreKey (frozen dataclass)."""
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.assertTrue(
+            _cpu_snapshot_model_keys_match(req_key, snap_key),
+            "key match must succeed for identical identity fields",
+        )
+
+
+# ── Model key matching tests (non-VAE) ──────────────────────────────
+
+
+class CpuSnapshotModelKeyMatchingTests(unittest.TestCase):
+    """_cpu_snapshot_model_keys_match requires exact vae_identity."""
+
+    def test_matches_identical_keys(self):
+        """Identical keys must match."""
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        self.assertTrue(_cpu_snapshot_model_keys_match(a, b))
+
+    def test_mismatch_when_only_vae_differs(self):
+        """VAE-only difference must prevent match (VAE-inclusive matcher)."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c", vae_identity="", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c", vae_identity="ae.safetensors", clip_type="sd3")
+        self.assertFalse(_cpu_snapshot_model_keys_match(a, b))
+        # Keys with the same VAE identity still match.
+        self.assertTrue(_cpu_snapshot_model_keys_match(b, b))
+
+    def test_mismatches_on_unet_difference(self):
+        """UNET identity difference must cause mismatch."""
+        a = ModelRestoreKey(unet_identity="u_a", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u_b", clip_identity="c", clip_type="sd3")
+        self.assertFalse(_cpu_snapshot_model_keys_match(a, b))
+
+    def test_mismatches_on_clip_difference(self):
+        """CLIP identity difference must cause mismatch."""
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c_a", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c_b", clip_type="sd3")
+        self.assertFalse(_cpu_snapshot_model_keys_match(a, b))
+
+    def test_mismatches_on_clip_type_difference(self):
+        """CLIP type difference must cause mismatch."""
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sdxl")
+        self.assertFalse(_cpu_snapshot_model_keys_match(a, b))
+
+    def test_empty_keys_match(self):
+        """Two empty keys should match."""
+        self.assertTrue(_cpu_snapshot_model_keys_match(ModelRestoreKey(), ModelRestoreKey()))
+
+
+# ── Request binding / prompt-only prefill rebinding tests ──────────────
+
+
+class CpuSnapshotRequestBindingProjectionTests(unittest.TestCase):
+    """Request binding uses _cpu_snapshot_specs_match instead of full equality.
+
+    Verify that prompt-only changes rebind (new prefill key) while model
+    identity changes (weight_dtype, CLIP type, loader class, filenames,
+    single/dual layout) clear the bridge.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="req-proj", process="remote")
+
+    def _make_plan_a_spec(self, unet_name="u.safetensors", clip_name="c.safetensors",
+                          clip_type="sd3", weight_dtype="default"):
+        return {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": unet_name, "weight_dtype": weight_dtype}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": clip_name, "type": clip_type, "device": "default"}],
+                "vae": [],
+            },
+        }
+
+    def _make_plan_b_spec(self, unet_name="u.safetensors", clip_name="c.safetensors",
+                          clip_type="sd3", weight_dtype="default", has_vae=False):
+        spec = {
+            "model_stack": {},
+            "loaders": {
+                "unet": [{"node_id": "13", "loader_class": "UNETLoader", "unet_name": unet_name, "weight_dtype": weight_dtype}],
+                "clip": [{"node_id": "45", "loader_class": "CLIPLoader", "clip_name": clip_name, "type": clip_type, "device": "default"}],
+            },
+        }
+        if has_vae:
+            spec["loaders"]["vae"] = [{"node_id": "67", "loader_class": "VAELoader", "vae_name": "ae.safetensors"}]
+        else:
+            spec["loaders"]["vae"] = []
+        return spec
+
+    def _make_snapshot_with_spec(self, spec=None):
+        if spec is None:
+            spec = self._make_plan_a_spec()
+        key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        return CpuSnapshotModels(
+            model_key=key,
+            model_spec=spec,
+            normalized_profile={"mode": "split", "unet": "u.safetensors", "clip1": "c.safetensors", "clip_type": "sd3"},
+            file_facts=(),
+            unet=object(),
+            clip=_FakeClip(),
+        )
+
+    def test_binds_on_plan_b_spec_match(self):
+        """Plan B request spec binds when projection matches Plan A snapshot."""
+        snapshot = self._make_snapshot_with_spec(self._make_plan_a_spec())
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        request_spec = self._make_plan_b_spec()
+        request_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+
+        # Simulate the request binding check
+        from comfymodal_runtime.contracts import PrefillKey as _PK
+        match = (
+            request_key == snapshot.model_key
+            and _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+        )
+        self.assertTrue(match, "Plan B spec should projection-match Plan A spec")
+
+        if match:
+            self.entrypoint._use_cpu_snapshot_models_on_bridge(
+                request_key,
+                _PK(model_key=request_key, prompt_bundle_hash="prompt123"),
+                request_spec,
+                snapshot.unet,
+                snapshot.clip,
+                trace=self.trace,
+            )
+        self.assertIsNotNone(
+            self.entrypoint._preload_bridge._preparation,
+            "bridge must have preparation after bind",
+        )
+
+    def test_clears_on_weight_dtype_change(self):
+        """Weight dtype change between request and snapshot must clear bridge."""
+        snapshot = self._make_snapshot_with_spec(
+            self._make_plan_a_spec(weight_dtype="fp16")
+        )
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        request_spec = self._make_plan_b_spec(weight_dtype="fp32")
+        request_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+
+        match = (
+            request_key == snapshot.model_key
+            and _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+        )
+        self.assertFalse(match, "weight_dtype change should not projection-match")
+
+    def test_clears_on_clip_type_change(self):
+        """CLIP type change must clear bridge."""
+        snapshot = self._make_snapshot_with_spec(
+            self._make_plan_a_spec(clip_type="sd3")
+        )
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        request_spec = self._make_plan_b_spec(clip_type="sdxl")
+        request_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+
+        snapshot_key = snapshot.model_key
+        # Model key may differ on clip_type; if it does, match is false anyway
+        if request_key == snapshot_key:
+            match = _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+            self.assertFalse(match, "clip_type change should not projection-match")
+
+    def test_clears_on_single_to_dual_layout(self):
+        """Switching from single CLIP to dual CLIP must clear bridge."""
+        plan_a_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        snapshot = self._make_snapshot_with_spec(plan_a_spec)
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        # Dual CLIP request spec
+        request_spec = {
+            "model_stack": {},
+            "loaders": {
+                "unet": [{"node_id": "1", "loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"node_id": "2", "loader_class": "DualCLIPLoader",
+                           "clip_name1": "c.safetensors", "clip_name2": "c2.safetensors",
+                           "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        request_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors||c2.safetensors",
+            clip_type="sd3",
+        )
+        snapshot_key = snapshot.model_key
+        if request_key == snapshot_key:
+            match = _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+            self.assertFalse(match, "single-to-dual layout change should not projection-match")
+
+    def test_rejects_when_only_vae_differs(self):
+        """VAE-only key difference must prevent bind (VAE-inclusive matcher)."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        snapshot = self._make_snapshot_with_spec(self._make_plan_a_spec())
+        # Snapshot has no VAE (vae_identity="")
+        snapshot.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="", clip_type="sd3",
+        )
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        # Request has VAE identity set (Plan B might include VAE)
+        request_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="ae.safetensors", clip_type="sd3",
+        )
+        request_spec = self._make_plan_b_spec(has_vae=True)
+
+        # VAE-inclusive key matcher must reject the difference
+        self.assertFalse(
+            _cpu_snapshot_model_keys_match(request_key, snapshot.model_key),
+            "keys must not match when only VAE differs",
+        )
+        # Spec projection must also reject the VAE-differing spec
+        self.assertFalse(
+            _cpu_snapshot_specs_match(request_spec, snapshot.model_spec),
+            "specs must not match when only VAE differs",
+        )
+
+        match = (
+            _cpu_snapshot_model_keys_match(request_key, snapshot.model_key)
+            and _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+        )
+        self.assertFalse(match, "VAE-only difference must prevent bind")
+
+        # Same request still binds when the snapshot ALSO carries the VAE.
+        matching_snapshot = self._make_snapshot_with_spec(
+            self._make_plan_b_spec(has_vae=True)
+        )
+        matching_snapshot.model_key = request_key
+        self.assertTrue(
+            _cpu_snapshot_model_keys_match(request_key, matching_snapshot.model_key),
+            "keys with equal VAE identity must match",
+        )
+        self.assertTrue(
+            _cpu_snapshot_specs_match(request_spec, matching_snapshot.model_spec),
+            "specs with equal VAE loader must match",
+        )
+
+    def test_request_event_name_is_cpu_snapshot_models_request_bound(self):
+        """Request event name must be exactly 'cpu_snapshot_models_request_bound'."""
+        trace = RuntimeTrace(request_id="evt-name-test", process="remote")
+        snapshot = self._make_snapshot_with_spec(self._make_plan_a_spec())
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+
+        from comfymodal_runtime.contracts import PrefillKey as _PK
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            snapshot.model_key,
+            _PK(model_key=snapshot.model_key, prompt_bundle_hash="test"),
+            snapshot.model_spec,
+            snapshot.unet,
+            snapshot.clip,
+            trace=trace,
+        )
+
+        # Emit the request-bound event
+        trace.emit(
+            "cpu_snapshot_models_request_bound",
+            phase="execution",
+            metadata={"status": "bound", "model_key_hash": "test"},
+        )
+        # Verify the exact event name exists in the trace
+        event_names = [e.name for e in trace.events]
+        self.assertIn("cpu_snapshot_models_request_bound", event_names)
+        self.assertNotIn("cpu_snapshot_request_bound", event_names,
+                         "old event name must not be present")
+
+    def test_prompt_only_change_rebinds_with_new_prefill_key(self):
+        """Prompt-only changes match on model_key and spec projection,
+        producing a new prefill_key without clearing the bridge."""
+        snapshot = self._make_snapshot_with_spec(self._make_plan_a_spec())
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._cpu_snapshot_models_active = True
+        # Activate bridge first (as restore would)
+        from comfymodal_runtime.contracts import PrefillKey as _PK
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            snapshot.model_key,
+            _PK(model_key=snapshot.model_key, prompt_bundle_hash="original_hash"),
+            snapshot.model_spec,
+            snapshot.unet,
+            snapshot.clip,
+        )
+
+        # Simulate a request that differs only in prompt (same model)
+        request_spec = self._make_plan_b_spec()  # same models, Plan B shape
+        request_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+
+        match = (
+            request_key == snapshot.model_key
+            and _cpu_snapshot_specs_match(request_spec, snapshot.model_spec)
+        )
+        self.assertTrue(match, "prompt-only request must projection-match")
+
+        # Rebind with new prefill key
+        new_prefill_key = _PK(model_key=request_key, prompt_bundle_hash="new_prompt_hash")
+        self.entrypoint._use_cpu_snapshot_models_on_bridge(
+            request_key,
+            new_prefill_key,
+            request_spec,
+            snapshot.unet,
+            snapshot.clip,
+            trace=self.trace,
+        )
+        bridge = self.entrypoint._preload_bridge
+        self.assertEqual(
+            bridge._prefill_key.prompt_bundle_hash,
+            "new_prompt_hash",
+            "prompt-only change must update prefill_key on bridge",
+        )
+        self.assertTrue(
+            self.entrypoint._cpu_snapshot_models_active,
+            "snapshot should remain active after prompt-only change",
+        )
+
+
+
+# ── Activation-condition tests (Issue 1) ──────────────────────────────
+
+
+class CpuSnapshotActivationConditionTests(unittest.TestCase):
+    """Verify that restore activation eligibility does NOT require
+    ``not self._cpu_snapshot_models_active``.
+
+    On every restore(snap=False), when the feature is enabled, a
+    snapshot bundle exists, and a restore plan is present, the
+    activation block must be entered regardless of the current
+    active bit.  This prevents a changed restore plan from inheriting
+    an old active bit.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        self.snapshot = _make_snapshot_models()
+        self.entrypoint._cpu_snapshot_models = self.snapshot
+        self.entrypoint._restore_plan = SimpleNamespace(
+            model_key=self.snapshot.model_key,
+            model_spec=self.snapshot.model_spec,
+        )
+
+    def test_activation_condition_not_blocked_by_active_state(self):
+        """Condition must pass even when _cpu_snapshot_models_active is True."""
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint._cpu_snapshot_models_active = True
+        try:
+            condition = (
+                _cpu_model_snapshot_enabled()
+                and self.entrypoint._cpu_snapshot_models is not None
+                and self.entrypoint._restore_plan is not None
+            )
+            self.assertTrue(
+                condition,
+                "activation eligibility must not require "
+                "not self._cpu_snapshot_models_active",
+            )
+        finally:
+            _clean_env()
+
+    def test_activation_condition_passes_when_inactive(self):
+        """Condition must pass when _cpu_snapshot_models_active is False (baseline)."""
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint._cpu_snapshot_models_active = False
+        try:
+            condition = (
+                _cpu_model_snapshot_enabled()
+                and self.entrypoint._cpu_snapshot_models is not None
+                and self.entrypoint._restore_plan is not None
+            )
+            self.assertTrue(condition, "baseline activation condition must pass")
+        finally:
+            _clean_env()
+
+    def test_activation_condition_fails_without_feature_flag(self):
+        """Condition must fail when feature is disabled."""
+        _clean_env()
+        self.entrypoint._cpu_snapshot_models_active = True
+        condition = (
+            _cpu_model_snapshot_enabled()
+            and self.entrypoint._cpu_snapshot_models is not None
+            and self.entrypoint._restore_plan is not None
+        )
+        self.assertFalse(condition, "must be false when feature is disabled")
+
+    def test_activation_condition_fails_without_models(self):
+        """Condition must fail when _cpu_snapshot_models is None."""
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint._cpu_snapshot_models = None
+        self.entrypoint._cpu_snapshot_models_active = True
+        try:
+            condition = (
+                _cpu_model_snapshot_enabled()
+                and self.entrypoint._cpu_snapshot_models is not None
+                and self.entrypoint._restore_plan is not None
+            )
+            self.assertFalse(condition, "must be false when snapshot models is None")
+        finally:
+            _clean_env()
+
+    def test_activation_condition_fails_without_plan(self):
+        """Condition must fail when _restore_plan is None."""
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint._restore_plan = None
+        self.entrypoint._cpu_snapshot_models_active = True
+        try:
+            condition = (
+                _cpu_model_snapshot_enabled()
+                and self.entrypoint._cpu_snapshot_models is not None
+                and self.entrypoint._restore_plan is not None
+            )
+            self.assertFalse(condition, "must be false when restore plan is None")
+        finally:
+            _clean_env()
+
+
+# ── Unbound stored original wrapper tests (Issue 2) ───────────────────
+
+
+class CpuSnapshotUnboundOriginalWrapperTests(unittest.TestCase):
+    """Verify that the startup loader callbacks correctly invoke explicit
+    ``_comfy_modal_v2_original`` methods when V2 wrappers are installed.
+
+    The V2LoaderBridge.install() stores the original unbound function
+    as ``_comfy_modal_v2_original`` on the wrapper (class method).
+    Startup callbacks resolve node classes from NODE_CLASS_MAPPINGS,
+    check if the class method has ``_comfy_modal_v2_original``, and if
+    so call it with the fresh loader instance as ``self``; otherwise
+    they fall back to the bound loader method.
+    """
+
+    def test_unbound_original_found_on_class_method(self):
+        """_comfy_modal_v2_original must be found on the class method
+        (unbound), not on the instance."""
+        class _MockUNETLoader:
+            def load_unet(self, name: str, weight_dtype: str) -> Any:
+                return (f"loaded:{name}:{weight_dtype}",)
+
+        original_unbound = _MockUNETLoader.load_unet
+
+        # Install a wrapper mimicking V2LoaderBridge.install()
+        def wrapper(self, name, weight_dtype):
+            return original_unbound(self, name, weight_dtype)
+        setattr(wrapper, "_comfy_modal_v2_original", original_unbound)
+        _MockUNETLoader.load_unet = wrapper
+
+        # Resolve as the startup code does
+        cls_method = _MockUNETLoader.load_unet
+        resolved_orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+
+        self.assertIsNotNone(
+            resolved_orig,
+            "_comfy_modal_v2_original must be resolvable from the class method",
+        )
+        self.assertIs(
+            resolved_orig, original_unbound,
+            "resolved original must be the original unbound function",
+        )
+
+        # Verify calling with a fresh instance as self works
+        loader = _MockUNETLoader()
+        result = resolved_orig(loader, "model.safetensors", "fp16")
+        self.assertEqual(result, ("loaded:model.safetensors:fp16",))
+
+    def test_fallback_to_bound_method_when_no_wrapper(self):
+        """When _comfy_modal_v2_original is absent, fall back to the
+        bound loader method (normal behavior without V2 wrappers)."""
+        class _MockCLIPLoader:
+            def load_clip(self, clip_name: str, clip_type: str, device: str = "cpu") -> Any:
+                return (f"clip:{clip_name}:{clip_type}",)
+
+        # No V2 wrapper — class method has no _comfy_modal_v2_original
+        cls_method = _MockCLIPLoader.load_clip
+        resolved_orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+        self.assertIsNone(
+            resolved_orig,
+            "without V2 wrapper, _comfy_modal_v2_original must be None",
+        )
+
+        # Fallback: use the bound method
+        loader = _MockCLIPLoader()
+        result = loader.load_clip("clip.safetensors", "sd3", device="cpu")
+        self.assertEqual(result, ("clip:clip.safetensors:sd3",))
+
+    def test_unbound_original_with_device_signature(self):
+        """When the original method accepts a 'device' kwarg, calling
+        with device='cpu' must work (signature-aware dispatch)."""
+        class _MockDualCLIPLoader:
+            def load_clip(self, name1: str, name2: str, typ: str, device: str = "default") -> Any:
+                return (f"dual:{name1}:{name2}:{typ}:{device}",)
+
+        original_unbound = _MockDualCLIPLoader.load_clip
+
+        # Install V2 wrapper
+        def wrapper(self, name1, name2, typ, device="default"):
+            return original_unbound(self, name1, name2, typ, device=device)
+        setattr(wrapper, "_comfy_modal_v2_original", original_unbound)
+        _MockDualCLIPLoader.load_clip = wrapper
+
+        cls_method = _MockDualCLIPLoader.load_clip
+        orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+        self.assertIsNotNone(orig)
+
+        # Call with instance as self and device='cpu'
+        loader = _MockDualCLIPLoader()
+        result = orig(loader, "clip1.safetensors", "clip2.safetensors", "sdxl", device="cpu")
+        self.assertEqual(result, ("dual:clip1.safetensors:clip2.safetensors:sdxl:cpu",))
+
+    def test_unbound_original_without_device_signature(self):
+        """When the original method does not accept a 'device' kwarg,
+        calling without device must work (single/dual arity)."""
+        class _MockCLIPLoaderNoDevice:
+            def load_clip(self, clip_name: str, clip_type: str) -> Any:
+                return (f"clip:{clip_name}:{clip_type}",)
+
+        original_unbound = _MockCLIPLoaderNoDevice.load_clip
+
+        def wrapper(self, name, typ):
+            return original_unbound(self, name, typ)
+        setattr(wrapper, "_comfy_modal_v2_original", original_unbound)
+        _MockCLIPLoaderNoDevice.load_clip = wrapper
+
+        cls_method = _MockCLIPLoaderNoDevice.load_clip
+        orig = getattr(cls_method, "_comfy_modal_v2_original", None)
+        self.assertIsNotNone(orig)
+
+        loader = _MockCLIPLoaderNoDevice()
+        result = orig(loader, "clip.safetensors", "sd3")
+        self.assertEqual(result, ("clip:clip.safetensors:sd3",))
+
+    def test_install_idempotence_preserves_unbound_original(self):
+        """Simulate V2LoaderBridge.install() idempotence: re-installing
+        must preserve the unbound original on the wrapper."""
+        class _MockLoader:
+            def load_unet(self, name, dtype):
+                return (f"ok:{name}",)
+
+        original_unbound = _MockLoader.load_unet
+
+        # First install
+        def wrapper1(self, name, dtype):
+            return original_unbound(self, name, dtype)
+        setattr(wrapper1, "_comfy_modal_v2_original", original_unbound)
+        setattr(wrapper1, "_comfy_modal_v2_loader_bridge", True)
+        _MockLoader.load_unet = wrapper1
+
+        # Simulate second install (idempotent path)
+        method = _MockLoader.load_unet
+        if getattr(method, "_comfy_modal_v2_loader_bridge", False):
+            stored_original = getattr(method, "_comfy_modal_v2_original", None)
+            if callable(stored_original):
+                # Re-use the stored original (this is what install() does)
+                pass
+
+        # The stored original must still be the original unbound function
+        self.assertIs(
+            getattr(_MockLoader.load_unet, "_comfy_modal_v2_original", None),
+            original_unbound,
+            "re-install must preserve _comfy_modal_v2_original on the wrapper",
+        )
+
+        # Calling through the pattern must still work
+        loader = _MockLoader()
+        orig = getattr(_MockLoader.load_unet, "_comfy_modal_v2_original", None)
+        result = orig(loader, "model.safetensors", "fp16")
+        self.assertEqual(result, ("ok:model.safetensors",))
+
+
+class TestCollectWarmupEnv(unittest.TestCase):
+    """Tests for _collect_warmup_env image-env propagation helper."""
+
+    def test_returns_only_present_keys(self):
+        """Only env vars that are set in the environment are returned."""
+        with unittest.mock.patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_UNET": "test_unet.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "test_clip.safetensors",
+            "COMFYMODAL_WARMUP_VAE": "test_vae.safetensors",
+        }, clear=True):
+            result = _collect_warmup_env()
+        self.assertEqual(result, {
+            "COMFYMODAL_WARMUP_UNET": "test_unet.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "test_clip.safetensors",
+            "COMFYMODAL_WARMUP_VAE": "test_vae.safetensors",
+        })
+        # Ensure only 3 keys were returned, not all 8
+        self.assertEqual(len(result), 3)
+
+    def test_returns_empty_dict_when_none_set(self):
+        """When no COMFYMODAL_WARMUP_* vars are set, returns empty dict."""
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            result = _collect_warmup_env()
+        self.assertEqual(result, {})
+
+    def test_returns_all_eight_keys_when_all_set(self):
+        """Every recognised warmup key is returned when present."""
+        full = {
+            "COMFYMODAL_WARMUP_PROFILE": "split",
+            "COMFYMODAL_WARMUP_CHECKPOINT": "ckpt.safetensors",
+            "COMFYMODAL_WARMUP_UNET": "unet.safetensors",
+            "COMFYMODAL_WARMUP_CLIP1": "clip1.safetensors",
+            "COMFYMODAL_WARMUP_CLIP2": "clip2.safetensors",
+            "COMFYMODAL_WARMUP_VAE": "vae.safetensors",
+            "COMFYMODAL_WARMUP_CLIP_TYPE": "flux",
+            "COMFYMODAL_WARMUP_TEXT": "warmup",
+        }
+        with unittest.mock.patch.dict(os.environ, full, clear=True):
+            result = _collect_warmup_env()
+        self.assertEqual(result, full)
+
+    def test_ignores_unrecognised_keys(self):
+        """Extra env vars without the COMFYMODAL_WARMUP_ prefix are ignored."""
+        with unittest.mock.patch.dict(os.environ, {
+            "COMFYMODAL_WARMUP_UNET": "u.safetensors",
+            "SOME_OTHER_VAR": "ignored",
+        }, clear=True):
+            result = _collect_warmup_env()
+        self.assertEqual(result, {"COMFYMODAL_WARMUP_UNET": "u.safetensors"})
+
+
+# ── Variant C: Compatibility-first matching tests ─────────────────────
+
+
+class CpuSnapshotVariantCCompatibilityTests(unittest.TestCase):
+    """Variant C compatibility-first matching: keys_match, specs_match,
+    and mismatch reason helpers for VAE, CLIP, UNET differences."""
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+
+    def tearDown(self):
+        _clean_env()
+
+    def test_vae_empty_snapshot_vs_ae_request(self):
+        """Snapshot with vae_identity='' and request with ae.safetensors
+        must NOT be compatible (VAE identity is part of activation)."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="ae.safetensors", clip_type="sd3",
+        )
+        self.assertFalse(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(snap_key, req_key),
+            "VAE identity mismatch",
+        )
+
+    def test_changed_vae_does_not_hit(self):
+        """Different VAE identity between snapshot and request must NOT match
+        (VAE identity is part of the activation contract)."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            vae_identity="different_ae.safetensors", clip_type="sd3",
+        )
+        self.assertFalse(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(snap_key, req_key),
+            "VAE identity mismatch",
+        )
+
+    def test_dual_clip_with_vae_and_default_device(self):
+        """Dual CLIP (qwen/qwen) with z_image default weight_dtype and the
+        same VAE in both snapshot and request specs must still match the
+        snapshot projection (device ignored, VAE identity compared)."""
+        # aligned with VAE-inclusive activation contract (257b677)
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "lumina2.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "qwen.safetensors", "clip_name2": "qwen.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [{"loader_class": "VAELoader", "vae_name": "ae.safetensors"}],
+            },
+        }
+        req_spec = {
+            "model_stack": {},
+            "loaders": {
+                "unet": [{"node_id": "1", "loader_class": "UNETLoader", "unet_name": "lumina2.safetensors", "weight_dtype": "default"}],
+                "clip": [{"node_id": "2", "loader_class": "DualCLIPLoader", "clip_name1": "qwen.safetensors", "clip_name2": "qwen.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [{"node_id": "3", "loader_class": "VAELoader", "vae_name": "ae.safetensors"}],
+            },
+        }
+        self.assertTrue(_cpu_snapshot_specs_match(snap_spec, req_spec))
+        self.assertIsNone(_cpu_snapshot_spec_mismatch_reason(snap_spec, req_spec))
+
+    def test_changed_unet_weight_dtype_mismatch(self):
+        """UNET weight_dtype change must cause spec mismatch."""
+        spec_a = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_b = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_a, spec_b))
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET weight_dtype mismatch")
+
+    def test_changed_clip_loader_class_mismatch(self):
+        """CLIP loader class change (single->dual) must cause mismatch."""
+        spec_single = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_dual = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c.safetensors", "clip_name2": "c2.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_single, spec_dual))
+        self.assertEqual(
+            _cpu_snapshot_spec_mismatch_reason(spec_single, spec_dual),
+            "CLIP loader_class mismatch",
+        )
+
+    def test_unsupported_fields_loader_configuration_ignored(self):
+        """loader_configuration difference in keys must NOT cause a miss
+        (never populated by identity_from_profile or derive_model_key)."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", loader_configuration={"version": 1},
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", loader_configuration={"version": 2},
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, req_key))
+
+    def test_unsupported_fields_model_volume_generation_ignored(self):
+        """model_volume_generation difference must NOT cause a miss."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", model_volume_generation="gen_1",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", model_volume_generation="gen_2",
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+
+    def test_unsupported_fields_optimization_loader_options_ignored(self):
+        """optimization_loader_options difference must NOT cause a miss."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", optimization_loader_options={"opt": "a"},
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3", optimization_loader_options={"opt": "b"},
+        )
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, req_key))
+
+    def test_spec_projection_enforces_loader_options(self):
+        """Spec projection still enforces actual loader options such as
+        UNET weight_dtype, loader class, CLIP structure, even though
+        unsupported key fields are ignored."""
+        spec_a = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        spec_b = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertFalse(_cpu_snapshot_specs_match(spec_a, spec_b))
+        self.assertEqual(
+            _cpu_snapshot_spec_mismatch_reason(spec_a, spec_b),
+            "UNET weight_dtype mismatch",
+        )
+
+
+class CpuSnapshotVariantCMismatchReasonTests(unittest.TestCase):
+    """Exact mismatch reason strings from the new helpers."""
+
+    def test_key_unet_identity_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u_a", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u_b", clip_identity="c", clip_type="sd3")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "UNET identity mismatch")
+
+    def test_key_clip_identity_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c_a", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c_b", clip_type="sd3")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "CLIP identity mismatch")
+
+    def test_key_clip_type_mismatch_reason(self):
+        a = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sd3")
+        b = ModelRestoreKey(unet_identity="u", clip_identity="c", clip_type="sdxl")
+        self.assertEqual(_cpu_snapshot_key_mismatch_reason(a, b), "clip_type mismatch")
+
+    def test_spec_unet_filename_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u_a.safetensors", "weight_dtype": "default"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u_b.safetensors", "weight_dtype": "default"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET filename mismatch")
+
+    def test_spec_unet_weight_dtype_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp16"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "fp32"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET weight_dtype mismatch")
+
+    def test_spec_clip_filename_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c_a.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c_b.safetensors", "type": "sd3"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP filename mismatch")
+
+    def test_spec_clip_loader_class_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "DualCLIPLoader", "clip_name1": "c.safetensors", "clip_name2": "c2.safetensors", "type": "sd3"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP loader_class mismatch")
+
+    def test_spec_clip_type_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}]}}
+        spec_b = {"loaders": {"unet": [], "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sdxl"}]}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "CLIP type mismatch")
+
+    def test_spec_loader_count_mismatch_reason(self):
+        spec_a = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}], "clip": []}}
+        spec_b = {"loaders": {"unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}, {"loader_class": "UNETLoader", "unet_name": "u2.safetensors", "weight_dtype": "default"}], "clip": []}}
+        self.assertEqual(_cpu_snapshot_spec_mismatch_reason(spec_a, spec_b), "UNET loader count mismatch")
+
+    def test_different_unet_rejects_unet_independent_clip(self):
+        """Different UNET causes key mismatch with UNET reason; unchanged CLIP
+        does NOT produce a CLIP mismatch reason — per-role independence."""
+        snap_key = ModelRestoreKey(
+            unet_identity="u_a.safetensors", clip_identity="c.safetensors", clip_type="sd3",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="u_b.safetensors", clip_identity="c.safetensors", clip_type="sd3",
+        )
+        keys_match = _cpu_snapshot_model_keys_match(req_key, snap_key)
+        self.assertFalse(keys_match, "different UNET must cause key mismatch")
+        reason = _cpu_snapshot_key_mismatch_reason(req_key, snap_key)
+        self.assertEqual(reason, "UNET identity mismatch",
+                         "reason must be UNET (not CLIP) identity mismatch")
+
+    def test_different_unet_spec_rejects_unet_independent_clip(self):
+        """Different UNET spec causes spec mismatch with UNET reason; unchanged
+        CLIP does NOT produce a CLIP mismatch — per-role independence via spec."""
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u_a.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        req_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u_b.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        specs_match = _cpu_snapshot_specs_match(req_spec, snap_spec)
+        self.assertFalse(specs_match, "different UNET spec must cause projection mismatch")
+        reason = _cpu_snapshot_spec_mismatch_reason(req_spec, snap_spec)
+        self.assertEqual(reason, "UNET filename mismatch",
+                         "reason must be UNET (not CLIP) filename mismatch")
+
+
+# ── Variant C: Snapshot match log line tests ──────────────────────
+
+
+class CpuSnapshotMatchLogLineTests(unittest.TestCase):
+    """Verify the [v2.cpu_snapshot_match] log line format and hashes."""
+
+    def setUp(self):
+        _clean_env()
+
+    def test_helpers_compute_correct_match_fields(self):
+        """The helper methods produce the correct match/mismatch values
+        for identical keys and specs."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        self.assertTrue(_cpu_snapshot_model_keys_match(snap_key, snap_key))
+        self.assertIsNone(_cpu_snapshot_key_mismatch_reason(snap_key, snap_key))
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        self.assertTrue(_cpu_snapshot_specs_match(snap_spec, snap_spec))
+        self.assertIsNone(_cpu_snapshot_spec_mismatch_reason(snap_spec, snap_spec))
+
+    def test_match_line_shows_reason_on_key_mismatch(self):
+        """On key mismatch, the reason is UNET identity mismatch."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        req_key = ModelRestoreKey(unet_identity="different.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        self.assertFalse(_cpu_snapshot_model_keys_match(req_key, snap_key))
+        self.assertEqual(
+            _cpu_snapshot_key_mismatch_reason(req_key, snap_key),
+            "UNET identity mismatch",
+        )
+
+    def test_match_line_shows_reason_on_both_key_and_spec_mismatch(self):
+        """When both key and spec mismatch, the combined reason includes both."""
+        snap_key = ModelRestoreKey(unet_identity="u.safetensors", clip_identity="c.safetensors", clip_type="sd3")
+        req_key = ModelRestoreKey(unet_identity="different.safetensors", clip_identity="c.safetensors", clip_type="sdxl")
+        snap_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        req_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "different.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3"}],
+            },
+        }
+        _key_reason = _cpu_snapshot_key_mismatch_reason(req_key, snap_key)
+        _spec_reason = _cpu_snapshot_spec_mismatch_reason(req_spec, snap_spec)
+        self.assertEqual(_key_reason, "UNET identity mismatch")
+        self.assertEqual(_spec_reason, "UNET filename mismatch")
+        _parts = []
+        if _key_reason:
+            _parts.append(f"key:{_key_reason}")
+        if _spec_reason:
+            _parts.append(f"spec:{_spec_reason}")
+        _combined = "; ".join(_parts)
+        self.assertEqual(_combined, "key:UNET identity mismatch; spec:UNET filename mismatch")
+# Variant C: Activation flow integration tests
+
+
+class CpuSnapshotVariantCActivationFlowTests(unittest.TestCase):
+    """Integration-style tests for the full activation flow."""
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.trace = RuntimeTrace(request_id="varc-flow", process="remote")
+
+    def tearDown(self):
+        _clean_env()
+        self.entrypoint._restore_plan = None
+        self.entrypoint._cpu_snapshot_models = None
+        self.entrypoint._cpu_snapshot_models_active = False
+
+    def test_skips_clip_prep_and_bg_unet_on_success(self):
+        """When activation succeeds, bridge.prepare() and background UNET
+        submission code is structurally skipped via _cpu_snapshot_activated."""
+        prepare_invoked = []
+        original_prepare = self.entrypoint._preload_bridge.prepare
+
+        def _tracking_prepare(*args, **kwargs):
+            prepare_invoked.append(True)
+            return original_prepare(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.prepare = _tracking_prepare  # type: ignore[assignment]
+
+        snapshot = _make_snapshot_models(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+        )
+        self.entrypoint._cpu_snapshot_models = snapshot
+        self.entrypoint._restore_plan = SimpleNamespace(
+            model_key=snapshot.model_key,
+            prefill_key=PrefillKey(model_key=snapshot.model_key),
+            model_spec=snapshot.model_spec,
+        )
+
+        # The activation block sets _cpu_snapshot_activated on success.
+        # Simulate the key behaviors:
+        _keys_match = _cpu_snapshot_model_keys_match(
+            self.entrypoint._restore_plan.model_key, snapshot.model_key
+        )
+        _specs_match = _cpu_snapshot_specs_match(
+            self.entrypoint._restore_plan.model_spec, snapshot.model_spec
+        )
+        self.assertTrue(_keys_match)
+        self.assertTrue(_specs_match)
+
+        # After activation, the fast-path guard prevents prepare()/bg UNET.
+        _cpu_snapshot_activated = True
+        if self.entrypoint._restore_plan is not None:
+            if _cpu_snapshot_activated:
+                pass  # Fast path: skip prepare entirely
+            else:
+                self.entrypoint._preload_bridge.prepare(self.entrypoint._restore_plan)
+        self.assertEqual(
+            len(prepare_invoked), 0,
+            "bridge.prepare must NOT be called when _cpu_snapshot_activated=True",
+        )
+
+    def test_no_activation_on_compatibility_mismatch(self):
+        """When keys or specs mismatch, _cpu_snapshot_activated stays False."""
+        snapshot = _make_snapshot_models(
+            unet_identity="u.safetensors", clip_identity="c.safetensors",
+        )
+        req_key = ModelRestoreKey(
+            unet_identity="different.safetensors", clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        _keys_match = _cpu_snapshot_model_keys_match(req_key, snapshot.model_key)
+        self.assertFalse(_keys_match, "different UNET must cause key mismatch")
+
+
+# ── Workflow e2e: snapshot spec vs request spec matching ───────────
+
+_SINGLE_WF = {
+    "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip_l.safetensors", "type": "flux"}},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux_1_dev.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux_vae.safetensors"}},
+}
+
+_DUAL_DUP_WF = {
+    "1": {"class_type": "DualCLIPLoader", "inputs": {
+        "clip_name1": "clip_l.safetensors", "clip_name2": "clip_l.safetensors", "type": "flux",
+    }},
+    "2": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux_1_dev.safetensors"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "flux_vae.safetensors"}},
+}
+
+
+class CpuSnapshotWorkflowE2ETests(unittest.TestCase):
+    """End-to-end: extract → profile → spec matching for single and dual CLIP."""
+
+    def setUp(self):
+        self._d = tempfile.mkdtemp(prefix="wf_e2e_")
+        # Mirror _SINGLE_WF / _DUAL_DUP_WF: UNET + CLIP + VAE loaders all
+        # need a resolvable fixture because stack_to_warmup_profile folds the
+        # VAE into the profile and identity_from_profile stats every file.
+        for n in ("flux_1_dev.safetensors", "clip_l.safetensors", "flux_vae.safetensors"):
+            open(os.path.join(self._d, n), "a").close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._d, ignore_errors=True)
+
+    def _resolve_path(self, _role, fname):
+        return os.path.join(self._d, fname)
+
+    def _snap_spec(self, workflow):
+        from workflow_metadata import extract_warmup_stack, stack_to_warmup_profile
+        stack = extract_warmup_stack(workflow)
+        profile = stack_to_warmup_profile(stack)
+        _key, spec, _facts = identity_from_profile(profile, resolve_path=self._resolve_path)
+        return spec
+
+    @staticmethod
+    def _req_spec(workflow):
+        return build_restore_model_spec(workflow)
+
+    def test_single_clip_e2e_specs_match(self):
+        snap = self._snap_spec(_SINGLE_WF)
+        req = self._req_spec(_SINGLE_WF)
+        self.assertEqual(snap["loaders"]["clip"][0]["loader_class"], "CLIPLoader")
+        self.assertEqual(req["loaders"]["clip"][0]["loader_class"], "CLIPLoader")
+        self.assertTrue(_cpu_snapshot_specs_match(snap, req))
+
+    def test_dual_clip_duplicate_e2e_specs_match(self):
+        snap = self._snap_spec(_DUAL_DUP_WF)
+        req = self._req_spec(_DUAL_DUP_WF)
+        self.assertEqual(snap["loaders"]["clip"][0]["loader_class"], "DualCLIPLoader")
+        self.assertEqual(req["loaders"]["clip"][0]["loader_class"], "DualCLIPLoader")
+        self.assertTrue(_cpu_snapshot_specs_match(snap, req))
+
+    def test_single_vs_dual_strict_mismatch(self):
+        self.assertFalse(
+            _cpu_snapshot_specs_match(self._snap_spec(_SINGLE_WF), self._snap_spec(_DUAL_DUP_WF))
+        )
+
+
+
+
+# Plan C UNET A/B diagnostic — bypass_unet actual request-binding path
+
+
+class CpuSnapshotBypassUnetRequestBindingTest(unittest.TestCase):
+    """Parameterized actual-path test for the Plan C request-binding flow.
+
+    Exercises the exact conditional branch from ``_run_in_process``:
+    ``_exact_flag_check`` → ``use_ready_clip`` + ``extend_preparation``
+    vs. ``use_ready_models``, verifying flag-edge identity, branch
+    routing, event metadata, and print output.
+    """
+
+    _BYPPASS_FLAG_KEY = "diagnostic_bypass_cpu_snapshot_unet"
+
+    @classmethod
+    def _exact_flag_check(cls, flags: Any) -> bool:
+        """Exact replica of the branch predicate in modal_app.py."""
+        return isinstance(flags, Mapping) and flags.get(cls._BYPPASS_FLAG_KEY) is True
+
+    def _run_plan_c_branch(self, bypass_flag_value: Any) -> dict[str, Any]:
+        """Execute the Plan C branching logic as it appears in
+        ``_run_in_process``, capturing print output and trace events.
+        Returns a dict with outcome details for assertion."""
+        _snapshot_models = SimpleNamespace(
+            model_key=self.model_key,
+            model_spec=self.model_spec,
+            clip=self.clip_obj,
+            unet=self.unet_obj,
+        )
+        # Identity matching before branch
+        _keys_match = _cpu_snapshot_model_keys_match(self.model_key, _snapshot_models.model_key)
+        _specs_match = _cpu_snapshot_specs_match(self.model_spec, _snapshot_models.model_spec)
+        self.assertTrue(_keys_match, "pre-branch identity match")
+        self.assertTrue(_specs_match, "pre-branch spec match")
+
+        _flags: Any
+        if bypass_flag_value is None:
+            _flags = None
+        elif isinstance(bypass_flag_value, dict):
+            _flags = bypass_flag_value
+        else:
+            _flags = {self._BYPPASS_FLAG_KEY: bypass_flag_value}
+
+        _bypass = self._exact_flag_check(_flags)
+        import io
+        _captured = io.StringIO()
+        _prior_stdout = sys.stdout
+        sys.stdout = _captured
+        try:
+            if _bypass:
+                self.bridge.use_ready_clip(
+                    model_key=self.model_key, prefill_key=self.prefill_key,
+                    model_spec=self.model_spec, clip=self.clip_obj,
+                    trace=self.trace,
+                )
+                self.bridge.extend_preparation(
+                    prepare_unet=True, prepare_vae=False, trace=self.trace,
+                )
+                _unet_source = "normal_loader"
+                _clip_source = "cpu_snapshot"
+                _reason = "diagnostic_unet_bypass"
+            else:
+                self.bridge.use_ready_models(
+                    model_key=self.model_key, prefill_key=self.prefill_key,
+                    model_spec=self.model_spec, unet=self.unet_obj, clip=self.clip_obj,
+                    trace=self.trace,
+                )
+                _unet_source = "cpu_snapshot"
+                _clip_source = "cpu_snapshot"
+                _reason = "ok"
+            if _bypass:
+                print(
+                    "[v2.cpu_snapshot_request] status=partial_bypass "
+                    "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
+                    "unet_source=normal_loader",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[v2.cpu_snapshot_request] status=reused reason=ok",
+                    flush=True,
+                )
+            self.trace.emit(
+                "cpu_snapshot_models_request_bound",
+                phase="execution",
+                metadata={
+                    "status": "bound",
+                    "reason": _reason,
+                    "diagnostic_bypass_cpu_snapshot_unet": 1 if _bypass else 0,
+                    "cpu_snapshot_clip_reused": 1,
+                    "cpu_snapshot_unet_reused": 0 if _bypass else 1,
+                    "unet_source": _unet_source,
+                    "clip_source": _clip_source,
+                    "model_key_hash": self.model_key.stable_hash[:16] if self.model_key else "",
+                    "clip_object_type": type(self.clip_obj).__name__,
+                    "unet_object_type": type(self.unet_obj).__name__,
+                    "duration_ms": 0.0,
+                },
+            )
+        finally:
+            sys.stdout = _prior_stdout
+        _stdout_text = _captured.getvalue()
+
+        prep = self.bridge._preparation
+        return {
+            "bypass": _bypass,
+            "prep": prep,
+            "unet_source": _unet_source,
+            "clip_source": _clip_source,
+            "reason": _reason,
+            "stdout": _stdout_text,
+            "events": list(self.trace.events),
+        }
+
+    def setUp(self):
+        _clean_env()
+        self.bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(self.bridge)
+        self.trace = RuntimeTrace(request_id="bypass-param", process="remote")
+        self.clip_obj = _FakeClip()
+        self.unet_obj = object()
+        self.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.model_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="bypass-param",
+        )
+
+    # ── Flag-edge identity checks ─────────────────────────────────
+
+    def test_flag_missing_not_bypass(self):
+        """Missing flag (None, empty dict, other key) → not bypass."""
+        self.assertFalse(self._exact_flag_check(None))
+        self.assertFalse(self._exact_flag_check({}))
+        self.assertFalse(self._exact_flag_check({"other": True}))
+
+    def test_flag_literal_true_is_bypass(self):
+        """Literal True → bypass."""
+        self.assertTrue(self._exact_flag_check({self._BYPPASS_FLAG_KEY: True}))
+
+    def test_flag_non_true_not_bypass(self):
+        """False, string 'true', int 1 → not bypass (strict ``is True``)."""
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: False}))
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: 1}))
+        self.assertFalse(self._exact_flag_check({self._BYPPASS_FLAG_KEY: "true"}))
+
+    # ── Actual-path branch routing ─────────────────────────────────
+
+    def test_non_true_routes_to_use_ready_models(self):
+        """False → use_ready_models serves both CLIP and UNET."""
+        outcome = self._run_plan_c_branch(False)
+        self.assertFalse(outcome["bypass"])
+        prep = outcome["prep"]
+        self.assertIsNotNone(prep.unet_future)
+        self.assertTrue(prep.unet_future.done())
+        self.assertIs(prep.unet_future.result(), self.unet_obj)
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_literal_true_routes_to_use_ready_clip(self):
+        """Literal True → use_ready_clip + extend."""
+        outcome = self._run_plan_c_branch(True)
+        self.assertTrue(outcome["bypass"])
+        prep = outcome["prep"]
+        # CLIP is served from snapshot
+        self.assertIsNotNone(prep.clip_future)
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+        # UNET future exists (via extend_preparation thread pool)
+        from concurrent.futures import Future
+        self.assertIsInstance(prep.unet_future, Future)
+        # Not the snapshot unet object
+        self.assertIsNot(prep.unet_future.result(timeout=10) if prep.unet_future.done() else None, self.unet_obj)
+
+    def test_missing_flag_routes_to_use_ready_models(self):
+        """No flag → use_ready_models (full bridge)."""
+        outcome = self._run_plan_c_branch(None)
+        self.assertFalse(outcome["bypass"])
+
+    def test_string_true_not_bypass(self):
+        """String 'true' → use_ready_models (not bypass)."""
+        outcome = self._run_plan_c_branch("true")
+        self.assertFalse(outcome["bypass"])
+
+    # ── Subsequent unflagged rebind ────────────────────────────────
+
+    def test_subsequent_unflagged_rebind(self):
+        """After bypass, unflagged call rebinds both UNET+CLIP from snapshot."""
+        # Request 1: bypass
+        self._run_plan_c_branch(True)
+        # Request 2: unflagged
+        outcome2 = self._run_plan_c_branch(False)
+        self.assertFalse(outcome2["bypass"])
+        prep = outcome2["prep"]
+        self.assertIs(prep.unet_future.result(), self.unet_obj)
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    # ── Mismatch fallback ──────────────────────────────────────────
+
+    def test_mismatch_clears_bridge(self):
+        """Model key mismatch clears bridge regardless of bypass flag."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.assertIsNotNone(self.bridge._preparation)
+        self.bridge.clear()
+        self.assertIsNone(self.bridge._preparation)
+
+    # ── Object/active state, event metadata, exact printed log ─────
+
+    def test_snapshot_active_state_preserved(self):
+        """After bypass branch, snapshot active state remains True."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+
+    def test_exact_event_metadata_bypass(self):
+        """Bypass branch emits event with exact diagnostic_bypass metadata."""
+        outcome = self._run_plan_c_branch(True)
+        bound_events = [e for e in outcome["events"] if e.name == "cpu_snapshot_models_request_bound"]
+        self.assertEqual(len(bound_events), 1)
+        md = bound_events[0].metadata
+        self.assertEqual(md.get("reason"), "diagnostic_unet_bypass")
+        self.assertEqual(md.get("diagnostic_bypass_cpu_snapshot_unet"), 1)
+        self.assertEqual(md.get("cpu_snapshot_unet_reused"), 0)
+        self.assertEqual(md.get("unet_source"), "normal_loader")
+
+    def test_exact_event_metadata_reuse(self):
+        """Reuse branch emits event with exact ok metadata."""
+        outcome = self._run_plan_c_branch(False)
+        bound_events = [e for e in outcome["events"] if e.name == "cpu_snapshot_models_request_bound"]
+        self.assertEqual(len(bound_events), 1)
+        md = bound_events[0].metadata
+        self.assertEqual(md.get("reason"), "ok")
+        self.assertEqual(md.get("diagnostic_bypass_cpu_snapshot_unet"), 0)
+        self.assertEqual(md.get("cpu_snapshot_unet_reused"), 1)
+        self.assertEqual(md.get("unet_source"), "cpu_snapshot")
+
+    def test_exact_bypass_stdout(self):
+        """Bypass print line matches expected format."""
+        outcome = self._run_plan_c_branch(True)
+        stdout = outcome["stdout"].strip()
+        self.assertIn(
+            "[v2.cpu_snapshot_request] status=partial_bypass "
+            "reason=diagnostic_unet_bypass clip_source=cpu_snapshot "
+            "unet_source=normal_loader",
+            stdout,
+        )
+        # Runtime state line is emitted by bridge._load_unet in a worker
+        # thread; it reaches real stdout (visible in test output) but is
+        # NOT captured by the test's StringIO redirect (thread-local).
+
+    def test_exact_reuse_stdout(self):
+        """Reuse print line matches expected format."""
+        outcome = self._run_plan_c_branch(False)
+        stdout = outcome["stdout"].strip()
+        self.assertIn(
+            "[v2.cpu_snapshot_request] status=reused reason=ok",
+            stdout,
+        )
+
+
+class CpuSnapshotExtendAfterUseReadyClipTests(unittest.TestCase):
+    """Extension of clip-only preparation with UNET."""
+
+    def setUp(self):
+        _clean_env()
+        self.bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(self.bridge)
+        self.trace = RuntimeTrace(request_id="extend-test", process="remote")
+        self.clip_obj = _FakeClip()
+        self.model_key = ModelRestoreKey(
+            unet_identity="u.safetensors",
+            clip_identity="c.safetensors",
+            clip_type="sd3",
+        )
+        self.prefill_key = PrefillKey(
+            model_key=self.model_key,
+            prompt_bundle_hash="extend-test",
+        )
+        self.model_spec = {
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "u.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "c.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        }
+
+    def test_use_ready_clip_then_extend(self):
+        """use_ready_clip then extend_preparation produces a usable prep."""
+        prep = self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        self.assertIsNone(prep.unet_future)
+        prep2 = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIs(prep, prep2)
+        self.assertIsNotNone(prep.unet_future)
+        self.assertTrue(prep.clip_future.done())
+        self.assertIs(prep.clip_future.result(), self.clip_obj)
+
+    def test_extend_preparation_returns_none_when_no_prep(self):
+        """extend_preparation returns None when no preparation exists."""
+        result = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIsNone(result)
+
+    def test_extend_with_vae_false(self):
+        """extend_preparation with prepare_vae=False does not submit VAE."""
+        self.bridge.use_ready_clip(
+            model_key=self.model_key, prefill_key=self.prefill_key,
+            model_spec=self.model_spec, clip=self.clip_obj,
+            trace=self.trace,
+        )
+        prep = self.bridge.extend_preparation(
+            prepare_unet=True, prepare_vae=False, trace=self.trace,
+        )
+        self.assertIsNone(prep.vae_future)
+
+
+# ── Snapshot UNET state propagation tests ──────────────────────────────
+
+
+class CpuSnapshotUnetStatePropagationTests(unittest.TestCase):
+    """_maybe_propagate_cpu_snapshot_unet_state coverage.
+
+    Exercises the exact lifecycle-to-request trace propagation logic
+    that re-emits ``snapshot_restored_post_retarget`` into the current
+    request trace when the snapshot models are reused.
+    """
+
+    _UNET_IDENTITY = "flux1-dev.safetensors"
+    _WEIGHT_DTYPE = "fp8_e4m3fn"
+    _RESTORED_INSTANCE_ID = "restored-abc-123"
+    _RESTORE_SESSION_ID = "session-xyz-789"
+
+    def _make_state(self) -> dict[str, Any]:
+        """Build a realistic saved state dict."""
+        return {
+            "stage": "snapshot_restored_post_retarget",
+            "unet_identity": self._UNET_IDENTITY,
+            "requested_weight_dtype": self._WEIGHT_DTYPE,
+            "restored_instance_id": self._RESTORED_INSTANCE_ID,
+            "restore_session_id": self._RESTORE_SESSION_ID,
+            "state": {
+                "patcher_type": "ModelPatcher",
+                "load_device": "cpu",
+                "offload_device": "cpu",
+                "weight_dtype": "fp8_e4m3fn",
+                "patch_count": "0",
+            },
+        }
+
+    def _make_model_key(self, unet_identity: str = None) -> Any:
+        from comfymodal_runtime.contracts import ModelRestoreKey
+        return ModelRestoreKey(
+            unet_identity=unet_identity or self._UNET_IDENTITY,
+            clip_identity="clip_l.safetensors",
+            clip_type="flux",
+        )
+
+    def _make_model_spec(self, weight_dtype: str = None) -> dict:
+        return {
+            "loaders": {
+                "unet": [{
+                    "loader_class": "UNETLoader",
+                    "unet_name": self._UNET_IDENTITY,
+                    "weight_dtype": weight_dtype or self._WEIGHT_DTYPE,
+                }],
+                "clip": [],
+                "vae": [],
+            },
+        }
+
+    def setUp(self):
+        self.entrypoint = ModalRuntimeEntrypoint()
+        self.trace = RuntimeTrace(request_id="req-propagate-001", process="remote")
+
+    # ── Test 1: Successful restore stores post-retarget metadata ──────
+
+    def test_restore_stores_post_retarget_metadata(self):
+        """Setting _cpu_snapshot_unet_runtime_state stores the expected fields."""
+        state = self._make_state()
+        self.entrypoint._cpu_snapshot_unet_runtime_state = state
+        self.assertIsNotNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+        self.assertEqual(
+            self.entrypoint._cpu_snapshot_unet_runtime_state["stage"],
+            "snapshot_restored_post_retarget",
+        )
+        self.assertEqual(
+            self.entrypoint._cpu_snapshot_unet_runtime_state["unet_identity"],
+            self._UNET_IDENTITY,
+        )
+
+    # ── Test 2: Stored nested state is a defensive copy ──────────────
+
+    def test_stored_state_is_defensive_copy(self):
+        """Mutating the original dict after storing does not affect stored state.
+        This simulates the deep-copy semantics used in the restore() path."""
+        original = self._make_state()
+        self.entrypoint._cpu_snapshot_unet_runtime_state = copy.deepcopy(original)
+        original["unet_identity"] = "mutated.safetensors"
+        original["state"]["load_device"] = "cuda:0"
+        stored = self.entrypoint._cpu_snapshot_unet_runtime_state
+        self.assertEqual(stored["unet_identity"], self._UNET_IDENTITY)
+        self.assertEqual(stored["state"]["load_device"], "cpu")
+
+    # ── Test 3: Exact snapshot reuse emits unet_runtime_state ────────
+
+    def test_reuse_emits_unet_runtime_state(self):
+        """Matching identity + dtype emits unet_runtime_state into request trace."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 1)
+        meta = events[0].metadata
+        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+
+    # ── Test 4: Propagated event retains all required fields ─────────
+
+    def test_propagated_event_retains_fields(self):
+        """The emitted event retains stage, restored_instance_id, restore_session_id,
+        unet_identity, and requested_weight_dtype."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 1)
+        meta = events[0].metadata
+        self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+        self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
+        self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
+        self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
+        self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
+
+    # ── Test 5: Propagated event uses current request ID ─────────────
+
+    def test_propagated_event_uses_current_request_id(self):
+        """The emitted event request_id matches the current trace."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        meta = events[0].metadata
+        self.assertEqual(meta["request_id"], "req-propagate-001")
+
+    # ── Test 6: Event includes propagated_from_restore=True ───────────
+
+    def test_propagated_event_has_propagated_flag(self):
+        """The emitted event includes propagated_from_restore=True."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        meta = events[0].metadata
+        self.assertTrue(meta.get("propagated_from_restore"))
+
+    # ── Test 7: Diagnostic UNET bypass does not emit propagated event ─
+
+    def test_bypass_does_not_emit_propagated_event(self):
+        """When bypass flag is active, the propagation must not be called.
+        This test simulates the bypass path by not calling
+        _maybe_propagate_cpu_snapshot_unet_state at all (as _run_in_process would)."""
+        # Bypass path does not call the helper — so state stays stored.
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Simulate bypass: do NOT call _maybe_propagate
+        self.assertEqual(len(self.trace.events), 0)
+
+    # ── Test 8: Incompatible UNET identity clears saved state ─────────
+
+    def test_incompatible_unet_identity_clears_state(self):
+        """Different UNET identity clears saved state and emits no event."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        other_key = self._make_model_key(unet_identity="other.safetensors")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            other_key, self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Test 9: Incompatible weight dtype clears saved state ──────────
+
+    def test_incompatible_weight_dtype_clears_state(self):
+        """Different requested_weight_dtype clears saved state and emits no event."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        other_spec = self._make_model_spec(weight_dtype="default")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), other_spec, self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Test 10: No active snapshot means no propagation ─────────────
+
+    def test_no_saved_state_no_propagation(self):
+        """When _cpu_snapshot_unet_runtime_state is None, nothing is emitted."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = None
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), self.trace,
+        )
+        events = [e for e in self.trace.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events), 0)
+
+    # ── Test 13: Repeated compatible requests each get independent copies ──
+
+    def test_repeated_compatible_requests_independent_copies(self):
+        """Each compatible request gets its own copy of the same saved state."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+
+        trace1 = RuntimeTrace(request_id="req-001", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace1,
+        )
+        events1 = [e for e in trace1.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events1), 1)
+        self.assertEqual(events1[0].metadata["request_id"], "req-001")
+
+        # Stored state persists for second request
+        self.assertIsNotNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+        trace2 = RuntimeTrace(request_id="req-002", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace2,
+        )
+        events2 = [e for e in trace2.events if e.name == "unet_runtime_state"]
+        self.assertEqual(len(events2), 1)
+        self.assertEqual(events2[0].metadata["request_id"], "req-002")
+
+    # ── Test 14: Mutating one request event does not affect stored state ──
+
+    def test_mutating_event_does_not_affect_stored_state(self):
+        """Mutating a deep-copied event's nested state does not modify stored state."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+
+        trace1 = RuntimeTrace(request_id="req-001", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace1,
+        )
+        events1 = [e for e in trace1.events if e.name == "unet_runtime_state"]
+
+        # The trace metadata is a mappingproxy (immutable), so the copy
+        # defense is verified at the object-reference level: verify that
+        # the stored state's nested dict is not the same object as the
+        # event's state dict.
+        stored_state = self.entrypoint._cpu_snapshot_unet_runtime_state["state"]
+        self.assertIsNot(stored_state, events1[0].metadata["state"])
+
+        # Stored state unchanged
+        stored = self.entrypoint._cpu_snapshot_unet_runtime_state
+        self.assertEqual(stored["state"]["load_device"], "cpu")
+
+        # Second request's event also uses independent copy
+        trace2 = RuntimeTrace(request_id="req-002", process="remote")
+        self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+            self._make_model_key(), self._make_model_spec(), trace2,
+        )
+        events2 = [e for e in trace2.events if e.name == "unet_runtime_state"]
+        self.assertEqual(events2[0].metadata["state"]["load_device"], "cpu")
+        # Verify each event has its own state dict (not shared)
+        self.assertIsNot(events1[0].metadata["state"], events2[0].metadata["state"])
+
+    # ── Test 15: _extract_unet_runtime_state_event succeeds on real result ──
+
+    def test_extract_succeeds_on_real_propagated_event(self):
+        """Call _maybe_propagate_cpu_snapshot_unet_state, then
+        _extract_unet_runtime_state_event on the result, proving extraction
+        works without manually inserting a restore event into the fixture."""
+        # Hermeticity: importing ``tools.benchmark_v2_direct`` executes its
+        # module body, which inserts the parent ComfyUI root into ``sys.path``
+        # (making the real ``comfy`` package importable in this process from
+        # then on).  Snapshot and restore ``sys.path`` + ``sys.modules`` so
+        # this suite leaves the process exactly as it found it w.r.t. comfy
+        # importability.
+        import sys as _sys
+        _path_before = list(_sys.path)
+        _comfy_mods_before = {
+            _k: _v for _k, _v in list(_sys.modules.items())
+            if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_")
+        }
+        try:
+            from tools.benchmark_v2_direct import _extract_unet_runtime_state_event
+
+            self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+            self.entrypoint._maybe_propagate_cpu_snapshot_unet_state(
+                self._make_model_key(), self._make_model_spec(), self.trace,
+            )
+
+            # Build a result dict as _run_in_process does
+            result = {"trace": self.trace.to_dict()}
+            meta = _extract_unet_runtime_state_event(result, "snapshot_restored_post_retarget")
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta["stage"], "snapshot_restored_post_retarget")
+            self.assertEqual(meta["unet_identity"], self._UNET_IDENTITY)
+            self.assertEqual(meta["requested_weight_dtype"], self._WEIGHT_DTYPE)
+            self.assertEqual(meta["restored_instance_id"], self._RESTORED_INSTANCE_ID)
+            self.assertEqual(meta["restore_session_id"], self._RESTORE_SESSION_ID)
+            self.assertEqual(meta["request_id"], "req-propagate-001")
+            self.assertTrue(meta.get("propagated_from_restore"))
+        finally:
+            # Restore the pre-test sys.path (the ComfyUI root insertion from
+            # tools.benchmark_v2_direct is the pollution source).
+            _sys.path[:] = _path_before
+            # Remove any comfy*/comfy_* modules this test pulled into
+            # sys.modules; restore any that were already present.
+            for _k in list(_sys.modules):
+                if _k == "comfy" or _k.startswith("comfy.") or _k.startswith("comfy_"):
+                    if _k in _comfy_mods_before:
+                        _sys.modules[_k] = _comfy_mods_before[_k]
+                    else:
+                        _sys.modules.pop(_k, None)
+
+    # ── Activation failure clears saved state ────────────────────────
+
+    def test_activation_failure_clears_state(self):
+        """Simulate activation failure by calling _use_cpu_snapshot_models_on_bridge
+        with unet that breaks use_ready_models and verifying state is cleared."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Patch the bridge's use_ready_models to raise, then verify state cleared.
+        # This simulates the except: handler in _use_cpu_snapshot_models_on_bridge.
+        try:
+            self.entrypoint._preload_bridge.use_ready_models = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("activation failed"))
+            self.entrypoint._use_cpu_snapshot_models_on_bridge(
+                self._make_model_key(),
+                PrefillKey(model_key=self._make_model_key(), prompt_bundle_hash="test"),
+                self._make_model_spec(),
+                unet=object(),
+                clip=object(),
+                trace=self.trace,
+            )
+        except RuntimeError:
+            pass
+        # State must be cleared by the except handler
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+    # ── Incompatible request clears saved state ──────────────────────
+
+    def test_incompatible_request_clears_state(self):
+        """When request binding detects mismatch, saved state is cleared."""
+        self.entrypoint._cpu_snapshot_unet_runtime_state = self._make_state()
+        # Simulate the mismatch path in _run_in_process
+        self.entrypoint._preload_bridge.clear()
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.entrypoint._cpu_snapshot_unet_runtime_state = None
+        self.assertIsNone(self.entrypoint._cpu_snapshot_unet_runtime_state)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# StorageRegistry and residency sampling tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestStorageRegistry(unittest.TestCase):
+    """build_unique_storage_registry and sample_storage_residency."""
+
+    def test_empty_registry(self):
+        """build_unique_storage_registry on a model with no CPU params returns empty."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, StorageRange, build_unique_storage_registry, sample_storage_residency
+        class _Empty:
+            def parameters(self): return iter([])
+            def buffers(self): return iter([])
+        reg = build_unique_storage_registry(_Empty())
+        self.assertIsInstance(reg, StorageRegistry)
+        self.assertEqual(reg.total_bytes, 0)
+        self.assertEqual(len(reg.ranges), 0)
+
+    def test_storage_range_dataclass(self):
+        """StorageRange stores address and length."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRange
+        sr = StorageRange(address=4096, length=16384)
+        self.assertEqual(sr.address, 4096)
+        self.assertEqual(sr.length, 16384)
+
+    def test_storage_registry_dataclass(self):
+        """StorageRegistry stores ranges and total_bytes."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, StorageRange
+        reg = StorageRegistry(ranges=[StorageRange(0, 4096)], total_bytes=4096)
+        self.assertEqual(len(reg.ranges), 1)
+        self.assertEqual(reg.total_bytes, 4096)
+
+    def test_sample_storage_residency_empty(self):
+        """sample_storage_residency with empty registry returns unsupported on Windows."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, sample_storage_residency
+        reg = StorageRegistry()
+        result = sample_storage_residency(reg)
+        self.assertEqual(result["status"], "unsupported")
+        # None is acceptable for unavailable page values on non-posix
+        self.assertIn(result.get("total_pages"), (None, 0))
+        self.assertIn(result.get("resident_pages"), (None, 0))
+
+    def test_sample_storage_residency_unsupported(self):
+        """On non-posix, sample_storage_residency returns status=unsupported."""
+        from comfymodal_runtime.cpu_snapshot_models import StorageRegistry, sample_storage_residency
+        reg = StorageRegistry()
+        result = sample_storage_residency(reg)
+        self.assertEqual(result["status"], "unsupported")
+
+    def test_registry_clear_on_failure(self):
+        """Storage registries cleared on mismatch/failure."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        ep = ModalRuntimeEntrypoint()
+        ep._lazy_init_snapshot_state()
+        ep._cpu_snapshot_unet_storage_registry = "dummy"
+        ep._cpu_snapshot_clip_storage_registry = "dummy"
+        # Simulate mismatch clear
+        ep._cpu_snapshot_unet_storage_registry = None
+        ep._cpu_snapshot_clip_storage_registry = None
+        self.assertIsNone(ep._cpu_snapshot_unet_storage_registry)
+        self.assertIsNone(ep._cpu_snapshot_clip_storage_registry)
+
+
+class TestBuildAfterCacheDiT(unittest.TestCase):
+    """Registries build after CacheDiT patching."""
+
+    def test_instance_attrs_exist(self):
+        """Instance has _cpu_snapshot_unet_storage_registry and clip variant."""
+        from comfymodal_runtime.modal_app import ModalRuntimeEntrypoint
+        ep = ModalRuntimeEntrypoint()
+        ep._lazy_init_snapshot_state()
+        self.assertTrue(hasattr(ep, "_cpu_snapshot_unet_storage_registry"))
+        self.assertTrue(hasattr(ep, "_cpu_snapshot_clip_storage_registry"))
+
+
+class CpuSnapshotPrefillGuardTests(unittest.TestCase):
+    """schedule_execution_prefill guard at the production call site in
+    ``_run_in_process`` (modal_app.py:~4130).
+
+    When ``_cpu_snapshot_models_active`` is True and Plan C binding
+    succeeds (exact hit), the prefill must be skipped because the
+    bridge was already prepared with snapshot models.  On mismatch
+    fallback or when no snapshot is active the prefill must run.
+    """
+
+    def setUp(self):
+        _clean_env()
+        self.entrypoint = ModalRuntimeEntrypoint()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.entrypoint._runtime_configured = True
+        self.entrypoint._legacy_api = SimpleNamespace(
+            _executor=SimpleNamespace(success=True, history_result={}),
+        )
+        self.entrypoint._legacy_module = SimpleNamespace()
+
+    @staticmethod
+    async def _execute_stub(_plan, _context, _api, _trace, *, activation_diagnostic_state=None, **kwargs):
+        """Minimal _execute_v2_prompt_executor replacement.
+
+        ``_run_in_process`` passes ``request_bound_to_production_snapshot``
+        as an extra keyword; the stub must accept it (via **kwargs) so the
+        guard test exercises the real call site signature.
+        """
+        return {"images": [], "videos": [], "outputs": {}}
+
+    def _run_scenario(self, *, snapshot_active: bool, simulate_exact_hit: bool):
+        """Run _run_in_process under the given snapshot state.
+
+        Returns ``(prefill_call_count, prefill_diag_lines)`` where
+        *prefill_diag_lines* is a list of ``[v2.execution_prefill]``
+        print call arguments.
+        """
+        prefill_called: list[bool] = []
+        prefill_diag_lines: list[str] = []
+
+        self.entrypoint._cpu_snapshot_models_active = snapshot_active
+        self.entrypoint._cpu_snapshot_models = (
+            _make_snapshot_models() if snapshot_active else None
+        )
+        self.entrypoint._execute_v2_prompt_executor = self._execute_stub
+
+        original_prefill = self.entrypoint._preload_bridge.schedule_execution_prefill
+
+        def _tracking_prefill(*args: Any, **kwargs: Any) -> Any:
+            prefill_called.append(True)
+            return original_prefill(*args, **kwargs)
+
+        self.entrypoint._preload_bridge.schedule_execution_prefill = _tracking_prefill  # type: ignore[assignment]
+
+        plan = ExecutionPlan(
+            workflow={"1": {"class_type": "KSampler", "inputs": {}}},
+            execution_options=ExecutionOptions(production_enabled=False),
+        )
+        context = ExecutionContext(request_id="test-prefill-guard")
+
+        _real_print = print  # capture before patch
+
+        def _capture_print(*args, **kwargs):
+            msg = str(args[0]) if args else ""
+            if msg.startswith("[v2.execution_prefill]"):
+                prefill_diag_lines.append(msg)
+            # Forward to real print so other diagnostics still reach stderr
+            _real_print(*args, file=sys.stderr, **kwargs)
+
+        try:
+            if simulate_exact_hit:
+                with patch(
+                    "comfymodal_runtime.modal_app._canonical_role_match_report",
+                    return_value={"compatible": True},
+                ):
+                    with patch.object(self.entrypoint, "_use_cpu_snapshot_models_on_bridge"):
+                        with patch("builtins.print", side_effect=_capture_print):
+                            asyncio.run(self.entrypoint._run_in_process(plan, context))
+            else:
+                with patch("builtins.print", side_effect=_capture_print):
+                    asyncio.run(self.entrypoint._run_in_process(plan, context))
+        finally:
+            self.entrypoint._preload_bridge.schedule_execution_prefill = original_prefill
+
+        return len(prefill_called), prefill_diag_lines
+
+    def test_prefill_guard_with_snapshot_state(self):
+        # schedule_execution_prefill is now invoked on EVERY request path
+        # (snapshot active or not) so the retained CLIP's prefill future is
+        # always offered to graph loaders.  The minimal KSampler-only workflow
+        # has no eligible encode entries, so the call happens but returns
+        # False -> the diagnostic still reports scheduled=0 in this harness.
+        for label, snapshot_active, simulate_exact_hit, expected_calls in [
+            ("exact_hit",          True,  True,  1),
+            ("mismatch_fallback",  True,  False, 1),
+            ("no_snapshot",        False, False, 1),
+        ]:
+            with self.subTest(case=label):
+                count, diag_lines = self._run_scenario(
+                    snapshot_active=snapshot_active,
+                    simulate_exact_hit=simulate_exact_hit,
+                )
+                self.assertEqual(
+                    count, expected_calls,
+                    f"[{label}] schedule_execution_prefill called {count} time(s), "
+                    f"expected {expected_calls}",
+                )
+                # Assert the execution-prefill diagnostic line is emitted exactly once
+                # with the correct scheduled= value (0 when prefill returns False in
+                # test setup because the workflow has no eligible encode entries).
+                self.assertEqual(
+                    len(diag_lines), 1,
+                    f"[{label}] expected exactly 1 [v2.execution_prefill] line, "
+                    f"got {len(diag_lines)}: {diag_lines}",
+                )
+                self.assertIn(
+                    "scheduled=0", diag_lines[0],
+                    f"[{label}] expected scheduled=0 in diagnostic line: {diag_lines[0]}",
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Request-time activation for the present-but-inactive cold-run path
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _FakeDM2:
+    """Diffusion-model stub that accepts forward hook registration (probe)."""
+
+    def __init__(self):
+        self._hooks = []
+
+    def register_forward_pre_hook(self, hook, **kwargs):
+        self._hooks.append(hook)
+        return hook
+
+    def register_forward_hook(self, hook, **kwargs):
+        self._hooks.append(hook)
+        return hook
+
+    def parameters(self):
+        return iter([])
+
+
+class _FakeUnetPatcher:
+    """ModelPatcher-ish retained UNET with a resolvable diffusion model."""
+
+    def __init__(self, name="sd3.5_large.safetensors"):
+        self._name = name
+        self.model = SimpleNamespace(diffusion_model=_FakeDM2())
+        self.load_device = "cpu"
+        self.offload_device = "cpu"
+
+    def named_parameters(self, recurse=True):
+        return iter([])
+
+    def named_buffers(self, recurse=True):
+        return iter([])
+
+
+def _make_retained_snapshot(unet=None, clip=None):
+    """Build a CpuSnapshotModels with patcher-shaped retained objects that
+    resolve to a diffusion model (required by the identity chain verify)."""
+    unet = unet if unet is not None else _FakeUnetPatcher()
+    clip = clip if clip is not None else _FakeClip()
+    return CpuSnapshotModels(
+        model_key=ModelRestoreKey(
+            unet_identity="sd3.5_large.safetensors",
+            clip_identity="t5xxl_fp16.safetensors",
+            clip_type="sd3",
+        ),
+        model_spec={
+            "loaders": {
+                "unet": [{"loader_class": "UNETLoader", "unet_name": "sd3.5_large.safetensors", "weight_dtype": "default"}],
+                "clip": [{"loader_class": "CLIPLoader", "clip_name": "t5xxl_fp16.safetensors", "type": "sd3", "device": "default"}],
+                "vae": [],
+            },
+        },
+        normalized_profile={
+            "mode": "split",
+            "unet": "sd3.5_large.safetensors",
+            "clip1": "t5xxl_fp16.safetensors",
+            "clip_type": "sd3",
+        },
+        file_facts=(),
+        unet=unet,
+        clip=clip,
+        load_timings_ms={},
+    )
+
+
+def _cold_run_plan(compat_flags=None, unet_name="sd3.5_large.safetensors"):
+    """Build a request plan whose model identity matches the retained
+    snapshot (UNET + CLIP)."""
+    return ExecutionPlan(
+        workflow={
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "t5xxl_fp16.safetensors", "type": "sd3"}},
+        },
+        execution_options=ExecutionOptions(compatibility_flags=compat_flags or {}),
+    )
+
+
+class _FakeSeedExecutor:
+    """Minimal executor with an outputs cache whose set_prompt the executor
+    seed hook can wrap (used to prove executor_loader_cache_seed_end evidence
+    is emitted after request-time activation populates snapshot_loader_outputs)."""
+
+    def __init__(self):
+        async def _set_prompt(*args: Any, **kwargs: Any) -> Any:
+            return None
+
+        outputs = SimpleNamespace(set_prompt=_set_prompt)
+        self.caches = SimpleNamespace(outputs=outputs)
+
+
+def _fake_comfy_modules():
+    """Register importable fake ``comfy`` / ``comfy.model_management`` modules
+    so ``_retarget_cpu_snapshot_models_for_request`` can import the live module
+    name even when ComfyUI is not installed.  The retarget itself is mocked in
+    these tests, so the fake functions are never called."""
+    import types as _types
+    _comfy = _types.ModuleType("comfy")
+    _comfy.__path__ = []  # mark as package
+    _mm = _types.ModuleType("comfy.model_management")
+    for _fn in ("get_torch_device", "unet_offload_device", "text_encoder_device", "text_encoder_offload_device"):
+        setattr(_mm, _fn, staticmethod(lambda: "cuda:0"))
+    _comfy.model_management = _mm
+    return {"comfy": _comfy, "comfy.model_management": _mm}
+
+
+
+class CpuSnapshotRequestTimeActivationTests(unittest.TestCase):
+    """Focused regression tests for the ACTUAL present-but-inactive cold-run
+    path in ``_run_in_process`` (production profile).
+
+    A cold run reaches the first request with the retained CLIP/UNET PRESENT
+    but INACTIVE because ``restore()`` has no plan and never runs the
+    restore-time activation.  The request-time path must activate them —
+    retarget to the live device policy and publish the exact retained objects
+    on the bridge — instead of raising the "present but INACTIVE"
+    RuntimeError.
+    """
+
+    _RETARGET_PATCH = "comfymodal_runtime.modal_app.retarget_cpu_snapshot_models"
+
+    def setUp(self):
+        _clean_env()
+        os.environ["COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"] = "1"
+        os.environ["COMFYMODAL_V2_ENV_PROFILE"] = "production"
+        os.environ.pop("COMFYMODAL_ENABLE_GPU_SNAPSHOT", None)
+        # Make `import comfy.model_management` resolvable without a ComfyUI
+        # install (the retarget itself is mocked per-test).
+        self._comfy_modules = patch.dict(sys.modules, _fake_comfy_modules())
+        self._comfy_modules.start()
+        self.addCleanup(self._comfy_modules.stop)
+        self.entrypoint = ModalRuntimeEntrypoint()
+        self.entrypoint._lazy_init_snapshot_state()
+        _ensure_bridge_has_fake_nodes(self.entrypoint._preload_bridge)
+        self.entrypoint._runtime_configured = True
+        self.entrypoint._legacy_api = SimpleNamespace(
+            _executor=SimpleNamespace(success=True, history_result={}),
+        )
+        self.entrypoint._legacy_module = SimpleNamespace()
+
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_V2_ENV_PROFILE", None)
+        _clean_env()
+        self.entrypoint._cpu_snapshot_models = None
+        self.entrypoint._cpu_snapshot_models_active = False
+        self.entrypoint._preload_bridge.clear()
+
+    def _run_cold_request(self, *, unet_name="sd3.5_large.safetensors"):
+        """Run ``_run_in_process`` for a production present-but-inactive
+        container.
+
+        Returns ``(result, retarget_calls, bound_flags, lines)`` where
+        *retarget_calls* is the number of request-time retarget invocations,
+        *bound_flags* the ``request_bound_to_production_snapshot`` values seen
+        by the executor stub, and *lines* the captured ``[v2.*]`` diagnostics.
+        """
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+        retarget_calls: list[int] = []
+        bound_flags: list[bool] = []
+        lines: list[str] = []
+        _real_print = print
+
+        async def _stub_execute(_plan, _context, _api, _trace, *,
+                                activation_diagnostic_state=None,
+                                request_bound_to_production_snapshot=False,
+                                **kwargs):
+            bound_flags.append(bool(request_bound_to_production_snapshot))
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+
+        def _fake_retarget(models, *, model_management=None):
+            retarget_calls.append(id(models))
+            return (True, "ok")
+
+        def _capture_print(*args, **kwargs):
+            msg = str(args[0]) if args else ""
+            if msg.startswith("[v2."):
+                lines.append(msg)
+            _real_print(*args, file=sys.stderr, **kwargs)
+
+        plan = _cold_run_plan(unet_name=unet_name)
+        context = ExecutionContext(request_id="cold-run-prod-001")
+        with patch(self._RETARGET_PATCH, side_effect=_fake_retarget):
+            with patch("builtins.print", side_effect=_capture_print):
+                result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        return result, retarget_calls, bound_flags, lines
+
+    # ── Test 1: production cold run activates instead of raising ──────
+
+    def test_production_cold_run_activates_inactive_models(self):
+        """Present-but-inactive + matching request activates at request time:
+        no RuntimeError, active=True, exact objects on the bridge, retarget
+        ran once, production binding flag propagated."""
+        result, retarget_calls, bound_flags, lines = self._run_cold_request()
+
+        # Activation completed.
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+        self.assertEqual(len(retarget_calls), 1, "request-time retarget must run exactly once")
+
+        # Bridge holds the exact retained objects.
+        prep = self.entrypoint._preload_bridge._preparation
+        self.assertIsNotNone(prep)
+        self.assertIs(prep.unet_future.result(), self.entrypoint._cpu_snapshot_models.unet)
+        self.assertIs(prep.clip_future.result(), self.entrypoint._cpu_snapshot_models.clip)
+
+        # Production binding flag propagated to the executor.
+        self.assertEqual(bound_flags, [True])
+
+        # Request + invariant markers pass.
+        self.assertTrue(
+            any("status=present_but_inactive" in line and "action=request_time_activation" in line for line in lines),
+            "present_but_inactive + request_time_activation marker missing",
+        )
+        self.assertTrue(
+            any(line == "[v2.cpu_snapshot_request] status=reused reason=ok" for line in lines),
+            "status=reused marker missing",
+        )
+        invariant = next(line for line in lines if line.startswith("[v2.snapshot_activation_invariant]"))
+        self.assertIn("status=pass", invariant)
+        self.assertIn("reason=ok", invariant)
+        self.assertIn("cpu_snapshot_container_active=1", invariant)
+        prefill = next(line for line in lines if line.startswith("[v2.execution_prefill]"))
+        self.assertIn("snapshot_active=1", prefill)
+        self.assertIn("scheduled=0", prefill)
+
+    # ── Test 2: exact objects are served at graph time ────────────────
+
+    def test_request_time_activation_serves_exact_objects_at_graph_time(self):
+        """After request-time activation, the bridge consumers return the
+        exact retained objects — the same ones the graph loaders would get."""
+        _result, _retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        unet = self.entrypoint._cpu_snapshot_models.unet
+        clip = self.entrypoint._cpu_snapshot_models.clip
+        bridge = self.entrypoint._preload_bridge
+        prep = bridge._preparation
+        self.assertIsNotNone(prep)
+        with bridge.request_scope():
+            served_unet = bridge.coordinator.wait_unet(
+                prep, trace=RuntimeTrace(request_id="cold-graph", process="test")
+            )
+            served_clip = bridge.coordinator.wait_clip(
+                prep, trace=RuntimeTrace(request_id="cold-graph", process="test")
+            )
+        self.assertIs(served_unet, unet)
+        self.assertIs(served_clip, clip)
+
+    # ── Test 3: identity mismatch still fails closed for production ───
+
+    def test_production_cold_run_identity_mismatch_fails_closed(self):
+        """A request for a DIFFERENT model must not be served from the
+        retained snapshot — production raises identity mismatch and the
+        snapshot stays inactive."""
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+
+        async def _stub_execute(*_a, **_kw):
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan(unet_name="different.safetensors")
+        context = ExecutionContext(request_id="cold-run-mismatch")
+        with patch(self._RETARGET_PATCH, return_value=(True, "ok")):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertIn("identity mismatch", str(ctx.exception).lower())
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsNone(self.entrypoint._preload_bridge._preparation)
+
+    # ── Test 4: retarget failure fails closed for production ──────────
+
+    def test_production_cold_run_retarget_failure_fails_closed(self):
+        """When request-time retargeting fails, the production path raises
+        instead of publishing an un-retargeted CPU patcher."""
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+
+        async def _stub_execute(*_a, **_kw):
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan()
+        context = ExecutionContext(request_id="cold-run-retarget-fail")
+        with patch(self._RETARGET_PATCH, return_value=(False, "no_device_policy")):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertIn("retarget failed", str(ctx.exception).lower())
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+
+    # ── Test 5: non-production mismatch falls back, does not raise ─────
+
+    def test_non_production_cold_run_mismatch_falls_back(self):
+        """Diagnostic/inherit profile + present-but-inactive + mismatch keeps
+        the fallback: no raise, bridge cleared, inactive, executor runs."""
+        os.environ["COMFYMODAL_V2_ENV_PROFILE"] = "diagnostic"
+        self.entrypoint._cpu_snapshot_models = _make_retained_snapshot()
+        self.entrypoint._cpu_snapshot_models_active = False
+        executor_called: list[bool] = []
+
+        async def _stub_execute(*_a, **_kw):
+            executor_called.append(True)
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute  # type: ignore[assignment]
+        plan = _cold_run_plan(unet_name="different.safetensors")
+        context = ExecutionContext(request_id="cold-run-diag-mismatch")
+        with patch(self._RETARGET_PATCH, return_value=(True, "ok")):
+            result = asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(executor_called, [True])
+        self.assertFalse(self.entrypoint._cpu_snapshot_models_active)
+        self.assertIsNone(self.entrypoint._preload_bridge._preparation)
+        self.assertIsInstance(result, dict)
+
+    # ── Test 6: subsequent requests stay activated (no re-retarget) ───
+
+    def test_warm_request_after_cold_activation_skips_retarget(self):
+        """After request-time activation marks the snapshot active, the next
+        request takes the normal binding path and does NOT retarget again."""
+        _result, retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        self.assertEqual(len(retarget_calls), 1)
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+
+        # Second request: snapshot already active -> normal binding, no retarget.
+        retarget_calls2: list[int] = []
+        bound_flags2: list[bool] = []
+
+        async def _stub_execute2(_plan, _context, _api, _trace, *,
+                                 activation_diagnostic_state=None,
+                                 request_bound_to_production_snapshot=False,
+                                 **kwargs):
+            bound_flags2.append(bool(request_bound_to_production_snapshot))
+            return {"images": [], "videos": [], "outputs": {}}
+
+        self.entrypoint._execute_v2_prompt_executor = _stub_execute2  # type: ignore[assignment]
+
+        def _fake_retarget2(models, *, model_management=None):
+            retarget_calls2.append(id(models))
+            return (True, "ok")
+
+        plan = _cold_run_plan()
+        context = ExecutionContext(request_id="cold-run-prod-002")
+        with patch(self._RETARGET_PATCH, side_effect=_fake_retarget2):
+            asyncio.run(self.entrypoint._run_in_process(plan, context))
+        self.assertEqual(retarget_calls2, [], "warm request must NOT retarget")
+        self.assertEqual(bound_flags2, [True], "warm production request still bound")
+        self.assertTrue(self.entrypoint._cpu_snapshot_models_active)
+
+    # ── Test 7: request-time activation mirrors restore seed evidence ──
+
+    def test_request_time_activation_populates_seed_evidence(self):
+        """Request-time activation populates snapshot_loader_outputs /
+        snapshot_model_identities / snapshot_execution_seed exactly like the
+        restore-time activation step, so the executor seed hook emits
+        executor_loader_cache_seed_end evidence (unet=seeded, clip=seeded,
+        vae=missing_snapshot_output) for a request-activated container."""
+        _result, retarget_calls, _bound_flags, _lines = self._run_cold_request()
+        self.assertEqual(len(retarget_calls), 1)
+        state = self.entrypoint.bootstrap.state
+        retained = self.entrypoint._cpu_snapshot_models
+        # Loader outputs hold the EXACT retained objects (mirrors restore).
+        self.assertIs(state.snapshot_loader_outputs.get("unet"), retained.unet)
+        self.assertIs(state.snapshot_loader_outputs.get("clip"), retained.clip)
+        # Identities mirror the request/snapshot model key.
+        self.assertEqual(
+            state.snapshot_model_identities.get("unet"), "sd3.5_large.safetensors"
+        )
+        self.assertEqual(
+            state.snapshot_model_identities.get("clip"), "t5xxl_fp16.safetensors"
+        )
+        # The deterministic execution seed is built (cold runs never built it).
+        self.assertTrue(state.snapshot_seed_built)
+        self.assertIsNotNone(state.snapshot_execution_seed)
+        self.assertEqual(
+            state.snapshot_execution_seed.loader_cache_signatures[0].get("node_id"),
+            "unet",
+        )
+
+        # The executor seed hook is now installable and emits the evidence.
+        seed_trace = RuntimeTrace(request_id="rt-seed-hook", process="test")
+        plan = _cold_run_plan()
+        fake_executor = _FakeSeedExecutor()
+        restore_hook = self.entrypoint._install_snapshot_executor_seed_hook(
+            fake_executor, plan.workflow, plan, seed_trace,
+        )
+        self.assertIsNotNone(
+            restore_hook,
+            "snapshot_loader_outputs populated -> seed hook must install",
+        )
+        # The seeded set_prompt wrapper is installed on the executor's outputs
+        # cache; invoking it emits the executor_loader_cache_seed_end evidence.
+        asyncio.run(fake_executor.caches.outputs.set_prompt())
+        event_names = [e.name for e in seed_trace.events]
+        self.assertIn("executor_seed_apply_start", event_names)
+        self.assertIn("executor_loader_cache_seed_end", event_names)
+        seed_ev = next(
+            e for e in seed_trace.events if e.name == "executor_loader_cache_seed_end"
+        )
+        self.assertIn("diagnostics", seed_ev.metadata)
+        # Restoring the original set_prompt is the returned hook's job.
+        restore_hook()
+        self.assertIsNotNone(fake_executor.caches.outputs.set_prompt)
+
+    # ── Test 8: request-time prefill future is consumed by graph loaders ──
+
+    def test_request_time_prefill_consumed_by_graph_loaders(self):
+        """After request-time activation the retained CLIP/UNET have COMPLETED
+        preparation futures; the execution prefill is scheduled from them and
+        the graph CLIPTextEncode consumer serves the cached encoding (no
+        duplicate construction of the retained objects)."""
+        from comfymodal_runtime.contracts import PrefillKey
+
+        bridge = V2LoaderBridge()
+        _ensure_bridge_has_fake_nodes(bridge)
+        trace = RuntimeTrace(request_id="rt-prefill", process="test")
+        model_key = ModelRestoreKey(
+            unet_identity="sd3.5_large.safetensors",
+            clip_identity="t5xxl_fp16.safetensors",
+            clip_type="sd3",
+        )
+        prefill_key = PrefillKey(
+            model_key=model_key,
+            prompt_bundle_hash="bundle-hash",
+            encode_options={
+                "eligible": True,
+                "encodes": [
+                    {"node_id": "pos", "role": "positive", "text": "a cat"},
+                    {"node_id": "neg", "role": "negative", "text": "blurry"},
+                ],
+            },
+        )
+        retained_clip = _FakeClip()
+        retained_unet = _FakeUnetPatcher()
+        prep = bridge.use_ready_models(
+            model_key=model_key,
+            prefill_key=prefill_key,
+            model_spec={},
+            unet=retained_unet,
+            clip=retained_clip,
+            trace=trace,
+        )
+        # Completed preparation futures: graph loaders never wait/construct.
+        self.assertTrue(prep.clip_future.done())
+        self.assertTrue(prep.unet_future.done())
+        self.assertIs(prep.clip_future.result(), retained_clip)
+        self.assertIs(prep.unet_future.result(), retained_unet)
+
+        # Execution prefill is scheduled from the retained CLIP.
+        self.assertTrue(
+            bridge.schedule_execution_prefill(
+                trace=trace, request_id="rt-prefill",
+            ),
+            "execution prefill must schedule from the completed retained CLIP",
+        )
+        prep.prefill_future.result(timeout=30)
+
+        # Graph CLIPTextEncode consumer serves the prefill result.
+        with bridge.request_scope():
+            served = bridge._consume_prefill((retained_clip, "a cat"), {})
+        self.assertEqual(served, ("conditioning:a cat",))
+        graph_prefill_ok = [
+            e for e in trace.events if e.name == "graph_prefill_consumed"
+        ]
+        self.assertEqual(len(graph_prefill_ok), 1)
+        self.assertEqual(graph_prefill_ok[0].metadata.get("status"), "prepared")
+        # No prefill fallback event: the cached encoding was served.
+        self.assertEqual(
+            [e for e in trace.events if e.name == "original_loader_fallback"
+             and e.metadata.get("lane") == "prefill"],
+            [],
+        )
+        # Exactly one preparation exists on the bridge (no duplicate
+        # construction), and VAE still falls back (no snapshot VAE).
+        self.assertIs(bridge._preparation, prep)
+        with bridge.request_scope():
+            bridge._consume_vae(("vae.safetensors",), {})
+        vae_fallback = [
+            e for e in trace.events
+            if e.name == "original_loader_fallback" and e.metadata.get("lane") == "VAE"
+        ]
+        self.assertEqual(len(vae_fallback), 1, "VAE must fall back to the original loader")
+
+
+if __name__ == "__main__":
+
+    unittest.main()

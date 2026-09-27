@@ -1,0 +1,690 @@
+{
+  "generated_by": "tools/analysis/h100_vs_rtx_forensics.py",
+  "units": "milliseconds; gbps fields are decimal GB/s (10^9 bytes/s)",
+  "source_evidence": {
+    "field": "golden_telemetry.stages[*].details.transport_stats.actual_source_events",
+    "roles": [
+      "clip",
+      "unet"
+    ],
+    "per_read_duration_ms": "(syscall_exit_monotonic_ns - syscall_enter_monotonic_ns) / 1e6"
+  },
+  "definitions": [
+    "read_count = number of actual_source_events for the role (all transports).",
+    "p50/p90/p95/p99/max = recomputed from per-read duration_ms (linear interpolation).",
+    "count_ge_<T>_ms = reads with duration_ms >= T.",
+    "first_pathological_read = first read_seq with duration_ms >= 500 ms.",
+    "source throughput = SOURCE bytes / SOURCE wall from the role's transport record (decimal GB/s).",
+    "role-scope source_gbps_decimal_pooled = total source_bytes / total source_wall_ms; median is over per-request values."
+  ],
+  "pathological_threshold_ms": 500,
+  "read_thresholds_ms": [
+    250,
+    500,
+    1000
+  ],
+  "read_role_totals": {
+    "clip": {
+      "read_count": 2673,
+      "count_ge_250_ms": 43,
+      "count_ge_500_ms": 25,
+      "count_ge_1000_ms": 9
+    },
+    "unet": {
+      "read_count": 4070,
+      "count_ge_250_ms": 27,
+      "count_ge_500_ms": 17,
+      "count_ge_1000_ms": 7
+    }
+  },
+  "per_role": {
+    "clip": {
+      "read_count": 2673,
+      "duration_null_count": 0,
+      "p50_ms": 21.072022,
+      "p90_ms": 33.109216,
+      "p95_ms": 39.781195,
+      "p99_ms": 461.603396,
+      "max_ms": 3927.614168,
+      "count_ge_250_ms": 43,
+      "count_ge_500_ms": 25,
+      "count_ge_1000_ms": 9,
+      "first_pathological_read": {
+        "read_seq": 2,
+        "duration_ms": 952.112678,
+        "threshold_ms": 500,
+        "producer_id": 3,
+        "region_id": 3,
+        "source_offset": 6033748000,
+        "returned_bytes": 6095616,
+        "retry_number": 0,
+        "error": null
+      },
+      "first_pathological_ms": 952.112678,
+      "first_pathological_seq": 2,
+      "first_pathological_threshold_ms": 500,
+      "first_pathological_request_id": "golden-p1-0-a4f66843ed5b",
+      "source_bytes_total": 88494298112.0,
+      "source_wall_ms_total": 33143.182067,
+      "source_gbps_decimal_pooled": 2.67006,
+      "source_gbps_decimal_median": 4.174389
+    },
+    "unet": {
+      "read_count": 4070,
+      "duration_null_count": 0,
+      "p50_ms": 22.413258,
+      "p90_ms": 33.008516,
+      "p95_ms": 38.734985,
+      "p99_ms": 117.264062,
+      "max_ms": 3101.366111,
+      "count_ge_250_ms": 27,
+      "count_ge_500_ms": 17,
+      "count_ge_1000_ms": 7,
+      "first_pathological_read": {
+        "read_seq": 4,
+        "duration_ms": 613.246805,
+        "threshold_ms": 500,
+        "producer_id": 3,
+        "region_id": 3,
+        "source_offset": 9232412032,
+        "returned_bytes": 28660128,
+        "retry_number": 0,
+        "error": null
+      },
+      "first_pathological_ms": 613.246805,
+      "first_pathological_seq": 4,
+      "first_pathological_threshold_ms": 500,
+      "first_pathological_request_id": "golden-p1-0-a4f66843ed5b",
+      "source_bytes_total": 135407992192.0,
+      "source_wall_ms_total": 41487.076338,
+      "source_gbps_decimal_pooled": 3.26386,
+      "source_gbps_decimal_median": 4.055408
+    }
+  },
+  "per_request": [
+    {
+      "request_id": "golden-p1-0-a4f66843ed5b",
+      "cohort": "cohort_2026-09-17_17-22-42_f841d7",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 27.913392,
+          "p90_ms": 41.020111,
+          "p95_ms": 56.610853,
+          "p99_ms": 466.854728,
+          "max_ms": 952.112678,
+          "count_ge_250_ms": 7,
+          "count_ge_500_ms": 2,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 2,
+            "duration_ms": 952.112678,
+            "threshold_ms": 500,
+            "producer_id": 3,
+            "region_id": 3,
+            "source_offset": 6033748000,
+            "returned_bytes": 6095616,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 952.112678,
+          "first_pathological_seq": 2,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 2972.943968,
+          "source_gbps_decimal": 2.70605
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 26.663998,
+          "p90_ms": 36.25874,
+          "p95_ms": 43.082626,
+          "p99_ms": 204.142028,
+          "max_ms": 634.663317,
+          "count_ge_250_ms": 4,
+          "count_ge_500_ms": 2,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 4,
+            "duration_ms": 613.246805,
+            "threshold_ms": 500,
+            "producer_id": 3,
+            "region_id": 3,
+            "source_offset": 9232412032,
+            "returned_bytes": 28660128,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 613.246805,
+          "first_pathological_seq": 4,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 3466.127492,
+          "source_gbps_decimal": 3.551461
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-bd8ea2348bd5",
+      "cohort": "cohort_2026-09-17_17-24-49_79e86b",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 17.395613,
+          "p90_ms": 31.928007,
+          "p95_ms": 373.473803,
+          "p99_ms": 2151.42708,
+          "max_ms": 3927.614168,
+          "count_ge_250_ms": 16,
+          "count_ge_500_ms": 9,
+          "count_ge_1000_ms": 4,
+          "first_pathological_read": {
+            "read_seq": 5,
+            "duration_ms": 803.7952,
+            "threshold_ms": 500,
+            "producer_id": 3,
+            "region_id": 3,
+            "source_offset": 6033748000,
+            "returned_bytes": 6095616,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 803.7952,
+          "first_pathological_seq": 5,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 7804.65601,
+          "source_gbps_decimal": 1.030787
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 19.299979,
+          "p90_ms": 25.632055,
+          "p95_ms": 27.59151,
+          "p99_ms": 38.299289,
+          "max_ms": 51.583691,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 1967.657314,
+          "source_gbps_decimal": 6.256078
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-a157324ed1d0",
+      "cohort": "cohort_2026-09-17_17-25-28_068779",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 23.456731,
+          "p90_ms": 32.352882,
+          "p95_ms": 34.556863,
+          "p99_ms": 38.592755,
+          "max_ms": 42.243899,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1603.844848,
+          "source_gbps_decimal": 5.016031
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 24.79173,
+          "p90_ms": 33.123244,
+          "p95_ms": 35.145505,
+          "p99_ms": 38.278225,
+          "max_ms": 45.325453,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 2461.956848,
+          "source_gbps_decimal": 5.000013
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-4a3a9df54ab7",
+      "cohort": "cohort_2026-09-17_17-26-51_c00a60",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 20.406105,
+          "p90_ms": 28.232167,
+          "p95_ms": 31.925232,
+          "p99_ms": 41.97718,
+          "max_ms": 48.413332,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1410.171912,
+          "source_gbps_decimal": 5.704933
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 20.916654,
+          "p90_ms": 26.511001,
+          "p95_ms": 29.392004,
+          "p99_ms": 33.539183,
+          "max_ms": 42.786317,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 2107.672425,
+          "source_gbps_decimal": 5.840479
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-94a52e483709",
+      "cohort": "cohort_2026-09-17_17-27-27_4437e0",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 19.512455,
+          "p90_ms": 25.726535,
+          "p95_ms": 28.804405,
+          "p99_ms": 33.005593,
+          "max_ms": 43.665129,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1333.277675,
+          "source_gbps_decimal": 6.033954
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 17.026009,
+          "p90_ms": 24.837086,
+          "p95_ms": 27.988511,
+          "p99_ms": 1817.135886,
+          "max_ms": 3101.366111,
+          "count_ge_250_ms": 13,
+          "count_ge_500_ms": 10,
+          "count_ge_1000_ms": 7,
+          "first_pathological_read": {
+            "read_seq": 5,
+            "duration_ms": 3101.366111,
+            "threshold_ms": 500,
+            "producer_id": 3,
+            "region_id": 3,
+            "source_offset": 9232412032,
+            "returned_bytes": 28660128,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 3101.366111,
+          "first_pathological_seq": 5,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 12638.460931,
+          "source_gbps_decimal": 0.973997
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-f98520a50bf1",
+      "cohort": "cohort_2026-09-17_17-29-27_62f388",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 22.182872,
+          "p90_ms": 37.078833,
+          "p95_ms": 40.868516,
+          "p99_ms": 334.025622,
+          "max_ms": 881.902494,
+          "count_ge_250_ms": 4,
+          "count_ge_500_ms": 2,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 1,
+            "duration_ms": 549.334867,
+            "threshold_ms": 500,
+            "producer_id": 1,
+            "region_id": 1,
+            "source_offset": 2011279904,
+            "returned_bytes": 2031872,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 549.334867,
+          "first_pathological_seq": 1,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 3584.720091,
+          "source_gbps_decimal": 2.24423
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 24.281889,
+          "p90_ms": 36.388348,
+          "p95_ms": 39.831033,
+          "p99_ms": 200.51331,
+          "max_ms": 379.354651,
+          "count_ge_250_ms": 3,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 3499.497755,
+          "source_gbps_decimal": 3.517595
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-2a264d69ee85",
+      "cohort": "cohort_2026-09-17_17-32-08_73af00",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 27.373684,
+          "p90_ms": 36.50109,
+          "p95_ms": 39.96957,
+          "p99_ms": 43.609211,
+          "max_ms": 48.5173,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1769.465991,
+          "source_gbps_decimal": 4.546533
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 25.268104,
+          "p90_ms": 36.223937,
+          "p95_ms": 47.701154,
+          "p99_ms": 91.870259,
+          "max_ms": 200.719574,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 2747.199292,
+          "source_gbps_decimal": 4.480861
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-207a82424ea6",
+      "cohort": "cohort_2026-09-17_17-33-19_10d7a0",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 21.054967,
+          "p90_ms": 29.152686,
+          "p95_ms": 31.167805,
+          "p99_ms": 35.135153,
+          "max_ms": 38.058561,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1406.540856,
+          "source_gbps_decimal": 5.719661
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 21.847173,
+          "p90_ms": 30.790202,
+          "p95_ms": 32.685431,
+          "p99_ms": 36.956799,
+          "max_ms": 52.292365,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 2252.728283,
+          "source_gbps_decimal": 5.464404
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-5ad28bce7dd5",
+      "cohort": "cohort_2026-09-17_17-33-58_b08572",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 17.729668,
+          "p90_ms": 22.35553,
+          "p95_ms": 26.024924,
+          "p99_ms": 435.169376,
+          "max_ms": 713.415857,
+          "count_ge_250_ms": 3,
+          "count_ge_500_ms": 3,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 1,
+            "duration_ms": 698.437131,
+            "threshold_ms": 500,
+            "producer_id": 1,
+            "region_id": 1,
+            "source_offset": 2011279904,
+            "returned_bytes": 2031872,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 698.437131,
+          "first_pathological_seq": 1,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 1927.212733,
+          "source_gbps_decimal": 4.174389
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 19.504317,
+          "p90_ms": 25.007946,
+          "p95_ms": 28.359098,
+          "p99_ms": 140.263546,
+          "max_ms": 542.450588,
+          "count_ge_250_ms": 2,
+          "count_ge_500_ms": 1,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 4,
+            "duration_ms": 542.450588,
+            "threshold_ms": 500,
+            "producer_id": 2,
+            "region_id": 2,
+            "source_offset": 6154957664,
+            "returned_bytes": 19106752,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 542.450588,
+          "first_pathological_seq": 4,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 3100.114822,
+          "source_gbps_decimal": 3.970762
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-65b7ddf18846",
+      "cohort": "cohort_2026-09-17_17-34-33_7a773e",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 19.765244,
+          "p90_ms": 41.309784,
+          "p95_ms": 177.209418,
+          "p99_ms": 523.976605,
+          "max_ms": 1676.447822,
+          "count_ge_250_ms": 7,
+          "count_ge_500_ms": 3,
+          "count_ge_1000_ms": 1,
+          "first_pathological_read": {
+            "read_seq": 5,
+            "duration_ms": 835.492663,
+            "threshold_ms": 500,
+            "producer_id": 3,
+            "region_id": 3,
+            "source_offset": 6033748000,
+            "returned_bytes": 6095616,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 835.492663,
+          "first_pathological_seq": 5,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 3492.285138,
+          "source_gbps_decimal": 2.303631
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 28.018532,
+          "p90_ms": 43.93204,
+          "p95_ms": 49.905202,
+          "p99_ms": 85.669759,
+          "max_ms": 122.85429,
+          "count_ge_250_ms": 0,
+          "count_ge_500_ms": 0,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": null,
+          "first_pathological_ms": null,
+          "first_pathological_seq": null,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 3035.407556,
+          "source_gbps_decimal": 4.055408
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-bf1abb3bd594",
+      "cohort": "cohort_2026-09-17_17-35-08_fe21e2",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "duration_null_count": 0,
+          "p50_ms": 22.307481,
+          "p90_ms": 31.74933,
+          "p95_ms": 37.368434,
+          "p99_ms": 2450.800414,
+          "max_ms": 3352.619289,
+          "count_ge_250_ms": 6,
+          "count_ge_500_ms": 6,
+          "count_ge_1000_ms": 4,
+          "first_pathological_read": {
+            "read_seq": 1,
+            "duration_ms": 652.642707,
+            "threshold_ms": 500,
+            "producer_id": 1,
+            "region_id": 1,
+            "source_offset": 2011279904,
+            "returned_bytes": 2031872,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 652.642707,
+          "first_pathological_seq": 1,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 8044936192.0,
+          "source_wall_ms": 5838.062845,
+          "source_gbps_decimal": 1.378015
+        },
+        "unet": {
+          "read_count": 370,
+          "duration_null_count": 0,
+          "p50_ms": 23.621152,
+          "p90_ms": 30.754497,
+          "p95_ms": 33.579111,
+          "p99_ms": 469.477878,
+          "max_ms": 650.526873,
+          "count_ge_250_ms": 5,
+          "count_ge_500_ms": 4,
+          "count_ge_1000_ms": 0,
+          "first_pathological_read": {
+            "read_seq": 0,
+            "duration_ms": 632.489241,
+            "threshold_ms": 500,
+            "producer_id": 0,
+            "region_id": 0,
+            "source_offset": 48928,
+            "returned_bytes": 33554432,
+            "retry_number": 0,
+            "error": null
+          },
+          "first_pathological_ms": 632.489241,
+          "first_pathological_seq": 0,
+          "first_pathological_threshold_ms": 500,
+          "source_bytes": 12309817472.0,
+          "source_wall_ms": 4210.25362,
+          "source_gbps_decimal": 2.923771
+        }
+      }
+    }
+  ]
+}

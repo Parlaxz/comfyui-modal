@@ -1,0 +1,3313 @@
+{
+  "accounting": {
+    "cell_count": 8,
+    "model_observations_per_request": 2,
+    "observation_count": 160,
+    "observations_per_cell": 10,
+    "request_count": 80
+  },
+  "cells": [
+    {
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 128,
+          "h2d_inflight_depth": 1,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 256,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b256_h2d128_depth1",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "134217728",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "1",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 128,
+          "h2d_inflight_depth": 2,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 256,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b256_h2d128_depth2",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "134217728",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 256,
+          "h2d_inflight_depth": 1,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 256,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b256_h2d256_depth1",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "1",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 256,
+          "h2d_inflight_depth": 2,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 256,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b256_h2d256_depth2",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 128,
+          "h2d_inflight_depth": 1,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 64,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b64_h2d128_depth1",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "134217728",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "1",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "67108864",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 128,
+          "h2d_inflight_depth": 2,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 64,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b64_h2d128_depth2",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "134217728",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "67108864",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 256,
+          "h2d_inflight_depth": 1,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 64,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b64_h2d256_depth1",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "1",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "67108864",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    },
+    {
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity": {
+        "actual": null,
+        "expected": {
+          "app": "exp-golden-p1-decoupled",
+          "class": "ModalRuntimeEntrypointV2",
+          "h2d_copy_mib": 256,
+          "h2d_inflight_depth": 2,
+          "method": "run_golden_serial_stream",
+          "profile": "golden_p1",
+          "source_block_mib": 64,
+          "source_capacity": 8,
+          "source_qd": 8,
+          "transport": "decoupled"
+        }
+      },
+      "deployment_manifest": {
+        "app": "exp-golden-p1-decoupled",
+        "cell_id": "source_b64_h2d256_depth2",
+        "deploy_baked_environment": {
+          "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "268435456",
+          "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+          "COMFYMODAL_GOLDEN_QD_TRANSPORT": "decoupled",
+          "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "67108864",
+          "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+          "COMFYMODAL_GOLDEN_SOURCE_QD": "8"
+        },
+        "profile": "golden_p1"
+      },
+      "models": [
+        "clip",
+        "unet"
+      ]
+    }
+  ],
+  "contract": {
+    "app": "exp-golden-p1-decoupled",
+    "class": "ModalRuntimeEntrypointV2",
+    "method": "run_golden_serial_stream",
+    "profile": "golden_p1",
+    "transport": "decoupled"
+  },
+  "cpu_allocation_configured": 4,
+  "execution_policy": {
+    "artifact_selection": "explicit_path_only",
+    "deploy_baked_dimensions_per_cell": true,
+    "homogeneous_cohort_scope": "one_cell_identity_only",
+    "local_only": true,
+    "modal_api_called": false,
+    "serial": true,
+    "subprocesses_launched": false
+  },
+  "experiment": "exp07_decoupled_integrated",
+  "h2d_copy_extents_mib": [
+    128,
+    256
+  ],
+  "h2d_inflight_depths": [
+    1,
+    2
+  ],
+  "models_per_request": [
+    "clip",
+    "unet"
+  ],
+  "phase": "phase_3_decoupled_integrated",
+  "post_decoupling_old_vs_new_diagnostics": {
+    "cells": [
+      {
+        "role": "clip",
+        "source_block_mib": 32,
+        "source_qd": 2
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 32,
+        "source_qd": 2
+      },
+      {
+        "role": "clip",
+        "source_block_mib": 32,
+        "source_qd": 4
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 32,
+        "source_qd": 4
+      },
+      {
+        "role": "clip",
+        "source_block_mib": 32,
+        "source_qd": 8
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 32,
+        "source_qd": 8
+      },
+      {
+        "role": "clip",
+        "source_block_mib": 256,
+        "source_qd": 2
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 256,
+        "source_qd": 2
+      },
+      {
+        "role": "clip",
+        "source_block_mib": 256,
+        "source_qd": 4
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 256,
+        "source_qd": 4
+      },
+      {
+        "role": "clip",
+        "source_block_mib": 256,
+        "source_qd": 8
+      },
+      {
+        "role": "unet",
+        "source_block_mib": 256,
+        "source_qd": 8
+      }
+    ],
+    "observation_count": null,
+    "observations_per_cell": null,
+    "request_count": null,
+    "required_h2d_geometry": {
+      "copy_extents_mib": null,
+      "inflight_depths": null
+    },
+    "status": "TODO_FAIL_CLOSED",
+    "todo": "Specify H2D copy extents, H2D inflight depths, and observations_per_cell before executing OLD-vs-NEW diagnostics."
+  },
+  "public_commands_for_parent": [
+    "python tools/v2ctl.py golden status --app exp-golden-p1-decoupled",
+    "python tools/v2ctl.py doctor --profile golden_p1 --app exp-golden-p1-decoupled",
+    "python tools/v2ctl.py golden deploy --app exp-golden-p1-decoupled",
+    "python tools/v2ctl.py --profile golden_p1 --app exp-golden-p1-decoupled source-probe",
+    "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled"
+  ],
+  "schedule": [
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 1,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c01",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 2,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c02",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 3,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c03",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 4,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c04",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 5,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c05",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 6,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c06",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 7,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c07",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 8,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r01-c08",
+      "round": 1,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 9,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c01",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 10,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c02",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 11,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c03",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 12,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c04",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 13,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c05",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 14,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c06",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 15,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c07",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 16,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r02-c08",
+      "round": 2,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 17,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c01",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 18,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c02",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 19,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c03",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 20,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c04",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 21,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c05",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 22,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c06",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 23,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c07",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 24,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r03-c08",
+      "round": 3,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 25,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c01",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 26,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c02",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 27,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c03",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 28,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c04",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 29,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c05",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 30,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c06",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 31,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c07",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 32,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r04-c08",
+      "round": 4,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 33,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c01",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 34,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c02",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 35,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c03",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 36,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c04",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 37,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c05",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 38,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c06",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 39,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c07",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 40,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r05-c08",
+      "round": 5,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 41,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c01",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 42,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c02",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 43,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c03",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 44,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c04",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 45,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c05",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 46,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c06",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 47,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c07",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 48,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r06-c08",
+      "round": 6,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 49,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c01",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 50,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c02",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 51,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c03",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 52,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c04",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 53,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c05",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 54,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c06",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 55,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c07",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 56,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r07-c08",
+      "round": 7,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 57,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c01",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 58,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c02",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 59,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c03",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 60,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c04",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 61,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c05",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 62,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c06",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 63,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c07",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 64,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r08-c08",
+      "round": 8,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 65,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c01",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 66,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c02",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 67,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c03",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 68,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c04",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 69,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c05",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 70,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c06",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 71,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c07",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 72,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r09-c08",
+      "round": 9,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth1",
+      "cell_index": 1,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 73,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c01",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d128_depth2",
+      "cell_index": 2,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 74,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c02",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth1",
+      "cell_index": 3,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 75,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c03",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b256_h2d256_depth2",
+      "cell_index": 4,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 268435456,
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 256,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 76,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c04",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth1",
+      "cell_index": 5,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 77,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c05",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d128_depth2",
+      "cell_index": 6,
+      "configuration": {
+        "h2d_copy_bytes": 134217728,
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 128,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 78,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c06",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth1",
+      "cell_index": 7,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 1,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 79,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c07",
+      "round": 10,
+      "status": "PENDING"
+    },
+    {
+      "attempts": [],
+      "cell_id": "source_b64_h2d256_depth2",
+      "cell_index": 8,
+      "configuration": {
+        "h2d_copy_bytes": 268435456,
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "source_block_bytes": 67108864,
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8
+      },
+      "deployment_identity_expected": {
+        "app": "exp-golden-p1-decoupled",
+        "class": "ModalRuntimeEntrypointV2",
+        "h2d_copy_mib": 256,
+        "h2d_inflight_depth": 2,
+        "method": "run_golden_serial_stream",
+        "profile": "golden_p1",
+        "source_block_mib": 64,
+        "source_capacity": 8,
+        "source_qd": 8,
+        "transport": "decoupled"
+      },
+      "invocation_command": "python tools/v2ctl.py golden run --app exp-golden-p1-decoupled",
+      "manifest_index": 80,
+      "models": [
+        "clip",
+        "unet"
+      ],
+      "request_id": "exp07-r10-c08",
+      "round": 10,
+      "status": "PENDING"
+    }
+  ],
+  "schema_version": 1,
+  "shared_source_configurations": [
+    {
+      "applies_to": [
+        "clip",
+        "unet"
+      ],
+      "phase_2_rank": 1,
+      "phase_2_rank_label": "winner",
+      "source_block_mib": 256,
+      "source_qd": 8
+    },
+    {
+      "applies_to": [
+        "clip",
+        "unet"
+      ],
+      "phase_2_rank": 2,
+      "phase_2_rank_label": "runner_up",
+      "source_block_mib": 64,
+      "source_qd": 8
+    }
+  ],
+  "source_capacity": 8,
+  "source_queue_contract": {
+    "independent": true,
+    "source_capacity": 8,
+    "source_qd": 8
+  }
+}

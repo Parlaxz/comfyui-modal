@@ -1,0 +1,46 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §10 corpus results (MEDIUM)",
+    "PHASE_G2 §1 environment HIGH",
+    "PHASE_G5 §2 MEDIUM-vs-HIGH resolution"
+  ],
+  "description": "Encodes the audited shape of the current production corpus without copying it: exact roundtrip true; no absolute paths; URLs only in note text; many custom dependencies across several repos with mixed exact/declared/inferred provenance (including the registry host-fallback attribution bug); missing model hashes; loader extraction gap; subgraph definitions; no required user input asset.",
+  "evidence_file": "evidence/current_corpus_shape.evidence.json",
+  "expected": {
+    "issue_codes": [
+      "custom_node_unpinned",
+      "model_hash_unpinned",
+      "model_extraction_gap",
+      "subgraph_frontend_requirement"
+    ],
+    "risk_level_hint_nonnormative": "medium",
+    "semantic_notes": [
+      "Shared reconciliation proof for G6: normative expectations live in expected/current_corpus_shape.expected.json (workflow medium AND environment high simultaneously)."
+    ],
+    "signals": {
+      "custom_node_count": 4,
+      "custom_node_revision_pinned": false,
+      "custom_repo_count": 4,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": true,
+      "model_hash_pinned": false,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": true
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/current_corpus_shape.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 3,
+    "ready": false
+  },
+  "manifest_sha256_canonical": "723482542ae4d4dab5466231389fa967429ff92196281ce40e0d9b0a799b1564",
+  "scenario_id": "current_corpus_shape",
+  "title": "Compact synthetic reconciliation of the G1 corpus"
+}

@@ -1,0 +1,22 @@
+GOLDEN_PROFILE_COMPLETE=YES
+GOLDEN_PROFILE_REASON=complete
+GOLDEN_PROFILE_TORCH=DISABLED
+# Golden profile Gantt
+TIMELINE_COLUMNS=100
+golden_serial_execute |████████████████████████████████████████████████████████████████████████████████████████████████████|
+  golden_restore |        ██████                                                                                      |
+  golden_request_setup |                ██████                                                                              |
+  golden_clip_load |                         █████                                                                      |
+  golden_clip_forward |                                 ██████                                                             |
+  golden_unet_load |                                         ██████                                                     |
+  golden_sampler_prepare |                                                  █████                                             |
+  golden_vae_load |                                                          ██████                                    |
+  golden_sampling |                                                                  ██████                            |
+  golden_sampler_tail |                                                                           █████                    |
+  golden_vae_decode |                                                                                   ██████           |
+  golden_output |                                                                                           ██████   |
+
+Torch lanes (clock alignment unproven; shown as a separate table, not plotted):
+| lane | operator/kernel | total_ms |
+|---|---|---|
+| (none) | (Torch trace unavailable) | measurement_unavailable |

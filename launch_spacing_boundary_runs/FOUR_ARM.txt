@@ -1,0 +1,129 @@
+﻿======================================================================================================================
+FOUR-ARM LAUNCH-SPACING BOUNDARY  (all arms recomputed from raw per-read records)
+======================================================================================================================
+  gap  2.5 ms : 15 runs, 1800 reads
+  gap  3.0 ms : 15 runs, 1800 reads
+  gap  3.5 ms : 15 runs, 1800 reads
+  gap  4.0 ms : 15 runs, 1800 reads
+
+=== MAIN TABLE ===
+  gap  runs  reads  poolMed  poolMean     p95      p99    worst  r>=500  n>=500  n>=1000  medGBps    ovl  conc
+  2.5    15   1800    43.40     82.92  100.61   788.38    11818       4      21       11    4.538  0.961  3.40
+  3.0    15   1800    42.98     48.07   77.11   111.36      656       1       2        0    5.292  0.979  3.64
+  3.5    15   1800    42.76     55.00   70.42   129.31     4082       3      10        6    5.169  0.984  3.53
+  4.0    15   1800    43.03     50.54   90.02   135.74      319       0       0        0    5.404  0.982  3.65
+
+=== PER-RUN DISTRIBUTION (pooled mean can be distorted by one sick run) ===
+  gap  med_of_meds  mean_of_meds  med_of_means  mean_of_means  max_run_mean
+  2.5        41.43         46.78         54.23          82.92        358.09
+  3.0        42.20         45.27         46.63          48.07         68.29
+  3.5        43.08         44.03         47.96          55.00        145.60
+  4.0        42.89         47.74         45.13          50.54         82.89
+
+=== MEDIAN vs MEAN (is pacing deleting tails, or speeding ordinary reads?) ===
+  gap  pooled median  pooled mean   mean-median gap      p95       p99
+  2.5          43.40        82.92             39.53   100.61    788.38
+  3.0          42.98        48.07              5.09    77.11    111.36
+  3.5          42.76        55.00             12.25    70.42    129.31
+  4.0          43.03        50.54              7.51    90.02    135.74
+
+=== GENERATION 0 ONLY ===
+ spacing  gen0 n   median      mean  >=250  >=500  >=1000    worst
+     2.5      60   105.41    870.29     10     10       8    11818
+     3.0      60    98.37    113.23      2      2       0      656
+     3.5      60   103.96    285.73      7      7       3     4082
+     4.0      60    92.80     94.33      0      0       0      204
+
+=== ALL GENERATIONS ===
+  gap  2.5 | g0: n=60 med=105.4 mean=870.3 max=11818 ge500=10 ge1k=8 | g1: n=60 med=47.9 mean=96.2 max=2791 ge500=1 ge1k=1 | g2: n=60 med=55.3 mean=84.2 max=928 ge500=2 ge1k=0 | g3: n=60 med=45.7 mean=52.1 max=131 ge500=0 ge1k=0
+  gap  3.0 | g0: n=60 med=98.4 mean=113.2 max=656 ge500=2 ge1k=0 | g1: n=60 med=43.4 mean=49.0 max=106 ge500=0 ge1k=0 | g2: n=60 med=47.8 mean=54.4 max=87 ge500=0 ge1k=0 | g3: n=60 med=43.4 mean=46.6 max=89 ge500=0 ge1k=0
+  gap  3.5 | g0: n=60 med=104.0 mean=285.7 max=4082 ge500=7 ge1k=3 | g1: n=60 med=47.6 mean=87.8 max=1205 ge500=2 ge1k=2 | g2: n=60 med=48.8 mean=74.0 max=1214 ge500=1 ge1k=1 | g3: n=60 med=46.5 mean=51.3 max=151 ge500=0 ge1k=0
+  gap  4.0 | g0: n=60 med=92.8 mean=94.3 max=204 ge500=0 ge1k=0 | g1: n=60 med=44.0 mean=49.0 max=90 ge500=0 ge1k=0 | g2: n=60 med=50.4 mean=54.7 max=99 ge500=0 ge1k=0 | g3: n=60 med=44.9 mean=48.4 max=86 ge500=0 ge1k=0
+
+=== PACER VALIDITY (observed floors) ===
+  gap            obs_min(range)           obs_p5(range)         obs_median(range)            obs_p95(range)
+  2.5                 2.51-2.61               2.73-3.25                4.92-34.54              26.03-262.89
+  3.0                 3.00-3.20               3.10-3.30                5.18-14.35               26.49-42.88
+  3.5                 3.50-3.59               3.61-4.10                5.55-12.52               27.95-46.03
+  4.0                 4.00-4.14               4.10-4.37                5.38-14.39               21.49-56.16
+
+=== CONCURRENCY / THROUGHPUT ===
+  gap  medGBps  meanGBps  minGBps  medWall  ovl_mean  conc_mean max_active
+  2.5    4.538     4.191    0.385     1773     0.961       3.40          4
+  3.0    5.292     5.154    3.652     1520     0.979       3.64          4
+  3.5    5.169     4.791    1.239     1556     0.984       3.53          4
+  4.0    5.404     5.169    2.980     1489     0.982       3.65          4
+
+=== FISHER EXACT (two-sided) ===
+  read-level >=500 ms (out of 1800 reads per arm)
+     2.5 vs  3.0:  21 vs   2  p=0.0001
+     2.5 vs  3.5:  21 vs  10  p=0.0696
+     2.5 vs  4.0:  21 vs   0  p=0.0000
+     3.0 vs  3.5:   2 vs  10  p=0.0383
+     3.0 vs  4.0:   2 vs   0  p=0.4999
+     3.5 vs  4.0:  10 vs   0  p=0.0019
+  read-level >=1000 ms
+     2.5 vs  3.0:  11 vs   0  p=0.0010
+     2.5 vs  3.5:  11 vs   6  p=0.3311
+     2.5 vs  4.0:  11 vs   0  p=0.0010
+     3.0 vs  3.5:   0 vs   6  p=0.0311
+     3.0 vs  4.0:   0 vs   0  p=1.0000
+     3.5 vs  4.0:   6 vs   0  p=0.0311
+  gen0 >=500 ms (out of 60 gen-0 reads per arm)
+     2.5 vs  3.0:  10 vs   2  p=0.0295
+     2.5 vs  3.5:  10 vs   7  p=0.6017
+     2.5 vs  4.0:  10 vs   0  p=0.0013
+     3.0 vs  3.5:   2 vs   7  p=0.1629
+     3.0 vs  4.0:   2 vs   0  p=0.4958
+     3.5 vs  4.0:   7 vs   0  p=0.0130
+  run-level: runs with any >=500 ms read (out of 15 runs per arm)
+     2.5 vs  3.0:   4 vs   1  p=0.3295
+     2.5 vs  3.5:   4 vs   3  p=1.0000
+     2.5 vs  4.0:   4 vs   0  p=0.0996
+     3.0 vs  3.5:   1 vs   3  p=0.5977
+     3.0 vs  4.0:   1 vs   0  p=1.0000
+     3.5 vs  4.0:   3 vs   0  p=0.2241
+
+=== PATHOLOGICAL RUNS (any read >=500 ms): first four launches ===
+  gap  2.5 bd-b25-r02       worst=5565 ge500=4 ge1k=3
+        #0w3 t=0.0 gap=- lat=5565 act=0 | #1w2 t=2.6 gap=2.57 lat=5563 act=1 | #2w0 t=65.1 gap=62.54 lat=5554 act=2 | #3w2 t=5565.2 gap=5500.12 lat=50 act=2
+  gap  2.5 bd-b25-r03       worst=11818 ge500=13 ge1k=6
+        #0w3 t=0.0 gap=- lat=6062 act=0 | #1w2 t=2.7 gap=2.73 lat=11818 act=1 | #2w1 t=6061.4 gap=6058.71 lat=5914 act=2 | #3w2 t=11821.1 gap=5759.62 lat=39 act=1
+  gap  2.5 bd-b25-r06       worst=908 ge500=2 ge1k=0
+        #0w3 t=0.0 gap=- lat=851 act=0 | #1w1 t=3.5 gap=3.54 lat=908 act=1 | #2w0 t=850.9 gap=847.34 lat=120 act=2 | #3w3 t=911.3 gap=60.41 lat=52 act=2
+  gap  2.5 bd-b25-r11       worst=2455 ge500=2 ge1k=2
+        #0w3 t=0.0 gap=- lat=2416 act=0 | #1w0 t=2.6 gap=2.61 lat=2455 act=1 | #2w3 t=2415.7 gap=2413.13 lat=33 act=1 | #3w1 t=2419.1 gap=3.35 lat=87 act=2
+  gap  3.0 bd-b30-r07       worst=656 ge500=2 ge1k=0
+        #0w3 t=0.0 gap=- lat=609 act=0 | #1w1 t=3.7 gap=3.68 lat=656 act=1 | #2w0 t=609.2 gap=605.49 lat=99 act=2 | #3w1 t=659.9 gap=50.71 lat=40 act=1
+  gap  3.5 bd-b35-r06       worst=598 ge500=2 ge1k=0
+        #0w3 t=0.0 gap=- lat=549 act=0 | #1w2 t=3.5 gap=3.50 lat=598 act=1 | #2w3 t=548.6 gap=545.06 lat=46 act=1 | #3w0 t=553.0 gap=4.48 lat=103 act=2
+  gap  3.5 bd-b35-r07       worst=4082 ge500=6 ge1k=6
+        #0w3 t=0.0 gap=- lat=4044 act=0 | #1w1 t=3.6 gap=3.59 lat=4082 act=1 | #2w2 t=4044.0 gap=4040.46 lat=86 act=2 | #3w1 t=4085.2 gap=41.12 lat=35 act=1
+  gap  3.5 bd-b35-r14       worst=727 ge500=2 ge1k=0
+        #0w3 t=0.0 gap=- lat=679 act=0 | #1w0 t=4.0 gap=4.04 lat=727 act=1 | #2w2 t=679.2 gap=675.19 lat=107 act=2 | #3w0 t=731.2 gap=51.98 lat=49 act=1
+
+=== FIRST FOUR LAUNCHES, first 6 runs of each arm (full traces in raw JSON) ===
+  gap  2.5 bd-b25-r01       :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w0 t=3.4 gap=3.42 lat=100 act=1 | #2w3 t=46.0 gap=42.53 lat=38 act=1 | #3w1 t=49.2 gap=3.29 lat=137 act=2
+  gap  2.5 bd-b25-r02       :: #0w3 t=0.0 gap=- lat=5565 act=0 | #1w2 t=2.6 gap=2.57 lat=5563 act=1 | #2w0 t=65.1 gap=62.54 lat=5554 act=2 | #3w2 t=5565.2 gap=5500.12 lat=50 act=2
+  gap  2.5 bd-b25-r03       :: #0w3 t=0.0 gap=- lat=6062 act=0 | #1w2 t=2.7 gap=2.73 lat=11818 act=1 | #2w1 t=6061.4 gap=6058.71 lat=5914 act=2 | #3w2 t=11821.1 gap=5759.62 lat=39 act=1
+  gap  2.5 bd-b25-r04       :: #0w3 t=0.0 gap=- lat=93 act=0 | #1w1 t=2.5 gap=2.51 lat=90 act=1 | #2w0 t=46.5 gap=44.00 lat=90 act=2 | #3w1 t=92.7 gap=46.18 lat=40 act=2
+  gap  2.5 bd-b25-r05       :: #0w3 t=0.0 gap=- lat=50 act=0 | #1w0 t=2.7 gap=2.66 lat=98 act=1 | #2w2 t=50.2 gap=47.55 lat=105 act=2 | #3w0 t=101.0 gap=50.78 lat=41 act=1
+  gap  2.5 bd-b25-r06       :: #0w3 t=0.0 gap=- lat=851 act=0 | #1w1 t=3.5 gap=3.54 lat=908 act=1 | #2w0 t=850.9 gap=847.34 lat=120 act=2 | #3w3 t=911.3 gap=60.41 lat=52 act=2
+  gap  3.0 bd-b30-r01       :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w0 t=3.2 gap=3.16 lat=101 act=1 | #2w3 t=48.1 gap=44.95 lat=38 act=1 | #3w1 t=51.4 gap=3.27 lat=116 act=2
+  gap  3.0 bd-b30-r02       :: #0w3 t=0.0 gap=- lat=43 act=0 | #1w0 t=3.5 gap=3.55 lat=154 act=1 | #2w1 t=42.7 gap=39.16 lat=55 act=2 | #3w1 t=97.5 gap=54.82 lat=41 act=1
+  gap  3.0 bd-b30-r03       :: #0w3 t=0.0 gap=- lat=98 act=0 | #1w1 t=3.1 gap=3.05 lat=95 act=1 | #2w2 t=48.8 gap=45.71 lat=106 act=2 | #3w1 t=97.8 gap=48.99 lat=43 act=2
+  gap  3.0 bd-b30-r04       :: #0w3 t=0.0 gap=- lat=49 act=0 | #1w0 t=3.1 gap=3.08 lat=96 act=1 | #2w3 t=49.4 gap=46.34 lat=37 act=1 | #3w1 t=52.7 gap=3.31 lat=98 act=2
+  gap  3.0 bd-b30-r05       :: #0w3 t=0.0 gap=- lat=45 act=0 | #1w2 t=3.8 gap=3.78 lat=87 act=1 | #2w0 t=45.2 gap=41.43 lat=103 act=2 | #3w2 t=91.2 gap=46.01 lat=44 act=1
+  gap  3.0 bd-b30-r06       :: #0w3 t=0.0 gap=- lat=54 act=0 | #1w1 t=3.5 gap=3.49 lat=105 act=1 | #2w3 t=53.7 gap=50.16 lat=45 act=1 | #3w2 t=57.1 gap=3.41 lat=111 act=2
+  gap  3.5 bd-b35-r01       :: #0w3 t=0.0 gap=- lat=78 act=0 | #1w1 t=3.6 gap=3.58 lat=138 act=1 | #2w3 t=78.1 gap=74.52 lat=50 act=1 | #3w0 t=81.7 gap=3.64 lat=124 act=2
+  gap  3.5 bd-b35-r02       :: #0w3 t=0.0 gap=- lat=59 act=0 | #1w1 t=3.7 gap=3.65 lat=113 act=1 | #2w3 t=59.1 gap=55.48 lat=45 act=1 | #3w0 t=63.6 gap=4.42 lat=119 act=2
+  gap  3.5 bd-b35-r03       :: #0w3 t=0.0 gap=- lat=53 act=0 | #1w0 t=3.9 gap=3.94 lat=105 act=1 | #2w3 t=53.2 gap=49.26 lat=42 act=1 | #3w2 t=57.6 gap=4.44 lat=109 act=2
+  gap  3.5 bd-b35-r04       :: #0w3 t=0.0 gap=- lat=47 act=0 | #1w2 t=4.3 gap=4.34 lat=91 act=1 | #2w3 t=46.6 gap=42.24 lat=38 act=1 | #3w0 t=51.0 gap=4.45 lat=97 act=2
+  gap  3.5 bd-b35-r05       :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w2 t=3.5 gap=3.55 lat=91 act=1 | #2w0 t=47.5 gap=43.95 lat=96 act=2 | #3w2 t=94.5 gap=46.99 lat=39 act=1
+  gap  3.5 bd-b35-r06       :: #0w3 t=0.0 gap=- lat=549 act=0 | #1w2 t=3.5 gap=3.50 lat=598 act=1 | #2w3 t=548.6 gap=545.06 lat=46 act=1 | #3w0 t=553.0 gap=4.48 lat=103 act=2
+  gap  4.0 cf-c4-r01        :: #0w3 t=0.0 gap=- lat=40 act=0 | #1w1 t=4.6 gap=4.65 lat=73 act=1 | #2w2 t=39.4 gap=34.77 lat=79 act=2 | #3w3 t=77.7 gap=38.31 lat=32 act=2
+  gap  4.0 cf-c4-r02        :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w1 t=4.1 gap=4.05 lat=93 act=1 | #2w3 t=46.2 gap=42.11 lat=36 act=1 | #3w0 t=50.5 gap=4.33 lat=100 act=2
+  gap  4.0 cf-c4-r03        :: #0w3 t=0.0 gap=- lat=42 act=0 | #1w2 t=4.6 gap=4.56 lat=82 act=1 | #2w3 t=42.4 gap=37.79 lat=34 act=1 | #3w1 t=46.7 gap=4.31 lat=87 act=2
+  gap  4.0 cf-c4-r04        :: #0w3 t=0.0 gap=- lat=51 act=0 | #1w0 t=4.7 gap=4.67 lat=101 act=1 | #2w3 t=51.4 gap=46.70 lat=44 act=1 | #3w2 t=55.9 gap=4.51 lat=112 act=2
+  gap  4.0 cf-c4-r05        :: #0w3 t=0.0 gap=- lat=36 act=0 | #1w1 t=4.0 gap=4.00 lat=119 act=1 | #2w0 t=36.3 gap=32.34 lat=38 act=2 | #3w0 t=74.7 gap=38.35 lat=41 act=1
+  gap  4.0 cf-c4-r06        :: #0w3 t=0.0 gap=- lat=81 act=0 | #1w0 t=4.0 gap=4.03 lat=77 act=1 | #2w1 t=42.6 gap=38.59 lat=78 act=2 | #3w2 t=80.6 gap=38.02 lat=86 act=3

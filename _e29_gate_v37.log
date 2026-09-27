@@ -1,0 +1,8 @@
+[v2ctl.gate] valid=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\gates\gate_20260819-235002_571d2ff0.json
+  FAIL [structural] backend invocation did not complete successfully
+  FAIL [structural] telemetry missing request_id
+  FAIL [structural] telemetry missing correlation_id
+  FAIL [structural] fresh_required but telemetry shows neither fresh nor restored identity
+  FAIL [structural] expected_output_sha configured but no output SHA observed
+  FAIL [output_sha] output SHA unavailable: backend produced no output_sha line
+  FAIL [canonical_ledger] canonical ledger missing from the run artifact (canonical_ledger_status absent): an E29 tracer run must attach canonical_ledger + canonical_ledger_status

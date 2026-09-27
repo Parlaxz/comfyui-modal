@@ -1,0 +1,242 @@
+[
+ {
+  "tag": "fio-11-pvsync",
+  "engine": "pvsync",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AWS",
+  "region": "eu-west",
+  "agg_gbps": 1.7890356926731266,
+  "agg_mib": 1812.0576028823853,
+  "wall_ms": 4351.298443,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 1900080113,
+    "bw_mib_per_s": 1812.0576028823853,
+    "iops": 28.3134,
+    "io_bytes": 7784628224,
+    "runtime_ms": 4097,
+    "clat_ns_mean": 113359919.974138,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-12-mmap",
+  "engine": "mmap",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AWS",
+  "region": "eu-west",
+  "agg_gbps": 3.57158778933297,
+  "agg_mib": 4032.590982437134,
+  "wall_ms": 2179.5987339999997,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 4228478122,
+    "bw_mib_per_s": 4032.590982437134,
+    "iops": 63.009234,
+    "io_bytes": 7784628224,
+    "runtime_ms": 1841,
+    "clat_ns_mean": 63054022.681034,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-13-mmap",
+  "engine": "mmap",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "us-east",
+  "agg_gbps": 3.211919584034528,
+  "agg_mib": 3770.4418478012085,
+  "wall_ms": 2423.66847,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3953594831,
+    "bw_mib_per_s": 3770.4418478012085,
+    "iops": 58.913154,
+    "io_bytes": 7784628224,
+    "runtime_ms": 1969,
+    "clat_ns_mean": 65641338.439655,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-14-pvsync",
+  "engine": "pvsync",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "eu-west",
+  "agg_gbps": 2.6980035655960246,
+  "agg_mib": 2993.5483865737915,
+  "wall_ms": 2885.329109,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3138962993,
+    "bw_mib_per_s": 2993.5483865737915,
+    "iops": 46.774194,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2480,
+    "clat_ns_mean": 72682754.724138,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-15-pvsync",
+  "engine": "pvsync",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "us-east",
+  "agg_gbps": 4.230316515833655,
+  "agg_mib": 4992.602555274963,
+  "wall_ms": 1840.199946,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 5235123217,
+    "bw_mib_per_s": 4992.602555274963,
+    "iops": 78.009415,
+    "io_bytes": 7784628224,
+    "runtime_ms": 1487,
+    "clat_ns_mean": 50249276.5,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-16-mmap",
+  "engine": "mmap",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "us-east",
+  "agg_gbps": 2.7729827183741986,
+  "agg_mib": 3139.1120500564575,
+  "wall_ms": 2807.312203,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3291597557,
+    "bw_mib_per_s": 3139.1120500564575,
+    "iops": 49.048626,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2365,
+    "clat_ns_mean": 79231957.224138,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-17-mmap",
+  "engine": "mmap",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "us-east",
+  "agg_gbps": 2.8348533246996532,
+  "agg_mib": 3233.4494771957397,
+  "wall_ms": 2746.0426810000004,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3390517519,
+    "bw_mib_per_s": 3233.4494771957397,
+    "iops": 50.522648,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2296,
+    "clat_ns_mean": 76562253.646552,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-18-pvsync",
+  "engine": "pvsync",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "eu-west",
+  "agg_gbps": 2.869069033300352,
+  "agg_mib": 3249.015316963196,
+  "wall_ms": 2713.2941499999997,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3406839485,
+    "bw_mib_per_s": 3249.015316963196,
+    "iops": 50.765864,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2285,
+    "clat_ns_mean": 76441884.284483,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-19-pvsync",
+  "engine": "pvsync",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "eu-west",
+  "agg_gbps": 3.1057582785892826,
+  "agg_mib": 3564.090253829956,
+  "wall_ms": 2506.514521,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3737219502,
+    "bw_mib_per_s": 3564.090253829956,
+    "iops": 55.68891,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2083,
+    "clat_ns_mean": 68856842.448276,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ },
+ {
+  "tag": "fio-20-mmap",
+  "engine": "mmap",
+  "status": "ok",
+  "provider": "CLOUD_PROVIDER_AZURE",
+  "region": "eu-west",
+  "agg_gbps": 2.7264781500713813,
+  "agg_mib": 3131.16828250885,
+  "wall_ms": 2855.1955290000005,
+  "jobs": [
+   {
+    "jobname": "job0",
+    "bw_bytes_per_s": 3283267913,
+    "bw_mib_per_s": 3131.16828250885,
+    "iops": 48.924504,
+    "io_bytes": 7784628224,
+    "runtime_ms": 2371,
+    "clat_ns_mean": 78529439.025862,
+    "lat_ns_percentile": {}
+   }
+  ],
+  "fio_version": "fio-3.33",
+  "error": null
+ }
+]

@@ -1,0 +1,11 @@
+{
+  "arm": "source_only_same_path",
+  "attempt_id": "unet_b256_qd2_source_only_same_path_R3",
+  "block_bytes": 268435456,
+  "classification": "FAILED",
+  "error": "ExtentTransportError:source_worker_join_timeout",
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "qd": 2,
+  "role": "unet",
+  "status": "error"
+}

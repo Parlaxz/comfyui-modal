@@ -1,0 +1,351 @@
+{
+  "attempt_id": "conc-rtx-reverse",
+  "batches": [
+    {
+      "all_full_length": true,
+      "block_range": [
+        15,
+        30
+      ],
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 380.463214,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 380.504704,
+      "mean_ms": 167.2769233125,
+      "median_ms": 149.91672,
+      "min_ms": 23.477705,
+      "n": 16,
+      "offsets": [
+        2013265920,
+        2147483648,
+        2281701376,
+        2415919104,
+        2550136832,
+        2684354560,
+        2818572288,
+        2952790016,
+        3087007744,
+        3221225472,
+        3355443200,
+        3489660928,
+        3623878656,
+        3758096384,
+        3892314112,
+        4026531840
+      ],
+      "order": "reverse",
+      "preadv_ms": [
+        135.028733,
+        221.795305,
+        285.966842,
+        65.327577,
+        188.719732,
+        287.176642,
+        111.124318,
+        310.884138,
+        253.514549,
+        164.804707,
+        105.433769,
+        45.505881,
+        32.097264,
+        23.477705,
+        65.068907,
+        380.504704
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "release_decimal_gbps": 4.813989488691041,
+      "release_gib_per_s": 4.483377084779591,
+      "release_to_first_enter_ms": 0.17386,
+      "release_wave_makespan_ms": 446.092301,
+      "scheduler_confounded": true,
+      "syscall_envelope_decimal_gbps": 4.815866424326685,
+      "syscall_envelope_gib_per_s": 4.485125117308167,
+      "syscall_envelope_ms": 445.918441,
+      "useful_bytes": 2147483648,
+      "wave_release_ns": 912490765
+    },
+    {
+      "all_full_length": true,
+      "block_range": [
+        7,
+        14
+      ],
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 0.52151,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 213.198117,
+      "mean_ms": 197.68482375,
+      "median_ms": 212.703912,
+      "min_ms": 92.933441,
+      "n": 8,
+      "offsets": [
+        939524096,
+        1073741824,
+        1207959552,
+        1342177280,
+        1476395008,
+        1610612736,
+        1744830464,
+        1879048192
+      ],
+      "order": "reverse",
+      "preadv_ms": [
+        212.906197,
+        213.198117,
+        212.501627,
+        92.933441,
+        213.025147,
+        212.154497,
+        211.844737,
+        212.914827
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "release_decimal_gbps": 5.027478164460137,
+      "release_gib_per_s": 4.682203907948115,
+      "release_to_first_enter_ms": 0.06095,
+      "release_wave_makespan_ms": 213.574637,
+      "scheduler_confounded": false,
+      "syscall_envelope_decimal_gbps": 5.028913317393091,
+      "syscall_envelope_gib_per_s": 4.6835404982726,
+      "syscall_envelope_ms": 213.513687,
+      "useful_bytes": 1073741824,
+      "wave_release_ns": 1361596585
+    },
+    {
+      "all_full_length": true,
+      "block_range": [
+        3,
+        6
+      ],
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 0.284379,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 96.36078,
+      "mean_ms": 92.6497635,
+      "median_ms": 96.05495049999999,
+      "min_ms": 82.128373,
+      "n": 4,
+      "offsets": [
+        402653184,
+        536870912,
+        671088640,
+        805306368
+      ],
+      "order": "reverse",
+      "preadv_ms": [
+        96.36078,
+        96.27417,
+        95.835731,
+        82.128373
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "release_decimal_gbps": 5.56271549826043,
+      "release_gib_per_s": 5.180682519693328,
+      "release_to_first_enter_ms": 0.02108,
+      "release_wave_makespan_ms": 96.51238,
+      "scheduler_confounded": false,
+      "syscall_envelope_decimal_gbps": 5.563930758524344,
+      "syscall_envelope_gib_per_s": 5.181814319011144,
+      "syscall_envelope_ms": 96.4913,
+      "useful_bytes": 536870912,
+      "wave_release_ns": 1577304762
+    },
+    {
+      "all_full_length": true,
+      "block_range": [
+        1,
+        2
+      ],
+      "bytes_returned": [
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 0.0515,
+      "lengths": [
+        134217728,
+        134217728
+      ],
+      "max_ms": 34.953633,
+      "mean_ms": 32.5177935,
+      "median_ms": 32.5177935,
+      "min_ms": 30.081954,
+      "n": 2,
+      "offsets": [
+        134217728,
+        268435456
+      ],
+      "order": "reverse",
+      "preadv_ms": [
+        30.081954,
+        34.953633
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "release_decimal_gbps": 7.677230320493757,
+      "release_gib_per_s": 7.14997790799826,
+      "release_to_first_enter_ms": 0.01151,
+      "release_wave_makespan_ms": 34.965143,
+      "scheduler_confounded": false,
+      "syscall_envelope_decimal_gbps": 7.679758381625165,
+      "syscall_envelope_gib_per_s": 7.152332348399949,
+      "syscall_envelope_ms": 34.953633,
+      "useful_bytes": 268435456,
+      "wave_release_ns": 1675347372
+    },
+    {
+      "all_full_length": true,
+      "block_range": [
+        0,
+        0
+      ],
+      "bytes_returned": [
+        134217728
+      ],
+      "dispatch_skew_ms": 0.0,
+      "lengths": [
+        134217728
+      ],
+      "max_ms": 28.634264,
+      "mean_ms": 28.634264,
+      "median_ms": 28.634264,
+      "min_ms": 28.634264,
+      "n": 1,
+      "offsets": [
+        0
+      ],
+      "order": "reverse",
+      "preadv_ms": [
+        28.634264
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "release_decimal_gbps": 4.686050200310914,
+      "release_gib_per_s": 4.364224337330939,
+      "release_to_first_enter_ms": 0.00771,
+      "release_wave_makespan_ms": 28.641974,
+      "scheduler_confounded": false,
+      "syscall_envelope_decimal_gbps": 4.687311956053768,
+      "syscall_envelope_gib_per_s": 4.36539943893791,
+      "syscall_envelope_ms": 28.634264,
+      "useful_bytes": 134217728,
+      "wave_release_ns": 1711395345
+    }
+  ],
+  "config": {
+    "extent_first_block_by_n": {
+      "1": 0,
+      "2": 1,
+      "4": 3,
+      "8": 7,
+      "16": 15
+    },
+    "file_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+    "max_n": 16,
+    "offset_start": 0,
+    "order": "reverse",
+    "read_bytes": 134217728,
+    "total_blocks_used": 31,
+    "widths": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ]
+  },
+  "container_session_id": "ta-01M33Y5ZRJ5V0Y7VDHJJKKQQNR",
+  "env": {
+    "platform": "Linux",
+    "preadv_available": true,
+    "syscall_impl": "os.preadv"
+  },
+  "file_identity": {
+    "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+    "size": 8044982048,
+    "st_dev": 31,
+    "st_ino": 4,
+    "st_mtime_ns": 1781316088009883330
+  },
+  "hostname": "modal",
+  "identity": {
+    "container_session_id": "ta-01M33Y5ZRJ5V0Y7VDHJJKKQQNR",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "hostname": "modal",
+    "image_id": "im-cOXxV1kdu8xIcFzoycUllG",
+    "observed_gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east",
+    "requested_gpu": "rtx-pro-6000"
+  },
+  "image_id": "im-cOXxV1kdu8xIcFzoycUllG",
+  "kind": "source_concurrency_probe",
+  "model_name": "qwen_3_4b.safetensors",
+  "observed_gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "us-east",
+  "requested_gpu": "rtx-pro-6000",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "schema_version": 1,
+  "status": "ok"
+}

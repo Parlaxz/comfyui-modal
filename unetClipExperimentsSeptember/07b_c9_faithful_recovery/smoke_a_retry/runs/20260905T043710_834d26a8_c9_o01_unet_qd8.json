@@ -1,0 +1,194 @@
+{
+  "active_reader_transitions": [],
+  "allocation_in_timed_loop": false,
+  "arm": "source_only",
+  "attempt_id": "20260905T043710_834d26a8_c9_o01_unet_qd8",
+  "buffer_allocations": null,
+  "buffer_type": null,
+  "byte_reconciliation": {
+    "expected_payload_bytes": null,
+    "offsets_recorded_per_physical_read": true,
+    "read_count": 0,
+    "requested_bytes": 0,
+    "returned_bytes": 0,
+    "returned_equals_expected": true
+  },
+  "campaign_index": 1,
+  "classification": "DNF",
+  "container_session": {
+    "hostname": "modal",
+    "session_id": "ta-01M1QXPC582SQH0AWRDB89D56R",
+    "single_use_container": true
+  },
+  "cpu_allocation": {
+    "declared_memory_mb": 8192,
+    "declared_modal_function_cpu": 12,
+    "observed_cpu": 21,
+    "requested_cpu": 12
+  },
+  "cpu_observed": 21,
+  "cpu_requested": 12,
+  "error": "RuntimeError:Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx",
+  "execution_contract": {
+    "allocation_in_timed_loop": false,
+    "block_bytes": 33554432,
+    "buffer_allocations": "one reusable buffer per worker, allocated before SOURCE_WALL",
+    "buffer_type": "torch.uint8.pinned_host",
+    "cuda_used": false,
+    "dispatcher_participation": false,
+    "fd_topology": "one shared read-only file descriptor; positioned reads",
+    "filesystem_mount": "/root/models",
+    "h2d_used": false,
+    "hashing_in_timed_loop": false,
+    "model_construction": false,
+    "mount_read_only": true,
+    "qd_values": [
+      2,
+      4,
+      8
+    ],
+    "range_geometry": "static contiguous disjoint payload ranges",
+    "source_only": true,
+    "telemetry_in_timed_loop": false,
+    "timing_boundary": "worker thread start -> all worker joins",
+    "torch_imported": true,
+    "workers_per_lane": 1
+  },
+  "experiment": "c9_recovery",
+  "fd_topology": {
+    "close_after_all_workers": true,
+    "mode": "one_shared_fd",
+    "open_count": 1,
+    "shared_by_workers": true
+  },
+  "file_identity": {
+    "basename": "z_image_turbo_bf16.safetensors",
+    "device": 31,
+    "inode": 4,
+    "mtime_ns": 1787810706829355211,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "size_bytes": 12309866400
+  },
+  "filesystem_identity": {
+    "mount": {
+      "filesystem_type": "9p",
+      "major_minor": "0:31",
+      "mount_id": 36,
+      "mount_options": "rw,nosuid",
+      "mountpoint": "/__modal/volumes",
+      "parent_id": 18,
+      "read_only_observed": false,
+      "root": "/",
+      "source": "none",
+      "super_options": "rw,trans=fd,rfdno=11,wfdno=11,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=0,cache=remote_revalidating,disable_fifo_open,directfs"
+    },
+    "mount_read_only_requested": true,
+    "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+    "stat": {
+      "device": 31,
+      "inode": 4,
+      "mode": 420
+    },
+    "statvfs": {
+      "available_bytes": 409600000000,
+      "filesystem_block_size": 4096,
+      "fragment_size": 4096
+    }
+  },
+  "gpu_attachment": {
+    "attached": false,
+    "reason": "source_only",
+    "requested": false
+  },
+  "hashing_in_timed_loop": false,
+  "identity": {
+    "accelerator": "none",
+    "container_session_id": "ta-01M1QXPC582SQH0AWRDB89D56R",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": null,
+    "hostname": "modal",
+    "image_id": "im-hgg4cVWWmDDSghzXBMbyuf",
+    "provider": "CLOUD_PROVIDER_AWS",
+    "region": "eu-west-3"
+  },
+  "max_achieved_qd": null,
+  "model_construction": false,
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "oracle_wall_ms": 4202.5917,
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_identity": {
+    "data_start": 0,
+    "hash_scope": "no payload hashing in the measured source loop",
+    "integrity_verification": "not performed",
+    "payload_bytes": 0
+  },
+  "physical_reads": [],
+  "probe": "exp04_source_ceiling_oracle",
+  "provider_region": {
+    "provider": "CLOUD_PROVIDER_AWS",
+    "region": "eu-west-3"
+  },
+  "qd_telemetry": {
+    "active_interval_end_ns": null,
+    "active_interval_start_ns": null,
+    "max_achieved_qd": null,
+    "time_at_qd_ms": null,
+    "time_weighted_achieved_qd": null
+  },
+  "read_size_evidence": [],
+  "resolved_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+  "role": "unet",
+  "run_id": "20260905T043710_834d26a8",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "source_block_bytes": 33554432,
+  "source_qd": 8,
+  "status": "error",
+  "telemetry_in_timed_loop": false,
+  "time_at_qd_ms": null,
+  "time_weighted_achieved_qd": null,
+  "timing_boundary": {},
+  "validation_failures": [
+    "status_not_ok",
+    "arm_not_source_only",
+    "qd_mismatch",
+    "fixed_config_missing",
+    "source_only_contract_failed",
+    "cuda_used_contract_failed",
+    "h2d_used_contract_failed",
+    "h2d_metric_present",
+    "coverage_failed",
+    "physical_reads_missing",
+    "source_wall_missing",
+    "effective_gbps_missing",
+    "time_weighted_qd_missing",
+    "max_achieved_qd_missing",
+    "worker_evidence_missing",
+    "cpu_observed_not_12",
+    "fd_topology_evidence_failed",
+    "buffer_not_pinned_host",
+    "buffer_reuse_contract_failed",
+    "timing_boundary_missing"
+  ],
+  "workers": []
+}

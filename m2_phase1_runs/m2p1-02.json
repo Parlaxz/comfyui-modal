@@ -1,0 +1,11 @@
+{
+  "_arm": "B",
+  "_call_id_client": "fc-01M3C6V5WQ9B1QPNWMEK49N7JB",
+  "_client_wall_s": 300.3055834000115,
+  "_spec": {
+    "mode": "shared"
+  },
+  "attempt_id": "m2p1-02",
+  "error": "TimeoutError:",
+  "status": "error"
+}

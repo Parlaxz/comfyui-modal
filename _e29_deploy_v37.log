@@ -1,0 +1,3 @@
+[v2ctl.deploy] profile=e29-tracer deploy_fingerprint=fc53f85d7ed2aa6ed34ecbb1c11df6af7a1f31c1b30337c8534dea4781dd1aa3
+[v2ctl.deploy] command="C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\deploy_and_run_v2_single.bat" E28_VALIDATION
+[v2ctl.deploy] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260819-184831_fc53f85d.json

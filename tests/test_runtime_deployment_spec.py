@@ -1,0 +1,545 @@
+"""Focused tests for deployment_spec: manifest builder and exclusion rules."""
+
+from __future__ import annotations
+
+import os
+import io
+import fnmatch
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+from comfymodal_runtime.deployment_spec import (
+    ALLOWED_SOURCE_EXTENSIONS,
+    EXCLUDED_DIRS,
+    EXCLUDED_EXTENSIONS,
+    EXCLUDED_FILENAMES,
+    EXCLUDED_INFIXES,
+    EXCLUDED_PREFIXES,
+    GENERATED_JSON_PREFIXES,
+    build_canonical_boundary_identity,
+    build_deployment_identity,
+    compute_aggregate_hash,
+    compute_file_hashes,
+    compute_source_bytes,
+    deployment_identity_from_dict,
+    is_excluded_path,
+    is_excluded_name,
+    validate_persisted_identity_pair,
+)
+from comfymodal_runtime import publication_policy
+
+
+class TestExclusionPredicate(unittest.TestCase):
+    """Pure-function tests for ``is_excluded_name`` — no filesystem access."""
+
+    def test_allowed_py_file(self):
+        self.assertFalse(is_excluded_name("main.py"))
+
+    def test_allowed_js_file(self):
+        self.assertFalse(is_excluded_name("app.js"))
+        self.assertFalse(is_excluded_name("module.mjs"))
+
+    def test_excluded_extension_pyc(self):
+        self.assertTrue(is_excluded_name("module.pyc"))
+
+    def test_excluded_extension_pyo(self):
+        self.assertTrue(is_excluded_name("module.pyo"))
+
+    def test_excluded_extension_md(self):
+        self.assertTrue(is_excluded_name("README.md"))
+
+    def test_excluded_extension_tmp(self):
+        self.assertTrue(is_excluded_name("scratch.tmp"))
+
+    def test_excluded_extension_ref(self):
+        self.assertTrue(is_excluded_name("reference.ref"))
+
+    def test_excluded_extension_log(self):
+        self.assertTrue(is_excluded_name("output.log"))
+
+    def test_excluded_prefix_before_v2(self):
+        self.assertTrue(is_excluded_name("before_v2_16_20_full.patch"))
+
+    def test_excluded_infix_backup(self):
+        self.assertTrue(is_excluded_name("comfyapp.py.v21610_backup"))
+
+    def test_excluded_exact_gitignore(self):
+        self.assertTrue(is_excluded_name(".gitignore"))
+
+    def test_excluded_exact_deploy_log(self):
+        self.assertTrue(is_excluded_name(".deploy_log"))
+
+    def test_excluded_exact_modal_logs(self):
+        self.assertTrue(is_excluded_name("modal_logs.txt"))
+
+    def test_excluded_generated_json_temp(self):
+        self.assertTrue(is_excluded_name("temp_result.json"))
+
+    def test_excluded_generated_json_last_trace(self):
+        self.assertTrue(is_excluded_name("_last_trace_result.json"))
+
+    def test_excluded_generated_json_studio(self):
+        self.assertTrue(is_excluded_name("studio-run-completed.json"))
+
+    def test_excluded_generated_json_clean(self):
+        self.assertTrue(is_excluded_name("clean_workflow.json"))
+
+    def test_excluded_generated_json_latest_benchmark(self):
+        self.assertTrue(is_excluded_name("latest_benchmark_workflow.json"))
+
+    def test_excluded_generated_json_modal_dot(self):
+        self.assertTrue(is_excluded_name(".modal_settings.json"))
+        self.assertTrue(is_excluded_name(".model_manifest.json"))
+        self.assertTrue(is_excluded_name(".profile_config.json"))
+
+    def test_publication_excludes_artifacts_and_bundles_but_keeps_source(self):
+        excluded_paths = (
+            "artifacts/phase_p1/manifest.json",
+            "legitimate-node/artifacts/manifest.json",
+            "comfyui-modal-P4-all.bundle",
+            "legitimate-node/comfyui-modal-P4-all.bundle",
+        )
+        for path in excluded_paths:
+            self.assertTrue(is_excluded_path(path), path)
+            self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/source.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/source.py"))
+
+    def test_publication_excludes_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        for directory in excluded_dirs:
+            for path in (
+                f"{directory}/state.json",
+                f"legitimate-node/{directory}/nested/runtime.py",
+            ):
+                self.assertTrue(is_excluded_path(path), path)
+                self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/runtime.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/runtime.py"))
+
+    def test_publication_walk_skips_known_non_runtime_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "node-a"
+            node.mkdir()
+            (node / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+            for directory in (".repowise", "ra11f", "reports", "example_workflows", "workflows"):
+                excluded = node / "nested" / directory
+                excluded.mkdir(parents=True)
+                (excluded / "ignored.py").write_text("ignored = True\n", encoding="utf-8")
+
+            published = {
+                path.relative_to(root).as_posix()
+                for path in publication_policy.iter_publication_files(root)
+            }
+
+        self.assertEqual(published, {"node-a/runtime.py"})
+
+    def test_image_ignore_patterns_cover_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for directory in excluded_dirs:
+            self.assertIn(f"{directory}/", patterns)
+            self.assertIn(f"**/{directory}/", patterns)
+
+    def test_image_ignore_patterns_cover_generated_json_and_generated_images(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for prefix in GENERATED_JSON_PREFIXES:
+            self.assertIn(f"{prefix}*.json", patterns)
+            self.assertIn(f"**/{prefix}*.json", patterns)
+        for extension in (".png", ".jpg", ".webp"):
+            self.assertIn(f"*screenshot*{extension}", patterns)
+            self.assertIn(f"**/*validation*{extension}", patterns)
+
+    def test_image_ignore_patterns_match_exclusions_without_hiding_runtime_files(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+
+        def ignored(path):
+            return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+        for path in (
+            "temp_result.json",
+            "nested/_last_trace_result.json",
+            "nested/screenshot-result.PNG",
+            "nested/studio-validation-desktop.webp",
+            "README.md",
+            "nested/README.MD",
+        ):
+            self.assertTrue(ignored(path), path)
+
+        for path in (
+            "REPORTS/",
+            "nested/Workflows/",
+            "BEFORE_deploy.patch",
+            "nested/BEFORE_v2_manifest.diff",
+        ):
+            self.assertTrue(ignored(path), path)
+
+        for path in ("runtime.py", "nested/runtime.py", "runtime_asset.png"):
+            self.assertFalse(ignored(path), path)
+
+    def test_excluded_screenshot_png(self):
+        self.assertTrue(is_excluded_name("studio-validation-desktop.png"))
+        self.assertTrue(is_excluded_name("screenshot-result.png"))
+
+    def test_excluded_allowed_runtime_json(self):
+        # Runtime state JSON should NOT be excluded (no matching prefix)
+        self.assertFalse(is_excluded_name("runtime_state.json"))
+        self.assertFalse(is_excluded_name("deployment_state.json"))
+
+    def test_included_python_file(self):
+        self.assertFalse(is_excluded_name("nodes.py"))
+        self.assertFalse(is_excluded_name("__init__.py"))
+
+    def test_included_js_file(self):
+        self.assertFalse(is_excluded_name("index.js"))
+        self.assertFalse(is_excluded_name("worker.mjs"))
+
+    def test_case_sensitivity_md(self):
+        # Extension matching should be case-insensitive
+        self.assertTrue(is_excluded_name("README.MD"))
+        self.assertTrue(is_excluded_name("readme.Md"))
+
+    def test_deployment_identity_and_publication_share_file_policy(self):
+        names = (
+            ".commandcode/settings.json",
+            ".v2ctl/runs/run.json",
+            "before_v2_16_20.patch",
+            "studio-validation-desktop.png",
+            "runtime_state.json",
+            "module.MJS",
+        )
+        for name in names:
+            self.assertEqual(
+                is_excluded_path(name),
+                publication_policy.is_excluded_path(name),
+                name,
+            )
+
+    def test_source_walkers_both_reject_symlinked_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "real.py").write_text("value = 1", encoding="utf-8")
+            link = root / "linked.py"
+            try:
+                link.symlink_to(root / "real.py")
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable on this host")
+            self.assertNotIn("linked.py", compute_file_hashes(root))
+            self.assertNotIn(link, set(publication_policy.iter_source_files(root)))
+
+
+class TestBuildDeploymentIdentity(unittest.TestCase):
+    """Integration tests for the full manifest builder with temp directories."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, rel: str, content: str = "content") -> Path:
+        """Create a file at *rel* under the temp root."""
+        path = self.tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    # ── No-op manifest ───────────────────────────────────────────────
+
+    def test_empty_runtime_root_yields_empty_identity(self):
+        """An empty runtime root produces an identity with empty hashes."""
+        identity = build_deployment_identity(self.tmp_path)
+        # SHA-256 of empty input is deterministic (empty dict produces it)
+        self.assertEqual(len(identity.runtime_hash), 64)
+        self.assertEqual(identity.custom_node_hash, "")
+        self.assertEqual(identity.dependency_hash, "")
+        self.assertEqual(identity.source_bytes, 0)
+        self.assertEqual(identity.file_hashes, {})
+
+    # ── Required module inclusion ────────────────────────────────────
+
+    def test_py_files_are_included_in_hash(self):
+        self._write("contracts.py", "class DeploymentIdentity: pass")
+        identity = build_deployment_identity(self.tmp_path)
+        self.assertNotEqual(identity.runtime_hash, "")
+        self.assertIn("contracts.py", identity.file_hashes)
+        self.assertGreater(identity.source_bytes, 0)
+
+    def test_multiple_py_files_are_all_included(self):
+        self._write("a.py", "x = 1")
+        self._write("b.py", "y = 2")
+        identity = build_deployment_identity(self.tmp_path)
+        self.assertIn("a.py", identity.file_hashes)
+        self.assertIn("b.py", identity.file_hashes)
+
+    def test_non_source_extensions_are_excluded(self):
+        self._write("main.py", "code")
+        self._write("readme.md", "# Docs")
+        self._write("data.tmp", "temp")
+        self._write("output.log", "log content")
+        identity = build_deployment_identity(self.tmp_path)
+        self.assertIn("main.py", identity.file_hashes)
+        self.assertNotIn("readme.md", identity.file_hashes)
+        self.assertNotIn("data.tmp", identity.file_hashes)
+        self.assertNotIn("output.log", identity.file_hashes)
+
+    # ── Excluded artifact change — must NOT alter identity ───────────
+
+    def test_excluded_artifact_change_does_not_alter_hash(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        # Add an excluded artifact
+        self._write("README.md", "new docs")
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertEqual(h1, h2)
+
+    def test_excluded_dir_content_does_not_affect_identity(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        # Files inside excluded directories should be invisible
+        self._write("docs/guide.md", "guide")
+        self._write("tests/test_a.py", "test")
+        self._write("reference/old.py", "old")
+        self._write("node_modules/pkg/index.js", "pkg")
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertEqual(h1, h2)
+
+    def test_backup_file_does_not_affect_identity(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self._write("main.py.v21610_backup", "backup")
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertEqual(h1, h2)
+
+    def test_before_v2_patch_does_not_affect_identity(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self._write("before_v2_16_20_full.patch", "diff")
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertEqual(h1, h2)
+
+    def test_generated_json_does_not_affect_identity(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self._write("temp_result.json", '{"key": "value"}')
+        self._write("_last_trace_result.json", '{"trace": []}')
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertEqual(h1, h2)
+
+    # ── Source-only custom-node change — MUST alter identity ─────────
+
+    def test_source_change_alters_identity(self):
+        self._write("core.py", "fixed")
+        h1 = build_deployment_identity(self.tmp_path).combined_hash
+
+        # Wait for different mtime (not needed; we change content)
+        self._write("core.py", "changed content")
+        h2 = build_deployment_identity(self.tmp_path).combined_hash
+
+        self.assertNotEqual(h1, h2)
+
+    def test_custom_node_py_change_alters_custom_node_hash(self):
+        self._write("runtime.py", "runtime code")
+        identity_no_custom = build_deployment_identity(self.tmp_path)
+
+        custom_dir = self.tmp_path / "_custom_nodes"
+        custom_dir.mkdir()
+        (custom_dir / "node.py").write_text("node v1", encoding="utf-8")
+
+        identity_v1 = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[custom_dir]
+        )
+        self.assertNotEqual(identity_v1.custom_node_hash, "")
+
+        # Change custom-node source
+        (custom_dir / "node.py").write_text("node v2", encoding="utf-8")
+        identity_v2 = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[custom_dir]
+        )
+        self.assertNotEqual(identity_v1.custom_node_hash, identity_v2.custom_node_hash)
+
+    def test_custom_node_js_change_alters_identity(self):
+        self._write("runtime.py", "runtime code")
+        custom_dir = self.tmp_path / "_custom_nodes"
+        custom_dir.mkdir()
+        (custom_dir / "ui.js").write_text("console.log('v1')", encoding="utf-8")
+
+        id1 = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[custom_dir]
+        )
+        (custom_dir / "ui.js").write_text("console.log('v2')", encoding="utf-8")
+        id2 = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[custom_dir]
+        )
+        self.assertNotEqual(id1.combined_hash, id2.combined_hash)
+
+    def test_multiple_custom_node_roots_keep_same_relative_paths_distinct(self):
+        self._write("runtime.py", "runtime code")
+        first = self.tmp_path / "custom-one"
+        second = self.tmp_path / "custom-two"
+        first.mkdir()
+        second.mkdir()
+        (first / "node.py").write_text("node one", encoding="utf-8")
+        (second / "node.py").write_text("node two", encoding="utf-8")
+
+        identity = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[first, second]
+        )
+
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_0/node.py"],
+            compute_file_hashes(first)["node.py"],
+        )
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_1/node.py"],
+            compute_file_hashes(second)["node.py"],
+        )
+
+    # ── Dependency-only change ───────────────────────────────────────
+
+    def test_dependency_hash_is_carried_through(self):
+        id1 = build_deployment_identity(
+            self.tmp_path, dependency_hash="dep-v1"
+        )
+        id2 = build_deployment_identity(
+            self.tmp_path, dependency_hash="dep-v2"
+        )
+        self.assertEqual(id1.runtime_hash, id2.runtime_hash)
+        self.assertNotEqual(id1.combined_hash, id2.combined_hash)
+
+    # ── Determinism ──────────────────────────────────────────────────
+
+    def test_identical_source_produces_identical_identity(self):
+        self._write("a.py", "x = 1")
+        id1 = build_deployment_identity(self.tmp_path)
+        id2 = build_deployment_identity(self.tmp_path)
+        self.assertEqual(id1.combined_hash, id2.combined_hash)
+        self.assertEqual(id1.to_dict(), id2.to_dict())
+
+
+class TestEmptyCustomNodeHashBoundary(unittest.TestCase):
+    """Identities built without a custom-node tree walk still round-trip."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_empty_custom_node_hash_passes_boundary_and_persisted_roundtrip(self):
+        (self.tmp_path / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+        source_identity = build_deployment_identity(
+            self.tmp_path, dependency_hash="d" * 64
+        )
+        self.assertEqual(source_identity.custom_node_hash, "")
+        canonical = build_canonical_boundary_identity(
+            source_identity=source_identity,
+            foundation_inputs={"foundation": "stable"},
+            dependency_inputs={"dependency": "stable"},
+            accelerator_inputs={"accelerator": "stable"},
+            late_config_inputs={"late": "stable"},
+        )
+        persisted = source_identity.with_deployment_hash(canonical.deployment)
+        restored = deployment_identity_from_dict(persisted.to_dict())
+        validate_persisted_identity_pair(restored, canonical)
+
+
+class TestComputeHelpers(unittest.TestCase):
+    """Tests for the lower-level hash/size computation functions."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, rel: str, content: str = "data") -> Path:
+        path = self.tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_compute_source_bytes_counts_only_allowed(self):
+        self._write("a.py", "hello")
+        self._write("b.md", "world")  # excluded extension
+        total = compute_source_bytes(self.tmp_path)
+        self.assertGreater(total, 0)
+        # Only a.py contributes
+        self.assertLess(total, 6)  # 'hello' is 5 bytes, plus maybe BOM
+
+    def test_compute_file_hashes_excludes_non_source(self):
+        self._write("a.py", "content")
+        self._write("b.md", "content")
+        hashes = compute_file_hashes(self.tmp_path)
+        self.assertIn("a.py", hashes)
+        self.assertNotIn("b.md", hashes)
+
+    def test_compute_aggregate_hash_is_deterministic(self):
+        h1 = compute_aggregate_hash({"a.py": "abc", "b.py": "def"})
+        h2 = compute_aggregate_hash({"b.py": "def", "a.py": "abc"})
+        self.assertEqual(h1, h2)
+
+    def test_compute_aggregate_hash_empty(self):
+        # SHA-256 of empty input (no paths fed into the hasher)
+        empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        self.assertEqual(compute_aggregate_hash({}), empty_hash)
+
+
+class TestPublisherArchiveFilter(unittest.TestCase):
+    """The deploy-time publisher must apply the shared source policy."""
+
+    def test_archive_excludes_artifacts_and_bundles_but_keeps_source(self):
+        from tools.publish_custom_nodes_volume import _build_custom_nodes_archive
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "legitimate-node"
+            node.mkdir()
+            (node / "source.py").write_text("value = 1", encoding="utf-8")
+            (node / "artifacts").mkdir()
+            (node / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+            (node / "comfyui-modal-P4-all.bundle").write_bytes(b"bundle")
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+
+            archive = _build_custom_nodes_archive(str(root))
+
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = set(tar.getnames())
+
+        self.assertIn("legitimate-node/source.py", names)
+        self.assertNotIn("legitimate-node/artifacts", names)
+        self.assertNotIn("legitimate-node/artifacts/manifest.json", names)
+        self.assertNotIn("legitimate-node/comfyui-modal-P4-all.bundle", names)
+        self.assertFalse(any(name == "artifacts" or name.startswith("artifacts/") for name in names))
+
+
+if __name__ == "__main__":
+    unittest.main()

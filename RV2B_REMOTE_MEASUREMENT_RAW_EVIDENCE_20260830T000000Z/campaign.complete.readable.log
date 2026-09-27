@@ -1,0 +1,265 @@
+RV2B raw evidence campaign
+timestamp=2026-08-30T21:17:11.0767684-05:00
+===== LOCAL SOURCE IDENTITY BEFORE LANE =====
+ M .opencode/skills/comfy-modal-core/SKILL.md
+ M .opencode/skills/comfymodal-golden-ops/SKILL.md
+ M comfyapp.py
+ M comfymodal_runtime/deployment_spec.py
+ M comfymodal_runtime/golden_serial.py
+ M comfymodal_runtime/modal_app.py
+ M comfymodal_runtime/publication_policy.py
+ M comfymodal_runtime/sampling_deep_profile.py
+ M config/v2/profiles/golden_p1.toml
+ M tests/test_dependency_manifest_lifecycle.py
+ M tests/test_golden_p1_wiring.py
+ M tests/test_modal_app_identity.py
+ M tests/test_p1_golden_serial.py
+ M tests/test_s1_publisher_bootstrap.py
+ M tests/test_s2_golden_deploy.py
+ M tests/test_source_identity_publication.py
+ M tests/test_v2_clip_restore_lifecycle.py
+ M tests/test_v2_custom_node_generation_identity.py
+ M tests/test_v2_diagnosis_restore_timing.py
+ M tests/test_v2_sampling_deep_profile.py
+ M tests/test_v2_snapshot_model_bridge.py
+ M tests/test_v2_snapshot_restore_only.py
+ M tools/v2_control/custom_nodes.py
+?? RA11A_MINIMAL_GOLDEN_RUNTIME_DEPENDENCY_CLOSURE_REPORT.md
+?? RA2B_SNAPSHOT_RESTORE_CONTENT_RAW_LOG.md
+?? RA2B_SNAPSHOT_RESTORE_CONTENT_TRUTH_REPORT.md
+?? RA3_CLIP_LOAD_FORWARD_TRUTH_AND_RECOVERY_REPORT.md
+?? RA6H_HISTORICAL_SAMPLING_FIRST_USE_FORENSICS_REPORT.md
+?? RA6_GOLDEN_SAMPLING_DECOMPOSITION_REPORT.md
+?? RA7_DURABLE_COMMIT_VARIANCE_AND_DECOMPOSITION_REPORT.md
+?? RA8_VAE_LOAD_VARIANCE_REPORT.md
+?? RA9A_QD_SHARED_PINNED_STAGING_ARCHITECTURE_REPORT.md
+?? RV1B_RESTORE_SNAPSHOT_FAILURE_CLASSIFICATION.md
+?? RV1C_FINAL_LOCAL_DEPLOY_GATE_REPORT.md
+?? RV1_SHARED_GOLDEN_DIAGNOSTIC_RECONCILIATION_REPORT.md
+?? RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z/campaign.log
+?? RV2_REMOTE_GOLDEN_BASELINE_RAW_LOG.md
+?? RV2_REMOTE_GOLDEN_BASELINE_TRUTH_REPORT.md
+?? S4B_REMOTE_PUBLICATION_GENERATION_RECONCILIATION_REPORT.md
+?? S4_CUSTOM_NODE_FULL_CONTENT_PUBLICATION_TRUST_REPORT.md
+?? STUDIO_AUDIT_FINAL_2026-08-30.md
+?? tests/test_ra3_clip_truth_telemetry.py
+git.head=02f1845a37c7c602bb598afb7e33cab938044e99
+git.branch=TESTING2
+git.status.exit=0
+
+===== PREDEPLOY GOLDEN STATUS =====
+COMMAND: python tools/v2ctl.py --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off golden status
+[v2ctl.golden.status]
+schema_version=2
+profile=golden_p1
+target={'app': 'batch-rv2b-golden-measurement', 'class': 'ModalRuntimeEntrypointV2', 'method': 'run_golden_serial_stream'}
+deployment_manifest=None
+deployment_fingerprint_current=1de279f72e7391d209bd9e72b007808f66ee416f118948a5ee76b1f408a1df0c
+deployment_fingerprint_stored=None
+deployment_fingerprint_match=False
+deployment_target_match=False
+deployed_state_present=True
+deployed_state_target_match=False
+deployed_state_app=batch-ra2-active-patcher
+deployed_state_class=ModalRuntimeEntrypointV2
+deployed_state_combined_hash=d25161544d2d2d7461d32a1b2f99ea381c6cf7a108d3c9b2481037192fbeac96
+deployed_state_error=
+runtime_health_status=unverified
+source_identity_status=unverified
+runtime_overrides_present=0
+deploy_lock_active=False
+capture_guard={'schema_version': 2, 'state': 'idle', 'post_capture_guard_pending': False, 'last_snapshot_capture_request_id': '', 'last_snapshot_capture_at': '', 'guard_armed_by_request_id': '', 'last_guard_consumed_by_request_id': '', 'last_guard_consumed_at': '', 'capture_identity': '', 'capture_request_id': '', 'capture_at': '', 'deployment_identity': '{"app_name":"batch-rv2b-golden-measurement","class_name":"ModalRuntimeEntrypointV2","deploy_fingerprint":"1de279f72e7391d209bd9e72b007808f66ee416f118948a5ee76b1f408a1df0c","deployment_combined_hash":"","gpu":"rtx-pro-6000"}', 'last_transition_reason': 'initial'}
+next_request_guarded=False
+remote_checks=not_performed
+ready=False
+EXIT_CODE=1
+
+===== PREDEPLOY DOCTOR =====
+COMMAND: python tools/v2ctl.py doctor --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+[v2ctl.doctor]
+git.head=02f1845a37c7c602bb598afb7e33cab938044e99
+git.branch=TESTING2
+git.dirty=1
+python=3.11.9
+profile=golden_p1
+target.app=batch-rv2b-golden-measurement
+target.class=ModalRuntimeEntrypointV2
+target.method=run_golden_serial_stream
+backend.deploy_and_run_v2_single.exists=1 kind=combined
+backend.deploy_and_run_v2_single_deploy_only.exists=1 kind=deploy_only_via_env
+backend.run_v2_single.exists=1 kind=run
+registry.flags=118
+profiles=e29-tracer,e30-clip-qd,e30-clip-qd-arm-a,e30-clip-qd-arm-b,e31-clip-fp32-fastsafe-arm-a,e31-clip-fp32-fastsafe-arm-b,e31-clip-fp32-qd4-arm-a,e31-clip-fp32-qd4-arm-b,e37-clean-lane-qd4,e37-clip-fastsafe,e37-clip-qd4,golden_p1,production
+runtime_override_policy=forbid
+runtime_overrides.present=0
+deploy.lock=none
+deployment.manifest=none
+[v2ctl.doctor] PROBLEMS:
+  - no deployment manifest found; run `v2ctl deploy-run` or `v2ctl deploy` first
+EXIT_CODE=1
+
+===== DEPLOYMENT 1 =====
+COMMAND: python tools/v2ctl.py --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off golden deploy --app batch-rv2b-golden-measurement
+[v2ctl.deploy] profile=golden_p1 deploy_fingerprint=1de279f72e7391d209bd9e72b007808f66ee416f118948a5ee76b1f408a1df0c
+[v2ctl.deploy] command=modal deploy -m comfymodal_runtime.modal_app --name batch-rv2b-golden-measurement
+[custom_nodes.publish] decision=skip_exact reason=exact_match generation=f4c12e9b7573 schema=2 policy=1
+[v2ctl.deploy] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260830-212135_1de279f7.json
+EXIT_CODE=0
+
+===== POSTDEPLOY SOURCE PROBE =====
+COMMAND: python tools/v2ctl.py --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off source-probe
+[v2.modal_target] app=batch-rv2b-golden-measurement class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+[v2ctl.source-probe] profile=golden_p1
+[v2ctl.source-probe] git_head=02f1845a37c7
+[v2ctl.source-probe] target app=batch-rv2b-golden-measurement class=ModalRuntimeEntrypointV2 gpu=rtx-pro-6000
+[v2ctl.source-probe] remote class=ModalRuntimeEntrypointV2 image=im-6tVko9CZ6dtfZ9t6Ewi5kO container=7397184e35124488
+[v2ctl.source-probe] remote deployment_combined_hash=aaba80156dc559e5
+[v2ctl.source-probe] remote cwd=/root/comfy/ComfyUI
+[v2ctl.source-probe] remote comfymodal_runtime __file__=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/modal_app.py: MATCH remote_sha=7f824881799ce1d0 expected_sha=7f824881799ce1d0 path=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/critical_path_ledger.py: MATCH remote_sha=4b907c986d2734e6 expected_sha=4b907c986d2734e6 path=/root/comfymodal_runtime/critical_path_ledger.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_bootstrap.py: MATCH remote_sha=624dcd50c26f55b5 expected_sha=624dcd50c26f55b5 path=/root/comfymodal_runtime/runtime_bootstrap.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_executor.py: MATCH remote_sha=ab0651bf2de41e7d expected_sha=ab0651bf2de41e7d path=/root/comfymodal_runtime/runtime_executor.py
+[v2ctl.source-probe]   comfymodal_runtime/gantt_telemetry.py: MATCH remote_sha=bf61c7db3a931120 expected_sha=bf61c7db3a931120 path=/root/comfymodal_runtime/gantt_telemetry.py
+[v2ctl.source-probe]   comfymodal_runtime/model_preload.py: MATCH remote_sha=4affe1e06a3acc24 expected_sha=4affe1e06a3acc24 path=/root/comfymodal_runtime/model_preload.py
+[v2ctl.source-probe]   comfymodal_runtime/clip_fast_hydration_wiring.py: MATCH remote_sha=4285c5a25fce5726 expected_sha=4285c5a25fce5726 path=/root/comfymodal_runtime/clip_fast_hydration_wiring.py
+[v2ctl.source-probe]   comfymodal_runtime/registry_proof_store.py: MATCH remote_sha=9e4692fddc14ad91 expected_sha=9e4692fddc14ad91 path=/root/comfymodal_runtime/registry_proof_store.py
+[v2ctl.source-probe] ledger flag=COMFYMODAL_V2_CRITICAL_PATH_LEDGER enabled=True record_event=True
+[v2ctl.source-probe] verdict=MATCH
+[v2ctl.source-probe] RESULT=PASS source_identity=MATCH
+[v2ctl.source-probe] manifest source_identity_status=verified
+EXIT_CODE=0
+
+===== POSTDEPLOY GOLDEN STATUS =====
+COMMAND: python tools/v2ctl.py --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off golden status
+[v2ctl.golden.status]
+schema_version=2
+profile=golden_p1
+target={'app': 'batch-rv2b-golden-measurement', 'class': 'ModalRuntimeEntrypointV2', 'method': 'run_golden_serial_stream'}
+deployment_manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260830-212135_1de279f7.json
+deployment_fingerprint_current=32dd57ed54eaddc337af6d790e722c6b8cdc7241e7f64e72a14a6e54d973a4d1
+deployment_fingerprint_stored=1de279f72e7391d209bd9e72b007808f66ee416f118948a5ee76b1f408a1df0c
+deployment_fingerprint_match=False
+deployment_target_match=True
+deployed_state_present=True
+deployed_state_target_match=False
+deployed_state_app=batch-ra2-active-patcher
+deployed_state_class=ModalRuntimeEntrypointV2
+deployed_state_combined_hash=d25161544d2d2d7461d32a1b2f99ea381c6cf7a108d3c9b2481037192fbeac96
+deployed_state_error=
+runtime_health_status=unverified
+source_identity_status=unverified
+runtime_overrides_present=0
+deploy_lock_active=False
+capture_guard={'schema_version': 2, 'state': 'idle', 'post_capture_guard_pending': False, 'last_snapshot_capture_request_id': '', 'last_snapshot_capture_at': '', 'guard_armed_by_request_id': '', 'last_guard_consumed_by_request_id': '', 'last_guard_consumed_at': '', 'capture_identity': '', 'capture_request_id': '', 'capture_at': '', 'deployment_identity': '{"app_name":"batch-rv2b-golden-measurement","class_name":"ModalRuntimeEntrypointV2","deploy_fingerprint":"32dd57ed54eaddc337af6d790e722c6b8cdc7241e7f64e72a14a6e54d973a4d1","deployment_combined_hash":"","gpu":"rtx-pro-6000"}', 'last_transition_reason': 'initial'}
+next_request_guarded=False
+remote_checks=not_performed
+ready=False
+EXIT_CODE=1
+
+===== POSTDEPLOY DOCTOR =====
+COMMAND: python tools/v2ctl.py doctor --profile golden_p1 --app batch-rv2b-golden-measurement --set COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=1 --set COMFYMODAL_SAMPLING_DEEP_PROFILE=off
+[v2ctl.doctor]
+git.head=7f9a19ef9bf88c1424340897cdf723748b1341dc
+git.branch=TESTING2
+git.dirty=1
+python=3.11.9
+profile=golden_p1
+target.app=batch-rv2b-golden-measurement
+target.class=ModalRuntimeEntrypointV2
+target.method=run_golden_serial_stream
+backend.deploy_and_run_v2_single.exists=1 kind=combined
+backend.deploy_and_run_v2_single_deploy_only.exists=1 kind=deploy_only_via_env
+backend.run_v2_single.exists=1 kind=run
+registry.flags=118
+profiles=e29-tracer,e30-clip-qd,e30-clip-qd-arm-a,e30-clip-qd-arm-b,e31-clip-fp32-fastsafe-arm-a,e31-clip-fp32-fastsafe-arm-b,e31-clip-fp32-qd4-arm-a,e31-clip-fp32-qd4-arm-b,e37-clean-lane-qd4,e37-clip-fastsafe,e37-clip-qd4,golden_p1,production
+runtime_override_policy=forbid
+runtime_overrides.present=0
+deploy.lock=none
+deployment.fingerprint.stored=1de279f72e7391d209bd9e72b007808f66ee416f118948a5ee76b1f408a1df0c
+deployment.fingerprint.current=32dd57ed54eaddc337af6d790e722c6b8cdc7241e7f64e72a14a6e54d973a4d1
+deployment.fingerprint.match=0
+deployment.target.match=1
+[v2ctl.doctor] PROBLEMS:
+  - deployment fingerprint mismatch: deploy-required state changed since last deploy
+EXIT_CODE=1
+
+===== STOP CONDITION: DEPLOY-RELEVANT IDENTITY CHANGED DURING LANE =====
+STOP=YES
+REASON=git/source identity changed after deployment; post-deploy status/doctor fingerprint mismatch
+===== LOCAL SOURCE IDENTITY AFTER STOP =====
+git.head=7f9a19ef9bf88c1424340897cdf723748b1341dc
+git.branch=TESTING2
+git.status=
+ M RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z/campaign.log
+changed_from_pre_lane_head=
+M	.opencode/skills/comfy-modal-core/SKILL.md
+M	.opencode/skills/comfymodal-golden-ops/SKILL.md
+A	RA10A_EMPTY_CACHE_MODEL_MANAGER_FORENSICS_REPORT.md
+A	RA11A_MINIMAL_GOLDEN_RUNTIME_DEPENDENCY_CLOSURE_REPORT.md
+A	RA2B_SNAPSHOT_RESTORE_CONTENT_RAW_LOG.md
+A	RA2B_SNAPSHOT_RESTORE_CONTENT_TRUTH_REPORT.md
+A	RA3_CLIP_LOAD_FORWARD_TRUTH_AND_RECOVERY_REPORT.md
+A	RA6H_HISTORICAL_SAMPLING_FIRST_USE_FORENSICS_REPORT.md
+A	RA6_GOLDEN_SAMPLING_DECOMPOSITION_REPORT.md
+A	RA7_DURABLE_COMMIT_VARIANCE_AND_DECOMPOSITION_REPORT.md
+A	RA8_VAE_LOAD_VARIANCE_REPORT.md
+A	RA9A_QD_SHARED_PINNED_STAGING_ARCHITECTURE_REPORT.md
+A	RV1B_RESTORE_SNAPSHOT_FAILURE_CLASSIFICATION.md
+A	RV1C_FINAL_LOCAL_DEPLOY_GATE_REPORT.md
+A	RV1_SHARED_GOLDEN_DIAGNOSTIC_RECONCILIATION_REPORT.md
+A	RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z/campaign.log
+A	RV2_REMOTE_GOLDEN_BASELINE_RAW_LOG.md
+A	RV2_REMOTE_GOLDEN_BASELINE_TRUTH_REPORT.md
+A	S4B_REMOTE_PUBLICATION_GENERATION_RECONCILIATION_REPORT.md
+A	S4_CUSTOM_NODE_FULL_CONTENT_PUBLICATION_TRUST_REPORT.md
+A	STUDIO_AUDIT_FINAL_2026-08-30.md
+M	comfyapp.py
+M	comfymodal_runtime/deployment_spec.py
+M	comfymodal_runtime/golden_serial.py
+M	comfymodal_runtime/modal_app.py
+M	comfymodal_runtime/publication_policy.py
+M	comfymodal_runtime/sampling_deep_profile.py
+M	config/v2/profiles/golden_p1.toml
+M	tests/test_dependency_manifest_lifecycle.py
+M	tests/test_golden_p1_wiring.py
+M	tests/test_modal_app_identity.py
+M	tests/test_p1_golden_serial.py
+A	tests/test_ra3_clip_truth_telemetry.py
+M	tests/test_s1_publisher_bootstrap.py
+M	tests/test_s2_golden_deploy.py
+M	tests/test_source_identity_publication.py
+M	tests/test_v2_clip_restore_lifecycle.py
+M	tests/test_v2_custom_node_generation_identity.py
+M	tests/test_v2_diagnosis_restore_timing.py
+M	tests/test_v2_sampling_deep_profile.py
+M	tests/test_v2_snapshot_model_bridge.py
+M	tests/test_v2_snapshot_restore_only.py
+M	tools/v2_control/custom_nodes.py
+worktree_diff_names=
+RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z/campaign.log
+===== CAMPAIGN COUNTS AT STOP =====
+deployment_command_attempts=1
+successful_deployments=1
+golden_run_attempts=0
+invalid_capture_attempts=0
+direct_following_invalid_attempts=0
+failed_golden_attempts=0
+eligible_runs=0
+same_deployment_cohort=NO
+RA3_DIAGNOSTICS_COMPLETE=NO
+RA7_DIAGNOSTICS_COMPLETE=NO
+RA8_DIAGNOSTICS_COMPLETE=NO
+RA6_EFFECTIVE_MODE=off_requested_not_runtime_verified
+PROTECTED_APP_TOUCHED=NO
+PATCH_REDEPLOY_AFTER_STOP=NO
+
+===== EVIDENCE BUNDLE METADATA =====
+EVIDENCE_ID=RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z
+DEPLOYMENT_MANIFEST=.v2ctl/deployments/deploy_20260830-212135_1de279f7.json
+DEPLOYMENT_V2CTL_INVOCATION_ID=2c340a54ddd548d081f78e7309601e5a
+REMOTE_IMAGE=im-6tVko9CZ6dtfZ9t6Ewi5kO
+REMOTE_CONTAINER=7397184e35124488
+REMOTE_DEPLOYMENT_COMBINED_HASH_PREFIX=aaba80156dc559e5
+STOP=YES
+STOP_REASON=deploy-relevant git/source identity changed during lane; post-deploy fingerprint mismatch

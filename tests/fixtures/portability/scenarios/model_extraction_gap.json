@@ -1,0 +1,39 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §6 ModelPatchLoader not covered",
+    "PHASE_G5 §6 model_extraction_gap"
+  ],
+  "description": "FixturePatchLoader mirrors the audited ModelPatchLoader blind spot: its string loader input is a model-like ref not covered by known extraction mappings, so it cannot enter dependency_metadata.model_stack.",
+  "expected": {
+    "issue_codes": [
+      "model_extraction_gap"
+    ],
+    "provenance_quality": "exact",
+    "risk_level_hint_nonnormative": "medium",
+    "signals": {
+      "custom_node_count": 1,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 1,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": true,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/model_extraction_gap.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "2fa7315fc4be34acf29ee42834f13c02ecfb86b5d9fdcae9f424655d634417d8",
+  "scenario_id": "model_extraction_gap",
+  "title": "Loader input outside extraction mappings"
+}

@@ -1,0 +1,7 @@
+[v2ctl.run] profile=golden_p1 deploy_fingerprint=a21a57b6aafb0863a539a7027fb98c70250438e566bf7d9cd85ef73ce64d2fd0 run_fingerprint=b246668ddab0ee0446d30809b84eb8bc486e76adaa2c58ded9418b1afbd9f2b0
+[v2ctl.run] command="C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\run_v2_single.bat" --run-count 1 --golden-p1-expected-output-sha 8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e --attention-backend pytorch
+[v2ctl.run] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\runs\run_20260903-102855_b246668d.json
+[v2ctl.run] evidence=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md status=OK
+Authoritative capture-guard classification in attempt_0.json: ELIGIBLE (valid=true, counted=true, transition=none).
+Cohort role: PRE_CAPTURE_UNCOUNTED — no request-time snapshot capture had been observed yet, so this
+observation cannot join the five-run cohort. Retained with full evidence.

@@ -1,0 +1,12 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "status": "error",
+ "probe": "resident_clip_dtypes",
+ "clip_obj_present": 1,
+ "clip_present": 1,
+ "error": "AttributeError:'CLIP' object has no attribute 'named_children'",
+ "waterfall": {
+  "status": "non_applicable",
+  "method": "run_e27_followup_probe"
+ }
+}

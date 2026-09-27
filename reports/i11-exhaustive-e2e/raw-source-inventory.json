@@ -1,0 +1,3089 @@
+[
+  {
+    "file": "modal-testing.js",
+    "line": 116,
+    "testid": "body",
+    "snippet": "const body = el(\"div\", { class: \"comfymodal-studio-body\", \"data-testid\": \"body\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 161,
+    "testid": "alias-deprecation-notice",
+    "snippet": "\"data-testid\": \"alias-deprecation-notice\",",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 377,
+    "testid": "sidebar-launcher-status",
+    "snippet": "const statusEl = el(\"div\", { class: \"launcher-status\", \"data-testid\": \"sidebar-launcher-status\", text: \"Studio shell rea",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 381,
+    "testid": "sidebar-open-studio",
+    "snippet": "\"data-testid\": \"sidebar-open-studio\",",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 388,
+    "testid": "sidebar-open-settings",
+    "snippet": "\"data-testid\": \"sidebar-open-settings\",",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 398,
+    "testid": "sidebar-panel",
+    "snippet": "const panel = el(\"div\", { class: \"comfymodal-testing-sidebar-panel\", \"data-testid\": \"sidebar-panel\" }, [",
+    "kind": "testid"
+  },
+  {
+    "file": "modal-testing.js",
+    "line": 413,
+    "testid": null,
+    "snippet": "el(\"button\", { text: \"Modal GPU\", onclick: () => open_testing_modal() }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-credentials.js",
+    "line": 24,
+    "testid": "backend-credentials",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-backend-detail\", \"data-testid\": \"backend-credentials\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-credentials.js",
+    "line": 29,
+    "testid": "backend-auth-status",
+    "snippet": "const modalStatusRow = el(\"div\", { \"data-testid\": \"backend-auth-status\", style: \"display:flex;align-items:center;gap:8px",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-credentials.js",
+    "line": 31,
+    "testid": "backend-auth-badge",
+    "snippet": "const modalBadgeWrap = el(\"span\", { \"data-testid\": \"backend-auth-badge\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 41,
+    "testid": "backend-deployment",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-backend-detail\", \"data-testid\": \"backend-deployment\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 46,
+    "testid": "backend-deploy-status",
+    "snippet": "\"data-testid\": \"backend-deploy-status\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 53,
+    "testid": "backend-deploy-trigger",
+    "snippet": "\"data-testid\": \"backend-deploy-trigger\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 59,
+    "testid": "backend-deploy-restart",
+    "snippet": "\"data-testid\": \"backend-deploy-restart\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 65,
+    "testid": "backend-deploy-refresh",
+    "snippet": "\"data-testid\": \"backend-deploy-refresh\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 70,
+    "testid": "backend-deploy-log-toggle",
+    "snippet": "\"data-testid\": \"backend-deploy-log-toggle\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 79,
+    "testid": "backend-deploy-log",
+    "snippet": "\"data-testid\": \"backend-deploy-log\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 83,
+    "testid": "backend-deploy-log-text",
+    "snippet": "\"data-testid\": \"backend-deploy-log-text\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 87,
+    "testid": "backend-deploy-log-refresh",
+    "snippet": "const logRefreshBtn = el(\"button\", { type: \"button\", text: \"Refresh Log\", \"data-testid\": \"backend-deploy-log-refresh\", s",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 101,
+    "testid": "backend-deploy-status-unavailable",
+    "snippet": "\"data-testid\": \"backend-deploy-status-unavailable\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 114,
+    "testid": "backend-deploy-state",
+    "snippet": "el(\"span\", { \"data-testid\": \"backend-deploy-state\", text: s.state, style: \"font-size:11px;color:#888;\" }),",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 119,
+    "testid": "backend-deploy-message",
+    "snippet": "\"data-testid\": \"backend-deploy-message\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-deployment.js",
+    "line": 201,
+    "testid": "backend-deploy-result",
+    "snippet": "\"data-testid\": \"backend-deploy-result\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 106,
+    "testid": "preset-card-",
+    "snippet": "\"data-testid\": \"preset-card-\" + id.replace(/[^a-zA-Z0-9_-]/g, \"_\"),",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 176,
+    "testid": "preset-group-",
+    "snippet": "\"data-testid\": \"preset-group-\" + testIdSuffix,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 24,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 119,
+    "testid": null,
+    "snippet": "var delRowBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 379,
+    "testid": null,
+    "snippet": "const saveBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 393,
+    "testid": null,
+    "snippet": "const editBindingsBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 408,
+    "testid": null,
+    "snippet": "const dupBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 422,
+    "testid": null,
+    "snippet": "const deleteBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 507,
+    "testid": null,
+    "snippet": "const createBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-presets.js",
+    "line": 525,
+    "testid": null,
+    "snippet": "const cancelBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-runtime.js",
+    "line": 63,
+    "testid": "backend-runtime",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-backend-detail\", \"data-testid\": \"backend-runtime\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-runtime.js",
+    "line": 68,
+    "testid": "backend-runtime-rows",
+    "snippet": "const rowsWrap = el(\"div\", { \"data-testid\": \"backend-runtime-rows\", style: \"display:flex;flex-direction:column;gap:6px;\"",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-runtime.js",
+    "line": 72,
+    "testid": "backend-runtime-refresh",
+    "snippet": "type: \"button\", text: \"Refresh\", \"data-testid\": \"backend-runtime-refresh\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-snapshots.js",
+    "line": 21,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-snapshots.js",
+    "line": 254,
+    "testid": null,
+    "snippet": "const saveBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-snapshots.js",
+    "line": 267,
+    "testid": null,
+    "snippet": "const dupBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-snapshots.js",
+    "line": 281,
+    "testid": null,
+    "snippet": "const archiveBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 45,
+    "testid": "backend-workspaces",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-backend-detail\", \"data-testid\": \"backend-workspaces\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 53,
+    "testid": "backend-workspaces-active",
+    "snippet": "\"data-testid\": \"backend-workspaces-active\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 65,
+    "testid": "backend-workspaces-list",
+    "snippet": "\"data-testid\": \"backend-workspaces-list\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 74,
+    "testid": "backend-workspace-activate",
+    "snippet": "\"data-testid\": \"backend-workspace-activate\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 80,
+    "testid": "backend-workspace-add",
+    "snippet": "\"data-testid\": \"backend-workspace-add\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 85,
+    "testid": "backend-workspace-edit",
+    "snippet": "\"data-testid\": \"backend-workspace-edit\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 90,
+    "testid": "backend-workspace-swap",
+    "snippet": "\"data-testid\": \"backend-workspace-swap\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 96,
+    "testid": "backend-manifest-repair-toggle",
+    "snippet": "\"data-testid\": \"backend-manifest-repair-toggle\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 108,
+    "testid": "backend-workspace-form",
+    "snippet": "\"data-testid\": \"backend-workspace-form\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 114,
+    "testid": "backend-workspace-swap-panel",
+    "snippet": "\"data-testid\": \"backend-workspace-swap-panel\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 120,
+    "testid": "backend-workspaces-progress",
+    "snippet": "\"data-testid\": \"backend-workspaces-progress\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 132,
+    "testid": "backend-manifest-repair",
+    "snippet": "\"data-testid\": \"backend-manifest-repair\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 161,
+    "testid": "backend-workspaces-active-label",
+    "snippet": "\"data-testid\": \"backend-workspaces-active-label\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 174,
+    "testid": "backend-workspace-card",
+    "snippet": "\"data-testid\": \"backend-workspace-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 279,
+    "testid": "backend-workspace-form-error",
+    "snippet": "const errLine = el(\"div\", { \"data-testid\": \"backend-workspace-form-error\", style: \"font-size:11px;color:#e05050;min-heig",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 282,
+    "testid": "backend-workspace-save",
+    "snippet": "\"data-testid\": \"backend-workspace-save\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 286,
+    "testid": "backend-workspace-cancel",
+    "snippet": "type: \"button\", text: \"Cancel\", \"data-testid\": \"backend-workspace-cancel\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 434,
+    "testid": "backend-swap-confirm-yes",
+    "snippet": "const yes = el(\"button\", { type: \"button\", class: \"comfymodal-primary-btn\", text: \"Interrupt and Switch\", \"data-testid\":",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 435,
+    "testid": "backend-swap-confirm-no",
+    "snippet": "const no = el(\"button\", { type: \"button\", text: \"Cancel\", \"data-testid\": \"backend-swap-confirm-no\", style: \"width:auto;p",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 472,
+    "testid": "backend-swap-review-list",
+    "snippet": "const checkList = el(\"div\", { \"data-testid\": \"backend-swap-review-list\", style: \"max-height:200px;overflow-y:auto;displa",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 490,
+    "testid": "backend-swap-review-go",
+    "snippet": "const goBtn = el(\"button\", { type: \"button\", class: \"comfymodal-primary-btn\", text: \"Start Swap\", \"data-testid\": \"backen",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 491,
+    "testid": "backend-swap-review-cancel",
+    "snippet": "const cancelBtn = el(\"button\", { type: \"button\", text: \"Cancel\", \"data-testid\": \"backend-swap-review-cancel\", style: \"wi",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 534,
+    "testid": "backend-manifest-repair-body",
+    "snippet": "const body = el(\"div\", { \"data-testid\": \"backend-manifest-repair-body\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 541,
+    "testid": "backend-manifest-repair-message",
+    "snippet": "body.appendChild(el(\"div\", { \"data-testid\": \"backend-manifest-repair-message\", text: state.repair.message, style: \"font-",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 600,
+    "testid": "backend-manifest-repair-apply",
+    "snippet": "const saveAll = el(\"button\", { type: \"button\", class: \"comfymodal-primary-btn\", text: \"Save All Valid\", \"data-testid\": \"",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 601,
+    "testid": "backend-manifest-repair-skip",
+    "snippet": "const skipAll = el(\"button\", { type: \"button\", text: \"Skip All\", \"data-testid\": \"backend-manifest-repair-skip\", style: \"",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend-workspaces.js",
+    "line": 569,
+    "testid": null,
+    "snippet": "const delBtn = el(\"button\", { type: \"button\", text: \"Delete\", style: \"width:auto;padding:2px 8px;font-size:10px;\" });",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 77,
+    "testid": "backend-page-title",
+    "snippet": "\"data-testid\": \"backend-page-title\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 159,
+    "testid": "backend-page",
+    "snippet": "\"data-testid\": \"backend-page\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 208,
+    "testid": "backend-list",
+    "snippet": "\"data-testid\": \"backend-list\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 214,
+    "testid": "backend-detail",
+    "snippet": "\"data-testid\": \"backend-detail\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 220,
+    "testid": "backend-ops-panel",
+    "snippet": "\"data-testid\": \"backend-ops-panel\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 96,
+    "testid": null,
+    "snippet": "const chip = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 180,
+    "testid": null,
+    "snippet": "const makePresetBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-backend.js",
+    "line": 250,
+    "testid": null,
+    "snippet": "const btn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 227,
+    "testid": "matrix-body",
+    "snippet": "? container.parentNode.querySelector('[data-testid=\"matrix-body\"]')",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 472,
+    "testid": "axis-editor-${controlId}",
+    "snippet": "const existingEditors = parent.querySelectorAll(`[data-testid=\"axis-editor-${controlId}\"]`);",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1571,
+    "testid": "modern-experiment-submit-btn",
+    "snippet": "var submitBtn = mount.querySelector('[data-testid=\"modern-experiment-submit-btn\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1572,
+    "testid": "modern-experiment-reason",
+    "snippet": "var reasonEl = mount.querySelector('[data-testid=\"modern-experiment-reason\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1573,
+    "testid": "modern-experiment-workflows-link",
+    "snippet": "var wfLink = mount.querySelector('[data-testid=\"modern-experiment-workflows-link\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1590,
+    "testid": "experiment-v2-progress",
+    "snippet": "var progressEl = mount.querySelector('[data-testid=\"experiment-v2-progress\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1601,
+    "testid": "experiment-v2-grid",
+    "snippet": "var gridEl = mount.querySelector('[data-testid=\"experiment-v2-grid\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1612,
+    "testid": "modern-experiment-cancel-btn",
+    "snippet": "var cancelBtn = mount.querySelector('[data-testid=\"modern-experiment-cancel-btn\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1613,
+    "testid": "modern-experiment-resume-btn",
+    "snippet": "var resumeBtn = mount.querySelector('[data-testid=\"modern-experiment-resume-btn\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-experiment-mode.js",
+    "line": 1614,
+    "testid": "experiment-v2-action-note",
+    "snippet": "var actionNote = mount.querySelector('[data-testid=\"experiment-v2-action-note\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 124,
+    "testid": "history-v2-preview-badge",
+    "snippet": "\"data-testid\": \"history-v2-preview-badge\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 601,
+    "testid": "history-v2-compare",
+    "snippet": "\"data-testid\": \"history-v2-compare\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 619,
+    "testid": "history-v2-compare-original",
+    "snippet": "\"data-testid\": \"history-v2-compare-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 643,
+    "testid": "history-v2-view-original",
+    "snippet": "\"data-testid\": \"history-v2-view-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 750,
+    "testid": "history-v2-original-failed-badge",
+    "snippet": "\"data-testid\": \"history-v2-original-failed-badge\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 781,
+    "testid": "history-v2-timing-placeholder",
+    "snippet": "\"data-testid\": \"history-v2-timing-placeholder\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 873,
+    "testid": "history-v2-generate-original",
+    "snippet": "const btn = content.querySelector('[data-testid=\"history-v2-generate-original\"]')",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 874,
+    "testid": "history-v2-generate-again",
+    "snippet": "|| content.querySelector('[data-testid=\"history-v2-generate-again\"]')",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 875,
+    "testid": "history-v2-retry-original",
+    "snippet": "|| content.querySelector('[data-testid=\"history-v2-retry-original\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 890,
+    "testid": "history-v2-generate-note",
+    "snippet": "const noteEl = content.querySelector('[data-testid=\"history-v2-generate-note\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 959,
+    "testid": "history-v2-resume-run",
+    "snippet": "const btn = content.querySelector('[data-testid=\"history-v2-resume-run\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1006,
+    "testid": "history-v2-generate-note",
+    "snippet": "const noteEl = content.querySelector('[data-testid=\"history-v2-generate-note\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1061,
+    "testid": "history-v2-generate-note",
+    "snippet": "\"data-testid\": \"history-v2-generate-note\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1072,
+    "testid": "history-v2-resume-run",
+    "snippet": "\"data-testid\": \"history-v2-resume-run\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1085,
+    "testid": "history-v2-resume-run",
+    "snippet": "\"data-testid\": \"history-v2-resume-run\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1096,
+    "testid": "history-v2-generate-original",
+    "snippet": "\"data-testid\": \"history-v2-generate-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1106,
+    "testid": "history-v2-generate-original",
+    "snippet": "\"data-testid\": \"history-v2-generate-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1119,
+    "testid": "history-v2-generate-again",
+    "snippet": "\"data-testid\": \"history-v2-generate-again\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1133,
+    "testid": "history-v2-retry-original",
+    "snippet": "\"data-testid\": \"history-v2-retry-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1150,
+    "testid": "history-v2-generate-original",
+    "snippet": "\"data-testid\": \"history-v2-generate-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1160,
+    "testid": "history-v2-generate-original",
+    "snippet": "\"data-testid\": \"history-v2-generate-original\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1347,
+    "testid": "history-v2-page",
+    "snippet": "? document.querySelector('[data-testid=\"history-v2-page\"]')",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 239,
+    "testid": null,
+    "snippet": "return el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 275,
+    "testid": null,
+    "snippet": "const item = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 425,
+    "testid": null,
+    "snippet": "const star = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 457,
+    "testid": null,
+    "snippet": "const saveBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 505,
+    "testid": null,
+    "snippet": "const menuBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-detail.js",
+    "line": 1294,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 220,
+    "testid": "history-v2-preview-badge",
+    "snippet": "\"data-testid\": \"history-v2-preview-badge\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 239,
+    "testid": "history-v2-experiment-page",
+    "snippet": "\"data-testid\": \"history-v2-experiment-page\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 626,
+    "testid": "history-v2-experiment-counts",
+    "snippet": "\"data-testid\": \"history-v2-experiment-counts\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 682,
+    "testid": "history-v2-experiment-retry",
+    "snippet": "\"data-testid\": \"history-v2-experiment-retry\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 698,
+    "testid": "history-v2-experiment-resume",
+    "snippet": "\"data-testid\": \"history-v2-experiment-resume\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 735,
+    "testid": "history-v2-experiment-cancel",
+    "snippet": "\"data-testid\": \"history-v2-experiment-cancel\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 783,
+    "testid": "history-v2-experiment-cancel-note",
+    "snippet": "\"data-testid\": \"history-v2-experiment-cancel-note\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 794,
+    "testid": "history-v2-experiment-cancel-note",
+    "snippet": "const noteEl = page.querySelector('[data-testid=\"history-v2-experiment-cancel-note\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 839,
+    "testid": "history-v2-cell-retry-",
+    "snippet": "\"data-testid\": \"history-v2-cell-retry-\" + key,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 864,
+    "testid": "history-v2-experiment-cell",
+    "snippet": "\"data-testid\": \"history-v2-experiment-cell\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 902,
+    "testid": "history-v2-cell-workflow-meta-",
+    "snippet": "\"data-testid\": \"history-v2-cell-workflow-meta-\" + key,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 909,
+    "testid": "history-v2-cell-attempts-",
+    "snippet": "\"data-testid\": \"history-v2-cell-attempts-\" + key,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 935,
+    "testid": "history-v2-experiment-grid",
+    "snippet": "\"data-testid\": \"history-v2-experiment-grid\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 966,
+    "testid": "history-v2-cell-detail",
+    "snippet": "const pane = el(\"div\", { class: \"comfymodal-studio-history-v2-cell-detail\", \"data-testid\": \"history-v2-cell-detail\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 984,
+    "testid": "history-v2-cell-attempt-list",
+    "snippet": "const attemptsList = el(\"div\", { class: \"comfymodal-studio-history-v2-cell-attempt-list\", \"data-testid\": \"history-v2-cel",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 1103,
+    "testid": "history-v2-cell-favorite",
+    "snippet": "\"data-testid\": \"history-v2-cell-favorite\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 1147,
+    "testid": "history-v2-cell-favorite",
+    "snippet": "? detailPaneEl.querySelector('[data-testid=\"history-v2-cell-favorite\"]')",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 1158,
+    "testid": "history-v2-cell-detail-retry-",
+    "snippet": "\"data-testid\": \"history-v2-cell-detail-retry-\" + key,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 1200,
+    "testid": "history-v2-cell-detail-compare-",
+    "snippet": "\"data-testid\": \"history-v2-cell-detail-compare-\" + key,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 520,
+    "testid": null,
+    "snippet": "return el(\"button\", attrs);",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 565,
+    "testid": null,
+    "snippet": "const star = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 597,
+    "testid": null,
+    "snippet": "const saveBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 640,
+    "testid": null,
+    "snippet": "header.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2-experiment.js",
+    "line": 1304,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 162,
+    "testid": "history-v2-page-title",
+    "snippet": "\"data-testid\": \"history-v2-page-title\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 179,
+    "testid": "history-v2-preview-badge",
+    "snippet": "\"data-testid\": \"history-v2-preview-badge\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 227,
+    "testid": "history-v2-page",
+    "snippet": "\"data-testid\": \"history-v2-page\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 427,
+    "testid": "history-v2-results",
+    "snippet": "\"data-testid\": \"history-v2-results\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 498,
+    "testid": "history-v2-load-more",
+    "snippet": "\"data-testid\": \"history-v2-load-more\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 552,
+    "testid": "history-v2-favorite-star",
+    "snippet": "\"data-testid\": \"history-v2-favorite-star\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 604,
+    "testid": "history-v2-generation-card",
+    "snippet": "\"data-testid\": \"history-v2-generation-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 671,
+    "testid": "history-v2-experiment-card",
+    "snippet": "\"data-testid\": \"history-v2-experiment-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 767,
+    "testid": "history-v2-search",
+    "snippet": "\"data-testid\": \"history-v2-search\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 784,
+    "testid": "history-v2-mode-banner",
+    "snippet": "\"data-testid\": \"history-v2-mode-banner\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 792,
+    "testid": "history-v2-result-count",
+    "snippet": "\"data-testid\": \"history-v2-result-count\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 473,
+    "testid": null,
+    "snippet": "action: el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 486,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 810,
+    "testid": null,
+    "snippet": "row1.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 827,
+    "testid": null,
+    "snippet": "const btn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 849,
+    "testid": null,
+    "snippet": "const btn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-history-v2.js",
+    "line": 876,
+    "testid": null,
+    "snippet": "const btn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 199,
+    "testid": "history-v2-page",
+    "snippet": "const anchor = document.querySelector('[data-testid=\"history-v2-page\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 208,
+    "testid": "cm-compare-tray",
+    "snippet": "\"data-testid\": \"cm-compare-tray\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 237,
+    "testid": "cm-compare-tray-a",
+    "snippet": "\"data-testid\": \"cm-compare-tray-a\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 242,
+    "testid": "cm-compare-tray-b",
+    "snippet": "\"data-testid\": \"cm-compare-tray-b\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 247,
+    "testid": "cm-compare-open",
+    "snippet": "\"data-testid\": \"cm-compare-open\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 259,
+    "testid": "cm-compare-clear",
+    "snippet": "\"data-testid\": \"cm-compare-clear\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 367,
+    "testid": "cm-compare-overlay",
+    "snippet": "\"data-testid\": \"cm-compare-overlay\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 374,
+    "testid": "cm-compare-dialog",
+    "snippet": "\"data-testid\": \"cm-compare-dialog\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 383,
+    "testid": "cm-compare-title",
+    "snippet": "\"data-testid\": \"cm-compare-title\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 388,
+    "testid": "cm-compare-close",
+    "snippet": "\"data-testid\": \"cm-compare-close\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 399,
+    "testid": "cm-compare-stage",
+    "snippet": "\"data-testid\": \"cm-compare-stage\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 406,
+    "testid": "cm-compare-img-a",
+    "snippet": "\"data-testid\": \"cm-compare-img-a\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 412,
+    "testid": "cm-compare-bwrap",
+    "snippet": "const bWrap = el(\"div\", { class: \"cm-compare-bwrap\", \"data-testid\": \"cm-compare-bwrap\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 415,
+    "testid": "cm-compare-img-b",
+    "snippet": "\"data-testid\": \"cm-compare-img-b\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 428,
+    "testid": "cm-compare-unavailable-",
+    "snippet": "\"data-testid\": \"cm-compare-unavailable-\" + side,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 440,
+    "testid": "cm-compare-label-a",
+    "snippet": "\"data-testid\": \"cm-compare-label-a\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 445,
+    "testid": "cm-compare-label-b",
+    "snippet": "\"data-testid\": \"cm-compare-label-b\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-image-compare.js",
+    "line": 456,
+    "testid": "cm-compare-slider",
+    "snippet": "\"data-testid\": \"cm-compare-slider\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 137,
+    "testid": "models-page",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-model-library\", \"data-testid\": \"models-page\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 142,
+    "testid": "models-rescan",
+    "snippet": "\"data-testid\": \"models-rescan\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 154,
+    "testid": "models-page-title",
+    "snippet": "el(\"h2\", { class: \"comfymodal-studio-workflows-title\", \"data-testid\": \"models-page-title\", text: \"Model Library\" }),",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 155,
+    "testid": "models-count",
+    "snippet": "el(\"span\", { class: \"comfymodal-studio-models-count\", \"data-testid\": \"models-count\", text: md.models.length + \" model\" +",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 160,
+    "testid": "models-back",
+    "snippet": "\"data-testid\": \"models-back\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 188,
+    "testid": "models-search",
+    "snippet": "\"data-testid\": \"models-search\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 205,
+    "testid": "models-type-filter",
+    "snippet": "\"data-testid\": \"models-type-filter\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 217,
+    "testid": "models-state-filter",
+    "snippet": "\"data-testid\": \"models-state-filter\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 233,
+    "testid": "models-list",
+    "snippet": "const list = el(\"div\", { class: \"comfymodal-studio-model-list\", \"data-testid\": \"models-list\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 362,
+    "testid": "custom-nodes-section",
+    "snippet": "\"data-testid\": \"custom-nodes-section\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 367,
+    "testid": "custom-nodes-refresh",
+    "snippet": "\"data-testid\": \"custom-nodes-refresh\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 377,
+    "testid": "custom-nodes-count",
+    "snippet": "\"data-testid\": \"custom-nodes-count\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 387,
+    "testid": "custom-nodes-focus",
+    "snippet": "\"data-testid\": \"custom-nodes-focus\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 396,
+    "testid": "custom-nodes-focus-clear",
+    "snippet": "\"data-testid\": \"custom-nodes-focus-clear\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 413,
+    "testid": "custom-nodes-list",
+    "snippet": "const table = el(\"div\", { class: \"comfymodal-studio-dependency-table\", \"data-testid\": \"custom-nodes-list\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 422,
+    "testid": "custom-nodes-no-match",
+    "snippet": "\"data-testid\": \"custom-nodes-no-match\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 468,
+    "testid": "custom-node-row",
+    "snippet": "\"data-testid\": \"custom-node-row\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 504,
+    "testid": "model-row",
+    "snippet": "\"data-testid\": \"model-row\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 521,
+    "testid": "model-used-by",
+    "snippet": "\"data-testid\": \"model-used-by\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 528,
+    "testid": "model-used-by-view",
+    "snippet": "\"data-testid\": \"model-used-by-view\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 567,
+    "testid": "model-details",
+    "snippet": "\"data-testid\": \"model-details\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 582,
+    "testid": "model-detail-dialog",
+    "snippet": "\"data-testid\": \"model-detail-dialog\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 634,
+    "testid": "model-notes-input",
+    "snippet": "inputs.notes = el(\"textarea\", { class: \"comfymodal-studio-textarea\", rows: 2, \"data-testid\": \"model-notes-input\", value:",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 652,
+    "testid": "model-detail-save",
+    "snippet": "\"data-testid\": \"model-detail-save\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 697,
+    "testid": "model-download-section",
+    "snippet": "const wrap = el(\"div\", { class: \"comfymodal-studio-dialog-section\", \"data-testid\": \"model-download-section\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 715,
+    "testid": "model-download-request",
+    "snippet": "\"data-testid\": \"model-download-request\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 763,
+    "testid": "dependencies-refresh",
+    "snippet": "*   button (data-testid=\"dependencies-refresh\")",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 775,
+    "testid": "dependencies-summary",
+    "snippet": "\"data-testid\": \"dependencies-summary\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 782,
+    "testid": "dependencies-refresh",
+    "snippet": "\"data-testid\": \"dependencies-refresh\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 798,
+    "testid": "dependency-status",
+    "snippet": "\"data-testid\": \"dependency-status\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 813,
+    "testid": "dependency-models",
+    "snippet": "section.appendChild(el(\"div\", { class: \"comfymodal-studio-dependency-group\", \"data-testid\": \"dependency-models\" }, [",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 819,
+    "testid": "dependency-nodes",
+    "snippet": "section.appendChild(el(\"div\", { class: \"comfymodal-studio-dependency-group\", \"data-testid\": \"dependency-nodes\" }, [",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 868,
+    "testid": "dependency-model-row",
+    "snippet": "\"data-testid\": \"dependency-model-row\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 887,
+    "testid": "dependency-model-find",
+    "snippet": "\"data-testid\": \"dependency-model-find\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 900,
+    "testid": "dependency-node-row",
+    "snippet": "\"data-testid\": \"dependency-node-row\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 921,
+    "testid": "dependency-node-find-registry",
+    "snippet": "\"data-testid\": \"dependency-node-find-registry\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 946,
+    "testid": "dependency-node-install-request",
+    "snippet": "\"data-testid\": \"dependency-node-install-request\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 981,
+    "testid": "dependency-node-install-note",
+    "snippet": "\"data-testid\": \"dependency-node-install-note\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 1003,
+    "testid": "model-choice-select",
+    "snippet": "const sel = el(\"select\", { class: \"comfymodal-studio-model-picker\", \"data-testid\": \"model-choice-select\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-model-library.js",
+    "line": 678,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Cancel\", onclick: close }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 538,
+    "testid": "playground-page-title",
+    "snippet": "\"data-testid\": \"playground-page-title\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 632,
+    "testid": "control-panel",
+    "snippet": "const panel = el(\"div\", { class: \"comfymodal-studio-control-panel\", \"data-testid\": \"control-panel\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 672,
+    "testid": "backend-select",
+    "snippet": "const select = document.querySelector('[data-testid=\"backend-select\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 701,
+    "testid": "controls-container",
+    "snippet": "const controlsContainer = el(\"div\", { class: \"comfymodal-studio-controls\", \"data-testid\": \"controls-container\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 821,
+    "testid": "input-",
+    "snippet": "const originalInput = controlRow.querySelector('[data-testid=\"input-' + ctrlId + '\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1169,
+    "testid": "backend-selector",
+    "snippet": "const container = el(\"div\", { class: \"comfymodal-studio-backend-selector\", \"data-testid\": \"backend-selector\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1173,
+    "testid": "backend-select",
+    "snippet": "\"data-testid\": \"backend-select\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1408,
+    "testid": "workflow-selector",
+    "snippet": "\"data-testid\": \"workflow-selector\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1434,
+    "testid": "workflow-version-selector",
+    "snippet": "\"data-testid\": \"workflow-version-selector\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1460,
+    "testid": "workflow-preset-selector",
+    "snippet": "\"data-testid\": \"workflow-preset-selector\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1486,
+    "testid": "workflow-run-gating",
+    "snippet": "\"data-testid\": \"workflow-run-gating\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1512,
+    "testid": "workflow-control-",
+    "snippet": "\"data-testid\": \"workflow-control-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1552,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1573,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1585,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1600,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1611,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1623,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1635,
+    "testid": "workflow-input-",
+    "snippet": "\"data-testid\": \"workflow-input-\" + role,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1673,
+    "testid": "workflow-handoff-notice",
+    "snippet": "\"data-testid\": \"workflow-handoff-notice\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1681,
+    "testid": "workflow-handoff-error",
+    "snippet": "\"data-testid\": \"workflow-handoff-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1688,
+    "testid": "workflow-mapped-controls",
+    "snippet": "const controlsBox = el(\"div\", { \"data-testid\": \"workflow-mapped-controls\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1694,
+    "testid": "workflow-selector-section",
+    "snippet": "const container = document.querySelector('[data-testid=\"workflow-selector-section\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1701,
+    "testid": "workflow-run-gating",
+    "snippet": "const line = document.querySelector('[data-testid=\"workflow-run-gating\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 1715,
+    "testid": "workflow-selector-section",
+    "snippet": "\"data-testid\": \"workflow-selector-section\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2044,
+    "testid": "run-btn",
+    "snippet": "var nodes = Array.prototype.slice.call(document.querySelectorAll('[data-testid=\"run-btn\"]'));",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2195,
+    "testid": "info-hint",
+    "snippet": "\"data-testid\": \"info-hint\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2472,
+    "testid": "input-steps",
+    "snippet": "const stepsInput = group.querySelector('[data-testid=\"input-steps\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2576,
+    "testid": "progress-elapsed",
+    "snippet": "var elapsedEl = document.querySelector('[data-testid=\"progress-elapsed\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2848,
+    "testid": "cancel-run-btn",
+    "snippet": "\"data-testid\": \"cancel-run-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2939,
+    "testid": "run-status-message",
+    "snippet": "\"data-testid\": \"run-status-message\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 2986,
+    "testid": "error-dismiss-btn",
+    "snippet": "\"data-testid\": \"error-dismiss-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3008,
+    "testid": "run-status-message",
+    "snippet": "\"data-testid\": \"run-status-message\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3203,
+    "testid": "progress-section",
+    "snippet": "\"data-testid\": \"progress-section\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3221,
+    "testid": "progress-bar-fill",
+    "snippet": "\"data-testid\": \"progress-bar-fill\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3230,
+    "testid": "progress-stage",
+    "snippet": "const stageEl = el(\"span\", { \"data-testid\": \"progress-stage\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3231,
+    "testid": "progress-nodes",
+    "snippet": "const nodesEl = el(\"span\", { \"data-testid\": \"progress-nodes\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3232,
+    "testid": "progress-elapsed",
+    "snippet": "const elapsedEl = el(\"span\", { \"data-testid\": \"progress-elapsed\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3233,
+    "testid": "progress-step",
+    "snippet": "const stepEl = el(\"span\", { \"data-testid\": \"progress-step\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3234,
+    "testid": "progress-queue",
+    "snippet": "const queueEl = el(\"span\", { \"data-testid\": \"progress-queue\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3305,
+    "testid": "progress-stage",
+    "snippet": "var stageEl = document.querySelector('[data-testid=\"progress-stage\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3318,
+    "testid": "progress-nodes",
+    "snippet": "var nodesEl = document.querySelector('[data-testid=\"progress-nodes\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3328,
+    "testid": "progress-elapsed",
+    "snippet": "var elapsedEl = document.querySelector('[data-testid=\"progress-elapsed\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3333,
+    "testid": "progress-step",
+    "snippet": "var stepEl = document.querySelector('[data-testid=\"progress-step\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3339,
+    "testid": "progress-queue",
+    "snippet": "var queueEl = document.querySelector('[data-testid=\"progress-queue\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3349,
+    "testid": "progress-bar-fill",
+    "snippet": "var barFill = document.querySelector('[data-testid=\"progress-bar-fill\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3368,
+    "testid": "favorite-star",
+    "snippet": "\"data-testid\": \"favorite-star\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3428,
+    "testid": "note-editor",
+    "snippet": "\"data-testid\": \"note-editor\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3435,
+    "testid": "note-textarea",
+    "snippet": "\"data-testid\": \"note-textarea\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3452,
+    "testid": "note-save-btn",
+    "snippet": "\"data-testid\": \"note-save-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3459,
+    "testid": "note-cancel-btn",
+    "snippet": "\"data-testid\": \"note-cancel-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3465,
+    "testid": "note-status",
+    "snippet": "\"data-testid\": \"note-status\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3548,
+    "testid": "workspace",
+    "snippet": "const workspace = el(\"div\", { class: \"comfymodal-studio-workspace\", \"data-testid\": \"workspace\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3571,
+    "testid": "feature-tabs",
+    "snippet": "const tabs = el(\"div\", { class: \"comfymodal-studio-feature-tabs\", \"data-testid\": \"feature-tabs\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3601,
+    "testid": "canvas-area",
+    "snippet": "\"data-testid\": \"canvas-area\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3614,
+    "testid": "mask-controls",
+    "snippet": "\"data-testid\": \"mask-controls\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3625,
+    "testid": "canvas-output",
+    "snippet": "\"data-testid\": \"canvas-output\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3649,
+    "testid": "live-return-control",
+    "snippet": "\"data-testid\": \"live-return-control\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3658,
+    "testid": "live-return-btn",
+    "snippet": "\"data-testid\": \"live-return-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3678,
+    "testid": "metadata-section",
+    "snippet": "\"data-testid\": \"metadata-section\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3767,
+    "testid": "save-output-btn",
+    "snippet": "\"data-testid\": \"save-output-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3772,
+    "testid": "save-output-error",
+    "snippet": "\"data-testid\": \"save-output-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3804,
+    "testid": "save-output-btn",
+    "snippet": "\"data-testid\": \"save-output-btn\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3809,
+    "testid": "save-output-error",
+    "snippet": "\"data-testid\": \"save-output-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3841,
+    "testid": "timing-card",
+    "snippet": "\"data-testid\": \"timing-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3955,
+    "testid": "note-toggle",
+    "snippet": "\"data-testid\": \"note-toggle\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 3972,
+    "testid": "advanced-toggle",
+    "snippet": "\"data-testid\": \"advanced-toggle\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 4167,
+    "testid": "filmstrip",
+    "snippet": "\"data-testid\": \"filmstrip\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 860,
+    "testid": null,
+    "snippet": "const resetLink = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 4210,
+    "testid": null,
+    "snippet": "const revealBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 4245,
+    "testid": null,
+    "snippet": "actions.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 4259,
+    "testid": null,
+    "snippet": "actions.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-playground.js",
+    "line": 4290,
+    "testid": null,
+    "snippet": "const thumb = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 175,
+    "testid": "portability-issue-row",
+    "snippet": "\"data-testid\": \"portability-issue-row\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 200,
+    "testid": "portability-issue-link",
+    "snippet": "\"data-testid\": \"portability-issue-link\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 221,
+    "testid": "portability-target-matrix",
+    "snippet": "\"data-testid\": \"portability-target-matrix\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 243,
+    "testid": "portability-target-",
+    "snippet": "\"data-testid\": \"portability-target-\" + tid,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 252,
+    "testid": "portability-target-risk-",
+    "snippet": "\"data-testid\": \"portability-target-risk-\" + tid,",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 302,
+    "testid": "portability-environment",
+    "snippet": "\"data-testid\": \"portability-environment\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 324,
+    "testid": "portability-environment-risk",
+    "snippet": "\"data-testid\": \"portability-environment-risk\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 367,
+    "testid": "portability-panel",
+    "snippet": "\"data-testid\": \"portability-panel\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 376,
+    "testid": "portability-check-button",
+    "snippet": "\"data-testid\": \"portability-check-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 385,
+    "testid": "portability-export-button",
+    "snippet": "\"data-testid\": \"portability-export-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 393,
+    "testid": "portability-checklist-button",
+    "snippet": "\"data-testid\": \"portability-checklist-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 404,
+    "testid": "portability-error",
+    "snippet": "\"data-testid\": \"portability-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 413,
+    "testid": "portability-not-analyzed",
+    "snippet": "\"data-testid\": \"portability-not-analyzed\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 424,
+    "testid": "portability-summary",
+    "snippet": "\"data-testid\": \"portability-summary\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 430,
+    "testid": "portability-version-context",
+    "snippet": "\"data-testid\": \"portability-version-context\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 436,
+    "testid": "portability-risk",
+    "snippet": "\"data-testid\": \"portability-risk\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-portability.js",
+    "line": 453,
+    "testid": "portability-meta",
+    "snippet": "\"data-testid\": \"portability-meta\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 203,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 290,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 303,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 314,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 325,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 330,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 342,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 349,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 362,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 367,
+    "testid": null,
+    "snippet": "footer.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-preset-wizard.js",
+    "line": 544,
+    "testid": null,
+    "snippet": "row.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 191,
+    "testid": "settings-page-title",
+    "snippet": "\"data-testid\": \"settings-page-title\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 207,
+    "testid": "settings-restart-banner",
+    "snippet": "\"data-testid\": \"settings-restart-banner\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 216,
+    "testid": "settings-search-results",
+    "snippet": "\"data-testid\": \"settings-search-results\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 223,
+    "testid": "settings-search",
+    "snippet": "\"data-testid\": \"settings-search\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 456,
+    "testid": "settings-gpu",
+    "snippet": "const gpuSelect = el(\"select\", { class: \"comfymodal-input\", \"data-testid\": \"settings-gpu\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 473,
+    "testid": "settings-migration-notice-host",
+    "snippet": "section.appendChild(el(\"div\", { \"data-testid\": \"settings-migration-notice-host\" }));",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 481,
+    "testid": "settings-outputs-host",
+    "snippet": "section.appendChild(el(\"div\", { \"data-testid\": \"settings-outputs-host\" }));",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 490,
+    "testid": "settings-history-columns",
+    "snippet": "const columnsSelect = el(\"select\", { class: \"comfymodal-input\", \"data-testid\": \"settings-history-columns\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 522,
+    "testid": "settings-reset-panel-layout",
+    "snippet": "\"data-testid\": \"settings-reset-panel-layout\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 577,
+    "testid": "settings-deploy-state",
+    "snippet": "\"data-testid\": \"settings-deploy-state\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 585,
+    "testid": "settings-runtime-snapshots",
+    "snippet": "\"data-testid\": \"settings-runtime-snapshots\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 593,
+    "testid": "settings-runtime-presets",
+    "snippet": "\"data-testid\": \"settings-runtime-presets\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 605,
+    "testid": "settings-open-backend",
+    "snippet": "\"data-testid\": \"settings-open-backend\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 644,
+    "testid": "settings-reset-all",
+    "snippet": "\"data-testid\": \"settings-reset-all\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 671,
+    "testid": "settings-migration-notice-host",
+    "snippet": "const host = sectionsHost.querySelector('[data-testid=\"settings-migration-notice-host\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 681,
+    "testid": "settings-engine-migration-notice",
+    "snippet": "\"data-testid\": \"settings-engine-migration-notice\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 692,
+    "testid": "settings-gpu",
+    "snippet": "const gpuSelect = sectionsHost.querySelector('[data-testid=\"settings-gpu\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 739,
+    "testid": "settings-deploy-state",
+    "snippet": "const row = sectionsHost.querySelector('[data-testid=\"settings-deploy-state\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 753,
+    "testid": "settings-runtime-snapshots",
+    "snippet": "const snapEl = sectionsHost.querySelector('[data-testid=\"settings-runtime-snapshots\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 754,
+    "testid": "settings-runtime-presets",
+    "snippet": "const presetEl = sectionsHost.querySelector('[data-testid=\"settings-runtime-presets\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 768,
+    "testid": "settings-outputs-host",
+    "snippet": "const host = sectionsHost.querySelector('[data-testid=\"settings-outputs-host\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 778,
+    "testid": "settings-preview-default",
+    "snippet": "const generationDefault = sectionsHost.querySelector('[data-testid=\"settings-preview-default\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 804,
+    "testid": "settings-quality",
+    "snippet": "\"data-testid\": \"settings-quality\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 809,
+    "testid": "settings-quality-value",
+    "snippet": "\"data-testid\": \"settings-quality-value\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 840,
+    "testid": "settings-auto-save-local",
+    "snippet": "\"data-testid\": \"settings-auto-save-local\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 855,
+    "testid": "settings-save-folder",
+    "snippet": "\"data-testid\": \"settings-save-folder\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 873,
+    "testid": "settings-save-metadata-sidecar",
+    "snippet": "\"data-testid\": \"settings-save-metadata-sidecar\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 902,
+    "testid": "settings-preview-quality",
+    "snippet": "\"data-testid\": \"settings-preview-quality\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 907,
+    "testid": "settings-preview-quality-value",
+    "snippet": "\"data-testid\": \"settings-preview-quality-value\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 924,
+    "testid": "settings-open-folder",
+    "snippet": "\"data-testid\": \"settings-open-folder\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-settings.js",
+    "line": 979,
+    "testid": "settings-heavy-tracing",
+    "snippet": "const tracingSelect = sectionsHost.querySelector('[data-testid=\"settings-heavy-tracing\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-shell.js",
+    "line": 99,
+    "testid": "studio-page",
+    "snippet": "const pageContainer = el(\"div\", { class: \"comfymodal-studio-pagecontainer\", \"data-testid\": \"studio-page\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-shell.js",
+    "line": 195,
+    "testid": null,
+    "snippet": "const btn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 381,
+    "testid": "workflows-page",
+    "snippet": "const root = el(\"div\", { class: \"comfymodal-studio-workflows\", \"data-testid\": \"workflows-page\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 567,
+    "testid": "workflows-usage-focus",
+    "snippet": "\"data-testid\": \"workflows-usage-focus\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 588,
+    "testid": "workflow-card",
+    "snippet": "\"data-testid\": \"workflow-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 635,
+    "testid": "portability-chip",
+    "snippet": "\"data-testid\": \"portability-chip\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 681,
+    "testid": "portability-detail-chip",
+    "snippet": "\"data-testid\": \"portability-detail-chip\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 689,
+    "testid": "portability-panel",
+    "snippet": "const panel = root.querySelector('[data-testid=\"portability-panel\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 731,
+    "testid": "workflows-folder-tree",
+    "snippet": "const container = el(\"div\", { class: \"comfymodal-studio-workflows-folder-tree\", \"data-testid\": \"workflows-folder-tree\" }",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 767,
+    "testid": "wf-subnav-library",
+    "snippet": "\"data-testid\": \"wf-subnav-library\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 773,
+    "testid": "wf-subnav-models",
+    "snippet": "\"data-testid\": \"wf-subnav-models\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 789,
+    "testid": "workflows-import-manifest-button",
+    "snippet": "\"data-testid\": \"workflows-import-manifest-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 795,
+    "testid": "workflows-import-button",
+    "snippet": "\"data-testid\": \"workflows-import-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 801,
+    "testid": "workflows-new-button",
+    "snippet": "\"data-testid\": \"workflows-new-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 812,
+    "testid": "workflows-search",
+    "snippet": "\"data-testid\": \"workflows-search\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 828,
+    "testid": "workflows-tag-filter",
+    "snippet": "\"data-testid\": \"workflows-tag-filter\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 840,
+    "testid": "workflows-favorites-only",
+    "snippet": "\"data-testid\": \"workflows-favorites-only\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 951,
+    "testid": "import-dialog",
+    "snippet": "\"data-testid\": \"import-dialog\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 968,
+    "testid": "import-confirm",
+    "snippet": "\"data-testid\": \"import-confirm\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1125,
+    "testid": "import-manifest-dialog",
+    "snippet": "\"data-testid\": \"import-manifest-dialog\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1140,
+    "testid": "import-manifest-file",
+    "snippet": "\"data-testid\": \"import-manifest-file\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1152,
+    "testid": "import-manifest-file-name",
+    "snippet": "\"data-testid\": \"import-manifest-file-name\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1159,
+    "testid": "import-manifest-too-large",
+    "snippet": "\"data-testid\": \"import-manifest-too-large\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1169,
+    "testid": "import-manifest-previewing",
+    "snippet": "el(\"p\", { class: \"comfymodal-studio-dependencies-note\", \"data-testid\": \"import-manifest-previewing\", text: \"Analyzing ma",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1176,
+    "testid": "import-manifest-preview-error",
+    "snippet": "\"data-testid\": \"import-manifest-preview-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1258,
+    "testid": "import-manifest-preview",
+    "snippet": "const wrap = el(\"div\", { class: \"comfymodal-studio-dialog-section\", \"data-testid\": \"import-manifest-preview\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1267,
+    "testid": "import-manifest-validity",
+    "snippet": "\"data-testid\": \"import-manifest-validity\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1279,
+    "testid": "import-manifest-proposed-name",
+    "snippet": "\"data-testid\": \"import-manifest-proposed-name\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1290,
+    "testid": "import-manifest-issues",
+    "snippet": "const issueBlock = el(\"div\", { \"data-testid\": \"import-manifest-issues\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1304,
+    "testid": "import-manifest-readiness",
+    "snippet": "\"data-testid\": \"import-manifest-readiness\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1319,
+    "testid": "import-manifest-dependencies",
+    "snippet": "\"data-testid\": \"import-manifest-dependencies\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1326,
+    "testid": "import-manifest-deps-note",
+    "snippet": "\"data-testid\": \"import-manifest-deps-note\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1339,
+    "testid": "import-manifest-portability",
+    "snippet": "\"data-testid\": \"import-manifest-portability\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1358,
+    "testid": "import-manifest-will-create",
+    "snippet": "\"data-testid\": \"import-manifest-will-create\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1369,
+    "testid": "import-manifest-presets",
+    "snippet": "\"data-testid\": \"import-manifest-presets\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1381,
+    "testid": "import-manifest-apply-default",
+    "snippet": "\"data-testid\": \"import-manifest-apply-default\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1404,
+    "testid": "import-manifest-commit",
+    "snippet": "\"data-testid\": \"import-manifest-commit\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1414,
+    "testid": "import-manifest-commit-error",
+    "snippet": "\"data-testid\": \"import-manifest-commit-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1443,
+    "testid": "import-manifest-commit",
+    "snippet": "const btn = root.querySelector('[data-testid=\"import-manifest-commit\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1453,
+    "testid": "import-manifest-success",
+    "snippet": "const wrap = el(\"div\", { class: \"comfymodal-studio-dialog-section\", \"data-testid\": \"import-manifest-success\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1462,
+    "testid": "import-manifest-created",
+    "snippet": "\"data-testid\": \"import-manifest-created\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1474,
+    "testid": "import-manifest-provenance",
+    "snippet": "\"data-testid\": \"import-manifest-provenance\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1483,
+    "testid": "import-manifest-open",
+    "snippet": "\"data-testid\": \"import-manifest-open\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1630,
+    "testid": "workflow-detail",
+    "snippet": "const wrap = el(\"div\", { class: \"comfymodal-studio-workflow-detail\", \"data-testid\": \"workflow-detail\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1675,
+    "testid": "workflow-detail-name",
+    "snippet": "el(\"h3\", { class: \"comfymodal-studio-workflow-detail-title\", \"data-testid\": \"workflow-detail-name\", text: wf.name || \"Un",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1690,
+    "testid": "workflow-detail-folder",
+    "snippet": "el(\"span\", { \"data-testid\": \"workflow-detail-folder\", text: wf.folder || \"No folder\" }),",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1700,
+    "testid": "workflow-detail-tags",
+    "snippet": "card.appendChild(el(\"div\", { class: \"comfymodal-studio-workflow-detail-tags\", \"data-testid\": \"workflow-detail-tags\" }, [",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1716,
+    "testid": "workflow-detail-source",
+    "snippet": "card.appendChild(el(\"div\", { class: \"comfymodal-studio-workflow-detail-source\", \"data-testid\": \"workflow-detail-source\" ",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1865,
+    "testid": "run-button",
+    "snippet": "\"data-testid\": \"run-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1900,
+    "testid": "version-capture-button",
+    "snippet": "\"data-testid\": \"version-capture-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1907,
+    "testid": "version-list",
+    "snippet": "const list = el(\"div\", { class: \"comfymodal-studio-version-list\", \"data-testid\": \"version-list\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1951,
+    "testid": "version-item",
+    "snippet": "\"data-testid\": \"version-item\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2056,
+    "testid": "portability-export-popover",
+    "snippet": "const panel = el(\"div\", { class: \"comfymodal-studio-confirm-panel\", \"data-testid\": \"portability-export-popover\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2063,
+    "testid": "portability-export-done",
+    "snippet": "\"data-testid\": \"portability-export-done\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2071,
+    "testid": "portability-export-error",
+    "snippet": "\"data-testid\": \"portability-export-error\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2080,
+    "testid": "portability-export-include-presets",
+    "snippet": "\"data-testid\": \"portability-export-include-presets\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2091,
+    "testid": "portability-export-confirm",
+    "snippet": "\"data-testid\": \"portability-export-confirm\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2146,
+    "testid": "portability-export-button",
+    "snippet": "const btn = root.querySelector('[data-testid=\"portability-export-button\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2199,
+    "testid": "portability-check-button",
+    "snippet": "const btn = root.querySelector('[data-testid=\"portability-check-button\"]');",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2228,
+    "testid": "mapping-editor",
+    "snippet": "const section = el(\"div\", { class: \"comfymodal-studio-section\", \"data-testid\": \"mapping-editor\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2297,
+    "testid": "mapping-candidates",
+    "snippet": "const candWrap = el(\"div\", { class: \"comfymodal-studio-mapping-candidates\", \"data-testid\": \"mapping-candidates\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2316,
+    "testid": "mapping-revision-button",
+    "snippet": "\"data-testid\": \"mapping-revision-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2327,
+    "testid": "mapping-revision-confirm",
+    "snippet": "\"data-testid\": \"mapping-revision-confirm\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2343,
+    "testid": "mapping-save",
+    "snippet": "\"data-testid\": \"mapping-save\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2361,
+    "testid": "mapping-role-row",
+    "snippet": "const row = el(\"div\", { class: \"comfymodal-studio-mapping-role-row\", \"data-testid\": \"mapping-role-row\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2474,
+    "testid": "preset-bulk-copy-button",
+    "snippet": "\"data-testid\": \"preset-bulk-copy-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2487,
+    "testid": "preset-list",
+    "snippet": "const list = el(\"div\", { class: \"comfymodal-studio-preset-list\", \"data-testid\": \"preset-list\" });",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2506,
+    "testid": "preset-card",
+    "snippet": "\"data-testid\": \"preset-card\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2510,
+    "testid": "preset-card-name",
+    "snippet": "el(\"span\", { class: \"comfymodal-studio-wf-preset-card-name\", \"data-testid\": \"preset-card-name\", text: p.name || \"Unnamed",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2522,
+    "testid": "preset-default-button",
+    "snippet": "\"data-testid\": \"preset-default-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2526,
+    "testid": "preset-duplicate-button",
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", \"data-testid\": \"preset-duplicate-button\", text: \"Duplicate\", onclick: ",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2527,
+    "testid": "preset-edit-button",
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", \"data-testid\": \"preset-edit-button\", text: \"Edit\", onclick: () => open",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2530,
+    "testid": "preset-copy-button",
+    "snippet": "\"data-testid\": \"preset-copy-button\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2624,
+    "testid": "copy-results",
+    "snippet": "section.appendChild(el(\"div\", { class: \"comfymodal-studio-copy-results\", \"data-testid\": \"copy-results\" },",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2639,
+    "testid": "copy-result-item",
+    "snippet": "\"data-testid\": \"copy-result-item\",",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2690,
+    "testid": "preset-editor",
+    "snippet": "const container = el(\"div\", { class: \"comfymodal-studio-section preset-editor-section\", \"data-testid\": \"preset-editor\" }",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2714,
+    "testid": "preset-state-reasons",
+    "snippet": "container.appendChild(el(\"div\", { class: \"comfymodal-studio-confirm-panel incomplete\", \"data-testid\": \"preset-state-reas",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2728,
+    "testid": "preset-name-input",
+    "snippet": "const nameIn = el(\"input\", { type: \"text\", class: \"comfymodal-studio-wf-input\", \"data-testid\": \"preset-name-input\", valu",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2848,
+    "testid": "preset-save",
+    "snippet": "el(\"button\", { class: \"comfymodal-primary-btn\", \"data-testid\": \"preset-save\", text: \"Save\", style: \"width:auto;padding:7",
+    "kind": "testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 545,
+    "testid": null,
+    "snippet": "action: el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 747,
+    "testid": null,
+    "snippet": "container.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 869,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Retry\", onclick: () => loadLibrary() }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 990,
+    "testid": null,
+    "snippet": "const createBtn = el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1010,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Cancel\", onclick: closeImportDialog }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1191,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Close\", onclick: closeImportManifestDialog }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1619,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1643,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Retry\", onclick: () => loadDetailData() }),",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1731,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1771,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Add\", style: \"padding:3px 8px;font-size:10px;\", onclick: addTag",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1796,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1825,
+    "testid": null,
+    "snippet": "el(\"button\", { class: \"comfymodal-secondary-btn\", text: \"Cancel\", onclick: () => { _view.detailEditing = false; render()",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 1936,
+    "testid": null,
+    "snippet": "main.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2249,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2258,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2699,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2808,
+    "testid": null,
+    "snippet": "loraBlock.appendChild(el(\"button\", {",
+    "kind": "button_no_testid"
+  },
+  {
+    "file": "studio-workflows.js",
+    "line": 2879,
+    "testid": null,
+    "snippet": "el(\"button\", {",
+    "kind": "button_no_testid"
+  }
+]

@@ -1,0 +1,170 @@
+=== stage 1: recorder OFF vs ON ===
+[fr] start off-r01 sample_ms=0
+[fr] done off-r01 status=ok gbps=1.8220373052428018 max_ms=2517.135724 samples=0 snapshots=0
+[fr] start off-r02 sample_ms=0
+[fr] done off-r02 status=ok gbps=4.185926952425076 max_ms=224.725967 samples=0 snapshots=0
+[fr] start on-r01 sample_ms=15
+[fr] done on-r01 status=ok gbps=5.3169776452995325 max_ms=213.057889 samples=77 snapshots=0
+[fr] start on-r02 sample_ms=15
+[fr] done on-r02 status=ok gbps=3.320867469945723 max_ms=836.242043 samples=76 snapshots=0
+  OFF median gbps=3.004 max_ms=2517 refill=0.016
+  ON  median gbps=4.319 max_ms=836 refill=0.018
+
+=== stage 2: capture campaign ===
+[fr] start cap-r01 sample_ms=15
+[fr] done cap-r01 status=ok gbps=4.89638705632513 max_ms=214.552948 samples=83 snapshots=0
+[fr] progress sick=0 clean=1 runs=1
+[fr] start cap-r02 sample_ms=15
+[fr] done cap-r02 status=ok gbps=2.805855153156765 max_ms=518.592588 samples=114 snapshots=3
+[fr] progress sick=0 clean=2 runs=2
+[fr] start cap-r03 sample_ms=15
+[fr] done cap-r03 status=ok gbps=5.833472462384999 max_ms=131.706657 samples=70 snapshots=0
+[fr] progress sick=0 clean=3 runs=3
+[fr] start cap-r04 sample_ms=15
+[fr] done cap-r04 status=ok gbps=4.082623275937456 max_ms=287.398523 samples=92 snapshots=2
+[fr] progress sick=0 clean=4 runs=4
+[fr] start cap-r05 sample_ms=15
+[fr] done cap-r05 status=ok gbps=4.475323624056734 max_ms=204.935664 samples=89 snapshots=0
+[fr] progress sick=0 clean=5 runs=5
+[fr] start cap-r06 sample_ms=15
+[fr] done cap-r06 status=ok gbps=4.155598945247851 max_ms=219.383179 samples=94 snapshots=0
+[fr] progress sick=0 clean=6 runs=6
+[fr] start cap-r07 sample_ms=15
+[fr] done cap-r07 status=ok gbps=4.974935728108452 max_ms=253.246096 samples=86 snapshots=0
+[fr] progress sick=0 clean=7 runs=7
+[fr] start cap-r08 sample_ms=15
+[fr] done cap-r08 status=ok gbps=4.28017898127876 max_ms=589.120338 samples=75 snapshots=2
+[fr] progress sick=0 clean=8 runs=8
+[fr] start cap-r09 sample_ms=15
+[fr] done cap-r09 status=ok gbps=3.777973726301333 max_ms=575.986496 samples=91 snapshots=3
+[fr] progress sick=0 clean=9 runs=9
+[fr] start cap-r10 sample_ms=15
+[fr] done cap-r10 status=ok gbps=5.5699606600381975 max_ms=133.641514 samples=72 snapshots=0
+[fr] progress sick=0 clean=10 runs=10
+[fr] start cap-r11 sample_ms=15
+[fr] done cap-r11 status=ok gbps=0.9495443486492056 max_ms=2679.144588 samples=236 snapshots=19
+[fr] progress sick=1 clean=10 runs=11
+[fr] start cap-r12 sample_ms=15
+[fr] done cap-r12 status=ok gbps=4.673030100560219 max_ms=212.090674 samples=86 snapshots=0
+[fr] progress sick=1 clean=11 runs=12
+[fr] start cap-r13 sample_ms=15
+[fr] done cap-r13 status=ok gbps=2.149274226744275 max_ms=2650.879074 samples=67 snapshots=5
+[fr] progress sick=2 clean=11 runs=13
+[fr] start cap-r14 sample_ms=15
+[fr] done cap-r14 status=ok gbps=5.318381221292783 max_ms=229.185839 samples=77 snapshots=0
+[fr] progress sick=2 clean=12 runs=14
+[fr] start cap-r15 sample_ms=15
+[fr] done cap-r15 status=ok gbps=5.873930351610503 max_ms=210.110213 samples=70 snapshots=0
+[fr] progress sick=2 clean=13 runs=15
+[fr] start cap-r16 sample_ms=15
+[fr] done cap-r16 status=ok gbps=5.487281928458374 max_ms=254.834483 samples=74 snapshots=0
+[fr] progress sick=2 clean=14 runs=16
+[fr] start cap-r17 sample_ms=15
+[fr] done cap-r17 status=ok gbps=4.910169276775965 max_ms=258.454014 samples=85 snapshots=2
+[fr] progress sick=2 clean=15 runs=17
+[fr] start cap-r18 sample_ms=15
+[fr] done cap-r18 status=ok gbps=5.417643243429906 max_ms=138.711204 samples=79 snapshots=0
+[fr] progress sick=2 clean=16 runs=18
+[fr] start cap-r19 sample_ms=15
+[fr] done cap-r19 status=ok gbps=5.758468263779435 max_ms=134.305168 samples=74 snapshots=0
+[fr] progress sick=2 clean=17 runs=19
+[fr] start cap-r20 sample_ms=15
+[fr] done cap-r20 status=ok gbps=6.1235645448773655 max_ms=151.838906 samples=67 snapshots=0
+[fr] progress sick=2 clean=18 runs=20
+
+=== per-run capture table ===
+run | region | healthy/sick | worst preadv | affected workers | states | wchan sig | IO PSI | CPU PSI | cgroup IO | samples | snapshots
+| cap-r01 | CLOUD_PROVIDER_GCP/asia-south2 | clean | 215 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 83 | 0 |
+| cap-r02 | CLOUD_PROVIDER_OCI/us-chicago-1 | clean | 519 | [0, 1, 2, 3] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 114 | 3 |
+| cap-r03 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 132 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 70 | 0 |
+| cap-r04 | CLOUD_PROVIDER_OCI/us-chicago-1 | clean | 287 | [1] | ['<unavailable:FileNotFoundError>', 'X'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 92 | 2 |
+| cap-r05 | CLOUD_PROVIDER_OCI/us-central | clean | 205 | [] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 89 | 0 |
+| cap-r06 | CLOUD_PROVIDER_OCI/us-chicago-1 | clean | 219 | [] | ['<unavailable:FileNotFoundError>', 'X'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 94 | 0 |
+| cap-r07 | CLOUD_PROVIDER_UNSPECIFIED/us-central | clean | 253 | [2] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 86 | 0 |
+| cap-r08 | CLOUD_PROVIDER_GCP/us-east4 | clean | 589 | [0, 1, 2, 3] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 75 | 2 |
+| cap-r09 | CLOUD_PROVIDER_GCP/us-east | clean | 576 | [0, 1, 2] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 91 | 3 |
+| cap-r10 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 134 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 72 | 0 |
+| cap-r11 | CLOUD_PROVIDER_UNSPECIFIED/london | SICK | 2679 | [0, 1, 2, 3] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 236 | 19 |
+| cap-r12 | CLOUD_PROVIDER_OCI/us-chicago-1 | clean | 212 | [] | ['<unavailable:FileNotFoundError>', 'X'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 86 | 0 |
+| cap-r13 | CLOUD_PROVIDER_UNSPECIFIED/ca | SICK | 2651 | [0, 1, 2, 3] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 67 | 5 |
+| cap-r14 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 229 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 77 | 0 |
+| cap-r15 | CLOUD_PROVIDER_GCP/us-east | clean | 210 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 70 | 0 |
+| cap-r16 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 255 | [0] | ['<unavailable:FileNotFoundError>', 'X'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 74 | 0 |
+| cap-r17 | CLOUD_PROVIDER_OCI/us-chicago-1 | clean | 258 | [2] | ['<unavailable:FileNotFoundError>', 'X'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 85 | 2 |
+| cap-r18 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 139 | [] | ['<unavailable:FileNotFoundError>', 'D'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 79 | 0 |
+| cap-r19 | CLOUD_PROVIDER_UNSPECIFIED/ca | clean | 134 | [] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 74 | 0 |
+| cap-r20 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | clean | 152 | [] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | ['<unavailable:FileNotFoundError>'] | 1 lines | 67 | 0 |
+
+=== pathological episodes and threshold snapshots ===
+
+cap-r11 (CLOUD_PROVIDER_UNSPECIFIED/london) worst=2679 ms gbps=0.950
+  t=250 ms worker=2 elapsed=516 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=2 elapsed=516 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=250 ms worker=3 elapsed=266 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=3 elapsed=510 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=250 ms worker=0 elapsed=256 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=1000 ms worker=3 elapsed=1000 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=0 elapsed=512 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=250 ms worker=0 elapsed=264 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=0 elapsed=515 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=250 ms worker=3 elapsed=254 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=250 ms worker=0 elapsed=262 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=0 elapsed=508 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=1000 ms worker=0 elapsed=1001 ms states={'0': 'D', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+
+cap-r13 (CLOUD_PROVIDER_UNSPECIFIED/ca) worst=2651 ms gbps=2.149
+  t=250 ms worker=1 elapsed=2612 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=500 ms worker=1 elapsed=2612 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=1000 ms worker=1 elapsed=2612 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']
+  t=2000 ms worker=1 elapsed=2612 ms states={'0': 'D', '1': 'D', '2': 'D', '3': 'D'}
+    wchan={'0': '<unavailable:FileNotFoundError>', '1': '<unavailable:FileNotFoundError>', '2': '<unavailable:FileNotFoundError>', '3': '<unavailable:FileNotFoundError>'}
+    psi_io=['<unavailable:FileNotFoundError>']
+    cgroup_io_pressure=['<unavailable:FileNotFoundError>']

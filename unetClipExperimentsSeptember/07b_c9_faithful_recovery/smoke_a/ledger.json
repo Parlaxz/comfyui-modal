@@ -1,0 +1,78 @@
+{
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "arm": "source_only",
+  "attempts": [
+    {
+      "artifact": "unetClipExperimentsSeptember\\07b_c9_faithful_recovery\\smoke_a\\runs\\20260905T043455_b7629d67_c9_o01_unet_qd8.json",
+      "attempt_id": "20260905T043455_b7629d67_c9_o01_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 1,
+      "cell_id": "unet_qd8",
+      "error": "RuntimeError:c9_block_bytes_not_enforced",
+      "finished_at": "2026-09-05T04:35:06.639799+00:00",
+      "finished_monotonic_ns": 224732250000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 1,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T043455_b7629d67",
+      "started_at": "2026-09-05T04:34:56.206168+00:00",
+      "started_monotonic_ns": 224721812000000,
+      "status": "FAILED",
+      "wall_ms": 10438.0
+    },
+    {
+      "artifact": "unetClipExperimentsSeptember\\07b_c9_faithful_recovery\\smoke_a\\runs\\20260905T043455_b7629d67_c9_o02_unet_qd8.json",
+      "attempt_id": "20260905T043455_b7629d67_c9_o02_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 2,
+      "cell_id": "unet_qd8",
+      "error": "RuntimeError:c9_block_bytes_not_enforced",
+      "finished_at": "2026-09-05T04:35:15.014900+00:00",
+      "finished_monotonic_ns": 224740625000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 2,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T043455_b7629d67",
+      "started_at": "2026-09-05T04:35:06.643798+00:00",
+      "started_monotonic_ns": 224732250000000,
+      "status": "FAILED",
+      "wall_ms": 8375.0
+    }
+  ],
+  "experiment": "c9_recovery",
+  "geometry": {
+    "block_bytes": 33554432,
+    "expected_attempts_per_run": 2,
+    "models": {
+      "unet": "z_image_turbo_bf16.safetensors"
+    },
+    "observations_per_model_qd": 2,
+    "qd_values": [
+      8
+    ],
+    "roles": [
+      "unet"
+    ]
+  },
+  "runs": [
+    {
+      "attempt_ids": [
+        "20260905T043455_b7629d67_c9_o01_unet_qd8",
+        "20260905T043455_b7629d67_c9_o02_unet_qd8"
+      ],
+      "completed_attempts": 2,
+      "expected_attempts": 2,
+      "finished_at": "2026-09-05T04:35:15.018900+00:00",
+      "run_id": "20260905T043455_b7629d67",
+      "started_at": "2026-09-05T04:34:55.632567+00:00",
+      "status": "COMPLETE_WITH_FAILURES"
+    }
+  ],
+  "status": "COMPLETE_WITH_FAILURES",
+  "updated_at": "2026-09-05T04:35:15.018900+00:00",
+  "version": 1
+}

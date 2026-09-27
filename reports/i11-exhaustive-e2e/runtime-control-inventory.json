@@ -1,0 +1,3075 @@
+[
+  {
+    "page": "playground",
+    "extra": "default",
+    "controls": [
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "studio-page",
+        "ariaLabel": null,
+        "text": "PlaygroundExperimentBackendSelect a backend…Default Preset (fake)Select a workfl",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-pagecontainer"
+      },
+      {
+        "tag": "h2",
+        "role": "h2",
+        "testid": "playground-page-title",
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "control-panel",
+        "ariaLabel": null,
+        "text": "ExperimentBackendSelect a backend…Default Preset (fake)Select a workflow…Fake Wo",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-control-panel"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "experiment-toggle",
+        "ariaLabel": null,
+        "text": "Experiment",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-secondary-btn"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-selector",
+        "ariaLabel": null,
+        "text": "Select a backend…Default Preset (fake)",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-selector"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "backend-select",
+        "ariaLabel": null,
+        "text": "Select a backend…Default Preset (fake)",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input comfymodal-studio-select"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workflow-selector-section",
+        "ariaLabel": null,
+        "text": "Select a workflow…Fake Workflow (v1)Text2Img Workflow (2 versions)Incomplete Wor",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-selector"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "workflow-selector",
+        "ariaLabel": null,
+        "text": "Select a workflow…Fake Workflow (v1)Text2Img Workflow (2 versions)Incomplete Wor",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input comfymodal-studio-select"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "workflow-version-selector",
+        "ariaLabel": null,
+        "text": "No workflow selected",
+        "disabled": true,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input comfymodal-studio-select"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "workflow-preset-selector",
+        "ariaLabel": null,
+        "text": "No version selected",
+        "disabled": true,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input comfymodal-studio-select"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workflow-run-gating",
+        "ariaLabel": null,
+        "text": "Select a workflow Open Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-control-note"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workflow-mapped-controls",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "controls-container",
+        "ariaLabel": null,
+        "text": "Select a Backend Preset to see controls.Open Backend to create presets",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-controls"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "run-btn",
+        "ariaLabel": null,
+        "text": "Run",
+        "disabled": true,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-primary-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Reset to defaults",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-reset-link"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workspace",
+        "ariaLabel": null,
+        "text": "Txt2ImgObject RemoveObject ReplaceGenerated output will appear here.Recent runsC",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workspace"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "feature-tabs",
+        "ariaLabel": null,
+        "text": "Txt2ImgObject RemoveObject Replace",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-feature-tabs"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "feature-tab-txt2img",
+        "ariaLabel": null,
+        "text": "Txt2Img",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-feature-tab active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "feature-tab-object_remove",
+        "ariaLabel": null,
+        "text": "Object Remove",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-feature-tab"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "feature-tab-object_replace",
+        "ariaLabel": null,
+        "text": "Object Replace",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-feature-tab"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "canvas-area",
+        "ariaLabel": null,
+        "text": "Generated output will appear here.",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-canvas"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "progress-section",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-studio-metadata-section"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "metadata-section",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-metadata-section"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "filmstrip",
+        "ariaLabel": null,
+        "text": "Recent runsClear✕EXPEXPEXPEXPEXPEXPEXPEXPEXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Clear",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-btn danger"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Hide recent runs",
+        "text": "✕",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-btn close-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 1:00 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_a, completed at 10:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_b, completed_with_failures at 9:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 9:00 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_a, interrupted at 8:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset B, completed at 8:00 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset B, completed at 7:00 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_b, canceled at 7:00 AM. No image.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item failed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 5:09 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_a, completed at 5:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 5:00 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_b, completed at 4:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 3:55 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_a, completed at 3:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 2:41 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_a, running at 2:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 1:27 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "preset_b, running at 1:00 AM. Open experiment.",
+        "text": "EXP",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item comfymodal-studio-carousel-item-experiment"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 12:13 AM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 10:59 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 9:45 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 8:31 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 7:17 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 6:03 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 4:49 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Preset A, completed at 3:35 PM. Open run.",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-carousel-item completed"
+      }
+    ],
+    "nav": [
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "pageAttr": "playground",
+        "ariaCurrent": "page",
+        "active": true
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "pageAttr": "history",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "pageAttr": "workflows",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "pageAttr": "backend",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "pageAttr": "settings",
+        "ariaCurrent": null,
+        "active": false
+      }
+    ],
+    "url": "http://127.0.0.1:8379/?session=sess_1c015eeae#comfymodal=playground"
+  },
+  {
+    "page": "history",
+    "extra": "default",
+    "controls": [
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "studio-page",
+        "ariaLabel": null,
+        "text": "HistoryDemo data45 resultsNewest firstOldest firstFastestSlowestWorkflow A-ZWork",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-pagecontainer"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "history-v2-page",
+        "ariaLabel": null,
+        "text": "HistoryDemo data45 resultsNewest firstOldest firstFastestSlowestWorkflow A-ZWork",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2"
+      },
+      {
+        "tag": "h2",
+        "role": "h2",
+        "testid": "history-v2-page-title",
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-page-title"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "history-v2-search",
+        "ariaLabel": "Search history",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-search"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "history-v2-mode-banner",
+        "ariaLabel": null,
+        "text": "Demo data",
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-studio-history-v2-mode-banner"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "history-v2-result-count",
+        "ariaLabel": null,
+        "text": "45 results",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-result-count"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": null,
+        "ariaLabel": "Sort history",
+        "text": "Newest firstOldest firstFastestSlowestWorkflow A-ZWorkflow Z-A",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-select"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Clear all",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-clear-all"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "All",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Generations",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Experiments",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Failed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Canceled",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Interrupted",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Favorites only",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Preview only",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Original available",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Has image",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-toggle"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": null,
+        "ariaLabel": "Filter by workflow",
+        "text": "All workflowsConcept LabLandscape UltraPortrait Pro",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-select"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": null,
+        "ariaLabel": "Filter by preset",
+        "text": "All presetsPreset APreset Bpreset_apreset_b",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-select"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": null,
+        "ariaLabel": "From date",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-date"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": null,
+        "ariaLabel": "To date",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-date"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "history-v2-results",
+        "ariaLabel": null,
+        "text": "Completed☆successful portrait of a deterministic personPortrait Pro · Preset AAu",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-results"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_ok — Portrait Pro · Preset A",
+        "text": "Completed☆successful portrait of a deterministic personPortrait Pro · Preset AAu",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 1:00 PM (gen_ok) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_interrupted — Portrait Pro · Preset A",
+        "text": "No imageInterrupted☆interrupted portrait runPortrait Pro · Preset AAug 10, 10:00",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 10:00 AM (rupted) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Seed Sweep — completed",
+        "text": "Completed☆Seed Sweep — completed4 resultsPortrait Pro · preset_aAug 10, 10:00 AM",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Seed Sweep — completed (pleted) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_preview_only — Landscape Ultra · Preset A",
+        "text": "Completed☆preview-only passLandscape Ultra · Preset AAug 10, 9:00 AM2.1s",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 9:00 AM (w_only) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Seed Sweep — partial",
+        "text": "No imageNo imageCompleted with failures☆Seed Sweep — partial2 resultsLandscape U",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Seed Sweep — partial (ilures) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_original_failed — Concept Lab · Preset B",
+        "text": "Completed☆preview succeeded, original failedConcept Lab · Preset BAug 10, 8:00 A",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 8:00 AM (failed) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Seed Sweep — interrupted",
+        "text": "No imageNo imageInterrupted☆Seed Sweep — interrupted2 resultsConcept Lab · prese",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Seed Sweep — interrupted (rupted) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_multi — Portrait Pro · Preset B",
+        "text": "Completed☆multi-output batchPortrait Pro · Preset BAug 10, 7:00 AM3.6s",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 7:00 AM (_multi) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_no_image — Landscape Ultra · Preset A",
+        "text": "No imageCompleted☆missing image recordLandscape Ultra · Preset AAug 10, 6:00 AM1",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 6:00 AM (_image) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_00 — Portrait Pro · Preset A",
+        "text": "Completed☆bulk deterministic generation #0 — searchable text for feed testsPortr",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 5:09 AM (_v2_00) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_dupe_names — Concept Lab · Preset A",
+        "text": "Completed☆duplicate filenames, distinct asset idsConcept Lab · Preset AAug 10, 5",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 5:00 AM (_names) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Single-cell sweep",
+        "text": "No imageNo imageNo imageCompleted☆Single-cell sweep1 resultPortrait Pro · preset",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Single-cell sweep (exp_1) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_01 — Landscape Ultra · Preset B",
+        "text": "No imageCompleted☆bulk deterministic generation #1 — searchable text for feed te",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 4:32 AM (_v2_01) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Two-cell sweep",
+        "text": "No imageNo imageCompleted☆Two-cell sweep2 resultsLandscape Ultra · preset_bAug 1",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Two-cell sweep (exp_2) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_02 — Concept Lab · Preset A",
+        "text": "Completed☆bulk deterministic generation #2 — searchable text for feed testsConce",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 3:55 AM (_v2_02) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_03 — Portrait Pro · Preset B",
+        "text": "No imageCompleted☆bulk deterministic generation #3 — searchable text for feed te",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 3:18 AM (_v2_03) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Three-cell sweep",
+        "text": "No imageCompleted☆Three-cell sweep3 resultsConcept Lab · preset_aAug 10, 3:00 AM",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Three-cell sweep (exp_3) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_04 — Landscape Ultra · Preset A",
+        "text": "Completed☆bulk deterministic generation #4 — searchable text for feed testsLands",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 2:41 AM (_v2_04) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_05 — Concept Lab · Preset B",
+        "text": "No imageCompleted★bulk deterministic generation #5 — searchable text for feed te",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Remove generation Aug 10, 2:04 AM (_v2_05) from favorites",
+        "text": "★",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Seed Sweep — running",
+        "text": "No imageNo imageNo imageRunning☆Seed Sweep — running1 resultLandscape Ultra · pr",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Seed Sweep — running (ning_1) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_06 — Portrait Pro · Preset A",
+        "text": "Completed☆bulk deterministic generation #6 — searchable text for feed testsPortr",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 1:27 AM (_v2_06) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-experiment-card",
+        "ariaLabel": "Open experiment Two-cell running sweep",
+        "text": "No imageNo imageNo imageRunning☆Two-cell running sweep1 resultPortrait Pro · pre",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-experiment-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add experiment Two-cell running sweep (ning_2) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_07 — Landscape Ultra · Preset B",
+        "text": "No imageCompleted☆bulk deterministic generation #7 — searchable text for feed te",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 12:50 AM (_v2_07) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "history-v2-generation-card",
+        "ariaLabel": "Open generation gen_v2_08 — Concept Lab · Preset A",
+        "text": "Completed☆bulk deterministic generation #8 — searchable text for feed testsConce",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-card comfymodal-studio-history-v2-generation-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-favorite-star",
+        "ariaLabel": "Add generation Aug 10, 12:13 AM (_v2_08) to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-fav"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "history-v2-load-more",
+        "ariaLabel": null,
+        "text": "Load more",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-history-v2-load-more"
+      }
+    ],
+    "nav": [
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "pageAttr": "playground",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "pageAttr": "history",
+        "ariaCurrent": "page",
+        "active": true
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "pageAttr": "workflows",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "pageAttr": "backend",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "pageAttr": "settings",
+        "ariaCurrent": null,
+        "active": false
+      }
+    ],
+    "url": "http://127.0.0.1:8379/?session=sess_252ff2c81#comfymodal=history"
+  },
+  {
+    "page": "workflows",
+    "extra": "default",
+    "controls": [
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "studio-page",
+        "ariaLabel": null,
+        "text": "WorkflowsModel LibraryWorkflows6 workflowsImport workflow manifestImportNew Work",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-pagecontainer"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workflows-page",
+        "ariaLabel": null,
+        "text": "WorkflowsModel LibraryWorkflows6 workflowsImport workflow manifestImportNew Work",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "wf-subnav-library",
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-subnav-btn active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "wf-subnav-models",
+        "ariaLabel": null,
+        "text": "Model Library",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-subnav-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "workflows-import-manifest-button",
+        "ariaLabel": null,
+        "text": "Import workflow manifest",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-secondary-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "workflows-import-button",
+        "ariaLabel": null,
+        "text": "Import",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-secondary-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "workflows-new-button",
+        "ariaLabel": null,
+        "text": "New Workflow",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-primary-btn"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "workflows-search",
+        "ariaLabel": "Search workflows",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows-search"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "workflows-tag-filter",
+        "ariaLabel": "Filter by tag",
+        "text": "All tagstxt2img",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows-select"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "workflows-favorites-only",
+        "ariaLabel": null,
+        "text": "Favorites only",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows-toggle"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "workflows-folder-tree",
+        "ariaLabel": null,
+        "text": "All folders",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows-folder-tree"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "All folders",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflows-folder-item active"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Fake Workflow",
+        "text": "Fake Workflow☆Incompletev1Not analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": "Add to favorites",
+        "text": "☆",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-favorite-star"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "workflow-card-state",
+        "ariaLabel": null,
+        "text": "Incomplete",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-status-badge warn cm-chip"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Fake Workflow: Not analyzed. Opens the portability panel.",
+        "text": "Not analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip neutral cm-chip cm-chip--portability"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Text2Img Workflow",
+        "text": "Text2Img Workflow☆txt2imgReadyv2Preset ANot analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "workflow-card-state",
+        "ariaLabel": null,
+        "text": "Ready",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-status-badge ok cm-chip"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Text2Img Workflow: Not analyzed. Opens the portability panel.",
+        "text": "Not analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip neutral cm-chip cm-chip--portability"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Incomplete Workflow",
+        "text": "Incomplete Workflow☆Incompletev1Medium · Stale",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Incomplete Workflow: Medium · Stale. Opens the portability panel.",
+        "text": "Medium · Stale",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip warn cm-chip cm-chip--portability"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Fail Workflow",
+        "text": "Fail Workflow☆Readyv1Fail PresetNot analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Fail Workflow: Not analyzed. Opens the portability panel.",
+        "text": "Not analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip neutral cm-chip cm-chip--portability"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Cancel Workflow",
+        "text": "Cancel Workflow☆Readyv1Cancel PresetNot analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Cancel Workflow: Not analyzed. Opens the portability panel.",
+        "text": "Not analyzed",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip neutral cm-chip cm-chip--portability"
+      },
+      {
+        "tag": "div",
+        "role": "button",
+        "testid": "workflow-card",
+        "ariaLabel": "Open workflow Interrupt Workflow",
+        "text": "Interrupt Workflow☆Readyv1Interrupt PresetLow · Needs check",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-workflow-card"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "portability-chip",
+        "ariaLabel": "Portability for Interrupt Workflow: Low · Needs check. Opens the portability panel.",
+        "text": "Low · Needs check",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-portability-chip ok cm-chip cm-chip--portability"
+      }
+    ],
+    "nav": [
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "pageAttr": "playground",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "pageAttr": "history",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "pageAttr": "workflows",
+        "ariaCurrent": "page",
+        "active": true
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "pageAttr": "backend",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "pageAttr": "settings",
+        "ariaCurrent": null,
+        "active": false
+      }
+    ],
+    "url": "http://127.0.0.1:8379/?session=sess_3594e448f#comfymodal=workflows"
+  },
+  {
+    "page": "backend",
+    "extra": "default",
+    "controls": [
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "studio-page",
+        "ariaLabel": null,
+        "text": "BackendMake PresetBind the current ComfyUI graph into a Studio presetOverviewWor",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-pagecontainer"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-page",
+        "ariaLabel": null,
+        "text": "BackendMake PresetBind the current ComfyUI graph into a Studio presetOverviewWor",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend"
+      },
+      {
+        "tag": "h2",
+        "role": "h2",
+        "testid": "backend-page-title",
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-page-title"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Make Preset",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-primary-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Overview",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab active"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workspaces",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Deployment",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Credentials",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend Presets",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Snapshots",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-tab"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-list",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-studio-backend-list"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-detail",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-studio-backend-detail"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-ops-panel",
+        "ariaLabel": null,
+        "text": "Operational OverviewActive workspaceDefault Workspace (server-resolved)Deploymen",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-detail"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-runtime",
+        "ariaLabel": null,
+        "text": "Operational OverviewActive workspaceDefault Workspace (server-resolved)Deploymen",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-backend-detail"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "backend-runtime-rows",
+        "ariaLabel": null,
+        "text": "Active workspaceDefault Workspace (server-resolved)Deploymentready — Fake deploy",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "backend-runtime-workspace",
+        "ariaLabel": null,
+        "text": "Default Workspace (server-resolved)",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "backend-runtime-deploy",
+        "ariaLabel": null,
+        "text": "ready — Fake deployment ready",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "backend-runtime-auth",
+        "ariaLabel": null,
+        "text": "Connected",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "backend-runtime-health",
+        "ariaLabel": null,
+        "text": "Ready",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "backend-runtime-refresh",
+        "ariaLabel": null,
+        "text": "Refresh",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      }
+    ],
+    "nav": [
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "pageAttr": "playground",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "pageAttr": "history",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "pageAttr": "workflows",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "pageAttr": "backend",
+        "ariaCurrent": "page",
+        "active": true
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "pageAttr": "settings",
+        "ariaCurrent": null,
+        "active": false
+      }
+    ],
+    "url": "http://127.0.0.1:8379/?session=sess_46ad68e74#comfymodal=backend"
+  },
+  {
+    "page": "settings",
+    "extra": "default",
+    "controls": [
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "active"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "studio-page",
+        "ariaLabel": null,
+        "text": "SettingsHeavy tracing change requires a ComfyUI restart to take effect.GeneralPr",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-pagecontainer"
+      },
+      {
+        "tag": "h2",
+        "role": "h2",
+        "testid": "settings-page-title",
+        "ariaLabel": null,
+        "text": "Settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-settings-page-title"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "settings-restart-banner",
+        "ariaLabel": null,
+        "text": "Heavy tracing change requires a ComfyUI restart to take effect.",
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-settings-restart-banner"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-search",
+        "ariaLabel": "Search settings",
+        "text": null,
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input comfymodal-settings-search"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "settings-search-results",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": true,
+        "classes": "comfymodal-settings-search-results"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-generation",
+        "ariaLabel": "Reset Generation section",
+        "text": "Reset section",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-settings-reset-section-btn"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-gpu",
+        "ariaLabel": null,
+        "text": "rtx-pro-6000 (default)",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-preview-default",
+        "ariaLabel": null,
+        "text": "OffOn",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "settings-migration-notice-host",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-outputs",
+        "ariaLabel": "Reset Outputs section",
+        "text": "Reset section",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-reset-section-btn"
+      },
+      {
+        "tag": "div",
+        "role": "div",
+        "testid": "settings-outputs-host",
+        "ariaLabel": null,
+        "text": "FormatOriginalWebP losslessWebP lossyJPEGOutput format for generated images.Qual",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": ""
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-output-format",
+        "ariaLabel": null,
+        "text": "OriginalWebP losslessWebP lossyJPEG",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-quality",
+        "ariaLabel": "Output quality",
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-range"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "settings-quality-value",
+        "ariaLabel": null,
+        "text": "75",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-range-value"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-webp-lossless-compression",
+        "ariaLabel": null,
+        "text": "FastBalancedMaximum",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-auto-save-local",
+        "ariaLabel": "Auto-save original outputs locally",
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-checkbox"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-save-folder",
+        "ariaLabel": null,
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-save-metadata-sidecar",
+        "ariaLabel": "Save metadata JSON sidecar",
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-checkbox"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-preview-codec",
+        "ariaLabel": null,
+        "text": "WebP",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "input",
+        "role": "input",
+        "testid": "settings-preview-quality",
+        "ariaLabel": "Preview quality",
+        "text": null,
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-range"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "settings-preview-quality-value",
+        "ariaLabel": null,
+        "text": "70",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-settings-range-value"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-open-folder",
+        "ariaLabel": null,
+        "text": "Open output folder",
+        "disabled": false,
+        "visible": false,
+        "hidden": false,
+        "classes": "comfymodal-secondary-btn comfymodal-settings-open-folder"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-history",
+        "ariaLabel": "Reset History section",
+        "text": "Reset section",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-settings-reset-section-btn"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-history-columns",
+        "ariaLabel": null,
+        "text": "2345678",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-interface",
+        "ariaLabel": "Reset Interface section",
+        "text": "Reset section",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-settings-reset-section-btn"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-panel-layout",
+        "ariaLabel": null,
+        "text": "Reset panel layout",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-secondary-btn comfymodal-settings-panel-reset"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-advanced",
+        "ariaLabel": "Reset Advanced section",
+        "text": "Reset section",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-settings-reset-section-btn"
+      },
+      {
+        "tag": "select",
+        "role": "select",
+        "testid": "settings-heavy-tracing",
+        "ariaLabel": null,
+        "text": "OffSummaryDetailedTraceTrace verbose",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-input"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "settings-deploy-state",
+        "ariaLabel": null,
+        "text": "ready — Fake deployment ready",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-settings-row-value"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "settings-runtime-snapshots",
+        "ariaLabel": null,
+        "text": "1",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-settings-row-value"
+      },
+      {
+        "tag": "span",
+        "role": "span",
+        "testid": "settings-runtime-presets",
+        "ariaLabel": null,
+        "text": "1",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-studio-settings-row-value"
+      },
+      {
+        "tag": "a",
+        "role": "a",
+        "testid": "settings-open-backend",
+        "ariaLabel": null,
+        "text": "Open Backend tab",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-settings-link"
+      },
+      {
+        "tag": "button",
+        "role": "button",
+        "testid": "settings-reset-all",
+        "ariaLabel": null,
+        "text": "Reset all settings",
+        "disabled": false,
+        "visible": true,
+        "hidden": false,
+        "classes": "comfymodal-destructive-btn comfymodal-settings-reset-all-btn"
+      }
+    ],
+    "nav": [
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Playground",
+        "pageAttr": "playground",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "History",
+        "pageAttr": "history",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Workflows",
+        "pageAttr": "workflows",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Backend",
+        "pageAttr": "backend",
+        "ariaCurrent": null,
+        "active": false
+      },
+      {
+        "tag": "button",
+        "role": "nav-button",
+        "testid": null,
+        "ariaLabel": null,
+        "text": "Settings",
+        "pageAttr": "settings",
+        "ariaCurrent": "page",
+        "active": true
+      }
+    ],
+    "url": "http://127.0.0.1:8379/?session=sess_5882fac8f#comfymodal=settings"
+  },
+  {
+    "page": "history-detail",
+    "extra": "generation-detail",
+    "controls": [
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Playground",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "History",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Workflows",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Backend",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Settings",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "studio-page",
+        "text": "HistoryDemo data7 resultsNewest firstOldest firstFastestSlow",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-page",
+        "text": "HistoryDemo data7 resultsNewest firstOldest firstFastestSlow",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "h2",
+        "testid": "history-v2-page-title",
+        "text": "History",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "input",
+        "testid": "history-v2-search",
+        "text": "",
+        "ariaLabel": "Search history",
+        "visible": true
+      },
+      {
+        "tag": "span",
+        "testid": "history-v2-result-count",
+        "text": "7 results",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Clear all",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "All",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Generations",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Experiments",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Failed",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Canceled",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Interrupted",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Favorites only",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Preview only",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Original available",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": null,
+        "text": "Has image",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-results",
+        "text": "Completed☆phase e preview onlyPortrait Pro · Preset AAug 10,",
+        "ariaLabel": null,
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "Completed☆phase e preview onlyPortrait Pro · Preset AAug 10,",
+        "ariaLabel": "Open generation gen_phase_e_preview_only — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 9:00 PM (w_only) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "Completed☆phase e preview with failed originalPortrait Pro ·",
+        "ariaLabel": "Open generation gen_phase_e_preview_failed_original — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 8:00 PM (iginal) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "Completed☆phase e preview and originalPortrait Pro · Preset ",
+        "ariaLabel": "Open generation gen_phase_e_preview_original — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 7:00 PM (iginal) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "Completed☆phase e original rerender failedPortrait Pro · Pre",
+        "ariaLabel": "Open generation gen_phase_e_rerender_failed — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 6:00 PM (failed) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "Original availableCompleted☆phase e remote originalPortrait ",
+        "ariaLabel": "Open generation gen_phase_e_remote_original — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 5:00 PM (iginal) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-generation-card",
+        "text": "No imageInterrupted☆Portrait Pro · Preset AAug 10, 3:00 PM1m",
+        "ariaLabel": "Open generation gen_phase_e_sparse_interrupted — Portrait Pro · Preset A",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add generation Aug 10, 3:00 PM (rupted) to favorites",
+        "visible": true
+      },
+      {
+        "tag": "div",
+        "testid": "history-v2-experiment-card",
+        "text": "No imageNo imageCompleted☆Phase E Preview Sweep2 resultsPort",
+        "ariaLabel": "Open experiment Phase E Preview Sweep",
+        "visible": true
+      },
+      {
+        "tag": "button",
+        "testid": "history-v2-favorite-star",
+        "text": "☆",
+        "ariaLabel": "Add experiment Phase E Preview Sweep (review) to favorites",
+        "visible": true
+      }
+    ],
+    "nav": []
+  }
+]

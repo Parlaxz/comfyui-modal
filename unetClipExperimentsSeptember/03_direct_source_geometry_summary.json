@@ -1,0 +1,1300 @@
+{
+  "arms": [
+    {
+      "app": "sept-unetclip-03-direct32",
+      "combined_loader_wall_ms": {
+        "cv": 0.06862326823283979,
+        "max": 4318.498855999999,
+        "mean": 3774.8524420833332,
+        "median": 3805.0947309999997,
+        "min": 3413.410042,
+        "n": 12,
+        "range": 905.0888139999993,
+        "sample_sd": 259.0427116724749
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "33f737d5753a6d00afb0bdefb9a8c32e4d34c571e33545519de3ae5b9a79162c"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct32",
+      "request_wall_ms": {
+        "cv": 0.5700375329467304,
+        "max": 124791.554,
+        "mean": 47294.81383333333,
+        "median": 35659.333,
+        "min": 32018.579,
+        "n": 12,
+        "range": 92772.975,
+        "sample_sd": 26959.81899872823
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            268435456
+          ],
+          "h2d_target_bytes": [
+            33554432
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.12432805087792066,
+            "max": 1271.909044,
+            "mean": 978.6608348333334,
+            "median": 978.8269605,
+            "min": 813.671104,
+            "n": 12,
+            "range": 458.23794,
+            "sample_sd": 121.67499406538698
+          },
+          "logical_slot_bytes": [
+            33554432
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.4678503785597486,
+            "max": 6.313391,
+            "mean": 2.7065075833333334,
+            "median": 2.5774084999999998,
+            "min": 0.92317,
+            "n": 12,
+            "range": 5.390221,
+            "sample_sd": 1.2662405974373303
+          },
+          "source_block_bytes": [
+            33554432
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.06459303511207229,
+            "max": 475.987383,
+            "mean": 422.6964775,
+            "median": 418.3021605,
+            "min": 389.507991,
+            "n": 12,
+            "range": 86.47939200000002,
+            "sample_sd": 27.303248412906775
+          },
+          "source_wall_ms": {
+            "cv": 0.12290065018178559,
+            "max": 1287.308308,
+            "mean": 989.358576,
+            "median": 989.7902174999999,
+            "min": 828.409576,
+            "n": 12,
+            "range": 458.8987319999999,
+            "sample_sd": 121.59281225332552
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            268435456
+          ],
+          "h2d_target_bytes": [
+            33554432
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.11998687116975494,
+            "max": 1752.89288,
+            "mean": 1515.2648711666666,
+            "median": 1506.136482,
+            "min": 1218.126453,
+            "n": 12,
+            "range": 534.766427,
+            "sample_sd": 181.81189088473013
+          },
+          "logical_slot_bytes": [
+            33554432
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.46793539059528444,
+            "max": 3.590769,
+            "mean": 1.91986225,
+            "median": 1.9287185,
+            "min": 0.982419,
+            "n": 12,
+            "range": 2.6083499999999997,
+            "sample_sd": 0.8983714918428917
+          },
+          "source_block_bytes": [
+            33554432
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.08326359771408491,
+            "max": 888.188585,
+            "mean": 717.0930915,
+            "median": 698.7507754999999,
+            "min": 666.505132,
+            "n": 12,
+            "range": 221.683453,
+            "sample_sd": 59.70775069420549
+          },
+          "source_wall_ms": {
+            "cv": 0.1189785469365484,
+            "max": 1760.626856,
+            "mean": 1524.5766846666666,
+            "median": 1517.3484105,
+            "min": 1224.319719,
+            "n": 12,
+            "range": 536.307137,
+            "sample_sd": 181.39191863498033
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            268435456
+          ],
+          "h2d_target_bytes": [
+            33554432
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.1394636167057044,
+            "max": 74.005031,
+            "mean": 58.03656875,
+            "median": 56.643162000000004,
+            "min": 45.412954,
+            "n": 12,
+            "range": 28.592077000000003,
+            "sample_sd": 8.093989779064263
+          },
+          "logical_slot_bytes": [
+            33554432
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.209359437662952,
+            "max": 3.290839,
+            "mean": 2.4355865833333334,
+            "median": 2.520574,
+            "min": 1.755839,
+            "n": 12,
+            "range": 1.5350000000000001,
+            "sample_sd": 0.5099130374660973
+          },
+          "source_block_bytes": [
+            33554432
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.28554258063408977,
+            "max": 54.743791,
+            "mean": 35.425461166666665,
+            "median": 33.285685,
+            "min": 22.160646,
+            "n": 12,
+            "range": 32.583145,
+            "sample_sd": 10.115477601682732
+          },
+          "source_wall_ms": {
+            "cv": 0.14554043118806756,
+            "max": 90.233882,
+            "mean": 69.06971166666666,
+            "median": 65.71104399999999,
+            "min": 56.431553,
+            "n": 12,
+            "range": 33.80232899999999,
+            "sample_sd": 10.052435618002166
+          }
+        }
+      },
+      "value_mib": 32
+    },
+    {
+      "app": "sept-unetclip-03-direct64",
+      "combined_loader_wall_ms": {
+        "cv": 0.4793718385362714,
+        "max": 10301.22603,
+        "mean": 4865.612753333333,
+        "median": 3927.613639,
+        "min": 3058.175698,
+        "n": 12,
+        "range": 7243.050332,
+        "sample_sd": 2332.4377311709295
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "09d93bfe76b472e3bdd807d0d932b9bb9504faa2824e0760ae48c1da79893bb1"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct64",
+      "request_wall_ms": {
+        "cv": 0.9520960635376409,
+        "max": 253075.744,
+        "mean": 67913.35783333333,
+        "median": 38460.868,
+        "min": 28736.475,
+        "n": 12,
+        "range": 224339.269,
+        "sample_sd": 64660.04065473987
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            536870912
+          ],
+          "h2d_target_bytes": [
+            67108864
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.925848486782121,
+            "max": 6203.103286,
+            "mean": 1612.49794225,
+            "median": 1154.4785885000001,
+            "min": 808.951246,
+            "n": 12,
+            "range": 5394.15204,
+            "sample_sd": 1492.9287797714464
+          },
+          "logical_slot_bytes": [
+            67108864
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.3588330896894381,
+            "max": 5.142149,
+            "mean": 2.881813,
+            "median": 2.58465,
+            "min": 1.971519,
+            "n": 12,
+            "range": 3.17063,
+            "sample_sd": 1.0340898626971888
+          },
+          "source_block_bytes": [
+            67108864
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.11442902606570303,
+            "max": 351.086204,
+            "mean": 288.46394733333335,
+            "median": 290.7520115,
+            "min": 235.717819,
+            "n": 12,
+            "range": 115.36838500000002,
+            "sample_sd": 33.00864854842159
+          },
+          "source_wall_ms": {
+            "cv": 0.9098235302326185,
+            "max": 6219.697744,
+            "mean": 1648.1750016666667,
+            "median": 1182.350087,
+            "min": 821.023359,
+            "n": 12,
+            "range": 5398.674385,
+            "sample_sd": 1499.5483984575187
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            536870912
+          ],
+          "h2d_target_bytes": [
+            67108864
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.3102696564942498,
+            "max": 3131.539964,
+            "mean": 2075.0522775,
+            "median": 1759.1813575,
+            "min": 1321.417851,
+            "n": 12,
+            "range": 1810.1221130000001,
+            "sample_sd": 643.8257573475357
+          },
+          "logical_slot_bytes": [
+            67108864
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.41912658771853767,
+            "max": 6.321329,
+            "mean": 2.7943872499999998,
+            "median": 2.4154904999999998,
+            "min": 1.984835,
+            "n": 12,
+            "range": 4.336494,
+            "sample_sd": 1.1712019928566881
+          },
+          "source_block_bytes": [
+            67108864
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.07067719083838545,
+            "max": 453.807101,
+            "mean": 405.30778783333335,
+            "median": 400.09499600000004,
+            "min": 355.592328,
+            "n": 12,
+            "range": 98.21477299999998,
+            "sample_sd": 28.64601586898034
+          },
+          "source_wall_ms": {
+            "cv": 0.3184147558342271,
+            "max": 3282.715604,
+            "mean": 2104.7280835,
+            "median": 1773.854323,
+            "min": 1332.017611,
+            "n": 12,
+            "range": 1950.697993,
+            "sample_sd": 670.1764788050933
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            536870912
+          ],
+          "h2d_target_bytes": [
+            67108864
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.6862070955085425,
+            "max": 193.866648,
+            "mean": 61.06408158333333,
+            "median": 49.2708595,
+            "min": 45.207174,
+            "n": 12,
+            "range": 148.659474,
+            "sample_sd": 41.90260606319585
+          },
+          "logical_slot_bytes": [
+            67108864
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.25972757769688176,
+            "max": 5.61988,
+            "mean": 3.593582,
+            "median": 3.5334125,
+            "min": 2.29908,
+            "n": 12,
+            "range": 3.3208,
+            "sample_sd": 0.9333523481151157
+          },
+          "source_block_bytes": [
+            67108864
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.7448277389492918,
+            "max": 151.288262,
+            "mean": 45.57013716666667,
+            "median": 38.2195185,
+            "min": 26.990963,
+            "n": 12,
+            "range": 124.29729900000001,
+            "sample_sd": 33.94190222945742
+          },
+          "source_wall_ms": {
+            "cv": 0.8005125627840184,
+            "max": 285.939855,
+            "mean": 80.79544841666667,
+            "median": 62.4541245,
+            "min": 57.594285,
+            "n": 12,
+            "range": 228.34557,
+            "sample_sd": 64.6777714733098
+          }
+        }
+      },
+      "value_mib": 64
+    },
+    {
+      "app": "sept-unetclip-03-direct128",
+      "combined_loader_wall_ms": {
+        "cv": 0.19722939028662115,
+        "max": 5739.771258,
+        "mean": 3919.1585721666665,
+        "median": 3692.1505125000003,
+        "min": 3274.6772039999996,
+        "n": 12,
+        "range": 2465.094054,
+        "sample_sd": 772.9732556250163
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "e7058eeffa2cf0a909ae22922544bdda1241efc966e4d606bda199a83afacf9d"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct128",
+      "request_wall_ms": {
+        "cv": 1.0324122969157556,
+        "max": 241004.215,
+        "mean": 61499.154833333334,
+        "median": 30767.426,
+        "min": 27498.197,
+        "n": 12,
+        "range": 213506.01799999998,
+        "sample_sd": 63492.48369985936
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            1073741824
+          ],
+          "h2d_target_bytes": [
+            134217728
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.2233794445815655,
+            "max": 1689.326557,
+            "mean": 1178.8369360833333,
+            "median": 1164.311273,
+            "min": 811.537555,
+            "n": 12,
+            "range": 877.7890020000001,
+            "sample_sd": 263.32794003452943
+          },
+          "logical_slot_bytes": [
+            134217728
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.5362938663947545,
+            "max": 13.905563,
+            "mean": 5.759756666666667,
+            "median": 4.776673,
+            "min": 2.87955,
+            "n": 12,
+            "range": 11.026013,
+            "sample_sd": 3.0889221722596303
+          },
+          "source_block_bytes": [
+            134217728
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.35875540506087494,
+            "max": 612.796362,
+            "mean": 308.12849508333335,
+            "median": 295.765001,
+            "min": 192.579685,
+            "n": 12,
+            "range": 420.216677,
+            "sample_sd": 110.54276306441906
+          },
+          "source_wall_ms": {
+            "cv": 0.23958195385205613,
+            "max": 1814.631813,
+            "mean": 1220.985189,
+            "median": 1200.764093,
+            "min": 830.770494,
+            "n": 12,
+            "range": 983.861319,
+            "sample_sd": 292.526017205042
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            1073741824
+          ],
+          "h2d_target_bytes": [
+            134217728
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.10906780283215803,
+            "max": 2036.922901,
+            "mean": 1762.08684025,
+            "median": 1764.7508579999999,
+            "min": 1387.274017,
+            "n": 12,
+            "range": 649.648884,
+            "sample_sd": 192.18694006552735
+          },
+          "logical_slot_bytes": [
+            134217728
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 1.2819735397896146,
+            "max": 50.037309,
+            "mean": 10.372307166666667,
+            "median": 4.272334,
+            "min": 2.647059,
+            "n": 12,
+            "range": 47.39025,
+            "sample_sd": 13.297023334236856
+          },
+          "source_block_bytes": [
+            134217728
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.3050039908740451,
+            "max": 739.865878,
+            "mean": 379.36078325,
+            "median": 355.8784015,
+            "min": 304.756701,
+            "n": 12,
+            "range": 435.10917699999993,
+            "sample_sd": 115.7065528723536
+          },
+          "source_wall_ms": {
+            "cv": 0.11816811231459143,
+            "max": 2227.515506,
+            "mean": 1797.5388805833334,
+            "median": 1787.3496264999999,
+            "min": 1417.619983,
+            "n": 12,
+            "range": 809.8955230000001,
+            "sample_sd": 212.41177633061628
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            1073741824
+          ],
+          "h2d_target_bytes": [
+            134217728
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.44877877861113646,
+            "max": 127.871316,
+            "mean": 53.65925691666666,
+            "median": 48.4142165,
+            "min": 39.75896,
+            "n": 12,
+            "range": 88.11235599999999,
+            "sample_sd": 24.081135780242843
+          },
+          "logical_slot_bytes": [
+            134217728
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 1.3685044334350613,
+            "max": 24.001136,
+            "mean": 4.5480496666666665,
+            "median": 2.380948,
+            "min": 1.87758,
+            "n": 12,
+            "range": 22.123556,
+            "sample_sd": 6.224026132316186
+          },
+          "source_block_bytes": [
+            134217728
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.6174833834272337,
+            "max": 118.351169,
+            "mean": 41.08550375,
+            "median": 35.750154,
+            "min": 15.000381,
+            "n": 12,
+            "range": 103.350788,
+            "sample_sd": 25.369615865362302
+          },
+          "source_wall_ms": {
+            "cv": 0.5437860834903324,
+            "max": 210.604208,
+            "mean": 78.17434891666667,
+            "median": 65.79686699999999,
+            "min": 55.539639,
+            "n": 12,
+            "range": 155.064569,
+            "sample_sd": 42.51012302680088
+          }
+        }
+      },
+      "value_mib": 128
+    },
+    {
+      "app": "sept-unetclip-03-direct256",
+      "combined_loader_wall_ms": {
+        "cv": 0.4287181635827788,
+        "max": 9530.46172,
+        "mean": 4057.36971175,
+        "median": 3568.4332835000005,
+        "min": 3049.238002,
+        "n": 12,
+        "range": 6481.223717999999,
+        "sample_sd": 1739.4680917978487
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "a23efcc7e5bccdaffebd07149bbd5f1abeea88c7fd5305d421ffdfb8d89bafee"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct256",
+      "request_wall_ms": {
+        "cv": 0.9940669569545812,
+        "max": 186325.952,
+        "mean": 45843.483916666664,
+        "median": 28718.7515,
+        "min": 25774.844,
+        "n": 12,
+        "range": 160551.10799999998,
+        "sample_sd": 45571.49255323712
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            2147483648
+          ],
+          "h2d_target_bytes": [
+            268435456
+          ],
+          "h2d_wall_ms": {
+            "cv": 1.0775484034934157,
+            "max": 6660.287941,
+            "mean": 1508.9368895,
+            "median": 1062.97503,
+            "min": 864.41485,
+            "n": 12,
+            "range": 5795.8730909999995,
+            "sample_sd": 1625.9525362530458
+          },
+          "logical_slot_bytes": [
+            268435456
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.8204318676033487,
+            "max": 28.076077,
+            "mean": 8.4546695,
+            "median": 7.310895,
+            "min": 3.415958,
+            "n": 12,
+            "range": 24.660119,
+            "sample_sd": 6.936480287854071
+          },
+          "source_block_bytes": [
+            268435456
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 2.109567817732556,
+            "max": 5928.590245,
+            "mean": 771.6514879166667,
+            "median": 288.1781595,
+            "min": 158.726538,
+            "n": 12,
+            "range": 5769.863707,
+            "sample_sd": 1627.8511454144425
+          },
+          "source_wall_ms": {
+            "cv": 1.0379729680487033,
+            "max": 6704.5877,
+            "mean": 1563.8594239166666,
+            "median": 1134.167826,
+            "min": 894.594157,
+            "n": 12,
+            "range": 5809.9935430000005,
+            "sample_sd": 1623.2438078537177
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            2147483648
+          ],
+          "h2d_target_bytes": [
+            268435456
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.12735196362639845,
+            "max": 1996.148611,
+            "mean": 1689.8395834166668,
+            "median": 1651.9819444999998,
+            "min": 1289.107245,
+            "n": 12,
+            "range": 707.0413660000002,
+            "sample_sd": 215.20438916172765
+          },
+          "logical_slot_bytes": [
+            268435456
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.44585924329160237,
+            "max": 12.870462,
+            "mean": 6.61916875,
+            "median": 5.7361640000000005,
+            "min": 2.685499,
+            "n": 12,
+            "range": 10.184963,
+            "sample_sd": 2.9512175700944216
+          },
+          "source_block_bytes": [
+            268435456
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.2248011536387115,
+            "max": 506.95892,
+            "mean": 351.00532258333334,
+            "median": 325.8491715,
+            "min": 248.908687,
+            "n": 12,
+            "range": 258.050233,
+            "sample_sd": 78.90640145006141
+          },
+          "source_wall_ms": {
+            "cv": 0.1224856711587262,
+            "max": 2055.400303,
+            "mean": 1749.7482258333334,
+            "median": 1695.2439290000002,
+            "min": 1360.042223,
+            "n": 12,
+            "range": 695.35808,
+            "sample_sd": 214.31908579998628
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            2147483648
+          ],
+          "h2d_target_bytes": [
+            268435456
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.2538108677924613,
+            "max": 50.771214,
+            "mean": 36.23715283333333,
+            "median": 34.081847,
+            "min": 19.242961,
+            "n": 12,
+            "range": 31.528253,
+            "sample_sd": 9.197383206956381
+          },
+          "logical_slot_bytes": [
+            268435456
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.257615750680527,
+            "max": 4.014608,
+            "mean": 2.3988841666666665,
+            "median": 2.2553985,
+            "min": 1.866429,
+            "n": 12,
+            "range": 2.148179,
+            "sample_sd": 0.6179903453914637
+          },
+          "source_block_bytes": [
+            268435456
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.3545655136487681,
+            "max": 39.793199,
+            "mean": 26.86358583333333,
+            "median": 24.1258545,
+            "min": 6.357377,
+            "n": 12,
+            "range": 33.435822,
+            "sample_sd": 9.524901109443602
+          },
+          "source_wall_ms": {
+            "cv": 0.09987061553485925,
+            "max": 73.700283,
+            "mean": 65.26248,
+            "median": 66.36504550000001,
+            "min": 55.177731,
+            "n": 12,
+            "range": 18.522551999999997,
+            "sample_sd": 6.517804048931441
+          }
+        }
+      },
+      "value_mib": 256
+    },
+    {
+      "app": "sept-unetclip-03-direct512",
+      "combined_loader_wall_ms": {
+        "cv": 0.4388799907936329,
+        "max": 10366.527367,
+        "mean": 4368.957226,
+        "median": 3746.9651125,
+        "min": 3420.1860330000004,
+        "n": 12,
+        "range": 6946.341334000001,
+        "sample_sd": 1917.447907124656
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "4de0c00f11de91ea99b8ce913f96a332b79720a1d18d34c039075104f84711c3"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct512",
+      "request_wall_ms": {
+        "cv": 0.7158990343236281,
+        "max": 129043.389,
+        "mean": 40651.88558333334,
+        "median": 30062.430500000002,
+        "min": 24461.874,
+        "n": 12,
+        "range": 104581.515,
+        "sample_sd": 29102.645632542957
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            4294967296
+          ],
+          "h2d_target_bytes": [
+            536870912
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.9875397796957396,
+            "max": 6144.195047,
+            "mean": 1488.2142283333333,
+            "median": 1028.011418,
+            "min": 964.108733,
+            "n": 12,
+            "range": 5180.086314,
+            "sample_sd": 1469.670751188365
+          },
+          "logical_slot_bytes": [
+            536870912
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.6052703437757391,
+            "max": 48.24126,
+            "mean": 21.023930416666666,
+            "median": 16.750591,
+            "min": 6.027928,
+            "n": 12,
+            "range": 42.213331999999994,
+            "sample_sd": 12.72516159081305
+          },
+          "source_block_bytes": [
+            536870912
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.44014766276243533,
+            "max": 841.518988,
+            "mean": 449.35679433333337,
+            "median": 446.111449,
+            "min": 138.242613,
+            "n": 12,
+            "range": 703.276375,
+            "sample_sd": 197.78334277223703
+          },
+          "source_wall_ms": {
+            "cv": 0.9212084470766153,
+            "max": 6280.071321,
+            "mean": 1602.2013003333334,
+            "median": 1165.4708495,
+            "min": 1048.82477,
+            "n": 12,
+            "range": 5231.246551,
+            "sample_sd": 1475.9613717842037
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            4294967296
+          ],
+          "h2d_target_bytes": [
+            536870912
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.2705711361014948,
+            "max": 3157.485342,
+            "mean": 1811.2720935833333,
+            "median": 1660.1032905000002,
+            "min": 1377.488931,
+            "n": 12,
+            "range": 1779.9964109999999,
+            "sample_sd": 490.0779481497755
+          },
+          "logical_slot_bytes": [
+            536870912
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.4690872603468935,
+            "max": 31.002829,
+            "mean": 15.39492375,
+            "median": 11.896882,
+            "min": 9.720171,
+            "n": 12,
+            "range": 21.282657999999998,
+            "sample_sd": 7.221562605136825
+          },
+          "source_block_bytes": [
+            536870912
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.40675873238432037,
+            "max": 957.110859,
+            "mean": 505.30559016666666,
+            "median": 437.4976735,
+            "min": 253.686836,
+            "n": 12,
+            "range": 703.424023,
+            "sample_sd": 205.53746132290422
+          },
+          "source_wall_ms": {
+            "cv": 0.25667267199085037,
+            "max": 3241.697861,
+            "mean": 1906.98223225,
+            "median": 1759.0956965,
+            "min": 1489.486921,
+            "n": 12,
+            "range": 1752.2109400000002,
+            "sample_sd": 489.4702249906839
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            4294967296
+          ],
+          "h2d_target_bytes": [
+            536870912
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.23691488895654078,
+            "max": 59.82105,
+            "mean": 42.18907925,
+            "median": 45.379497,
+            "min": 24.921429,
+            "n": 12,
+            "range": 34.899620999999996,
+            "sample_sd": 9.995221025692448
+          },
+          "logical_slot_bytes": [
+            536870912
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.4043754004322896,
+            "max": 7.26032,
+            "mean": 4.41165775,
+            "median": 4.119705,
+            "min": 1.98523,
+            "n": 12,
+            "range": 5.2750900000000005,
+            "sample_sd": 1.7839658692264637
+          },
+          "source_block_bytes": [
+            536870912
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.3750009877253956,
+            "max": 52.89643,
+            "mean": 33.104061,
+            "median": 36.530020500000006,
+            "min": 5.73645,
+            "n": 12,
+            "range": 47.159980000000004,
+            "sample_sd": 12.414055572721747
+          },
+          "source_wall_ms": {
+            "cv": 0.13975507590076405,
+            "max": 85.344859,
+            "mean": 63.16309091666667,
+            "median": 63.47298,
+            "min": 53.389998,
+            "n": 12,
+            "range": 31.954861,
+            "sample_sd": 8.827362565185611
+          }
+        }
+      },
+      "value_mib": 512
+    },
+    {
+      "app": "sept-unetclip-03-direct1024",
+      "combined_loader_wall_ms": {
+        "cv": 0.18840491268655007,
+        "max": 7032.4272550000005,
+        "mean": 4500.158337083333,
+        "median": 4306.7228185,
+        "min": 3845.253317,
+        "n": 12,
+        "range": 3187.1739380000004,
+        "sample_sd": 847.8519385738358
+      },
+      "core_n": 8,
+      "deployment_fingerprints": [
+        "5e455f65749b308d327acc5438edf01f3a335b11e203008f3a2cf23d4d56a144"
+      ],
+      "eligible_n": 12,
+      "extra_n": 4,
+      "geometry_ok": true,
+      "invariant_failures": [],
+      "profile": "golden_p1_direct1024",
+      "request_wall_ms": {
+        "cv": 0.6826924040137685,
+        "max": 128018.243,
+        "mean": 52361.780166666664,
+        "median": 37752.005000000005,
+        "min": 25330.058,
+        "n": 12,
+        "range": 102688.185,
+        "sample_sd": 35746.98958042213
+      },
+      "transport": {
+        "clip": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            8589934592
+          ],
+          "h2d_target_bytes": [
+            1073741824
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.31081318194843605,
+            "max": 2142.021113,
+            "mean": 1137.20644225,
+            "median": 1061.5645450000002,
+            "min": 787.633537,
+            "n": 12,
+            "range": 1354.3875759999996,
+            "sample_sd": 353.4587528479829
+          },
+          "logical_slot_bytes": [
+            1073741824
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.6471427416823682,
+            "max": 72.30429,
+            "mean": 26.914683916666668,
+            "median": 22.023407,
+            "min": 11.07752,
+            "n": 12,
+            "range": 61.226769999999995,
+            "sample_sd": 17.417642341346006
+          },
+          "source_block_bytes": [
+            1073741824
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.5564043882917914,
+            "max": 986.955869,
+            "mean": 539.4170795833334,
+            "median": 531.5482535,
+            "min": 77.644697,
+            "n": 12,
+            "range": 909.311172,
+            "sample_sd": 300.1340301997092
+          },
+          "source_wall_ms": {
+            "cv": 0.25656988244498996,
+            "max": 2346.265142,
+            "mean": 1353.4154170000002,
+            "median": 1281.9952555,
+            "min": 938.985036,
+            "n": 12,
+            "range": 1407.2801060000002,
+            "sample_sd": 347.2456344389271
+          }
+        },
+        "unet": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            8589934592
+          ],
+          "h2d_target_bytes": [
+            1073741824
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.08996248271640356,
+            "max": 1981.259906,
+            "mean": 1693.40573025,
+            "median": 1664.81763,
+            "min": 1418.365518,
+            "n": 12,
+            "range": 562.8943879999999,
+            "sample_sd": 152.34298373947436
+          },
+          "logical_slot_bytes": [
+            1073741824
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.8665402339503728,
+            "max": 111.620481,
+            "mean": 35.56394216666666,
+            "median": 24.001517,
+            "min": 10.226555,
+            "n": 12,
+            "range": 101.393926,
+            "sample_sd": 30.81758676530086
+          },
+          "source_block_bytes": [
+            1073741824
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.5198527338202041,
+            "max": 1105.104711,
+            "mean": 570.5703330833334,
+            "median": 553.020026,
+            "min": 187.715157,
+            "n": 12,
+            "range": 917.389554,
+            "sample_sd": 296.6125474900753
+          },
+          "source_wall_ms": {
+            "cv": 0.24927087867402828,
+            "max": 3537.60809,
+            "mean": 2016.3249166666667,
+            "median": 1905.7771659999999,
+            "min": 1623.676297,
+            "n": 12,
+            "range": 1913.9317930000002,
+            "sample_sd": 502.61108366983683
+          }
+        },
+        "vae": {
+          "aggregation_enabled": [
+            false
+          ],
+          "arena_bytes": [
+            8589934592
+          ],
+          "h2d_target_bytes": [
+            1073741824
+          ],
+          "h2d_wall_ms": {
+            "cv": 0.2014785199529342,
+            "max": 54.575306,
+            "mean": 39.639945166666664,
+            "median": 37.613073,
+            "min": 24.85935,
+            "n": 12,
+            "range": 29.715956,
+            "sample_sd": 7.9865974831954665
+          },
+          "logical_slot_bytes": [
+            1073741824
+          ],
+          "logical_slot_count": [
+            8
+          ],
+          "post_source_h2d_tail_ms": {
+            "cv": 0.3141477155810418,
+            "max": 7.490809,
+            "mean": 4.850359833333333,
+            "median": 4.8359345000000005,
+            "min": 2.430409,
+            "n": 12,
+            "range": 5.0604,
+            "sample_sd": 1.5237294613877093
+          },
+          "source_block_bytes": [
+            1073741824
+          ],
+          "source_h2d_overlap_ms": {
+            "cv": 0.3313511721750509,
+            "max": 43.920273,
+            "mean": 31.420247333333332,
+            "median": 31.377090000000003,
+            "min": 4.776294,
+            "n": 12,
+            "range": 39.143979,
+            "sample_sd": 10.411135783930016
+          },
+          "source_wall_ms": {
+            "cv": 0.10766385998984213,
+            "max": 75.301632,
+            "mean": 63.33987308333333,
+            "median": 63.5354515,
+            "min": 53.886479,
+            "n": 12,
+            "range": 21.415152999999997,
+            "sample_sd": 6.81941522741837
+          }
+        }
+      },
+      "value_mib": 1024
+    }
+  ],
+  "expected_output_sha": "8a92446890bebaecdc10eb5f207766a4b05af40ca3137108e25bfe88d9c1c44e",
+  "experiment_id": "sept-unetclip-03-direct-source-geometry",
+  "performance_comparison": "NOT_PERFORMED",
+  "performance_verdict": "NOT_PROVIDED",
+  "schema_version": 1,
+  "status": "COMPLETE"
+}

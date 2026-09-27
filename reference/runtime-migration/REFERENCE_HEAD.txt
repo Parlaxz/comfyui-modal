@@ -1,0 +1,4 @@
+fe05aa7eadd06281ca8501a19aa38065fbd5999f
+
+Captured before production-file edits. The current checkout matched this
+historical audit anchor at capture time.

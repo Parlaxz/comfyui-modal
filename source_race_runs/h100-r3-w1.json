@@ -1,0 +1,5204 @@
+{
+  "_attempt": {
+    "attempt_id": "h100-r3-w1",
+    "family": "h100",
+    "finished_at": "2026-09-22T05:29:46.889939+00:00",
+    "fresh_container_vs_previous": true,
+    "race_width": 1,
+    "round": 3,
+    "width_index": 2
+  },
+  "accepted": {
+    "accepted_sum_ms": 5865.0900950000005,
+    "count": 60,
+    "ge_100": 30,
+    "ge_1000": 0,
+    "ge_250": 0,
+    "ge_500": 0,
+    "max_ms": 216.469557,
+    "mean_ms": 97.75150158333334,
+    "median_ms": 105.94593850000001,
+    "p90_ms": 131.03017780000002,
+    "p95_ms": 132.3449494,
+    "p99_ms": 168.23621447999972,
+    "stdev_ms": 34.26107556784353,
+    "winner_envelope_ms": 10773.14043
+  },
+  "amplification": {
+    "accepted_bytes": 8044982048,
+    "attempts_launched": 60,
+    "attempts_per_accepted_read": 1.0,
+    "speculative_amplification_ratio": 1.0,
+    "speculative_byte_amplification_ratio": 1.0,
+    "total_physical_bytes_requested": 8044982048
+  },
+  "attempt_id": "h100-r3-w1",
+  "blocks": [
+    {
+      "accepted_preadv_ms": 216.469557,
+      "attempts_alive_after_drain": 0,
+      "block_index": 0,
+      "cumulative_attempts_before_block": 0,
+      "cumulative_physical_bytes_before_block": 0,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 1642238041,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 216.181815,
+          "physical_syscall_ms": 216.181815,
+          "preadv_enter_ns": 1642239348,
+          "preadv_exit_ns": 1858421163,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 0,
+      "logical_race_start_ns": 1641951606,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 0,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 1642238041,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 216.181815,
+          "physical_syscall_ms": 216.181815,
+          "preadv_enter_ns": 1642239348,
+          "preadv_exit_ns": 1858421163,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 1641951606,
+      "race_width": 1,
+      "wave_index": 0,
+      "wave_release_ns": 1641951606,
+      "winner_completion_ns": 1858421163,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 1858421163
+    },
+    {
+      "accepted_preadv_ms": 93.235971,
+      "attempts_alive_after_drain": 0,
+      "block_index": 1,
+      "cumulative_attempts_before_block": 1,
+      "cumulative_physical_bytes_before_block": 134217728,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 1641968736,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 93.218439,
+          "physical_syscall_ms": 93.218439,
+          "preadv_enter_ns": 1641969138,
+          "preadv_exit_ns": 1735187577,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 1,
+      "logical_race_start_ns": 1641951606,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 134217728,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 1641968736,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 93.218439,
+          "physical_syscall_ms": 93.218439,
+          "preadv_enter_ns": 1641969138,
+          "preadv_exit_ns": 1735187577,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 1641951606,
+      "race_width": 1,
+      "wave_index": 0,
+      "wave_release_ns": 1641951606,
+      "winner_completion_ns": 1735187577,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 1735187577
+    },
+    {
+      "accepted_preadv_ms": 67.035044,
+      "attempts_alive_after_drain": 0,
+      "block_index": 2,
+      "cumulative_attempts_before_block": 2,
+      "cumulative_physical_bytes_before_block": 268435456,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2097189556,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 67.0006,
+          "physical_syscall_ms": 67.0006,
+          "preadv_enter_ns": 2097190920,
+          "preadv_exit_ns": 2164191520,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 2,
+      "logical_race_start_ns": 2097156476,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 268435456,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2097189556,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 67.0006,
+          "physical_syscall_ms": 67.0006,
+          "preadv_enter_ns": 2097190920,
+          "preadv_exit_ns": 2164191520,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2097156476,
+      "race_width": 1,
+      "wave_index": 1,
+      "wave_release_ns": 2097156476,
+      "winner_completion_ns": 2164191520,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2164191520
+    },
+    {
+      "accepted_preadv_ms": 132.283288,
+      "attempts_alive_after_drain": 0,
+      "block_index": 3,
+      "cumulative_attempts_before_block": 3,
+      "cumulative_physical_bytes_before_block": 402653184,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2097241816,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 132.197434,
+          "physical_syscall_ms": 132.197434,
+          "preadv_enter_ns": 2097242330,
+          "preadv_exit_ns": 2229439764,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 3,
+      "logical_race_start_ns": 2097156476,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 402653184,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2097241816,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 132.197434,
+          "physical_syscall_ms": 132.197434,
+          "preadv_enter_ns": 2097242330,
+          "preadv_exit_ns": 2229439764,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2097156476,
+      "race_width": 1,
+      "wave_index": 1,
+      "wave_release_ns": 2097156476,
+      "winner_completion_ns": 2229439764,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2229439764
+    },
+    {
+      "accepted_preadv_ms": 65.182336,
+      "attempts_alive_after_drain": 0,
+      "block_index": 4,
+      "cumulative_attempts_before_block": 4,
+      "cumulative_physical_bytes_before_block": 536870912,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2466221266,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.036379,
+          "physical_syscall_ms": 65.036379,
+          "preadv_enter_ns": 2466221698,
+          "preadv_exit_ns": 2531258077,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 4,
+      "logical_race_start_ns": 2466075741,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 536870912,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2466221266,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.036379,
+          "physical_syscall_ms": 65.036379,
+          "preadv_enter_ns": 2466221698,
+          "preadv_exit_ns": 2531258077,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2466075741,
+      "race_width": 1,
+      "wave_index": 2,
+      "wave_release_ns": 2466075741,
+      "winner_completion_ns": 2531258077,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2531258077
+    },
+    {
+      "accepted_preadv_ms": 129.224002,
+      "attempts_alive_after_drain": 0,
+      "block_index": 5,
+      "cumulative_attempts_before_block": 5,
+      "cumulative_physical_bytes_before_block": 671088640,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2466111095,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 129.187272,
+          "physical_syscall_ms": 129.187272,
+          "preadv_enter_ns": 2466112471,
+          "preadv_exit_ns": 2595299743,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 5,
+      "logical_race_start_ns": 2466075741,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 671088640,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2466111095,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 129.187272,
+          "physical_syscall_ms": 129.187272,
+          "preadv_enter_ns": 2466112471,
+          "preadv_exit_ns": 2595299743,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2466075741,
+      "race_width": 1,
+      "wave_index": 2,
+      "wave_release_ns": 2466075741,
+      "winner_completion_ns": 2595299743,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2595299743
+    },
+    {
+      "accepted_preadv_ms": 63.657297,
+      "attempts_alive_after_drain": 0,
+      "block_index": 6,
+      "cumulative_attempts_before_block": 6,
+      "cumulative_physical_bytes_before_block": 805306368,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2836649660,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.468073,
+          "physical_syscall_ms": 63.468073,
+          "preadv_enter_ns": 2836650212,
+          "preadv_exit_ns": 2900118285,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 6,
+      "logical_race_start_ns": 2836460988,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 805306368,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2836649660,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.468073,
+          "physical_syscall_ms": 63.468073,
+          "preadv_enter_ns": 2836650212,
+          "preadv_exit_ns": 2900118285,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2836460988,
+      "race_width": 1,
+      "wave_index": 3,
+      "wave_release_ns": 2836460988,
+      "winner_completion_ns": 2900118285,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2900118285
+    },
+    {
+      "accepted_preadv_ms": 127.287603,
+      "attempts_alive_after_drain": 0,
+      "block_index": 7,
+      "cumulative_attempts_before_block": 7,
+      "cumulative_physical_bytes_before_block": 939524096,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 2836540902,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.204803,
+          "physical_syscall_ms": 127.204803,
+          "preadv_enter_ns": 2836543788,
+          "preadv_exit_ns": 2963748591,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 7,
+      "logical_race_start_ns": 2836460988,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 939524096,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 2836540902,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.204803,
+          "physical_syscall_ms": 127.204803,
+          "preadv_enter_ns": 2836543788,
+          "preadv_exit_ns": 2963748591,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 2836460988,
+      "race_width": 1,
+      "wave_index": 3,
+      "wave_release_ns": 2836460988,
+      "winner_completion_ns": 2963748591,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 2963748591
+    },
+    {
+      "accepted_preadv_ms": 63.056435,
+      "attempts_alive_after_drain": 0,
+      "block_index": 8,
+      "cumulative_attempts_before_block": 8,
+      "cumulative_physical_bytes_before_block": 1073741824,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3203276264,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.005377,
+          "physical_syscall_ms": 63.005377,
+          "preadv_enter_ns": 3203278384,
+          "preadv_exit_ns": 3266283761,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 8,
+      "logical_race_start_ns": 3203227326,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1073741824,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3203276264,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.005377,
+          "physical_syscall_ms": 63.005377,
+          "preadv_enter_ns": 3203278384,
+          "preadv_exit_ns": 3266283761,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3203227326,
+      "race_width": 1,
+      "wave_index": 4,
+      "wave_release_ns": 3203227326,
+      "winner_completion_ns": 3266283761,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 3266283761
+    },
+    {
+      "accepted_preadv_ms": 128.416941,
+      "attempts_alive_after_drain": 0,
+      "block_index": 9,
+      "cumulative_attempts_before_block": 9,
+      "cumulative_physical_bytes_before_block": 1207959552,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3203348068,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.295819,
+          "physical_syscall_ms": 128.295819,
+          "preadv_enter_ns": 3203348448,
+          "preadv_exit_ns": 3331644267,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 9,
+      "logical_race_start_ns": 3203227326,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1207959552,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3203348068,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.295819,
+          "physical_syscall_ms": 128.295819,
+          "preadv_enter_ns": 3203348448,
+          "preadv_exit_ns": 3331644267,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3203227326,
+      "race_width": 1,
+      "wave_index": 4,
+      "wave_release_ns": 3203227326,
+      "winner_completion_ns": 3331644267,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 3331644267
+    },
+    {
+      "accepted_preadv_ms": 63.439995,
+      "attempts_alive_after_drain": 0,
+      "block_index": 10,
+      "cumulative_attempts_before_block": 10,
+      "cumulative_physical_bytes_before_block": 1342177280,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3565386549,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.313404,
+          "physical_syscall_ms": 63.313404,
+          "preadv_enter_ns": 3565387067,
+          "preadv_exit_ns": 3628700471,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 10,
+      "logical_race_start_ns": 3565260476,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1342177280,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3565386549,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.313404,
+          "physical_syscall_ms": 63.313404,
+          "preadv_enter_ns": 3565387067,
+          "preadv_exit_ns": 3628700471,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3565260476,
+      "race_width": 1,
+      "wave_index": 5,
+      "wave_release_ns": 3565260476,
+      "winner_completion_ns": 3628700471,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 3628700471
+    },
+    {
+      "accepted_preadv_ms": 126.548358,
+      "attempts_alive_after_drain": 0,
+      "block_index": 11,
+      "cumulative_attempts_before_block": 11,
+      "cumulative_physical_bytes_before_block": 1476395008,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3565302302,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 126.504143,
+          "physical_syscall_ms": 126.504143,
+          "preadv_enter_ns": 3565304691,
+          "preadv_exit_ns": 3691808834,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 11,
+      "logical_race_start_ns": 3565260476,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1476395008,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3565302302,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 126.504143,
+          "physical_syscall_ms": 126.504143,
+          "preadv_enter_ns": 3565304691,
+          "preadv_exit_ns": 3691808834,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3565260476,
+      "race_width": 1,
+      "wave_index": 5,
+      "wave_release_ns": 3565260476,
+      "winner_completion_ns": 3691808834,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 3691808834
+    },
+    {
+      "accepted_preadv_ms": 65.720656,
+      "attempts_alive_after_drain": 0,
+      "block_index": 12,
+      "cumulative_attempts_before_block": 12,
+      "cumulative_physical_bytes_before_block": 1610612736,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3929268009,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.593964,
+          "physical_syscall_ms": 65.593964,
+          "preadv_enter_ns": 3929268407,
+          "preadv_exit_ns": 3994862371,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 12,
+      "logical_race_start_ns": 3929141715,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1610612736,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3929268009,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.593964,
+          "physical_syscall_ms": 65.593964,
+          "preadv_enter_ns": 3929268407,
+          "preadv_exit_ns": 3994862371,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3929141715,
+      "race_width": 1,
+      "wave_index": 6,
+      "wave_release_ns": 3929141715,
+      "winner_completion_ns": 3994862371,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 3994862371
+    },
+    {
+      "accepted_preadv_ms": 131.249588,
+      "attempts_alive_after_drain": 0,
+      "block_index": 13,
+      "cumulative_attempts_before_block": 13,
+      "cumulative_physical_bytes_before_block": 1744830464,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 3929197376,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 131.191952,
+          "physical_syscall_ms": 131.191952,
+          "preadv_enter_ns": 3929199351,
+          "preadv_exit_ns": 4060391303,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 13,
+      "logical_race_start_ns": 3929141715,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1744830464,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 3929197376,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 131.191952,
+          "physical_syscall_ms": 131.191952,
+          "preadv_enter_ns": 3929199351,
+          "preadv_exit_ns": 4060391303,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 3929141715,
+      "race_width": 1,
+      "wave_index": 6,
+      "wave_release_ns": 3929141715,
+      "winner_completion_ns": 4060391303,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 4060391303
+    },
+    {
+      "accepted_preadv_ms": 65.991128,
+      "attempts_alive_after_drain": 0,
+      "block_index": 14,
+      "cumulative_attempts_before_block": 14,
+      "cumulative_physical_bytes_before_block": 1879048192,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 4298569411,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.880192,
+          "physical_syscall_ms": 65.880192,
+          "preadv_enter_ns": 4298569791,
+          "preadv_exit_ns": 4364449983,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 14,
+      "logical_race_start_ns": 4298458855,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 1879048192,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 4298569411,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.880192,
+          "physical_syscall_ms": 65.880192,
+          "preadv_enter_ns": 4298569791,
+          "preadv_exit_ns": 4364449983,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 4298458855,
+      "race_width": 1,
+      "wave_index": 7,
+      "wave_release_ns": 4298458855,
+      "winner_completion_ns": 4364449983,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 4364449983
+    },
+    {
+      "accepted_preadv_ms": 128.03098,
+      "attempts_alive_after_drain": 0,
+      "block_index": 15,
+      "cumulative_attempts_before_block": 15,
+      "cumulative_physical_bytes_before_block": 2013265920,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 4298514771,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.972827,
+          "physical_syscall_ms": 127.972827,
+          "preadv_enter_ns": 4298517008,
+          "preadv_exit_ns": 4426489835,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 15,
+      "logical_race_start_ns": 4298458855,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2013265920,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 4298514771,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.972827,
+          "physical_syscall_ms": 127.972827,
+          "preadv_enter_ns": 4298517008,
+          "preadv_exit_ns": 4426489835,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 4298458855,
+      "race_width": 1,
+      "wave_index": 7,
+      "wave_release_ns": 4298458855,
+      "winner_completion_ns": 4426489835,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 4426489835
+    },
+    {
+      "accepted_preadv_ms": 66.981971,
+      "attempts_alive_after_drain": 0,
+      "block_index": 16,
+      "cumulative_attempts_before_block": 16,
+      "cumulative_physical_bytes_before_block": 2147483648,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 4666662666,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.861172,
+          "physical_syscall_ms": 66.861172,
+          "preadv_enter_ns": 4666663439,
+          "preadv_exit_ns": 4733524611,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 16,
+      "logical_race_start_ns": 4666542640,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2147483648,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 4666662666,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.861172,
+          "physical_syscall_ms": 66.861172,
+          "preadv_enter_ns": 4666663439,
+          "preadv_exit_ns": 4733524611,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 4666542640,
+      "race_width": 1,
+      "wave_index": 8,
+      "wave_release_ns": 4666542640,
+      "winner_completion_ns": 4733524611,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 4733524611
+    },
+    {
+      "accepted_preadv_ms": 131.018674,
+      "attempts_alive_after_drain": 0,
+      "block_index": 17,
+      "cumulative_attempts_before_block": 17,
+      "cumulative_physical_bytes_before_block": 2281701376,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 4666587803,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 130.971059,
+          "physical_syscall_ms": 130.971059,
+          "preadv_enter_ns": 4666590255,
+          "preadv_exit_ns": 4797561314,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 17,
+      "logical_race_start_ns": 4666542640,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2281701376,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 4666587803,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 130.971059,
+          "physical_syscall_ms": 130.971059,
+          "preadv_enter_ns": 4666590255,
+          "preadv_exit_ns": 4797561314,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 4666542640,
+      "race_width": 1,
+      "wave_index": 8,
+      "wave_release_ns": 4666542640,
+      "winner_completion_ns": 4797561314,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 4797561314
+    },
+    {
+      "accepted_preadv_ms": 64.064987,
+      "attempts_alive_after_drain": 0,
+      "block_index": 18,
+      "cumulative_attempts_before_block": 18,
+      "cumulative_physical_bytes_before_block": 2415919104,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5035142936,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.896819,
+          "physical_syscall_ms": 63.896819,
+          "preadv_enter_ns": 5035143407,
+          "preadv_exit_ns": 5099040226,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 18,
+      "logical_race_start_ns": 5034975239,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2415919104,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5035142936,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.896819,
+          "physical_syscall_ms": 63.896819,
+          "preadv_enter_ns": 5035143407,
+          "preadv_exit_ns": 5099040226,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5034975239,
+      "race_width": 1,
+      "wave_index": 9,
+      "wave_release_ns": 5034975239,
+      "winner_completion_ns": 5099040226,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5099040226
+    },
+    {
+      "accepted_preadv_ms": 127.168232,
+      "attempts_alive_after_drain": 0,
+      "block_index": 19,
+      "cumulative_attempts_before_block": 19,
+      "cumulative_physical_bytes_before_block": 2550136832,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5035052084,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.088659,
+          "physical_syscall_ms": 127.088659,
+          "preadv_enter_ns": 5035054812,
+          "preadv_exit_ns": 5162143471,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 19,
+      "logical_race_start_ns": 5034975239,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2550136832,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5035052084,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.088659,
+          "physical_syscall_ms": 127.088659,
+          "preadv_enter_ns": 5035054812,
+          "preadv_exit_ns": 5162143471,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5034975239,
+      "race_width": 1,
+      "wave_index": 9,
+      "wave_release_ns": 5034975239,
+      "winner_completion_ns": 5162143471,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5162143471
+    },
+    {
+      "accepted_preadv_ms": 67.732292,
+      "attempts_alive_after_drain": 0,
+      "block_index": 20,
+      "cumulative_attempts_before_block": 20,
+      "cumulative_physical_bytes_before_block": 2684354560,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5397303346,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 67.667326,
+          "physical_syscall_ms": 67.667326,
+          "preadv_enter_ns": 5397306228,
+          "preadv_exit_ns": 5464973554,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 20,
+      "logical_race_start_ns": 5397241262,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2684354560,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5397303346,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 67.667326,
+          "physical_syscall_ms": 67.667326,
+          "preadv_enter_ns": 5397306228,
+          "preadv_exit_ns": 5464973554,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5397241262,
+      "race_width": 1,
+      "wave_index": 10,
+      "wave_release_ns": 5397241262,
+      "winner_completion_ns": 5464973554,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5464973554
+    },
+    {
+      "accepted_preadv_ms": 133.516516,
+      "attempts_alive_after_drain": 0,
+      "block_index": 21,
+      "cumulative_attempts_before_block": 21,
+      "cumulative_physical_bytes_before_block": 2818572288,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5397389333,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 133.368008,
+          "physical_syscall_ms": 133.368008,
+          "preadv_enter_ns": 5397389770,
+          "preadv_exit_ns": 5530757778,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 21,
+      "logical_race_start_ns": 5397241262,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2818572288,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5397389333,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 133.368008,
+          "physical_syscall_ms": 133.368008,
+          "preadv_enter_ns": 5397389770,
+          "preadv_exit_ns": 5530757778,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5397241262,
+      "race_width": 1,
+      "wave_index": 10,
+      "wave_release_ns": 5397241262,
+      "winner_completion_ns": 5530757778,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5530757778
+    },
+    {
+      "accepted_preadv_ms": 66.788681,
+      "attempts_alive_after_drain": 0,
+      "block_index": 22,
+      "cumulative_attempts_before_block": 22,
+      "cumulative_physical_bytes_before_block": 2952790016,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5770592013,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.687323,
+          "physical_syscall_ms": 66.687323,
+          "preadv_enter_ns": 5770592405,
+          "preadv_exit_ns": 5837279728,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 22,
+      "logical_race_start_ns": 5770491047,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 2952790016,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5770592013,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.687323,
+          "physical_syscall_ms": 66.687323,
+          "preadv_enter_ns": 5770592405,
+          "preadv_exit_ns": 5837279728,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5770491047,
+      "race_width": 1,
+      "wave_index": 11,
+      "wave_release_ns": 5770491047,
+      "winner_completion_ns": 5837279728,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5837279728
+    },
+    {
+      "accepted_preadv_ms": 125.090315,
+      "attempts_alive_after_drain": 0,
+      "block_index": 23,
+      "cumulative_attempts_before_block": 23,
+      "cumulative_physical_bytes_before_block": 3087007744,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 5770526445,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 125.053199,
+          "physical_syscall_ms": 125.053199,
+          "preadv_enter_ns": 5770528163,
+          "preadv_exit_ns": 5895581362,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 23,
+      "logical_race_start_ns": 5770491047,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3087007744,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 5770526445,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 125.053199,
+          "physical_syscall_ms": 125.053199,
+          "preadv_enter_ns": 5770528163,
+          "preadv_exit_ns": 5895581362,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 5770491047,
+      "race_width": 1,
+      "wave_index": 11,
+      "wave_release_ns": 5770491047,
+      "winner_completion_ns": 5895581362,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 5895581362
+    },
+    {
+      "accepted_preadv_ms": 66.649162,
+      "attempts_alive_after_drain": 0,
+      "block_index": 24,
+      "cumulative_attempts_before_block": 24,
+      "cumulative_physical_bytes_before_block": 3221225472,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6136080156,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.518644,
+          "physical_syscall_ms": 66.518644,
+          "preadv_enter_ns": 6136080558,
+          "preadv_exit_ns": 6202599202,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 24,
+      "logical_race_start_ns": 6135950040,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3221225472,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6136080156,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.518644,
+          "physical_syscall_ms": 66.518644,
+          "preadv_enter_ns": 6136080558,
+          "preadv_exit_ns": 6202599202,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6135950040,
+      "race_width": 1,
+      "wave_index": 12,
+      "wave_release_ns": 6135950040,
+      "winner_completion_ns": 6202599202,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6202599202
+    },
+    {
+      "accepted_preadv_ms": 125.726575,
+      "attempts_alive_after_drain": 0,
+      "block_index": 25,
+      "cumulative_attempts_before_block": 25,
+      "cumulative_physical_bytes_before_block": 3355443200,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6135987262,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 125.687655,
+          "physical_syscall_ms": 125.687655,
+          "preadv_enter_ns": 6135988960,
+          "preadv_exit_ns": 6261676615,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 25,
+      "logical_race_start_ns": 6135950040,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3355443200,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6135987262,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 125.687655,
+          "physical_syscall_ms": 125.687655,
+          "preadv_enter_ns": 6135988960,
+          "preadv_exit_ns": 6261676615,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6135950040,
+      "race_width": 1,
+      "wave_index": 12,
+      "wave_release_ns": 6135950040,
+      "winner_completion_ns": 6261676615,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6261676615
+    },
+    {
+      "accepted_preadv_ms": 65.201568,
+      "attempts_alive_after_drain": 0,
+      "block_index": 26,
+      "cumulative_attempts_before_block": 26,
+      "cumulative_physical_bytes_before_block": 3489660928,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6498589070,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.080335,
+          "physical_syscall_ms": 65.080335,
+          "preadv_enter_ns": 6498589330,
+          "preadv_exit_ns": 6563669665,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 26,
+      "logical_race_start_ns": 6498468097,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3489660928,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6498589070,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 65.080335,
+          "physical_syscall_ms": 65.080335,
+          "preadv_enter_ns": 6498589330,
+          "preadv_exit_ns": 6563669665,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6498468097,
+      "race_width": 1,
+      "wave_index": 13,
+      "wave_release_ns": 6498468097,
+      "winner_completion_ns": 6563669665,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6563669665
+    },
+    {
+      "accepted_preadv_ms": 124.859093,
+      "attempts_alive_after_drain": 0,
+      "block_index": 27,
+      "cumulative_attempts_before_block": 27,
+      "cumulative_physical_bytes_before_block": 3623878656,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6498519850,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 124.805839,
+          "physical_syscall_ms": 124.805839,
+          "preadv_enter_ns": 6498521351,
+          "preadv_exit_ns": 6623327190,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 27,
+      "logical_race_start_ns": 6498468097,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3623878656,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6498519850,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 124.805839,
+          "physical_syscall_ms": 124.805839,
+          "preadv_enter_ns": 6498521351,
+          "preadv_exit_ns": 6623327190,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6498468097,
+      "race_width": 1,
+      "wave_index": 13,
+      "wave_release_ns": 6498468097,
+      "winner_completion_ns": 6623327190,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6623327190
+    },
+    {
+      "accepted_preadv_ms": 64.655672,
+      "attempts_alive_after_drain": 0,
+      "block_index": 28,
+      "cumulative_attempts_before_block": 28,
+      "cumulative_physical_bytes_before_block": 3758096384,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6862910068,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.598309,
+          "physical_syscall_ms": 64.598309,
+          "preadv_enter_ns": 6862914200,
+          "preadv_exit_ns": 6927512509,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 28,
+      "logical_race_start_ns": 6862856837,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3758096384,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6862910068,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.598309,
+          "physical_syscall_ms": 64.598309,
+          "preadv_enter_ns": 6862914200,
+          "preadv_exit_ns": 6927512509,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6862856837,
+      "race_width": 1,
+      "wave_index": 14,
+      "wave_release_ns": 6862856837,
+      "winner_completion_ns": 6927512509,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6927512509
+    },
+    {
+      "accepted_preadv_ms": 123.381923,
+      "attempts_alive_after_drain": 0,
+      "block_index": 29,
+      "cumulative_attempts_before_block": 29,
+      "cumulative_physical_bytes_before_block": 3892314112,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 6863004620,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 123.233308,
+          "physical_syscall_ms": 123.233308,
+          "preadv_enter_ns": 6863005452,
+          "preadv_exit_ns": 6986238760,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 29,
+      "logical_race_start_ns": 6862856837,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 3892314112,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 6863004620,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 123.233308,
+          "physical_syscall_ms": 123.233308,
+          "preadv_enter_ns": 6863005452,
+          "preadv_exit_ns": 6986238760,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 6862856837,
+      "race_width": 1,
+      "wave_index": 14,
+      "wave_release_ns": 6862856837,
+      "winner_completion_ns": 6986238760,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 6986238760
+    },
+    {
+      "accepted_preadv_ms": 64.90019,
+      "attempts_alive_after_drain": 0,
+      "block_index": 30,
+      "cumulative_attempts_before_block": 30,
+      "cumulative_physical_bytes_before_block": 4026531840,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7224355681,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.745933,
+          "physical_syscall_ms": 64.745933,
+          "preadv_enter_ns": 7224357387,
+          "preadv_exit_ns": 7289103320,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 30,
+      "logical_race_start_ns": 7224203130,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4026531840,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7224355681,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.745933,
+          "physical_syscall_ms": 64.745933,
+          "preadv_enter_ns": 7224357387,
+          "preadv_exit_ns": 7289103320,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7224203130,
+      "race_width": 1,
+      "wave_index": 15,
+      "wave_release_ns": 7224203130,
+      "winner_completion_ns": 7289103320,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 7289103320
+    },
+    {
+      "accepted_preadv_ms": 122.2234,
+      "attempts_alive_after_drain": 0,
+      "block_index": 31,
+      "cumulative_attempts_before_block": 31,
+      "cumulative_physical_bytes_before_block": 4160749568,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7224244124,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.180276,
+          "physical_syscall_ms": 122.180276,
+          "preadv_enter_ns": 7224246254,
+          "preadv_exit_ns": 7346426530,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 31,
+      "logical_race_start_ns": 7224203130,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4160749568,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7224244124,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.180276,
+          "physical_syscall_ms": 122.180276,
+          "preadv_enter_ns": 7224246254,
+          "preadv_exit_ns": 7346426530,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7224203130,
+      "race_width": 1,
+      "wave_index": 15,
+      "wave_release_ns": 7224203130,
+      "winner_completion_ns": 7346426530,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 7346426530
+    },
+    {
+      "accepted_preadv_ms": 62.405032,
+      "attempts_alive_after_drain": 0,
+      "block_index": 32,
+      "cumulative_attempts_before_block": 32,
+      "cumulative_physical_bytes_before_block": 4294967296,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7582308118,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 62.351949,
+          "physical_syscall_ms": 62.351949,
+          "preadv_enter_ns": 7582310127,
+          "preadv_exit_ns": 7644662076,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 32,
+      "logical_race_start_ns": 7582257044,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4294967296,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7582308118,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 62.351949,
+          "physical_syscall_ms": 62.351949,
+          "preadv_enter_ns": 7582310127,
+          "preadv_exit_ns": 7644662076,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7582257044,
+      "race_width": 1,
+      "wave_index": 16,
+      "wave_release_ns": 7582257044,
+      "winner_completion_ns": 7644662076,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 7644662076
+    },
+    {
+      "accepted_preadv_ms": 118.655906,
+      "attempts_alive_after_drain": 0,
+      "block_index": 33,
+      "cumulative_attempts_before_block": 33,
+      "cumulative_physical_bytes_before_block": 4429185024,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7582377010,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 118.535577,
+          "physical_syscall_ms": 118.535577,
+          "preadv_enter_ns": 7582377373,
+          "preadv_exit_ns": 7700912950,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 33,
+      "logical_race_start_ns": 7582257044,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4429185024,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7582377010,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 118.535577,
+          "physical_syscall_ms": 118.535577,
+          "preadv_enter_ns": 7582377373,
+          "preadv_exit_ns": 7700912950,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7582257044,
+      "race_width": 1,
+      "wave_index": 16,
+      "wave_release_ns": 7582257044,
+      "winner_completion_ns": 7700912950,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 7700912950
+    },
+    {
+      "accepted_preadv_ms": 66.113596,
+      "attempts_alive_after_drain": 0,
+      "block_index": 34,
+      "cumulative_attempts_before_block": 34,
+      "cumulative_physical_bytes_before_block": 4563402752,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7940844160,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.064561,
+          "physical_syscall_ms": 66.064561,
+          "preadv_enter_ns": 7940846307,
+          "preadv_exit_ns": 8006910868,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 34,
+      "logical_race_start_ns": 7940797272,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4563402752,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7940844160,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.064561,
+          "physical_syscall_ms": 66.064561,
+          "preadv_enter_ns": 7940846307,
+          "preadv_exit_ns": 8006910868,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7940797272,
+      "race_width": 1,
+      "wave_index": 17,
+      "wave_release_ns": 7940797272,
+      "winner_completion_ns": 8006910868,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8006910868
+    },
+    {
+      "accepted_preadv_ms": 134.718129,
+      "attempts_alive_after_drain": 0,
+      "block_index": 35,
+      "cumulative_attempts_before_block": 35,
+      "cumulative_physical_bytes_before_block": 4697620480,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 7940912936,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 134.602189,
+          "physical_syscall_ms": 134.602189,
+          "preadv_enter_ns": 7940913212,
+          "preadv_exit_ns": 8075515401,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 35,
+      "logical_race_start_ns": 7940797272,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4697620480,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 7940912936,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 134.602189,
+          "physical_syscall_ms": 134.602189,
+          "preadv_enter_ns": 7940913212,
+          "preadv_exit_ns": 8075515401,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 7940797272,
+      "race_width": 1,
+      "wave_index": 17,
+      "wave_release_ns": 7940797272,
+      "winner_completion_ns": 8075515401,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8075515401
+    },
+    {
+      "accepted_preadv_ms": 64.951044,
+      "attempts_alive_after_drain": 0,
+      "block_index": 36,
+      "cumulative_attempts_before_block": 36,
+      "cumulative_physical_bytes_before_block": 4831838208,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 8311086112,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.88971,
+          "physical_syscall_ms": 64.88971,
+          "preadv_enter_ns": 8311087949,
+          "preadv_exit_ns": 8375977659,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 36,
+      "logical_race_start_ns": 8311026615,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4831838208,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 8311086112,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.88971,
+          "physical_syscall_ms": 64.88971,
+          "preadv_enter_ns": 8311087949,
+          "preadv_exit_ns": 8375977659,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 8311026615,
+      "race_width": 1,
+      "wave_index": 18,
+      "wave_release_ns": 8311026615,
+      "winner_completion_ns": 8375977659,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8375977659
+    },
+    {
+      "accepted_preadv_ms": 121.521878,
+      "attempts_alive_after_drain": 0,
+      "block_index": 37,
+      "cumulative_attempts_before_block": 37,
+      "cumulative_physical_bytes_before_block": 4966055936,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 8311185728,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 121.362334,
+          "physical_syscall_ms": 121.362334,
+          "preadv_enter_ns": 8311186159,
+          "preadv_exit_ns": 8432548493,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 37,
+      "logical_race_start_ns": 8311026615,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 4966055936,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 8311185728,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 121.362334,
+          "physical_syscall_ms": 121.362334,
+          "preadv_enter_ns": 8311186159,
+          "preadv_exit_ns": 8432548493,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 8311026615,
+      "race_width": 1,
+      "wave_index": 18,
+      "wave_release_ns": 8311026615,
+      "winner_completion_ns": 8432548493,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8432548493
+    },
+    {
+      "accepted_preadv_ms": 66.53516,
+      "attempts_alive_after_drain": 0,
+      "block_index": 38,
+      "cumulative_attempts_before_block": 38,
+      "cumulative_physical_bytes_before_block": 5100273664,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 8669815757,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.356078,
+          "physical_syscall_ms": 66.356078,
+          "preadv_enter_ns": 8669816168,
+          "preadv_exit_ns": 8736172246,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 38,
+      "logical_race_start_ns": 8669637086,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5100273664,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 8669815757,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.356078,
+          "physical_syscall_ms": 66.356078,
+          "preadv_enter_ns": 8669816168,
+          "preadv_exit_ns": 8736172246,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 8669637086,
+      "race_width": 1,
+      "wave_index": 19,
+      "wave_release_ns": 8669637086,
+      "winner_completion_ns": 8736172246,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8736172246
+    },
+    {
+      "accepted_preadv_ms": 128.641164,
+      "attempts_alive_after_drain": 0,
+      "block_index": 39,
+      "cumulative_attempts_before_block": 39,
+      "cumulative_physical_bytes_before_block": 5234491392,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 8669680914,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.596779,
+          "physical_syscall_ms": 128.596779,
+          "preadv_enter_ns": 8669681471,
+          "preadv_exit_ns": 8798278250,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 39,
+      "logical_race_start_ns": 8669637086,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5234491392,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 8669680914,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.596779,
+          "physical_syscall_ms": 128.596779,
+          "preadv_enter_ns": 8669681471,
+          "preadv_exit_ns": 8798278250,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 8669637086,
+      "race_width": 1,
+      "wave_index": 19,
+      "wave_release_ns": 8669637086,
+      "winner_completion_ns": 8798278250,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 8798278250
+    },
+    {
+      "accepted_preadv_ms": 64.720509,
+      "attempts_alive_after_drain": 0,
+      "block_index": 40,
+      "cumulative_attempts_before_block": 40,
+      "cumulative_physical_bytes_before_block": 5368709120,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9032464215,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.67602,
+          "physical_syscall_ms": 64.67602,
+          "preadv_enter_ns": 9032465665,
+          "preadv_exit_ns": 9097141685,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 40,
+      "logical_race_start_ns": 9032421176,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5368709120,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9032464215,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.67602,
+          "physical_syscall_ms": 64.67602,
+          "preadv_enter_ns": 9032465665,
+          "preadv_exit_ns": 9097141685,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9032421176,
+      "race_width": 1,
+      "wave_index": 20,
+      "wave_release_ns": 9032421176,
+      "winner_completion_ns": 9097141685,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9097141685
+    },
+    {
+      "accepted_preadv_ms": 119.997597,
+      "attempts_alive_after_drain": 0,
+      "block_index": 41,
+      "cumulative_attempts_before_block": 41,
+      "cumulative_physical_bytes_before_block": 5502926848,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9032610798,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 119.805753,
+          "physical_syscall_ms": 119.805753,
+          "preadv_enter_ns": 9032613020,
+          "preadv_exit_ns": 9152418773,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 41,
+      "logical_race_start_ns": 9032421176,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5502926848,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9032610798,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 119.805753,
+          "physical_syscall_ms": 119.805753,
+          "preadv_enter_ns": 9032613020,
+          "preadv_exit_ns": 9152418773,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9032421176,
+      "race_width": 1,
+      "wave_index": 20,
+      "wave_release_ns": 9032421176,
+      "winner_completion_ns": 9152418773,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9152418773
+    },
+    {
+      "accepted_preadv_ms": 63.361544,
+      "attempts_alive_after_drain": 0,
+      "block_index": 42,
+      "cumulative_attempts_before_block": 42,
+      "cumulative_physical_bytes_before_block": 5637144576,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9390260728,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.21369,
+          "physical_syscall_ms": 63.21369,
+          "preadv_enter_ns": 9390261142,
+          "preadv_exit_ns": 9453474832,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 42,
+      "logical_race_start_ns": 9390113288,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5637144576,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9390260728,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.21369,
+          "physical_syscall_ms": 63.21369,
+          "preadv_enter_ns": 9390261142,
+          "preadv_exit_ns": 9453474832,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9390113288,
+      "race_width": 1,
+      "wave_index": 21,
+      "wave_release_ns": 9390113288,
+      "winner_completion_ns": 9453474832,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9453474832
+    },
+    {
+      "accepted_preadv_ms": 127.691898,
+      "attempts_alive_after_drain": 0,
+      "block_index": 43,
+      "cumulative_attempts_before_block": 43,
+      "cumulative_physical_bytes_before_block": 5771362304,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9390184706,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.6168,
+          "physical_syscall_ms": 127.6168,
+          "preadv_enter_ns": 9390188386,
+          "preadv_exit_ns": 9517805186,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 43,
+      "logical_race_start_ns": 9390113288,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5771362304,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9390184706,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 127.6168,
+          "physical_syscall_ms": 127.6168,
+          "preadv_enter_ns": 9390188386,
+          "preadv_exit_ns": 9517805186,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9390113288,
+      "race_width": 1,
+      "wave_index": 21,
+      "wave_release_ns": 9390113288,
+      "winner_completion_ns": 9517805186,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9517805186
+    },
+    {
+      "accepted_preadv_ms": 64.803252,
+      "attempts_alive_after_drain": 0,
+      "block_index": 44,
+      "cumulative_attempts_before_block": 44,
+      "cumulative_physical_bytes_before_block": 5905580032,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9755782949,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.660872,
+          "physical_syscall_ms": 64.660872,
+          "preadv_enter_ns": 9755783396,
+          "preadv_exit_ns": 9820444268,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 44,
+      "logical_race_start_ns": 9755641016,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 5905580032,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9755782949,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.660872,
+          "physical_syscall_ms": 64.660872,
+          "preadv_enter_ns": 9755783396,
+          "preadv_exit_ns": 9820444268,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9755641016,
+      "race_width": 1,
+      "wave_index": 22,
+      "wave_release_ns": 9755641016,
+      "winner_completion_ns": 9820444268,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9820444268
+    },
+    {
+      "accepted_preadv_ms": 122.412392,
+      "attempts_alive_after_drain": 0,
+      "block_index": 45,
+      "cumulative_attempts_before_block": 45,
+      "cumulative_physical_bytes_before_block": 6039797760,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 9755698542,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.352034,
+          "physical_syscall_ms": 122.352034,
+          "preadv_enter_ns": 9755701374,
+          "preadv_exit_ns": 9878053408,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 45,
+      "logical_race_start_ns": 9755641016,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6039797760,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 9755698542,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.352034,
+          "physical_syscall_ms": 122.352034,
+          "preadv_enter_ns": 9755701374,
+          "preadv_exit_ns": 9878053408,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 9755641016,
+      "race_width": 1,
+      "wave_index": 22,
+      "wave_release_ns": 9755641016,
+      "winner_completion_ns": 9878053408,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 9878053408
+    },
+    {
+      "accepted_preadv_ms": 64.667945,
+      "attempts_alive_after_drain": 0,
+      "block_index": 46,
+      "cumulative_attempts_before_block": 46,
+      "cumulative_physical_bytes_before_block": 6174015488,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10115336416,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.608242,
+          "physical_syscall_ms": 64.608242,
+          "preadv_enter_ns": 10115338024,
+          "preadv_exit_ns": 10179946266,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 46,
+      "logical_race_start_ns": 10115278321,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6174015488,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10115336416,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.608242,
+          "physical_syscall_ms": 64.608242,
+          "preadv_enter_ns": 10115338024,
+          "preadv_exit_ns": 10179946266,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10115278321,
+      "race_width": 1,
+      "wave_index": 23,
+      "wave_release_ns": 10115278321,
+      "winner_completion_ns": 10179946266,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10179946266
+    },
+    {
+      "accepted_preadv_ms": 131.133712,
+      "attempts_alive_after_drain": 0,
+      "block_index": 47,
+      "cumulative_attempts_before_block": 47,
+      "cumulative_physical_bytes_before_block": 6308233216,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10115412220,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 130.999487,
+          "physical_syscall_ms": 130.999487,
+          "preadv_enter_ns": 10115412546,
+          "preadv_exit_ns": 10246412033,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 47,
+      "logical_race_start_ns": 10115278321,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6308233216,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10115412220,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 130.999487,
+          "physical_syscall_ms": 130.999487,
+          "preadv_enter_ns": 10115412546,
+          "preadv_exit_ns": 10246412033,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10115278321,
+      "race_width": 1,
+      "wave_index": 23,
+      "wave_release_ns": 10115278321,
+      "winner_completion_ns": 10246412033,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10246412033
+    },
+    {
+      "accepted_preadv_ms": 66.316325,
+      "attempts_alive_after_drain": 0,
+      "block_index": 48,
+      "cumulative_attempts_before_block": 48,
+      "cumulative_physical_bytes_before_block": 6442450944,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10485160472,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.26097,
+          "physical_syscall_ms": 66.26097,
+          "preadv_enter_ns": 10485162451,
+          "preadv_exit_ns": 10551423421,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 48,
+      "logical_race_start_ns": 10485107096,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6442450944,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10485160472,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.26097,
+          "physical_syscall_ms": 66.26097,
+          "preadv_enter_ns": 10485162451,
+          "preadv_exit_ns": 10551423421,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10485107096,
+      "race_width": 1,
+      "wave_index": 24,
+      "wave_release_ns": 10485107096,
+      "winner_completion_ns": 10551423421,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10551423421
+    },
+    {
+      "accepted_preadv_ms": 128.48625,
+      "attempts_alive_after_drain": 0,
+      "block_index": 49,
+      "cumulative_attempts_before_block": 49,
+      "cumulative_physical_bytes_before_block": 6576668672,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10485240688,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.35133,
+          "physical_syscall_ms": 128.35133,
+          "preadv_enter_ns": 10485242016,
+          "preadv_exit_ns": 10613593346,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 49,
+      "logical_race_start_ns": 10485107096,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6576668672,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10485240688,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.35133,
+          "physical_syscall_ms": 128.35133,
+          "preadv_enter_ns": 10485242016,
+          "preadv_exit_ns": 10613593346,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10485107096,
+      "race_width": 1,
+      "wave_index": 24,
+      "wave_release_ns": 10485107096,
+      "winner_completion_ns": 10613593346,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10613593346
+    },
+    {
+      "accepted_preadv_ms": 64.406295,
+      "attempts_alive_after_drain": 0,
+      "block_index": 50,
+      "cumulative_attempts_before_block": 50,
+      "cumulative_physical_bytes_before_block": 6710886400,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10850766748,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.300122,
+          "physical_syscall_ms": 64.300122,
+          "preadv_enter_ns": 10850767425,
+          "preadv_exit_ns": 10915067547,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 50,
+      "logical_race_start_ns": 10850661252,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6710886400,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10850766748,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 64.300122,
+          "physical_syscall_ms": 64.300122,
+          "preadv_enter_ns": 10850767425,
+          "preadv_exit_ns": 10915067547,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10850661252,
+      "race_width": 1,
+      "wave_index": 25,
+      "wave_release_ns": 10850661252,
+      "winner_completion_ns": 10915067547,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10915067547
+    },
+    {
+      "accepted_preadv_ms": 120.518306,
+      "attempts_alive_after_drain": 0,
+      "block_index": 51,
+      "cumulative_attempts_before_block": 51,
+      "cumulative_physical_bytes_before_block": 6845104128,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 10850706740,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 120.470419,
+          "physical_syscall_ms": 120.470419,
+          "preadv_enter_ns": 10850709139,
+          "preadv_exit_ns": 10971179558,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 51,
+      "logical_race_start_ns": 10850661252,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6845104128,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 10850706740,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 120.470419,
+          "physical_syscall_ms": 120.470419,
+          "preadv_enter_ns": 10850709139,
+          "preadv_exit_ns": 10971179558,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 10850661252,
+      "race_width": 1,
+      "wave_index": 25,
+      "wave_release_ns": 10850661252,
+      "winner_completion_ns": 10971179558,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 10971179558
+    },
+    {
+      "accepted_preadv_ms": 62.2083,
+      "attempts_alive_after_drain": 0,
+      "block_index": 52,
+      "cumulative_attempts_before_block": 52,
+      "cumulative_physical_bytes_before_block": 6979321856,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11208907205,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 62.032568,
+          "physical_syscall_ms": 62.032568,
+          "preadv_enter_ns": 11208908556,
+          "preadv_exit_ns": 11270941124,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 52,
+      "logical_race_start_ns": 11208732824,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 6979321856,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11208907205,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 62.032568,
+          "physical_syscall_ms": 62.032568,
+          "preadv_enter_ns": 11208908556,
+          "preadv_exit_ns": 11270941124,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11208732824,
+      "race_width": 1,
+      "wave_index": 26,
+      "wave_release_ns": 11208732824,
+      "winner_completion_ns": 11270941124,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 11270941124
+    },
+    {
+      "accepted_preadv_ms": 120.567479,
+      "attempts_alive_after_drain": 0,
+      "block_index": 53,
+      "cumulative_attempts_before_block": 53,
+      "cumulative_physical_bytes_before_block": 7113539584,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11208788627,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 120.50916,
+          "physical_syscall_ms": 120.50916,
+          "preadv_enter_ns": 11208791143,
+          "preadv_exit_ns": 11329300303,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 53,
+      "logical_race_start_ns": 11208732824,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7113539584,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11208788627,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 120.50916,
+          "physical_syscall_ms": 120.50916,
+          "preadv_enter_ns": 11208791143,
+          "preadv_exit_ns": 11329300303,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11208732824,
+      "race_width": 1,
+      "wave_index": 26,
+      "wave_release_ns": 11208732824,
+      "winner_completion_ns": 11329300303,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 11329300303
+    },
+    {
+      "accepted_preadv_ms": 68.467359,
+      "attempts_alive_after_drain": 0,
+      "block_index": 54,
+      "cumulative_attempts_before_block": 54,
+      "cumulative_physical_bytes_before_block": 7247757312,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11564747654,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 68.292086,
+          "physical_syscall_ms": 68.292086,
+          "preadv_enter_ns": 11564748063,
+          "preadv_exit_ns": 11633040149,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 54,
+      "logical_race_start_ns": 11564572790,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7247757312,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11564747654,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 68.292086,
+          "physical_syscall_ms": 68.292086,
+          "preadv_enter_ns": 11564748063,
+          "preadv_exit_ns": 11633040149,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11564572790,
+      "race_width": 1,
+      "wave_index": 27,
+      "wave_release_ns": 11564572790,
+      "winner_completion_ns": 11633040149,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 11633040149
+    },
+    {
+      "accepted_preadv_ms": 128.520255,
+      "attempts_alive_after_drain": 0,
+      "block_index": 55,
+      "cumulative_attempts_before_block": 55,
+      "cumulative_physical_bytes_before_block": 7381975040,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11564618741,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.472621,
+          "physical_syscall_ms": 128.472621,
+          "preadv_enter_ns": 11564620424,
+          "preadv_exit_ns": 11693093045,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 55,
+      "logical_race_start_ns": 11564572790,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7381975040,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11564618741,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 128.472621,
+          "physical_syscall_ms": 128.472621,
+          "preadv_enter_ns": 11564620424,
+          "preadv_exit_ns": 11693093045,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11564572790,
+      "race_width": 1,
+      "wave_index": 27,
+      "wave_release_ns": 11564572790,
+      "winner_completion_ns": 11693093045,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 11693093045
+    },
+    {
+      "accepted_preadv_ms": 63.301657,
+      "attempts_alive_after_drain": 0,
+      "block_index": 56,
+      "cumulative_attempts_before_block": 56,
+      "cumulative_physical_bytes_before_block": 7516192768,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11929388602,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.207132,
+          "physical_syscall_ms": 63.207132,
+          "preadv_enter_ns": 11929388850,
+          "preadv_exit_ns": 11992595982,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 56,
+      "logical_race_start_ns": 11929294325,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7516192768,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11929388602,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 63.207132,
+          "physical_syscall_ms": 63.207132,
+          "preadv_enter_ns": 11929388850,
+          "preadv_exit_ns": 11992595982,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11929294325,
+      "race_width": 1,
+      "wave_index": 28,
+      "wave_release_ns": 11929294325,
+      "winner_completion_ns": 11992595982,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 11992595982
+    },
+    {
+      "accepted_preadv_ms": 122.657798,
+      "attempts_alive_after_drain": 0,
+      "block_index": 57,
+      "cumulative_attempts_before_block": 57,
+      "cumulative_physical_bytes_before_block": 7650410496,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 11929334145,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.616292,
+          "physical_syscall_ms": 122.616292,
+          "preadv_enter_ns": 11929335831,
+          "preadv_exit_ns": 12051952123,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 57,
+      "logical_race_start_ns": 11929294325,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7650410496,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 11929334145,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 122.616292,
+          "physical_syscall_ms": 122.616292,
+          "preadv_enter_ns": 11929335831,
+          "preadv_exit_ns": 12051952123,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 11929294325,
+      "race_width": 1,
+      "wave_index": 28,
+      "wave_release_ns": 11929294325,
+      "winner_completion_ns": 12051952123,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 12051952123
+    },
+    {
+      "accepted_preadv_ms": 66.814192,
+      "attempts_alive_after_drain": 0,
+      "block_index": 58,
+      "cumulative_attempts_before_block": 58,
+      "cumulative_physical_bytes_before_block": 7784628224,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 12291437850,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.759598,
+          "physical_syscall_ms": 66.759598,
+          "preadv_enter_ns": 12291439939,
+          "preadv_exit_ns": 12358199537,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 134217728,
+      "logical_index": 58,
+      "logical_race_start_ns": 12291385345,
+      "logical_slot_within_wave": 0,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7784628224,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 12291437850,
+          "bytes_read": 134217728,
+          "bytes_returned": 134217728,
+          "dest_buffer_id": 0,
+          "error": null,
+          "fd_id": 10,
+          "is_winner": true,
+          "lane": [
+            0,
+            0
+          ],
+          "logical_slot_within_wave": 0,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 66.759598,
+          "physical_syscall_ms": 66.759598,
+          "preadv_enter_ns": 12291439939,
+          "preadv_exit_ns": 12358199537,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 12291385345,
+      "race_width": 1,
+      "wave_index": 29,
+      "wave_release_ns": 12291385345,
+      "winner_completion_ns": 12358199537,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 12358199537
+    },
+    {
+      "accepted_preadv_ms": 123.706691,
+      "attempts_alive_after_drain": 0,
+      "block_index": 59,
+      "cumulative_attempts_before_block": 59,
+      "cumulative_physical_bytes_before_block": 7918845952,
+      "dispatch_skew_ms": 0.0,
+      "drain_wait_ms": 0.0,
+      "fd_mode": "independent",
+      "fighters": [
+        {
+          "attempt_submit_ns": 12291509685,
+          "bytes_read": 126136096,
+          "bytes_returned": 126136096,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 123.581954,
+          "physical_syscall_ms": 123.581954,
+          "preadv_enter_ns": 12291510082,
+          "preadv_exit_ns": 12415092036,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "file_identity": {
+        "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+        "size": 8044982048,
+        "st_dev": 31,
+        "st_ino": 4,
+        "st_mtime_ns": 1781316088009883330
+      },
+      "length": 126136096,
+      "logical_index": 59,
+      "logical_race_start_ns": 12291385345,
+      "logical_slot_within_wave": 1,
+      "loser_completion_ns": [],
+      "loser_completion_timestamps_ns": [],
+      "offset": 7918845952,
+      "physical_racers": [
+        {
+          "attempt_submit_ns": 12291509685,
+          "bytes_read": 126136096,
+          "bytes_returned": 126136096,
+          "dest_buffer_id": 1,
+          "error": null,
+          "fd_id": 11,
+          "is_winner": true,
+          "lane": [
+            1,
+            0
+          ],
+          "logical_slot_within_wave": 1,
+          "per_attempt_valid": true,
+          "physical_preadv_duration_ms": 123.581954,
+          "physical_syscall_ms": 123.581954,
+          "preadv_enter_ns": 12291510082,
+          "preadv_exit_ns": 12415092036,
+          "racer_index": 0,
+          "status": "ok",
+          "valid": true
+        }
+      ],
+      "race_start_ns": 12291385345,
+      "race_width": 1,
+      "wave_index": 29,
+      "wave_release_ns": 12291385345,
+      "winner_completion_ns": 12415092036,
+      "winner_racer_index": 0,
+      "winner_to_loser_end_delta_ms": [],
+      "winning_completion_timestamp_ns": 12415092036
+    }
+  ],
+  "config": {
+    "block_count": 60,
+    "expected_sha256": null,
+    "fd_count": 2,
+    "fd_mode": "independent",
+    "file_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+    "file_size": 8044982048,
+    "hash_mode": "winners_in_order",
+    "logical_qd": 2,
+    "max_physical_concurrency": 2,
+    "offset_start": 0,
+    "race_width": 1,
+    "read_bytes": 134217728,
+    "suitable_for_race_benchmarking": true,
+    "unsafe_shared_lseek": false
+  },
+  "container_session_id": "ta-01M33SEDQS85A2757XK08VW5FR",
+  "content_validation_mode": "no expected_sha256: whole-run byte correctness is separate and does not participate in winner selection",
+  "env": {
+    "oracle_imported_torch": false,
+    "platform": "Linux",
+    "preadv_available": true,
+    "syscall_impl": "os.preadv",
+    "torch_present_after": false,
+    "torch_present_before": false
+  },
+  "hostname": "modal",
+  "identity": {
+    "container_session_id": "ta-01M33SEDQS85A2757XK08VW5FR",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "hostname": "modal",
+    "image_id": "im-wjloyqG1wIWYj61AOQaJB9",
+    "observed_gpu": "NVIDIA H100 80GB HBM3",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-west4",
+    "requested_gpu": "h100!"
+  },
+  "image_id": "im-wjloyqG1wIWYj61AOQaJB9",
+  "integrity": {
+    "all_blocks_byte_exact": true,
+    "content_validation_mode": "no expected_sha256: whole-run byte correctness is separate and does not participate in winner selection",
+    "errors": [],
+    "expected_sha256": null,
+    "expected_sha256_match": null,
+    "reference_compare": "not_checked",
+    "sha256_checked": true,
+    "winner_selection_rule": "winner = earliest preadv_exit_ns among attempts with per_attempt_valid == True",
+    "winner_sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a"
+  },
+  "metric_definitions": {
+    "accepted_sum_ms": "sum of accepted_preadv_ms; this is not a wall figure",
+    "accepted_wave_wall_ms": "sum over waves of max(accepted_preadv_ms for blocks in that wave); winner completion gates each wave",
+    "dispatch_skew_ms": "max preadv_enter_ns minus min preadv_enter_ns within a block",
+    "percentiles": "linear interpolation between adjacent ordered ranks",
+    "total_wall_ms": "first wave release through the final physical syscall exit, including loser drain"
+  },
+  "model_name": "qwen_3_4b.safetensors",
+  "observed_gpu": "NVIDIA H100 80GB HBM3",
+  "physical": {
+    "count": 60,
+    "ge_100": 30,
+    "ge_1000": 0,
+    "ge_250": 0,
+    "ge_500": 0,
+    "loser_count": 0,
+    "loser_lifetime_max_ms": 0.0,
+    "loser_lifetime_mean_ms": 0.0,
+    "max_ms": 216.181815,
+    "mean_ms": 97.65404473333334,
+    "median_ms": 105.877008,
+    "p95_ms": 132.2559627
+  },
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "us-west4",
+  "requested_gpu": "h100!",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "schema_version": 2,
+  "status": "ok",
+  "wall": {
+    "accepted_wave_wall_ms": 3881.7244999999994,
+    "total_drain_wait_ms": 0.0,
+    "total_wall_ms": 10773.14043,
+    "winner_envelope_ms": 10773.14043
+  },
+  "waves": [
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        0,
+        1
+      ],
+      "wave_index": 0,
+      "wave_release_ns": 1641951606
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        2,
+        3
+      ],
+      "wave_index": 1,
+      "wave_release_ns": 2097156476
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        4,
+        5
+      ],
+      "wave_index": 2,
+      "wave_release_ns": 2466075741
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        6,
+        7
+      ],
+      "wave_index": 3,
+      "wave_release_ns": 2836460988
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        8,
+        9
+      ],
+      "wave_index": 4,
+      "wave_release_ns": 3203227326
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        10,
+        11
+      ],
+      "wave_index": 5,
+      "wave_release_ns": 3565260476
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        12,
+        13
+      ],
+      "wave_index": 6,
+      "wave_release_ns": 3929141715
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        14,
+        15
+      ],
+      "wave_index": 7,
+      "wave_release_ns": 4298458855
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        16,
+        17
+      ],
+      "wave_index": 8,
+      "wave_release_ns": 4666542640
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        18,
+        19
+      ],
+      "wave_index": 9,
+      "wave_release_ns": 5034975239
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        20,
+        21
+      ],
+      "wave_index": 10,
+      "wave_release_ns": 5397241262
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        22,
+        23
+      ],
+      "wave_index": 11,
+      "wave_release_ns": 5770491047
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        24,
+        25
+      ],
+      "wave_index": 12,
+      "wave_release_ns": 6135950040
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        26,
+        27
+      ],
+      "wave_index": 13,
+      "wave_release_ns": 6498468097
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        28,
+        29
+      ],
+      "wave_index": 14,
+      "wave_release_ns": 6862856837
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        30,
+        31
+      ],
+      "wave_index": 15,
+      "wave_release_ns": 7224203130
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        32,
+        33
+      ],
+      "wave_index": 16,
+      "wave_release_ns": 7582257044
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        34,
+        35
+      ],
+      "wave_index": 17,
+      "wave_release_ns": 7940797272
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        36,
+        37
+      ],
+      "wave_index": 18,
+      "wave_release_ns": 8311026615
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        38,
+        39
+      ],
+      "wave_index": 19,
+      "wave_release_ns": 8669637086
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        40,
+        41
+      ],
+      "wave_index": 20,
+      "wave_release_ns": 9032421176
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        42,
+        43
+      ],
+      "wave_index": 21,
+      "wave_release_ns": 9390113288
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        44,
+        45
+      ],
+      "wave_index": 22,
+      "wave_release_ns": 9755641016
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        46,
+        47
+      ],
+      "wave_index": 23,
+      "wave_release_ns": 10115278321
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        48,
+        49
+      ],
+      "wave_index": 24,
+      "wave_release_ns": 10485107096
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        50,
+        51
+      ],
+      "wave_index": 25,
+      "wave_release_ns": 10850661252
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        52,
+        53
+      ],
+      "wave_index": 26,
+      "wave_release_ns": 11208732824
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        54,
+        55
+      ],
+      "wave_index": 27,
+      "wave_release_ns": 11564572790
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        56,
+        57
+      ],
+      "wave_index": 28,
+      "wave_release_ns": 11929294325
+    },
+    {
+      "attempts_alive_after_drain": 0,
+      "block_indices": [
+        58,
+        59
+      ],
+      "wave_index": 29,
+      "wave_release_ns": 12291385345
+    }
+  ],
+  "winner_distribution": {
+    "racer_win_fraction": {
+      "0": 1.0
+    },
+    "wins_by_racer_index": {
+      "0": 60
+    }
+  },
+  "winner_selection_rule": "winner = earliest preadv_exit_ns among attempts with per_attempt_valid == True"
+}

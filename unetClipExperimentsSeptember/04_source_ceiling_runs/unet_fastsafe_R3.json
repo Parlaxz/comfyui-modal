@@ -1,0 +1,87 @@
+{
+  "FILE_TO_CUDA_WALL_MS": 2844.4027,
+  "arm": "fastsafe",
+  "attempt_id": "unet_fastsafe_R3",
+  "byte_validation": {
+    "checks": [
+      {
+        "bytes": 5120,
+        "device_sha16": "e85de8ae8bc8b5f4",
+        "key": "cap_embedder.0.weight",
+        "ok": true,
+        "source_sha16": "e85de8ae8bc8b5f4"
+      },
+      {
+        "bytes": 7680,
+        "device_sha16": "d6ca91fe9ba0d6c3",
+        "key": "cap_embedder.1.bias",
+        "ok": true,
+        "source_sha16": "d6ca91fe9ba0d6c3"
+      },
+      {
+        "bytes": 491520,
+        "device_sha16": "25947b6d973488f8",
+        "key": "x_embedder.weight",
+        "ok": true,
+        "source_sha16": "25947b6d973488f8"
+      },
+      {
+        "bytes": 7680,
+        "device_sha16": "fca93b5c36393136",
+        "key": "x_pad_token",
+        "ok": true,
+        "source_sha16": "fca93b5c36393136"
+      }
+    ],
+    "ok": true
+  },
+  "campaign_index": 15,
+  "classification": "ELIGIBLE",
+  "file_size_bytes": 12309866400,
+  "fixed_config": {
+    "bbuf_size_kb": 524288,
+    "disable_cache": true,
+    "loader": "fastsafetensors.SafeTensorsFileLoader",
+    "max_copy_block_size": 268435456,
+    "nogds": true,
+    "threads": 8,
+    "use_buf_register": false
+  },
+  "fixed_config_expected": {
+    "bbuf_size_kb": 524288,
+    "disable_cache": true,
+    "loader": "fastsafetensors.SafeTensorsFileLoader",
+    "max_copy_block_size": 268435456,
+    "nogds": true,
+    "threads": 8,
+    "use_buf_register": false
+  },
+  "identity": {
+    "container_session_id": "ta-01M1PHRFHQSAW125FK76GH9ETR",
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-v2C7hQYVNqlPjiTAGPuwOh",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1"
+  },
+  "model_construction": false,
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "oracle_wall_ms": 4219.4365,
+  "ownership": {
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 47168538804224
+  },
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_bytes": 12309817472,
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+  "role": "unet",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "status": "ok",
+  "tensor_count": 453,
+  "timing_scope": "copy_files_to_device entry -> required torch.cuda.synchronize return; header/add_filenames and post-ready validation excluded"
+}

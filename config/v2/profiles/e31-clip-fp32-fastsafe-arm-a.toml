@@ -1,0 +1,26 @@
+# v2ctl profile: E31 CLIP FP32 cast-once FASTSAFE ARM A (control).
+# Canonical E29 tracer workload; the E31 measurement gate is ON while
+# cast-once remains OFF.  ARM B differs only in the cast-once setting.
+schema_version = 1
+name = "e31-clip-fp32-fastsafe-arm-a"
+extends = "e29-tracer"
+owner = "E31"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# FASTSAFE control: explicitly keep the QD reader disabled.
+COMFYMODAL_V2_CLIP_QD_READER = "0"
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "1"
+# E31 evidence/timing gates: synchronized forensics, profiler disabled.
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+COMFYMODAL_V2_E31_FORENSICS = "1"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"

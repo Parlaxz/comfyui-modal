@@ -1,0 +1,1243 @@
+{
+  "generated_by": "tools/analysis/h100_vs_rtx_forensics.py",
+  "units": "milliseconds",
+  "source_evidence": {
+    "field": "golden_telemetry.stages[*].details.transport_stats.actual_source_events",
+    "roles": [
+      "clip",
+      "unet"
+    ]
+  },
+  "canonical_threshold_ms": 500,
+  "read_thresholds_ms": [
+    250,
+    500,
+    1000
+  ],
+  "definitions": {
+    "born_sick": "first read_seq with duration >= T is <= 1",
+    "becomes_sick": "first read_seq with duration >= T is > 1",
+    "never_sick": "no read reaches threshold T",
+    "episodes": "number of contiguous runs of reads with duration >= T",
+    "longest_episode": "longest such contiguous run",
+    "persistent_ends_sick": "single contiguous >=T block reaching the final read",
+    "contiguous_then_clear": "single contiguous >=T block clearing before the final read",
+    "single_episode": "exactly one isolated off->on->off crossing",
+    "alternating": "4+ transitions across the threshold",
+    "transient_recovery_500": "sick at 500 ms but the block clears before the final read",
+    "final_read_sick_500": "last read's duration >= 500 ms"
+  },
+  "per_role": {
+    "clip": {
+      "requests_with_reads": 11,
+      "onset_class_counts": {
+        "becomes_sick": 3,
+        "never_sick": 5,
+        "born_sick": 3
+      },
+      "recovery_class_counts": {
+        "alternating": 5,
+        "none": 5,
+        "single_episode": 1
+      },
+      "episode_request_counts": {
+        "0": 5,
+        "1": 1,
+        "2": 2,
+        "3": 2,
+        "9": 1
+      },
+      "transient_recovery_requests": 1,
+      "final_read_sick_requests": 0
+    },
+    "unet": {
+      "requests_with_reads": 11,
+      "onset_class_counts": {
+        "becomes_sick": 3,
+        "never_sick": 7,
+        "born_sick": 1
+      },
+      "recovery_class_counts": {
+        "alternating": 3,
+        "none": 7,
+        "single_episode": 1
+      },
+      "episode_request_counts": {
+        "0": 7,
+        "1": 1,
+        "2": 2,
+        "10": 1
+      },
+      "transient_recovery_requests": 1,
+      "final_read_sick_requests": 0
+    }
+  },
+  "per_request": [
+    {
+      "request_id": "golden-p1-0-a4f66843ed5b",
+      "cohort": "cohort_2026-09-17_17-22-42_f841d7",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 952.112678,
+          "thresholds": {
+            "250": {
+              "count_ge": 7,
+              "first_seq_ge": 0,
+              "last_seq_ge": 46,
+              "first_ms_ge": 358.86829,
+              "last_ms_ge": 270.467723,
+              "toggles": 13,
+              "episodes": 7,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.028807,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 2,
+              "first_seq_ge": 2,
+              "last_seq_ge": 25,
+              "first_ms_ge": 952.112678,
+              "last_ms_ge": 609.325158,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.00823,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 5.12781
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 634.663317,
+          "thresholds": {
+            "250": {
+              "count_ge": 4,
+              "first_seq_ge": 4,
+              "last_seq_ge": 43,
+              "first_ms_ge": 613.246805,
+              "last_ms_ge": 634.663317,
+              "toggles": 8,
+              "episodes": 4,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.010811,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 2,
+              "first_seq_ge": 4,
+              "last_seq_ge": 43,
+              "first_ms_ge": 613.246805,
+              "last_ms_ge": 634.663317,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.005405,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 1.205046
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-bd8ea2348bd5",
+      "cohort": "cohort_2026-09-17_17-24-49_79e86b",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 3927.614168,
+          "thresholds": {
+            "250": {
+              "count_ge": 16,
+              "first_seq_ge": 4,
+              "last_seq_ge": 175,
+              "first_ms_ge": 273.527521,
+              "last_ms_ge": 1103.806819,
+              "toggles": 26,
+              "episodes": 13,
+              "longest_episode": 2,
+              "final_read_sick": false,
+              "fraction_ge": 0.065844,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 9,
+              "first_seq_ge": 5,
+              "last_seq_ge": 175,
+              "first_ms_ge": 803.7952,
+              "last_ms_ge": 1103.806819,
+              "toggles": 18,
+              "episodes": 9,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.037037,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 4,
+              "first_seq_ge": 82,
+              "last_seq_ge": 175,
+              "first_ms_ge": 3927.614168,
+              "last_ms_ge": 1103.806819,
+              "toggles": 8,
+              "episodes": 4,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.016461,
+              "recovered_before_final": true
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.43559
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 51.583691,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 2.862762
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-a157324ed1d0",
+      "cohort": "cohort_2026-09-17_17-25-28_068779",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 42.243899,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 9.060427
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 45.325453,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.235718
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-4a3a9df54ab7",
+      "cohort": "cohort_2026-09-17_17-26-51_c00a60",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 48.413332,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.424664
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 42.786317,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 1.694133
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-94a52e483709",
+      "cohort": "cohort_2026-09-17_17-27-27_4437e0",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 43.665129,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 7.293344
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 3101.366111,
+          "thresholds": {
+            "250": {
+              "count_ge": 13,
+              "first_seq_ge": 5,
+              "last_seq_ge": 357,
+              "first_ms_ge": 3101.366111,
+              "last_ms_ge": 425.088266,
+              "toggles": 26,
+              "episodes": 13,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.035135,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 10,
+              "first_seq_ge": 5,
+              "last_seq_ge": 342,
+              "first_ms_ge": 3101.366111,
+              "last_ms_ge": 564.001743,
+              "toggles": 20,
+              "episodes": 10,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.027027,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 7,
+              "first_seq_ge": 5,
+              "last_seq_ge": 326,
+              "first_ms_ge": 3101.366111,
+              "last_ms_ge": 1450.138792,
+              "toggles": 14,
+              "episodes": 7,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.018919,
+              "recovered_before_final": true
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 7.168507
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-f98520a50bf1",
+      "cohort": "cohort_2026-09-17_17-29-27_62f388",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 881.902494,
+          "thresholds": {
+            "250": {
+              "count_ge": 4,
+              "first_seq_ge": 1,
+              "last_seq_ge": 241,
+              "first_ms_ge": 549.334867,
+              "last_ms_ge": 881.902494,
+              "toggles": 6,
+              "episodes": 3,
+              "longest_episode": 2,
+              "final_read_sick": false,
+              "fraction_ge": 0.016461,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 2,
+              "first_seq_ge": 1,
+              "last_seq_ge": 241,
+              "first_ms_ge": 549.334867,
+              "last_ms_ge": 881.902494,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.00823,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "born_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.954128
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 379.354651,
+          "thresholds": {
+            "250": {
+              "count_ge": 3,
+              "first_seq_ge": 2,
+              "last_seq_ge": 5,
+              "first_ms_ge": 252.486279,
+              "last_ms_ge": 280.282591,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 2,
+              "final_read_sick": false,
+              "fraction_ge": 0.008108,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.658522
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-2a264d69ee85",
+      "cohort": "cohort_2026-09-17_17-32-08_73af00",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 48.5173,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 7.798374
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 200.719574,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 1.561089
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-207a82424ea6",
+      "cohort": "cohort_2026-09-17_17-33-19_10d7a0",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 38.058561,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 5.963059
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 52.292365,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 1.120107
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-5ad28bce7dd5",
+      "cohort": "cohort_2026-09-17_17-33-58_b08572",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 713.415857,
+          "thresholds": {
+            "250": {
+              "count_ge": 3,
+              "first_seq_ge": 1,
+              "last_seq_ge": 3,
+              "first_ms_ge": 698.437131,
+              "last_ms_ge": 713.415857,
+              "toggles": 2,
+              "episodes": 1,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.012346,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 3,
+              "first_seq_ge": 1,
+              "last_seq_ge": 3,
+              "first_ms_ge": 698.437131,
+              "last_ms_ge": 713.415857,
+              "toggles": 2,
+              "episodes": 1,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.012346,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "born_sick",
+          "recovery_class_500": "single_episode",
+          "transient_recovery_500": true,
+          "final_read_sick_500": false,
+          "final_read_ms": 5.640628
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 542.450588,
+          "thresholds": {
+            "250": {
+              "count_ge": 2,
+              "first_seq_ge": 4,
+              "last_seq_ge": 7,
+              "first_ms_ge": 542.450588,
+              "last_ms_ge": 318.447763,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.005405,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 1,
+              "first_seq_ge": 4,
+              "last_seq_ge": 4,
+              "first_ms_ge": 542.450588,
+              "last_ms_ge": 542.450588,
+              "toggles": 2,
+              "episodes": 1,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.002703,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "single_episode",
+          "transient_recovery_500": true,
+          "final_read_sick_500": false,
+          "final_read_ms": 5.157592
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-65b7ddf18846",
+      "cohort": "cohort_2026-09-17_17-34-33_7a773e",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 1676.447822,
+          "thresholds": {
+            "250": {
+              "count_ge": 7,
+              "first_seq_ge": 2,
+              "last_seq_ge": 62,
+              "first_ms_ge": 338.28174,
+              "last_ms_ge": 626.494248,
+              "toggles": 12,
+              "episodes": 6,
+              "longest_episode": 2,
+              "final_read_sick": false,
+              "fraction_ge": 0.028807,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 3,
+              "first_seq_ge": 5,
+              "last_seq_ge": 62,
+              "first_ms_ge": 835.492663,
+              "last_ms_ge": 626.494248,
+              "toggles": 6,
+              "episodes": 3,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.012346,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 1,
+              "first_seq_ge": 43,
+              "last_seq_ge": 43,
+              "first_ms_ge": 1676.447822,
+              "last_ms_ge": 1676.447822,
+              "toggles": 2,
+              "episodes": 1,
+              "longest_episode": 1,
+              "final_read_sick": false,
+              "fraction_ge": 0.004115,
+              "recovered_before_final": true
+            }
+          },
+          "onset_class_500": "becomes_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.738386
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 122.85429,
+          "thresholds": {
+            "250": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "500": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "never_sick",
+          "recovery_class_500": "none",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 10.116016
+        }
+      }
+    },
+    {
+      "request_id": "golden-p1-0-bf1abb3bd594",
+      "cohort": "cohort_2026-09-17_17-35-08_fe21e2",
+      "roles": {
+        "clip": {
+          "read_count": 243,
+          "max_ms": 3352.619289,
+          "thresholds": {
+            "250": {
+              "count_ge": 6,
+              "first_seq_ge": 1,
+              "last_seq_ge": 8,
+              "first_ms_ge": 652.642707,
+              "last_ms_ge": 2425.167928,
+              "toggles": 6,
+              "episodes": 3,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.024691,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 6,
+              "first_seq_ge": 1,
+              "last_seq_ge": 8,
+              "first_ms_ge": 652.642707,
+              "last_ms_ge": 2425.167928,
+              "toggles": 6,
+              "episodes": 3,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.024691,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 4,
+              "first_seq_ge": 4,
+              "last_seq_ge": 8,
+              "first_ms_ge": 3352.619289,
+              "last_ms_ge": 2425.167928,
+              "toggles": 4,
+              "episodes": 2,
+              "longest_episode": 2,
+              "final_read_sick": false,
+              "fraction_ge": 0.016461,
+              "recovered_before_final": true
+            }
+          },
+          "onset_class_500": "born_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 6.627797
+        },
+        "unet": {
+          "read_count": 370,
+          "max_ms": 650.526873,
+          "thresholds": {
+            "250": {
+              "count_ge": 5,
+              "first_seq_ge": 0,
+              "last_seq_ge": 79,
+              "first_ms_ge": 632.489241,
+              "last_ms_ge": 454.679595,
+              "toggles": 5,
+              "episodes": 3,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.013514,
+              "recovered_before_final": true
+            },
+            "500": {
+              "count_ge": 4,
+              "first_seq_ge": 0,
+              "last_seq_ge": 8,
+              "first_ms_ge": 632.489241,
+              "last_ms_ge": 650.526873,
+              "toggles": 3,
+              "episodes": 2,
+              "longest_episode": 3,
+              "final_read_sick": false,
+              "fraction_ge": 0.010811,
+              "recovered_before_final": true
+            },
+            "1000": {
+              "count_ge": 0,
+              "first_seq_ge": null,
+              "last_seq_ge": null,
+              "first_ms_ge": null,
+              "last_ms_ge": null,
+              "toggles": 0,
+              "episodes": 0,
+              "longest_episode": 0,
+              "final_read_sick": false,
+              "fraction_ge": 0.0,
+              "recovered_before_final": false
+            }
+          },
+          "onset_class_500": "born_sick",
+          "recovery_class_500": "alternating",
+          "transient_recovery_500": false,
+          "final_read_sick_500": false,
+          "final_read_ms": 7.751416
+        }
+      }
+    }
+  ]
+}

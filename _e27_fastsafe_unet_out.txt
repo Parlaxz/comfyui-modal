@@ -1,0 +1,1400 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "probe": "fastsafe_screen",
+ "path": "/root/comfy/ComfyUI/models/diffusion_models/z_image_turbo_bf16.safetensors",
+ "device": "cuda:0",
+ "status": "ok",
+ "file_size_bytes": 12309866400,
+ "cells": [
+  {
+   "index": 0,
+   "label": "CONTROL T16/B1GiB",
+   "threads": 16,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": true,
+   "first_payload_access": true,
+   "cell_wall_ms": 5034.529,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 4287.378,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 2.8712,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12310282240,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 5034.467,
+    "cpu_wall_ms": 22490.0
+   }
+  },
+  {
+   "index": 1,
+   "label": "T4/B32MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 935.419,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 881.23,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 13.969,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 935.359,
+    "cpu_wall_ms": 1690.0
+   }
+  },
+  {
+   "index": 2,
+   "label": "T4/B64MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 890.853,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 844.36,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 14.5789,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 890.8,
+    "cpu_wall_ms": 1390.0
+   }
+  },
+  {
+   "index": 3,
+   "label": "T4/B128MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 870.99,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 827.014,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 14.8847,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 870.939,
+    "cpu_wall_ms": 1460.0
+   }
+  },
+  {
+   "index": 4,
+   "label": "T4/B256MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 903.929,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 839.888,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 14.6566,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 903.888,
+    "cpu_wall_ms": 1550.0
+   }
+  },
+  {
+   "index": 5,
+   "label": "T4/B1024MiB",
+   "threads": 4,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 837.555,
+   "metrics": {
+    "threads": 4,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 792.67,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 15.5296,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 837.501,
+    "cpu_wall_ms": 1220.0
+   }
+  },
+  {
+   "index": 6,
+   "label": "T8/B32MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 785.281,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 740.017,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 16.6346,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 785.237,
+    "cpu_wall_ms": 1880.0
+   }
+  },
+  {
+   "index": 7,
+   "label": "T8/B64MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 763.39,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 706.89,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 17.4141,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 763.349,
+    "cpu_wall_ms": 1690.0
+   }
+  },
+  {
+   "index": 8,
+   "label": "T8/B128MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 748.249,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 706.902,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 17.4138,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 748.192,
+    "cpu_wall_ms": 1700.0
+   }
+  },
+  {
+   "index": 9,
+   "label": "T8/B256MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 743.712,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 699.357,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 17.6017,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 743.661,
+    "cpu_wall_ms": 1500.0
+   }
+  },
+  {
+   "index": 10,
+   "label": "T8/B1024MiB",
+   "threads": 8,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 820.179,
+   "metrics": {
+    "threads": 8,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 777.126,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 15.8402,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 820.135,
+    "cpu_wall_ms": 1420.0
+   }
+  },
+  {
+   "index": 11,
+   "label": "T16/B32MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 33554432,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 877.698,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 33554432,
+    "status": "ok",
+    "copy_files_to_device_ms": 833.96,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 14.7607,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 877.51,
+    "cpu_wall_ms": 2120.0
+   }
+  },
+  {
+   "index": 12,
+   "label": "T16/B64MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 67108864,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 861.17,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 67108864,
+    "status": "ok",
+    "copy_files_to_device_ms": 816.109,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 15.0836,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 861.099,
+    "cpu_wall_ms": 1990.0
+   }
+  },
+  {
+   "index": 13,
+   "label": "T16/B128MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 134217728,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 857.128,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 134217728,
+    "status": "ok",
+    "copy_files_to_device_ms": 812.854,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 15.144,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 857.083,
+    "cpu_wall_ms": 1860.0
+   }
+  },
+  {
+   "index": 14,
+   "label": "T16/B256MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 268435456,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 848.223,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 268435456,
+    "status": "ok",
+    "copy_files_to_device_ms": 803.146,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 15.3271,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 848.162,
+    "cpu_wall_ms": 1970.0
+   }
+  },
+  {
+   "index": 15,
+   "label": "T16/B1024MiB",
+   "threads": 16,
+   "max_copy_block_bytes": 1073741824,
+   "is_control": false,
+   "first_payload_access": false,
+   "cell_wall_ms": 871.667,
+   "metrics": {
+    "threads": 16,
+    "max_copy_block_bytes": 1073741824,
+    "status": "ok",
+    "copy_files_to_device_ms": 827.72,
+    "tensor_count": 453,
+    "file_size_bytes": 12309866400,
+    "effective_file_gbps": 14.872,
+    "cuda_allocated_delta": 0,
+    "cuda_reserved_delta": 0,
+    "cuda_allocated_after": 12310282240,
+    "cuda_reserved_after": 12352225280,
+    "device": "cuda:0",
+    "first_key": "cap_embedder.0.weight",
+    "first_key_data_ptr": 46963588333568,
+    "first_key_storage_data_ptr": 46963588333568,
+    "first_key_shape": [
+     2560
+    ],
+    "first_key_dtype": "torch.bfloat16",
+    "spot_checks": [
+     {
+      "rel_start": 0,
+      "bytes": 262144,
+      "source_sha16": "b99b013d7479c734"
+     },
+     {
+      "rel_start": 3077454368,
+      "bytes": 262144,
+      "source_sha16": "c17dcd692f647f27"
+     },
+     {
+      "rel_start": 6154908736,
+      "bytes": 262144,
+      "source_sha16": "1e2d064124dd7077"
+     },
+     {
+      "rel_start": 9232363104,
+      "bytes": 262144,
+      "source_sha16": "4aca1f19ac37e3dd"
+     },
+     {
+      "rel_start": 12309555328,
+      "bytes": 262144,
+      "source_sha16": "517fa42c9183e87f"
+     }
+    ],
+    "device_sample_checks": [
+     {
+      "key": "cap_embedder.0.weight",
+      "bytes": 5120,
+      "device_sha16": "680a5e057799e755",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.bias",
+      "bytes": 7680,
+      "device_sha16": "e322c00020301792",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_embedder.1.weight",
+      "bytes": 19660800,
+      "device_sha16": "fde710fd803a87fc",
+      "dtype": "torch.bfloat16"
+     },
+     {
+      "key": "cap_pad_token",
+      "bytes": 7680,
+      "device_sha16": "5b3b9a1e27701480",
+      "dtype": "torch.bfloat16"
+     }
+    ],
+    "spot_checks_ok": true,
+    "total_wall_ms": 871.617,
+    "cpu_wall_ms": 1840.0
+   }
+  }
+ ],
+ "first_touch": false,
+ "container_session_id": "",
+ "cuda_available": true,
+ "cuda_device_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+ "gpu_total_bytes": 101974081536,
+ "gpu_free_bytes_before": 101388779520,
+ "first_touch_cell_index": 0,
+ "kind": "fastsafe_screen",
+ "model_name": "z_image_turbo_bf16.safetensors",
+ "resolved_path": "/root/comfy/ComfyUI/models/diffusion_models/z_image_turbo_bf16.safetensors",
+ "waterfall": {
+  "status": "non_applicable",
+  "method": "run_e27_followup_probe"
+ }
+}

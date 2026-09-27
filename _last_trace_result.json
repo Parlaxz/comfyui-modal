@@ -1,0 +1,128 @@
+{
+    "prompt_id":  "494de919-71b9-40f5-9cf2-c7ca8e23b201",
+    "t0":  1780981438.726,
+    "trace_version":  "2.0.0",
+    "stages":  {
+                   "t0_client_press":  1780981438.726,
+                   "t1_local_recv":  1781032704.613215,
+                   "t2_local_dispatch":  1781032704.6183186,
+                   "t3_modal_entry":  1781032736.640205,
+                   "t3d_prompt_start":  1781032737.6827605,
+                   "t3b_validate_done":  1781032738.83851,
+                   "t3c_prep_done":  1781032738.8385684,
+                   "t3e_execution_start":  1781032738.8390992,
+                   "t4b_unet_load_start":  1781032745.245695,
+                   "t4b_unet_load_end":  1781032745.2475924,
+                   "t4_clip_load_start":  1781032738.8732145,
+                   "t4_clip_load_end":  1781032743.2222803,
+                   "t4c_vae_load_start":  1781032738.8706331,
+                   "t4c_vae_load_end":  1781032738.8723795,
+                   "t5_text_encode_start":  1781032743.2222803,
+                   "t5_text_encode_end":  1781032745.2359896,
+                   "t6_sampler_start":  1781032748.1815395,
+                   "t6_sampler_end":  1781032755.7972672,
+                   "t6_sampler_progress_start":  1781032748.1815395,
+                   "t6_sampler_progress_end":  1781032755.7972672,
+                   "t7_vae_decode_start":  1781032756.565734,
+                   "t7_vae_decode_end":  1781032757.066758,
+                   "t8_cachedit_start":  1781032745.2567122,
+                   "t8_cachedit_end":  1781032745.2574227,
+                   "t8_noise_inject_start":  1781032745.270424,
+                   "t8_noise_inject_end":  1781032745.2715075,
+                   "t8_image_written":  1781032757.326011,
+                   "t7b_collect_start":  1781032758.3597088,
+                   "t8b_outputs_collected":  1781032758.9555166,
+                   "t9_modal_return":  1781032758.955526,
+                   "t10_local_materialized":  1781032759.681554
+               },
+    "deltas_ms":  {
+                      "t0_to_t1":  51265887.21,
+                      "t1_to_t2":  5.1,
+                      "t2_to_t3":  32021.89,
+                      "t3_to_t3b":  2198.31,
+                      "t3b_to_t3c":  0.06,
+                      "clip_load":  4349.07,
+                      "clip_encode":  2013.71,
+                      "sampler":  7615.73,
+                      "vae_decode":  501.02,
+                      "unet_load":  1.9,
+                      "vae_load":  1.75,
+                      "image_io":  1629.51,
+                      "t8b_to_t9":  0.01,
+                      "t9_to_t10":  726.03,
+                      "inference_total":  14483.18,
+                      "t3b_to_t8":  18487.5,
+                      "graph_overhead":  4004.32,
+                      "modal_to_browser":  55063.24,
+                      "modal_to_return":  54337.21,
+                      "remote_total":  22315.32
+                  },
+    "derived_ms":  {
+                       "sampler_prep_ms":  0.0,
+                       "sampler_denoise_ms":  7615.73,
+                       "sampler_teardown_ms":  0.0,
+                       "prompt_start_to_sampler_start_ms":  10498.78,
+                       "sampler_ms":  7615.73,
+                       "sampler_end_to_outputs_collected_ms":  3158.25,
+                       "output_collection_total_ms":  595.81,
+                       "total_input_execution_ms":  21272.77,
+                       "modal_to_return_ms":  54337.21,
+                       "modal_to_browser_ms":  55063.24,
+                       "modal_entry_to_prompt_start_ms":  1042.56,
+                       "clip_node_wait_ms":  4349.07,
+                       "unet_node_wait_ms":  1.9,
+                       "vae_node_wait_ms":  1.75
+                   },
+    "missing_timing_fields":  [
+
+                              ],
+    "timing_quality":  "complete",
+    "timing_quality_reason":  "all_required_fields_present",
+    "restore":  {
+                    "restore_total_ms":  845.0,
+                    "restore_start_unix_s":  1781032735.6829755,
+                    "restore_end_unix_s":  1781032736.5279543,
+                    "warmup_status":  "ok",
+                    "warmup_profile":  {
+
+                                       },
+                    "warmup_profile_source":  "none",
+                    "warmup_profile_token":  "",
+                    "ensure_models_ms":  0.1,
+                    "volume_mount_wait_ms":  212.0,
+                    "custom_nodes_sync_ms":  99.9,
+                    "custom_nodes_created":  0,
+                    "preload_mode":  "off",
+                    "preload_mode_source":  "env_var",
+                    "disable_cachedit":  0,
+                    "early_path_resolve_ms":  0.8,
+                    "gpu_state_ms":  303.4,
+                    "cuda_warmup_ms":  200.1,
+                    "clip_cache_clear_requested":  0,
+                    "clip_cache_size_at_start":  0,
+                    "sage_runtime_ms":  18.1,
+                    "sage_mode":  "baked_cuda",
+                    "sage_reason":  "runtime_override",
+                    "sage_env_mode":  "baked_cuda",
+                    "sage_probe_on_restore":  0,
+                    "preload_skipped":  1,
+                    "preload_skip_reason":  "unknown_profile",
+                    "warmup_preload_ms":  0.0,
+                    "clip_cache_size_after_warmup":  0,
+                    "cpu_cache_hits":  {
+
+                                       },
+                    "cpu_cache_misses":  {
+
+                                         },
+                    "gpu_cache_eq":  {
+
+                                     },
+                    "clip_cache":  {
+                                       "size":  0,
+                                       "keys":  [
+
+                                                ]
+                                   }
+                }
+}

@@ -1,0 +1,205 @@
+[cf] start cf-c0-r01 gap_ms=0.0
+[cf] done cf-c0-r01 gpu=NVIDIA H100 80GB HBM3 region=chicago gbps=6.198021063837844 worst=117.767162 ge250=0 obs_min=0.042569 ovl=0.9833333333333333 conc=3.7758337204973644
+[cf] start cf-c2-r01 gap_ms=2.0
+[cf] done cf-c2-r01 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=2.0566202195170966 worst=2091.519351 ge250=4 obs_min=2.032321 ovl=0.8333333333333334 conc=2.436477261013697
+[cf] start cf-c4-r01 gap_ms=4.0
+[cf] done cf-c4-r01 gpu=NVIDIA H100 80GB HBM3 region=chicago gbps=6.766010993995952 worst=86.442478 ge250=0 obs_min=4.046257 ovl=0.9916666666666667 conc=3.676741360255863
+[cf] start cf-c2-r02 gap_ms=2.0
+[cf] done cf-c2-r02 gpu=NVIDIA H100 80GB HBM3 region=odin gbps=6.373590396232595 worst=110.535733 ge250=0 obs_min=2.045028 ovl=0.975 conc=3.7129209809523047
+[cf] start cf-c4-r02 gap_ms=4.0
+[cf] done cf-c4-r02 gpu=NVIDIA H100 80GB HBM3 region=us-west4 gbps=5.111006842527041 worst=122.330846 ge250=0 obs_min=3.999197 ovl=0.975 conc=3.617073416619031
+[cf] start cf-c0-r02 gap_ms=0.0
+[cf] done cf-c0-r02 gpu=NVIDIA H100 80GB HBM3 region=chicago gbps=6.484688084154722 worst=117.167321 ge250=0 obs_min=0.059749 ovl=0.9916666666666667 conc=3.8662903978127634
+[cf] start cf-c4-r03 gap_ms=4.0
+[cf] done cf-c4-r03 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=6.229151742753028 worst=95.112973 ge250=0 obs_min=4.059065 ovl=0.9833333333333333 conc=3.6501575426451485
+[cf] start cf-c0-r03 gap_ms=0.0
+[cf] done cf-c0-r03 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=4.037242998893776 worst=224.684957 ge250=0 obs_min=0.008631 ovl=0.9916666666666667 conc=3.9258008488421456
+[cf] start cf-c2-r03 gap_ms=2.0
+[cf] done cf-c2-r03 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.015488281943822 worst=140.392045 ge250=0 obs_min=2.027426 ovl=0.975 conc=3.6058917045510865
+[cf] start cf-c0-r04 gap_ms=0.0
+[cf] done cf-c0-r04 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.241318308052679 worst=248.171866 ge250=0 obs_min=0.019413 ovl=0.9833333333333333 conc=3.8200775592403766
+[cf] start cf-c2-r04 gap_ms=2.0
+[cf] done cf-c2-r04 gpu=NVIDIA H100 80GB HBM3 region=denver gbps=4.825851494738133 worst=111.812689 ge250=0 obs_min=2.037467 ovl=0.9916666666666667 conc=3.786818514083393
+[cf] start cf-c4-r04 gap_ms=4.0
+[cf] done cf-c4-r04 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.330773693959718 worst=144.423989 ge250=0 obs_min=4.055368 ovl=0.9833333333333333 conc=3.666072757074382
+[cf] start cf-c2-r05 gap_ms=2.0
+[cf] done cf-c2-r05 gpu=NVIDIA H100 80GB HBM3 region=ap-south gbps=1.9714389626557036 worst=2626.783435 ge250=2 obs_min=2.138577 ovl=0.9833333333333333 conc=2.651942261613643
+[cf] start cf-c4-r05 gap_ms=4.0
+[cf] done cf-c4-r05 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=5.793266352890515 worst=119.438917 ge250=0 obs_min=4.004162 ovl=0.9666666666666667 conc=3.563580831439186
+[cf] start cf-c0-r05 gap_ms=0.0
+[cf] done cf-c0-r05 gpu=NVIDIA H100 80GB HBM3 region=CANADA-2 gbps=5.960363052724823 worst=213.129524 ge250=0 obs_min=0.014724 ovl=0.975 conc=3.875235261037068
+[cf] start cf-c4-r06 gap_ms=4.0
+[cf] done cf-c4-r06 gpu=NVIDIA H100 80GB HBM3 region=chicago gbps=6.567568196492529 worst=86.042682 ge250=0 obs_min=4.026013 ovl=0.975 conc=3.658069190219247
+[cf] start cf-c0-r06 gap_ms=0.0
+[cf] done cf-c0-r06 gpu=NVIDIA H100 80GB HBM3 region=CANADA-2 gbps=2.2484730388481493 worst=2262.712934 ge250=7 obs_min=0.009646 ovl=0.9333333333333333 conc=3.8169804801763543
+[cf] start cf-c2-r06 gap_ms=2.0
+[cf] done cf-c2-r06 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=4.02005866539418 worst=640.123417 ge250=2 obs_min=2.043389 ovl=0.9833333333333333 conc=3.2590421401283836
+[cf] start cf-c0-r07 gap_ms=0.0
+[cf] done cf-c0-r07 gpu=NVIDIA H100 80GB HBM3 region=chicago gbps=5.848363587141975 worst=105.149661 ge250=0 obs_min=0.018232 ovl=0.9916666666666667 conc=3.764586905422917
+[cf] start cf-c2-r07 gap_ms=2.0
+[cf] done cf-c2-r07 gpu=NVIDIA H100 80GB HBM3 region=eu-north gbps=4.459913981932161 worst=202.277068 ge250=0 obs_min=2.036605 ovl=0.9583333333333334 conc=3.432103288862442
+[cf] start cf-c4-r07 gap_ms=4.0
+[cf] done cf-c4-r07 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=2.9801732873985447 worst=318.615801 ge250=4 obs_min=4.043975 ovl=0.975 conc=3.6846040202633286
+[cf] start cf-c2-r08 gap_ms=2.0
+[cf] done cf-c2-r08 gpu=NVIDIA H100 80GB HBM3 region=us-east4 gbps=5.199573555942433 worst=151.643345 ge250=0 obs_min=2.070334 ovl=0.9833333333333333 conc=3.738872820382617
+[cf] start cf-c4-r08 gap_ms=4.0
+[cf] done cf-c4-r08 gpu=NVIDIA H100 80GB HBM3 region=ca gbps=5.508083674792835 worst=135.640775 ge250=0 obs_min=4.074397 ovl=0.9833333333333333 conc=3.6473971546944033
+[cf] start cf-c0-r08 gap_ms=0.0
+[cf] done cf-c0-r08 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=4.423891671313083 worst=313.055574 ge250=1 obs_min=0.028317 ovl=0.9916666666666667 conc=3.8731265069784153
+[cf] start cf-c4-r09 gap_ms=4.0
+[cf] done cf-c4-r09 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.69720418594928 worst=109.696517 ge250=0 obs_min=4.03756 ovl=0.9916666666666667 conc=3.669254523637311
+[cf] start cf-c0-r09 gap_ms=0.0
+[cf] done cf-c0-r09 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=5.019616165910534 worst=294.490974 ge250=1 obs_min=0.0148 ovl=0.9833333333333333 conc=3.82159159674072
+[cf] start cf-c2-r09 gap_ms=2.0
+[cf] done cf-c2-r09 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.30159789007874 worst=117.080984 ge250=0 obs_min=2.021809 ovl=0.9916666666666667 conc=3.769245496842523
+[cf] start cf-c0-r10 gap_ms=0.0
+[cf] done cf-c0-r10 gpu=NVIDIA H100 80GB HBM3 region=CANADA-2 gbps=6.281528290014215 worst=119.753064 ge250=0 obs_min=0.012386 ovl=0.9916666666666667 conc=3.815406323664479
+[cf] start cf-c2-r10 gap_ms=2.0
+[cf] done cf-c2-r10 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=4.953570964250631 worst=242.073673 ge250=0 obs_min=2.000551 ovl=0.9916666666666667 conc=3.5396834115426863
+[cf] start cf-c4-r10 gap_ms=4.0
+[cf] done cf-c4-r10 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=3.218717053711848 worst=161.48726 ge250=0 obs_min=4.020807 ovl=0.9916666666666667 conc=3.8212981599993467
+[cf] start cf-c2-r11 gap_ms=2.0
+[cf] done cf-c2-r11 gpu=NVIDIA H100 80GB HBM3 region=denver gbps=4.302704688341781 worst=167.565004 ge250=0 obs_min=2.107017 ovl=0.9833333333333333 conc=3.682905634886512
+[cf] start cf-c4-r11 gap_ms=4.0
+[cf] done cf-c4-r11 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=3.394886055370517 worst=166.722542 ge250=0 obs_min=4.066404 ovl=0.975 conc=3.616573875854305
+[cf] start cf-c0-r11 gap_ms=0.0
+[cf] done cf-c0-r11 gpu=NVIDIA H100 80GB HBM3 region=us-west4 gbps=4.977326093346282 worst=246.849537 ge250=0 obs_min=0.016877 ovl=0.9916666666666667 conc=3.8994631105055566
+[cf] start cf-c4-r12 gap_ms=4.0
+[cf] done cf-c4-r12 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=4.3211999906227865 worst=204.258893 ge250=0 obs_min=4.051729 ovl=0.9833333333333333 conc=3.5812886160272837
+[cf] start cf-c0-r12 gap_ms=0.0
+[cf] done cf-c0-r12 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=3.8976167729971682 worst=192.108963 ge250=0 obs_min=0.02126 ovl=0.9666666666666667 conc=3.8622874249481693
+[cf] start cf-c2-r12 gap_ms=2.0
+[cf] done cf-c2-r12 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.131280335912411 worst=119.976889 ge250=0 obs_min=2.04753 ovl=0.9916666666666667 conc=3.740567339410698
+[cf] start cf-c0-r13 gap_ms=0.0
+[cf] done cf-c0-r13 gpu=NVIDIA H100 80GB HBM3 region=us-east gbps=3.1232281141017464 worst=277.203199 ge250=1 obs_min=0.037501 ovl=0.9916666666666667 conc=3.9510101437884866
+[cf] start cf-c2-r13 gap_ms=2.0
+[cf] done cf-c2-r13 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.012852379641572 worst=136.45729 ge250=0 obs_min=2.039431 ovl=0.9833333333333333 conc=3.714326271881393
+[cf] start cf-c4-r13 gap_ms=4.0
+[cf] done cf-c4-r13 gpu=NVIDIA H100 80GB HBM3 region=us-east4 gbps=5.169084035063543 worst=157.521061 ge250=0 obs_min=4.019373 ovl=0.9833333333333333 conc=3.6120742551135225
+[cf] start cf-c2-r14 gap_ms=2.0
+[cf] done cf-c2-r14 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.3829789457908355 worst=108.004108 ge250=0 obs_min=2.002064 ovl=0.9833333333333333 conc=3.667871284583279
+[cf] start cf-c4-r14 gap_ms=4.0
+[cf] done cf-c4-r14 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=6.037095588059387 worst=107.321905 ge250=0 obs_min=4.05595 ovl=0.9916666666666667 conc=3.7185100849482855
+[cf] start cf-c0-r14 gap_ms=0.0
+[cf] done cf-c0-r14 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.292205588667089 worst=213.949183 ge250=0 obs_min=0.028967 ovl=0.9916666666666667 conc=3.9018463635411282
+[cf] start cf-c4-r15 gap_ms=4.0
+[cf] done cf-c4-r15 gpu=NVIDIA H100 80GB HBM3 region=us-west gbps=5.404421108746181 worst=97.968721 ge250=0 obs_min=4.137482 ovl=0.9833333333333333 conc=3.638351378394197
+[cf] start cf-c0-r15 gap_ms=0.0
+[cf] done cf-c0-r15 gpu=NVIDIA H100 80GB HBM3 region=us-central gbps=5.029142921805017 worst=179.23385 ge250=0 obs_min=0.020029 ovl=0.9916666666666667 conc=3.9305760733913884
+[cf] start cf-c2-r15 gap_ms=2.0
+[cf] done cf-c2-r15 gpu=NVIDIA H100 80GB HBM3 region=london gbps=4.722001209637955 worst=149.246578 ge250=0 obs_min=2.022636 ovl=0.975 conc=3.6082879696013683
+
+valid H100 runs: 45 / 45
+regions: {'chicago': 5, 'us-central': 7, 'odin': 1, 'us-west4': 2, 'us-west': 12, 'denver': 2, 'ap-south': 1, 'CANADA-2': 3, 'eu-north': 1, 'us-east': 7, 'us-east4': 2, 'ca': 1, 'london': 1}
+
+=== per-run ===
+run              gap   wall   gbps   n    med    p95     p99     max >250 >500  >1k   ex100   gmin    gp5   gmed    gp95   ovl  conc mxact
+cf-c0-r01          0   1298  6.198 120  38.60  54.19   96.49     118    0    0    0      18   0.04   0.24   8.87   23.42 0.983  3.78     4
+cf-c0-r02          0   1241  6.485 120  37.58  50.35  103.56     117    0    0    0      27   0.06   0.25   6.36   32.04 0.992  3.87     4
+cf-c0-r03          0   1993  4.037 120  61.13  94.15  144.04     225    0    0    0     208   0.01   0.09  12.33   43.21 0.992  3.93     4
+cf-c0-r04          0   1535  5.241 120  43.91  58.47  146.09     248    0    0    0     234   0.02   0.28   7.41   33.41 0.983  3.82     4
+cf-c0-r05          0   1350  5.960 120  40.25  58.36  129.24     213    0    0    0     152   0.01   2.44   7.96   26.99 0.975  3.88     4
+cf-c0-r06          0   3578  2.248 120  36.45 279.87 1966.78    2263    7    6    4    8480   0.01   0.14   7.55   37.28 0.933  3.82     4
+cf-c0-r07          0   1376  5.848 120  41.08  54.56   91.58     105    0    0    0       5   0.02   0.16   3.84   43.03 0.992  3.76     4
+cf-c0-r08          0   1819  4.424 120  53.82  72.26  202.56     313    1    0    0     412   0.03   0.14   7.98   45.54 0.992  3.87     4
+cf-c0-r09          0   1603  5.020 120  45.48  71.70  145.73     294    1    0    0     254   0.01   0.45   8.13   37.43 0.983  3.82     4
+cf-c0-r10          0   1281  6.282 120  39.07  52.59   96.31     120    0    0    0      20   0.01   0.16   7.89   28.44 0.992  3.82     4
+cf-c0-r11          0   1616  4.977 120  47.62  77.87  155.81     247    0    0    0     245   0.02   0.12   9.24   33.91 0.992  3.90     4
+cf-c0-r12          0   2064  3.898 120  65.70  85.76  123.76     192    0    0    0     126   0.02   0.10  11.94   45.63 0.967  3.86     4
+cf-c0-r13          0   2576  3.123 120  84.51 105.77  167.33     277    1    0    0     391   0.04   0.23  10.68   58.73 0.992  3.95     4
+cf-c0-r14          0   1520  5.292 120  44.39  64.96  141.15     214    0    0    0     184   0.03   0.21   5.91   38.58 0.992  3.90     4
+cf-c0-r15          0   1600  5.029 120  49.14  68.57  118.72     179    0    0    0     104   0.02   0.18   6.97   39.71 0.992  3.93     4
+cf-c2-r01          2   3912  2.057 120  37.28  65.72 1755.22    2092    4    2    2    4534   2.03   2.13  14.27   36.79 0.833  2.44     4
+cf-c2-r02          2   1262  6.374 120  36.84  47.54   88.72     111    0    0    0      11   2.05   2.11   7.09   28.35 0.975  3.71     4
+cf-c2-r03          2   1604  5.015 120  46.49  61.44  123.97     140    0    0    0      81   2.03   2.14  10.58   35.15 0.975  3.61     4
+cf-c2-r04          2   1667  4.826 120  52.56  66.20   90.54     112    0    0    0      12   2.04   2.14   8.64   32.61 0.992  3.79     4
+cf-c2-r05          2   4081  1.971 120  44.22  70.45 2112.45    2627    2    2    2    5033   2.14   2.16   6.59   38.36 0.983  2.65     4
+cf-c2-r06          2   2001  4.020 120  42.70  58.12  498.14     640    2    2    0    1043   2.04   2.16   5.85   35.60 0.983  3.26     4
+cf-c2-r07          2   1804  4.460 120  47.59  65.01  127.77     202    0    0    0     155   2.04   2.12   9.34   42.71 0.958  3.43     4
+cf-c2-r08          2   1547  5.200 120  46.30  61.13  115.95     152    0    0    0      74   2.07   2.17   7.63   33.81 0.983  3.74     4
+cf-c2-r09          2   1517  5.302 120  45.02  62.22   94.82     117    0    0    0      17   2.02   2.16   9.30   32.98 0.992  3.77     4
+cf-c2-r10          2   1624  4.954 120  43.28  59.95  181.22     242    0    0    0     267   2.00   2.15   8.18   32.85 0.992  3.54     4
+cf-c2-r11          2   1870  4.303 120  56.74  74.92  121.04     168    0    0    0     100   2.11   2.14   8.53   38.75 0.983  3.68     4
+cf-c2-r12          2   1568  5.131 120  47.56  61.75  105.48     120    0    0    0      27   2.05   2.14   6.65   36.52 0.992  3.74     4
+cf-c2-r13          2   1605  5.013 120  47.09  60.70  118.16     136    0    0    0      68   2.04   2.14   8.35   34.73 0.983  3.71     4
+cf-c2-r14          2   1495  5.383 120  42.99  61.73   92.12     108    0    0    0       8   2.00   2.15   6.13   31.82 0.983  3.67     4
+cf-c2-r15          2   1704  4.722 120  47.24  88.51  105.80     149    0    0    0      57   2.02   2.17  10.71   34.64 0.975  3.61     4
+cf-c4-r01          4   1189  6.766 120  35.30  41.26   78.16      86    0    0    0       0   4.05   4.15   5.38   22.65 0.992  3.68     4
+cf-c4-r02          4   1574  5.111 120  44.61  64.29   98.47     122    0    0    0      22   4.00   4.10   8.69   31.73 0.975  3.62     4
+cf-c4-r03          4   1292  6.229 120  38.14  45.27   85.85      95    0    0    0       0   4.06   4.29   8.24   27.99 0.983  3.65     4
+cf-c4-r04          4   1509  5.331 120  43.58  65.65  109.89     144    0    0    0      57   4.06   4.17   6.19   31.90 0.983  3.67     4
+cf-c4-r05          4   1389  5.793 120  38.94  55.45  104.55     119    0    0    0      32   4.00   4.26   6.72   29.20 0.967  3.56     4
+cf-c4-r06          4   1225  6.568 120  35.44  44.26   80.21      86    0    0    0       0   4.03   4.30   8.00   21.49 0.975  3.66     4
+cf-c4-r07          4   2700  2.980 120  69.70 238.95  274.57     319    4    0    0    1471   4.04   4.36  10.91   49.15 0.975  3.68     4
+cf-c4-r08          4   1461  5.508 120  42.73  56.97  109.96     136    0    0    0      48   4.07   4.28   8.55   28.85 0.983  3.65     4
+cf-c4-r09          4   1412  5.697 120  40.81  59.73   99.87     110    0    0    0      11   4.04   4.23   6.22   32.64 0.992  3.67     4
+cf-c4-r10          4   2499  3.219 120  82.47  95.21  104.14     161    0    0    0      67   4.02   4.31  14.39   53.85 0.992  3.82     4
+cf-c4-r11          4   2370  3.395 120  66.19 121.70  150.71     167    0    0    0     323   4.07   4.26   8.97   56.16 0.975  3.62     4
+cf-c4-r12          4   1862  4.321 120  50.95  76.37  169.44     204    0    0    0     256   4.05   4.37   9.74   47.66 0.983  3.58     4
+cf-c4-r13          4   1556  5.169 120  44.76  56.82  110.91     158    0    0    0      79   4.02   4.26   7.46   31.99 0.983  3.61     4
+cf-c4-r14          4   1333  6.037 120  39.64  47.80   87.46     107    0    0    0       7   4.06   4.27   7.67   27.20 0.992  3.72     4
+cf-c4-r15          4   1489  5.404 120  42.89  55.05   93.59      98    0    0    0       0   4.14   4.25   6.61   29.19 0.983  3.64     4
+
+=== summary ===
+ gap runs r>=250 r>=500  r>=1k n>=250 n>=500  n>=1k    worst  medGbps  minGbps    ovl  conc
+   0   15      4      1      1     10      6      4     2263    5.029    2.248  0.983  3.86
+   2   15      3      3      2      8      6      4     2627    4.954    1.971  0.972  3.49
+   4   15      1      0      0      4      0      0      319    5.404    2.980  0.982  3.65
+
+=== generation 0 only ===
+ gap  gen0 n  >=250  >=500  >=1k    worst
+   0      60      7      4     4     2263
+   2      60      6      6     4     2627
+   4      60      0      0     0      204
+
+=== per-generation (max ms across arm / counts) ===
+  gap  0 | g0: n=60 max=2263 ge500=4 ge1k=4 | g1: n=60 max=522 ge500=2 ge1k=0 | g2: n=60 max=138 ge500=0 ge1k=0 | g3: n=60 max=100 ge500=0 ge1k=0
+  gap  2 | g0: n=60 max=2627 ge500=6 ge1k=4 | g1: n=60 max=498 ge500=0 ge1k=0 | g2: n=60 max=108 ge500=0 ge1k=0 | g3: n=60 max=270 ge500=0 ge1k=0
+  gap  4 | g0: n=60 max=204 ge500=0 ge1k=0 | g1: n=60 max=90 ge500=0 ge1k=0 | g2: n=60 max=99 ge500=0 ge1k=0 | g3: n=60 max=86 ge500=0 ge1k=0
+
+=== first four global launches ===
+  gap 0 cf-c0-r01        :: #0w3 t=0.0 gap=- lat=41 act=0 | #1w2 t=0.2 gap=0.25 lat=83 act=1 | #2w1 t=41.4 gap=41.16 lat=89 act=2 | #3w3 t=83.5 gap=42.06 lat=34 act=2
+  gap 0 cf-c0-r02        :: #0w3 t=0.0 gap=- lat=38 act=0 | #1w2 t=0.3 gap=0.25 lat=75 act=1 | #2w1 t=37.8 gap=37.57 lat=74 act=2 | #3w0 t=38.0 gap=0.16 lat=117 act=3
+  gap 0 cf-c0-r03        :: #0w3 t=0.0 gap=- lat=44 act=0 | #1w1 t=0.1 gap=0.10 lat=95 act=1 | #2w0 t=0.1 gap=0.03 lat=146 act=2 | #3w2 t=0.1 gap=0.01 lat=225 act=3
+  gap 0 cf-c0-r04        :: #0w3 t=0.0 gap=- lat=50 act=0 | #1w0 t=0.2 gap=0.19 lat=148 act=1 | #2w1 t=0.2 gap=0.04 lat=98 act=2 | #3w2 t=0.2 gap=0.02 lat=248 act=3
+  gap 0 cf-c0-r05        :: #0w3 t=0.0 gap=- lat=45 act=0 | #1w2 t=0.0 gap=0.03 lat=88 act=1 | #2w0 t=0.1 gap=0.09 lat=139 act=2 | #3w1 t=0.1 gap=0.01 lat=213 act=3
+  gap 0 cf-c0-r06        :: #0w3 t=0.0 gap=- lat=1688 act=0 | #1w0 t=0.1 gap=0.12 lat=2263 act=1 | #2w1 t=0.1 gap=0.02 lat=1733 act=2 | #3w2 t=0.1 gap=0.01 lat=2022 act=3
+  gap 0 cf-c0-r07        :: #0w3 t=0.0 gap=- lat=90 act=0 | #1w2 t=0.3 gap=0.27 lat=90 act=1 | #2w1 t=47.5 gap=47.26 lat=92 act=2 | #3w3 t=90.4 gap=42.85 lat=44 act=2
+  gap 0 cf-c0-r08        :: #0w3 t=0.0 gap=- lat=53 act=0 | #1w1 t=1.1 gap=1.09 lat=152 act=1 | #2w0 t=1.1 gap=0.04 lat=313 act=2 | #3w2 t=1.2 gap=0.03 lat=214 act=3
+  gap 0 cf-c0-r09        :: #0w3 t=0.0 gap=- lat=47 act=0 | #1w0 t=0.1 gap=0.11 lat=99 act=1 | #2w1 t=0.2 gap=0.04 lat=156 act=2 | #3w2 t=0.2 gap=0.01 lat=294 act=3
+  gap 0 cf-c0-r10        :: #0w3 t=0.0 gap=- lat=87 act=0 | #1w0 t=0.4 gap=0.42 lat=87 act=1 | #2w1 t=42.4 gap=42.02 lat=99 act=2 | #3w3 t=86.9 gap=44.50 lat=54 act=2
+  gap 0 cf-c0-r11        :: #0w3 t=0.0 gap=- lat=49 act=0 | #1w1 t=0.8 gap=0.83 lat=101 act=1 | #2w0 t=0.9 gap=0.06 lat=160 act=2 | #3w2 t=0.9 gap=0.03 lat=247 act=3
+  gap 0 cf-c0-r12        :: #0w3 t=0.0 gap=- lat=41 act=0 | #1w1 t=0.2 gap=0.18 lat=128 act=1 | #2w0 t=0.3 gap=0.13 lat=81 act=2 | #3w2 t=0.3 gap=0.04 lat=192 act=3
+  gap 0 cf-c0-r13        :: #0w3 t=0.0 gap=- lat=168 act=0 | #1w1 t=0.0 gap=0.05 lat=110 act=1 | #2w0 t=1.6 gap=1.52 lat=166 act=2 | #3w2 t=1.8 gap=0.27 lat=277 act=3
+  gap 0 cf-c0-r14        :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w0 t=0.0 gap=0.03 lat=147 act=1 | #2w1 t=4.0 gap=3.93 lat=93 act=2 | #3w2 t=4.2 gap=0.22 lat=214 act=3
+  gap 0 cf-c0-r15        :: #0w3 t=0.0 gap=- lat=40 act=0 | #1w2 t=0.0 gap=0.03 lat=81 act=1 | #2w1 t=0.1 gap=0.11 lat=125 act=2 | #3w0 t=0.2 gap=0.02 lat=179 act=3
+  gap 2 cf-c2-r01        :: #0w3 t=0.0 gap=- lat=2050 act=0 | #1w0 t=2.3 gap=2.27 lat=2092 act=1 | #2w1 t=2050.1 gap=2047.78 lat=97 act=2 | #3w0 t=2093.8 gap=43.75 lat=37 act=1
+  gap 2 cf-c2-r02        :: #0w3 t=0.0 gap=- lat=83 act=0 | #1w2 t=3.0 gap=3.02 lat=80 act=1 | #2w1 t=40.2 gap=37.18 lat=90 act=2 | #3w2 t=82.9 gap=42.65 lat=37 act=2
+  gap 2 cf-c2-r03        :: #0w3 t=0.0 gap=- lat=51 act=0 | #1w2 t=2.1 gap=2.06 lat=140 act=1 | #2w3 t=51.3 gap=49.21 lat=38 act=1 | #3w3 t=89.0 gap=37.75 lat=40 act=1
+  gap 2 cf-c2-r04        :: #0w3 t=0.0 gap=- lat=45 act=0 | #1w1 t=2.7 gap=2.67 lat=87 act=1 | #2w0 t=45.2 gap=42.49 lat=91 act=2 | #3w1 t=89.7 gap=44.51 lat=40 act=1
+  gap 2 cf-c2-r05        :: #0w3 t=0.0 gap=- lat=2580 act=0 | #1w2 t=2.1 gap=2.14 lat=2627 act=1 | #2w1 t=2579.3 gap=2577.20 lat=106 act=2 | #3w2 t=2629.0 gap=49.63 lat=47 act=1
+  gap 2 cf-c2-r06        :: #0w3 t=0.0 gap=- lat=589 act=0 | #1w0 t=2.0 gap=2.04 lat=640 act=1 | #2w3 t=588.8 gap=586.77 lat=42 act=1 | #3w2 t=591.0 gap=2.22 lat=102 act=2
+  gap 2 cf-c2-r07        :: #0w3 t=0.0 gap=- lat=82 act=0 | #1w2 t=2.7 gap=2.70 lat=202 act=1 | #2w3 t=81.9 gap=79.19 lat=56 act=1 | #3w3 t=138.0 gap=56.07 lat=55 act=1
+  gap 2 cf-c2-r08        :: #0w3 t=0.0 gap=- lat=51 act=0 | #1w2 t=2.6 gap=2.65 lat=104 act=1 | #2w3 t=51.3 gap=48.68 lat=42 act=1 | #3w1 t=53.7 gap=2.38 lat=119 act=2
+  gap 2 cf-c2-r09        :: #0w3 t=0.0 gap=- lat=90 act=0 | #1w1 t=2.3 gap=2.26 lat=87 act=1 | #2w0 t=43.8 gap=41.51 lat=96 act=2 | #3w1 t=89.6 gap=45.83 lat=42 act=2
+  gap 2 cf-c2-r10        :: #0w3 t=0.0 gap=- lat=194 act=0 | #1w1 t=2.9 gap=2.86 lat=242 act=1 | #2w2 t=193.6 gap=190.76 lat=103 act=2 | #3w1 t=245.0 gap=51.35 lat=42 act=1
+  gap 2 cf-c2-r11        :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w2 t=2.4 gap=2.36 lat=100 act=1 | #2w0 t=46.2 gap=43.83 lat=124 act=2 | #3w2 t=102.3 gap=56.13 lat=53 act=1
+  gap 2 cf-c2-r12        :: #0w3 t=0.0 gap=- lat=50 act=0 | #1w2 t=2.6 gap=2.57 lat=101 act=1 | #2w3 t=50.2 gap=47.61 lat=44 act=1 | #3w0 t=52.4 gap=2.18 lat=107 act=2
+  gap 2 cf-c2-r13        :: #0w3 t=0.0 gap=- lat=53 act=0 | #1w2 t=2.0 gap=2.04 lat=103 act=1 | #2w0 t=53.0 gap=50.96 lat=108 act=2 | #3w2 t=105.0 gap=52.02 lat=43 act=1
+  gap 2 cf-c2-r14        :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w0 t=2.3 gap=2.26 lat=91 act=1 | #2w3 t=48.0 gap=45.72 lat=42 act=1 | #3w2 t=50.2 gap=2.22 lat=92 act=2
+  gap 2 cf-c2-r15        :: #0w3 t=0.0 gap=- lat=50 act=0 | #1w2 t=2.1 gap=2.10 lat=98 act=1 | #2w1 t=50.2 gap=48.10 lat=107 act=2 | #3w2 t=99.9 gap=49.72 lat=44 act=1
+  gap 4 cf-c4-r01        :: #0w3 t=0.0 gap=- lat=40 act=0 | #1w1 t=4.6 gap=4.65 lat=73 act=1 | #2w2 t=39.4 gap=34.77 lat=79 act=2 | #3w3 t=77.7 gap=38.31 lat=32 act=2
+  gap 4 cf-c4-r02        :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w1 t=4.1 gap=4.05 lat=93 act=1 | #2w3 t=46.2 gap=42.11 lat=36 act=1 | #3w0 t=50.5 gap=4.33 lat=100 act=2
+  gap 4 cf-c4-r03        :: #0w3 t=0.0 gap=- lat=42 act=0 | #1w2 t=4.6 gap=4.56 lat=82 act=1 | #2w3 t=42.4 gap=37.79 lat=34 act=1 | #3w1 t=46.7 gap=4.31 lat=87 act=2
+  gap 4 cf-c4-r04        :: #0w3 t=0.0 gap=- lat=51 act=0 | #1w0 t=4.7 gap=4.67 lat=101 act=1 | #2w3 t=51.4 gap=46.70 lat=44 act=1 | #3w2 t=55.9 gap=4.51 lat=112 act=2
+  gap 4 cf-c4-r05        :: #0w3 t=0.0 gap=- lat=36 act=0 | #1w1 t=4.0 gap=4.00 lat=119 act=1 | #2w0 t=36.3 gap=32.34 lat=38 act=2 | #3w0 t=74.7 gap=38.35 lat=41 act=1
+  gap 4 cf-c4-r06        :: #0w3 t=0.0 gap=- lat=81 act=0 | #1w0 t=4.0 gap=4.03 lat=77 act=1 | #2w1 t=42.6 gap=38.59 lat=78 act=2 | #3w2 t=80.6 gap=38.02 lat=86 act=3
+  gap 4 cf-c4-r07        :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w2 t=5.0 gap=5.03 lat=84 act=1 | #2w0 t=48.1 gap=43.03 lat=96 act=2 | #3w2 t=89.5 gap=41.42 lat=44 act=1
+  gap 4 cf-c4-r08        :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w1 t=4.3 gap=4.33 lat=100 act=1 | #2w3 t=48.1 gap=43.76 lat=39 act=1 | #3w0 t=52.5 gap=4.39 lat=112 act=2
+  gap 4 cf-c4-r09        :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w2 t=4.1 gap=4.14 lat=92 act=1 | #2w0 t=46.4 gap=42.23 lat=102 act=2 | #3w2 t=96.3 gap=49.90 lat=42 act=1
+  gap 4 cf-c4-r10        :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w0 t=4.1 gap=4.12 lat=82 act=1 | #2w2 t=48.0 gap=43.86 lat=105 act=2 | #3w0 t=86.6 gap=38.60 lat=64 act=1
+  gap 4 cf-c4-r11        :: #0w3 t=0.0 gap=- lat=49 act=0 | #1w2 t=4.8 gap=4.81 lat=114 act=1 | #2w0 t=48.7 gap=43.89 lat=154 act=2 | #3w2 t=118.8 gap=70.08 lat=71 act=1
+  gap 4 cf-c4-r12        :: #0w3 t=0.0 gap=- lat=115 act=0 | #1w0 t=4.4 gap=4.39 lat=204 act=1 | #2w3 t=115.5 gap=111.07 lat=53 act=1 | #3w2 t=119.7 gap=4.29 lat=166 act=2
+  gap 4 cf-c4-r13        :: #0w3 t=0.0 gap=- lat=53 act=0 | #1w0 t=4.6 gap=4.65 lat=158 act=1 | #2w2 t=53.0 gap=48.40 lat=52 act=2 | #3w2 t=105.3 gap=52.29 lat=42 act=1
+  gap 4 cf-c4-r14        :: #0w3 t=0.0 gap=- lat=39 act=0 | #1w0 t=4.7 gap=4.70 lat=76 act=1 | #2w2 t=38.6 gap=33.89 lat=90 act=2 | #3w0 t=81.0 gap=42.46 lat=43 act=1
+  gap 4 cf-c4-r15        :: #0w3 t=0.0 gap=- lat=48 act=0 | #1w2 t=4.2 gap=4.15 lat=93 act=1 | #2w1 t=48.0 gap=43.85 lat=94 act=2 | #3w0 t=96.7 gap=48.68 lat=98 act=2

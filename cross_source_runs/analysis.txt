@@ -1,0 +1,233 @@
+﻿
+====================================================================================================
+cs-r01  CLOUD_PROVIDER_GCP/us-east4  gbps=3.86 max=339ms hb_max_gap=179ms  stall_episodes=1
+  stall#0: t=0..339ms span=339ms worst=339ms workers=[1]
+      w1 gen0 enter=0 exit=339 ms=339 off=2013265920
+  --- pathological probe set, trigger t=256ms
+      blocked at trigger: w0(el=16ms,off=134217728), w1(el=256ms,off=2013265920), w2(el=20ms,off=4160749568), w3(el=22ms,off=6241124352)
+      A_same_file_fresh_fd: enter=738 exit=810 lat=72ms enter-trig=482ms  no-overlap
+      B_same_range_fresh_fd: enter=992 exit=1071 lat=80ms enter-trig=736ms  no-overlap
+      C_other_volume_file: enter=1112 exit=1172 lat=60ms enter-trig=856ms  no-overlap
+      D_local_file: enter=1173 exit=1251 lat=78ms enter-trig=917ms  no-overlap
+  --- clean_reference probe set, trigger t=2091ms
+      A_same_file_fresh_fd: enter=2094 exit=2095 lat=1ms enter-trig=3ms  no-overlap
+      C_other_volume_file: enter=2097 exit=2101 lat=3ms enter-trig=6ms  no-overlap
+      D_local_file: enter=2101 exit=2102 lat=1ms enter-trig=10ms  no-overlap
+  TRIGGER->clear: blocked requests exited 38..84ms after trigger; earliest probe entered 482ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r02  CLOUD_PROVIDER_GCP/us-east  gbps=2.38 max=1080ms hb_max_gap=910ms  stall_episodes=2
+  stall#0: t=0..1080ms span=1080ms worst=1080ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=1080 ms=1080 off=6039797760
+      w0 gen0 enter=0 exit=1080 ms=1080 off=0
+      w1 gen0 enter=0 exit=1080 ms=1079 off=2013265920
+      w2 gen0 enter=0 exit=1080 ms=1080 off=4026531840
+  stall#1: t=1235..1725ms span=490ms worst=404ms workers=[0, 1, 2, 3]
+      w3 gen3 enter=1235 exit=1625 ms=390 off=6241124352
+      w0 gen4 enter=1275 exit=1672 ms=398 off=268435456
+      w2 gen4 enter=1321 exit=1725 ms=404 off=4294967296
+      w1 gen4 enter=1327 exit=1671 ms=344 off=2281701376
+  --- pathological probe set, trigger t=913ms
+      blocked at trigger: w0(el=913ms,off=0), w1(el=913ms,off=2013265920), w2(el=913ms,off=4026531840), w3(el=913ms,off=6039797760)
+      A_same_file_fresh_fd: enter=1995 exit=2125 lat=130ms enter-trig=1081ms  no-overlap
+      B_same_range_fresh_fd: enter=2285 exit=2513 lat=228ms enter-trig=1372ms  no-overlap
+      C_other_volume_file: enter=2465 exit=2634 lat=168ms enter-trig=1552ms  no-overlap
+      D_local_file: enter=2513 exit=2571 lat=58ms enter-trig=1600ms  no-overlap
+  --- clean_reference probe set, trigger t=3388ms
+      A_same_file_fresh_fd: enter=3401 exit=3405 lat=4ms enter-trig=13ms  no-overlap
+      C_other_volume_file: enter=3405 exit=3408 lat=3ms enter-trig=16ms  no-overlap
+      D_local_file: enter=3405 exit=3408 lat=3ms enter-trig=17ms  no-overlap
+  TRIGGER->clear: blocked requests exited 166..167ms after trigger; earliest probe entered 1081ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r03  CLOUD_PROVIDER_GCP/asia-south2  gbps=3.93 max=297ms hb_max_gap=211ms  stall_episodes=1
+  stall#0: t=0..297ms span=297ms worst=297ms workers=[2]
+      w2 gen0 enter=0 exit=297 ms=297 off=4026531840
+  --- pathological probe set, trigger t=255ms
+      blocked at trigger: w0(el=58ms,off=134217728), w1(el=43ms,off=2080374784), w2(el=255ms,off=4026531840), w3(el=58ms,off=6241124352)
+      A_same_file_fresh_fd: enter=682 exit=820 lat=138ms enter-trig=428ms  no-overlap
+      B_same_range_fresh_fd: enter=978 exit=1030 lat=52ms enter-trig=724ms  no-overlap
+      C_other_volume_file: enter=1202 exit=1272 lat=70ms enter-trig=947ms  no-overlap
+      D_local_file: enter=1203 exit=1204 lat=1ms enter-trig=949ms  no-overlap
+  --- clean_reference probe set, trigger t=2049ms
+      A_same_file_fresh_fd: enter=2053 exit=2055 lat=2ms enter-trig=3ms  no-overlap
+      C_other_volume_file: enter=2057 exit=2061 lat=4ms enter-trig=8ms  no-overlap
+      D_local_file: enter=2061 exit=2063 lat=2ms enter-trig=11ms  no-overlap
+  TRIGGER->clear: blocked requests exited 43..43ms after trigger; earliest probe entered 428ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r04  CLOUD_PROVIDER_GCP/us-east4  gbps=2.10 max=991ms hb_max_gap=987ms  stall_episodes=2
+  stall#0: t=0..991ms span=991ms worst=991ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=991 ms=991 off=6039797760
+      w2 gen0 enter=0 exit=990 ms=990 off=4026531840
+      w0 gen0 enter=0 exit=990 ms=990 off=0
+      w1 gen0 enter=0 exit=991 ms=990 off=2013265920
+  stall#1: t=1044..1798ms span=754ms worst=754ms workers=[0, 1, 2, 3]
+      w1 gen2 enter=1044 exit=1798 ms=754 off=2147483648
+      w0 gen2 enter=1044 exit=1798 ms=754 off=134217728
+      w2 gen2 enter=1044 exit=1798 ms=754 off=4160749568
+      w3 gen2 enter=1044 exit=1797 ms=753 off=6174015488
+  --- pathological probe set, trigger t=810ms
+      blocked at trigger: w0(el=810ms,off=0), w1(el=810ms,off=2013265920), w2(el=810ms,off=4026531840), w3(el=810ms,off=6039797760)
+      A_same_file_fresh_fd: enter=2349 exit=2475 lat=126ms enter-trig=1539ms  no-overlap
+      B_same_range_fresh_fd: enter=2350 exit=2535 lat=186ms enter-trig=1539ms  no-overlap
+      C_other_volume_file: enter=2680 exit=2764 lat=84ms enter-trig=1870ms  no-overlap
+      D_local_file: enter=2678 exit=2681 lat=3ms enter-trig=1867ms  no-overlap
+  TRIGGER->clear: blocked requests exited 180..180ms after trigger; earliest probe entered 1539ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r05  CLOUD_PROVIDER_GCP/us-east4  gbps=3.45 max=318ms hb_max_gap=181ms  stall_episodes=1
+  stall#0: t=0..318ms span=318ms worst=318ms workers=[2]
+      w2 gen0 enter=0 exit=318 ms=318 off=4026531840
+  --- pathological probe set, trigger t=254ms
+      blocked at trigger: w0(el=10ms,off=67108864), w1(el=69ms,off=2080374784), w2(el=254ms,off=4026531840), w3(el=150ms,off=6174015488)
+      A_same_file_fresh_fd: enter=1031 exit=1257 lat=226ms enter-trig=776ms  no-overlap
+      B_same_range_fresh_fd: enter=1258 exit=1305 lat=48ms enter-trig=1003ms  no-overlap
+      C_other_volume_file: enter=1471 exit=1582 lat=111ms enter-trig=1217ms  no-overlap
+      D_local_file: enter=1472 exit=1527 lat=55ms enter-trig=1217ms  no-overlap
+  TRIGGER->clear: blocked requests exited 64..64ms after trigger; earliest probe entered 776ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r06  CLOUD_PROVIDER_OCI/us-chicago-1  gbps=3.06 max=290ms hb_max_gap=215ms  stall_episodes=1
+  stall#0: t=0..290ms span=290ms worst=290ms workers=[2]
+      w2 gen0 enter=0 exit=290 ms=290 off=4026531840
+  --- pathological probe set, trigger t=256ms
+      blocked at trigger: w0(el=139ms,off=67108864), w1(el=87ms,off=2080374784), w2(el=256ms,off=4026531840), w3(el=155ms,off=6174015488)
+      A_same_file_fresh_fd: enter=928 exit=1025 lat=97ms enter-trig=672ms  no-overlap
+      B_same_range_fresh_fd: enter=1025 exit=1115 lat=90ms enter-trig=768ms  no-overlap
+      C_other_volume_file: enter=1303 exit=1391 lat=88ms enter-trig=1047ms  no-overlap
+      D_local_file: enter=1392 exit=1466 lat=74ms enter-trig=1136ms  no-overlap
+  TRIGGER->clear: blocked requests exited 34..34ms after trigger; earliest probe entered 672ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r07  CLOUD_PROVIDER_UNSPECIFIED/CANADA-2  gbps=3.01 max=298ms hb_max_gap=271ms  stall_episodes=1
+  stall#0: t=0..298ms span=298ms worst=298ms workers=[2]
+      w2 gen0 enter=0 exit=298 ms=298 off=4026531840
+  --- pathological probe set, trigger t=252ms
+      blocked at trigger: w0(el=65ms,off=67108864), w1(el=3ms,off=2147483648), w2(el=252ms,off=4026531840), w3(el=6ms,off=6241124352)
+      A_same_file_fresh_fd: enter=859 exit=1041 lat=183ms enter-trig=607ms  no-overlap
+      B_same_range_fresh_fd: enter=1042 exit=1142 lat=101ms enter-trig=789ms  no-overlap
+      C_other_volume_file: enter=1313 exit=1591 lat=279ms enter-trig=1061ms  no-overlap
+      D_local_file: enter=1313 exit=1383 lat=70ms enter-trig=1061ms  no-overlap
+  TRIGGER->clear: blocked requests exited 46..46ms after trigger; earliest probe entered 607ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r08  CLOUD_PROVIDER_GCP/us-east  gbps=2.31 max=853ms hb_max_gap=922ms  stall_episodes=2
+  stall#0: t=0..647ms span=647ms worst=647ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=647 ms=647 off=6039797760
+      w0 gen0 enter=0 exit=646 ms=646 off=0
+      w1 gen0 enter=0 exit=647 ms=646 off=2013265920
+      w2 gen0 enter=0 exit=646 ms=646 off=4026531840
+  stall#1: t=716..1568ms span=853ms worst=853ms workers=[0, 1, 2, 3]
+      w1 gen2 enter=716 exit=1568 ms=853 off=2147483648
+      w2 gen2 enter=716 exit=1509 ms=793 off=4160749568
+      w0 gen2 enter=716 exit=1509 ms=793 off=134217728
+      w3 gen2 enter=716 exit=1509 ms=793 off=6174015488
+  --- pathological probe set, trigger t=362ms
+      blocked at trigger: w0(el=361ms,off=0), w1(el=361ms,off=2013265920), w2(el=361ms,off=4026531840), w3(el=362ms,off=6039797760)
+      A_same_file_fresh_fd: enter=1823 exit=2022 lat=199ms enter-trig=1462ms  no-overlap
+      B_same_range_fresh_fd: enter=2299 exit=2371 lat=72ms enter-trig=1937ms  no-overlap
+      C_other_volume_file: enter=2241 exit=2298 lat=57ms enter-trig=1879ms  no-overlap
+      D_local_file: enter=2468 exit=2564 lat=96ms enter-trig=2106ms  no-overlap
+  TRIGGER->clear: blocked requests exited 285..285ms after trigger; earliest probe entered 1462ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r09  CLOUD_PROVIDER_UNSPECIFIED/odin  gbps=6.26 max=199ms hb_max_gap=76ms  stall_episodes=0
+
+====================================================================================================
+cs-r10  CLOUD_PROVIDER_OCI/us-chicago-1  gbps=3.43 max=315ms hb_max_gap=213ms  stall_episodes=1
+  stall#0: t=0..315ms span=315ms worst=315ms workers=[1]
+      w1 gen0 enter=0 exit=315 ms=315 off=2013265920
+  --- pathological probe set, trigger t=254ms
+      blocked at trigger: w0(el=22ms,off=201326592), w1(el=254ms,off=2013265920), w2(el=25ms,off=4160749568), w3(el=21ms,off=6241124352)
+      A_same_file_fresh_fd: enter=952 exit=1101 lat=149ms enter-trig=698ms  no-overlap
+      B_same_range_fresh_fd: enter=1180 exit=1315 lat=136ms enter-trig=926ms  no-overlap
+      C_other_volume_file: enter=1315 exit=1398 lat=83ms enter-trig=1061ms  no-overlap
+      D_local_file: enter=1399 exit=1474 lat=75ms enter-trig=1145ms  no-overlap
+  TRIGGER->clear: blocked requests exited 61..61ms after trigger; earliest probe entered 698ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r11  CLOUD_PROVIDER_AWS/us-east  gbps=4.26 max=239ms hb_max_gap=105ms  stall_episodes=0
+
+====================================================================================================
+cs-r12  CLOUD_PROVIDER_GCP/us-east  gbps=2.05 max=2161ms hb_max_gap=1591ms  stall_episodes=1
+  stall#0: t=0..2163ms span=2163ms worst=2161ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=1407 ms=1407 off=6039797760
+      w2 gen0 enter=0 exit=1594 ms=1594 off=4026531840
+      w0 gen0 enter=0 exit=1466 ms=1466 off=0
+      w1 gen0 enter=1 exit=2162 ms=2161 off=2013265920
+      w0 gen1 enter=1466 exit=2163 ms=697 off=67108864
+      w2 gen1 enter=1594 exit=2163 ms=569 off=4093640704
+      w3 gen2 enter=1594 exit=2163 ms=569 off=6174015488
+  --- pathological probe set, trigger t=1466ms
+      blocked at trigger: w0(el=0ms,off=67108864), w1(el=1465ms,off=2013265920), w2(el=1466ms,off=4026531840), w3(el=59ms,off=6106906624)
+      A_same_file_fresh_fd: enter=2458 exit=2717 lat=259ms enter-trig=992ms  no-overlap
+      B_same_range_fresh_fd: enter=2717 exit=2811 lat=94ms enter-trig=1252ms  no-overlap
+      C_other_volume_file: enter=2949 exit=3060 lat=111ms enter-trig=1483ms  no-overlap
+      D_local_file: enter=2993 exit=2994 lat=1ms enter-trig=1527ms  no-overlap
+  TRIGGER->clear: blocked requests exited 128..697ms after trigger; earliest probe entered 992ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r13  CLOUD_PROVIDER_UNSPECIFIED/CANADA-2  gbps=1.33 max=3497ms hb_max_gap=1940ms  stall_episodes=3
+  stall#0: t=0..3497ms span=3497ms worst=3497ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=2280 ms=2280 off=6039797760
+      w0 gen0 enter=0 exit=2241 ms=2241 off=0
+      w1 gen0 enter=0 exit=2280 ms=2280 off=2013265920
+      w2 gen0 enter=0 exit=3497 ms=3497 off=4026531840
+      w0 gen1 enter=2241 exit=3497 ms=1256 off=67108864
+      w3 gen1 enter=2280 exit=3497 ms=1217 off=6106906624
+      w1 gen1 enter=2280 exit=3497 ms=1218 off=2080374784
+  stall#1: t=3667..3970ms span=304ms worst=304ms workers=[3]
+      w3 gen5 enter=3667 exit=3970 ms=304 off=6375342080
+  stall#2: t=4105..4957ms span=852ms worst=852ms workers=[0, 1, 2, 3]
+      w1 gen10 enter=4105 exit=4957 ms=852 off=2684354560
+      w0 gen12 enter=4105 exit=4957 ms=852 off=805306368
+      w2 gen8 enter=4105 exit=4925 ms=819 off=4563402752
+      w3 gen9 enter=4105 exit=4957 ms=851 off=6643777536
+  --- pathological probe set, trigger t=2280ms
+      blocked at trigger: w0(el=39ms,off=67108864), w1(el=0ms,off=2080374784), w2(el=2280ms,off=4026531840), w3(el=0ms,off=6106906624)
+      A_same_file_fresh_fd: enter=4105 exit=4957 lat=852ms enter-trig=1825ms  OVERLAPS stall#2 (worst=852ms,workers=[0, 1, 2, 3])
+      B_same_range_fresh_fd: enter=5172 exit=5266 lat=94ms enter-trig=2892ms  no-overlap
+      C_other_volume_file: enter=5267 exit=5324 lat=57ms enter-trig=2986ms  no-overlap
+      D_local_file: enter=5267 exit=5324 lat=57ms enter-trig=2987ms  no-overlap
+  TRIGGER->clear: blocked requests exited 1217..1217ms after trigger; earliest probe entered 1825ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r14  CLOUD_PROVIDER_UNSPECIFIED/eu-north  gbps=1.82 max=2567ms hb_max_gap=2074ms  stall_episodes=1
+  stall#0: t=0..2568ms span=2568ms worst=2567ms workers=[0, 1, 2, 3]
+      w3 gen0 enter=0 exit=2078 ms=2078 off=6039797760
+      w0 gen0 enter=1 exit=2567 ms=2567 off=0
+      w1 gen0 enter=1 exit=2153 ms=2152 off=2013265920
+      w2 gen0 enter=1 exit=2233 ms=2232 off=4026531840
+      w3 gen1 enter=2078 exit=2506 ms=429 off=6106906624
+      w1 gen1 enter=2153 exit=2568 ms=414 off=2080374784
+      w2 gen1 enter=2233 exit=2568 ms=335 off=4093640704
+  --- pathological probe set, trigger t=2507ms
+      blocked at trigger: w0(el=2506ms,off=0), w1(el=353ms,off=2080374784), w2(el=274ms,off=4093640704), w3(el=0ms,off=6174015488)
+      A_same_file_fresh_fd: enter=3112 exit=3170 lat=58ms enter-trig=605ms  no-overlap
+      B_same_range_fresh_fd: enter=3349 exit=3465 lat=116ms enter-trig=842ms  no-overlap
+      C_other_volume_file: enter=3348 exit=3395 lat=47ms enter-trig=842ms  no-overlap
+      D_local_file: enter=3605 exit=3607 lat=1ms enter-trig=1099ms  no-overlap
+  TRIGGER->clear: blocked requests exited 61..61ms after trigger; earliest probe entered 605ms after trigger => probes fired AFTER clear
+
+====================================================================================================
+cs-r15  CLOUD_PROVIDER_GCP/us-east  gbps=4.93 max=222ms hb_max_gap=141ms  stall_episodes=0
+
+
+====================================================================================================
+SUMMARY
+  cs-r01 CLOUD_PROVIDER_GCP/us-east4                gbps=3.86 max=    339ms hb_gap=   179ms stalls=1 probe_sets=1
+  cs-r02 CLOUD_PROVIDER_GCP/us-east                 gbps=2.38 max=   1080ms hb_gap=   910ms stalls=2 probe_sets=1
+  cs-r03 CLOUD_PROVIDER_GCP/asia-south2             gbps=3.93 max=    297ms hb_gap=   211ms stalls=1 probe_sets=1
+  cs-r04 CLOUD_PROVIDER_GCP/us-east4                gbps=2.10 max=    991ms hb_gap=   987ms stalls=2 probe_sets=1
+  cs-r05 CLOUD_PROVIDER_GCP/us-east4                gbps=3.45 max=    318ms hb_gap=   181ms stalls=1 probe_sets=1
+  cs-r06 CLOUD_PROVIDER_OCI/us-chicago-1            gbps=3.06 max=    290ms hb_gap=   215ms stalls=1 probe_sets=1
+  cs-r07 CLOUD_PROVIDER_UNSPECIFIED/CANADA-2        gbps=3.01 max=    298ms hb_gap=   271ms stalls=1 probe_sets=1
+  cs-r08 CLOUD_PROVIDER_GCP/us-east                 gbps=2.31 max=    853ms hb_gap=   922ms stalls=2 probe_sets=1
+  cs-r09 CLOUD_PROVIDER_UNSPECIFIED/odin            gbps=6.26 max=    199ms hb_gap=    76ms stalls=0 probe_sets=0
+  cs-r10 CLOUD_PROVIDER_OCI/us-chicago-1            gbps=3.43 max=    315ms hb_gap=   213ms stalls=1 probe_sets=1
+  cs-r11 CLOUD_PROVIDER_AWS/us-east                 gbps=4.26 max=    239ms hb_gap=   105ms stalls=0 probe_sets=0
+  cs-r12 CLOUD_PROVIDER_GCP/us-east                 gbps=2.05 max=   2161ms hb_gap=  1591ms stalls=1 probe_sets=1
+  cs-r13 CLOUD_PROVIDER_UNSPECIFIED/CANADA-2        gbps=1.33 max=   3497ms hb_gap=  1940ms stalls=3 probe_sets=1
+  cs-r14 CLOUD_PROVIDER_UNSPECIFIED/eu-north        gbps=1.82 max=   2567ms hb_gap=  2074ms stalls=1 probe_sets=1
+  cs-r15 CLOUD_PROVIDER_GCP/us-east                 gbps=4.93 max=    222ms hb_gap=   141ms stalls=0 probe_sets=0

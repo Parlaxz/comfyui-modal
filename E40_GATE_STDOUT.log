@@ -1,0 +1,3 @@
+[v2ctl.deploy-run] profile=e37-clean-lane-qd4 deploy_fingerprint=f15874bd3012b164e883e9089e0e459317ec03c58563325e9b3633d004fecb41
+[v2ctl.deploy-run] command="C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\deploy_and_run_v2_single.bat" E37_CLEAN_LANE_VALIDATION
+[v2ctl.deploy-run] exit=0 manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260822-070931_f15874bd.json

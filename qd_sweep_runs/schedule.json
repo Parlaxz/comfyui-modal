@@ -1,0 +1,197 @@
+{
+  "arms": [
+    "qd5",
+    "qd6",
+    "qd7"
+  ],
+  "min_launch_gap_ms": 4.0,
+  "pinned": false,
+  "position_counts": {
+    "qd5": [
+      4,
+      3,
+      3
+    ],
+    "qd6": [
+      3,
+      3,
+      4
+    ],
+    "qd7": [
+      3,
+      4,
+      3
+    ]
+  },
+  "qd_by_arm": {
+    "qd5": 5,
+    "qd6": 6,
+    "qd7": 7
+  },
+  "read_mib": 64,
+  "rounds": 10,
+  "schedule": [
+    {
+      "first": "qd5",
+      "order": [
+        "qd5",
+        "qd7",
+        "qd6"
+      ],
+      "round": 1,
+      "run_ordinals": {
+        "qd5": 1,
+        "qd6": 3,
+        "qd7": 2
+      },
+      "second": "qd7",
+      "third": "qd6"
+    },
+    {
+      "first": "qd6",
+      "order": [
+        "qd6",
+        "qd7",
+        "qd5"
+      ],
+      "round": 2,
+      "run_ordinals": {
+        "qd5": 6,
+        "qd6": 4,
+        "qd7": 5
+      },
+      "second": "qd7",
+      "third": "qd5"
+    },
+    {
+      "first": "qd5",
+      "order": [
+        "qd5",
+        "qd6",
+        "qd7"
+      ],
+      "round": 3,
+      "run_ordinals": {
+        "qd5": 7,
+        "qd6": 8,
+        "qd7": 9
+      },
+      "second": "qd6",
+      "third": "qd7"
+    },
+    {
+      "first": "qd5",
+      "order": [
+        "qd5",
+        "qd7",
+        "qd6"
+      ],
+      "round": 4,
+      "run_ordinals": {
+        "qd5": 10,
+        "qd6": 12,
+        "qd7": 11
+      },
+      "second": "qd7",
+      "third": "qd6"
+    },
+    {
+      "first": "qd7",
+      "order": [
+        "qd7",
+        "qd6",
+        "qd5"
+      ],
+      "round": 5,
+      "run_ordinals": {
+        "qd5": 15,
+        "qd6": 14,
+        "qd7": 13
+      },
+      "second": "qd6",
+      "third": "qd5"
+    },
+    {
+      "first": "qd6",
+      "order": [
+        "qd6",
+        "qd5",
+        "qd7"
+      ],
+      "round": 6,
+      "run_ordinals": {
+        "qd5": 17,
+        "qd6": 16,
+        "qd7": 18
+      },
+      "second": "qd5",
+      "third": "qd7"
+    },
+    {
+      "first": "qd6",
+      "order": [
+        "qd6",
+        "qd7",
+        "qd5"
+      ],
+      "round": 7,
+      "run_ordinals": {
+        "qd5": 21,
+        "qd6": 19,
+        "qd7": 20
+      },
+      "second": "qd7",
+      "third": "qd5"
+    },
+    {
+      "first": "qd7",
+      "order": [
+        "qd7",
+        "qd5",
+        "qd6"
+      ],
+      "round": 8,
+      "run_ordinals": {
+        "qd5": 23,
+        "qd6": 24,
+        "qd7": 22
+      },
+      "second": "qd5",
+      "third": "qd6"
+    },
+    {
+      "first": "qd5",
+      "order": [
+        "qd5",
+        "qd6",
+        "qd7"
+      ],
+      "round": 9,
+      "run_ordinals": {
+        "qd5": 25,
+        "qd6": 26,
+        "qd7": 27
+      },
+      "second": "qd6",
+      "third": "qd7"
+    },
+    {
+      "first": "qd7",
+      "order": [
+        "qd7",
+        "qd5",
+        "qd6"
+      ],
+      "round": 10,
+      "run_ordinals": {
+        "qd5": 29,
+        "qd6": 30,
+        "qd7": 28
+      },
+      "second": "qd5",
+      "third": "qd6"
+    }
+  ],
+  "seed": 20260928,
+  "worker_model": "processes"
+}

@@ -1,0 +1,55 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 platform-specific risk matrix",
+    "PHASE_G5 §5 broad semantics"
+  ],
+  "branch_alternatives": {
+    "comfy_cloud_off_curated_list": "high"
+  },
+  "capability_evidence": {
+    "baseten": {
+      "deployment_model": "workflow-embedded-per-deployment",
+      "install": "supported_with_setup"
+    },
+    "comfy_cloud": {
+      "allowlist_evidence": {
+        "fixture-popular-node": "on_curated_list"
+      }
+    },
+    "local": {
+      "install_arbitrary_nodes": "supported"
+    },
+    "modal": {
+      "install_arbitrary_nodes": "supported"
+    },
+    "runcomfy": {
+      "auto_setup": "supported",
+      "exact_pin_required_for_this_characteristic": false
+    },
+    "runpod": {
+      "install_arbitrary_nodes": "supported_with_setup",
+      "setup": "dockerfile-bake-per-change"
+    }
+  },
+  "characteristic": "popular_custom",
+  "determinism_notes": [
+    "G3 gave runcomfy LOW-MEDIUM for auto-setup; supplied evidence states no exact pin is required for this characteristic, so the single deterministic contract-compliant outcome is low.",
+    "comfy_cloud depends on supplied allowlist evidence: on-list resolves low; the off-list branch is documented in branch_alternatives."
+  ],
+  "evidence_id": "target_characteristic_popular_custom",
+  "expected_target_risk": {
+    "baseten": "medium",
+    "comfy_cloud": "low",
+    "local": "low",
+    "modal": "low",
+    "runcomfy": "low",
+    "runpod": "medium"
+  },
+  "provider_independent_facts": {
+    "declared_version_available": true,
+    "node_manager_common": true,
+    "requires_exact_commit_pin": false,
+    "requires_native_build": false
+  },
+  "scenario_id": "popular_custom"
+}

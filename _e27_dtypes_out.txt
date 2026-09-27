@@ -1,0 +1,28 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "status": "ok",
+ "path": "/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors",
+ "tensor_count": 398,
+ "total_data_bytes": 8044936192,
+ "count_by_dtype": {
+  "BF16": 398
+ },
+ "bytes_by_dtype": {
+  "BF16": 8044936192
+ },
+ "bias_bytes_by_dtype": {},
+ "bytes_by_dtype_human": {
+  "BF16": "7.4924 GiB"
+ },
+ "fp32_conversion_bytes": 8044936192,
+ "fp32_resident_bytes_total": 16089872384,
+ "fp32_resident_bytes_human": "14.9849 GiB",
+ "probe": "enumerate_dtypes",
+ "kind": "enumerate_dtypes",
+ "model_name": "qwen_3_4b.safetensors",
+ "resolved_path": "/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors",
+ "waterfall": {
+  "status": "non_applicable",
+  "method": "run_e27_followup_probe"
+ }
+}

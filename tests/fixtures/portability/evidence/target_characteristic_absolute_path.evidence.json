@@ -1,0 +1,45 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 platform-specific risk matrix",
+    "PHASE_G5 §5 broad semantics",
+    "PHASE_G5 POLICY_ABSOLUTE_PATHS"
+  ],
+  "capability_evidence": {
+    "baseten": {
+      "path_semantics": "image-defined"
+    },
+    "comfy_cloud": {
+      "path_semantics": "no-filesystem-semantics"
+    },
+    "local": {
+      "path_semantics": "self-consistent-host"
+    },
+    "modal": {
+      "path_semantics": "container-paths-differ"
+    },
+    "runcomfy": {
+      "path_semantics": "managed-tree-differs"
+    },
+    "runpod": {
+      "path_semantics": "mount-differs"
+    }
+  },
+  "characteristic": "absolute_path",
+  "determinism_notes": [
+    "Local stays low/self-host-sensitive while every remote target is high via severity override; summary algorithm remains source-environment-oriented per PHASE_G5 §4.3."
+  ],
+  "evidence_id": "target_characteristic_absolute_path",
+  "expected_target_risk": {
+    "baseten": "high",
+    "comfy_cloud": "high",
+    "local": "low",
+    "modal": "high",
+    "runcomfy": "high",
+    "runpod": "high"
+  },
+  "provider_independent_facts": {
+    "host_bound_path_in_functional_position": true,
+    "path_examples_are_synthetic": true
+  },
+  "scenario_id": "absolute_path"
+}

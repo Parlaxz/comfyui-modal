@@ -1,0 +1,5 @@
+[v2.modal_target] app=stable-modal-comfy-v2-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+FAIL source_identity_probe: NotFoundError: Lookup failed for Cls 'ModalRuntimeEntrypointV2' from the 'stable-modal-comfy-v2-shadow' app: App 'stable-modal-comfy-v2-shadow' not found in environment 'main'.
+FAIL run_env_probe: NotFoundError: Lookup failed for Cls 'ModalRuntimeEntrypointV2' from the 'stable-modal-comfy-v2-shadow' app: App 'stable-modal-comfy-v2-shadow' not found in environment 'main'.
+FAIL get_deployment_identity_static: NotFoundError: Lookup failed for Cls 'ModalRuntimeEntrypointV2' from the 'stable-modal-comfy-v2-shadow' app: App 'stable-modal-comfy-v2-shadow' not found in environment 'main'.
+FAIL run_entry_probe: NotFoundError: Lookup failed for Cls 'ModalRuntimeEntrypointV2' from the 'stable-modal-comfy-v2-shadow' app: App 'stable-modal-comfy-v2-shadow' not found in environment 'main'.

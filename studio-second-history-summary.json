@@ -1,0 +1,3027 @@
+{
+  "/comfymodal/history-v2/feed?limit=200&kind=mixed": {
+    "status": 200,
+    "keys": [
+      "status",
+      "items",
+      "next_cursor",
+      "limit",
+      "total",
+      "has_more"
+    ],
+    "total": 366,
+    "items": [
+      {
+        "id": "gen_acfcedc2fabb",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37993302000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_a535e19083c8",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2026-08-14T18:41:42.059+00:00",
+        "duration_ms": 59,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_9e099bf63fa6",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37993302000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_990d862c019b",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2026-08-14T18:41:42.151+00:00",
+        "duration_ms": 151,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_9193c4eaf6f6",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37993302000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_82dc5bd32304",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a cat",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_3b6eb9786563",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": "p1",
+        "preset": "p1",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_0a96b703bd72",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:42Z",
+        "started_at": "2026-08-14T18:41:42Z",
+        "completed_at": "2026-08-14T18:41:42.642+00:00",
+        "duration_ms": 642,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_d1a7323cf6e2",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37993301000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_c5d4c4740543",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": "2026-08-14T18:41:41.247+00:00",
+        "duration_ms": 247,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "aerial view of coastline",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_b155cba5aa6f",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_ac8679d2645b",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_a8b087555b77",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": "2026-08-14T18:41:41.111+00:00",
+        "duration_ms": 111,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "Golden Gate Bridge at dusk",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_a452006200ce",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_8420e3251bf8",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": "2026-08-14T18:41:41.202+00:00",
+        "duration_ms": 202,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a beautiful sunset over mountains",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_6bfdcd97bacc",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_63a60fdac52d",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": "2026-08-14T18:41:41.157+00:00",
+        "duration_ms": 157,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "portrait",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_53da32c06537",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_4cda7725e55a",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_4cbf84fb76b1",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:41:41Z",
+        "started_at": "2026-08-14T18:41:41Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 1,
+        "has_image": true,
+        "original_available": true
+      },
+      {
+        "id": "test_nd_1772825348816",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:41:32.547+00:00",
+        "started_at": "2026-08-14T18:41:32.547+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_1772825348752",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:41:32.519+00:00",
+        "started_at": "2026-08-14T18:41:32.519+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_1772825348688",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:41:32.500+00:00",
+        "started_at": "2026-08-14T18:41:32.500+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "gen_7745e51875c5",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:53Z",
+        "started_at": "2026-08-14T18:30:53Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": "p1",
+        "preset": "p1",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_db97126f9719",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_97bdb651ffd9",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37992652000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_948a607cc4ff",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2026-08-14T18:30:52.697+00:00",
+        "duration_ms": 697,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_850239892855",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_76c57aa6c62a",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37992652000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_64dbeef9e58d",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a cat",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_5cc327061218",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37992652000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_4088e478b67a",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37992652000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_173798279b12",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2026-08-14T18:30:52.436+00:00",
+        "duration_ms": 436,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_101bfc420242",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": "2026-08-14T18:30:52.368+00:00",
+        "duration_ms": 368,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_0533aa9804e8",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:52Z",
+        "started_at": "2026-08-14T18:30:52Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 1,
+        "has_image": true,
+        "original_available": true
+      },
+      {
+        "id": "gen_fb62e7b52d56",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_d478efa8e393",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_946faa247a73",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": "2026-08-14T18:30:51.431+00:00",
+        "duration_ms": 431,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "portrait",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_7784573b787e",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": "2026-08-14T18:30:51.518+00:00",
+        "duration_ms": 518,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "aerial view of coastline",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_4285effa260e",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": "2026-08-14T18:30:51.475+00:00",
+        "duration_ms": 475,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a beautiful sunset over mountains",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_388249406780",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_218ee873d771",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_0a14141ef284",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T18:30:51Z",
+        "started_at": "2026-08-14T18:30:51Z",
+        "completed_at": "2026-08-14T18:30:51.386+00:00",
+        "duration_ms": 386,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "Golden Gate Bridge at dusk",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "test_nd_2711564405840",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:30:42.952+00:00",
+        "started_at": "2026-08-14T18:30:42.952+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2711564405776",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:30:42.925+00:00",
+        "started_at": "2026-08-14T18:30:42.925+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2711564405712",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:30:42.907+00:00",
+        "started_at": "2026-08-14T18:30:42.907+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2531844557328",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:04:51.108+00:00",
+        "started_at": "2026-08-14T18:04:51.108+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2531844557264",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:04:51.067+00:00",
+        "started_at": "2026-08-14T18:04:51.067+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2531844557200",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T18:04:51.045+00:00",
+        "started_at": "2026-08-14T18:04:51.045+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "gen_7683f89c7587",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T16:20:54Z",
+        "started_at": "2026-08-14T16:20:54Z",
+        "completed_at": "2026-08-14T16:20:54.621+00:00",
+        "duration_ms": 621,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": "preset_8238cf8b69b54b2e",
+        "preset": "7-30-26",
+        "preset_name": "7-30-26",
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_f1a0ad05fbe7",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:16Z",
+        "started_at": "2026-08-14T03:36:16Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a cat",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_9fac17e417ea",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:16Z",
+        "started_at": "2026-08-14T03:36:16Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": "p1",
+        "preset": "p1",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_fe0b0a772d5a",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 1,
+        "has_image": true,
+        "original_available": true
+      },
+      {
+        "id": "gen_d8be3e78bdc2",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37938975000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_c96ea3fa11ba",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2026-08-14T03:36:15.502+00:00",
+        "duration_ms": 502,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_a1b489c0e2e0",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2026-08-14T03:36:15.425+00:00",
+        "duration_ms": 425,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_97dd03a9b6ed",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37938975000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_9491e4258bf5",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_5c46fb35850e",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37938975000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_2b198a222753",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2026-08-14T03:36:15.845+00:00",
+        "duration_ms": 845,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_190dd55ba862",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37938975000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_02853613bf31",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:15Z",
+        "started_at": "2026-08-14T03:36:15Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_fa02582bc92f",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_c8d6e07b2f27",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_6cf243778756",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": "2026-08-14T03:36:14.337+00:00",
+        "duration_ms": 337,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "portrait",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_6b1f060c9014",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": "2026-08-14T03:36:14.437+00:00",
+        "duration_ms": 437,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "aerial view of coastline",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_2e04310e3312",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_227186abe2ad",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_105d2ae115e9",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": "2026-08-14T03:36:14.386+00:00",
+        "duration_ms": 386,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a beautiful sunset over mountains",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_0ad667b2ee67",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T03:36:14Z",
+        "started_at": "2026-08-14T03:36:14Z",
+        "completed_at": "2026-08-14T03:36:14.286+00:00",
+        "duration_ms": 286,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "Golden Gate Bridge at dusk",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "test_nd_2297761172368",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T03:35:46.331+00:00",
+        "started_at": "2026-08-14T03:35:46.331+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2297761172304",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T03:35:46.302+00:00",
+        "started_at": "2026-08-14T03:35:46.302+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "test_nd_2297761172240",
+        "status": "draft",
+        "kind": "experiment",
+        "created_at": "2026-08-14T03:35:46.282+00:00",
+        "started_at": "2026-08-14T03:35:46.282+00:00",
+        "completed_at": null,
+        "duration_ms": null,
+        "preset": ""
+      },
+      {
+        "id": "gen_81abd691b4f1",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:51Z",
+        "started_at": "2026-08-14T02:54:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "a cat",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_24a2048e8cd1",
+        "status": "running",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:51Z",
+        "started_at": "2026-08-14T02:54:51Z",
+        "completed_at": null,
+        "duration_ms": null,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": "p1",
+        "preset": "p1",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_ba936db16449",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:50Z",
+        "started_at": "2026-08-14T02:54:50Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37936490000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_659e8d59e2db",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:50Z",
+        "started_at": "2026-08-14T02:54:50Z",
+        "completed_at": "2026-08-14T02:54:50.676+00:00",
+        "duration_ms": 676,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_5bf984c4628f",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:50Z",
+        "started_at": "2026-08-14T02:54:50Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37936490000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_01539c8dadea",
+        "status": "failed",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:50Z",
+        "started_at": "2026-08-14T02:54:50Z",
+        "completed_at": "2025-06-01T01:00:00Z",
+        "duration_ms": -37936490000,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      },
+      {
+        "id": "gen_dfa3f2eff7eb",
+        "status": "completed",
+        "kind": "generation",
+        "created_at": "2026-08-14T02:54:49Z",
+        "started_at": "2026-08-14T02:54:49Z",
+        "completed_at": "2026-08-14T02:54:49.968+00:00",
+        "duration_ms": 968,
+        "workflow_id": null,
+        "workflow_name": null,
+        "preset_id": null,
+        "preset": "",
+        "preset_name": null,
+        "prompt": "",
+        "output_count": 0,
+        "has_image": false,
+        "original_available": false
+      }
+    ]
+  },
+  "/comfymodal/run-history?limit=50": {
+    "status": 200,
+    "keys": [
+      "status",
+      "runs",
+      "total",
+      "limit",
+      "offset"
+    ],
+    "total": 824,
+    "items": [
+      {
+        "run_id": "r_11164354e458",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:46Z",
+        "completed_at": "2026-08-14T18:12:46Z",
+        "extra": {
+          "experiment_id": "play_0d719dfc56804f1c",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_ca441d85b942",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "extra": {
+          "experiment_id": "play_379fc2cbcb61478c",
+          "output_paths": [
+            "test_1ec9d9b9c105.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_911e1f6220bb",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "extra": {
+          "experiment_id": "play_9696c327b85e496a",
+          "output_paths": [
+            "test_d83d80ef24eb.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_af3a48cc1883",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "extra": {
+          "experiment_id": "play_d8c4db414f9c411f",
+          "output_paths": [
+            "test_da409fd43902.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_9e202b4bd7a5",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "extra": {
+          "experiment_id": "play_5217f4ca8d4d4b86",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_d1e197d66346",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "extra": {
+          "experiment_id": "play_5a411395894f41c4",
+          "output_paths": [
+            "test_6959586db508.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_1e7565d7a191",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "extra": {
+          "experiment_id": "play_ee8d1a7271a4494b",
+          "output_paths": [
+            "test_a668bdcb3b3b.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_b5ebff558585",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "extra": {
+          "experiment_id": "play_a2ac6e51c84545b9",
+          "output_paths": [
+            "test_357e0d849914.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_67fa01ab08cc",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T16:20:54Z",
+        "completed_at": "2026-08-14T16:20:54Z",
+        "extra": {
+          "experiment_id": "play_cf3401e49a7f41dc",
+          "playground_run": true,
+          "primary_asset_id": "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260",
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": ""
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_8238cf8b69b54b2e",
+          "studio_preset_label": "7-30-26",
+          "studio_snapshot_id": "snap_0f15d89f6c7b4fa8",
+          "workflow_hash": "2e43d4c0ba3b82c0a96edef5decfc861e756718c7adce3ba91559203231c0f77"
+        }
+      },
+      {
+        "run_id": "r_fb53edb8c101",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "extra": {
+          "experiment_id": "play_397df19fb4354c4f",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_94c6125b5133",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "extra": {
+          "experiment_id": "play_8c4f7f998f25449d",
+          "output_paths": [
+            "test_ad86d85fac1f.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_82cea5d5ac7c",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "extra": {
+          "experiment_id": "play_9a34d9967d274616",
+          "output_paths": [
+            "test_50fffb2caf54.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_95b16197f8df",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "extra": {
+          "experiment_id": "play_499e4001f95045c2",
+          "output_paths": [
+            "test_af3b50ce9aab.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_96f494c7c21d",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:32Z",
+        "completed_at": "2026-08-12T02:06:32Z",
+        "extra": {
+          "experiment_id": "play_6fa4b790d5bb4242",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_c4acba085ff4",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "extra": {
+          "experiment_id": "play_1007d07084be4b27",
+          "output_paths": [
+            "test_86f274a1a8e8.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_fa7da2d5abcf",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "extra": {
+          "experiment_id": "play_5c1fb740c0074fbe",
+          "output_paths": [
+            "test_8e94828e3a77.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_fbb42bcbc0fd",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "extra": {
+          "experiment_id": "play_251bb01081a24097",
+          "output_paths": [
+            "test_dd317b242113.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_ef413e864655",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "extra": {
+          "experiment_id": "play_af3696bed0c84bdb",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_5dc5ac9efc81",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "extra": {
+          "experiment_id": "play_4bd5e3176cc344a3",
+          "output_paths": [
+            "test_899fec5595e4.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_e9fdd32286fe",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "extra": {
+          "experiment_id": "play_89f35b7c576649b5",
+          "output_paths": [
+            "test_0ca46ff3bc4c.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_91d23dc4ca0a",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "extra": {
+          "experiment_id": "play_6ac97b90a82e44f3",
+          "output_paths": [
+            "test_cd2cdc456dab.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_a4c0b8913b3f",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "extra": {
+          "experiment_id": "play_878fc25ffa9f4111",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_dca8a7a0147b",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "extra": {
+          "experiment_id": "play_15e876ce105e46dc",
+          "output_paths": [
+            "test_64de78882f41.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_f14c579c2ee9",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "extra": {
+          "experiment_id": "play_7e0d325b8b5f442c",
+          "output_paths": [
+            "test_d3df17d3ae25.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_ed9c4d0df806",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "extra": {
+          "experiment_id": "play_aaaa83f5113444e6",
+          "output_paths": [
+            "test_542a1bd8c6b4.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_327129a63591",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:52:29Z",
+        "completed_at": "2026-08-01T03:52:29Z",
+        "extra": {
+          "experiment_id": "play_151a76730f1b4fe0",
+          "output_paths": [
+            "production_867654c7_107_b_0.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": ""
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_8238cf8b69b54b2e",
+          "studio_preset_label": "7-30-26",
+          "studio_snapshot_id": "snap_0f15d89f6c7b4fa8",
+          "workflow_hash": "2e43d4c0ba3b82c0a96edef5decfc861e756718c7adce3ba91559203231c0f77"
+        }
+      },
+      {
+        "run_id": "r_fb4a17558734",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:02:25Z",
+        "completed_at": "2026-08-01T03:02:25Z",
+        "extra": {
+          "experiment_id": "play_4a87f8e9751146dc",
+          "output_paths": [
+            "production_04912485_107_b_0.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": ""
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_8238cf8b69b54b2e",
+          "studio_preset_label": "7-30-26",
+          "studio_snapshot_id": "snap_0f15d89f6c7b4fa8",
+          "workflow_hash": "354c8c033dce2064a640caf263e869086b713d33fe88b016f46e995e2fe9053d"
+        }
+      },
+      {
+        "run_id": "r_bcebf3715c6c",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "extra": {
+          "experiment_id": "play_0453ee09dbe04917",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_1fb0ef66621b",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "extra": {
+          "experiment_id": "play_56dee3be72164219",
+          "output_paths": [
+            "test_51d8c2ff7294.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_d1b7144fb555",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "extra": {
+          "experiment_id": "play_881ddf9a82ca4f88",
+          "output_paths": [
+            "test_7a9d01486ddd.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_49f553b0fca1",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:24Z",
+        "completed_at": "2026-08-01T02:47:24Z",
+        "extra": {
+          "experiment_id": "play_6d4fdbb7e58e46ae",
+          "output_paths": [
+            "test_9d0299c89c26.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_64e4e2badaac",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:49Z",
+        "completed_at": "2026-08-01T02:45:49Z",
+        "extra": {
+          "experiment_id": "play_3af098ddc531491c",
+          "output_paths": [
+            "production_05022fd1_107_b_0.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "a small red apple on a wooden table, studio lighting"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_8238cf8b69b54b2e",
+          "studio_preset_label": "7-30-26",
+          "studio_snapshot_id": "snap_0f15d89f6c7b4fa8",
+          "workflow_hash": "f5ec544e016784fea5985ef5519e2f68727936d34a570c114a32070b6fec500a"
+        }
+      },
+      {
+        "run_id": "r_6c79ea215de1",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "extra": {
+          "experiment_id": "play_b19ed18e292a4129",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_84e60fba215f",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "extra": {
+          "experiment_id": "play_82e4a589dbe244f3",
+          "output_paths": [
+            "test_d3db469c8970.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_60a1e4b0e6a6",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "extra": {
+          "experiment_id": "play_06f3a1f743aa437d",
+          "output_paths": [
+            "test_15ba28c63bd2.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_7149a6d46000",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:25Z",
+        "completed_at": "2026-08-01T02:45:25Z",
+        "extra": {
+          "experiment_id": "play_cbe35a79b5074ada",
+          "output_paths": [
+            "test_162a073d833d.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_0c681bb636bd",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "extra": {
+          "experiment_id": "play_ad2cd473ce4340ae",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_1725ae278f85",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "extra": {
+          "experiment_id": "play_358f31028b894a1d",
+          "output_paths": [
+            "test_e5c22554facb.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_56d59b23fb3d",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "extra": {
+          "experiment_id": "play_d0abed7275ab4c43",
+          "output_paths": [
+            "test_f2b94302b826.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_80be157a61e5",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "extra": {
+          "experiment_id": "play_14f2feea3cd84ef5",
+          "output_paths": [
+            "test_55491e4ccbdb.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_b3f4042b2669",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:23:40Z",
+        "completed_at": "2026-08-01T01:23:40Z",
+        "extra": {
+          "experiment_id": "play_894e62ef980040d9",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_11754b6ff360",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:23:40Z",
+        "completed_at": "2026-08-01T01:23:40Z",
+        "extra": {
+          "experiment_id": "play_e942a7db11584397",
+          "output_paths": [
+            "test_0310c730dc86.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_4e833c56817b",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:23:40Z",
+        "completed_at": "2026-08-01T01:23:40Z",
+        "extra": {
+          "experiment_id": "play_15f07894cad443d5",
+          "output_paths": [
+            "test_cb9df0a4cdbe.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_99b41dadc4d8",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:23:40Z",
+        "completed_at": "2026-08-01T01:23:40Z",
+        "extra": {
+          "experiment_id": "play_c49ffb4fda2043e2",
+          "output_paths": [
+            "test_8528c01955cb.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_8f3d5f5a5292",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:18:32Z",
+        "completed_at": "2026-08-01T01:18:32Z",
+        "extra": {
+          "experiment_id": "play_c499fbb8a53f4c1c",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_91635c5eff7e",
+        "status": "error",
+        "kind": "studio_run",
+        "started_at": "2026-07-31T17:48:56Z",
+        "completed_at": "2026-07-31T17:52:35Z",
+        "extra": {
+          "_error_detail": "_emit_dependency_validation_v2() got an unexpected keyword argument 'cheap_check_ms'",
+          "error": "Internal error processing Studio execution. Retry or inspect the run details.",
+          "error_code": "STUDIO_EXECUTION_ERROR",
+          "experiment_id": "studio_d308ba9b968e4ce3",
+          "preset_label": "7-30-26",
+          "requested_controls": {
+            "steps": 8
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_8238cf8b69b54b2e",
+          "studio_snapshot_id": "snap_0f15d89f6c7b4fa8",
+          "submitted_at": "2026-07-31T17:48:56Z",
+          "workflow_hash": "75a1e2e42749153b684b61b878c5a1fec34547970acd1f36c8625cacf25698bd"
+        }
+      },
+      {
+        "run_id": "r_1bc889ca7c41",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-07-31T17:44:05Z",
+        "completed_at": "2026-07-31T17:44:05Z",
+        "extra": {
+          "experiment_id": "play_b4579d254150407c",
+          "playground_run": true,
+          "requested_controls": {},
+          "workflow_hash": "f84d3ce8cf477521d897d9b1957a7993dbe9b396e88cd65fe7c86eaffa6e42fa"
+        }
+      },
+      {
+        "run_id": "r_fb52b5ba1852",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-07-31T17:44:05Z",
+        "completed_at": "2026-07-31T17:44:05Z",
+        "extra": {
+          "experiment_id": "play_d82264a82bae47f7",
+          "output_paths": [
+            "test_cffeaabe5d2a.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_618427b2ef58",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-07-31T17:44:05Z",
+        "completed_at": "2026-07-31T17:44:05Z",
+        "extra": {
+          "experiment_id": "play_436b232d1dd64879",
+          "output_paths": [
+            "test_a93c06648225.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      },
+      {
+        "run_id": "r_61c29adc4fe6",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-07-31T17:44:05Z",
+        "completed_at": "2026-07-31T17:44:05Z",
+        "extra": {
+          "experiment_id": "play_09fece3082b24f7b",
+          "output_paths": [
+            "test_9f3115958a2f.png"
+          ],
+          "playground_run": true,
+          "requested_controls": {
+            "negative_prompt": "",
+            "prompt": "hello"
+          },
+          "studio_feature_id": "txt2img",
+          "studio_preset_id": "preset_play_test",
+          "studio_preset_label": "Playground Test Preset",
+          "studio_snapshot_id": "snap_play_test",
+          "workflow_hash": "0a831f029c275dd3f5f20767d6faaf99d25cc2fa49fb9c65055702ccaf997597"
+        }
+      }
+    ]
+  },
+  "/comfymodal/history?page=1&page_size=50": {
+    "status": 200,
+    "keys": [
+      "status",
+      "items",
+      "page",
+      "page_size",
+      "total",
+      "has_more"
+    ],
+    "total": 824,
+    "items": [
+      {
+        "run_id": "r_11164354e458",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:46Z",
+        "completed_at": "2026-08-14T18:12:46Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_af3a48cc1883",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_911e1f6220bb",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_ca441d85b942",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T18:12:45Z",
+        "completed_at": "2026-08-14T18:12:45Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_b5ebff558585",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_1e7565d7a191",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_d1e197d66346",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_9e202b4bd7a5",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T17:14:32Z",
+        "completed_at": "2026-08-14T17:14:32Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_67fa01ab08cc",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-14T16:20:54Z",
+        "completed_at": "2026-08-14T16:20:54Z",
+        "duration_ms": null,
+        "preset_id": "preset_8238cf8b69b54b2e",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_96fc1e25325f",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-12T16:06:00Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_765def57ee7e",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-12T15:57:53Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_306811a52006",
+        "status": "error",
+        "kind": "ordinary",
+        "started_at": "2026-08-12T14:56:57Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_82cea5d5ac7c",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_94c6125b5133",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_95b16197f8df",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_fb53edb8c101",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:10:00Z",
+        "completed_at": "2026-08-12T02:10:00Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_96f494c7c21d",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:32Z",
+        "completed_at": "2026-08-12T02:06:32Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_c4acba085ff4",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_fa7da2d5abcf",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_fbb42bcbc0fd",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-12T02:06:31Z",
+        "completed_at": "2026-08-12T02:06:31Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_d13beb45c5fb",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-09T14:59:35Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_a44802267d5c",
+        "status": "error",
+        "kind": "ordinary",
+        "started_at": "2026-08-09T14:54:33Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_26d8dfa1cf5e",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-09T14:53:49Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_8a66258c4caa",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-06T17:19:10Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_f82b795557df",
+        "status": "deployed",
+        "kind": "deploy",
+        "started_at": "2026-08-06T17:13:13Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_191246f76843",
+        "status": "success",
+        "kind": "ordinary",
+        "started_at": "2026-08-05T22:18:27Z",
+        "completed_at": "",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_5dc5ac9efc81",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_91d23dc4ca0a",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_e9fdd32286fe",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_ef413e864655",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T21:21:16Z",
+        "completed_at": "2026-08-01T21:21:16Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_a4c0b8913b3f",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_dca8a7a0147b",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_ed9c4d0df806",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_f14c579c2ee9",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:59:09Z",
+        "completed_at": "2026-08-01T03:59:09Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_327129a63591",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:52:29Z",
+        "completed_at": "2026-08-01T03:52:29Z",
+        "duration_ms": null,
+        "preset_id": "preset_8238cf8b69b54b2e",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_fb4a17558734",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T03:02:25Z",
+        "completed_at": "2026-08-01T03:02:25Z",
+        "duration_ms": null,
+        "preset_id": "preset_8238cf8b69b54b2e",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_1fb0ef66621b",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_bcebf3715c6c",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_d1b7144fb555",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:25Z",
+        "completed_at": "2026-08-01T02:47:25Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_49f553b0fca1",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:47:24Z",
+        "completed_at": "2026-08-01T02:47:24Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_64e4e2badaac",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:49Z",
+        "completed_at": "2026-08-01T02:45:49Z",
+        "duration_ms": null,
+        "preset_id": "preset_8238cf8b69b54b2e",
+        "prompt": "a small red apple on a wooden table, studio lighting",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_60a1e4b0e6a6",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_6c79ea215de1",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_84e60fba215f",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:26Z",
+        "completed_at": "2026-08-01T02:45:26Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_7149a6d46000",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T02:45:25Z",
+        "completed_at": "2026-08-01T02:45:25Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_0c681bb636bd",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "duration_ms": null,
+        "preset_id": "",
+        "prompt": "",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_1725ae278f85",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_56d59b23fb3d",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_80be157a61e5",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:24:37Z",
+        "completed_at": "2026-08-01T01:24:37Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      },
+      {
+        "run_id": "r_11754b6ff360",
+        "status": "completed",
+        "kind": "playground_run",
+        "started_at": "2026-08-01T01:23:40Z",
+        "completed_at": "2026-08-01T01:23:40Z",
+        "duration_ms": null,
+        "preset_id": "preset_play_test",
+        "prompt": "hello",
+        "output_count": 0
+      }
+    ]
+  },
+  "diagnostics": {
+    "runId": "3d49a5c3-9da1-449d-90a7-efa086e04057",
+    "requestId": "5b37c7cc-cbd2-48ef-99f9-6c0908f1cd0d",
+    "backendRunId": null,
+    "experimentId": null,
+    "status": "failed",
+    "isTerminal": true,
+    "eventCount": 2,
+    "stage": "created",
+    "sampler": null,
+    "progress": null,
+    "marks": [
+      {
+        "name": "run_click",
+        "wallMs": 1786735449955,
+        "perfMs": 11622513.200000018,
+        "deltaMs": 0
+      },
+      {
+        "name": "validation_start",
+        "wallMs": 1786735449959,
+        "perfMs": 11622517.300000012,
+        "deltaMs": 4
+      },
+      {
+        "name": "validation_end",
+        "wallMs": 1786735449960,
+        "perfMs": 11622517.300000012,
+        "deltaMs": 5
+      },
+      {
+        "name": "build_start",
+        "wallMs": 1786735449989,
+        "perfMs": 11622546.599999994,
+        "deltaMs": 34
+      },
+      {
+        "name": "build_end",
+        "wallMs": 1786735449989,
+        "perfMs": 11622546.700000018,
+        "deltaMs": 34
+      },
+      {
+        "name": "http_invoked",
+        "wallMs": 1786735449989,
+        "perfMs": 11622546.700000018,
+        "deltaMs": 34
+      },
+      {
+        "name": "backend_ack",
+        "wallMs": 1786735457517,
+        "perfMs": 11630074.400000006,
+        "deltaMs": 7562
+      },
+      {
+        "name": "terminal",
+        "wallMs": 1786735457517,
+        "perfMs": 11630075,
+        "deltaMs": 7562
+      }
+    ],
+    "cells": {}
+  }
+}

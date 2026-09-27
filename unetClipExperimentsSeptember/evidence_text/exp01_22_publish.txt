@@ -1,0 +1,14 @@
+Exp01 operator-authorized standalone Volume publication (no redeploy).
+Command: python C:\Users\parla\AppData\Local\Temp\opencode\exp01_publish.py .
+  (control-plane's own cli._invoke_golden_publisher under DeployLock; script outside repo)
+Authorization: explicit user "1" (publish over foreign Volume content).
+Pre-checks passed: local_generation matched fresh tree; lock acquired (no rival holder).
+Exit: 0.
+
+local_generation=e1d1c266e03fb7ef342d396d27bc75f4e3072408a4083464643fa499cb12ebb0
+lock=acquired
+[custom_nodes.publish] decision=published reason=published_verified generation=e1d1c266e03f schema=2 policy=1
+publish_action=published reason=published_verified
+publish_generation=e1d1c266e03fb7ef342d396d27bc75f4e3072408a4083464643fa499cb12ebb0
+PUBLISH_OK (verify with source-probe next)
+lock=released
