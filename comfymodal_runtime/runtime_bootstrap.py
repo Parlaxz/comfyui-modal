@@ -1658,12 +1658,28 @@ class RuntimeBootstrap:
                 if not _manifest:
                     _source = "manifest_empty"
                 else:
-                    _writer = self.write_runtime_state_generation_marker
-                    _baseline = (
-                        _writer(_root, reason=reason, files_manifest=_manifest) or ""
-                    )
+                    # The runtime-state Volume is shared by deployments. Keep
+                    # construction idempotent when its correctness manifest is
+                    # unchanged; otherwise a fresh UUID from one deployment
+                    # needlessly invalidates another deployment's snapshot.
+                    _existing = self.read_runtime_state_generation_marker(_root)
+                    if (
+                        isinstance(_existing, dict)
+                        and int(_existing.get("schema_version", 0) or 0)
+                        == RUNTIME_STATE_GENERATION_SCHEMA_VERSION
+                        and isinstance(_existing.get("generation"), str)
+                        and _existing.get("generation")
+                        and _existing.get("files") == _manifest
+                    ):
+                        _baseline = str(_existing["generation"])
+                        _source = "reused_matching_runtime_config_generation_json"
+                    else:
+                        _writer = self.write_runtime_state_generation_marker
+                        _baseline = (
+                            _writer(_root, reason=reason, files_manifest=_manifest) or ""
+                        )
                     self.state.runtime_state_generation_marker_written = bool(_baseline)
-                    if _baseline:
+                    if _baseline and _source != "reused_matching_runtime_config_generation_json":
                         _source = "runtime_config_generation_json"
         except Exception as _gen_exc:
             _source = f"write_error:{type(_gen_exc).__name__}"

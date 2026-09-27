@@ -578,6 +578,23 @@ class RuntimeStateReloadGuardTest(unittest.TestCase):
         self.assertEqual(payload["files"], manifest)
         self.assertEqual(calls, [])  # construction marker write is not a reload
 
+    def test_finalize_reuses_matching_shared_volume_marker(self) -> None:
+        _write_prescan(self.root_dir)
+        manifest = build_runtime_state_manifest(self.root_dir)
+        write_runtime_state_generation_marker(
+            self.root_dir, generation="d" * 32, files_manifest=manifest
+        )
+        bootstrap, calls = _make_bootstrap(
+            self.root_dir,
+            manifest_files=("prescan_custom_nodes.json", "gpu_capacity_frozen.json"),
+        )
+
+        gen = bootstrap.finalize_runtime_state_generation()
+
+        self.assertEqual(gen, "d" * 32)
+        self.assertEqual(bootstrap.state.snapshot_runtime_state_generation, gen)
+        self.assertEqual(calls, [])
+
     def test_finalize_required_file_missing_fail_closed(self) -> None:
         # No prescan file in the construction root -> required-file read
         # failure -> no usable baseline.
