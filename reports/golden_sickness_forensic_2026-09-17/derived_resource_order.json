@@ -1,0 +1,107 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "source": "per_request.json identity.* + transport.*.created_vs_reused (computed_valid rows only)",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "created_vs_reused_by_arm": {
+    "sham": {
+      "clip": {
+        "CREATED": 55
+      },
+      "unet": {
+        "REUSED": 55
+      }
+    },
+    "split": {
+      "clip": {
+        "CREATED": 86
+      },
+      "unet": {
+        "CREATED": 86
+      }
+    }
+  },
+  "by_clip_resource": {
+    "A": {
+      "n": 79,
+      "arms": {
+        "sham": 34,
+        "split": 45
+      },
+      "clip_sick": 8,
+      "unet_sick": 8,
+      "both_sick": 3,
+      "clip_sick_rate": 0.101266,
+      "unet_sick_rate": 0.101266,
+      "severity_median": 4.306717
+    },
+    "B": {
+      "n": 62,
+      "arms": {
+        "sham": 21,
+        "split": 41
+      },
+      "clip_sick": 6,
+      "unet_sick": 4,
+      "both_sick": 3,
+      "clip_sick_rate": 0.096774,
+      "unet_sick_rate": 0.064516,
+      "severity_median": 4.342413
+    }
+  },
+  "by_direction": {
+    "A->A": {
+      "n": 34,
+      "arm": {
+        "sham": 34
+      },
+      "clip_sick_rate": 0.147059,
+      "unet_sick_rate": 0.147059,
+      "both_sick": 3
+    },
+    "A->B": {
+      "n": 45,
+      "arm": {
+        "split": 45
+      },
+      "clip_sick_rate": 0.066667,
+      "unet_sick_rate": 0.066667,
+      "both_sick": 0
+    },
+    "B->A": {
+      "n": 41,
+      "arm": {
+        "split": 41
+      },
+      "clip_sick_rate": 0.073171,
+      "unet_sick_rate": 0.02439,
+      "both_sick": 1
+    },
+    "B->B": {
+      "n": 21,
+      "arm": {
+        "sham": 21
+      },
+      "clip_sick_rate": 0.142857,
+      "unet_sick_rate": 0.142857,
+      "both_sick": 2
+    }
+  },
+  "direction_contrast": {
+    "A_to_B_n": 45,
+    "B_to_A_n": 41,
+    "unet_sick_fisher_p": 0.617717
+  },
+  "note": "clip arena is CREATED in all 141 computed_valid requests; unet arena is REUSED only in the 55 valid same-resource (sham) requests and CREATED in all 86 valid switched-resource (split) requests, matching the arm split exactly."
+}

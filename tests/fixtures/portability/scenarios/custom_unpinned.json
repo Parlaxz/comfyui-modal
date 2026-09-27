@@ -1,0 +1,39 @@
+{
+  "audit_basis": [
+    "PHASE_G5 §6 provenance declared",
+    "PHASE_G2 §4.1 zip/manual installs"
+  ],
+  "description": "Package/version known, exact source commit absent (revision is a declared version string). Provenance level declared.",
+  "expected": {
+    "issue_codes": [
+      "custom_node_unpinned"
+    ],
+    "provenance_quality": "declared",
+    "risk_level_hint_nonnormative": "medium",
+    "signals": {
+      "custom_node_count": 1,
+      "custom_node_revision_pinned": false,
+      "custom_repo_count": 1,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/custom_unpinned.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "6c8c57ca42717ef3390f696e17296d3f260b9894d10dae3c9c3fd83df98dbcee",
+  "scenario_id": "custom_unpinned",
+  "title": "Custom node with declared-only provenance"
+}

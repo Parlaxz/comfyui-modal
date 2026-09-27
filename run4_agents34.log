@@ -1,0 +1,429 @@
+[v2.env_profile]
+env_profile=inherit
+thread_policy=TBASE
+snapshot_model_order=O0
+baseline_cpu_request=12
+baseline_memory_request=32768
+memory_request_mb=32768
+vae_policy=v1
+release_gpu_after_request=1
+cpu_model_snapshot=1
+native_fast_disk_unet=1
+publish_restore_plan=0
+vae_snapshot=1
+clip_conditioning_cache=1
+unet_activation_mode=late
+vae_activation_mode=sampling_end
+persistent_local_handle=1
+full_trace=0
+residency_diagnostics=0
+deep_model_diag=0
+pagefault_tracking=0
+eviction_enabled=1
+eviction_role=clip_vae
+eviction_idle_seconds=0
+prefill_lanes=critical
+prefill_wait_for_unet=0
+restore_torch_threads=none
+variance_pretouch=0
+volume_read_run_count=3
+restore_only_app=stable-modal-comfy-v2-restore-only-shadow
+restore_only_run_count=6
+snapshot_exclude_unet=1
+=== Running one V2 benchmark trial against the existing deployment ===
+=== Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
+{"guard": {"allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768, "changed_axes": []}, "runtime_shape": {"cpu_request": 12, "malloc_arena_max": null, "memory_request": 32768, "mkl_num_threads": null, "numexpr_num_threads": null, "omp_num_threads": null, "openblas_num_threads": null, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "snapshot_model_order": "O0", "thread_policy": "TBASE", "torch_interop_threads": null, "torch_intraop_threads": null}}
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+cpu_snapshot_unet_mode=reuse
+[v2.benchmark] phase=execute_plan_start
+[active_profile.publish] decision=skipped_post_snapshot_noop requested=inherit container_default=inherit cpu_model_snapshot=1 snapshot_build_phase=0 consumer_requires_publication=0 checker_remote=0 setter_remote=0 active_profile_noop_ms=0.0
+[v2.restore_publish] skipped reason=flag_disabled
+[v2.seed_build] source=invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=dabf819d1604b03a loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.local_submission_breakdown.pre_dispatch] request_id=v2-benchmark-0-30177c6e92fc local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=47.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=47.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15678 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.local_handle] owner_ready pid=26296
+[v2.local_handle] decision=persistent_hit
+[v2.local_submission_breakdown] request_id=v2-benchmark-0-30177c6e92fc local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=47.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=15.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=47.0 generator_create_ms=15.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=62.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15678 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.request_origin] request_id=v2-benchmark-0-30177c6e92fc trigger_source=benchmark local_prompt_enqueued_unix_ns=None local_prompt_ack_ready_unix_ns=None modal_generator_created_unix_ns=1786515174044892100 modal_submission_attempt_unix_ns=1786515174044892100 modal_first_event_received_unix_ns=1786515185308718100 t0_to_t1_ms=0.892 t1_to_queue_enqueue_ms=None local_receive_to_enqueue_ms=None queue_wait_before_worker_ms=None plan_build_ms=47.0 active_profile_ms=0.0 handle_lookup_ms=15.0 payload_serialize_ms=0.0 local_residual_ms=0.0 clock_reconciliation_residual_ms=0.0 route_unattributed_ms=None worker_unattributed_ms=None reconciliation_status=incomplete missing_stages=local_receive_to_enqueue_ms overlap_error= modal_input_id=in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0 trigger_to_local_receive_ms=0.892 local_receive_to_generator_create_start_ms=54.0 generator_create_ms=3.0 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=11263.826 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=551.815 restore_end_to_modal_method_entry_ms=32.949 modal_method_entry_to_executor_ms=209.221 submission_to_remote_python_resume_ms=10672.985 unexplained_pre_remote_ms=10679.062
+[v2.remote_request_origin] request_id=v2-benchmark-0-30177c6e92fc trigger_source=benchmark ui_trigger_unix_ms=1786515173987 local_receive_wall_unix_ns=1786515173987892480 local_receive_mono_ns=115642453000000 modal_generator_create_start_wall_unix_ns=1786515174041892700 modal_generator_create_start_mono_ns=115642500000000 modal_generator_created_wall_unix_ns=1786515174044892100 modal_generator_created_mono_ns=115642515000000 modal_first_iteration_start_wall_unix_ns=1786515174044892100 modal_first_iteration_start_mono_ns=115642515000000 modal_submission_attempt_wall_unix_ns=1786515174044892100 modal_submission_attempt_mono_ns=115642515000000 modal_first_remote_event_wall_unix_ns=1786515185308718100 modal_first_remote_event_mono_ns=115653765000000 modal_submission_boundary_source=first_iteration_proxy remote_python_resume_wall_unix_ns=1786515184717876736 restore_method_start_wall_unix_ns=1786515184717876736 restore_method_end_wall_unix_ns=1786515185269691392 modal_method_entry_wall_unix_ns=1786515185302640384 prompt_executor_invoke_start_wall_unix_ns=1786515185511861760 trigger_to_local_receive_ms=0.892 local_receive_to_generator_create_start_ms=54.0 generator_create_ms=3.0 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=11263.826 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=551.815 restore_end_to_modal_method_entry_ms=32.949 modal_method_entry_to_executor_ms=209.221 submission_to_remote_python_resume_ms=10672.985 unexplained_pre_remote_ms=10679.062 modal_input_id=in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0
+[v2.local_submission_breakdown.final] request_id=v2-benchmark-0-30177c6e92fc local_receive_to_worker_start_ms=0.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=0.0 worker_queue_ms=0.0 plan_build_ms=47.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=15.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=47.0 generator_create_ms=15.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=62.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=False profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=15678 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.0 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.0 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+{"run_index": 0, "request_id": "v2-benchmark-0-30177c6e92fc", "identity": {"app_name": "stable-modal-comfy-v2-restore-only-shadow", "class_name": "ModalRuntimeEntrypoint", "method_name": "run_plan_stream", "gpu": ["RTX-PRO-6000"], "cpu": 12, "memory_mb": 32768, "fingerprint": "3378579908274910dc43d104f59142e27d0dac2b3037457ac4622f41acb3e621", "runtime_shape": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "stored_snapshot_model_order": "O0", "restore_count": 1, "request_count": 1, "restored_instance_id": "1cfcae916715468796637f43024d93e1", "restore_session_id": "66c131eec2a8445a995bc8d9ad76acd6", "container_task_id": "ta-01KZT9MEERCYQC2CW1DQSDGTVR", "modal_container_id": "", "image_id": "im-fopBG65UjVS6vwA7IAPqUf", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east1", "modal_input_id": "in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0", "container_session_id": "aad499e898f94807"}, "runtime_shape": {"requested": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "deployed": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "observed": {"stage": "request_entry", "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "thread_policy": "TBASE", "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "native_thread_count": 48, "configured_omp": null, "configured_mkl": null, "configured_openblas": null, "configured_numexpr": null, "malloc_arena_max": null, "native_library_settings": {"OMP_NUM_THREADS": "12", "MKL_NUM_THREADS": "12", "OPENBLAS_NUM_THREADS": "12", "NUMEXPR_NUM_THREADS": null, "MALLOC_ARENA_MAX": null}, "torch_intraop_threads": 12, "torch_interop_threads": 14, "actual_torch_intraop_threads": 12, "actual_torch_interop_threads": 14, "requested_torch_intraop_threads": null, "requested_torch_interop_threads": null, "requested_vs_actual_match": true, "status": "baseline_passthrough", "error": "", "trace_id": "66f8e3afbfc34b73", "pid": 2, "thread_native_id": 2, "restored_instance_id": "1cfcae916715468796637f43024d93e1", "restore_session_id": "66c131eec2a8445a995bc8d9ad76acd6", "legacy_container_session_id": "aad499e898f94807", "container_task_id": "ta-01KZT9MEERCYQC2CW1DQSDGTVR", "modal_input_id": "in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0", "image_id": "im-fopBG65UjVS6vwA7IAPqUf", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east1", "app_name": "stable-modal-comfy-v2-restore-only-shadow", "class_name": "ModalRuntimeEntrypoint"}, "stored_snapshot_model_order": "O0", "snapshot_target_fingerprint": "3378579908274910dc43d104f59142e27d0dac2b3037457ac4622f41acb3e621", "guard": {"changed_axes": [], "allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768}, "construction_order_semantics": "model_construction_order_only"}, "timing": {"wall_ms": 22039.6, "handle_lookup_ms": 3.999, "submission_to_first_remote_event_ms": 11263.826, "command_to_response_ms": 22566.6, "submit2entry_ms": 11261.747, "t3b_to_t8_ms": 10461.736, "restore_total_ms": 549.312, "pre_sampler_ms": 4929.899, "sampler_ms": 3708.045, "vae_decode_ms": 387.521, "output_collection_ms": 7.653, "snapshot_callback_age_at_restore_ms": 829119.253, "snapshot_callback_to_command_start_ms": 817909.175, "command_start_to_restore_start_ms": 11209.877, "local_timing": {"t0_to_t1_ms": 0.892, "t1_to_queue_enqueue_ms": null, "local_receive_to_enqueue_ms": null, "local_body_read_ms": null, "local_json_parse_ms": null, "local_preflight_ms": null, "local_queue_lock_wait_ms": null, "local_queue_enqueue_ms": null, "queue_wait_before_worker_ms": null, "plan_build_ms": 47.0, "active_profile_ms": 0.0, "restore_plan_build_ms": null, "restore_publish_ms": null, "handle_lookup_ms": 15.0, "payload_serialize_ms": 0.0, "payload_materialization_ms": 0.0, "payload_size_measurement_ms": 0.0, "generator_create_ms": 3.0, "local_residual_ms": 0.0, "clock_reconciliation_residual_ms": 0.0, "route_unattributed_ms": null, "worker_unattributed_ms": null, "reconciliation_status": "incomplete", "missing_stages": ["local_receive_to_enqueue_ms"], "overlap_error": "", "stage_attribution_residual_ms": {"route_unattributed_ms": null, "worker_unattributed_ms": null, "missing_stages": ["local_receive_to_enqueue_ms"], "reconciliation_status": "incomplete", "overlap_error": ""}, "local_receive_to_generator_create_ms": 47.0, "generator_create_to_first_iteration_ms": 0.0, "first_iteration_to_first_remote_event_ms": 11263.826, "local_receive_to_actual_submission_ms": 62.0, "trigger_to_local_receive_ms": 0.892, "local_receive_to_generator_create_start_ms": 54.0, "generator_created_to_first_iteration_ms": 0.0, "remote_python_resume_to_restore_start_ms": 0.0, "restore_method_ms": 551.815, "restore_end_to_modal_method_entry_ms": 32.949, "modal_method_entry_to_executor_ms": 209.221, "submission_to_remote_python_resume_ms": 10672.985, "unexplained_pre_remote_ms": 10679.062}, "restore_breakdown": {"restore_total_ms": 549.312, "snapshot_callback_age_at_restore_ms": 829119.253, "models_symlink_ms": 2.33, "manager_offline_ms": 0.55, "reload_models_ms": 164.186, "reload_runtime_state_ms": 120.834, "v2_startup_custom_node_source_copy_ms": 2881.14, "sync_custom_nodes_ms": 2881.25, "install_requirements_ms": 0.01, "v2_startup_comfyui_path_startup_ms": 0.08, "comfyui_path_setup_ms": 0.13, "v2_startup_backend_startup_ms": 24496.07, "backend_startup_ms": 24496.55, "observe_generations_ms": 0.2, "snapshot_restore_ms": 529.13, "restore_gpu_state_ms": 236.489, "cuda_init_ms": 2.3, "v2_startup_snapshot_execution_seed_ms": 3.81, "initialize_cuda_ms": 2.257, "snapshot_identity_checks_ms": 0.0, "cpu_snapshot_retargeting_ms": 0.0}, "early_activation_total_ms": null, "queue_delay_ms": null, "cpu_snapshot_wait_ms": null, "dtype_layout_preparation_ms": null, "post_load_bookkeeping_ms": null, "submission_to_remote_python_resume_ms": 10672.985, "remote_python_resume_to_restore_start_ms": 0.0, "restore_to_method_entry_ms": 32.949, "method_entry_to_first_remote_event_ms": 6.078, "first_remote_event_to_final_result_ms": 10750.834, "transfer_queue_delay_ms": null, "synchronized_transfer_ms": null, "quiesce_wait_ms": null, "graph_activity_ms": 3605.375, "sampler_lane_wait_ms": 0.107, "quiesced_transfer": null}}
+{
+  "output_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-12_06-12-53",
+  "target": {
+    "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+    "class_name": "ModalRuntimeEntrypointV2",
+    "gpu": "rtx-pro-6000"
+  },
+  "runtime_shape": {
+    "requested": {
+      "thread_policy": "TBASE",
+      "torch_intraop_threads": null,
+      "torch_interop_threads": null,
+      "omp_num_threads": null,
+      "mkl_num_threads": null,
+      "openblas_num_threads": null,
+      "numexpr_num_threads": null,
+      "malloc_arena_max": null,
+      "snapshot_model_order": "O0",
+      "cpu_request": 12,
+      "memory_request": 32768,
+      "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+      "runtime_shape_label": null
+    },
+    "guard": {
+      "changed_axes": [],
+      "allow_multi_axis": false,
+      "baseline_cpu_request": 12,
+      "baseline_memory_request": 32768
+    }
+  },
+  "run_count": 1,
+  "gap_seconds": 0.0,
+  "trace_handoff_errors": 0,
+  "waterfall_runs": 1,
+  "runs": [
+    {
+      "run_index": 0,
+      "request_id": "v2-benchmark-0-30177c6e92fc",
+      "identity": {
+        "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+        "class_name": "ModalRuntimeEntrypoint",
+        "method_name": "run_plan_stream",
+        "gpu": [
+          "RTX-PRO-6000"
+        ],
+        "cpu": 12,
+        "memory_mb": 32768,
+        "fingerprint": "3378579908274910dc43d104f59142e27d0dac2b3037457ac4622f41acb3e621",
+        "runtime_shape": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+        "runtime_shape_label": null,
+        "stored_snapshot_model_order": "O0",
+        "restore_count": 1,
+        "request_count": 1,
+        "restored_instance_id": "1cfcae916715468796637f43024d93e1",
+        "restore_session_id": "66c131eec2a8445a995bc8d9ad76acd6",
+        "container_task_id": "ta-01KZT9MEERCYQC2CW1DQSDGTVR",
+        "modal_container_id": "",
+        "image_id": "im-fopBG65UjVS6vwA7IAPqUf",
+        "cloud": "CLOUD_PROVIDER_GCP",
+        "region": "us-east1",
+        "modal_input_id": "in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0",
+        "container_session_id": "aad499e898f94807"
+      },
+      "runtime_shape": {
+        "requested": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "deployed": {
+          "thread_policy": "TBASE",
+          "torch_intraop_threads": null,
+          "torch_interop_threads": null,
+          "omp_num_threads": null,
+          "mkl_num_threads": null,
+          "openblas_num_threads": null,
+          "numexpr_num_threads": null,
+          "malloc_arena_max": null,
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null
+        },
+        "observed": {
+          "stage": "request_entry",
+          "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2",
+          "runtime_shape_label": null,
+          "thread_policy": "TBASE",
+          "snapshot_model_order": "O0",
+          "cpu_request": 12,
+          "memory_request": 32768,
+          "native_thread_count": 48,
+          "configured_omp": null,
+          "configured_mkl": null,
+          "configured_openblas": null,
+          "configured_numexpr": null,
+          "malloc_arena_max": null,
+          "native_library_settings": {
+            "OMP_NUM_THREADS": "12",
+            "MKL_NUM_THREADS": "12",
+            "OPENBLAS_NUM_THREADS": "12",
+            "NUMEXPR_NUM_THREADS": null,
+            "MALLOC_ARENA_MAX": null
+          },
+          "torch_intraop_threads": 12,
+          "torch_interop_threads": 14,
+          "actual_torch_intraop_threads": 12,
+          "actual_torch_interop_threads": 14,
+          "requested_torch_intraop_threads": null,
+          "requested_torch_interop_threads": null,
+          "requested_vs_actual_match": true,
+          "status": "baseline_passthrough",
+          "error": "",
+          "trace_id": "66f8e3afbfc34b73",
+          "pid": 2,
+          "thread_native_id": 2,
+          "restored_instance_id": "1cfcae916715468796637f43024d93e1",
+          "restore_session_id": "66c131eec2a8445a995bc8d9ad76acd6",
+          "legacy_container_session_id": "aad499e898f94807",
+          "container_task_id": "ta-01KZT9MEERCYQC2CW1DQSDGTVR",
+          "modal_input_id": "in-01KZT9MCR556H9HCC91CMCV4MS:1786515174149-0",
+          "image_id": "im-fopBG65UjVS6vwA7IAPqUf",
+          "cloud": "CLOUD_PROVIDER_GCP",
+          "region": "us-east1",
+          "app_name": "stable-modal-comfy-v2-restore-only-shadow",
+          "class_name": "ModalRuntimeEntrypoint"
+        },
+        "stored_snapshot_model_order": "O0",
+        "snapshot_target_fingerprint": "3378579908274910dc43d104f59142e27d0dac2b3037457ac4622f41acb3e621",
+        "guard": {
+          "changed_axes": [],
+          "allow_multi_axis": false,
+          "baseline_cpu_request": 12,
+          "baseline_memory_request": 32768
+        },
+        "construction_order_semantics": "model_construction_order_only"
+      },
+      "timing": {
+        "wall_ms": 22039.6,
+        "handle_lookup_ms": 3.999,
+        "submission_to_first_remote_event_ms": 11263.826,
+        "command_to_response_ms": 22566.6,
+        "submit2entry_ms": 11261.747,
+        "t3b_to_t8_ms": 10461.736,
+        "restore_total_ms": 549.312,
+        "pre_sampler_ms": 4929.899,
+        "sampler_ms": 3708.045,
+        "vae_decode_ms": 387.521,
+        "output_collection_ms": 7.653,
+        "snapshot_callback_age_at_restore_ms": 829119.253,
+        "snapshot_callback_to_command_start_ms": 817909.175,
+        "command_start_to_restore_start_ms": 11209.877,
+        "local_timing": {
+          "t0_to_t1_ms": 0.892,
+          "t1_to_queue_enqueue_ms": null,
+          "local_receive_to_enqueue_ms": null,
+          "local_body_read_ms": null,
+          "local_json_parse_ms": null,
+          "local_preflight_ms": null,
+          "local_queue_lock_wait_ms": null,
+          "local_queue_enqueue_ms": null,
+          "queue_wait_before_worker_ms": null,
+          "plan_build_ms": 47.0,
+          "active_profile_ms": 0.0,
+          "restore_plan_build_ms": null,
+          "restore_publish_ms": null,
+          "handle_lookup_ms": 15.0,
+          "payload_serialize_ms": 0.0,
+          "payload_materialization_ms": 0.0,
+          "payload_size_measurement_ms": 0.0,
+          "generator_create_ms": 3.0,
+          "local_residual_ms": 0.0,
+          "clock_reconciliation_residual_ms": 0.0,
+          "route_unattributed_ms": null,
+          "worker_unattributed_ms": null,
+          "reconciliation_status": "incomplete",
+          "missing_stages": [
+            "local_receive_to_enqueue_ms"
+          ],
+          "overlap_error": "",
+          "stage_attribution_residual_ms": {
+            "route_unattributed_ms": null,
+            "worker_unattributed_ms": null,
+            "missing_stages": [
+              "local_receive_to_enqueue_ms"
+            ],
+            "reconciliation_status": "incomplete",
+            "overlap_error": ""
+          },
+          "local_receive_to_generator_create_ms": 47.0,
+          "generator_create_to_first_iteration_ms": 0.0,
+          "first_iteration_to_first_remote_event_ms": 11263.826,
+          "local_receive_to_actual_submission_ms": 62.0,
+          "trigger_to_local_receive_ms": 0.892,
+          "local_receive_to_generator_create_start_ms": 54.0,
+          "generator_created_to_first_iteration_ms": 0.0,
+          "remote_python_resume_to_restore_start_ms": 0.0,
+          "restore_method_ms": 551.815,
+          "restore_end_to_modal_method_entry_ms": 32.949,
+          "modal_method_entry_to_executor_ms": 209.221,
+          "submission_to_remote_python_resume_ms": 10672.985,
+          "unexplained_pre_remote_ms": 10679.062
+        },
+        "restore_breakdown": {
+          "restore_total_ms": 549.312,
+          "snapshot_callback_age_at_restore_ms": 829119.253,
+          "models_symlink_ms": 2.33,
+          "manager_offline_ms": 0.55,
+          "reload_models_ms": 164.186,
+          "reload_runtime_state_ms": 120.834,
+          "v2_startup_custom_node_source_copy_ms": 2881.14,
+          "sync_custom_nodes_ms": 2881.25,
+          "install_requirements_ms": 0.01,
+          "v2_startup_comfyui_path_startup_ms": 0.08,
+          "comfyui_path_setup_ms": 0.13,
+          "v2_startup_backend_startup_ms": 24496.07,
+          "backend_startup_ms": 24496.55,
+          "observe_generations_ms": 0.2,
+          "snapshot_restore_ms": 529.13,
+          "restore_gpu_state_ms": 236.489,
+          "cuda_init_ms": 2.3,
+          "v2_startup_snapshot_execution_seed_ms": 3.81,
+          "initialize_cuda_ms": 2.257,
+          "snapshot_identity_checks_ms": 0.0,
+          "cpu_snapshot_retargeting_ms": 0.0
+        },
+        "early_activation_total_ms": null,
+        "queue_delay_ms": null,
+        "cpu_snapshot_wait_ms": null,
+        "dtype_layout_preparation_ms": null,
+        "post_load_bookkeeping_ms": null,
+        "submission_to_remote_python_resume_ms": 10672.985,
+        "remote_python_resume_to_restore_start_ms": 0.0,
+        "restore_to_method_entry_ms": 32.949,
+        "method_entry_to_first_remote_event_ms": 6.078,
+        "first_remote_event_to_final_result_ms": 10750.834,
+        "transfer_queue_delay_ms": null,
+        "synchronized_transfer_ms": null,
+        "quiesce_wait_ms": null,
+        "graph_activity_ms": 3605.375,
+        "sampler_lane_wait_ms": 0.107,
+        "quiesced_transfer": null
+      }
+    }
+  ]
+}
+V2 COLD WATERFALL - run 1
+Request: v2-benchmark-0-30177c6e92fc  Instance: 1cfcae916715468796637f43024d93e1  GPU: ['RTX-PRO-6000']  Fresh: YES
+
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+ # | Stage                                          | Duration |     Cum. |      % | Relative wall time
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+  1 | Local preparation                              |     0.480s |     0.480s |   2.127% | +                                    
+  2 | Modal handle and submission                    |     0.057s |     0.537s |   0.253% | +                                    
+  3 | Pre-Python Modal scheduling (command to Pyt... |    10.673s |    11.210s |  47.296% | =================                    
+  4 | Application restore                            |     0.552s |    11.762s |   2.445% | #                                    
+  5 | Restore-to-method entry                        |     0.033s |    11.795s |   0.146% | =                                    
+  6 | ~ Method entry to UNET ownership claim         |          - |          - |       - |                                      
+  7 | ~ UNET claim to ready (worker load)            |          - |          - |       - |                                      
+  8 | Remote method setup                            |     0.209s |    12.004s |   0.927% | #                                    
+  9 |   detail: method entry to graph start          |     0.020s |          - |   0.086% |                                      
+ 10 |   detail: method entry to runtime configura... |     0.019s |          - |   0.086% |                                      
+ 11 |   detail: runtime configuration                |     0.000s |          - |   0.000% |                                      
+ 12 |   detail: graph setup                          |     0.190s |          - |   0.841% |                                      
+ 13 |   detail: certificate                          |     0.151s |          - |   0.667% |                                      
+ 14 |   detail: preflight                            |          - |          - |       - |                                      
+ 15 |   detail: validation                           |     0.000s |          - |   0.000% |                                      
+ 16 |   detail: legacy runtime resolution            |     0.000s |          - |   0.000% |                                      
+ 17 |   detail: preload check                        |     0.002s |          - |   0.009% |                                      
+ 18 |   detail: missing-node repair                  |     0.000s |          - |   0.001% |                                      
+ 19 |   detail: production registry setup            |     0.000s |          - |   0.000% |                                      
+ 20 |   detail: pregraph setup                       |     0.001s |          - |   0.002% |                                      
+ 21 |   detail: executor reset                       |     0.000s |          - |   0.001% |                                      
+ 22 |   detail: residual before executor invoke      |     0.015s |          - |   0.066% |                                      
+ 23 |   detail: pre-sampler total                    |     3.947s |          - |  17.492% |                                      
+ 24 |   detail: measured pre-sampler children        |     3.890s |          - |  17.236% |                                      
+ 25 |   detail: pre-sampler residual                 |     0.058s |          - |   0.256% |                                      
+ 26 |   detail: UNET quiesce wait (diagnostic)       |          - |          - |       - |                                      
+ 27 |   detail: UNET transfer queue delay            |          - |          - |       - |                                      
+ 28 |   detail: UNET synchronized transfer           |          - |          - |       - |                                      
+ 29 | PromptExecutor/cache setup                     |     1.227s |    13.231s |   5.438% | ##                                   
+ 30 |   detail: PromptExecutor invoke to execution   |     0.001s |          - |   0.003% |                                      
+ 31 |   detail: execution to cached                  |     0.999s |          - |   4.428% |                                      
+ 32 |   detail: cached to first node                 |     0.227s |          - |   1.007% |                                      
+ 33 |   detail: graph/prefill activity               |     3.605s |          - |  15.977% |                                      
+ 34 |   detail: CPU owner: CLIPTextEncode [CLIP]     |     0.002s |          - |   0.009% |                                      
+ 35 |   detail: CPU owner: load_models_gpu [other]   |     0.055s |          - |   0.245% |                                      
+ 36 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.002% |                                      
+ 37 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.001% |                                      
+ 38 |   detail: Node: SimpleMath+                    |     0.000s |          - |   0.001% |                                      
+ 39 |   detail: Node: ImpactSwitch                   |     0.082s |          - |   0.361% |                                      
+ 40 |   detail: Node: VAELoader                      |     0.002s |          - |   0.007% |                                      
+ 41 |   detail: Node: ClownOptions_ExtraOptions_Beta |     0.000s |          - |   0.001% |                                      
+ 42 |   detail: Node: ImpactIfNone                   |     0.000s |          - |   0.000% |                                      
+ 43 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.001% |                                      
+ 44 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 45 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 46 |   detail: Node: PrimitiveStringMultiline       |     0.000s |          - |   0.001% |                                      
+ 47 |   detail: Node: JoinStrings                    |     0.000s |          - |   0.000% |                                      
+ 48 |   detail: Node: CLIPLoader                     |     0.002s |          - |   0.007% |                                      
+ 49 |   detail: Node: CLIPTextEncode                 |     0.002s |          - |   0.011% |                                      
+ 50 |   detail: Node: ConditioningZeroOut            |     0.002s |          - |   0.009% |                                      
+ 51 |   detail: Node: PairConditioningSetProperties  |     0.000s |          - |   0.001% |                                      
+ 52 |   detail: Node: UNETLoader                     |     2.214s |          - |   9.809% |                                      
+ 53 |   detail: Node: ModelSamplingAuraFlow          |     0.003s |          - |   0.013% |                                      
+ 54 |   detail: Node: CacheDiT_Model_Optimizer       |     0.000s |          - |   0.001% |                                      
+ 55 |   detail: Node: PathchSageAttentionKJ          |     0.000s |          - |   0.001% |                                      
+ 56 |   detail: Node: easy float                     |     0.000s |          - |   0.000% |                                      
+ 57 |   detail: Node: CustomCombo                    |     0.000s |          - |   0.001% |                                      
+ 58 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 59 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 60 |   detail: Node: easy stringToIntList           |     0.000s |          - |   0.000% |                                      
+ 61 |   detail: Node: easy indexAnything             |     0.000s |          - |   0.000% |                                      
+ 62 |   detail: Node: EmptyImage                     |     0.022s |          - |   0.099% |                                      
+ 63 |   detail: Node: ImageRotate                    |     0.002s |          - |   0.009% |                                      
+ 64 |   detail: Node: ImpactSwitch                   |     0.041s |          - |   0.183% |                                      
+ 65 |   detail: Node: easy imageSize                 |     0.000s |          - |   0.001% |                                      
+ 66 |   detail: Node: EmptySD3LatentImage            |     0.001s |          - |   0.003% |                                      
+ 67 |   detail: Node: Any Switch (rgthree)           |     0.000s |          - |   0.000% |                                      
+ 68 |   detail: Node: LGNoiseInjectionLatent         |     0.001s |          - |   0.004% |                                      
+ 69 |   detail: Node: easy int                       |     0.000s |          - |   0.000% |                                      
+ 70 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 71 |   detail: Node: StringToCombo|LP               |     0.000s |          - |   0.000% |                                      
+ 72 |   detail: Node: easy ifElse                    |     0.000s |          - |   0.000% |                                      
+ 73 |   detail: Node: ClownsharKSampler_Beta         |     0.140s |          - |   0.621% |                                      
+ 74 | First node to CLIP                             |     0.087s |    13.318s |   0.383% | #                                    
+ 75 | CLIP to sampler node                           |     2.292s |    15.609s |  10.155% | ####                                 
+ 76 | Sampler graph-join wait                        |          - |          - |       - |                                      
+ 77 | Sampler node to sampling                       |     0.133s |    15.742s |   0.588% | #                                    
+ 78 |   detail: sampler lane wait                    |     0.000s |          - |   0.000% |                                      
+ 79 |   detail: sampler node to lane acquired        |     0.000s |          - |   0.001% |                                      
+ 80 |   detail: lane acquired to actual stage        |     0.133s |          - |   0.588% |                                      
+ 81 | Sampling                                       |     4.881s |    20.623s |  21.628% | ########                             
+ 82 | Post-sampling transition                       |     0.837s |    21.460s |   3.710% | #                                    
+ 83 | VAE                                            |     0.388s |    21.847s |   1.717% | #                                    
+ 84 | Output persistence                             |     0.596s |    22.443s |   2.639% | #                                    
+ 85 |   detail: output encode                        |          - |          - |       - |                                      
+ 86 |   detail: output commit                        |          - |          - |       - |                                      
+ 87 | Remote result handoff                          |     0.108s |    22.551s |   0.477% | +                                    
+ 88 | Remote/local return                            |     0.015s |    22.566s |   0.066% | +                                    
+ 89 | Captured timeline gaps / residual              |     0.001s |    22.567s |   0.004% | =                                    
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+    | ACCOUNTED     |    22.566s |            |  99.996% | .....................................
+    | RECONCILIATION |     0.001s |            |            | .....................................
+    | COMMAND -> RESPONSE |    22.567s |            |  100.0% | #####################################
++-----+------------------------------------------------+------------+------------+---------+---------------------------------------+
+Warnings:
+  - captured residual excluded from accounted: 0.893ms unaccounted
+Task was destroyed but it is pending!
+task: <Task pending name='Task-7' coro=<_spawn_persistence_drain.<locals>._shielded_drain() done, defined at C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\comfymodal_runtime\modal_transport.py:124> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at C:\Program Files\Python311\Lib\asyncio\tasks.py:908, Task.task_wakeup()]>>
+Task was destroyed but it is pending!
+task: <Task pending name='Task-8' coro=<_drain_persistence_iterator() done, defined at C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\comfymodal_runtime\modal_transport.py:139> wait_for=<Future cancelled> cb=[shield.<locals>._inner_done_callback() at C:\Program Files\Python311\Lib\asyncio\tasks.py:891]>
+=== Single V2 benchmark completed ===
+=== Total command-to-response time: 23.032s ===

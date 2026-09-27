@@ -1,0 +1,52 @@
+[primer] start control-rep1
+[primer] done control-rep1 status=ok gbps=5.679343156187631
+[primer] start control-rep2
+[primer] done control-rep2 status=ok gbps=5.76300880110043
+[primer] start control-rep3
+[primer] done control-rep3 status=ok gbps=5.994600811577321
+[primer] start control-rep4
+[primer] done control-rep4 status=ok gbps=2.1118908654268504
+[primer] start control-rep5
+[primer] done control-rep5 status=ok gbps=5.185738094415074
+[primer] start global_primed-rep1
+[primer] done global_primed-rep1 status=ok gbps=5.7532719581624185
+[primer] start global_primed-rep2
+[primer] done global_primed-rep2 status=ok gbps=4.84408832935086
+[primer] start global_primed-rep3
+[primer] done global_primed-rep3 status=ok gbps=5.872117619537285
+[primer] start global_primed-rep4
+[primer] done global_primed-rep4 status=ok gbps=4.311795567110763
+[primer] start global_primed-rep5
+[primer] done global_primed-rep5 status=ok gbps=5.56877270985695
+[primer] start primed-rep1
+[primer] done primed-rep1 status=ok gbps=4.703986227627135
+[primer] start primed-rep2
+[primer] done primed-rep2 status=ok gbps=5.42314250285536
+[primer] start primed-rep3
+[primer] done primed-rep3 status=ok gbps=5.089028665661841
+[primer] start primed-rep4
+[primer] done primed-rep4 status=ok gbps=5.374217106930258
+[primer] start primed-rep5
+[primer] done primed-rep5 status=ok gbps=5.298672119709222
+
+arm | run | region | primer config | primer ms | GB/s | median | max | ge250 | ge500 | ge1000 | bad? | QD ok?
+| control | control-rep1 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=0 | [] | 5.679 | 43.1 | 123 | 0 | 0 | 0 | ok | True |
+| control | control-rep2 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=0 | [] | 5.763 | 40.0 | 219 | 0 | 0 | 0 | ok | True |
+| control | control-rep3 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=0 | [] | 5.995 | 38.7 | 125 | 0 | 0 | 0 | ok | True |
+| control | control-rep4 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=0 | [] | 2.112 | 38.1 | 2678 | 4 | 4 | 4 | ok | True |
+| control | control-rep5 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=0 | [] | 5.186 | 43.6 | 143 | 0 | 0 | 0 | ok | True |
+| global_primed | global_primed-rep1 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=1 | [27.5] | 5.753 | 43.0 | 119 | 0 | 0 | 0 | ok | True |
+| global_primed | global_primed-rep2 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=1 | [36.5] | 4.844 | 49.8 | 276 | 1 | 0 | 0 | ok | True |
+| global_primed | global_primed-rep3 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=1 | [32.8] | 5.872 | 38.8 | 197 | 0 | 0 | 0 | ok | True |
+| global_primed | global_primed-rep4 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=1 | [2259.9] | 4.312 | 39.0 | 678 | 4 | 4 | 0 | ok | True |
+| global_primed | global_primed-rep5 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=1 | [35.7] | 5.569 | 42.6 | 235 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep1 | CLOUD_PROVIDER_GCP/ap-northeast | n=4 | [2351.5, 201.0, 93.6, 28.7] | 4.704 | 51.2 | 138 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep2 | CLOUD_PROVIDER_GCP/us-west | n=4 | [3937.3, 33.8, 33.9, 19.9] | 5.423 | 43.5 | 230 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep3 | CLOUD_PROVIDER_GCP/us-east | n=4 | [334.3, 2749.8, 41.3, 23.7] | 5.089 | 48.0 | 164 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep4 | CLOUD_PROVIDER_GCP/us-west | n=4 | [162.3, 38.1, 43.2, 27.4] | 5.374 | 47.4 | 84 | 0 | 0 | 0 | ok | True |
+| primed | primed-rep5 | CLOUD_PROVIDER_UNSPECIFIED/CANADA-2 | n=4 | [43.4, 30.6, 36.1, 19.9] | 5.299 | 51.5 | 68 | 0 | 0 | 0 | ok | True |
+
+=== per-arm summary ===
+control: median 5.679 mean 4.947 min 2.112 max 5.995 | bad 0/5 | runs>=1000 1 | tot>=1000 4 | tot>=500 4 | tot>=250 4 | worst 2678 ms | gen0>=1000 4/20 | primer n=0 ms=[]
+global_primed: median 5.569 mean 5.270 min 4.312 max 5.872 | bad 0/5 | runs>=1000 0 | tot>=1000 0 | tot>=500 4 | tot>=250 5 | worst 678 ms | gen0>=1000 0/20 | primer n=5 ms=[27.5, 36.5, 32.8, 2259.9, 35.7]
+primed: median 5.299 mean 5.178 min 4.704 max 5.423 | bad 0/5 | runs>=1000 0 | tot>=1000 0 | tot>=500 0 | tot>=250 0 | worst 230 ms | gen0>=1000 0/20 | primer n=20 ms=[2351.5, 201.0, 93.6, 28.7, 3937.3, 33.8, 33.9, 19.9, 334.3, 2749.8, 41.3, 23.7, 162.3, 38.1, 43.2, 27.4, 43.4, 30.6, 36.1, 19.9]

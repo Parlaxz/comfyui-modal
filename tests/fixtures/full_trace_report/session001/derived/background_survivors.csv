@@ -1,0 +1,8 @@
+﻿owner_type,owner_id,name,created_or_started_ms,boundary_crossed,ended_ms,duration_ms,thread_or_task,evidence_source
+python_call,6,long_async_init,500.0,prompt_executor_invoke,6000.0,5500.0,2,viztracer
+python_call,6,long_async_init,500.0,request_entry,6000.0,5500.0,2,viztracer
+python_call,,long_async_init,500.0,restore_complete,6000.0,5500.0,2,viztracer
+python_call,6,long_async_init,500.0,restore_complete,6000.0,5500.0,2,viztracer
+semantic_operation,,clip_graph_encode,800.0,restore_complete,2000.0,1200.0,1,session_events
+python_call,1,clip_graph_encode,800.0,restore_complete,2000.0,1200.0,1,viztracer
+python_call,6,long_async_init,500.0,sampling_start,6000.0,5500.0,2,viztracer

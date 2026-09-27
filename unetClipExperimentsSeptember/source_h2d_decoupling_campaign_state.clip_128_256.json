@@ -1,0 +1,3592 @@
+{
+  "campaign": "source_h2d_decoupling",
+  "constraints": {
+    "no_acknowledge_volume_drift": true,
+    "no_cache_investigation": true,
+    "preserve_raw_evidence": true,
+    "remote_measurements_started": true,
+    "run_remote_only_after_focused_tests_pass": true
+  },
+  "coordinator": {
+    "deployment_performed": false,
+    "runner": "tools/run_exp04_source_ceiling.py",
+    "source_only": true
+  },
+  "deployment": {
+    "app": "sept-unetclip-04-source-ceiling-oracle",
+    "deployment_url": "https://modal.com/apps/testing7/main/deployed/sept-unetclip-04-source-ceiling-oracle",
+    "models_mount": "/root/models",
+    "models_mount_read_only": true,
+    "source_only_image_id": "im-T0i7a8ZwRw0DKHLGiwPJIy",
+    "workspace": "Testing 7"
+  },
+  "ledger": {
+    "app": "sept-unetclip-04-source-ceiling-batch2",
+    "campaign": "source_h2d_decoupling",
+    "cells": [
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R1.json",
+            "attempt_id": "clip_b128_qd1_R1",
+            "campaign_index": 17,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.533777+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.859029+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R2.json",
+            "attempt_id": "clip_b128_qd1_R2",
+            "campaign_index": 49,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.011395+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.009617+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R3.json",
+            "attempt_id": "clip_b128_qd1_R3",
+            "campaign_index": 81,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.423406+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.200149+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R4.json",
+            "attempt_id": "clip_b128_qd1_R4",
+            "campaign_index": 113,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.974327+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.369215+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R5.json",
+            "attempt_id": "clip_b128_qd1_R5",
+            "campaign_index": 145,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.527039+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.552727+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R6.json",
+            "attempt_id": "clip_b128_qd1_R6",
+            "campaign_index": 177,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.376858+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.739755+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R1_A2.json",
+            "attempt_id": "clip_b128_qd1_R1_A2",
+            "campaign_index": 17,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:24.854196+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R2_A2.json",
+            "attempt_id": "clip_b128_qd1_R2_A2",
+            "campaign_index": 49,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.790620+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R3_A2.json",
+            "attempt_id": "clip_b128_qd1_R3_A2",
+            "campaign_index": 81,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.726404+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R4_A2.json",
+            "attempt_id": "clip_b128_qd1_R4_A2",
+            "campaign_index": 113,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:09.483489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R5_A2.json",
+            "attempt_id": "clip_b128_qd1_R5_A2",
+            "campaign_index": 145,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.338656+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R6_A2.json",
+            "attempt_id": "clip_b128_qd1_R6_A2",
+            "campaign_index": 177,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.107021+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R7.json",
+            "attempt_id": "clip_b128_qd1_R7",
+            "campaign_index": 209,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.249519+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:34.957274+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R8.json",
+            "attempt_id": "clip_b128_qd1_R8",
+            "campaign_index": 241,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.106427+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.352673+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R9.json",
+            "attempt_id": "clip_b128_qd1_R9",
+            "campaign_index": 273,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.210885+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.702782+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R10.json",
+            "attempt_id": "clip_b128_qd1_R10",
+            "campaign_index": 305,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:09:57.001435+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.080947+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R1_A3.json",
+            "attempt_id": "clip_b128_qd1_R1_A3",
+            "campaign_index": 17,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:02.751489+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R2_A3.json",
+            "attempt_id": "clip_b128_qd1_R2_A3",
+            "campaign_index": 49,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:04.815488+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R3_A3.json",
+            "attempt_id": "clip_b128_qd1_R3_A3",
+            "campaign_index": 81,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.065988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R7_A2.json",
+            "attempt_id": "clip_b128_qd1_R7_A2",
+            "campaign_index": 209,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:32.908634+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R8_A2.json",
+            "attempt_id": "clip_b128_qd1_R8_A2",
+            "campaign_index": 241,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:33.832818+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R9_A2.json",
+            "attempt_id": "clip_b128_qd1_R9_A2",
+            "campaign_index": 273,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:34.738198+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R10_A2.json",
+            "attempt_id": "clip_b128_qd1_R10_A2",
+            "campaign_index": 305,
+            "error": null,
+            "finished_at": "2026-09-04T22:08:23.505014+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:22.719989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R1_A4.json",
+            "attempt_id": "clip_b128_qd1_R1_A4",
+            "campaign_index": 17,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:02.847989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd1_R2_A4.json",
+            "attempt_id": "clip_b128_qd1_R2_A4",
+            "campaign_index": 49,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:04.839489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R5_A2.json",
+            "attempt_id": "clip_b128_qd1_R5_A2",
+            "campaign_index": 73,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.720187+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R6_A2.json",
+            "attempt_id": "clip_b128_qd1_R6_A2",
+            "campaign_index": 89,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:54.964211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R7_A2.json",
+            "attempt_id": "clip_b128_qd1_R7_A2",
+            "campaign_index": 105,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.223211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R8_A2.json",
+            "attempt_id": "clip_b128_qd1_R8_A2",
+            "campaign_index": 121,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.462211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R9_A2.json",
+            "attempt_id": "clip_b128_qd1_R9_A2",
+            "campaign_index": 137,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.710236+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd1_R10_A2.json",
+            "attempt_id": "clip_b128_qd1_R10_A2",
+            "campaign_index": 153,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:55.932261+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R5_A2.json",
+            "attempt_id": "clip_b128_qd1_R5_A2",
+            "campaign_index": 33,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.724824+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.644327+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R6_A2.json",
+            "attempt_id": "clip_b128_qd1_R6_A2",
+            "campaign_index": 41,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.725823+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.726386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R7_A2.json",
+            "attempt_id": "clip_b128_qd1_R7_A2",
+            "campaign_index": 49,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.726823+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.798387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R8_A2.json",
+            "attempt_id": "clip_b128_qd1_R8_A2",
+            "campaign_index": 57,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.727823+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.881387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R9_A2.json",
+            "attempt_id": "clip_b128_qd1_R9_A2",
+            "campaign_index": 65,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.728822+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:41.961411+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd1_R10_A2.json",
+            "attempt_id": "clip_b128_qd1_R10_A2",
+            "campaign_index": 73,
+            "error": null,
+            "finished_at": "2026-09-04T22:54:47.225787+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.038920+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "campaign_index": 17,
+        "cell_id": "clip_b128_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R1.json",
+            "attempt_id": "clip_b128_qd2_R1",
+            "campaign_index": 19,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.559057+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.867028+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R2.json",
+            "attempt_id": "clip_b128_qd2_R2",
+            "campaign_index": 51,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.044398+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.022618+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R3.json",
+            "attempt_id": "clip_b128_qd2_R3",
+            "campaign_index": 83,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.455405+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.211151+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R4.json",
+            "attempt_id": "clip_b128_qd2_R4",
+            "campaign_index": 115,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.005838+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.381215+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R5.json",
+            "attempt_id": "clip_b128_qd2_R5",
+            "campaign_index": 147,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.565059+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.567727+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R6.json",
+            "attempt_id": "clip_b128_qd2_R6",
+            "campaign_index": 179,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.419371+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.751754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R1_A2.json",
+            "attempt_id": "clip_b128_qd2_R1_A2",
+            "campaign_index": 19,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:24.914270+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R2_A2.json",
+            "attempt_id": "clip_b128_qd2_R2_A2",
+            "campaign_index": 51,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.843620+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R3_A2.json",
+            "attempt_id": "clip_b128_qd2_R3_A2",
+            "campaign_index": 83,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.780520+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R4_A2.json",
+            "attempt_id": "clip_b128_qd2_R4_A2",
+            "campaign_index": 115,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:09.681489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R5_A2.json",
+            "attempt_id": "clip_b128_qd2_R5_A2",
+            "campaign_index": 147,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.385690+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R6_A2.json",
+            "attempt_id": "clip_b128_qd2_R6_A2",
+            "campaign_index": 179,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.151535+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R7.json",
+            "attempt_id": "clip_b128_qd2_R7",
+            "campaign_index": 211,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.303035+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:34.974984+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R8.json",
+            "attempt_id": "clip_b128_qd2_R8",
+            "campaign_index": 243,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.160428+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.374186+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R9.json",
+            "attempt_id": "clip_b128_qd2_R9",
+            "campaign_index": 275,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.273105+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.723782+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R10.json",
+            "attempt_id": "clip_b128_qd2_R10",
+            "campaign_index": 307,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:10:02.431647+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.102948+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R1_A3.json",
+            "attempt_id": "clip_b128_qd2_R1_A3",
+            "campaign_index": 19,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:02.982488+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R2_A3.json",
+            "attempt_id": "clip_b128_qd2_R2_A3",
+            "campaign_index": 51,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:04.933488+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R3_A3.json",
+            "attempt_id": "clip_b128_qd2_R3_A3",
+            "campaign_index": 83,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.335490+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R7_A2.json",
+            "attempt_id": "clip_b128_qd2_R7_A2",
+            "campaign_index": 211,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:32.968632+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R8_A2.json",
+            "attempt_id": "clip_b128_qd2_R8_A2",
+            "campaign_index": 243,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:33.893818+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R9_A2.json",
+            "attempt_id": "clip_b128_qd2_R9_A2",
+            "campaign_index": 275,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:34.797712+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R10_A2.json",
+            "attempt_id": "clip_b128_qd2_R10_A2",
+            "campaign_index": 307,
+            "error": null,
+            "finished_at": "2026-09-04T22:09:01.893014+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:22.807989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R1_A4.json",
+            "attempt_id": "clip_b128_qd2_R1_A4",
+            "campaign_index": 19,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.006990+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd2_R2_A4.json",
+            "attempt_id": "clip_b128_qd2_R2_A4",
+            "campaign_index": 51,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:04.966489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R5_A2.json",
+            "attempt_id": "clip_b128_qd2_R5_A2",
+            "campaign_index": 74,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.734699+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R6_A2.json",
+            "attempt_id": "clip_b128_qd2_R6_A2",
+            "campaign_index": 90,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:54.978211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R7_A2.json",
+            "attempt_id": "clip_b128_qd2_R7_A2",
+            "campaign_index": 106,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.240213+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R8_A2.json",
+            "attempt_id": "clip_b128_qd2_R8_A2",
+            "campaign_index": 122,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.476212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R9_A2.json",
+            "attempt_id": "clip_b128_qd2_R9_A2",
+            "campaign_index": 138,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.724750+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd2_R10_A2.json",
+            "attempt_id": "clip_b128_qd2_R10_A2",
+            "campaign_index": 154,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:55.945261+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R5_A2.json",
+            "attempt_id": "clip_b128_qd2_R5_A2",
+            "campaign_index": 34,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.729822+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.653843+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R6_A2.json",
+            "attempt_id": "clip_b128_qd2_R6_A2",
+            "campaign_index": 42,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.730822+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.735387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R7_A2.json",
+            "attempt_id": "clip_b128_qd2_R7_A2",
+            "campaign_index": 50,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.731824+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.808386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R8_A2.json",
+            "attempt_id": "clip_b128_qd2_R8_A2",
+            "campaign_index": 58,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.733824+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.892387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R9_A2.json",
+            "attempt_id": "clip_b128_qd2_R9_A2",
+            "campaign_index": 66,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.733824+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:41.972412+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd2_R10_A2.json",
+            "attempt_id": "clip_b128_qd2_R10_A2",
+            "campaign_index": 74,
+            "error": null,
+            "finished_at": "2026-09-04T22:54:57.923254+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.049963+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "campaign_index": 19,
+        "cell_id": "clip_b128_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R1.json",
+            "attempt_id": "clip_b128_qd4_R1",
+            "campaign_index": 21,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.584332+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.875028+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R2.json",
+            "attempt_id": "clip_b128_qd4_R2",
+            "campaign_index": 53,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.073437+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.046638+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R3.json",
+            "attempt_id": "clip_b128_qd4_R3",
+            "campaign_index": 85,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.487013+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.220152+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R4.json",
+            "attempt_id": "clip_b128_qd4_R4",
+            "campaign_index": 117,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.037350+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.391214+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R5.json",
+            "attempt_id": "clip_b128_qd4_R5",
+            "campaign_index": 149,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.610573+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.578726+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R6.json",
+            "attempt_id": "clip_b128_qd4_R6",
+            "campaign_index": 181,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.458883+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.762754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R1_A2.json",
+            "attempt_id": "clip_b128_qd4_R1_A2",
+            "campaign_index": 21,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:24.974302+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R2_A2.json",
+            "attempt_id": "clip_b128_qd4_R2_A2",
+            "campaign_index": 53,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.903616+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R3_A2.json",
+            "attempt_id": "clip_b128_qd4_R3_A2",
+            "campaign_index": 85,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.840520+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R4_A2.json",
+            "attempt_id": "clip_b128_qd4_R4_A2",
+            "campaign_index": 117,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:09.818490+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R5_A2.json",
+            "attempt_id": "clip_b128_qd4_R5_A2",
+            "campaign_index": 149,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.433748+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R6_A2.json",
+            "attempt_id": "clip_b128_qd4_R6_A2",
+            "campaign_index": 181,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.202049+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R7.json",
+            "attempt_id": "clip_b128_qd4_R7",
+            "campaign_index": 213,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.355038+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:34.993419+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R8.json",
+            "attempt_id": "clip_b128_qd4_R8",
+            "campaign_index": 245,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.216426+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.392693+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R9.json",
+            "attempt_id": "clip_b128_qd4_R9",
+            "campaign_index": 277,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.331533+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.745784+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R10.json",
+            "attempt_id": "clip_b128_qd4_R10",
+            "campaign_index": 309,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:10:09.293214+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.121948+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R1_A3.json",
+            "attempt_id": "clip_b128_qd4_R1_A3",
+            "campaign_index": 21,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.127489+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R2_A3.json",
+            "attempt_id": "clip_b128_qd4_R2_A3",
+            "campaign_index": 53,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.124489+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R3_A3.json",
+            "attempt_id": "clip_b128_qd4_R3_A3",
+            "campaign_index": 85,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.459490+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R7_A2.json",
+            "attempt_id": "clip_b128_qd4_R7_A2",
+            "campaign_index": 213,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.025656+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R8_A2.json",
+            "attempt_id": "clip_b128_qd4_R8_A2",
+            "campaign_index": 245,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:33.959395+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R9_A2.json",
+            "attempt_id": "clip_b128_qd4_R9_A2",
+            "campaign_index": 277,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:34.849713+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R10_A2.json",
+            "attempt_id": "clip_b128_qd4_R10_A2",
+            "campaign_index": 309,
+            "error": null,
+            "finished_at": "2026-09-04T22:09:34.569014+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:22.882989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R1_A4.json",
+            "attempt_id": "clip_b128_qd4_R1_A4",
+            "campaign_index": 21,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.152997+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd4_R2_A4.json",
+            "attempt_id": "clip_b128_qd4_R2_A4",
+            "campaign_index": 53,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.155989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R5_A2.json",
+            "attempt_id": "clip_b128_qd4_R5_A2",
+            "campaign_index": 75,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.747699+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R6_A2.json",
+            "attempt_id": "clip_b128_qd4_R6_A2",
+            "campaign_index": 91,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:54.995212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R7_A2.json",
+            "attempt_id": "clip_b128_qd4_R7_A2",
+            "campaign_index": 107,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.259212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R8_A2.json",
+            "attempt_id": "clip_b128_qd4_R8_A2",
+            "campaign_index": 123,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.495212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R9_A2.json",
+            "attempt_id": "clip_b128_qd4_R9_A2",
+            "campaign_index": 139,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.738751+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd4_R10_A2.json",
+            "attempt_id": "clip_b128_qd4_R10_A2",
+            "campaign_index": 155,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:55.958260+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R5_A2.json",
+            "attempt_id": "clip_b128_qd4_R5_A2",
+            "campaign_index": 35,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.735823+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.664844+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R6_A2.json",
+            "attempt_id": "clip_b128_qd4_R6_A2",
+            "campaign_index": 43,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.735823+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.746388+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R7_A2.json",
+            "attempt_id": "clip_b128_qd4_R7_A2",
+            "campaign_index": 51,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.736826+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.817386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R8_A2.json",
+            "attempt_id": "clip_b128_qd4_R8_A2",
+            "campaign_index": 59,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.738824+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.901896+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R9_A2.json",
+            "attempt_id": "clip_b128_qd4_R9_A2",
+            "campaign_index": 67,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.739823+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:41.982411+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd4_R10_A2.json",
+            "attempt_id": "clip_b128_qd4_R10_A2",
+            "campaign_index": 75,
+            "error": null,
+            "finished_at": "2026-09-04T22:55:11.700196+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.061950+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "campaign_index": 21,
+        "cell_id": "clip_b128_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R1.json",
+            "attempt_id": "clip_b128_qd8_R1",
+            "campaign_index": 23,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.611702+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.883121+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R2.json",
+            "attempt_id": "clip_b128_qd8_R2",
+            "campaign_index": 55,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.100435+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.059639+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R3.json",
+            "attempt_id": "clip_b128_qd8_R3",
+            "campaign_index": 87,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.515311+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.230151+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R4.json",
+            "attempt_id": "clip_b128_qd8_R4",
+            "campaign_index": 119,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.068406+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.402214+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R5.json",
+            "attempt_id": "clip_b128_qd8_R5",
+            "campaign_index": 151,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.661575+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.589727+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R6.json",
+            "attempt_id": "clip_b128_qd8_R6",
+            "campaign_index": 183,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.495395+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.773754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R1_A2.json",
+            "attempt_id": "clip_b128_qd8_R1_A2",
+            "campaign_index": 23,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.025822+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R2_A2.json",
+            "attempt_id": "clip_b128_qd8_R2_A2",
+            "campaign_index": 55,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.962129+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R3_A2.json",
+            "attempt_id": "clip_b128_qd8_R3_A2",
+            "campaign_index": 87,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.897517+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R4_A2.json",
+            "attempt_id": "clip_b128_qd8_R4_A2",
+            "campaign_index": 119,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:09.935988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R5_A2.json",
+            "attempt_id": "clip_b128_qd8_R5_A2",
+            "campaign_index": 151,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.472822+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R6_A2.json",
+            "attempt_id": "clip_b128_qd8_R6_A2",
+            "campaign_index": 183,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.249567+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R7.json",
+            "attempt_id": "clip_b128_qd8_R7",
+            "campaign_index": 215,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.406038+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:35.013418+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R8.json",
+            "attempt_id": "clip_b128_qd8_R8",
+            "campaign_index": 247,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.271425+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.411693+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R9.json",
+            "attempt_id": "clip_b128_qd8_R9",
+            "campaign_index": 279,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.386543+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.778831+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R10.json",
+            "attempt_id": "clip_b128_qd8_R10",
+            "campaign_index": 311,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:10:16.684600+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.144947+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R1_A3.json",
+            "attempt_id": "clip_b128_qd8_R1_A3",
+            "campaign_index": 23,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.242989+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R2_A3.json",
+            "attempt_id": "clip_b128_qd8_R2_A3",
+            "campaign_index": 55,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.281488+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R3_A3.json",
+            "attempt_id": "clip_b128_qd8_R3_A3",
+            "campaign_index": 87,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.582988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R7_A2.json",
+            "attempt_id": "clip_b128_qd8_R7_A2",
+            "campaign_index": 215,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.078168+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R8_A2.json",
+            "attempt_id": "clip_b128_qd8_R8_A2",
+            "campaign_index": 247,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:34.017450+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R9_A2.json",
+            "attempt_id": "clip_b128_qd8_R9_A2",
+            "campaign_index": 279,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:34.908226+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R10_A2.json",
+            "attempt_id": "clip_b128_qd8_R10_A2",
+            "campaign_index": 311,
+            "error": null,
+            "finished_at": "2026-09-04T22:10:07.941012+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:22.949489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R1_A4.json",
+            "attempt_id": "clip_b128_qd8_R1_A4",
+            "campaign_index": 23,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.268488+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b128_qd8_R2_A4.json",
+            "attempt_id": "clip_b128_qd8_R2_A4",
+            "campaign_index": 55,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.311988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R5_A2.json",
+            "attempt_id": "clip_b128_qd8_R5_A2",
+            "campaign_index": 76,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.760701+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R6_A2.json",
+            "attempt_id": "clip_b128_qd8_R6_A2",
+            "campaign_index": 92,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:55.011212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R7_A2.json",
+            "attempt_id": "clip_b128_qd8_R7_A2",
+            "campaign_index": 108,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.277211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R8_A2.json",
+            "attempt_id": "clip_b128_qd8_R8_A2",
+            "campaign_index": 124,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.508212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R9_A2.json",
+            "attempt_id": "clip_b128_qd8_R9_A2",
+            "campaign_index": 140,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.751751+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b128_qd8_R10_A2.json",
+            "attempt_id": "clip_b128_qd8_R10_A2",
+            "campaign_index": 156,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:55.974259+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R5_A2.json",
+            "attempt_id": "clip_b128_qd8_R5_A2",
+            "campaign_index": 36,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.739823+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.674360+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R6_A2.json",
+            "attempt_id": "clip_b128_qd8_R6_A2",
+            "campaign_index": 44,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.740824+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.755385+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R7_A2.json",
+            "attempt_id": "clip_b128_qd8_R7_A2",
+            "campaign_index": 52,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.741824+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.827387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R8_A2.json",
+            "attempt_id": "clip_b128_qd8_R8_A2",
+            "campaign_index": 60,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.742824+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.912898+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R9_A2.json",
+            "attempt_id": "clip_b128_qd8_R9_A2",
+            "campaign_index": 68,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.743827+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:41.990410+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b128_qd8_R10_A2.json",
+            "attempt_id": "clip_b128_qd8_R10_A2",
+            "campaign_index": 76,
+            "error": null,
+            "finished_at": "2026-09-04T22:55:36.127392+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.072467+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 134217728,
+        "block_mib": 128,
+        "campaign_index": 23,
+        "cell_id": "clip_b128_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R1.json",
+            "attempt_id": "clip_b256_qd1_R1",
+            "campaign_index": 25,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.636716+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.891103+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R2.json",
+            "attempt_id": "clip_b256_qd1_R2",
+            "campaign_index": 57,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.127950+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.069638+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R3.json",
+            "attempt_id": "clip_b256_qd1_R3",
+            "campaign_index": 89,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.543310+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.241152+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R4.json",
+            "attempt_id": "clip_b256_qd1_R4",
+            "campaign_index": 121,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.101425+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.414728+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R5.json",
+            "attempt_id": "clip_b256_qd1_R5",
+            "campaign_index": 153,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.705085+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.599726+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R6.json",
+            "attempt_id": "clip_b256_qd1_R6",
+            "campaign_index": 185,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.534906+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.784754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R1_A2.json",
+            "attempt_id": "clip_b256_qd1_R1_A2",
+            "campaign_index": 25,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.082336+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R2_A2.json",
+            "attempt_id": "clip_b256_qd1_R2_A2",
+            "campaign_index": 57,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.021128+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R3_A2.json",
+            "attempt_id": "clip_b256_qd1_R3_A2",
+            "campaign_index": 89,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.953517+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R4_A2.json",
+            "attempt_id": "clip_b256_qd1_R4_A2",
+            "campaign_index": 121,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:10.062989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R5_A2.json",
+            "attempt_id": "clip_b256_qd1_R5_A2",
+            "campaign_index": 153,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.513822+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R6_A2.json",
+            "attempt_id": "clip_b256_qd1_R6_A2",
+            "campaign_index": 185,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.302624+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R7.json",
+            "attempt_id": "clip_b256_qd1_R7",
+            "campaign_index": 217,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.457035+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:35.033557+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R8.json",
+            "attempt_id": "clip_b256_qd1_R8",
+            "campaign_index": 249,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.324427+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.435693+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R9.json",
+            "attempt_id": "clip_b256_qd1_R9",
+            "campaign_index": 281,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.445541+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.804345+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R10.json",
+            "attempt_id": "clip_b256_qd1_R10",
+            "campaign_index": 313,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:11:30.326128+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.166925+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R1_A3.json",
+            "attempt_id": "clip_b256_qd1_R1_A3",
+            "campaign_index": 25,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.368988+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R2_A3.json",
+            "attempt_id": "clip_b256_qd1_R2_A3",
+            "campaign_index": 57,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.450489+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R3_A3.json",
+            "attempt_id": "clip_b256_qd1_R3_A3",
+            "campaign_index": 89,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.714490+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R7_A2.json",
+            "attempt_id": "clip_b256_qd1_R7_A2",
+            "campaign_index": 217,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.130704+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R8_A2.json",
+            "attempt_id": "clip_b256_qd1_R8_A2",
+            "campaign_index": 249,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:34.067472+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R9_A2.json",
+            "attempt_id": "clip_b256_qd1_R9_A2",
+            "campaign_index": 281,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:34.952737+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R10_A2.json",
+            "attempt_id": "clip_b256_qd1_R10_A2",
+            "campaign_index": 313,
+            "error": null,
+            "finished_at": "2026-09-04T22:11:09.087513+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:23.021989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R1_A4.json",
+            "attempt_id": "clip_b256_qd1_R1_A4",
+            "campaign_index": 25,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.395988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd1_R2_A4.json",
+            "attempt_id": "clip_b256_qd1_R2_A4",
+            "campaign_index": 57,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.493490+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R5_A2.json",
+            "attempt_id": "clip_b256_qd1_R5_A2",
+            "campaign_index": 77,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.773700+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R6_A2.json",
+            "attempt_id": "clip_b256_qd1_R6_A2",
+            "campaign_index": 93,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:55.031212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R7_A2.json",
+            "attempt_id": "clip_b256_qd1_R7_A2",
+            "campaign_index": 109,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.293212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R8_A2.json",
+            "attempt_id": "clip_b256_qd1_R8_A2",
+            "campaign_index": 125,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.521210+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R9_A2.json",
+            "attempt_id": "clip_b256_qd1_R9_A2",
+            "campaign_index": 141,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.767750+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd1_R10_A2.json",
+            "attempt_id": "clip_b256_qd1_R10_A2",
+            "campaign_index": 157,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:55.992772+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R5_A2.json",
+            "attempt_id": "clip_b256_qd1_R5_A2",
+            "campaign_index": 37,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.744826+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.684361+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R6_A2.json",
+            "attempt_id": "clip_b256_qd1_R6_A2",
+            "campaign_index": 45,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.744826+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.764387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R7_A2.json",
+            "attempt_id": "clip_b256_qd1_R7_A2",
+            "campaign_index": 53,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.745823+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.838386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R8_A2.json",
+            "attempt_id": "clip_b256_qd1_R8_A2",
+            "campaign_index": 61,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.746825+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.921896+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R9_A2.json",
+            "attempt_id": "clip_b256_qd1_R9_A2",
+            "campaign_index": 69,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.746825+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:41.999409+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd1_R10_A2.json",
+            "attempt_id": "clip_b256_qd1_R10_A2",
+            "campaign_index": 77,
+            "error": null,
+            "finished_at": "2026-09-04T22:55:56.743162+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.081465+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "campaign_index": 25,
+        "cell_id": "clip_b256_qd1",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 1,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R1.json",
+            "attempt_id": "clip_b256_qd2_R1",
+            "campaign_index": 27,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.661703+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.901104+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R2.json",
+            "attempt_id": "clip_b256_qd2_R2",
+            "campaign_index": 59,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.156950+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.078638+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R3.json",
+            "attempt_id": "clip_b256_qd2_R3",
+            "campaign_index": 91,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.576311+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.250662+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R4.json",
+            "attempt_id": "clip_b256_qd2_R4",
+            "campaign_index": 123,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.139693+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.425726+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R5.json",
+            "attempt_id": "clip_b256_qd2_R5",
+            "campaign_index": 155,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.740707+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.612240+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R6.json",
+            "attempt_id": "clip_b256_qd2_R6",
+            "campaign_index": 187,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.573416+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.795755+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R1_A2.json",
+            "attempt_id": "clip_b256_qd2_R1_A2",
+            "campaign_index": 27,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.144335+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R2_A2.json",
+            "attempt_id": "clip_b256_qd2_R2_A2",
+            "campaign_index": 59,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.089128+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R3_A2.json",
+            "attempt_id": "clip_b256_qd2_R3_A2",
+            "campaign_index": 91,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:27.016447+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R4_A2.json",
+            "attempt_id": "clip_b256_qd2_R4_A2",
+            "campaign_index": 123,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T21:22:10.199488+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R5_A2.json",
+            "attempt_id": "clip_b256_qd2_R5_A2",
+            "campaign_index": 155,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.554191+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R6_A2.json",
+            "attempt_id": "clip_b256_qd2_R6_A2",
+            "campaign_index": 187,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.362623+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R7.json",
+            "attempt_id": "clip_b256_qd2_R7",
+            "campaign_index": 219,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.507705+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:35.071547+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R8.json",
+            "attempt_id": "clip_b256_qd2_R8",
+            "campaign_index": 251,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.378424+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.458204+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R9.json",
+            "attempt_id": "clip_b256_qd2_R9",
+            "campaign_index": 283,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.499545+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.833857+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R10.json",
+            "attempt_id": "clip_b256_qd2_R10",
+            "campaign_index": 315,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:11:35.767590+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.193951+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R1_A3.json",
+            "attempt_id": "clip_b256_qd2_R1_A3",
+            "campaign_index": 27,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.483988+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R2_A3.json",
+            "attempt_id": "clip_b256_qd2_R2_A3",
+            "campaign_index": 59,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.634988+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R3_A3.json",
+            "attempt_id": "clip_b256_qd2_R3_A3",
+            "campaign_index": 91,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.834989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R7_A2.json",
+            "attempt_id": "clip_b256_qd2_R7_A2",
+            "campaign_index": 219,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.187704+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R8_A2.json",
+            "attempt_id": "clip_b256_qd2_R8_A2",
+            "campaign_index": 251,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:34.115987+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R9_A2.json",
+            "attempt_id": "clip_b256_qd2_R9_A2",
+            "campaign_index": 283,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:35.005836+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R10_A2.json",
+            "attempt_id": "clip_b256_qd2_R10_A2",
+            "campaign_index": 315,
+            "error": null,
+            "finished_at": "2026-09-04T22:11:46.220513+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T21:22:23.090988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R1_A4.json",
+            "attempt_id": "clip_b256_qd2_R1_A4",
+            "campaign_index": 27,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.528988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd2_R2_A4.json",
+            "attempt_id": "clip_b256_qd2_R2_A4",
+            "campaign_index": 59,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.658488+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R5_A2.json",
+            "attempt_id": "clip_b256_qd2_R5_A2",
+            "campaign_index": 78,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.785699+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R6_A2.json",
+            "attempt_id": "clip_b256_qd2_R6_A2",
+            "campaign_index": 94,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:55.047211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R7_A2.json",
+            "attempt_id": "clip_b256_qd2_R7_A2",
+            "campaign_index": 110,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.311212+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R8_A2.json",
+            "attempt_id": "clip_b256_qd2_R8_A2",
+            "campaign_index": 126,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.537214+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R9_A2.json",
+            "attempt_id": "clip_b256_qd2_R9_A2",
+            "campaign_index": 142,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.781749+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd2_R10_A2.json",
+            "attempt_id": "clip_b256_qd2_R10_A2",
+            "campaign_index": 158,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:56.009771+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R5_A2.json",
+            "attempt_id": "clip_b256_qd2_R5_A2",
+            "campaign_index": 38,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.747824+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.693876+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R6_A2.json",
+            "attempt_id": "clip_b256_qd2_R6_A2",
+            "campaign_index": 46,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.748824+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.772386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R7_A2.json",
+            "attempt_id": "clip_b256_qd2_R7_A2",
+            "campaign_index": 54,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.748824+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.849387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R8_A2.json",
+            "attempt_id": "clip_b256_qd2_R8_A2",
+            "campaign_index": 62,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.749825+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.931412+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R9_A2.json",
+            "attempt_id": "clip_b256_qd2_R9_A2",
+            "campaign_index": 70,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.749825+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:42.007921+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd2_R10_A2.json",
+            "attempt_id": "clip_b256_qd2_R10_A2",
+            "campaign_index": 78,
+            "error": null,
+            "finished_at": "2026-09-04T22:56:07.962763+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.101138+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "campaign_index": 27,
+        "cell_id": "clip_b256_qd2",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 2,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R1.json",
+            "attempt_id": "clip_b256_qd4_R1",
+            "campaign_index": 29,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.689724+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.911103+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R2.json",
+            "attempt_id": "clip_b256_qd4_R2",
+            "campaign_index": 61,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.185153+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.091639+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R3.json",
+            "attempt_id": "clip_b256_qd4_R3",
+            "campaign_index": 93,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.623311+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.261662+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R4.json",
+            "attempt_id": "clip_b256_qd4_R4",
+            "campaign_index": 125,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.173692+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.435726+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R5.json",
+            "attempt_id": "clip_b256_qd4_R5",
+            "campaign_index": 157,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.857353+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.625240+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R6.json",
+            "attempt_id": "clip_b256_qd4_R6",
+            "campaign_index": 189,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.617445+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.806754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R1_A2.json",
+            "attempt_id": "clip_b256_qd4_R1_A2",
+            "campaign_index": 29,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.200337+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R2_A2.json",
+            "attempt_id": "clip_b256_qd4_R2_A2",
+            "campaign_index": 61,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.162128+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R3_A2.json",
+            "attempt_id": "clip_b256_qd4_R3_A2",
+            "campaign_index": 93,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:27.074201+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R4_A2.json",
+            "attempt_id": "clip_b256_qd4_R4_A2",
+            "campaign_index": 125,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T22:20:30.850887+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R5_A2.json",
+            "attempt_id": "clip_b256_qd4_R5_A2",
+            "campaign_index": 157,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.597704+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R6_A2.json",
+            "attempt_id": "clip_b256_qd4_R6_A2",
+            "campaign_index": 189,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.418623+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R7.json",
+            "attempt_id": "clip_b256_qd4_R7",
+            "campaign_index": 221,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.564705+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:35.097547+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R8.json",
+            "attempt_id": "clip_b256_qd4_R8",
+            "campaign_index": 253,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.456426+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.482718+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R9.json",
+            "attempt_id": "clip_b256_qd4_R9",
+            "campaign_index": 285,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.555170+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.857893+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R10.json",
+            "attempt_id": "clip_b256_qd4_R10",
+            "campaign_index": 317,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:11:41.171150+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.221977+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R1_A3.json",
+            "attempt_id": "clip_b256_qd4_R1_A3",
+            "campaign_index": 29,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.626488+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R2_A3.json",
+            "attempt_id": "clip_b256_qd4_R2_A3",
+            "campaign_index": 61,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.748988+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R3_A3.json",
+            "attempt_id": "clip_b256_qd4_R3_A3",
+            "campaign_index": 93,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:07.958489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R7_A2.json",
+            "attempt_id": "clip_b256_qd4_R7_A2",
+            "campaign_index": 221,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.244704+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R8_A2.json",
+            "attempt_id": "clip_b256_qd4_R8_A2",
+            "campaign_index": 253,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:34.172017+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R9_A2.json",
+            "attempt_id": "clip_b256_qd4_R9_A2",
+            "campaign_index": 285,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:35.049620+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R10_A2.json",
+            "attempt_id": "clip_b256_qd4_R10_A2",
+            "campaign_index": 317,
+            "error": null,
+            "finished_at": "2026-09-04T22:21:07.659884+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:20:36.059689+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R1_A4.json",
+            "attempt_id": "clip_b256_qd4_R1_A4",
+            "campaign_index": 29,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.648989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd4_R2_A4.json",
+            "attempt_id": "clip_b256_qd4_R2_A4",
+            "campaign_index": 61,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.773988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R5_A2.json",
+            "attempt_id": "clip_b256_qd4_R5_A2",
+            "campaign_index": 79,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.796699+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R6_A2.json",
+            "attempt_id": "clip_b256_qd4_R6_A2",
+            "campaign_index": 95,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:55.062211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R7_A2.json",
+            "attempt_id": "clip_b256_qd4_R7_A2",
+            "campaign_index": 111,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.324211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R8_A2.json",
+            "attempt_id": "clip_b256_qd4_R8_A2",
+            "campaign_index": 127,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.550211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R9_A2.json",
+            "attempt_id": "clip_b256_qd4_R9_A2",
+            "campaign_index": 143,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.794260+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd4_R10_A2.json",
+            "attempt_id": "clip_b256_qd4_R10_A2",
+            "campaign_index": 159,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:56.026770+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R5_A2.json",
+            "attempt_id": "clip_b256_qd4_R5_A2",
+            "campaign_index": 39,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.750827+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.704875+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R6_A2.json",
+            "attempt_id": "clip_b256_qd4_R6_A2",
+            "campaign_index": 47,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.750827+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.780387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R7_A2.json",
+            "attempt_id": "clip_b256_qd4_R7_A2",
+            "campaign_index": 55,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.751826+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.862386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R8_A2.json",
+            "attempt_id": "clip_b256_qd4_R8_A2",
+            "campaign_index": 63,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.751826+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.943410+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R9_A2.json",
+            "attempt_id": "clip_b256_qd4_R9_A2",
+            "campaign_index": 71,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.752823+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:42.017920+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd4_R10_A2.json",
+            "attempt_id": "clip_b256_qd4_R10_A2",
+            "campaign_index": 79,
+            "error": null,
+            "finished_at": "2026-09-04T22:56:17.764334+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.117138+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "campaign_index": 29,
+        "cell_id": "clip_b256_qd4",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 4,
+        "role": "clip",
+        "status": "COMPLETE"
+      },
+      {
+        "attempts": [
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R1.json",
+            "attempt_id": "clip_b256_qd8_R1",
+            "campaign_index": 31,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:46.716725+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T20:55:03.920105+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R2.json",
+            "attempt_id": "clip_b256_qd8_R2",
+            "campaign_index": 63,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:55:47.214164+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T20:55:04.103151+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R3.json",
+            "attempt_id": "clip_b256_qd8_R3",
+            "campaign_index": 95,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:32.653311+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T20:55:04.270172+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R4.json",
+            "attempt_id": "clip_b256_qd8_R4",
+            "campaign_index": 127,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.209732+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T20:55:04.445726+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R5.json",
+            "attempt_id": "clip_b256_qd8_R5",
+            "campaign_index": 159,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:33.977827+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T20:55:04.636241+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R6.json",
+            "attempt_id": "clip_b256_qd8_R6",
+            "campaign_index": 191,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T20:56:34.652470+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T20:55:04.818754+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R1_A2.json",
+            "attempt_id": "clip_b256_qd8_R1_A2",
+            "campaign_index": 31,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:25.255338+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R2_A2.json",
+            "attempt_id": "clip_b256_qd8_R2_A2",
+            "campaign_index": 63,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:26.223127+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R3_A2.json",
+            "attempt_id": "clip_b256_qd8_R3_A2",
+            "campaign_index": 95,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:13:27.130200+00:00",
+            "round": 3,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R4_A2.json",
+            "attempt_id": "clip_b256_qd8_R4_A2",
+            "campaign_index": 127,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 4,
+            "started_at": "2026-09-04T22:20:30.911889+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R5_A2.json",
+            "attempt_id": "clip_b256_qd8_R5_A2",
+            "campaign_index": 159,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:20:31.648422+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R6_A2.json",
+            "attempt_id": "clip_b256_qd8_R6_A2",
+            "campaign_index": 191,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:20:32.461623+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R7.json",
+            "attempt_id": "clip_b256_qd8_R7",
+            "campaign_index": 223,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:30.617389+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T20:56:35.119546+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R8.json",
+            "attempt_id": "clip_b256_qd8_R8",
+            "campaign_index": 255,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:31.531425+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T20:56:35.506718+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R9.json",
+            "attempt_id": "clip_b256_qd8_R9",
+            "campaign_index": 287,
+            "error": "interrupted_without_artifact",
+            "finished_at": "2026-09-04T21:13:32.612167+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T20:56:35.880878+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R10.json",
+            "attempt_id": "clip_b256_qd8_R10",
+            "campaign_index": 319,
+            "error": "TypeError:run_source_ceiling_oracle() takes from 3 to 4 positional arguments but 6 were given",
+            "finished_at": "2026-09-04T21:11:46.697350+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T20:56:36.246489+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R1_A3.json",
+            "attempt_id": "clip_b256_qd8_R1_A3",
+            "campaign_index": 31,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:03.747489+00:00",
+            "round": 1,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R2_A3.json",
+            "attempt_id": "clip_b256_qd8_R2_A3",
+            "campaign_index": 63,
+            "error": "arm_mismatch;fixed_config_missing;status_not_ok;byte_validation_failed;source_only_marker_missing;source_only_used_cuda_or_h2d;source_only_h2d_metric_present;source_only_coverage_failed;source_only_syscall_telemetry_missing;not_eligible",
+            "finished_at": "2026-09-04T21:22:05.871990+00:00",
+            "round": 2,
+            "status": "INVALID"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R3_A3.json",
+            "attempt_id": "clip_b256_qd8_R3_A3",
+            "campaign_index": 95,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 3,
+            "started_at": "2026-09-04T21:22:08.077489+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R7_A2.json",
+            "attempt_id": "clip_b256_qd8_R7_A2",
+            "campaign_index": 223,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:20:33.304703+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R8_A2.json",
+            "attempt_id": "clip_b256_qd8_R8_A2",
+            "campaign_index": 255,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:20:34.233532+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R9_A2.json",
+            "attempt_id": "clip_b256_qd8_R9_A2",
+            "campaign_index": 287,
+            "error": "campaign_interrupted_for_parallel_sharding",
+            "finished_at": "2026-09-04T22:22:56.936284+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:20:35.100725+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R10_A2.json",
+            "attempt_id": "clip_b256_qd8_R10_A2",
+            "campaign_index": 319,
+            "error": null,
+            "finished_at": "2026-09-04T22:21:52.582997+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:20:36.110198+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R1_A4.json",
+            "attempt_id": "clip_b256_qd8_R1_A4",
+            "campaign_index": 31,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 1,
+            "started_at": "2026-09-04T21:22:03.782989+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs\\clip_b256_qd8_R2_A4.json",
+            "attempt_id": "clip_b256_qd8_R2_A4",
+            "campaign_index": 63,
+            "error": "campaign_stopped_after_sufficient_data",
+            "finished_at": "2026-09-04T22:16:58.147513+00:00",
+            "round": 2,
+            "started_at": "2026-09-04T21:22:05.893988+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R5_A2.json",
+            "attempt_id": "clip_b256_qd8_R5_A2",
+            "campaign_index": 80,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 5,
+            "started_at": "2026-09-04T22:23:54.812700+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R6_A2.json",
+            "attempt_id": "clip_b256_qd8_R6_A2",
+            "campaign_index": 96,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 6,
+            "started_at": "2026-09-04T22:23:55.078213+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R7_A2.json",
+            "attempt_id": "clip_b256_qd8_R7_A2",
+            "campaign_index": 112,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 7,
+            "started_at": "2026-09-04T22:23:55.339211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R8_A2.json",
+            "attempt_id": "clip_b256_qd8_R8_A2",
+            "campaign_index": 128,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 8,
+            "started_at": "2026-09-04T22:23:55.568211+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R9_A2.json",
+            "attempt_id": "clip_b256_qd8_R9_A2",
+            "campaign_index": 144,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 9,
+            "started_at": "2026-09-04T22:23:55.807259+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "unetClipExperimentsSeptember\\06_source_only_runs_batch1_clip\\clip_b256_qd8_R10_A2.json",
+            "attempt_id": "clip_b256_qd8_R10_A2",
+            "campaign_index": 160,
+            "error": "interrupted_before_exp06_parallel_sharding",
+            "finished_at": "2026-09-04T22:41:40.861528+00:00",
+            "interruption_reason": "interrupted_before_exp06_parallel_sharding",
+            "round": 10,
+            "started_at": "2026-09-04T22:23:56.038770+00:00",
+            "status": "FAILED"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R5_A2.json",
+            "attempt_id": "clip_b256_qd8_R5_A2",
+            "campaign_index": 40,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.753824+00:00",
+            "round": 5,
+            "started_at": "2026-09-04T22:41:41.714387+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R6_A2.json",
+            "attempt_id": "clip_b256_qd8_R6_A2",
+            "campaign_index": 48,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.754824+00:00",
+            "round": 6,
+            "started_at": "2026-09-04T22:41:41.789386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R7_A2.json",
+            "attempt_id": "clip_b256_qd8_R7_A2",
+            "campaign_index": 56,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.754824+00:00",
+            "round": 7,
+            "started_at": "2026-09-04T22:41:41.871386+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R8_A2.json",
+            "attempt_id": "clip_b256_qd8_R8_A2",
+            "campaign_index": 64,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.755824+00:00",
+            "round": 8,
+            "started_at": "2026-09-04T22:41:41.952412+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R9_A2.json",
+            "attempt_id": "clip_b256_qd8_R9_A2",
+            "campaign_index": 72,
+            "error": null,
+            "finished_at": "2026-09-04T23:15:15.755824+00:00",
+            "round": 9,
+            "started_at": "2026-09-04T22:41:42.027920+00:00",
+            "status": "COMPLETE"
+          },
+          {
+            "artifact": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\unetClipExperimentsSeptember\\06_source_only_runs_clip_128_256\\clip_b256_qd8_R10_A2.json",
+            "attempt_id": "clip_b256_qd8_R10_A2",
+            "campaign_index": 80,
+            "error": null,
+            "finished_at": "2026-09-04T22:56:28.527804+00:00",
+            "round": 10,
+            "started_at": "2026-09-04T22:41:42.131138+00:00",
+            "status": "COMPLETE"
+          }
+        ],
+        "block_bytes": 268435456,
+        "block_mib": 256,
+        "campaign_index": 31,
+        "cell_id": "clip_b256_qd8",
+        "model": "qwen_3_4b.safetensors",
+        "qd": 8,
+        "role": "clip",
+        "status": "COMPLETE"
+      }
+    ],
+    "eligibility_arm": "source_only",
+    "historical_integrated_arms": [
+      "static_e27",
+      "fastsafe"
+    ],
+    "phase": "phase_2_source_only",
+    "schedule": [
+      {
+        "campaign_index": 1,
+        "cell_id": "clip_b128_qd1",
+        "round": 1
+      },
+      {
+        "campaign_index": 2,
+        "cell_id": "clip_b128_qd2",
+        "round": 1
+      },
+      {
+        "campaign_index": 3,
+        "cell_id": "clip_b128_qd4",
+        "round": 1
+      },
+      {
+        "campaign_index": 4,
+        "cell_id": "clip_b128_qd8",
+        "round": 1
+      },
+      {
+        "campaign_index": 5,
+        "cell_id": "clip_b256_qd1",
+        "round": 1
+      },
+      {
+        "campaign_index": 6,
+        "cell_id": "clip_b256_qd2",
+        "round": 1
+      },
+      {
+        "campaign_index": 7,
+        "cell_id": "clip_b256_qd4",
+        "round": 1
+      },
+      {
+        "campaign_index": 8,
+        "cell_id": "clip_b256_qd8",
+        "round": 1
+      },
+      {
+        "campaign_index": 9,
+        "cell_id": "clip_b128_qd1",
+        "round": 2
+      },
+      {
+        "campaign_index": 10,
+        "cell_id": "clip_b128_qd2",
+        "round": 2
+      },
+      {
+        "campaign_index": 11,
+        "cell_id": "clip_b128_qd4",
+        "round": 2
+      },
+      {
+        "campaign_index": 12,
+        "cell_id": "clip_b128_qd8",
+        "round": 2
+      },
+      {
+        "campaign_index": 13,
+        "cell_id": "clip_b256_qd1",
+        "round": 2
+      },
+      {
+        "campaign_index": 14,
+        "cell_id": "clip_b256_qd2",
+        "round": 2
+      },
+      {
+        "campaign_index": 15,
+        "cell_id": "clip_b256_qd4",
+        "round": 2
+      },
+      {
+        "campaign_index": 16,
+        "cell_id": "clip_b256_qd8",
+        "round": 2
+      },
+      {
+        "campaign_index": 17,
+        "cell_id": "clip_b128_qd1",
+        "round": 3
+      },
+      {
+        "campaign_index": 18,
+        "cell_id": "clip_b128_qd2",
+        "round": 3
+      },
+      {
+        "campaign_index": 19,
+        "cell_id": "clip_b128_qd4",
+        "round": 3
+      },
+      {
+        "campaign_index": 20,
+        "cell_id": "clip_b128_qd8",
+        "round": 3
+      },
+      {
+        "campaign_index": 21,
+        "cell_id": "clip_b256_qd1",
+        "round": 3
+      },
+      {
+        "campaign_index": 22,
+        "cell_id": "clip_b256_qd2",
+        "round": 3
+      },
+      {
+        "campaign_index": 23,
+        "cell_id": "clip_b256_qd4",
+        "round": 3
+      },
+      {
+        "campaign_index": 24,
+        "cell_id": "clip_b256_qd8",
+        "round": 3
+      },
+      {
+        "campaign_index": 25,
+        "cell_id": "clip_b128_qd1",
+        "round": 4
+      },
+      {
+        "campaign_index": 26,
+        "cell_id": "clip_b128_qd2",
+        "round": 4
+      },
+      {
+        "campaign_index": 27,
+        "cell_id": "clip_b128_qd4",
+        "round": 4
+      },
+      {
+        "campaign_index": 28,
+        "cell_id": "clip_b128_qd8",
+        "round": 4
+      },
+      {
+        "campaign_index": 29,
+        "cell_id": "clip_b256_qd1",
+        "round": 4
+      },
+      {
+        "campaign_index": 30,
+        "cell_id": "clip_b256_qd2",
+        "round": 4
+      },
+      {
+        "campaign_index": 31,
+        "cell_id": "clip_b256_qd4",
+        "round": 4
+      },
+      {
+        "campaign_index": 32,
+        "cell_id": "clip_b256_qd8",
+        "round": 4
+      },
+      {
+        "campaign_index": 33,
+        "cell_id": "clip_b128_qd1",
+        "round": 5
+      },
+      {
+        "campaign_index": 34,
+        "cell_id": "clip_b128_qd2",
+        "round": 5
+      },
+      {
+        "campaign_index": 35,
+        "cell_id": "clip_b128_qd4",
+        "round": 5
+      },
+      {
+        "campaign_index": 36,
+        "cell_id": "clip_b128_qd8",
+        "round": 5
+      },
+      {
+        "campaign_index": 37,
+        "cell_id": "clip_b256_qd1",
+        "round": 5
+      },
+      {
+        "campaign_index": 38,
+        "cell_id": "clip_b256_qd2",
+        "round": 5
+      },
+      {
+        "campaign_index": 39,
+        "cell_id": "clip_b256_qd4",
+        "round": 5
+      },
+      {
+        "campaign_index": 40,
+        "cell_id": "clip_b256_qd8",
+        "round": 5
+      },
+      {
+        "campaign_index": 41,
+        "cell_id": "clip_b128_qd1",
+        "round": 6
+      },
+      {
+        "campaign_index": 42,
+        "cell_id": "clip_b128_qd2",
+        "round": 6
+      },
+      {
+        "campaign_index": 43,
+        "cell_id": "clip_b128_qd4",
+        "round": 6
+      },
+      {
+        "campaign_index": 44,
+        "cell_id": "clip_b128_qd8",
+        "round": 6
+      },
+      {
+        "campaign_index": 45,
+        "cell_id": "clip_b256_qd1",
+        "round": 6
+      },
+      {
+        "campaign_index": 46,
+        "cell_id": "clip_b256_qd2",
+        "round": 6
+      },
+      {
+        "campaign_index": 47,
+        "cell_id": "clip_b256_qd4",
+        "round": 6
+      },
+      {
+        "campaign_index": 48,
+        "cell_id": "clip_b256_qd8",
+        "round": 6
+      },
+      {
+        "campaign_index": 49,
+        "cell_id": "clip_b128_qd1",
+        "round": 7
+      },
+      {
+        "campaign_index": 50,
+        "cell_id": "clip_b128_qd2",
+        "round": 7
+      },
+      {
+        "campaign_index": 51,
+        "cell_id": "clip_b128_qd4",
+        "round": 7
+      },
+      {
+        "campaign_index": 52,
+        "cell_id": "clip_b128_qd8",
+        "round": 7
+      },
+      {
+        "campaign_index": 53,
+        "cell_id": "clip_b256_qd1",
+        "round": 7
+      },
+      {
+        "campaign_index": 54,
+        "cell_id": "clip_b256_qd2",
+        "round": 7
+      },
+      {
+        "campaign_index": 55,
+        "cell_id": "clip_b256_qd4",
+        "round": 7
+      },
+      {
+        "campaign_index": 56,
+        "cell_id": "clip_b256_qd8",
+        "round": 7
+      },
+      {
+        "campaign_index": 57,
+        "cell_id": "clip_b128_qd1",
+        "round": 8
+      },
+      {
+        "campaign_index": 58,
+        "cell_id": "clip_b128_qd2",
+        "round": 8
+      },
+      {
+        "campaign_index": 59,
+        "cell_id": "clip_b128_qd4",
+        "round": 8
+      },
+      {
+        "campaign_index": 60,
+        "cell_id": "clip_b128_qd8",
+        "round": 8
+      },
+      {
+        "campaign_index": 61,
+        "cell_id": "clip_b256_qd1",
+        "round": 8
+      },
+      {
+        "campaign_index": 62,
+        "cell_id": "clip_b256_qd2",
+        "round": 8
+      },
+      {
+        "campaign_index": 63,
+        "cell_id": "clip_b256_qd4",
+        "round": 8
+      },
+      {
+        "campaign_index": 64,
+        "cell_id": "clip_b256_qd8",
+        "round": 8
+      },
+      {
+        "campaign_index": 65,
+        "cell_id": "clip_b128_qd1",
+        "round": 9
+      },
+      {
+        "campaign_index": 66,
+        "cell_id": "clip_b128_qd2",
+        "round": 9
+      },
+      {
+        "campaign_index": 67,
+        "cell_id": "clip_b128_qd4",
+        "round": 9
+      },
+      {
+        "campaign_index": 68,
+        "cell_id": "clip_b128_qd8",
+        "round": 9
+      },
+      {
+        "campaign_index": 69,
+        "cell_id": "clip_b256_qd1",
+        "round": 9
+      },
+      {
+        "campaign_index": 70,
+        "cell_id": "clip_b256_qd2",
+        "round": 9
+      },
+      {
+        "campaign_index": 71,
+        "cell_id": "clip_b256_qd4",
+        "round": 9
+      },
+      {
+        "campaign_index": 72,
+        "cell_id": "clip_b256_qd8",
+        "round": 9
+      },
+      {
+        "campaign_index": 73,
+        "cell_id": "clip_b128_qd1",
+        "round": 10
+      },
+      {
+        "campaign_index": 74,
+        "cell_id": "clip_b128_qd2",
+        "round": 10
+      },
+      {
+        "campaign_index": 75,
+        "cell_id": "clip_b128_qd4",
+        "round": 10
+      },
+      {
+        "campaign_index": 76,
+        "cell_id": "clip_b128_qd8",
+        "round": 10
+      },
+      {
+        "campaign_index": 77,
+        "cell_id": "clip_b256_qd1",
+        "round": 10
+      },
+      {
+        "campaign_index": 78,
+        "cell_id": "clip_b256_qd2",
+        "round": 10
+      },
+      {
+        "campaign_index": 79,
+        "cell_id": "clip_b256_qd4",
+        "round": 10
+      },
+      {
+        "campaign_index": 80,
+        "cell_id": "clip_b256_qd8",
+        "round": 10
+      }
+    ],
+    "status": "COMPLETE",
+    "target_rounds": 10,
+    "updated_at": "2026-09-04T23:15:17.196922+00:00",
+    "version": 2
+  },
+  "next_action": "Run three disjoint Testing 7 source-only shards and merge their ledgers.",
+  "parallel_shards": {
+    "clip_128_256": {
+      "app": "sept-unetclip-04-source-ceiling-batch2",
+      "block_mib": [
+        128,
+        256
+      ],
+      "ledger": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/source_h2d_decoupling_campaign_state.clip_128_256.json",
+      "out_dir": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/06_source_only_runs_clip_128_256",
+      "role": "clip"
+    },
+    "clip_32_64": {
+      "app": "sept-unetclip-04-source-ceiling-batch1",
+      "block_mib": [
+        32,
+        64
+      ],
+      "ledger": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/source_h2d_decoupling_campaign_state.clip_32_64.json",
+      "out_dir": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/06_source_only_runs_clip_32_64",
+      "role": "clip"
+    },
+    "unet_128_256": {
+      "app": "sept-unetclip-04-source-ceiling-oracle",
+      "block_mib": [
+        128,
+        256
+      ],
+      "ledger": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/source_h2d_decoupling_campaign_state.unet_128_256.json",
+      "out_dir": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/06_source_only_runs_unet_128_256",
+      "role": "unet"
+    },
+    "unet_32_64": {
+      "app": "sept-unetclip-04-source-ceiling-batch3",
+      "block_mib": [
+        32,
+        64
+      ],
+      "ledger": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/source_h2d_decoupling_campaign_state.unet_32_64.json",
+      "out_dir": "C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/custom_nodes/comfyui-modal/unetClipExperimentsSeptember/06_source_only_runs_unet_32_64",
+      "role": "unet"
+    }
+  },
+  "phases": {
+    "phase_1_correctness": {
+      "status": "passed",
+      "tests": [
+        "tests/test_preplanned_extent_transport.py",
+        "tests/test_golden_qd_transport.py",
+        "tests/test_e27_source_integration.py"
+      ]
+    },
+    "phase_2_source_only": {
+      "cell_count": 8,
+      "eligible_observations": 123,
+      "ledger_version": 2,
+      "raw_evidence_root": "unetClipExperimentsSeptember/06_source_only_runs",
+      "report_csv": "unetClipExperimentsSeptember/06_source_block_qd_matrix_pure_source.csv",
+      "report_json": "unetClipExperimentsSeptember/06_source_block_qd_matrix_pure_source.json",
+      "report_markdown": "unetClipExperimentsSeptember/06_source_block_qd_matrix_pure_source.md",
+      "requested_observations": 320,
+      "status": "complete",
+      "stop_reason": "user_confirmed_sufficient_data",
+      "valid_cells": 0
+    },
+    "phase_3_integrated_matrix": {
+      "reason": "no decoupled integrated observations collected",
+      "status": "not_run"
+    },
+    "phase_4_golden_ab": {
+      "reason": "no winning decoupled integrated geometry available",
+      "status": "not_run"
+    }
+  },
+  "status": "parallel_shards_prepared",
+  "transport": {
+    "arm": "decoupled",
+    "h2d_copy_bytes_env": "COMFYMODAL_GOLDEN_H2D_COPY_BYTES",
+    "h2d_inflight_depth_env": "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH",
+    "post_hoc_aggregation": false,
+    "preplanned_extents": true,
+    "source_block_bytes_env": "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES",
+    "source_capacity_env": "COMFYMODAL_GOLDEN_SOURCE_CAPACITY",
+    "source_qd_env": "COMFYMODAL_GOLDEN_SOURCE_QD"
+  },
+  "updated_at": "2026-09-04T22:57:41.593736+00:00",
+  "worktree": "TESTING2"
+}

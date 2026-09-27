@@ -1,0 +1,4404 @@
+{
+  "runs": [
+    {
+      "mode": "imports",
+      "ts_unix": 1786861920.0424807,
+      "data": {
+        "class_set": [
+          "Any Switch (rgthree)",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "CacheDiT_Model_Optimizer",
+          "ClownOptions_ExtraOptions_Beta",
+          "ClownsharKSampler_Beta",
+          "ComfyModalProductionImageComparerOutput",
+          "ConditioningZeroOut",
+          "CustomCombo",
+          "EmptyImage",
+          "EmptySD3LatentImage",
+          "ImageRotate",
+          "ImpactIfNone",
+          "ImpactSwitch",
+          "JoinStrings",
+          "LGNoiseInjectionLatent",
+          "ModelSamplingAuraFlow",
+          "PairConditioningSetProperties",
+          "PathchSageAttentionKJ",
+          "PrimitiveStringMultiline",
+          "SimpleMath+",
+          "StringToCombo|LP",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "easy float",
+          "easy ifElse",
+          "easy imageSize",
+          "easy indexAnything",
+          "easy int",
+          "easy stringToIntList"
+        ],
+        "class_count": 31,
+        "total_mappings": 2192,
+        "mapped": [
+          "Any Switch (rgthree)",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "CacheDiT_Model_Optimizer",
+          "ClownOptions_ExtraOptions_Beta",
+          "ClownsharKSampler_Beta",
+          "ComfyModalProductionImageComparerOutput",
+          "ConditioningZeroOut",
+          "CustomCombo",
+          "EmptyImage",
+          "EmptySD3LatentImage",
+          "ImageRotate",
+          "ImpactIfNone",
+          "ImpactSwitch",
+          "JoinStrings",
+          "LGNoiseInjectionLatent",
+          "ModelSamplingAuraFlow",
+          "PairConditioningSetProperties",
+          "PathchSageAttentionKJ",
+          "PrimitiveStringMultiline",
+          "SimpleMath+",
+          "StringToCombo|LP",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "easy float",
+          "easy ifElse",
+          "easy imageSize",
+          "easy indexAnything",
+          "easy int",
+          "easy stringToIntList"
+        ],
+        "mapped_count": 31,
+        "unmapped": []
+      }
+    },
+    {
+      "mode": "measure",
+      "ts_unix": 1786861954.6586676,
+      "data": {
+        "comfyui_root": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\folder_paths.py",
+        "classes": [
+          "Any Switch (rgthree)",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "CacheDiT_Model_Optimizer",
+          "ClownOptions_ExtraOptions_Beta",
+          "ClownsharKSampler_Beta",
+          "ComfyModalProductionImageComparerOutput",
+          "ConditioningZeroOut",
+          "CustomCombo",
+          "EmptyImage",
+          "EmptySD3LatentImage",
+          "ImageRotate",
+          "ImpactIfNone",
+          "ImpactSwitch",
+          "JoinStrings",
+          "LGNoiseInjectionLatent",
+          "ModelSamplingAuraFlow",
+          "PairConditioningSetProperties",
+          "PathchSageAttentionKJ",
+          "PrimitiveStringMultiline",
+          "SimpleMath+",
+          "StringToCombo|LP",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "easy float",
+          "easy ifElse",
+          "easy imageSize",
+          "easy indexAnything",
+          "easy int",
+          "easy stringToIntList"
+        ],
+        "class_count": 31,
+        "mapped_count": 31,
+        "unmapped": [],
+        "import_cost_ms": 24584.1,
+        "cuda_initialized_at_start": true,
+        "threads_at_start": 7,
+        "rss_mb_at_start": 1270.4,
+        "pass1_cold": {
+          "count": 31,
+          "warm_fn_ms": 23.964,
+          "caller_wall_ms": 23.989,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 3,
+            "gfl_ms": 1.1976000387221575,
+            "rs_ms": 0.9138000314123929
+          }
+        },
+        "per_class_pass1": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.005,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.125,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.11960003757849336,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.005,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.006,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.146,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.051,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.03,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.021,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.521,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.044,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.143,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.13950001448392868,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.11,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.09799998952075839,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.3522000042721629,
+            "rs_ms": 0
+          }
+        },
+        "pass2_warm": {
+          "count": 31,
+          "warm_fn_ms": 1.394,
+          "caller_wall_ms": 1.412,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.30399998649954796,
+            "rs_ms": 0
+          }
+        },
+        "per_class_pass2": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.087,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.08450000314041972,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.005,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.03,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.033,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.025,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.019,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.483,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.026,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.093,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.09079999290406704,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.098,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.08950004121288657,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.2614000113680959,
+            "rs_ms": 0
+          }
+        },
+        "pass3_warm": {
+          "count": 31,
+          "warm_fn_ms": 0.973,
+          "caller_wall_ms": 0.989,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.2549000200815499,
+            "rs_ms": 0
+          }
+        },
+        "per_class_pass3": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.085,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.08269998943433166,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.027,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.021,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.023,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.015,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.468,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.02,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.106,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.1037000329233706,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.087,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.07920002099126577,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.26240007719025016,
+            "rs_ms": 0
+          }
+        },
+        "per_class_repeated": {
+          "Any Switch (rgthree)": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.002
+          },
+          "CLIPLoader": {
+            "call4_ms": 0.082,
+            "call5_ms": 0.074
+          },
+          "CLIPTextEncode": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "CacheDiT_Model_Optimizer": {
+            "call4_ms": 0.004,
+            "call5_ms": 0.002
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "ClownsharKSampler_Beta": {
+            "call4_ms": 0.028,
+            "call5_ms": 0.02
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "ConditioningZeroOut": {
+            "call4_ms": 0.0,
+            "call5_ms": 0.0
+          },
+          "CustomCombo": {
+            "call4_ms": 0.024,
+            "call5_ms": 0.014
+          },
+          "EmptyImage": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "EmptySD3LatentImage": {
+            "call4_ms": 0.021,
+            "call5_ms": 0.013
+          },
+          "ImageRotate": {
+            "call4_ms": 0.013,
+            "call5_ms": 0.009
+          },
+          "ImpactIfNone": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "ImpactSwitch": {
+            "call4_ms": 0.381,
+            "call5_ms": 0.368
+          },
+          "JoinStrings": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "LGNoiseInjectionLatent": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "ModelSamplingAuraFlow": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "PairConditioningSetProperties": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "PathchSageAttentionKJ": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "PrimitiveStringMultiline": {
+            "call4_ms": 0.019,
+            "call5_ms": 0.012
+          },
+          "SimpleMath+": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "StringToCombo|LP": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "UNETLoader": {
+            "call4_ms": 0.086,
+            "call5_ms": 0.073
+          },
+          "VAEDecode": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "VAELoader": {
+            "call4_ms": 0.081,
+            "call5_ms": 0.077
+          },
+          "easy float": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "easy ifElse": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "easy imageSize": {
+            "call4_ms": 0.0,
+            "call5_ms": 0.0
+          },
+          "easy indexAnything": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "easy int": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "easy stringToIntList": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          }
+        },
+        "warm_registered_folders": {
+          "folder_count": 29,
+          "warm_fn_ms": 388.01,
+          "caller_wall_ms": 388.021,
+          "fs": {
+            "get_filename_list": 29,
+            "recursive_search": 14,
+            "gfl_ms": 387.9624000401236,
+            "rs_ms": 366.4585999213159
+          }
+        },
+        "loader_listings": {
+          "diffusion_models": {
+            "cold_ms": 0.897,
+            "file_count": 7,
+            "warm_ms": 0.149
+          },
+          "text_encoders": {
+            "cold_ms": 0.341,
+            "file_count": 5,
+            "warm_ms": 0.086
+          },
+          "vae": {
+            "cold_ms": 0.192,
+            "file_count": 4,
+            "warm_ms": 0.053
+          },
+          "vae_approx": {
+            "cold_ms": 0.263,
+            "file_count": 8,
+            "warm_ms": 0.077
+          }
+        },
+        "sys_after": {
+          "thread_count": 7,
+          "rss_mb": 1272.5,
+          "cuda_initialized": true,
+          "process_cpu_ms": 8984.4
+        }
+      }
+    },
+    {
+      "mode": "measure",
+      "ts_unix": 1786862008.3612723,
+      "data": {
+        "comfyui_root": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\folder_paths.py",
+        "classes": [
+          "Any Switch (rgthree)",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "CacheDiT_Model_Optimizer",
+          "ClownOptions_ExtraOptions_Beta",
+          "ClownsharKSampler_Beta",
+          "ComfyModalProductionImageComparerOutput",
+          "ConditioningZeroOut",
+          "CustomCombo",
+          "EmptyImage",
+          "EmptySD3LatentImage",
+          "ImageRotate",
+          "ImpactIfNone",
+          "ImpactSwitch",
+          "JoinStrings",
+          "LGNoiseInjectionLatent",
+          "ModelSamplingAuraFlow",
+          "PairConditioningSetProperties",
+          "PathchSageAttentionKJ",
+          "PrimitiveStringMultiline",
+          "SimpleMath+",
+          "StringToCombo|LP",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "easy float",
+          "easy ifElse",
+          "easy imageSize",
+          "easy indexAnything",
+          "easy int",
+          "easy stringToIntList"
+        ],
+        "class_count": 31,
+        "mapped_count": 31,
+        "unmapped": [],
+        "import_cost_ms": 25071.4,
+        "cuda_initialized_at_start": true,
+        "threads_at_start": 7,
+        "rss_mb_at_start": 1269.7,
+        "pass1_cold": {
+          "count": 31,
+          "warm_fn_ms": 18.026,
+          "caller_wall_ms": 18.045,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 3,
+            "gfl_ms": 0.8046999573707581,
+            "rs_ms": 0.5831999587826431
+          }
+        },
+        "per_class_pass1": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.105,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.10029994882643223,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.006,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.006,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.042,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.005,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.06,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.031,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.023,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.988,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.05,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.128,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.12590002734214067,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.116,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.10230002226307988,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.32460002694278955,
+            "rs_ms": 0
+          }
+        },
+        "pass2_warm": {
+          "count": 31,
+          "warm_fn_ms": 1.146,
+          "caller_wall_ms": 1.166,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.25890005053952336,
+            "rs_ms": 0
+          }
+        },
+        "per_class_pass2": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.163,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.1583000412210822,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.006,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.007,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.038,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.004,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.029,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.024,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.019,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.478,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.021,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.096,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.09379995753988624,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.09,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.08219998562708497,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.33030001213774085,
+            "rs_ms": 0
+          }
+        },
+        "pass3_warm": {
+          "count": 31,
+          "warm_fn_ms": 1.049,
+          "caller_wall_ms": 1.064,
+          "fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.26519998209550977,
+            "rs_ms": 0
+          }
+        },
+        "per_class_pass3": {
+          "Any Switch (rgthree)": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 32,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPLoader": {
+            "ok": true,
+            "wall_ms": 0.082,
+            "result_bytes": 573,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.07990002632141113,
+              "rs_ms": 0.0
+            }
+          },
+          "CLIPTextEncode": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 194,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CacheDiT_Model_Optimizer": {
+            "ok": true,
+            "wall_ms": 0.005,
+            "result_bytes": 1162,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 117,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ClownsharKSampler_Beta": {
+            "ok": true,
+            "wall_ms": 0.025,
+            "result_bytes": 4968,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "ok": true,
+            "wall_ms": 0.003,
+            "result_bytes": 110,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ConditioningZeroOut": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 48,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "CustomCombo": {
+            "ok": true,
+            "wall_ms": 0.021,
+            "result_bytes": 74,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptyImage": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 311,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "EmptySD3LatentImage": {
+            "ok": true,
+            "wall_ms": 0.021,
+            "result_bytes": 225,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImageRotate": {
+            "ok": true,
+            "wall_ms": 0.015,
+            "result_bytes": 150,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactIfNone": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 67,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ImpactSwitch": {
+            "ok": true,
+            "wall_ms": 0.481,
+            "result_bytes": 735,
+            "result_keys": 3,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "JoinStrings": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 211,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "LGNoiseInjectionLatent": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 678,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "ModelSamplingAuraFlow": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 113,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PairConditioningSetProperties": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 295,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PathchSageAttentionKJ": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 613,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "PrimitiveStringMultiline": {
+            "ok": true,
+            "wall_ms": 0.018,
+            "result_bytes": 56,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "SimpleMath+": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 188,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "StringToCombo|LP": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 73,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "UNETLoader": {
+            "ok": true,
+            "wall_ms": 0.093,
+            "result_bytes": 398,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 1,
+              "recursive_search": 0,
+              "gfl_ms": 0.09159999899566174,
+              "rs_ms": 0.0
+            }
+          },
+          "VAEDecode": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 155,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "VAELoader": {
+            "ok": true,
+            "wall_ms": 0.111,
+            "result_bytes": 199,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 2,
+              "recursive_search": 0,
+              "gfl_ms": 0.10289996862411499,
+              "rs_ms": 0.0
+            }
+          },
+          "easy float": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 123,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy ifElse": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 107,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy imageSize": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 34,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy indexAnything": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 171,
+            "result_keys": 2,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy int": {
+            "ok": true,
+            "wall_ms": 0.002,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "easy stringToIntList": {
+            "ok": true,
+            "wall_ms": 0.001,
+            "result_bytes": 79,
+            "result_keys": 1,
+            "error": null,
+            "fs": {
+              "get_filename_list": 0,
+              "recursive_search": 0,
+              "gfl_ms": 0.0,
+              "rs_ms": 0.0
+            }
+          },
+          "_fs": {
+            "get_filename_list": 4,
+            "recursive_search": 0,
+            "gfl_ms": 0.2707999665290117,
+            "rs_ms": 0
+          }
+        },
+        "per_class_repeated": {
+          "Any Switch (rgthree)": {
+            "call4_ms": 0.003,
+            "call5_ms": 0.002
+          },
+          "CLIPLoader": {
+            "call4_ms": 0.107,
+            "call5_ms": 0.093
+          },
+          "CLIPTextEncode": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "CacheDiT_Model_Optimizer": {
+            "call4_ms": 0.004,
+            "call5_ms": 0.002
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "ClownsharKSampler_Beta": {
+            "call4_ms": 0.026,
+            "call5_ms": 0.019
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "ConditioningZeroOut": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "CustomCombo": {
+            "call4_ms": 0.023,
+            "call5_ms": 0.011
+          },
+          "EmptyImage": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "EmptySD3LatentImage": {
+            "call4_ms": 0.02,
+            "call5_ms": 0.014
+          },
+          "ImageRotate": {
+            "call4_ms": 0.013,
+            "call5_ms": 0.009
+          },
+          "ImpactIfNone": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "ImpactSwitch": {
+            "call4_ms": 0.44,
+            "call5_ms": 0.426
+          },
+          "JoinStrings": {
+            "call4_ms": 0.003,
+            "call5_ms": 0.001
+          },
+          "LGNoiseInjectionLatent": {
+            "call4_ms": 0.003,
+            "call5_ms": 0.002
+          },
+          "ModelSamplingAuraFlow": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "PairConditioningSetProperties": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "PathchSageAttentionKJ": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.114
+          },
+          "PrimitiveStringMultiline": {
+            "call4_ms": 0.027,
+            "call5_ms": 0.016
+          },
+          "SimpleMath+": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "StringToCombo|LP": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "UNETLoader": {
+            "call4_ms": 0.157,
+            "call5_ms": 0.106
+          },
+          "VAEDecode": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "VAELoader": {
+            "call4_ms": 0.164,
+            "call5_ms": 0.153
+          },
+          "easy float": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "easy ifElse": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "easy imageSize": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.0
+          },
+          "easy indexAnything": {
+            "call4_ms": 0.002,
+            "call5_ms": 0.001
+          },
+          "easy int": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          },
+          "easy stringToIntList": {
+            "call4_ms": 0.001,
+            "call5_ms": 0.001
+          }
+        },
+        "warm_registered_folders": {
+          "folder_count": 29,
+          "warm_fn_ms": 348.105,
+          "caller_wall_ms": 348.117,
+          "fs": {
+            "get_filename_list": 29,
+            "recursive_search": 14,
+            "gfl_ms": 348.0509999790229,
+            "rs_ms": 329.98030009912327
+          }
+        },
+        "loader_listings": {
+          "diffusion_models": {
+            "cold_ms": 0.878,
+            "file_count": 7,
+            "warm_ms": 0.613
+          },
+          "text_encoders": {
+            "cold_ms": 0.447,
+            "file_count": 5,
+            "warm_ms": 0.118
+          },
+          "vae": {
+            "cold_ms": 0.236,
+            "file_count": 4,
+            "warm_ms": 0.061
+          },
+          "vae_approx": {
+            "cold_ms": 0.297,
+            "file_count": 8,
+            "warm_ms": 0.086
+          }
+        },
+        "sys_after": {
+          "thread_count": 7,
+          "rss_mb": 1270.9,
+          "cuda_initialized": true,
+          "process_cpu_ms": 9687.5
+        }
+      }
+    },
+    {
+      "mode": "omit",
+      "ts_unix": 1786862045.114777,
+      "data": {
+        "classes": [
+          "Any Switch (rgthree)",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "CacheDiT_Model_Optimizer",
+          "ClownOptions_ExtraOptions_Beta",
+          "ClownsharKSampler_Beta",
+          "ComfyModalProductionImageComparerOutput",
+          "ConditioningZeroOut",
+          "CustomCombo",
+          "EmptyImage",
+          "EmptySD3LatentImage",
+          "ImageRotate",
+          "ImpactIfNone",
+          "ImpactSwitch",
+          "JoinStrings",
+          "LGNoiseInjectionLatent",
+          "ModelSamplingAuraFlow",
+          "PairConditioningSetProperties",
+          "PathchSageAttentionKJ",
+          "PrimitiveStringMultiline",
+          "SimpleMath+",
+          "StringToCombo|LP",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "easy float",
+          "easy ifElse",
+          "easy imageSize",
+          "easy indexAnything",
+          "easy int",
+          "easy stringToIntList"
+        ],
+        "deferred_cold_pass_ms": 3.294,
+        "deferred_fs": {
+          "get_filename_list": 4,
+          "recursive_search": 6,
+          "gfl_ms": 2.026100060902536,
+          "rs_ms": 1.9368999637663364
+        },
+        "deferred_count": 31,
+        "schema_mismatch_count": 0,
+        "schema_mismatches": [],
+        "lookup_costs": {
+          "Any Switch (rgthree)": {
+            "input_count": 0,
+            "walk_per_input_ms": 0.001
+          },
+          "CLIPLoader": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.278
+          },
+          "CLIPTextEncode": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.018
+          },
+          "CacheDiT_Model_Optimizer": {
+            "input_count": 6,
+            "walk_per_input_ms": 0.024
+          },
+          "ClownOptions_ExtraOptions_Beta": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.005
+          },
+          "ClownsharKSampler_Beta": {
+            "input_count": 18,
+            "walk_per_input_ms": 0.397
+          },
+          "ComfyModalProductionImageComparerOutput": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.007
+          },
+          "ConditioningZeroOut": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.002
+          },
+          "CustomCombo": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.035
+          },
+          "EmptyImage": {
+            "input_count": 4,
+            "walk_per_input_ms": 0.008
+          },
+          "EmptySD3LatentImage": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.07
+          },
+          "ImageRotate": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.027
+          },
+          "ImpactIfNone": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.005
+          },
+          "ImpactSwitch": {
+            "input_count": 5,
+            "walk_per_input_ms": 3.274
+          },
+          "JoinStrings": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.009
+          },
+          "LGNoiseInjectionLatent": {
+            "input_count": 5,
+            "walk_per_input_ms": 0.01
+          },
+          "ModelSamplingAuraFlow": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.003
+          },
+          "PairConditioningSetProperties": {
+            "input_count": 7,
+            "walk_per_input_ms": 0.011
+          },
+          "PathchSageAttentionKJ": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.005
+          },
+          "PrimitiveStringMultiline": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.036
+          },
+          "SimpleMath+": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.006
+          },
+          "StringToCombo|LP": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.002
+          },
+          "UNETLoader": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.25
+          },
+          "VAEDecode": {
+            "input_count": 2,
+            "walk_per_input_ms": 0.006
+          },
+          "VAELoader": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.118
+          },
+          "easy float": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.005
+          },
+          "easy ifElse": {
+            "input_count": 3,
+            "walk_per_input_ms": 0.007
+          },
+          "easy imageSize": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.003
+          },
+          "easy indexAnything": {
+            "input_count": 4,
+            "walk_per_input_ms": 0.01
+          },
+          "easy int": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.002
+          },
+          "easy stringToIntList": {
+            "input_count": 1,
+            "walk_per_input_ms": 0.003
+          }
+        }
+      }
+    },
+    {
+      "mode": "bench",
+      "ts_unix": 1786862196.120824,
+      "data": {
+        "iterations": 3,
+        "model_file": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\models\\sams\\sam_vit_b_01ec64.pth",
+        "warm": [
+          {
+            "combo": "warm",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 39.291,
+                "cpu_ms": 31.25,
+                "count": 31,
+                "warm_fn_ms": 39.259
+              }
+            },
+            "sys_wall_ms": 39.351,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1272.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 9171.9
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.27,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 3.222
+              }
+            },
+            "sys_wall_ms": 3.339,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.8,
+              "cuda_initialized": true,
+              "process_cpu_ms": 26093.8
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 2.257,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 2.231
+              }
+            },
+            "sys_wall_ms": 2.305,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.8,
+              "cuda_initialized": true,
+              "process_cpu_ms": 48890.6
+            }
+          }
+        ],
+        "meta": [
+          {
+            "combo": "meta",
+            "iter": 0,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.69,
+                "cpu_ms": 1593.75
+              }
+            },
+            "sys_wall_ms": 2000.778,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1277.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 15609.4
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 1,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2001.273,
+                "cpu_ms": 1859.375
+              }
+            },
+            "sys_wall_ms": 2001.37,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1279.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 35921.9
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 2,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.206,
+                "cpu_ms": 1687.5
+              }
+            },
+            "sys_wall_ms": 2000.338,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.5,
+              "cuda_initialized": true,
+              "process_cpu_ms": 57109.4
+            }
+          }
+        ],
+        "fileread": [
+          {
+            "combo": "fileread",
+            "iter": 0,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 246.821,
+                "cpu_ms": 156.25,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 246.918,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1277.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 16171.9
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 1,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 142.503,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 142.62,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1279.5,
+              "cuda_initialized": true,
+              "process_cpu_ms": 37046.9
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 2,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 163.009,
+                "cpu_ms": 171.875,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 163.084,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.6,
+              "cuda_initialized": true,
+              "process_cpu_ms": 58046.9
+            }
+          }
+        ],
+        "warm+meta": [
+          {
+            "combo": "warm+meta",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 5.927,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 5.891
+              },
+              "meta_1": {
+                "wall_ms": 2000.453,
+                "cpu_ms": 1625.0
+              }
+            },
+            "sys_wall_ms": 2000.597,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.0,
+              "cuda_initialized": true,
+              "process_cpu_ms": 24328.1
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6.978,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6.917
+              },
+              "meta_1": {
+                "wall_ms": 2000.338,
+                "cpu_ms": 1828.125
+              }
+            },
+            "sys_wall_ms": 2000.739,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 47093.8
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 9.287,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 9.26
+              },
+              "meta_1": {
+                "wall_ms": 2004.302,
+                "cpu_ms": 1812.5
+              }
+            },
+            "sys_wall_ms": 2004.572,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.5,
+              "cuda_initialized": true,
+              "process_cpu_ms": 66046.9
+            }
+          }
+        ],
+        "warm+fileread": [
+          {
+            "combo": "warm+fileread",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.072,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 3.047
+              },
+              "fileread_1": {
+                "wall_ms": 149.263,
+                "cpu_ms": 156.25,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 149.387,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 25312.5
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 2.753,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 2.729
+              },
+              "fileread_1": {
+                "wall_ms": 110.063,
+                "cpu_ms": 109.375,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 110.177,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 48156.2
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.721,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 3.671
+              },
+              "fileread_1": {
+                "wall_ms": 140.964,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 141.127,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.6,
+              "cuda_initialized": true,
+              "process_cpu_ms": 67109.4
+            }
+          }
+        ],
+        "all": [
+          {
+            "combo": "all",
+            "iter": 0,
+            "lanes": {
+              "all_0": {
+                "wall_ms": 178.935,
+                "cpu_ms": 171.875,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 179.002,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 25687.5
+            }
+          },
+          {
+            "combo": "all",
+            "iter": 1,
+            "lanes": {
+              "all_0": {
+                "wall_ms": 131.402,
+                "cpu_ms": 109.375,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 131.485,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.8,
+              "cuda_initialized": true,
+              "process_cpu_ms": 48546.9
+            }
+          },
+          {
+            "combo": "all",
+            "iter": 2,
+            "lanes": {
+              "all_0": {
+                "wall_ms": 146.69,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 146.778,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 67515.6
+            }
+          }
+        ]
+      }
+    },
+    {
+      "mode": "bench",
+      "ts_unix": 1786862307.4762223,
+      "data": {
+        "iterations": 3,
+        "model_file": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\models\\sams\\sam_vit_b_01ec64.pth",
+        "sim_fs_ms": 0.0,
+        "warm": [
+          {
+            "combo": "warm",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 21.518,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 21.489
+              }
+            },
+            "sys_wall_ms": 21.577,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1270.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 9484.4
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 2.699,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 2.668
+              }
+            },
+            "sys_wall_ms": 2.751,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 32968.8
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 2.825,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 2.793
+              }
+            },
+            "sys_wall_ms": 2.875,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 63234.4
+            }
+          }
+        ],
+        "meta": [
+          {
+            "combo": "meta",
+            "iter": 0,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.461,
+                "cpu_ms": 1203.125
+              }
+            },
+            "sys_wall_ms": 2000.686,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1275.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 15453.1
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 1,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.883,
+                "cpu_ms": 1781.25
+              }
+            },
+            "sys_wall_ms": 2000.968,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1279.0,
+              "cuda_initialized": true,
+              "process_cpu_ms": 42062.5
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 2,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.325,
+                "cpu_ms": 1968.75
+              }
+            },
+            "sys_wall_ms": 2000.425,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1281.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 72921.9
+            }
+          }
+        ],
+        "fileread": [
+          {
+            "combo": "fileread",
+            "iter": 0,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 149.559,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 149.65,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1275.4,
+              "cuda_initialized": true,
+              "process_cpu_ms": 16171.9
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 1,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 126.792,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 126.859,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1279.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 43296.9
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 2,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 142.578,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 142.655,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1281.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 73953.1
+            }
+          }
+        ],
+        "warm+meta": [
+          {
+            "combo": "warm+meta",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 5.871,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 5.84
+              },
+              "meta_1": {
+                "wall_ms": 2001.082,
+                "cpu_ms": 1828.125
+              }
+            },
+            "sys_wall_ms": 2001.265,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1276.8,
+              "cuda_initialized": true,
+              "process_cpu_ms": 25234.4
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 5.24,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 5.213
+              },
+              "meta_1": {
+                "wall_ms": 2000.354,
+                "cpu_ms": 1703.125
+              }
+            },
+            "sys_wall_ms": 2000.49,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1279.9,
+              "cuda_initialized": true,
+              "process_cpu_ms": 51343.8
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.42,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 3.35
+              },
+              "meta_1": {
+                "wall_ms": 2014.077,
+                "cpu_ms": 1140.625
+              }
+            },
+            "sys_wall_ms": 2014.34,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1281.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 78296.9
+            }
+          }
+        ],
+        "warm+fileread": [
+          {
+            "combo": "warm+fileread",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.497,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 3.462
+              },
+              "fileread_1": {
+                "wall_ms": 136.981,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 137.106,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1277.0,
+              "cuda_initialized": true,
+              "process_cpu_ms": 26234.4
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 2.713,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 2.688
+              },
+              "fileread_1": {
+                "wall_ms": 119.655,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 119.88,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.0,
+              "cuda_initialized": true,
+              "process_cpu_ms": 52531.2
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 3.588,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 3.551
+              },
+              "fileread_1": {
+                "wall_ms": 205.291,
+                "cpu_ms": 156.25,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 205.444,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1281.4,
+              "cuda_initialized": true,
+              "process_cpu_ms": 78828.1
+            }
+          }
+        ],
+        "warm+meta+fileread": [
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6.715,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6.683
+              },
+              "meta_1": {
+                "wall_ms": 2000.471,
+                "cpu_ms": 1703.125
+              },
+              "fileread_2": {
+                "wall_ms": 320.063,
+                "cpu_ms": 109.375,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 2000.696,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 32218.8
+            }
+          },
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 8.793,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 8.763
+              },
+              "meta_1": {
+                "wall_ms": 2073.325,
+                "cpu_ms": 1890.625
+              },
+              "fileread_2": {
+                "wall_ms": 316.427,
+                "cpu_ms": 93.75,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 2073.608,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 62640.6
+            }
+          },
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 4.023,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 3.986
+              },
+              "meta_1": {
+                "wall_ms": 2017.114,
+                "cpu_ms": 1796.875
+              },
+              "fileread_2": {
+                "wall_ms": 303.915,
+                "cpu_ms": 156.25,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 2017.575,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1282.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 88203.1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "mode": "bench",
+      "ts_unix": 1786862430.7634187,
+      "data": {
+        "iterations": 3,
+        "model_file": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\models\\sams\\sam_vit_b_01ec64.pth",
+        "sim_fs_ms": 1000.0,
+        "warm": [
+          {
+            "combo": "warm",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6029.722,
+                "cpu_ms": 15.625,
+                "count": 31,
+                "warm_fn_ms": 6029.688
+              }
+            },
+            "sys_wall_ms": 6029.791,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1271.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 10015.6
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6006.756,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6006.722
+              }
+            },
+            "sys_wall_ms": 6006.833,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1282.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 38734.4
+            }
+          },
+          {
+            "combo": "warm",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6007.266,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6007.229
+              }
+            },
+            "sys_wall_ms": 6007.345,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1287.2,
+              "cuda_initialized": true,
+              "process_cpu_ms": 70000.0
+            }
+          }
+        ],
+        "meta": [
+          {
+            "combo": "meta",
+            "iter": 0,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.823,
+                "cpu_ms": 1890.625
+              }
+            },
+            "sys_wall_ms": 2000.937,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1276.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 19781.2
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 1,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.414,
+                "cpu_ms": 1843.75
+              }
+            },
+            "sys_wall_ms": 2000.515,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1282.9,
+              "cuda_initialized": true,
+              "process_cpu_ms": 48359.4
+            }
+          },
+          {
+            "combo": "meta",
+            "iter": 2,
+            "lanes": {
+              "meta_0": {
+                "wall_ms": 2000.871,
+                "cpu_ms": 1828.125
+              }
+            },
+            "sys_wall_ms": 2000.969,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1287.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 79250.0
+            }
+          }
+        ],
+        "fileread": [
+          {
+            "combo": "fileread",
+            "iter": 0,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 142.971,
+                "cpu_ms": 140.625,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 143.074,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1276.9,
+              "cuda_initialized": true,
+              "process_cpu_ms": 20734.4
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 1,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 116.007,
+                "cpu_ms": 109.375,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 116.078,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1283.2,
+              "cuda_initialized": true,
+              "process_cpu_ms": 49453.1
+            }
+          },
+          {
+            "combo": "fileread",
+            "iter": 2,
+            "lanes": {
+              "fileread_0": {
+                "wall_ms": 119.647,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 119.765,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1287.8,
+              "cuda_initialized": true,
+              "process_cpu_ms": 80453.1
+            }
+          }
+        ],
+        "warm+meta": [
+          {
+            "combo": "warm+meta",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6014.036,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6013.997
+              },
+              "meta_1": {
+                "wall_ms": 2000.224,
+                "cpu_ms": 1640.625
+              }
+            },
+            "sys_wall_ms": 6014.14,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1278.9,
+              "cuda_initialized": true,
+              "process_cpu_ms": 28921.9
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6006.945,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6006.913
+              },
+              "meta_1": {
+                "wall_ms": 2000.473,
+                "cpu_ms": 1890.625
+              }
+            },
+            "sys_wall_ms": 6007.012,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1284.2,
+              "cuda_initialized": true,
+              "process_cpu_ms": 59609.4
+            }
+          },
+          {
+            "combo": "warm+meta",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6010.868,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6010.831
+              },
+              "meta_1": {
+                "wall_ms": 2000.027,
+                "cpu_ms": 1875.0
+              }
+            },
+            "sys_wall_ms": 6010.964,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1289.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 90703.1
+            }
+          }
+        ],
+        "warm+fileread": [
+          {
+            "combo": "warm+fileread",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6006.97,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6006.942
+              },
+              "fileread_1": {
+                "wall_ms": 119.761,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6007.076,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1280.0,
+              "cuda_initialized": true,
+              "process_cpu_ms": 29343.8
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6006.877,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6006.85
+              },
+              "fileread_1": {
+                "wall_ms": 114.053,
+                "cpu_ms": 109.375,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6006.942,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1285.3,
+              "cuda_initialized": true,
+              "process_cpu_ms": 59984.4
+            }
+          },
+          {
+            "combo": "warm+fileread",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6006.524,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6006.493
+              },
+              "fileread_1": {
+                "wall_ms": 175.634,
+                "cpu_ms": 156.25,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6006.728,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1289.7,
+              "cuda_initialized": true,
+              "process_cpu_ms": 91171.9
+            }
+          }
+        ],
+        "warm+meta+fileread": [
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 0,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6008.521,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6008.49
+              },
+              "meta_1": {
+                "wall_ms": 2000.369,
+                "cpu_ms": 1812.5
+              },
+              "fileread_2": {
+                "wall_ms": 325.973,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6008.616,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1281.6,
+              "cuda_initialized": true,
+              "process_cpu_ms": 38359.4
+            }
+          },
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 1,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6009.145,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6009.115
+              },
+              "meta_1": {
+                "wall_ms": 2001.045,
+                "cpu_ms": 1828.125
+              },
+              "fileread_2": {
+                "wall_ms": 287.127,
+                "cpu_ms": 125.0,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6009.251,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1287.1,
+              "cuda_initialized": true,
+              "process_cpu_ms": 69703.1
+            }
+          },
+          {
+            "combo": "warm+meta+fileread",
+            "iter": 2,
+            "lanes": {
+              "warm_0": {
+                "wall_ms": 6008.262,
+                "cpu_ms": 0.0,
+                "count": 31,
+                "warm_fn_ms": 6008.233
+              },
+              "meta_1": {
+                "wall_ms": 2000.18,
+                "cpu_ms": 1953.125
+              },
+              "fileread_2": {
+                "wall_ms": 300.086,
+                "cpu_ms": 62.5,
+                "bytes_read_mb": 357.7
+              }
+            },
+            "sys_wall_ms": 6008.376,
+            "sys": {
+              "thread_count": 7,
+              "rss_mb": 1291.6,
+              "cuda_initialized": true,
+              "process_cpu_ms": 102296.9
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "basis": [
+    "PHASE_G3 §7",
+    "PHASE_G5 §5"
+  ],
+  "branch_alternatives": {
+    "popular_custom": {
+      "comfy_cloud_off_curated_list": "high"
+    },
+    "private_model": {
+      "comfy_cloud_catalog_hit": "low"
+    }
+  },
+  "characteristics": {
+    "absolute_path": {
+      "baseten": "high",
+      "comfy_cloud": "high",
+      "local": "low",
+      "modal": "high",
+      "runcomfy": "high",
+      "runpod": "high"
+    },
+    "core_clean": {
+      "baseten": "medium",
+      "comfy_cloud": "low",
+      "local": "low",
+      "modal": "low",
+      "runcomfy": "low",
+      "runpod": "low"
+    },
+    "native_build_dependency": {
+      "baseten": "medium",
+      "comfy_cloud": "high",
+      "local": "medium",
+      "modal": "low",
+      "runcomfy": "unknown",
+      "runpod": "high"
+    },
+    "popular_custom": {
+      "baseten": "medium",
+      "comfy_cloud": "low",
+      "local": "low",
+      "modal": "low",
+      "runcomfy": "low",
+      "runpod": "medium"
+    },
+    "private_model": {
+      "baseten": "medium",
+      "comfy_cloud": "high",
+      "local": "low",
+      "modal": "low",
+      "runcomfy": "medium",
+      "runpod": "medium"
+    }
+  },
+  "determinism_rules": [
+    "Where G3 stated a range or dependency, the per-characteristic evidence file supplies the explicit capability facts that select ONE outcome.",
+    "popular_custom/runcomfy=low: auto-setup supported and exact pin not required for this characteristic.",
+    "popular_custom/comfy_cloud=low: supplied allowlist evidence places the fixture node on the curated list (off-list branch documented as high).",
+    "native_build_dependency/runcomfy=unknown: audited UNKNOWN capability; emit target_capability_unknown, never assume support/failure.",
+    "native_build_dependency/baseten=medium: verified setup path exists (lower bound of the audited medium-high range with verified setup path).",
+    "private_model/comfy_cloud=high: supplied catalog-miss evidence (catalog-hit branch documented as low).",
+    "absolute_path/local=low: self-consistent host path; all remote targets high via severity override."
+  ],
+  "expected_id": "target_matrix_broad",
+  "normative_for": "G7 target-rule golden tests",
+  "unknown_capability_rule": {
+    "capability": "native_system_dependency_build",
+    "expected_issue_code": "target_capability_unknown",
+    "expected_risk_level": "unknown",
+    "scenario": "unknown_target_capability",
+    "target_id": "runcomfy"
+  }
+}

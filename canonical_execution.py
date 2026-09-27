@@ -1,0 +1,3371 @@
+"""Canonical Modal plan execution — single shared path for normal dispatch and Playground single runs.
+
+Provides ``RunTrace`` (in-memory hierarchical spans using ``perf_counter_ns``),
+``build_execution_plan`` and ``execute_plan`` (own final workflow input,
+production compile, profile preparation, modal-args construction, the V2
+transport call, result collection, and canonical trace/counts).
+
+H19 Wave G: the retired V1 ``execute_modal_prompt`` /
+``prepare_modal_execution`` pair was deleted (zero production callers
+after H12/H15; the V2 pipeline is the only executor).
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import inspect
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from api_prompt_validator import assert_valid_api_prompt_structure
+from production_workflow import (
+    COMPILER_SCHEMA_VERSION,
+    HASH_SCHEMA_VERSION,
+    PRODUCTION_PLAN_SCHEMA_VERSION,
+    compile_production_workflow,
+    normalize_production_options,
+)
+# Note: modal_options are passed through without reconstructing model-loading policy.
+from warmup_profile import (
+    active_next_publication_required,
+    compute_profile_identity_keys,
+    prepare_active_next_profile,
+)
+from workflow_metadata import (
+    extract_model_stack,
+    extract_warmup_stack,
+    prompt_sha256,
+    stack_to_warmup_profile,
+    summarize_prompt_fields,
+)
+from comfymodal_runtime.contracts import (
+    VALIDATION_PROOF_SCHEMA_VERSION,
+    ExecutionOptions,
+    ExecutionPlan,
+    stable_hash,
+)
+from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
+from comfymodal_runtime.modal_transport import ModalTransport
+from comfymodal_runtime.restore_plan import (
+    RestorePlan,
+    build_restore_model_spec,
+    derive_model_key,
+    derive_prefill_key,
+)
+from comfymodal_runtime.trace import (
+    LOCAL_SUBMISSION_FIELD_KEYS,
+    RuntimeTrace,
+    _build_local_submission_breakdown,
+    _emit_breakdown_line,
+    _event_mono_ns,
+    _strict_event_span_ms,
+    _derived_mono_delta_ms,
+    merge_runtime_traces,
+)
+
+# ---------------------------------------------------------------------------
+# Disk-persisted cache — bounded/versioned atomic JSON state shared across
+# separate run_v2_single processes.  Extends the in-memory profile and
+# restore-publication caches so that the second invocation of a separate
+# process can reuse the first process's cached result without a remote call.
+#
+# Default behavior — no flag required.  The cache is loaded on module
+# import and written only after confirmed remote success.
+#
+# Design:
+#   * Two files under .cache/: v2_profile_cache.json, v2_restore_cache.json
+#   * Schema-versioned (bump _DISK_CACHE_VERSION on incompatible format change)
+#   * Bounded to _DISK_CACHE_MAX entries per file
+#   * Atomic writes via tempfile.mkstemp + os.replace (crash-safe)
+#   * Thread-safe via per-file threading.Lock
+#   * Only stable identity fields and successful metadata — NEVER serializes
+#     handles, credentials, full workflows, base64 images, output data, or
+#     request-specific payloads.
+#   * Telemetry counters (read/write/miss/corruption) exposed via module vars.
+#   * Exact invalidation: when a remote operation fails, the entry for that
+#     exact cache key is removed from both the in-memory and disk caches.
+# ---------------------------------------------------------------------------
+
+import errno as _errno
+
+_DISK_CACHE_VERSION = 1
+"""Schema version for this cache format.  Bump on incompatible changes."""
+
+_DISK_CACHE_MAX = 100
+"""Maximum entries per disk cache before LRU-style eviction."""
+
+# ── Cache directory (lazy-initialised) ──────────────────────────────
+_DISK_CACHE_DIR: str | None = None
+"""Lazy-resolved path to the .cache/ directory."""
+
+def _disk_cache_dir() -> str:
+    global _DISK_CACHE_DIR
+    if _DISK_CACHE_DIR is None:
+        _DISK_CACHE_DIR = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".cache",
+        )
+    os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+    return _DISK_CACHE_DIR
+
+_PROFILE_DISK_CACHE_FILE = "v2_profile_cache.json"
+_RESTORE_DISK_CACHE_FILE = "v2_restore_cache.json"
+
+# ── In-memory shadow of the disk cache (populated at load, written on change) ──
+_profile_disk_cache: dict[str, dict] = {}
+"""In-memory mirror of the profile cache disk file."""
+_profile_disk_lock = threading.Lock()
+"""Thread lock for profile disk cache I/O."""
+
+_restore_disk_cache: dict[str, dict] = {}
+"""In-memory mirror of the restore cache disk file."""
+_restore_disk_lock = threading.Lock()
+"""Thread lock for restore disk cache I/O."""
+
+# ── Telemetry counters (monotonic per process) ──────────────────────
+_disk_profile_read_count: int = 0
+"""Monotonic count of disk-profile-cache reads."""
+_disk_profile_write_count: int = 0
+"""Monotonic count of disk-profile-cache writes."""
+_disk_profile_miss_count: int = 0
+"""Monotonic count of disk-profile-cache read misses."""
+_disk_profile_corruption_count: int = 0
+"""Monotonic count of disk-profile-cache corrupt-file detections."""
+
+_disk_restore_read_count: int = 0
+"""Monotonic count of disk-restore-cache reads."""
+_disk_restore_write_count: int = 0
+"""Monotonic count of disk-restore-cache writes."""
+_disk_restore_miss_count: int = 0
+"""Monotonic count of disk-restore-cache read misses."""
+_disk_restore_corruption_count: int = 0
+"""Monotonic count of disk-restore-cache corrupt-file detections."""
+
+
+def _disk_cache_filepath(kind: str) -> str:
+    """Return the absolute file path for the given cache *kind*.
+
+    *kind* must be ``"profile"`` or ``"restore"``.
+    """
+    filename = (
+        _PROFILE_DISK_CACHE_FILE if kind == "profile"
+        else _RESTORE_DISK_CACHE_FILE if kind == "restore"
+        else _PROFILE_DISK_CACHE_FILE
+    )
+    return os.path.join(_disk_cache_dir(), filename)
+
+
+def _read_disk_cache(kind: str) -> dict:
+    """Load the disk cache file for *kind* and return its entries dict.
+
+    Returns an empty dict when the file is missing, corrupt, or at a
+    different schema version.  Updates telemetry counters.
+    """
+    global _disk_profile_read_count, _disk_profile_corruption_count
+    global _disk_restore_read_count, _disk_restore_corruption_count
+
+    path = _disk_cache_filepath(kind)
+    if not os.path.isfile(path):
+        return {}
+
+    if kind == "profile":
+        _disk_profile_read_count += 1
+    else:
+        _disk_restore_read_count += 1
+
+    try:
+        with open(path, "rb") as _f:
+            raw = _f.read()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        if kind == "profile":
+            _disk_profile_corruption_count += 1
+        else:
+            _disk_restore_corruption_count += 1
+        return {}
+
+    if not isinstance(data, dict) or data.get("version") != _DISK_CACHE_VERSION:
+        if kind == "profile":
+            _disk_profile_corruption_count += 1
+        else:
+            _disk_restore_corruption_count += 1
+        return {}
+
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return entries
+
+
+def _write_disk_cache(kind: str, entries: dict) -> None:
+    """Atomically write *entries* to the disk cache for *kind*.
+
+    Uses ``tempfile.mkstemp`` + ``os.replace`` for crash safety.
+    Only writes entries dict (never handles, images, prompts, or outputs).
+    """
+    global _disk_profile_write_count, _disk_restore_write_count
+    path = _disk_cache_filepath(kind)
+    data = {
+        "version": _DISK_CACHE_VERSION,
+        "created_at": time.time(),
+        "max_entries": _DISK_CACHE_MAX,
+        "entries": entries,
+    }
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        fd, tmp = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=os.path.basename(path) + ".",
+            dir=parent,
+        )
+        try:
+            with os.fdopen(fd, "wb") as _f:
+                _f.write(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as _exc:
+        # Non-fatal: cache write failures must never raise.
+        print(f"[disk_cache] write failed for {kind}: {_exc}", flush=True)
+
+    if kind == "profile":
+        _disk_profile_write_count += 1
+    else:
+        _disk_restore_write_count += 1
+
+
+def _populate_profile_cache_from_disk() -> None:
+    """Load profile disk cache entries into ``_PROFILE_PREP_CACHE`` (fast path).
+
+    Called once at process startup.  Skips entries whose identity fields
+    would have already expired (TTL is managed upstream).
+    """
+    entries = _read_disk_cache("profile")
+    if not entries:
+        return
+    with _PROFILE_PREP_CACHE_LOCK:
+        for ck, ev in entries.items():
+            if ck not in _PROFILE_PREP_CACHE and isinstance(ev, dict):
+                result = ev.get("result")
+                if isinstance(result, dict) and result.get("status") not in ("error",):
+                    _PROFILE_PREP_CACHE[ck] = dict(result)
+    # Keep mirror in sync
+    with _profile_disk_lock:
+        _profile_disk_cache.update(entries)
+    # Evict in-memory cache if over limit
+    _evict_profile_prep_cache()
+
+
+def _populate_restore_cache_from_disk() -> None:
+    """Load restore disk cache entries into ``_RESTORE_PUBLISH_CACHE``.
+
+    Called once at process startup.
+    """
+    entries = _read_disk_cache("restore")
+    if not entries:
+        return
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        for ck, ev in entries.items():
+            if ck not in _RESTORE_PUBLISH_CACHE and isinstance(ev, dict):
+                identity_hash = ev.get("identity_hash", "")
+                publication_result = ev.get("publication_result")
+                if identity_hash and isinstance(publication_result, dict):
+                    _RESTORE_PUBLISH_CACHE[ck] = {
+                        "identity_hash": identity_hash,
+                        "publication_result": dict(publication_result),
+                    }
+    with _restore_disk_lock:
+        _restore_disk_cache.update(entries)
+    _evict_restore_publish_cache()
+
+
+def _flush_profile_disk_cache() -> None:
+    """Write the current in-memory shadow of the profile cache to disk.
+
+    Only stores stable identity metadata — never serialises handles,
+    full workflows, images, prompts, or output data.
+    """
+    with _profile_disk_lock:
+        entries = dict(_profile_disk_cache)
+        # Prune stale or oversized entries before write
+        if len(entries) > _DISK_CACHE_MAX:
+            _keys = list(entries.keys())
+            for _k in _keys[:_DISK_CACHE_MAX // 2]:
+                entries.pop(_k, None)
+    _write_disk_cache("profile", entries)
+
+
+def _flush_restore_disk_cache() -> None:
+    """Write the current in-memory shadow of the restore cache to disk."""
+    with _restore_disk_lock:
+        entries = dict(_restore_disk_cache)
+        if len(entries) > _DISK_CACHE_MAX:
+            _keys = list(entries.keys())
+            for _k in _keys[:_DISK_CACHE_MAX // 2]:
+                entries.pop(_k, None)
+    _write_disk_cache("restore", entries)
+
+
+def _remove_profile_disk_entry(cache_key: str) -> None:
+    """Remove a single entry from the profile disk cache (invalidation)."""
+    with _profile_disk_lock:
+        _profile_disk_cache.pop(cache_key, None)
+    _flush_profile_disk_cache()
+
+
+def _remove_restore_disk_entry(cache_key: str) -> None:
+    """Remove a single entry from the restore disk cache (invalidation)."""
+    with _restore_disk_lock:
+        _restore_disk_cache.pop(cache_key, None)
+    _flush_restore_disk_cache()
+
+
+def _reset_disk_caches() -> None:
+    """Clear both disk caches in memory and on filesystem (test/teardown only)."""
+    with _profile_disk_lock:
+        _profile_disk_cache.clear()
+    with _restore_disk_lock:
+        _restore_disk_cache.clear()
+    # Write empty files to reset on-disk state
+    _write_disk_cache("profile", {})
+    _write_disk_cache("restore", {})
+
+
+# ---------------------------------------------------------------------------
+# Restore-plan publish cache (process-safe, skips remote calls when
+# the canonical identity is unchanged for the same app/workspace)
+# ---------------------------------------------------------------------------
+
+_RESTORE_PUBLISH_CACHE: dict[str, dict] = {}
+"""``{cache_key: {"identity_hash": str, "publication_result": dict}}`` — cached
+publication metadata keyed by plan identity.
+
+Cache-key format: ``stable_hash({app_identity, environment, ws_id,
+plan_identity_hash, seed_identity})``.
+Also serves as the last-successful publication store — cleared only by
+module reload or explicit ``_reset_restore_publish_cache()``.
+Thread-safe via ``_RESTORE_PUBLISH_CACHE_LOCK``.
+Bounded to ``_RESTORE_PUBLISH_CACHE_MAX`` entries.
+"""
+
+_RESTORE_PUBLISH_CACHE_LOCK = threading.Lock()
+"""Guard for all ``_RESTORE_PUBLISH_CACHE`` access."""
+
+_RESTORE_PUBLISH_CACHE_MAX = 100
+"""Maximum entries in the restore publish cache before eviction."""
+
+# ── Cache-reset counters (monotonic per process) ────────────────────────
+_profile_cache_reset_count: int = 0
+"""Monotonic counter incremented each time ``_reset_profile_prep_cache`` is called."""
+
+_restore_cache_reset_count: int = 0
+"""Monotonic counter incremented each time ``_reset_restore_publish_cache`` is called."""
+
+
+def _app_identity() -> str:
+    """Current app identity used for cache scoping (matches ``warmup_profile._app_identity``)."""
+    app = os.environ.get("COMFYMODAL_V2_APP_NAME", "").strip()
+    if not app:
+        app = os.environ.get("COMFYMODAL_APP_NAME", "").strip()
+    return app or "comfyui"
+
+
+def _workspace_identity(workspace: Mapping[str, Any] | None) -> str:
+    if isinstance(workspace, Mapping):
+        value = workspace.get("id") or workspace.get("workspace_id") or ""
+        if value:
+            return str(value)
+    return "__default__"
+
+
+def _restore_plan_identity_hash(plan: RestorePlan) -> str:
+    """Deterministic hash of identity fields, excluding volatile
+    ``generation`` and ``created_at``.
+
+    Mirrors ``RestorePlanPublisher._identity_hash`` so the local cache
+    is consistent with the publisher's own no-op detection.
+    """
+    identity = {
+        "schema_version": plan.schema_version,
+        "model_key": plan.model_key.to_dict(),
+        "prefill_key": plan.prefill_key.to_dict(),
+        "model_spec": dict(plan.model_spec),
+        "prefill_spec": dict(plan.prefill_spec),
+        "source_workflow_hash": plan.source_workflow_hash,
+        "workflow_hash": plan.workflow_hash,
+    }
+    return stable_hash(identity)
+
+
+def _reset_restore_publish_cache() -> None:
+    """Clear the restore-plan publish cache and its persisted disk mirror.
+
+    Test / teardown only.  Clears the in-memory ``_RESTORE_PUBLISH_CACHE``
+    AND the restore disk cache (``_restore_disk_cache`` mirror plus the
+    ``v2_restore_cache.json`` file via the atomic writer) so a later process
+    cannot repopulate from a stale on-disk restore publication.  The profile
+    caches are left untouched.
+    """
+    global _restore_cache_reset_count
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        _RESTORE_PUBLISH_CACHE.clear()
+        _restore_cache_reset_count += 1
+    with _restore_disk_lock:
+        _restore_disk_cache.clear()
+    _write_disk_cache("restore", {})
+
+
+def _evict_restore_publish_cache() -> None:
+    """Evict oldest entries when cache exceeds ``_RESTORE_PUBLISH_CACHE_MAX``."""
+    with _RESTORE_PUBLISH_CACHE_LOCK:
+        while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
+            _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+
+
+# ---------------------------------------------------------------------------
+# Profile preparation cache — skip prepare_active_next_profile when the
+# model identity (app_identity, ws_id, model_profile_key, prefill_key) is
+# unchanged for the same process.  Also serves as the last-successful
+# profile store — populated on success, cleared only by module reload or
+# explicit ``_reset_profile_prep_cache()``.
+# ---------------------------------------------------------------------------
+
+_PROFILE_PREP_CACHE: dict[str, dict] = {}
+"""``{cache_key: profile_result}`` — cached prepared profile results.
+
+Cache-key format: ``stable_hash({app_identity, ws_id, model_profile_key,
+prefill_key})``.
+Also serves as the last-successful profile store — populated on success,
+cleared only by module reload or explicit ``_reset_profile_prep_cache()``.
+Thread-safe via ``_PROFILE_PREP_CACHE_LOCK``.
+Bounded to ``_PROFILE_PREP_CACHE_MAX`` entries.
+"""
+
+_PROFILE_PREP_CACHE_LOCK = threading.Lock()
+"""Guard for all ``_PROFILE_PREP_CACHE`` access."""
+
+_PROFILE_PREP_CACHE_MAX = 100
+"""Maximum entries in the profile prep cache before eviction."""
+
+
+def _profile_prep_cache_key(
+    app_identity: str,
+    ws_id: str,
+    model_profile_key: str,
+    prefill_key: str,
+) -> str:
+    """Deterministic cache key for profile preparation results.
+
+    Includes only stable identity fields that reflect the actual model
+    profile identity, excluding volatile workflow content hashes.
+    Matches the semantics of ``warmup_profile``'s own dedup key so the
+    outer (execute_plan) and inner (prepare_active_next_profile) caches
+    miss/populate consistently.
+    """
+    identity = {
+        "a": app_identity,
+        "w": ws_id,
+        "m": model_profile_key,
+        "p": prefill_key,
+    }
+    return stable_hash(identity)
+
+
+def _restore_publish_cache_key(
+    app_identity: str,
+    environment: str,
+    ws_id: str,
+    plan_identity: str,
+    seed_identity: str,
+) -> str:
+    """Return the deployment-scoped restore publication cache key."""
+    return stable_hash({
+        "app": app_identity,
+        "environment": environment,
+        "workspace": ws_id,
+        "plan": plan_identity,
+        "seed": seed_identity,
+    })
+
+
+def _reset_profile_prep_cache() -> None:
+    """Clear the profile prep cache (test / teardown only)."""
+    global _profile_cache_reset_count
+    with _PROFILE_PREP_CACHE_LOCK:
+        _PROFILE_PREP_CACHE.clear()
+        _profile_cache_reset_count += 1
+
+
+def _evict_profile_prep_cache() -> None:
+    """Evict oldest entries when cache exceeds ``_PROFILE_PREP_CACHE_MAX``."""
+    with _PROFILE_PREP_CACHE_LOCK:
+        while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
+            _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
+
+
+# ── Bootstrap: pre-populate in-memory caches from disk on import ─────
+# Must live here — after _PROFILE_PREP_CACHE, _PROFILE_PREP_CACHE_LOCK,
+# _RESTORE_PUBLISH_CACHE, _RESTORE_PUBLISH_CACHE_LOCK, _evict_profile_prep_cache,
+# and _evict_restore_publish_cache are all defined.
+_populate_profile_cache_from_disk()
+_populate_restore_cache_from_disk()
+
+
+def _reset_all_cache_counters() -> None:
+    """Reset all caches and counters.
+
+    Clears ``_PROFILE_PREP_CACHE`` and ``_RESTORE_PUBLISH_CACHE``
+    (the sole process-local stores) and resets their reset counters.
+    Also resets the warmup-profile module-level dedup cache so the
+    inner ``prepare_active_next_profile`` cannot short-circuit after
+    a cache reset.
+    Also clears and persists both disk-backed caches.
+
+    Test / teardown only.
+    """
+    _reset_profile_prep_cache()
+    _reset_disk_caches()
+    from warmup_profile import _reset_last_stable_profile_cache as _wp_reset
+    _wp_reset()
+
+
+# ---------------------------------------------------------------------------
+# RunTrace — in-memory hierarchical span collector
+# ---------------------------------------------------------------------------
+
+
+class RunTrace:
+    """Hierarchical execution trace using ``perf_counter_ns`` for duration and
+    ``time.time`` only for wall-clock correlation.
+
+    Accumulates in memory.  Callers invoke ``emit_local_summary`` before
+    Modal submission and ``emit_remote_summary`` before return.  Persistence
+    happens only after output delivery (caller responsibility).
+
+    Optional spans (LocalRemoteInvoker, scheduler, runner, lease, checkpoint,
+    StudioProgressTracker, LocalRemoteHandler, deploy_listener, scheduler_loop,
+    hot_reload_listener) are always present with ``called/count/duration_ms/reason``.
+    Payload-size fields report byte counts without full prompt/image bytes.
+
+    Correlation fields (trace_id, run_id, prompt_id, run_surface) are set at
+    creation and included in every summary.
+    """
+
+    # Required canonical operation count names — counted at the actual
+    # operation boundary.
+    CANONICAL_COUNTS = frozenset({
+        "production_compile_count",
+        "full_workflow_hash_count",
+        "model_stack_extract_count",
+        "active_profile_prepare_count",
+        "modal_handle_lookup_count",
+        "run_prompt_stream_call_count",
+        "workflow_deepcopy_count",
+        "workflow_serialization_count",
+    })
+
+    # All named Studio wrapper spans — always present with called=False
+    # for a direct Playground run.  Includes the original high-level names
+    # plus every granular span that the Studio lifecycle creates for
+    # experiment/scheduler/runner/invoker/lease flows.
+    MARK_OPTIONAL = (
+        # Original high-level optional spans
+        "LocalRemoteInvoker", "scheduler", "runner", "lease", "checkpoint",
+        "StudioProgressTracker", "LocalRemoteHandler", "deploy_listener",
+        "scheduler_loop", "hot_reload_listener",
+        # Granular Studio lifecycle spans
+        "studio_single_run_enter", "direct_studio_run_completion",
+        "experiment_creation", "run_history_creation",
+        "scheduler_creation", "scheduler_start",
+        "runner_creation",
+        "local_remote_invoker_creation",
+        "local_remote_invoker_open_worker",
+        "local_remote_invoker_run_cell",
+        "local_remote_invoker_close_worker",
+        "lease_claim", "checkpoint_write", "journal_write",
+        "cell_resolution", "experiment_trace_merge",
+        "studio_output_copy", "studio_history_update",
+        "studio_output_metadata_write",
+        # Required canonical span names — stable entries in every RunTrace summary
+        # (called=true when the boundary was reached, otherwise defaults)
+        "canonical_execute_enter",
+        "workflow_input_size",
+        "workflow_deepcopy",
+        "workflow_normalization",
+        "production_compile",
+        "production_validate_local",
+        "source_workflow_hash",
+        "compiled_workflow_hash",
+        "production_plan_hash",
+        "model_stack_extract",
+        "used_node_class_extract",
+        "input_image_discovery",
+        "input_image_read",
+        "input_image_encode",
+        "extra_data_build",
+        "modal_options_build",
+        "production_report_build",
+        "active_profile_build",
+        "active_profile_dedup",
+        "active_profile_local_write",
+        "active_profile_remote_call",
+        "active_profile_ack_wait",
+        "modal_handle_lookup",
+        "modal_handle_cache_hit",
+        "modal_argument_serialization",
+        "remote_generator_create",
+        "remote_submit",
+        "first_remote_message",
+        "remote_result_complete",
+        "canonical_execute_exit",
+    )
+
+    def __init__(
+        self,
+        *,
+        trace_id: str = "",
+        run_id: str = "",
+        prompt_id: str = "",
+        run_surface: str = "unknown",
+    ) -> None:
+        self._spans: dict[str, dict[str, Any]] = {}
+        self._counts: dict[str, int] = {}
+        self._wall_start: float = time.time()
+        self._perf_start_ns: int = time.perf_counter_ns()
+        self._major_samples: list[dict[str, Any]] = []
+        self._payload_sizes: dict[str, int] = {}
+        self._meta: dict[str, Any] = {}  # canonical metadata without full workflow bytes
+        # Correlation fields
+        self._trace_id: str = trace_id or uuid.uuid4().hex[:16]
+        self._run_id: str = run_id or uuid.uuid4().hex[:12]
+        self._prompt_id: str = prompt_id
+        self._run_surface: str = run_surface
+
+    # -- correlation property access --
+
+    @property
+    def trace_id(self) -> str:
+        return self._trace_id
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def prompt_id(self) -> str:
+        return self._prompt_id
+
+    @property
+    def run_surface(self) -> str:
+        return self._run_surface
+
+    # -- span lifecycle --
+
+    def begin(self, name: str, *, reason: str = "") -> None:
+        entry = self._spans.setdefault(name, {})
+        entry["called"] = True
+        entry["_start_ns"] = time.perf_counter_ns()
+        entry["wall_s"] = time.time()
+        entry["count"] = entry.get("count", 0) + 1
+        if reason:
+            entry["reason"] = reason
+
+    def end(self, name: str, *, reason: str = "") -> None:
+        entry = self._spans.get(name)
+        if entry is None or "_start_ns" not in entry:
+            return
+        entry["duration_ns"] = time.perf_counter_ns() - entry["_start_ns"]
+        entry["duration_ms"] = round(entry["duration_ns"] / 1_000_000, 2)
+        del entry["_start_ns"]
+        if reason:
+            entry["reason"] = reason
+
+    def count(self, name: str, delta: int = 1) -> None:
+        self._counts[name] = self._counts.get(name, 0) + delta
+
+    def record_payload_size(self, label: str, byte_count: int) -> None:
+        self._payload_sizes[label] = byte_count
+
+    def set_meta(self, **fields: Any) -> None:
+        """Store canonical metadata fields (model_stack, hashes, GPU, etc.)
+        without logging full workflow/image bytes."""
+        self._meta.update(fields)
+
+    def sample(self, label: str, **fields: Any) -> None:
+        self._major_samples.append({"label": label, "wall_s": time.time(), **fields})
+
+    # -- optional spans (always present with called=False by default) --
+
+    def _ensure_optionals(self) -> None:
+        for name in self.MARK_OPTIONAL:
+            if name not in self._spans:
+                self._spans[name] = {
+                    "called": False,
+                    "count": 0,
+                    "duration_ms": 0,
+                    "reason": "",
+                }
+
+    def _init_canonical_counts(self) -> None:
+        """Ensure every named canonical count is present (even if zero)."""
+        for name in self.CANONICAL_COUNTS:
+            if name not in self._counts:
+                self._counts[name] = 0
+
+    # -- emission --
+
+    def emit_local_summary(self) -> dict[str, Any]:
+        """Structured summary emitted before Modal submission."""
+        self._ensure_optionals()
+        self._init_canonical_counts()
+        return {
+            "trace_id": self._trace_id,
+            "run_id": self._run_id,
+            "prompt_id": self._prompt_id,
+            "run_surface": self._run_surface,
+            "spans": {k: {sk: sv for sk, sv in v.items() if not sk.startswith("_")}
+                      for k, v in self._spans.items()},
+            "counts": dict(self._counts),
+            "payload_sizes": dict(self._payload_sizes),
+            "meta": dict(self._meta),
+            "wall_start_s": self._wall_start,
+        }
+
+    def emit_remote_summary(self) -> dict[str, Any]:
+        """Structured summary emitted before return (after Modal call)."""
+        self._ensure_optionals()
+        self._init_canonical_counts()
+        return {
+            "trace_id": self._trace_id,
+            "run_id": self._run_id,
+            "prompt_id": self._prompt_id,
+            "run_surface": self._run_surface,
+            "spans": {k: {sk: sv for sk, sv in v.items() if not sk.startswith("_")}
+                      for k, v in self._spans.items()},
+            "counts": dict(self._counts),
+            "payload_sizes": dict(self._payload_sizes),
+            "meta": dict(self._meta),
+            "wall_start_s": self._wall_start,
+            "perf_start_ns": self._perf_start_ns,
+            "samples": list(self._major_samples),
+        }
+
+    def merge_into_trace(self, trace_dict: dict[str, Any]) -> None:
+        """Merge run-trace fields into the existing trace payload for history."""
+        rs = self.emit_remote_summary()
+        trace_dict["_run_trace"] = rs
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_class_types(workflow: dict, production_report: dict | None = None) -> None:
+    """Local class-type existence check.  Skips compiler-rewritten node IDs."""
+    try:
+        import nodes as _validate_nodes
+    except Exception:
+        return  # skip when not running inside ComfyUI
+
+    _requested_types: set[str] = set()
+    _PRODUCTION_REMOTE_CLASSES = frozenset({
+        "ComfyModalProductionOutput",
+        "ComfyModalProductionImageComparerOutput",
+    })
+    for _spec in workflow.values():
+        if isinstance(_spec, dict):
+            _ct = _spec.get("class_type")
+            if isinstance(_ct, str) and _ct:
+                _requested_types.add(_ct)
+
+    _production_active = bool(
+        production_report
+        and isinstance(production_report, dict)
+        and production_report.get("enabled")
+    )
+    if _production_active:
+        _rewritten_out_ids = set(production_report.get("direct_output_rewritten_node_ids", []))
+        _rewritten_rgthree_ids = set(production_report.get("rgthree_comparer_rewritten_node_ids", []))
+        _validated_types: set[str] = set()
+        for _nid, _spec in workflow.items():
+            if not isinstance(_spec, dict):
+                continue
+            _ct = _spec.get("class_type")
+            if not isinstance(_ct, str) or not _ct:
+                continue
+            if _ct == "ComfyModalProductionOutput" and str(_nid) in _rewritten_out_ids:
+                continue
+            if _ct == "ComfyModalProductionImageComparerOutput" and str(_nid) in _rewritten_rgthree_ids:
+                continue
+            _validated_types.add(_ct)
+    else:
+        _validated_types = _requested_types
+
+    _missing = sorted(
+        ct for ct in _validated_types
+        if ct not in _validate_nodes.NODE_CLASS_MAPPINGS
+    )
+    if _missing:
+        raise RuntimeError(
+            f"Missing custom node class(es): {_missing}. "
+            f"Install the missing custom nodes or fix the workflow."
+        )
+
+
+def _collect_input_images(workflow: dict, comfyui_root: str) -> dict[str, str]:
+    """Base64-encode local images referenced by LoadImage nodes."""
+    images: dict[str, str] = {}
+    _WORKFLOW_IMAGE_SUFFIX_DIRS = {
+        " [output]": "output",
+        " [input]": "input",
+        " [temp]": "temp",
+    }
+
+    def _resolve_candidates(filename: str) -> list[str]:
+        name = (filename or "").strip()
+        for suffix, directory in _WORKFLOW_IMAGE_SUFFIX_DIRS.items():
+            if name.endswith(suffix):
+                base = name[: -len(suffix)].rstrip()
+                return [os.path.join(comfyui_root, directory, *base.replace("\\", "/").split("/"))]
+        parts = [p for p in filename.replace("\\", "/").split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            return []
+        return [
+            os.path.join(comfyui_root, d, *parts)
+            for d in ("input", "output")
+            if os.path.isdir(os.path.join(comfyui_root, d))
+        ]
+
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        if not class_type.startswith("LoadImage"):
+            continue
+        for key in ("image", "mask"):
+            filename = node.get("inputs", {}).get(key, "")
+            if not isinstance(filename, str) or not filename:
+                continue
+            if filename in images:
+                continue
+            if filename.startswith(("http://", "https://")):
+                continue
+            candidates = _resolve_candidates(filename)
+            for filepath in candidates:
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        images[filename] = base64.b64encode(f.read()).decode()
+                    break
+    return images
+
+
+def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float | None:
+    start_ns: int | None = None
+    for event in trace.events:
+        if event.name == start_name:
+            start_ns = event.monotonic_ns
+        elif event.name == end_name and start_ns is not None:
+            return round((event.monotonic_ns - start_ns) / 1_000_000, 3)
+    return None
+
+
+# ── Host-side transport boundary helpers ────────────────────────────────
+# modal_transport emits the generator/submission/result boundaries as
+# RuntimeTrace events (with wall_unix_ns + monotonic_ns) and a metadata
+# backfill.  These pure helpers read the LAST occurrence of a named event
+# from the merged trace so the local prints can surface boundaries that
+# never landed in the origin dict.  All return None when unavailable so
+# callers can render a literal "absent".
+
+
+def _host_boundary_event(trace: RuntimeTrace | None, event_name: str) -> Any | None:
+    """Return the LAST event named *event_name* in *trace*, or None.
+
+    Last occurrence wins: the merged trace may contain lifecycle/startup
+    events from earlier requests, and the most recent one is the boundary
+    for the current request.
+    """
+    if trace is None:
+        return None
+    last: Any | None = None
+    for event in getattr(trace, "events", ()):
+        if getattr(event, "name", None) == event_name:
+            last = event
+    return last
+
+
+def _host_boundary_wall_ns(trace: RuntimeTrace | None, event_name: str) -> int | None:
+    """Return the wall_unix_ns of the last *event_name* event, or None."""
+    event = _host_boundary_event(trace, event_name)
+    value = getattr(event, "wall_unix_ns", None) if event is not None else None
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _host_boundary_field(
+    trace: RuntimeTrace | None,
+    event_name: str,
+    ref_wall_ns: Any = None,
+) -> float | None:
+    """Return ms from *ref_wall_ns* to the last *event_name* wall time.
+
+    Pure helper used to surface host-side transport boundaries in the
+    [v2.request_origin] / [v2.local_submission_breakdown] prints.  Returns
+    None when the event or reference boundary is missing, or when the
+    ordering is negative (event wall before the reference).
+    """
+    event_wall = _host_boundary_wall_ns(trace, event_name)
+    if event_wall is None or not isinstance(ref_wall_ns, (int, float)):
+        return None
+    delta_ns = event_wall - int(ref_wall_ns)
+    if delta_ns < 0:
+        return None
+    return round(delta_ns / 1_000_000, 3)
+
+
+# Host-side transport boundary fields appended to the canonical
+# [v2.local_submission_breakdown] field map by the local emitter.
+_HOST_BOUNDARY_FIELD_KEYS: tuple[tuple[str, str], ...] = (
+    ("modal_submission_attempt_unix_ns", "modal_submission_attempt_unix_ns"),
+    ("modal_generator_created_unix_ns", "modal_generator_created_unix_ns"),
+    ("modal_first_iteration_start_unix_ns", "modal_first_iteration_start_unix_ns"),
+    ("modal_first_remote_event_unix_ns", "modal_first_remote_event_unix_ns"),
+    ("dispatch_to_modal_entry_ms", "dispatch_to_modal_entry_ms"),
+    ("local_receive_to_actual_submission_ms", "local_receive_to_actual_submission_ms"),
+    ("local_receive_to_result_return_ms", "local_receive_to_result_return_ms"),
+)
+
+
+# _strict_event_span_ms, _event_mono_ns, _derived_mono_delta_ms
+# are imported from comfymodal_runtime.trace above.
+
+
+# ── Step-2 baked custom-node dependency manifest (host-side reader) ──────
+# The deploy tooling writes the canonical (immutable) custom-node dependency
+# manifest into the repo's ``.baked_custom_node_deps/`` directory.  The
+# container bakes the same artifact into the image (comfyapp reads it from
+# ``BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH``).  The host reader below consumes
+# the same deploy-generated artifact so plan identity provenance matches the
+# snapshot-side freeze.  Reads are pure file I/O — no Modal/network/Volume.
+# NOTE: this file is a CONSTRUCTION-time artifact and may be regenerated by
+# other workflows after deploy.  For an already-deployed runtime, plan
+# identity is derived from the deploy-frozen ``.deployed_state.json`` record
+# instead (see ``_read_frozen_deployed_identity``), so regeneration can never
+# change the identity of an existing deployment.
+_BAKED_CUSTOM_NODE_DEPS_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".baked_custom_node_deps",
+    "custom_node_deps_baked.json",
+)
+
+
+def _read_baked_custom_node_manifest() -> dict:
+    """Return the deploy-generated baked custom-node dependency manifest."""
+    try:
+        with open(_BAKED_CUSTOM_NODE_DEPS_LOCAL, "r", encoding="utf-8") as _f:
+            import json
+            _m = json.load(_f)
+        return _m if isinstance(_m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_baked_custom_node_generation() -> str:
+    """Canonical custom-node generation from the deploy-generated manifest."""
+    return str(_read_baked_custom_node_manifest().get("production_custom_node_generation", "") or "")
+
+
+def _host_requirements_repair_mode() -> str:
+    """Mirror the container's repair-mode resolution (comfyapp).
+
+    ``_resolve_requirements_repair_mode()`` reads ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``
+    (default ``fail_fast``) and normalizes to the allowed set.  Mirroring the
+    container exactly is required so the host-computed dependency manifest
+    identity matches the snapshot-frozen one when the deployment envs agree.
+    """
+    import os
+    _mode = str(os.environ.get("COMFYMODAL_REQUIREMENTS_REPAIR_MODE", "fail_fast") or "fail_fast").strip().lower()
+    if _mode not in ("off", "fail_fast", "dev"):
+        _mode = "fail_fast"
+    return _mode
+
+
+# ── Step-3 host-side canonical deployment combined hash ──────────────────
+# Mirrors the container's ``_V2_DEPLOYMENT_COMBINED_HASH`` (modal_app.py:
+# ``build_modal_resources`` + the module-level ``stable_hash`` wrapper) from
+# pure modules so the plan carries the same deployment identity the container
+# froze into its snapshot proof.  Computed at most once per process — a
+# repo-wide filesystem scan is NEVER performed per request.  Returns "" when
+# the mirror cannot be reproduced (never fabricated).
+_HOST_DEPLOYMENT_HASH_COMPUTED: str | None = None
+
+
+def _compute_host_deployment_combined_hash() -> str:
+    global _HOST_DEPLOYMENT_HASH_COMPUTED
+    if _HOST_DEPLOYMENT_HASH_COMPUTED is not None:
+        return _HOST_DEPLOYMENT_HASH_COMPUTED
+    try:
+        from comfymodal_runtime.deployment_spec import build_deployment_identity
+        from comfymodal_runtime.runtime_shape import runtime_shape_config
+        from comfymodal_runtime.contracts import stable_hash as _stable_hash
+        from comfymodal_runtime.publication_policy import resolve_custom_nodes_root
+        # Mirror build_modal_resources: runtime_root is the runtime package,
+        # while custom_root is the same published custom-nodes tree used by
+        # image/archive/volume publication.
+        _repo_root = os.path.dirname(os.path.abspath(__file__))
+        _runtime_root = os.path.join(_repo_root, "comfymodal_runtime")
+        _custom_root = resolve_custom_nodes_root(_repo_root)
+        # The container call passes no dependency_hash (defaults to "").
+        _identity = build_deployment_identity(
+            runtime_root=_runtime_root,
+        )
+        _payload = runtime_shape_config().identity_payload()
+        _HOST_DEPLOYMENT_HASH_COMPUTED = _stable_hash({
+            "source_combined_hash": _identity.combined_hash,
+            "runtime_shape": _payload,
+        })
+    except Exception:
+        _HOST_DEPLOYMENT_HASH_COMPUTED = ""
+    return _HOST_DEPLOYMENT_HASH_COMPUTED
+
+
+_DEPLOY_STATE_JSON_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".deployed_state.json"
+)
+
+
+def _read_frozen_deployed_identity() -> dict:
+    """Read the deploy-frozen identity record (``.deployed_state.json``).
+
+    Written at deploy time by ``tools/record_deployment_identity.py`` from the
+    container readback, so ``deployment_combined_hash`` /
+    ``custom_nodes_generation`` / ``overall_dependency_hash`` are the identity
+    frozen for the DEPLOYED image — NOT the mutable local
+    ``.baked_custom_node_deps/`` manifest, which other workflows may
+    regenerate after deploy.  Missing/unreadable record → {} (never
+    fabricated).  Pure local file I/O — no Modal/network.
+    """
+    try:
+        import json
+        with open(_DEPLOY_STATE_JSON_LOCAL, "r", encoding="utf-8") as _f:
+            _m = json.load(_f)
+        return _m if isinstance(_m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_persisted_deployment_combined_hash() -> str:
+    """Read the deploy-bookkeeping ``.deployed_state.json`` hash (repo root).
+
+    Written by the deploy-time identity record tool from the container
+    readback (and, for version bookkeeping, ``__init__._save_deploy_state``).
+    Missing file/key → "".
+    """
+    return str(_read_frozen_deployed_identity().get("deployment_combined_hash", "") or "")
+
+
+# ── Step-2 host validation memoization ───────────────────────────────────
+# ``execution.validate_prompt`` runs once per (workflow, deployment identity).
+# Identical subsequent builds reuse the cached payload.  Simple bounded dict;
+# a full clear is used as the documented eviction policy.  Exceptions are
+# never cached (fail-closed unchanged).
+_PLAN_VALIDATION_MEMO_MAX = 64
+_PLAN_VALIDATION_MEMO: dict = {}
+
+
+def _memo_key_plan_validation(workflow_hash: str, dep_identity: dict) -> tuple:
+    return (
+        workflow_hash,
+        str(dep_identity.get("deployment_combined_hash", "")),
+        str(dep_identity.get("custom_nodes_generation", "")),
+        stable_hash(dep_identity.get("registry_proof") or {}),
+        VALIDATION_PROOF_SCHEMA_VERSION,
+    )
+
+
+def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
+    """Run the parent-ComfyUI ``execution.validate_prompt`` (fail-closed).
+
+    Host-only, lazy imports only — module import must NOT import
+    ``execution``/``nodes``.  Returns the plan-carried validation proof
+    payload.  Raises ``RuntimeError`` when validation fails or raises, so an
+    invalid workflow never reaches dispatch.
+    """
+    import asyncio
+    import concurrent.futures
+    import execution  # parent ComfyUI module — lazy, host-only
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION
+    try:
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+        # ComfyUI validation may coerce scalar inputs in place.  Validation is
+        # a proof-producing read of the dispatch workflow, not an authoring
+        # step; never let that implementation detail change the hash used for
+        # registry-store lookup or the immutable plan payload.
+        _validation_workflow = copy.deepcopy(workflow)
+        _coro = execution.validate_prompt(prompt_id, _validation_workflow, None)
+        if _loop is not None and _loop.is_running():
+            # Running loop in the current thread (v2 dispatch runs on the
+            # ComfyUI event loop).  Blocking that loop via
+            # ``asyncio.run_coroutine_threadsafe(...).result()`` would stall it
+            # (the loop cannot progress while its own thread is blocked), so
+            # drive the coroutine on a fresh loop in a worker thread instead.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                _result = _pool.submit(lambda: asyncio.run(_coro)).result(timeout=120)
+            _valid, _error, _outputs, _node_errors = _result
+        else:
+            _valid, _error, _outputs, _node_errors = asyncio.run(_coro)
+    except Exception as _exc:
+        raise RuntimeError(f"plan validation failed (exception): {_exc}") from _exc
+    if not _valid:
+        _err_text = str(_error or {})[:300]
+        raise RuntimeError(f"plan validation failed (invalid workflow): {_err_text}")
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "validated": bool(_valid),
+        "outputs_to_execute": sorted(str(o) for o in (_outputs or [])),
+        "node_errors": dict(_node_errors or {}),
+        "validated_workflow_hash": "",
+        # E29: node-type fingerprint (sorted class_type list) so a stored
+        # deployed proof can be matched even when a per-run nonce mutates
+        # literal text values and changes the full workflow hash.
+        "node_type_fingerprint": sorted(
+            str(n.get("class_type", ""))
+            for n in (workflow or {}).values()
+            if isinstance(n, dict)
+        ),
+        "source": "host_validate_prompt",
+    }
+
+
+def _registry_proof_cache_entry_is_usable(
+    entry: object, workflow: object, workflow_hash: str,
+) -> bool:
+    """Defensively validate a registry-store hit before consuming it."""
+    if not isinstance(entry, Mapping):
+        return False
+    entry_hash = str(entry.get("workflow_hash", "") or "")
+    if entry_hash and entry_hash != str(workflow_hash or ""):
+        return False
+    proof = entry.get("registry_proof")
+    if not isinstance(proof, Mapping) or not proof.get("complete"):
+        return False
+    if proof.get("schema_version") != 1:
+        return False
+    classes = proof.get("classes")
+    identities = proof.get("identities")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(name, str) or not name for name in classes)
+        or len(classes) != len(set(classes))
+    ):
+        return False
+    if not isinstance(identities, Mapping) or set(identities) != set(classes):
+        return False
+    if proof.get("workflow_class_count") != len(classes):
+        return False
+    if proof.get("missing_host") or proof.get("unresolved_identity"):
+        return False
+    if any(not isinstance(value, str) or not value for value in identities.values()):
+        return False
+    expected_classes = sorted({
+        str(node.get("class_type", ""))
+        for node in (workflow or {}).values()
+        if isinstance(node, dict) and node.get("class_type")
+    }) if isinstance(workflow, dict) else []
+    if classes != expected_classes:
+        return False
+    # Real store entries carry both the current anchor and proof hash.  The
+    # relaxed branch is only for legacy test doubles; public store.lookup never
+    # returns an entry without these fields.
+    if "identity_anchor" in entry:
+        try:
+            from comfymodal_runtime.registry_proof_store import current_identity_anchor
+            from comfymodal_runtime.registry_proof_store import REGISTRY_PROOF_STORE_SCHEMA_VERSION
+            if entry.get("schema_version") != REGISTRY_PROOF_STORE_SCHEMA_VERSION:
+                return False
+            if entry.get("identity_anchor") != current_identity_anchor():
+                return False
+        except Exception:
+            return False
+        if str(proof.get("workflow_hash", "") or "") != str(workflow_hash or ""):
+            return False
+    return True
+
+
+def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str = "", workflow=None) -> dict:
+    """Best-effort deployment identity for the plan (never fabricated).
+
+    ``registry_fingerprint`` returns ``""`` when ``nodes`` is unavailable, so
+    ``complete`` is only ever True when every component is known.  The
+    ``custom_nodes_generation`` and ``overall_dependency_hash`` are taken from
+    the deploy-frozen ``.deployed_state.json`` record when the deployment hash
+    source is ``persisted`` (already-deployed runtime) — NEVER from the mutable
+    local baked manifest, which other workflows may regenerate after deploy.
+    Fail closed: a persisted record missing the generation or dependency hash
+    yields an incomplete identity (``deployment_identity_fail_closed_reason``)
+    and never silently falls back to the baked manifest.  For non-persisted
+    sources (metadata/env) the legacy baked-manifest provenance is preserved.
+    ``dependency_manifest_identity`` mirrors the shared
+    identity builder the container's manifest writer uses; it is carried
+    separately for parity and never affects ``complete`` (Step-1 semantics).
+
+    Deployment hash fail-closed: the authoritative value comes only from
+    ``request_metadata`` → env ``COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH`` →
+    persisted ``.deployed_state.json``.  The host mirror
+    (``_compute_host_deployment_combined_hash``) is DIAGNOSTIC only and never
+    grants identity when the baked value is unknown.
+
+    Registry proof: when ``workflow`` is provided, a per-class canonical
+    identity proof over exactly the workflow's class set is built
+    (``registry_proof``).  It is the Step-3 registry-parity authority;
+    ``registry_proof_complete`` fails closed (False) whenever ``workflow`` is
+    None or the proof cannot be built.
+    """
+    import os
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION, compute_registry_fingerprint
+    _meta = dict(request_metadata or {})
+    _dep = str(_meta.get("deployment_combined_hash", "") or "")
+    _dep_source = "metadata"
+    if not _dep:
+        _dep = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+        _dep_source = "env"
+    if not _dep:
+        _dep = _read_persisted_deployment_combined_hash()
+        _dep_source = "persisted"
+    if not _dep:
+        # NO host-mirror fallback for the authoritative value: the mirror must
+        # not grant identity when the actual baked value is unknown.
+        _dep_source = "unavailable"
+    # Host mirror recomputation — DIAGNOSTIC ONLY, never used in ``complete``.
+    _host_mirror_dep = _compute_host_deployment_combined_hash()
+    _identity_frozen = _dep_source == "persisted"
+    _identity_fail_closed_reason = ""
+    if _identity_frozen:
+        # Deploy-frozen identity mode: an already-deployed runtime derives its
+        # plan identity EXCLUSIVELY from the deploy-frozen .deployed_state.json
+        # record (container readback at deploy time).  The mutable local baked
+        # manifest (.baked_custom_node_deps/) may be regenerated by other
+        # workflows after deploy and must NEVER change the plan identity of an
+        # existing deployment.  Fail closed: when the frozen record lacks the
+        # generation or the dependency hash, do NOT silently substitute the
+        # mutable manifest — the plan is incomplete and the fast path is not
+        # eligible until a new deployment freezes a complete record.
+        _frozen = _read_frozen_deployed_identity()
+        _gen = str(_frozen.get("custom_nodes_generation", "") or "")
+        _overall = str(_frozen.get("overall_dependency_hash", "") or "")
+        if not _gen:
+            _identity_fail_closed_reason = "deploy_frozen_custom_nodes_generation_missing"
+            _gen = ""
+            _overall = ""
+        elif not _overall:
+            _identity_fail_closed_reason = "deploy_frozen_overall_dependency_hash_missing"
+            _overall = ""
+    else:
+        # No deployed record (or metadata/env override): keep the legacy
+        # construction-time baked manifest as the identity source.
+        _baked = _read_baked_custom_node_manifest()
+        _gen = str(_baked.get("production_custom_node_generation", "") or "")
+        if not _gen:
+            _gen = str(_meta.get("custom_node_generation", "") or "")
+        _overall = str(_baked.get("overall_dependency_hash", "") or "")
+    _repair = _host_requirements_repair_mode()
+    _dep_identity = ""
+    if _dep and _gen and _overall:
+        from comfymodal_runtime.dependency_manifest import (
+            DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+            build_identity,
+        )
+        _dep_identity = build_identity(
+            combined_hash=_dep,
+            custom_node_fingerprint={"overall_dependency_hash": _overall},
+            custom_node_generation=_gen,
+            repair_mode=_repair,
+            schema_version=DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+        )
+    # Root-filtered registry fingerprint.  repo_root = the comfyui-modal dir
+    # (this file lives at the repo root); custom_nodes_dir = parent of
+    # repo_root.  If roots derivation is impossible, fall back to the full
+    # registry (no roots).  Diagnostic only (Step-3 parity uses the
+    # workflow-relevant registry_proof instead).
+    #
+    # D1 persisted registry-proof fast path: when the deploy-frozen identity is
+    # current AND a store entry covers this workflow, reuse the persisted
+    # fingerprint + workflow proof instead of importing the live registry
+    # (17-90 s per fresh command).  Fail-closed: any mismatch falls back to the
+    # live computation below.
+    _reg = ""
+    _reg_proof = {}
+    _reg_proof_complete = False
+    _wf_hash = prompt_sha256(workflow) if isinstance(workflow, dict) else ""
+    if _identity_frozen and _wf_hash:
+        try:
+            from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+            _entry = _proof_store_lookup(
+                workflow_hash=_wf_hash, comfyui_root=str(comfyui_root or ""),
+            )
+        except Exception:
+            _entry = None
+        if _registry_proof_cache_entry_is_usable(_entry, workflow, _wf_hash):
+            _reg = str(_entry.get("registry_fingerprint", "") or "")
+            _reg_proof = _entry.get("registry_proof") or {}
+            _reg_proof_complete = True
+    if not _reg and not _reg_proof:
+        _repo_root = os.path.dirname(os.path.abspath(__file__))
+        _custom_nodes_dir = os.path.dirname(_repo_root)
+        _roots = [r for r in (str(comfyui_root or ""), _custom_nodes_dir, _repo_root) if r]
+        if _roots:
+            _reg = compute_registry_fingerprint(roots=_roots)
+        else:
+            _reg = compute_registry_fingerprint()  # full registry fallback
+        _reg_proof = {}
+        if workflow:
+            try:
+                from comfymodal_runtime.registry_proof import build_workflow_registry_proof
+                _reg_proof = build_workflow_registry_proof(
+                    workflow,
+                    roots=[
+                        r for r in (
+                            str(comfyui_root or ""),
+                            _custom_nodes_dir,
+                            _repo_root,
+                        ) if r
+                    ],
+                    workflow_hash=_wf_hash,
+                )
+            except Exception:
+                _reg_proof = {}
+        if isinstance(_reg_proof, dict) and _reg_proof.get("complete"):
+            _proof_hash = str(_reg_proof.get("workflow_hash", "") or "")
+            if _proof_hash and _proof_hash != _wf_hash:
+                _reg_proof = {}
+            else:
+                # Bind a complete live proof to the finalized dispatch hash
+                # before it can be persisted or carried by the plan.
+                _reg_proof = dict(_reg_proof)
+                _reg_proof["workflow_hash"] = _wf_hash
+        _reg_proof_complete = bool(_reg_proof.get("complete", False))
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "deployment_combined_hash": _dep,
+        "deployment_combined_hash_source": _dep_source,
+        "host_mirror_deployment_combined_hash": str(_host_mirror_dep or ""),
+        "custom_nodes_generation": _gen,
+        "registry_fingerprint": _reg,
+        "registry_proof": _reg_proof,
+        "registry_proof_complete": _reg_proof_complete,
+        "dependency_manifest_identity": _dep_identity,
+        "deployment_identity_frozen": _identity_frozen,
+        "deployment_identity_fail_closed_reason": _identity_fail_closed_reason,
+        "workflow_hash": _wf_hash,
+        "complete": bool(
+            _dep and _gen and _reg_proof_complete
+            and not _identity_fail_closed_reason
+            # A deploy-frozen identity must include its frozen dependency
+            # pair.  Legacy metadata/env construction remains descriptive;
+            # the parity evaluator still gates it on dependency identity.
+            and (
+                not _identity_frozen
+                or bool(_overall and _dep_identity)
+            )
+        ),
+    }
+
+
+def resolve_dispatch_workflow_hash(
+    workflow: dict,
+    modal_options: dict | None = None,
+    production_options: dict | None = None,
+    production_report: dict | None = None,
+) -> str:
+    """Mirror ``build_execution_plan``'s compile step and return the dispatch
+    workflow hash WITHOUT importing the node registry.
+
+    ``build_execution_plan`` keys the registry-proof store, the plan, and the
+    validation memo by the hash of the DISPATCH workflow — which differs from
+    ``prompt_sha256(source_workflow)`` whenever production compile rewrites the
+    dict.  This helper replicates the exact compile decision (pure dict work,
+    never imports ``nodes``/``execution``):
+
+    * ``production_report.get("enabled")``  → dispatch stays the source
+      (the report already describes the compiled workflow).
+    * ``production_options`` provided and enabled → normalize + compile, hash
+      ``compiled.compiled_workflow``.
+    * ``production_options`` absent but ``modal_options`` given → derive the
+      options exactly as the benchmark call sites do
+      (``normalize_production_options(modal_options)``), then compile.
+    * otherwise → hash the source (no compile).
+
+    Callers pass the same inputs they give ``build_execution_plan`` so the
+    lookup key is identical to the persisted store key.
+    """
+    source_workflow = copy.deepcopy(workflow or {})
+    dispatch_workflow = source_workflow
+    report = dict(production_report or {})
+    if report.get("enabled"):
+        # production_report already describes the compiled workflow; the
+        # source dict IS the dispatch workflow (no recompile).
+        pass
+    elif production_options is not None:
+        if production_options.get("enabled"):
+            normalized_production = normalize_production_options(production_options)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+    elif modal_options:
+        # Mirror the benchmark call sites: production options are derived
+        # from modal_options, normalized, then re-normalized by the plan
+        # build (the same double-normalization the production path performs).
+        _derived = normalize_production_options(modal_options)
+        if _derived.get("enabled"):
+            normalized_production = normalize_production_options(_derived)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+    return prompt_sha256(dispatch_workflow)
+
+
+def build_execution_plan(
+    workflow: dict,
+    *,
+    prompt_id: str = "",
+    client_id: str = "",
+    input_images: dict[str, str] | None = None,
+    modal_options: dict | None = None,
+    production_options: dict | None = None,
+    production_report: dict | None = None,
+    gpu: str | None = None,
+    workspace: dict | None = None,
+    request_metadata: dict | None = None,
+    comfyui_root: str = "",
+    trace: RuntimeTrace | None = None,
+    validate: bool = True,
+    collect_validation_proof: bool = False,
+) -> ExecutionPlan:
+    """Normalize, validate, compile, and freeze one dispatch plan."""
+    if trace:
+        trace.emit("plan_build_start", phase="local", metadata={"prompt_id": prompt_id})
+    source_workflow = copy.deepcopy(workflow or {})
+    source_hash = prompt_sha256(source_workflow)
+    if validate:
+        assert_valid_api_prompt_structure(source_workflow)
+        _validate_class_types(source_workflow, production_report)
+
+    dispatch_workflow = source_workflow
+    report = dict(production_report or {})
+    normalized_production = None
+    if report.get("enabled"):
+        # Reuse existing validated deep copy — production_report already
+        # describes the compiled workflow. No second deepcopy needed.
+        pass
+    elif production_options and production_options.get("enabled"):
+        normalized_production = normalize_production_options(production_options)
+        compiled = compile_production_workflow(
+            source_workflow,
+            normalized_production,
+            allow_direct_output_rewrite=True,
+        )
+        dispatch_workflow = compiled.compiled_workflow
+        report = dict(compiled.report)
+    elif modal_options:
+        # Keep plan construction identical to resolve_dispatch_workflow_hash:
+        # callers that provide only modal_options still dispatch the compiled
+        # workflow and therefore receive proof keyed to that exact hash.
+        _derived_production = normalize_production_options(modal_options)
+        if _derived_production.get("enabled"):
+            normalized_production = normalize_production_options(_derived_production)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+            report = dict(compiled.report)
+    # Deployment identity is computed ONCE up-front: it feeds the host-side
+    # validation memo key AND the plan arg / instrumentation line below
+    # (never recomputed twice).  ``dispatch_workflow`` is finalized above.
+    _deployment_identity = _collect_plan_deployment_identity(
+        request_metadata, comfyui_root, workflow=dispatch_workflow
+    )
+    # Step-1/Step-2 plan-carried validation proof.  Runs AFTER the dispatch
+    # workflow is finalized and uses the exact dispatch hash.  Validation is
+    # given a defensive copy, so the object used by the proof-store lookup is
+    # also the object frozen into the plan.  Fail-closed: any validation
+    # failure aborts the build and exceptions are never cached.
+    _validation_payload: dict = {}
+    _validation_memo_state = "off"
+    if collect_validation_proof:
+        _memo_key = _memo_key_plan_validation(
+            prompt_sha256(dispatch_workflow), _deployment_identity
+        )
+        _cached = _PLAN_VALIDATION_MEMO.get(_memo_key)
+        if _cached is None:
+            # D1 persisted validation-proof fast path (cross-process): the
+            # same memo key persisted by a prior command makes plan
+            # construction skip the live `execution.validate_prompt`.
+            if _deployment_identity.get("deployment_identity_frozen"):
+                try:
+                    from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+                    _store_entry = _proof_store_lookup(
+                        workflow_hash=prompt_sha256(dispatch_workflow),
+                        comfyui_root=str(comfyui_root or ""),
+                    )
+                except Exception:
+                    _store_entry = None
+                _stored_validation = (
+                    _store_entry.get("validation") if isinstance(_store_entry, dict) else None
+                )
+                if isinstance(_stored_validation, dict) and _stored_validation:
+                    _cached = dict(_stored_validation)
+                    _PLAN_VALIDATION_MEMO[_memo_key] = dict(_cached)
+        if _cached is not None:
+            _validation_payload = dict(_cached)
+            _validation_memo_state = "hit"
+        else:
+            try:
+                _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+                _validation_memo_state = "miss"
+            except RuntimeError as _validation_exc:
+                # ── E29 host-registry fallback (fail-closed → stored proof) ──
+                # The host ComfyUI node registry can be incomplete/broken (a
+                # third-party custom node shadowing ``utils`` breaks
+                # PromptServer imports, so nodes like
+                # PairConditioningSetProperties are missing HOST-side while
+                # present in the DEPLOYED container).  The D1 registry-proof
+                # store holds a validation proof from the DEPLOYED registry
+                # (parity-correct by construction).  When live host validation
+                # fails for a missing node, fall back to the stored deployed
+                # proof for the SAME workflow — never fabricate success.
+                #
+                # The frozen flag is not required here: the store lookup is
+                # itself anchor-validated against .deployed_state.json, and the
+                # run carries the deploy-frozen hash via env/metadata.  Any
+                # store entry whose anchor matches the CURRENT
+                # .deployed_state.json is deploy-frozen by construction.
+                _fallback_payload: dict | None = None
+                if _deployment_identity.get("deployment_combined_hash"):
+                    try:
+                        from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+                        # Primary: exact dispatch-hash lookup (nonce included).
+                        _store_entry = _proof_store_lookup(
+                            workflow_hash=prompt_sha256(dispatch_workflow),
+                            comfyui_root=str(comfyui_root or ""),
+                        )
+                        _stored_validation = (
+                            _store_entry.get("validation")
+                            if isinstance(_store_entry, dict) else None
+                        )
+                        if isinstance(_stored_validation, dict) and _stored_validation.get("validated"):
+                            _fallback_payload = dict(_stored_validation)
+                        else:
+                            # Secondary: node-type fingerprint scan.  The
+                            # per-run conditioning nonce mutates literal text
+                            # values only, so the NODE-TYPE structure of the
+                            # dispatch workflow is identical to the stored
+                            # workflow; match on the sorted class_type list.
+                            _current_types = sorted(
+                                str(n.get("class_type", ""))
+                                for n in (dispatch_workflow or {}).values()
+                                if isinstance(n, dict)
+                            )
+                            if _current_types:
+                                from comfymodal_runtime.registry_proof_store import entries as _proof_store_entries
+                                for _wf_hash, _entry in (_proof_store_entries() or {}).items():
+                                    # ``entries()`` is already anchor-filtered,
+                                    # but retain a defensive check here so a
+                                    # substituted/scanned store cannot promote
+                                    # stale or validation-only data.
+                                    if not _registry_proof_cache_entry_is_usable(
+                                        _entry,
+                                        dispatch_workflow,
+                                        str(_entry.get("workflow_hash", "") or ""),
+                                    ):
+                                        continue
+                                    _val = _entry.get("validation") or {}
+                                    _stored_types = _val.get("node_type_fingerprint") or []
+                                    if (
+                                        _val.get("validated")
+                                        and isinstance(_stored_types, list)
+                                        and _stored_types == _current_types
+                                    ):
+                                        _fallback_payload = dict(_val)
+                                        break
+                    except Exception:
+                        _fallback_payload = None
+                if _fallback_payload is not None:
+                    _validation_payload = _fallback_payload
+                    _validation_memo_state = "deployed-proof-fallback"
+                else:
+                    # E29 diagnostic: make the fallback miss VISIBLE so the
+                    # next run can be fixed from evidence, not guessing.
+                    print(
+                        f"[v2.plan_proof] fallback=miss frozen="
+                        f"{_deployment_identity.get('deployment_identity_frozen')} "
+                        f"wf_hash={prompt_sha256(dispatch_workflow)[:12]} "
+                        f"types={len([n for n in (dispatch_workflow or {}).values() if isinstance(n, dict)])} "
+                        f"error={str(_validation_exc)[:160]}",
+                        flush=True,
+                    )
+                    raise _validation_exc
+            if len(_PLAN_VALIDATION_MEMO) >= _PLAN_VALIDATION_MEMO_MAX:
+                _PLAN_VALIDATION_MEMO.clear()  # simple documented eviction
+            _PLAN_VALIDATION_MEMO[_memo_key] = dict(_validation_payload)
+            _validation_memo_state = "miss" if _validation_memo_state == "miss" else _validation_memo_state
+    # Hash the finalized object that is actually frozen into the plan.  Do
+    # not independently recompile here: a second normalization/compile can
+    # diverge from the workflow passed to the proof-store lookup.
+    dispatch_hash = prompt_sha256(dispatch_workflow)
+    if _validation_payload:
+        _validation_payload["validated_workflow_hash"] = dispatch_hash
+        # E29: always carry the node-type fingerprint (the per-run nonce
+        # mutates literal text but not node structure), so a stored deployed
+        # proof can be matched by the fallback even for a nonce'd workflow.
+        _validation_payload["node_type_fingerprint"] = sorted(
+            str(n.get("class_type", ""))
+            for n in (dispatch_workflow or {}).values()
+            if isinstance(n, dict)
+        )
+    # D1 persisted registry-proof/validation store write: the next process can
+    # rebuild the identical plan payloads without importing the registry.
+    if _deployment_identity.get("deployment_identity_frozen"):
+        try:
+            from comfymodal_runtime.registry_proof_store import save as _proof_store_save
+            _proof_store_save({
+                "workflow_hash": dispatch_hash,
+                "comfyui_root": str(comfyui_root or ""),
+                "registry_fingerprint": str(_deployment_identity.get("registry_fingerprint", "") or ""),
+                "registry_proof": _deployment_identity.get("registry_proof") or {},
+                "validation": dict(_validation_payload) if _validation_payload else None,
+            })
+        except Exception:
+            pass
+    if report.get("enabled"):
+        compiled_hash = str(report.get("compiled_workflow_hash", ""))
+        if compiled_hash and compiled_hash != dispatch_hash:
+            raise AssertionError(
+                "execution plan compiled workflow hash mismatch: "
+                f"compiled={compiled_hash[:12]} dispatch={dispatch_hash[:12]}"
+            )
+
+    if input_images is None:
+        input_images = _collect_input_images(dispatch_workflow, comfyui_root) if comfyui_root else {}
+
+    model_stack = extract_model_stack(dispatch_workflow)
+    try:
+        from optimizations import extract_safe_prompt_bundle
+        bundle_result = extract_safe_prompt_bundle(dispatch_workflow)
+        prompt_bundle = bundle_result.get("bundle", {}) if bundle_result.get("eligible") else {}
+    except Exception:
+        prompt_bundle = summarize_prompt_fields(dispatch_workflow)
+
+    option_source = dict(modal_options or {})
+    if report.get("enabled"):
+        option_source["production"] = {
+            "enabled": True,
+            "output_node_ids": list(report.get("output_node_ids", [])),
+        }
+    options = ExecutionOptions.from_legacy(
+        option_source,
+        production_report=report,
+        default_production=bool(report.get("enabled")),
+    )
+    output_node_ids = tuple(str(v) for v in report.get("output_node_ids", options.production_output_node_ids))
+    metadata = dict(request_metadata or {})
+    # Propagate request_origin_info from trace when request_metadata lacks it.
+    # Use Mapping check because frozen dataclasses wrap nested dicts as
+    # mappingproxy; isinstance(x, dict) fails for mappingproxy values.
+    if trace is not None:
+        _trace_origin = trace._metadata.get("request_origin_info", {})
+        if isinstance(_trace_origin, Mapping) and _trace_origin:
+            metadata.setdefault("request_origin_info", dict(_trace_origin))
+    metadata.update({
+        "prompt_id": prompt_id,
+        "client_id": client_id,
+        "selected_gpu": gpu or "",
+        "workspace_id": str((workspace or {}).get("id", "")),
+    })
+    plan = ExecutionPlan(
+        workflow=dispatch_workflow,
+        workflow_hash=dispatch_hash,
+        source_workflow_hash=str(report.get("source_workflow_hash", source_hash)),
+        production_report=report,
+        model_stack=model_stack,
+        prompt_bundle=prompt_bundle,
+        output_node_ids=output_node_ids,
+        input_images=input_images or {},
+        execution_options=options,
+        request_metadata=metadata,
+        validation=_validation_payload,
+        deployment_identity=_deployment_identity,
+    )
+    if _validation_payload:
+        print(
+            f"[v2.plan_proof] schema={_validation_payload.get('schema_version')} payload=yes "
+            f"validated={_validation_payload.get('validated')} outputs={len(_validation_payload.get('outputs_to_execute', []))} "
+            f"wf_hash={dispatch_hash[:16]} dep_complete={_deployment_identity.get('complete')} "
+            f"reg_proof={int(bool(_deployment_identity.get('registry_proof_complete')))} "
+            f"memo={'hit' if _validation_memo_state == 'hit' else 'miss'}",
+            flush=True,
+        )
+    if trace:
+        trace.emit("plan_build_end", phase="local", metadata={
+            "workflow_hash": plan.workflow_hash,
+            "source_workflow_hash": plan.source_workflow_hash,
+            "production_enabled": bool(report.get("enabled")),
+        })
+    return plan
+
+
+async def execute_plan(
+    plan: ExecutionPlan,
+    *,
+    transport: ModalTransport | None = None,
+    restore_publisher: Any | None = None,
+    profile_setter: Callable[..., Any] | None = None,
+    profile_checker: Callable[..., Any] | None = None,
+    gpu: str | None = None,
+    workspace: dict | None = None,
+    trace: RuntimeTrace | None = None,
+    event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Publish one restore plan, submit one plan, and merge one trace.
+
+    When *profile_setter* is provided, calls ``prepare_active_next_profile``
+    before restore publication / Modal submission.  A missing setter is a
+    safe dry-run / no-remote path.  *profile_checker* is forwarded as the
+    ``checker`` argument to ``prepare_active_next_profile`` (cold-safe
+    read-only identity seam).
+    """
+    runtime_trace = trace or RuntimeTrace(
+        request_id=str(plan.request_metadata.get("prompt_id", "")),
+        process="local",
+    )
+
+    # Propagate request_origin_info from plan metadata into runtime_trace when
+    # the trace metadata does not already carry it.  Preserve existing values
+    # (never overwrite with plan defaults).
+    # Use Mapping check because frozen dataclasses wrap nested dicts as
+    # mappingproxy.
+    _plan_origin = plan.request_metadata.get("request_origin_info", {})
+    if isinstance(_plan_origin, Mapping) and _plan_origin:
+        _existing_origin = runtime_trace._metadata.get("request_origin_info", {})
+        if not isinstance(_existing_origin, Mapping) or not _existing_origin:
+            runtime_trace.set_metadata(request_origin_info=dict(_plan_origin))
+
+    # ── Entry timestamp for the execute_plan boundary ──
+    runtime_trace.emit("execute_plan_entry", phase="local")
+
+    # ── Single canonical payload — materialize the frozen plan exactly once ──
+    # Reused for active-profile workflow, restore publication, and final Modal
+    # payload.  ExecutionPlan is immutable; the thawed dict is a safe copy.
+    runtime_trace.emit("plan_materialization_start", phase="local")
+    _plan_mat_start_ns = time.perf_counter_ns()
+    _canonical_dict: dict = plan.to_dict()
+    _plan_mat_end_ns = time.perf_counter_ns()
+    runtime_trace.emit("plan_materialization_end", phase="local")
+    _plan_mat_ms = round((_plan_mat_end_ns - _plan_mat_start_ns) / 1_000_000, 3)
+    runtime_trace.set_metadata(
+        plan_materialization_count=1,
+        plan_to_dict_count=1,
+        plan_materialization_ms=_plan_mat_ms,
+    )
+    _canonical_workflow: dict = _canonical_dict["workflow"]
+
+    # ── Profile preparation (before restore publication / Modal submission) ──
+    runtime_trace.emit("active_profile_prepare_start", phase="local")
+    runtime_trace.emit("active_next_profile_start", phase="local")
+    # Effective requested env profile: request-carried origin first, process
+    # env fallback (deploy default "inherit" is a no-op request override).
+    _profile_req_meta = plan.request_metadata if isinstance(plan.request_metadata, Mapping) else {}
+    _profile_origin = _profile_req_meta.get("request_origin_info", {})
+    _profile_requested_env = str(
+        _profile_origin.get("env_profile", "") if isinstance(_profile_origin, Mapping) else ""
+    ).strip().lower()
+    if not _profile_requested_env:
+        _profile_requested_env = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+    if profile_setter is not None and active_next_publication_required(_profile_requested_env):
+        # ── Profile prep cache identity keys ──
+        _profile_ws_id = _workspace_identity(workspace)
+        _profile_app_identity = _app_identity()
+        _pr = dict(plan.production_report) if isinstance(plan.production_report, Mapping) else {}
+
+        # Compute stable model identity keys from the canonical workflow
+        # (same values prepare_active_next_profile would produce).
+        _model_profile_key, _prefill_key = compute_profile_identity_keys(
+            _canonical_workflow,
+        )
+
+        _profile_cache_key = _profile_prep_cache_key(
+            _profile_app_identity, _profile_ws_id,
+            _model_profile_key, _prefill_key,
+        )
+
+        _profile_cache_lookup_start_ns = time.perf_counter_ns()
+
+        # ── Instrumentation: owner metadata for diagnostics ──
+        _cache_pid = os.getpid()
+        _cache_module_id = str(id(sys.modules[__name__]))
+        _cache_obj_id = str(id(_PROFILE_PREP_CACHE))
+        _cache_size_before = len(_PROFILE_PREP_CACHE)
+        _cache_reset_count_current = _profile_cache_reset_count
+        _profile_miss_reason = ""
+
+        with _PROFILE_PREP_CACHE_LOCK:
+            _cached_result = _PROFILE_PREP_CACHE.get(_profile_cache_key)
+        _profile_cache_lookup_ms = round((time.perf_counter_ns() - _profile_cache_lookup_start_ns) / 1_000_000, 3)
+
+        if _cached_result is not None:
+            # Identity unchanged — reuse cached result, no remote calls
+            _pn_result = dict(_cached_result)
+            runtime_trace.emit(
+                "profile_prep_cache_hit", phase="local",
+                metadata={"cache_key_prefix": _profile_cache_key[:16],
+                          "source": "profile_prep_cache"},
+            )
+            runtime_trace.set_metadata(
+                active_profile_publish_decision="cached_unchanged",
+                active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
+                active_profile_token=_pn_result.get("active_profile_token", ""),
+                local_active_profile_prepare_ms=0.0,
+                active_profile_remote_call=0,
+                active_profile_remote_ms=0.0,
+                active_profile_prepare_count=0,
+                profile_cache_hit=True,
+                profile_cache_lookup_ms=_profile_cache_lookup_ms,
+                profile_remote_call_performed=False,
+                profile_checker_performed=False,
+                profile_checker_matched=False,
+                profile_setter_performed=False,
+                active_profile_local_ms=0.0,
+                active_profile_cache_lookup_ms=_profile_cache_lookup_ms,
+                active_profile_checker_ms=0.0,
+                active_profile_setter_ms=0.0,
+                active_profile_total_ms=_profile_cache_lookup_ms,
+                source_workflow_hash=plan.source_workflow_hash,
+                model_stack=dict(plan.model_stack),
+                prompt_summary=dict(plan.prompt_bundle),
+                # Instrumentation diagnostics
+                profile_cache_pid=_cache_pid,
+                profile_cache_module_id=_cache_module_id,
+                profile_cache_object_id=_cache_obj_id,
+                profile_cache_size_before=_cache_size_before,
+                profile_cache_key_hash=_profile_cache_key[:16],
+                profile_identity_key=_model_profile_key[:16],
+                profile_cache_reset_count=_cache_reset_count_current,
+                profile_miss_reason="",
+                # Disk cache telemetry
+                disk_profile_cache_hit=_profile_cache_key in _profile_disk_cache,
+                disk_profile_read_count=_disk_profile_read_count,
+                disk_profile_write_count=_disk_profile_write_count,
+                disk_profile_miss_count=_disk_profile_miss_count,
+                disk_profile_corruption_count=_disk_profile_corruption_count,
+            )
+            runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+                "decision": "profile_prep_cache_hit",
+                "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
+            })
+        else:
+            # ── Cache miss — determine reason ──
+            # Possible reasons: key not found (never seen), cache reset occurred,
+            # identity changed (model profile or prefill), or app/workspace changed.
+            # Compute the miss reason string for diagnostics.
+            _profile_miss_reason = "key_not_found"
+            if _cache_size_before > 0:
+                # Cache had entries but this key wasn't one of them
+                _profile_miss_reason = "identity_mismatch"
+            elif _cache_reset_count_current > 0:
+                _profile_miss_reason = "cache_reset"
+
+            runtime_trace.emit("plan_serialization_start", phase="local",
+                               metadata={"purpose": "profile_activation"})
+            _activation_wf = _canonical_workflow  # reuse canonical payload
+            runtime_trace.emit("plan_serialization_end", phase="local",
+                               metadata={"purpose": "profile_activation",
+                                         "reused_canonical": True})
+            _activation_hash = plan.source_workflow_hash or plan.workflow_hash
+            _prod_opts: dict | None = None
+            if _pr.get("enabled"):
+                _prod_opts = {
+                    "enabled": True,
+                    "output_node_ids": list(_pr.get("output_node_ids", [])),
+                    "bypass_node_ids": list(_pr.get("bypass_node_ids", [])),
+                    "source_workflow_hash": _pr.get("source_workflow_hash", ""),
+                    "compiled_workflow_hash": _pr.get("compiled_workflow_hash", ""),
+                    "production_plan_hash": _pr.get("production_plan_hash", ""),
+                    "compiler_version": _pr.get("compiler_version", COMPILER_SCHEMA_VERSION),
+                    "hash_schema_version": _pr.get("hash_schema_version", HASH_SCHEMA_VERSION),
+                    "production_plan_schema_version": _pr.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION),
+                }
+                _activation_hash = _pr.get("source_workflow_hash", _activation_hash)
+            _pn_result = await prepare_active_next_profile(
+                _activation_wf,
+                _activation_hash,
+                production_options=_prod_opts,
+                workspace=workspace,
+                setter=profile_setter,
+                checker=profile_checker,
+            )
+            runtime_trace.set_metadata(
+                active_profile_publish_decision=_pn_result.get("active_profile_publish_decision", ""),
+                active_profile_stable_key=_pn_result.get("active_profile_stable_key", ""),
+                active_profile_token=_pn_result.get("active_profile_token", ""),
+                local_active_profile_prepare_ms=_pn_result.get("local_active_profile_prepare_ms", 0.0),
+                active_profile_remote_call=_pn_result.get("active_profile_remote_call", 0),
+                active_profile_remote_ms=_pn_result.get("active_profile_remote_ms", 0.0),
+                active_profile_prepare_count=1,
+                profile_cache_hit=False,
+                profile_cache_lookup_ms=_profile_cache_lookup_ms,
+                profile_remote_call_performed=bool(_pn_result.get("active_profile_remote_call", 0)),
+                profile_checker_performed=bool(_pn_result.get("profile_checker_performed", False)),
+                # Propagated from prepare_active_next_profile result.
+                # True only when the volume-backed checker returned matched=True;
+                # False for process-local dedup hit, setter-write, or no-checker paths.
+                profile_checker_matched=_pn_result.get("profile_checker_matched", False),
+                profile_setter_performed=bool(_pn_result.get("profile_setter_performed", False)),
+                active_profile_local_ms=_pn_result.get("active_profile_local_ms", 0.0),
+                active_profile_cache_lookup_ms=_pn_result.get("active_profile_cache_lookup_ms", _profile_cache_lookup_ms),
+                active_profile_checker_ms=_pn_result.get("active_profile_checker_ms", 0.0),
+                active_profile_setter_ms=_pn_result.get("active_profile_setter_ms", 0.0),
+                active_profile_total_ms=_pn_result.get("active_profile_total_ms", 0.0),
+                source_workflow_hash=plan.source_workflow_hash,
+                model_stack=dict(plan.model_stack),
+                prompt_summary=dict(plan.prompt_bundle),
+                # Instrumentation diagnostics
+                profile_cache_pid=_cache_pid,
+                profile_cache_module_id=_cache_module_id,
+                profile_cache_object_id=_cache_obj_id,
+                profile_cache_size_before=_cache_size_before,
+                profile_cache_key_hash=_profile_cache_key[:16],
+                profile_identity_key=_model_profile_key[:16],
+                profile_cache_reset_count=_cache_reset_count_current,
+                profile_miss_reason=_profile_miss_reason,
+                # Disk cache telemetry
+                disk_profile_cache_hit=False,
+                disk_profile_read_count=_disk_profile_read_count,
+                disk_profile_write_count=_disk_profile_write_count,
+                disk_profile_miss_count=_disk_profile_miss_count,
+                disk_profile_corruption_count=_disk_profile_corruption_count,
+            )
+            runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+                "decision": _pn_result.get("active_profile_publish_decision", ""),
+                "stable_key": _pn_result.get("active_profile_stable_key", "")[:16],
+                "miss_reason": _profile_miss_reason,
+            })
+            # On success populate cache; on failure remove any stale entry
+            if _pn_result.get("status") not in ("error",):
+                with _PROFILE_PREP_CACHE_LOCK:
+                    _PROFILE_PREP_CACHE[_profile_cache_key] = dict(_pn_result)
+                    while len(_PROFILE_PREP_CACHE) > _PROFILE_PREP_CACHE_MAX:
+                        _PROFILE_PREP_CACHE.pop(next(iter(_PROFILE_PREP_CACHE)), None)
+                # Persist to disk after confirmed remote success
+                _disk_entry = {
+                    "result": dict(_pn_result),
+                    "model_profile_key": _model_profile_key,
+                    "prefill_key": _prefill_key,
+                    "ws_id": _profile_ws_id,
+                    "app_identity": _profile_app_identity,
+                    "ts": time.time(),
+                    "pid": _cache_pid,
+                }
+                with _profile_disk_lock:
+                    _profile_disk_cache[_profile_cache_key] = _disk_entry
+                    while len(_profile_disk_cache) > _DISK_CACHE_MAX:
+                        _profile_disk_cache.pop(next(iter(_profile_disk_cache)), None)
+                _flush_profile_disk_cache()
+            else:
+                # Failure: remove any stale cached entry for this key
+                with _PROFILE_PREP_CACHE_LOCK:
+                    _PROFILE_PREP_CACHE.pop(_profile_cache_key, None)
+                # Also remove from disk cache (invalidation)
+                _remove_profile_disk_entry(_profile_cache_key)
+    elif profile_setter is not None:
+        # ── Inherit no-op gate (default single-invocation V2 path) ──
+        _noop_start_s = time.time()
+        _container_default_profile = os.environ.get(
+            "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ).strip().lower()
+        _cpu_snapshot_enabled = 1 if os.environ.get(
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", ""
+        ).strip() == "1" else 0
+        _snapshot_build_phase = 1 if os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", ""
+        ).strip() == "1" else 0
+        # Lifecycle-accurate no-op: the requested profile is the deploy
+        # default (inherit — a no-op in-container override) and no warmup-
+        # profile consumer is active.  A CPU-model-snapshot deployment
+        # consumes active_next_profile.json only during snapshot
+        # CONSTRUCTION (startup, snap=True); normal restored generations
+        # (snap=False) derive all request state from invocation_plan and
+        # never read the volume record, so the remote checker/setter here
+        # is pure pre-submission latency.  Explicit profile changes and
+        # construction/consumer invocations still use the full path above.
+        _noop_reason = "post_snapshot" if _cpu_snapshot_enabled else "inherit_default_no_consumer"
+        _noop_decision = (
+            "skipped_post_snapshot_noop" if _cpu_snapshot_enabled
+            else "skipped_inherit_noop"
+        )
+        runtime_trace.emit("active_profile_skip_noop", phase="local", metadata={
+            "reason": _noop_reason,
+            "requested_env_profile": _profile_requested_env,
+            "container_default_profile": _container_default_profile,
+            "checker_remote_call": 0,
+            "setter_remote_call": 0,
+            "override_applied": 0,
+            "snapshot_build_phase": _snapshot_build_phase,
+            "cpu_model_snapshot_enabled": _cpu_snapshot_enabled,
+            "consumer_requires_publication": 0,
+        })
+        runtime_trace.set_metadata(
+            active_profile_publish_decision=_noop_decision,
+            active_profile_stable_key="",
+            active_profile_token="",
+            local_active_profile_prepare_ms=0.0,
+            active_profile_remote_call=0,
+            active_profile_remote_ms=0.0,
+            active_profile_prepare_count=0,
+            profile_cache_hit=False,
+            profile_cache_lookup_ms=0.0,
+            profile_remote_call_performed=False,
+            profile_checker_performed=False,
+            profile_checker_matched=False,
+            profile_setter_performed=False,
+            active_profile_local_ms=0.0,
+            active_profile_cache_lookup_ms=0.0,
+            active_profile_checker_ms=0.0,
+            active_profile_setter_ms=0.0,
+            active_profile_total_ms=round((time.time() - _noop_start_s) * 1000, 2),
+            source_workflow_hash=plan.source_workflow_hash,
+            model_stack=dict(plan.model_stack),
+            prompt_summary=dict(plan.prompt_bundle),
+            profile_noop_reason=_noop_reason,
+            profile_requested_env=_profile_requested_env,
+            profile_container_default=_container_default_profile,
+            profile_effective=_profile_requested_env,
+            profile_override_applied=False,
+            snapshot_build_phase=_snapshot_build_phase,
+            cpu_model_snapshot_enabled=_cpu_snapshot_enabled,
+            consumer_requires_publication=0,
+        )
+        runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+            "decision": _noop_decision,
+            "reason": _noop_reason,
+        })
+        print(
+            f"[active_profile.publish] decision={_noop_decision} "
+            f"requested={_profile_requested_env or '(inherit)'} "
+            f"container_default={_container_default_profile} "
+            f"cpu_model_snapshot={_cpu_snapshot_enabled} "
+            f"snapshot_build_phase={_snapshot_build_phase} "
+            f"consumer_requires_publication=0 "
+            f"checker_remote=0 setter_remote=0 "
+            f"active_profile_noop_ms={round((time.time() - _noop_start_s) * 1000, 2)}",
+            flush=True,
+        )
+    else:
+        runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
+    runtime_trace.emit("active_profile_prepare_end", phase="local")
+
+    active_transport = transport or ModalTransport()
+
+    # Request-scoped identity travels with the exact execution payload.  It is
+    # metadata for validation/diagnostics only; no shared current-plan state is
+    # written or read.
+    try:
+        _request_model_key = derive_model_key(_canonical_workflow)
+        _request_prefill_key = derive_prefill_key(_request_model_key, _canonical_workflow)
+        _request_metadata = dict(_canonical_dict.get("request_metadata", {}))
+        _request_metadata["model_identity"] = _request_model_key.to_dict()
+        _request_metadata["prefill_identity"] = _request_prefill_key.to_dict()
+        _canonical_dict["request_metadata"] = _request_metadata
+        runtime_trace.set_metadata(
+            request_model_identity_hash=_request_model_key.stable_hash,
+            request_prefill_identity_hash=_request_prefill_key.stable_hash,
+        )
+    except Exception as _identity_exc:
+        runtime_trace.set_metadata(request_identity_error=f"{type(_identity_exc).__name__}: {_identity_exc}")
+
+    # ── Step 3: build the deployment-scoped schema-v2 seed (publisher side) ──
+    # The canonical workflow is available on the publisher side.  Build the
+    # deterministic seed payload exactly once and hand it to the restore
+    # publisher so it is persisted atomically alongside the restore plan on
+    # the shared runtime-state volume — never reconstructed from the request
+    # workflow inside the container.  When no publisher is configured
+    # (dry-run / local-only path) the payload is persisted to the local
+    # .runtime_state for observability parity.  Honest fallback: when the
+    # workflow is empty, publication is unavailable, or persistence fails,
+    # restore() falls back to a minimal startup seed — never guessed and
+    # never claiming seeded parity.
+    #
+    # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN (default "0") disables the remote
+    # publication: on that path the seed payload is labelled
+    # ``seed_source=invocation_plan`` (the REQUEST derives its own seed on
+    # the container side) and the local persistence below never claims
+    # ``publisher_plan``.  When the flag is "1" the payload keeps the legacy
+    # ``publisher_plan`` label for the diagnostic publisher path.
+    _seed_payload_ctx: dict[str, Any] = {
+        "built": 0, "topology_available": 0, "schema_version": 0,
+        "persisted": 0, "error": "",
+    }
+    _seed_payload: dict[str, Any] | None = None
+    _seed_obs_fields: dict[str, Any] = {}
+    try:
+        from comfymodal_runtime.execution_seed import (
+            build_invocation_seed_payload,
+            build_snapshot_seed_payload,
+            snapshot_seed_observability,
+        )
+
+        # The payload label follows the DESTINATION: when a publisher is
+        # configured the payload is published remotely and keeps the legacy
+        # ``publisher_plan`` label; when publication is skipped (default
+        # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN path passes restore_publisher=None)
+        # the payload is labelled ``invocation_plan`` and only persisted
+        # locally — never claiming a publisher-side seed.
+        _publish_enabled = restore_publisher is not None
+        _seed_req_meta = plan.request_metadata or {}
+        _seed_cn_gen = str(
+            _seed_req_meta.get("custom_node_generation", "") if hasattr(_seed_req_meta, "get") else ""
+        )
+        _seed_dep_hash = str(
+            _seed_req_meta.get("deployment_combined_hash", "") if hasattr(_seed_req_meta, "get") else ""
+        )
+        if not _seed_dep_hash:
+            _seed_dep_hash = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+        _seed_builder = (
+            build_snapshot_seed_payload if _publish_enabled else build_invocation_seed_payload
+        )
+        _seed_payload = _seed_builder(
+            _canonical_workflow,
+            output_node_ids=plan.output_node_ids,
+            workflow_hash=plan.workflow_hash,
+            source_workflow_hash=plan.source_workflow_hash,
+            custom_node_generation=_seed_cn_gen,
+            deployment_combined_hash=_seed_dep_hash,
+        )
+        if _seed_payload is not None:
+            _seed_obs_fields = snapshot_seed_observability(_seed_payload.get("seed"))
+            _seed_payload_ctx.update({
+                "built": 1,
+                "topology_available": 1,
+                "schema_version": int(_seed_payload.get("schema_version", 0) or 0),
+                **_seed_obs_fields,
+                # NOTE: must come AFTER **_seed_obs_fields — that helper
+                # hardcodes seed_source="" (it derives observability from the
+                # seed object only); the payload-level source wins here.
+                "seed_source": str(_seed_payload.get("seed_source", "") or ""),
+            })
+    except Exception as _seed_exc:
+        _seed_payload_ctx["error"] = f"{type(_seed_exc).__name__}: {str(_seed_exc)[:120]}"
+
+    # ── Restore-plan + seed publication (V2-only, publisher side) ──
+    # Replaces the previously disabled restore-publication block with the
+    # narrowest equivalent V2-only path: the plan is derived from the
+    # canonical workflow here, and the already-built seed payload is passed
+    # through unchanged — never rebuilt or re-validated in the remote
+    # request.  Publication is best-effort and fail-closed: any failure is
+    # recorded on the trace, nothing is cached, and the seed is never claimed
+    # persisted (restore() then honestly falls back to ``startup_minimal``).
+    _restore_publish_error = ""
+    if restore_publisher is not None:
+        runtime_trace.emit("plan_serialization_start", phase="local",
+                           metadata={"purpose": "restore_publication"})
+        workflow = _canonical_workflow  # reuse canonical payload
+        runtime_trace.emit("plan_serialization_end", phase="local",
+                           metadata={"purpose": "restore_publication",
+                                     "reused_canonical": True})
+        # Paired restore-plan build markers bound the plan derivation from the
+        # canonical workflow (restore_plan_build_start/end).
+        runtime_trace.emit("restore_plan_build_start", phase="local",
+                           metadata={"purpose": "restore_plan"})
+        try:
+            model_key = derive_model_key(workflow)
+            prefill_key = derive_prefill_key(model_key, workflow)
+            restore_plan = RestorePlan(
+                generation=0,
+                model_key=model_key,
+                prefill_key=prefill_key,
+                model_spec=build_restore_model_spec(workflow, dict(plan.model_stack)),
+                prefill_spec=dict(prefill_key.encode_options),
+                source_workflow_hash=plan.source_workflow_hash,
+                workflow=workflow,
+                workflow_hash=plan.workflow_hash,
+            )
+        except Exception as _plan_exc:
+            restore_plan = None
+            _restore_publish_error = (
+                f"restore_plan_build_error:{type(_plan_exc).__name__}:{str(_plan_exc)[:120]}"
+            )
+            runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
+        runtime_trace.emit("restore_plan_build_end", phase="local")
+        if restore_plan is not None:
+            runtime_trace.emit("restore_plan_publish_start", phase="local")
+
+            # Tracks whether the authoritative publication succeeded (or was
+            # skipped via a prior-success cache hit).  Drives the honest seed
+            # ``persisted`` flag: only a confirmed-success publication may
+            # claim the deployment-scoped seed exists.
+            _publish_succeeded = False
+
+            # ── Local process-safe cache: skip remote call when identity
+            #    is unchanged for the same app/workspace.  The seed identity
+            #    participates so a changed seed forces a republish.  Only
+            #    deterministic seed fields hash (never the volatile built_at). ──
+            plan_identity = _restore_plan_identity_hash(restore_plan)
+            seed_identity = ""
+            if _seed_payload is not None:
+                _seed_core = {
+                    "schema_version": _seed_payload.get("schema_version"),
+                    "seed_source": _seed_payload.get("seed_source"),
+                    "workflow_hash": _seed_payload.get("workflow_hash"),
+                    "seed": _seed_payload.get("seed"),
+                }
+                seed_identity = stable_hash(_seed_core)
+            _restore_app_identity = _app_identity()
+            _restore_ws_id = _workspace_identity(workspace)
+            cache_key = _restore_publish_cache_key(
+                _restore_app_identity,
+                os.environ.get("COMFYMODAL_V2_ENVIRONMENT", "").strip() or "__default__",
+                _restore_ws_id,
+                plan_identity,
+                seed_identity,
+            )
+
+            # ── Instrumentation metadata ──
+            _restore_cache_pid = os.getpid()
+            _restore_cache_module_id = str(id(sys.modules[__name__]))
+            _restore_cache_obj_id = str(id(_RESTORE_PUBLISH_CACHE))
+            _restore_cache_size_before = len(_RESTORE_PUBLISH_CACHE)
+            _restore_cache_reset_count_current = _restore_cache_reset_count
+            _restore_miss_reason = ""
+
+            _restore_cache_lookup_start_ns = time.perf_counter_ns()
+            with _RESTORE_PUBLISH_CACHE_LOCK:
+                _cached_restore = _RESTORE_PUBLISH_CACHE.get(cache_key)
+            _restore_cache_lookup_ms = round((time.perf_counter_ns() - _restore_cache_lookup_start_ns) / 1_000_000, 3)
+
+            if _cached_restore is not None:
+                # Identity unchanged — skip the remote publish call entirely.
+                # Return the cached metadata including observed generation.
+                # The cached entry is evidence of an earlier successful
+                # publication, so the seed was persisted with it.
+                _publish_succeeded = True
+                _cached_publish_result = dict(_cached_restore.get("publication_result", {}))
+                observed_generation = _cached_publish_result.get(
+                    "generation", _cached_publish_result.get("observed_generation", "")
+                )
+                runtime_trace.emit(
+                    "restore_publish_cache_skip", phase="local",
+                    metadata={"cache_key_prefix": cache_key[:64], "identity": plan_identity[:16]},
+                )
+                runtime_trace.set_metadata(
+                    restore_publish_cache_skipped=True,
+                    restore_publish_cache_hit=True,
+                    restore_cache_lookup_ms=_restore_cache_lookup_ms,
+                    restore_publish_ms=_restore_cache_lookup_ms,
+                    restore_remote_call_performed=False,
+                    restore_publish_result=_cached_publish_result,
+                    # Restore instrumentation
+                    restore_cache_pid=_restore_cache_pid,
+                    restore_cache_module_id=_restore_cache_module_id,
+                    restore_cache_object_id=_restore_cache_obj_id,
+                    restore_cache_size_before=_restore_cache_size_before,
+                    restore_cache_key_hash=cache_key[:64],
+                    restore_identity_hash=plan_identity[:16],
+                    complete_plan_identity_hash=plan_identity[:16],
+                    restore_cache_reset_count=_restore_cache_reset_count_current,
+                    restore_miss_reason="",
+                    # Disk cache telemetry
+                    disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                    disk_restore_read_count=_disk_restore_read_count,
+                    disk_restore_write_count=_disk_restore_write_count,
+                    disk_restore_miss_count=_disk_restore_miss_count,
+                    disk_restore_corruption_count=_disk_restore_corruption_count,
+                )
+            else:
+                # ── Cache miss — determine reason ──
+                _restore_miss_reason = "key_not_found"
+                if _restore_cache_size_before > 0:
+                    _restore_miss_reason = "identity_mismatch"
+                elif _restore_cache_reset_count_current > 0:
+                    _restore_miss_reason = "cache_reset"
+
+                runtime_trace.set_metadata(
+                    restore_publish_cache_skipped=False,
+                    restore_publish_cache_hit=False,
+                    restore_cache_lookup_ms=_restore_cache_lookup_ms,
+                )
+                try:
+                    publish_result = restore_publisher.publish(
+                        restore_plan, snapshot_seed=_seed_payload,
+                    )
+                except Exception as _pub_exc:
+                    publish_result = None
+                    _restore_publish_error = (
+                        f"restore_plan_publish_error:{type(_pub_exc).__name__}:{str(_pub_exc)[:120]}"
+                    )
+                    runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
+                    runtime_trace.emit(
+                        "restore_plan_publish_error", phase="local",
+                        metadata={"error": _restore_publish_error},
+                    )
+                if inspect.isawaitable(publish_result):
+                    try:
+                        publish_result = await publish_result
+                    except Exception as _pub_exc:
+                        publish_result = None
+                        _restore_publish_error = (
+                            f"restore_plan_publish_error:{type(_pub_exc).__name__}:{str(_pub_exc)[:120]}"
+                        )
+                        runtime_trace.set_metadata(restore_publish_error=_restore_publish_error)
+                        runtime_trace.emit(
+                            "restore_plan_publish_error", phase="local",
+                            metadata={"error": _restore_publish_error},
+                        )
+                runtime_trace.set_metadata(restore_remote_call_performed=True)
+                _publish_succeeded = publish_result is not None
+                if isinstance(publish_result, Mapping):
+                    observed_generation = publish_result.get(
+                        "generation", publish_result.get("observed_generation", "")
+                    )
+                    runtime_trace.set_metadata(restore_publish_result=dict(publish_result))
+                    # Guard cache against semantic failure: detect any of:
+                    #   status in error/failure/failed, ok==False, success==False,
+                    #   or a truthy error/failure field.
+                    _pub_status = publish_result.get("status", "")
+                    _pub_ok = publish_result.get("ok", True)
+                    _pub_success = publish_result.get("success", True)
+                    _pub_error_field = publish_result.get("error") or publish_result.get("failure")
+                    if (_pub_status in ("error", "failure", "failed")
+                            or _pub_ok is False
+                            or _pub_success is False
+                            or bool(_pub_error_field)):
+                        _publish_succeeded = False
+                else:
+                    observed_generation = publish_result
+                # On success populate cache with metadata; on failure remove stale.
+                if _publish_succeeded:
+                    _publication_result = (
+                        dict(publish_result)
+                        if isinstance(publish_result, Mapping)
+                        else {"generation": observed_generation}
+                    )
+                    with _RESTORE_PUBLISH_CACHE_LOCK:
+                        _RESTORE_PUBLISH_CACHE[cache_key] = {
+                            "identity_hash": plan_identity,
+                            "publication_result": _publication_result,
+                        }
+                        while len(_RESTORE_PUBLISH_CACHE) > _RESTORE_PUBLISH_CACHE_MAX:
+                            _RESTORE_PUBLISH_CACHE.pop(next(iter(_RESTORE_PUBLISH_CACHE)), None)
+                    # Persist to disk after confirmed remote success
+                    _restore_disk_entry = {
+                        "identity_hash": plan_identity,
+                        "publication_result": dict(_publication_result),
+                        "ws_id": _restore_ws_id,
+                        "app_identity": _restore_app_identity,
+                        "ts": time.time(),
+                        "pid": _restore_cache_pid,
+                    }
+                    with _restore_disk_lock:
+                        _restore_disk_cache[cache_key] = _restore_disk_entry
+                        while len(_restore_disk_cache) > _DISK_CACHE_MAX:
+                            _restore_disk_cache.pop(next(iter(_restore_disk_cache)), None)
+                    _flush_restore_disk_cache()
+                else:
+                    with _RESTORE_PUBLISH_CACHE_LOCK:
+                        _RESTORE_PUBLISH_CACHE.pop(cache_key, None)
+                    # Also remove from disk cache (invalidation)
+                    _remove_restore_disk_entry(cache_key)
+                # Instrumentation metadata on miss path
+                runtime_trace.set_metadata(
+                    restore_cache_pid=_restore_cache_pid,
+                    restore_cache_module_id=_restore_cache_module_id,
+                    restore_cache_object_id=_restore_cache_obj_id,
+                    restore_cache_size_before=_restore_cache_size_before,
+                    restore_cache_key_hash=cache_key[:64],
+                    restore_identity_hash=plan_identity[:16],
+                    complete_plan_identity_hash=plan_identity[:16],
+                    restore_cache_reset_count=_restore_cache_reset_count_current,
+                    restore_miss_reason=_restore_miss_reason,
+                    # Disk cache telemetry
+                    disk_restore_cache_hit=cache_key in _restore_disk_cache,
+                    disk_restore_read_count=_disk_restore_read_count,
+                    disk_restore_write_count=_disk_restore_write_count,
+                    disk_restore_miss_count=_disk_restore_miss_count,
+                    disk_restore_corruption_count=_disk_restore_corruption_count,
+                )
+            # Seed is persisted only when the authoritative publication
+            # succeeded (the seed was written atomically with the plan).  On
+            # cache-hit the seed was already persisted on the earlier
+            # successful publish; on any failure it is never claimed.
+            if _seed_payload is not None and _publish_succeeded:
+                _seed_payload_ctx["persisted"] = 1
+            # Represent the publish generation in request metadata when it is
+            # actually known (cache hit or confirmed publish) — never invented.
+            if observed_generation is not None:
+                runtime_trace.set_metadata(restore_publish_generation=observed_generation)
+            runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
+    else:
+        # ── Publish skipped (no remote publisher configured) ──
+        # Default production path: COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is unset
+        # (or "0"), so no remote ``publish_restore_plan`` RPC is performed.
+        # Emit a bounded marker so the artifact proves the skip:
+        #   * one trace event ``restore_publish_skipped``
+        #   * one console line ``[v2.restore_publish] skipped ...``
+        # ``restore_plan_publish_start/end`` are NOT emitted here, so
+        # ``restore_publish_ms`` / ``restore_publish_to_transport_entry_ms``
+        # render absent downstream (never a misleading tiny span).
+        # The seed payload (labelled ``invocation_plan`` on this path) is
+        # still persisted to the local .runtime_state path (existing
+        # local-observability behavior) — a local write only, never a remote
+        # RPC.
+        _restore_skip_reason = (
+            "flag_disabled"
+            if not publish_restore_plan_enabled()
+            else "publisher_not_configured"
+        )
+        runtime_trace.emit(
+            "restore_publish_skipped",
+            phase="local",
+            metadata={
+                "reason": _restore_skip_reason,
+                "restore_remote_call_performed": False,
+                "status": "skipped",
+            },
+        )
+        runtime_trace.set_metadata(
+            restore_publish_cache_skipped=None,
+            restore_publish_cache_hit=False,
+            restore_remote_call_performed=False,
+            restore_publish_status="skipped",
+            restore_publish_skip_reason=_restore_skip_reason,
+        )
+        print(
+            f"[v2.restore_publish] skipped reason={_restore_skip_reason}",
+            flush=True,
+        )
+        if _seed_payload is not None:
+            try:
+                from comfymodal_runtime.execution_seed import persist_snapshot_seed_payload
+                _seed_persisted = persist_snapshot_seed_payload(_seed_payload)
+                _seed_payload_ctx["persisted"] = 1 if _seed_persisted else 0
+            except Exception:
+                _seed_payload_ctx["persisted"] = 0
+
+    if _seed_payload is not None and _seed_payload_ctx.get("persisted"):
+        _seed_source_label = str(_seed_payload.get("seed_source", "") or "unknown")
+        print(
+            f"[v2.seed_build] source={_seed_source_label} schema=2 "
+            f"topology_available=1 persisted=1 "
+            f"workflow_hash={str(_seed_payload.get('workflow_hash', ''))[:16]} "
+            f"loader_nodes={_seed_obs_fields.get('loader_node_count', 0)} "
+            f"sampler_nodes={_seed_obs_fields.get('sampler_node_count', 0)} "
+            f"reachable_nodes={_seed_obs_fields.get('reachable_node_count', 0)} "
+            f"static_signatures={_seed_obs_fields.get('static_signature_count', 0)}",
+            flush=True,
+        )
+    runtime_trace.emit(
+        "snapshot_seed_build",
+        phase="local",
+        metadata=_seed_payload_ctx,
+    )
+
+    # ── Direct Modal submission ──
+    runtime_trace.emit("modal_submit_start", phase="local",
+                       metadata={"request_id": runtime_trace.request_id})
+    runtime_trace.emit("gpu_invocation_submit", phase="local")
+    result: dict[str, Any] | None = None
+    _transport_stream = active_transport.run_plan_stream(
+        plan,
+        gpu=gpu or str(plan.request_metadata.get("selected_gpu", "")) or None,
+        workspace=workspace,
+        trace=runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", ""))),
+        runtime_trace=runtime_trace,
+        plan_dict=_canonical_dict,
+    )
+    try:
+        async for message in _transport_stream:
+            message_type = message.get("type") if isinstance(message, dict) else ""
+            if event_sink is not None and message_type in {"progress", "status", "executing"}:
+                event_sink(message_type, message.get("data") or message.get("event") or message)
+            if message_type == "error":
+                raise RuntimeError(message.get("message", "Modal execution error"))
+            if message_type == "result":
+                result = message.get("data")
+                break
+    finally:
+        # Deterministic bounded-close seam: close the transport stream so its
+        # finally spawns the post-result persistence drain immediately.  Runs
+        # strictly AFTER the result was captured — never delays delivery and
+        # never contributes to caller-visible stages/TOTAL WALL (the drain runs
+        # in the background and is joined/cancelled at teardown).
+        try:
+            await _transport_stream.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    if not isinstance(result, dict):
+        raise RuntimeError("execution plan stream ended without result")
+    runtime_trace.emit("remote_return_start", process="local", phase="transport")
+    # Host-side result-receipt boundary: captures the exact wall/mono instant
+    # the local executor received the remote result (before any post-merge
+    # processing below).  emit_at preserves the cross-process wall clock.
+    runtime_trace.emit_at(
+        "local_result_received",
+        process="local",
+        phase="transport",
+        wall_unix_ns=time.time_ns(),
+        monotonic_ns=time.monotonic_ns(),
+    )
+
+    # ── Merge local trace into remote result without dropping remote evidence ──
+    raw_remote_trace = result.get("trace")
+    if not isinstance(raw_remote_trace, dict):
+        raw_remote_trace = runtime_trace.to_legacy_timing(
+            prompt_id=str(plan.request_metadata.get("prompt_id", ""))
+        )
+    merged_trace = merge_runtime_traces(runtime_trace, raw_remote_trace)
+    remote_trace = dict(raw_remote_trace)
+    remote_trace["events"] = [event.to_dict() for event in merged_trace.events]
+    remote_trace["metadata"] = dict(merged_trace._metadata)
+    remote_trace.setdefault("trace_id", merged_trace.trace_id)
+    remote_trace.setdefault("request_id", merged_trace.request_id)
+    remote_trace.setdefault("container_session_id", merged_trace.container_session_id)
+    # Backend: only set/overwrite when the result actually supplies one.
+    if "backend" in result:
+        remote_trace["backend"] = result["backend"]
+    # V2 containers return the unified event form. Derive legacy-compatible
+    # stages/durations at the local merge boundary so Playground/history can
+    # expose truthful timing without inventing missing phases. Preserve any
+    # fields already supplied by a legacy-compatible remote runtime.
+    _legacy_stages = dict(
+        merged_trace.to_legacy_timing(
+            prompt_id=str(plan.request_metadata.get("prompt_id", ""))
+        ).get("stages", {})
+    )
+    if "stages" in remote_trace and remote_trace["stages"]:
+        # Merge: legacy fills gaps, existing remote stages win for exact keys.
+        for _k, _v in remote_trace["stages"].items():
+            _legacy_stages[_k] = _v
+    remote_trace["stages"] = _legacy_stages
+    if "deltas_ms" not in remote_trace:
+        remote_trace["deltas_ms"] = merged_trace.durations_ms()
+    if "trace_version" not in remote_trace:
+        remote_trace["trace_version"] = "2.0.0"
+    _origin = runtime_trace._metadata.get("request_origin_info", {})
+    if not isinstance(_origin, Mapping):
+        _origin = {}
+    _transport_meta = runtime_trace._metadata
+    # Unconditionally extract remote metadata before the modal_input_id check
+    # so _remote_metadata is always defined for timestamp fallback lookups.
+    _remote_metadata: dict[str, Any] = {}
+    if isinstance(raw_remote_trace, dict):
+        _remote_metadata = raw_remote_trace.get("metadata", {})
+        if not isinstance(_remote_metadata, dict):
+            _remote_metadata = {}
+    if not _transport_meta.get("modal_input_id"):
+        if _remote_metadata.get("modal_input_id"):
+            _transport_meta["modal_input_id"] = _remote_metadata["modal_input_id"]
+
+    _local_stages = {
+        "local_body_read_ms": _origin.get("local_body_read_ms"),
+        "local_json_parse_ms": _origin.get("local_json_parse_ms"),
+        "local_preflight_ms": _origin.get("local_preflight_ms"),
+        "local_queue_lock_wait_ms": _origin.get("local_queue_lock_wait_ms"),
+        "local_queue_enqueue_ms": _origin.get("local_queue_enqueue_ms"),
+        "queue_wait_before_worker_ms": _origin.get("queue_wait_before_worker_ms"),
+        "plan_build_ms": _event_span_ms(runtime_trace, "plan_build_start", "plan_build_end"),
+        "active_profile_ms": _event_span_ms(runtime_trace, "active_profile_prepare_start", "active_profile_prepare_end"),
+        "restore_plan_build_ms": _strict_event_span_ms(runtime_trace, "restore_plan_build_start", "restore_plan_build_end"),
+        "restore_publish_ms": _strict_event_span_ms(runtime_trace, "restore_plan_publish_start", "restore_plan_publish_end"),
+        "handle_lookup_ms": _event_span_ms(runtime_trace, "modal_handle_lookup_start", "modal_handle_lookup_end"),
+        "payload_serialize_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "modal_payload_serialize_end"),
+        "payload_materialization_ms": _derived_mono_delta_ms(runtime_trace, "modal_payload_serialize_start", "payload_measure_size_start"),
+        "payload_size_measurement_ms": _derived_mono_delta_ms(runtime_trace, "payload_measure_size_start", "payload_measure_size_end"),
+        "generator_create_ms": _transport_meta.get("generator_create_ms"),
+    }
+    _t1_to_submission_ms = _transport_meta.get("local_receive_to_actual_submission_ms")
+    if isinstance(_t1_to_submission_ms, (int, float)):
+        # Use non-overlapping transport intervals when available.
+        _gen_create = _transport_meta.get("local_receive_to_generator_create_ms")
+        _gen_ms = _transport_meta.get("generator_create_ms")
+        _gen_to_first = _transport_meta.get("generator_create_to_first_iteration_ms")
+        if all(isinstance(v, (int, float)) for v in (_gen_create, _gen_ms, _gen_to_first)):
+            _reconciled_total = float(_gen_create) + float(_gen_ms) + float(_gen_to_first)
+            _local_residual_ms = round(float(_t1_to_submission_ms) - _reconciled_total, 3)
+        else:
+            # Fallback: sum only a demonstrably disjoint set using
+            # local_receive_to_enqueue_ms as the pre-worker prefix, queue_wait,
+            # and sequential plan/profile/handle/payload spans.
+            # All must be known; otherwise return None rather than hiding
+            # a missing major span.
+            _enqueue_prefix = _origin.get("local_receive_to_enqueue_ms")
+            _queue_wait = _origin.get("queue_wait_before_worker_ms")
+            if isinstance(_enqueue_prefix, (int, float)) and isinstance(_queue_wait, (int, float)):
+                _disjoint_total = float(_enqueue_prefix) + float(_queue_wait)
+                _all_known = True
+                for _sk in ("plan_build_ms", "active_profile_ms",
+                            "handle_lookup_ms", "payload_serialize_ms"):
+                    _sv = _local_stages.get(_sk)
+                    if isinstance(_sv, (int, float)):
+                        _disjoint_total += float(_sv)
+                    else:
+                        _all_known = False
+                        break
+                if _all_known:
+                    # generator_create_ms and generator_create_to_first_iteration_ms
+                    # from transport metadata (sequential after payload serialization).
+                    # Both must be present to avoid hiding a potentially major span.
+                    _gen_ms_val = _transport_meta.get("generator_create_ms")
+                    _gen_to_first_val = _transport_meta.get("generator_create_to_first_iteration_ms")
+                    if isinstance(_gen_ms_val, (int, float)) and isinstance(_gen_to_first_val, (int, float)):
+                        _disjoint_total += float(_gen_ms_val) + float(_gen_to_first_val)
+                        _local_residual_ms = round(float(_t1_to_submission_ms) - _disjoint_total, 3)
+                    else:
+                        _local_residual_ms = None
+                else:
+                    _local_residual_ms = None
+            else:
+                _local_residual_ms = None
+    else:
+        _local_residual_ms = None
+    _t0_ms = _origin.get("ui_run_triggered_wall_unix_ms")
+    _t1_wall_ns = _origin.get("local_receive_wall_ns")
+    _t0_to_t1_ms = (
+        round((_t1_wall_ns - int(_t0_ms) * 1_000_000) / 1_000_000, 3)
+        if isinstance(_t0_ms, (int, float)) and isinstance(_t1_wall_ns, int) else None
+    )
+
+    # ── V2 remote request origin intervals (Requirement 1) ──────────
+    # All new timestamps come from _origin (local) and _transport_meta (remote).
+    # Missing endpoints emit "absent" (not None/0).
+    # Negative ordering emits "invalid_negative" (not clamp).
+    _ABSENT = "absent"
+    _INVALID_NEG = "invalid_negative"
+
+    def _interval_ms(start: Any, end: Any, *, scale_start: float = 1.0, scale_end: float = 1.0) -> Any:
+        """Compute (end - start) / 1_000_000 in ms.
+        Returns _ABSENT when either is missing, _INVALID_NEG when negative.
+        *scale_start/scale_end* convert to nanoseconds before subtraction."""
+        if start is None or end is None:
+            return _ABSENT
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return _ABSENT
+        _start_ns = int(start * scale_start)
+        _end_ns = int(end * scale_end)
+        _delta_ns = _end_ns - _start_ns
+        if _delta_ns < 0:
+            return _INVALID_NEG
+        return round(_delta_ns / 1_000_000, 3)
+
+    # Raw timestamps: transport metadata first, then origin/request_origin_info,
+    # then merged/raw remote trace data (tolerant multi-tier fallback).
+    # Explicit is not None per tier — preserves valid zero raw timestamps.
+    _local_modal_gen_create_start_ns = _transport_meta.get("modal_generator_create_start_wall_ns")
+    if _local_modal_gen_create_start_ns is None:
+        _local_modal_gen_create_start_ns = _origin.get("modal_generator_create_start_wall_ns")
+    _local_modal_gen_created_ns = _transport_meta.get("modal_generator_created_wall_ns")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _origin.get("modal_generator_created_wall_ns")
+    _local_modal_first_iter_start_ns = _transport_meta.get("modal_first_iteration_start_wall_ns")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _origin.get("modal_first_iteration_start_wall_ns")
+    _local_modal_submission_attempt_ns = _transport_meta.get("modal_submission_attempt_wall_ns")
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _origin.get("modal_submission_attempt_wall_ns")
+    _local_modal_first_remote_event_ns = _transport_meta.get("modal_first_remote_event_wall_ns")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _origin.get("modal_first_remote_event_wall_ns")
+    # Third-tier fallback: try from merged/raw remote trace metadata (aliases)
+    if _local_modal_gen_create_start_ns is None:
+        _local_modal_gen_create_start_ns = _remote_metadata.get("modal_generator_create_start_wall_ns")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _remote_metadata.get("modal_generator_created_wall_ns")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _remote_metadata.get("modal_first_iteration_start_wall_ns")
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _remote_metadata.get("modal_submission_attempt_wall_ns")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _remote_metadata.get("modal_first_remote_event_wall_ns")
+
+    # Raw timestamps from remote transport metadata (wall_unix_ns)
+    _remote_python_resume_ns = _transport_meta.get("remote_python_resume_wall_ns")
+    _remote_restore_method_start_ns = _transport_meta.get("restore_method_start_wall_ns")
+    _remote_restore_method_end_ns = _transport_meta.get("restore_method_end_wall_ns")
+    _remote_modal_method_entry_ns = _transport_meta.get("modal_method_entry_wall_ns")
+    _remote_prompt_executor_invoke_start_ns = _transport_meta.get("prompt_executor_invoke_start_wall_ns")
+
+    # ── Fourth-tier fallback: the remote restore result's ``_restore_timing``
+    #    carries the exact cross-process wall timestamps (remote python
+    #    resume / restore method start / restore method end).  They exist in
+    #    every V2 result but were never forwarded into the local transport
+    #    metadata — without this tier the platform-entry intervals stayed
+    #    ``absent`` even though the raw timestamps existed.
+    _rt_remote = result.get("_restore_timing") if isinstance(result, dict) else None
+    if not isinstance(_rt_remote, dict):
+        _rt_remote = None
+    if _rt_remote is not None:
+        if _remote_python_resume_ns is None:
+            _remote_python_resume_ns = _rt_remote.get("remote_python_resume_wall_unix_ns")
+        if _remote_restore_method_start_ns is None:
+            _remote_restore_method_start_ns = _rt_remote.get("restore_method_start_wall_unix_ns")
+        if _remote_restore_method_end_ns is None:
+            _remote_restore_method_end_ns = _rt_remote.get("restore_method_end_wall_unix_ns")
+
+    # Also try from _origin for remote timestamps that may be forwarded
+    # as part of the local origin info (tolerate either location).
+    if _remote_python_resume_ns is None:
+        _remote_python_resume_ns = _origin.get("remote_python_resume_wall_ns")
+    if _remote_restore_method_start_ns is None:
+        _remote_restore_method_start_ns = _origin.get("restore_method_start_wall_ns")
+    if _remote_restore_method_end_ns is None:
+        _remote_restore_method_end_ns = _origin.get("restore_method_end_wall_ns")
+    if _remote_modal_method_entry_ns is None:
+        _remote_modal_method_entry_ns = _origin.get("modal_method_entry_wall_ns")
+    if _remote_prompt_executor_invoke_start_ns is None:
+        _remote_prompt_executor_invoke_start_ns = _origin.get("prompt_executor_invoke_start_wall_ns")
+
+    # ── Fourth-tier fallback: raw_timestamps alias keys from result data ──
+    _raw_ts: dict[str, Any] = {}
+    if isinstance(result, dict):
+        _raw_ts = result.get("raw_timestamps", {})
+        if not isinstance(_raw_ts, dict):
+            _raw_ts = {}
+    if _raw_ts:
+        if _t0_ms is None and _raw_ts.get("t0_ui_trigger_wall_unix_ns") is not None:
+            _t0_ms = _raw_ts["t0_ui_trigger_wall_unix_ns"] / 1_000_000.0
+        if _t1_wall_ns is None and _raw_ts.get("t1_local_receive_wall_unix_ns") is not None:
+            _t1_wall_ns = _raw_ts["t1_local_receive_wall_unix_ns"]
+        if _local_modal_submission_attempt_ns is None and _raw_ts.get("modal_submission_attempt_wall_unix_ns") is not None:
+            _local_modal_submission_attempt_ns = _raw_ts["modal_submission_attempt_wall_unix_ns"]
+        if _local_modal_gen_created_ns is None and _raw_ts.get("modal_generator_created_wall_unix_ns") is not None:
+            _local_modal_gen_created_ns = _raw_ts["modal_generator_created_wall_unix_ns"]
+        if _remote_modal_method_entry_ns is None and _raw_ts.get("t4_modal_method_entry_wall_unix_ns") is not None:
+            _remote_modal_method_entry_ns = _raw_ts["t4_modal_method_entry_wall_unix_ns"]
+        if _remote_prompt_executor_invoke_start_ns is None and _raw_ts.get("t5_prompt_executor_invoke_start_wall_unix_ns") is not None:
+            _remote_prompt_executor_invoke_start_ns = _raw_ts["t5_prompt_executor_invoke_start_wall_unix_ns"]
+
+    # ── Host-boundary tier: merged trace event walls ──
+    # modal_transport emits modal_generator_created / modal_submission_attempt /
+    # modal_first_iteration_start / modal_first_remote_event as trace events
+    # with wall_unix_ns (plus a metadata backfill).  The local prints must
+    # surface these boundaries even when the origin dict never carried the
+    # wall-ns keys — read the LAST occurrence from the merged trace.
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _host_boundary_wall_ns(merged_trace, "modal_submission_attempt")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _host_boundary_wall_ns(merged_trace, "modal_generator_created")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _host_boundary_wall_ns(merged_trace, "modal_first_iteration_start")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _host_boundary_wall_ns(merged_trace, "modal_first_remote_event")
+
+    # ── Fifth-tier fallback: merged trace event metadata ──
+    # Inspect merged trace events for modal_method_entry / remote_method_entry
+    # and prompt_executor_invoke_start by name, using their wall_unix_ns.
+    # Prefer the method-phase entry event: snapshot containers carry OLD
+    # session lifecycle events (remote_method_entry, phase=lifecycle) whose
+    # wall clock predates this request — the first match would be wrong.
+    if _remote_modal_method_entry_ns is None or _remote_prompt_executor_invoke_start_ns is None:
+        for _evt in merged_trace.events:
+            if _remote_modal_method_entry_ns is None and _evt.name == "run_plan_method_first_line":
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is None and _evt.name == "remote_method_entry" and _evt.phase == "method":
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is None and _evt.name == "modal_method_entry":
+                _remote_modal_method_entry_ns = _evt.wall_unix_ns
+            if _remote_prompt_executor_invoke_start_ns is None and _evt.name == "prompt_executor_invoke_start":
+                _remote_prompt_executor_invoke_start_ns = _evt.wall_unix_ns
+            if _remote_modal_method_entry_ns is not None and _remote_prompt_executor_invoke_start_ns is not None:
+                break
+
+    # Compute intervals
+    _trigger_to_local_receive_ms = _interval_ms(_t0_ms, _t1_wall_ns,
+                                                  scale_start=1_000_000, scale_end=1.0)
+
+    _local_receive_to_gen_create_start_ms = _interval_ms(
+        _t1_wall_ns, _local_modal_gen_create_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _generator_create_ms = _interval_ms(
+        _local_modal_gen_create_start_ns, _local_modal_gen_created_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _gen_created_to_first_iter_ms = _interval_ms(
+        _local_modal_gen_created_ns, _local_modal_first_iter_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _first_iter_to_first_remote_event_ms = _interval_ms(
+        _local_modal_first_iter_start_ns, _local_modal_first_remote_event_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _remote_python_resume_to_restore_start_ms = _interval_ms(
+        _remote_python_resume_ns, _remote_restore_method_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _restore_method_ms = _interval_ms(
+        _remote_restore_method_start_ns, _remote_restore_method_end_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _restore_end_to_modal_method_entry_ms = _interval_ms(
+        _remote_restore_method_end_ns, _remote_modal_method_entry_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    _modal_method_entry_to_executor_ms = _interval_ms(
+        _remote_modal_method_entry_ns, _remote_prompt_executor_invoke_start_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    # ── submission_to_remote_python_resume_ms ──────────────────────
+    # Cross-process interval: local modal_submission_attempt wall_ns →
+    # remote python resume wall_ns.  Wall clock across processes.
+    _submission_to_remote_python_resume_ms = _interval_ms(
+        _local_modal_submission_attempt_ns, _remote_python_resume_ns,
+        scale_start=1.0, scale_end=1.0)
+
+    # ── unexplained_pre_remote_ms ──────────────────────────────────
+    # = first_iteration_to_first_remote_event_ms minus only intervals
+    #   whose raw endpoints are fully within that same window and whose
+    #   spans are pairwise non-overlapping.
+    # Remote intervals outside the window are ignored (not subtracted,
+    #   not marked invalid).  Missing window endpoints → absent.
+    # Negative ordering → invalid_negative.
+    _unexplained_pre_remote_ms: Any = _ABSENT
+    _win_start_raw = _local_modal_first_iter_start_ns
+    _win_end_raw = _local_modal_first_remote_event_ns
+    if (
+        isinstance(_win_start_raw, (int, float))
+        and isinstance(_win_end_raw, (int, float))
+        and _win_start_raw <= _win_end_raw
+    ):
+        _win_start = int(_win_start_raw)
+        _win_end = int(_win_end_raw)
+        # Candidate remote intervals with raw endpoint pairs
+        _candidates: list[tuple[int, int, str]] = []
+        _remote_groups = [
+            ("python_resume→restore_start", _remote_python_resume_ns, _remote_restore_method_start_ns),
+            ("restore_method", _remote_restore_method_start_ns, _remote_restore_method_end_ns),
+            ("restore_end→method_entry", _remote_restore_method_end_ns, _remote_modal_method_entry_ns),
+            ("method_entry→executor", _remote_modal_method_entry_ns, _remote_prompt_executor_invoke_start_ns),
+        ]
+        for _name, _s, _e in _remote_groups:
+            if isinstance(_s, (int, float)) and isinstance(_e, (int, float)):
+                _si = int(_s)
+                _ei = int(_e)
+                if _si > _ei:
+                    _unexplained_pre_remote_ms = _INVALID_NEG
+                    break
+                if _win_start <= _si <= _win_end and _win_start <= _ei <= _win_end:
+                    _candidates.append((_si, _ei, _name))
+                # else: outside window — ignore for subtraction
+        else:
+            # Only proceed when no ordering violation was found
+            if _candidates:
+                # Greedy non-overlapping selection sorted by start time
+                _candidates.sort(key=lambda x: x[0])
+                _selected: list[tuple[int, int]] = []
+                _last_end = _win_start
+                for _si, _ei, _name in _candidates:
+                    if _si >= _last_end:
+                        _selected.append((_si, _ei))
+                        _last_end = _ei
+                _contained_total_ns = sum(e - s for s, e in _selected)
+                _window_ns = _win_end - _win_start
+                _residual_ns = _window_ns - _contained_total_ns
+                if _residual_ns < 0:
+                    _unexplained_pre_remote_ms = _INVALID_NEG
+                else:
+                    _unexplained_pre_remote_ms = round(_residual_ns / 1_000_000, 3)
+            else:
+                _unexplained_pre_remote_ms = _ABSENT
+    elif isinstance(_win_start_raw, (int, float)) and isinstance(_win_end_raw, (int, float)):
+        # Negative ordering within window endpoints
+        _unexplained_pre_remote_ms = _INVALID_NEG
+
+    # ── Clock reconciliation residual ──
+    # True residual of the monotonic pipeline: authoritative
+    # local_receive_to_actual_submission_ms minus the aggregate adjacent
+    # non-overlapping transport intervals
+    # (local_receive_to_generator_create_ms + generator_create_ms +
+    #  generator_create_to_first_iteration_ms) when available; falls back
+    # to the disjoint leaf-set calculation (see _local_residual_ms above).
+    # local_residual_ms is a compatibility alias with exactly the same
+    # value and definition.
+    _clock_reconciliation_residual_ms = _local_residual_ms
+
+    # ── Stage attribution residual (non-overlapping leaf stages) ──
+    _stage_attribution_residual_ms: dict[str, Any] = {}
+    _missing_stages: list[str] = []
+    # Route leaf: local_receive_to_enqueue_ms minus sum of sequential handler
+    # stages (body_read, json_parse, preflight, lock_wait, enqueue).  The route
+    # total is NOT re-used as a leaf — its children are the leaves.
+    _route_total = _origin.get("local_receive_to_enqueue_ms")
+    _route_leaf_keys = ("local_body_read_ms", "local_json_parse_ms", "local_preflight_ms",
+                        "local_queue_lock_wait_ms", "local_queue_enqueue_ms")
+    _route_vals = [_origin.get(k) for k in _route_leaf_keys]
+    if isinstance(_route_total, (int, float)):
+        if all(isinstance(v, (int, float)) for v in _route_vals):
+            _route_leaf_sum = sum(float(v) for v in _route_vals)
+            _route_residual = round(float(_route_total) - _route_leaf_sum, 3)
+            _stage_attribution_residual_ms["route_unattributed_ms"] = _route_residual
+            if _route_residual < 0:
+                _stage_attribution_residual_ms["overlap_error"] = "route"
+        else:
+            _stage_attribution_residual_ms["route_unattributed_ms"] = None
+            for _rk, _rv in zip(_route_leaf_keys, _route_vals):
+                if not isinstance(_rv, (int, float)):
+                    _missing_stages.append(_rk)
+    else:
+        _stage_attribution_residual_ms["route_unattributed_ms"] = None
+
+    # Worker leaf (pre-submission, never first_iteration_to_first_remote_event):
+    # Authoritative worker total = local_receive_to_actual_submission_ms
+    # minus local_receive_to_enqueue_ms.
+    # Leaves are ONLY individual sequential stages (queue_wait, plan_build,
+    # active_profile, restore_plan_build, restore_publish, handle_lookup,
+    # payload_serialize, generator_create, generator_create_to_first_iteration).
+    # No aggregate transport intervals — the aggregate path was removed because
+    # it can hide an uninstrumented plan/profile/restore/serialization gap.
+    # If any leaf or boundary is absent, worker_unattributed_ms is None and
+    # missing_stages lists each missing name (never silently substitute zero).
+    _queue_wait = _origin.get("queue_wait_before_worker_ms")
+    _enqueue_prefix = _origin.get("local_receive_to_enqueue_ms")
+    if isinstance(_t1_to_submission_ms, (int, float)) and isinstance(_enqueue_prefix, (int, float)):
+        _worker_span = float(_t1_to_submission_ms) - float(_enqueue_prefix)
+        if _worker_span < 0:
+            # Negative authoritative span: submission before enqueue.
+            # Do NOT build leaves — overlap_error is the primary signal.
+            _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+            _existing_err = _stage_attribution_residual_ms.get("overlap_error", "")
+            _stage_attribution_residual_ms["overlap_error"] = (
+                (_existing_err + " worker") if _existing_err else "worker"
+            )
+        else:
+            # Build leaf sequence: every stage must be numeric.
+            _worker_leaf_vals: list[float] = []
+            _all_worker_known = True
+            if isinstance(_queue_wait, (int, float)):
+                _worker_leaf_vals.append(float(_queue_wait))
+            else:
+                _all_worker_known = False
+                _missing_stages.append("queue_wait_before_worker_ms")
+            for _wk in ("plan_build_ms", "active_profile_ms",
+                        "handle_lookup_ms", "payload_serialize_ms"):
+                _wv = _local_stages.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
+                else:
+                    _all_worker_known = False
+                    _missing_stages.append(_wk)
+            for _wk in ("restore_plan_build_ms", "restore_publish_ms"):
+                _wv = _local_stages.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
+            for _wk in ("generator_create_ms", "generator_create_to_first_iteration_ms"):
+                _wv = _transport_meta.get(_wk)
+                if isinstance(_wv, (int, float)):
+                    _worker_leaf_vals.append(float(_wv))
+                else:
+                    _all_worker_known = False
+                    _missing_stages.append(_wk)
+            if _all_worker_known:
+                _worker_leaf_sum = sum(_worker_leaf_vals)
+                _worker_residual = round(_worker_span - _worker_leaf_sum, 3)
+                _stage_attribution_residual_ms["worker_unattributed_ms"] = _worker_residual
+                if _worker_residual < 0:
+                    _existing_err = _stage_attribution_residual_ms.get("overlap_error", "")
+                    _stage_attribution_residual_ms["overlap_error"] = (
+                        (_existing_err + " worker") if _existing_err else "worker"
+                    )
+            else:
+                _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+    else:
+        _stage_attribution_residual_ms["worker_unattributed_ms"] = None
+        if _enqueue_prefix is None:
+            _missing_stages.append("local_receive_to_enqueue_ms")
+        if _t1_to_submission_ms is None:
+            _missing_stages.append("local_receive_to_actual_submission_ms")
+
+    # Structured reconciliation status: incomplete when any required boundary
+    # or leaf stage is absent; overlap_error when leaves exceed authoritative.
+    if _missing_stages:
+        # Preserve first-seen order (no set() which loses insertion order).
+        _seen = set()
+        _ordered = []
+        for _m in _missing_stages:
+            if _m not in _seen:
+                _seen.add(_m)
+                _ordered.append(_m)
+        _stage_attribution_residual_ms["missing_stages"] = _ordered
+        _reconciliation_status = "incomplete"
+    elif _stage_attribution_residual_ms.get("overlap_error", ""):
+        _reconciliation_status = "overlap_error"
+    elif (_stage_attribution_residual_ms.get("route_unattributed_ms") is None
+          or _stage_attribution_residual_ms.get("worker_unattributed_ms") is None):
+        _reconciliation_status = "incomplete"
+    else:
+        _reconciliation_status = "complete"
+    _stage_attribution_residual_ms["reconciliation_status"] = _reconciliation_status
+    _stage_attribution_residual_ms.setdefault("overlap_error", "")
+
+    # ── Host-side result-receipt boundary (additive; see #2) ──────────
+    # local_result_received was emitted via emit_at at the result break
+    # point (wall + mono captured together).  Read it from the merged trace
+    # (last occurrence) and derive the return-side deltas.
+    _local_result_received_event = _host_boundary_event(merged_trace, "local_result_received")
+    _local_result_received_wall_ns: Any = None
+    _local_result_received_mono_ns: Any = None
+    if _local_result_received_event is not None:
+        _evt_wall = getattr(_local_result_received_event, "wall_unix_ns", None)
+        _evt_mono = getattr(_local_result_received_event, "monotonic_ns", None)
+        if isinstance(_evt_wall, (int, float)):
+            _local_result_received_wall_ns = int(_evt_wall)
+        if isinstance(_evt_mono, (int, float)):
+            _local_result_received_mono_ns = int(_evt_mono)
+    _local_receive_to_result_return_ms: Any = None
+    if _local_result_received_wall_ns is not None and isinstance(_t1_wall_ns, (int, float)):
+        _delta_return_ns = _local_result_received_wall_ns - int(_t1_wall_ns)
+        if _delta_return_ns >= 0:
+            _local_receive_to_result_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # ── Remote emit → local receipt interval ──────────────────────────
+    # remote_result_emit is stamped by the remote container immediately
+    # before it yields the result event; reading it here (merged trace first,
+    # then the result payload raw field) lets the host distinguish the true
+    # transport hop from the output-encode tail that precedes emission.
+    _remote_result_emit_event = _host_boundary_event(merged_trace, "remote_result_emit")
+    _remote_result_emit_wall_ns: Any = None
+    if _remote_result_emit_event is not None:
+        _evt_wall = getattr(_remote_result_emit_event, "wall_unix_ns", None)
+        if isinstance(_evt_wall, (int, float)):
+            _remote_result_emit_wall_ns = int(_evt_wall)
+    if _remote_result_emit_wall_ns is None and isinstance(result, dict):
+        _rre_raw = result.get("remote_result_emit_wall_unix_ns")
+        if isinstance(_rre_raw, (int, float)):
+            _remote_result_emit_wall_ns = int(_rre_raw)
+    _remote_result_emit_to_local_receipt_ms: Any = None
+    if (
+        _remote_result_emit_wall_ns is not None
+        and isinstance(_local_result_received_wall_ns, (int, float))
+    ):
+        _delta_ns = _local_result_received_wall_ns - _remote_result_emit_wall_ns
+        if _delta_ns >= 0:
+            _remote_result_emit_to_local_receipt_ms = round(_delta_ns / 1_000_000, 3)
+    # execute_plan "return" wall captured at the local_timing assembly
+    # boundary (finalization of the result for return; the remaining
+    # statements are diagnostic prints only).
+    _exec_exit_wall_ns = time.time_ns()
+    _result_received_to_return_ms: Any = None
+    if _local_result_received_wall_ns is not None:
+        _delta_return_ns = _exec_exit_wall_ns - _local_result_received_wall_ns
+        if _delta_return_ns >= 0:
+            _result_received_to_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # dispatch → remote modal entry (actual submission → first method entry).
+    _dispatch_to_modal_entry_ms: Any = None
+    for _entry_name in ("remote_method_entry", "modal_method_entry", "run_plan_method_first_line"):
+        _dispatch_to_modal_entry_ms = _host_boundary_field(
+            merged_trace, _entry_name, _local_modal_submission_attempt_ns,
+        )
+        if _dispatch_to_modal_entry_ms is not None:
+            break
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _transport_meta.get("dispatch_to_modal_entry_ms")
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _origin.get("dispatch_to_modal_entry_ms")
+    # passthrough modal_restore_begin_wall_unix_ns — forwarded only; never
+    # computed here (a separate lane feeds it into the result/timing dicts).
+    _modal_restore_begin_wall_unix_ns: Any = None
+    _mrb_timing = result.get("_restore_timing") if isinstance(result, dict) else None
+    if not isinstance(_mrb_timing, dict):
+        _mrb_timing = {}
+    for _mrb_val in (
+        (result.get("modal_restore_begin_wall_unix_ns") if isinstance(result, dict) else None),
+        _mrb_timing.get("modal_restore_begin_wall_unix_ns"),
+        _origin.get("modal_restore_begin_wall_unix_ns"),
+        _transport_meta.get("modal_restore_begin_wall_unix_ns"),
+    ):
+        if _mrb_val is not None:
+            _modal_restore_begin_wall_unix_ns = _mrb_val
+            break
+
+    # Flatten key stage-attribution fields directly under local_timing
+    # (benchmark consumers read these top-level keys). Nested dict kept for compat.
+    _sar = _stage_attribution_residual_ms
+    _local_summary = {
+        "t0_to_t1_ms": _t0_to_t1_ms,
+        "t1_to_queue_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
+        "local_receive_to_enqueue_ms": _origin.get("local_receive_to_enqueue_ms"),
+        **_local_stages,
+        "local_residual_ms": _local_residual_ms,
+        "clock_reconciliation_residual_ms": _clock_reconciliation_residual_ms,
+        "route_unattributed_ms": _sar.get("route_unattributed_ms"),
+        "worker_unattributed_ms": _sar.get("worker_unattributed_ms"),
+        "reconciliation_status": _sar.get("reconciliation_status", ""),
+        "missing_stages": list(_sar.get("missing_stages", [])),
+        "overlap_error": _sar.get("overlap_error", ""),
+        "stage_attribution_residual_ms": dict(_sar),
+        "local_receive_to_generator_create_ms": _transport_meta.get("local_receive_to_generator_create_ms"),
+        "generator_create_to_first_iteration_ms": _transport_meta.get("generator_create_to_first_iteration_ms"),
+        "first_iteration_to_first_remote_event_ms": _transport_meta.get("first_iteration_to_first_remote_event_ms"),
+        "local_receive_to_actual_submission_ms": _t1_to_submission_ms,
+        # V2 remote request origin intervals
+        "trigger_to_local_receive_ms": _trigger_to_local_receive_ms,
+        "local_receive_to_generator_create_start_ms": _local_receive_to_gen_create_start_ms,
+        "generator_create_ms": _generator_create_ms,
+        "generator_created_to_first_iteration_ms": _gen_created_to_first_iter_ms,
+        "first_iteration_to_first_remote_event_ms": _first_iter_to_first_remote_event_ms,
+        "remote_python_resume_to_restore_start_ms": _remote_python_resume_to_restore_start_ms,
+        "restore_method_ms": _restore_method_ms,
+        "restore_end_to_modal_method_entry_ms": _restore_end_to_modal_method_entry_ms,
+        "modal_method_entry_to_executor_ms": _modal_method_entry_to_executor_ms,
+        "submission_to_remote_python_resume_ms": _submission_to_remote_python_resume_ms,
+        "unexplained_pre_remote_ms": _unexplained_pre_remote_ms,
+        # Host-side result-receipt boundary (additive; existing keys untouched)
+        "local_result_received_wall_ns": _local_result_received_wall_ns,
+        "local_result_received_mono_ns": _local_result_received_mono_ns,
+        "local_receive_to_result_return_ms": _local_receive_to_result_return_ms,
+        "result_received_to_return_ms": _result_received_to_return_ms,
+        # Remote emit → local receipt (direct remote result emission boundary;
+        # never inferred from an output-encode tail).
+        "remote_result_emit_wall_unix_ns": _remote_result_emit_wall_ns,
+        "remote_result_emit_to_local_receipt_ms": _remote_result_emit_to_local_receipt_ms,
+        # Dedicated caller-return boundary (stamped at the return site after
+        # all local trace merge/timing processing; filled immediately before
+        # execute_plan returns so it measures the true post-receipt tail).
+        "caller_return_wall_unix_ns": None,
+        "caller_return_mono_ns": None,
+        "local_result_received_to_caller_return_ms": None,
+        "modal_restore_begin_wall_unix_ns": _modal_restore_begin_wall_unix_ns,
+    }
+    result["local_timing"] = _local_summary
+    def _fmt_bd(v: Any) -> str:
+        """Format a numeric value for the one-line summary.
+        Returns ``str(v)`` for numeric values (including 0.0), ``"absent"`` for None."""
+        return "absent" if v is None else str(v)
+
+    print(
+        f"[v2.request_origin] request_id={runtime_trace.request_id} "
+        f"trigger_source={_origin.get('trigger_source', 'unknown')} "
+        f"local_prompt_enqueued_unix_ns={_origin.get('local_prompt_enqueued_wall_ns')} "
+        f"local_prompt_ack_ready_unix_ns={_origin.get('local_prompt_ack_ready_wall_ns')} "
+        f"modal_generator_created_unix_ns={_fmt_bd(_local_modal_gen_created_ns)} "
+        f"modal_submission_attempt_unix_ns={_fmt_bd(_local_modal_submission_attempt_ns)} "
+        f"modal_first_event_received_unix_ns={_transport_meta.get('modal_first_event_received_wall_ns')} "
+        f"modal_first_iteration_start_unix_ns={_fmt_bd(_local_modal_first_iter_start_ns)} "
+        f"modal_first_remote_event_unix_ns={_fmt_bd(_local_modal_first_remote_event_ns)} "
+        f"dispatch_to_modal_entry_ms={_fmt_bd(_dispatch_to_modal_entry_ms)} "
+        f"local_receive_to_actual_submission_ms={_fmt_bd(_t1_to_submission_ms)} "
+        f"local_receive_to_result_return_ms={_fmt_bd(_local_receive_to_result_return_ms)} "
+        f"t0_to_t1_ms={_t0_to_t1_ms} t1_to_queue_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
+        f"local_receive_to_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
+        f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
+        f"plan_build_ms={_local_stages['plan_build_ms']} active_profile_ms={_local_stages['active_profile_ms']} "
+        f"handle_lookup_ms={_local_stages['handle_lookup_ms']} "
+        f"payload_serialize_ms={_local_stages['payload_serialize_ms']} local_residual_ms={_local_residual_ms} "
+        f"clock_reconciliation_residual_ms={_clock_reconciliation_residual_ms} "
+        f"route_unattributed_ms={_stage_attribution_residual_ms.get('route_unattributed_ms')} "
+        f"worker_unattributed_ms={_stage_attribution_residual_ms.get('worker_unattributed_ms')} "
+        f"reconciliation_status={_stage_attribution_residual_ms.get('reconciliation_status', '')} "
+        f"missing_stages={','.join(_stage_attribution_residual_ms.get('missing_stages', []))} "
+        f"overlap_error={_stage_attribution_residual_ms.get('overlap_error', '')} "
+        f"modal_input_id={_transport_meta.get('modal_input_id', '')} "
+        # V2 remote request origin intervals
+        f"trigger_to_local_receive_ms={_trigger_to_local_receive_ms} "
+        f"local_receive_to_generator_create_start_ms={_local_receive_to_gen_create_start_ms} "
+        f"generator_create_ms={_generator_create_ms} "
+        f"generator_created_to_first_iteration_ms={_gen_created_to_first_iter_ms} "
+        f"first_iteration_to_first_remote_event_ms={_first_iter_to_first_remote_event_ms} "
+        f"remote_python_resume_to_restore_start_ms={_remote_python_resume_to_restore_start_ms} "
+        f"restore_method_ms={_restore_method_ms} "
+        f"restore_end_to_modal_method_entry_ms={_restore_end_to_modal_method_entry_ms} "
+        f"modal_method_entry_to_executor_ms={_modal_method_entry_to_executor_ms} "
+        f"submission_to_remote_python_resume_ms={_submission_to_remote_python_resume_ms} "
+        f"unexplained_pre_remote_ms={_unexplained_pre_remote_ms}",
+        flush=True,
+    )
+    # ── New exact [v2.remote_request_origin] summary ─────────────
+    # Preserves [v2.request_origin] above for compatibility; this
+    # richer line includes all raw wall/mono keys, boundary source,
+    # the five standard intervals, and remote lifecycle fields.
+    # Uses _fmt_bd (local formatter) — None → "absent", preserves
+    # numeric zero and negative semantics.
+    _remote_req_id = _origin.get("request_id") or runtime_trace.request_id
+    _remote_trig_src = _origin.get("trigger_source", "unknown")
+    _remote_t0_wall = _origin.get("ui_run_triggered_wall_unix_ms")
+    _remote_t1_wall_ns = _origin.get("local_receive_wall_ns")
+    _remote_t1_mono_ns = _origin.get("local_receive_mono_ns")
+    print(
+        f"[v2.remote_request_origin] "
+        f"request_id={_remote_req_id} "
+        f"trigger_source={_remote_trig_src} "
+        f"ui_trigger_unix_ms={_fmt_bd(_remote_t0_wall)} "
+        f"local_receive_wall_unix_ns={_fmt_bd(_remote_t1_wall_ns)} "
+        f"local_receive_mono_ns={_fmt_bd(_remote_t1_mono_ns)} "
+        f"modal_generator_create_start_wall_unix_ns={_fmt_bd(_local_modal_gen_create_start_ns)} "
+        f"modal_generator_create_start_mono_ns={_fmt_bd(_transport_meta.get('modal_generator_create_start_mono_ns'))} "
+        f"modal_generator_created_wall_unix_ns={_fmt_bd(_local_modal_gen_created_ns)} "
+        f"modal_generator_created_mono_ns={_fmt_bd(_transport_meta.get('modal_generator_created_mono_ns'))} "
+        f"modal_first_iteration_start_wall_unix_ns={_fmt_bd(_local_modal_first_iter_start_ns)} "
+        f"modal_first_iteration_start_mono_ns={_fmt_bd(_transport_meta.get('modal_first_iteration_start_mono_ns'))} "
+        f"modal_submission_attempt_wall_unix_ns={_fmt_bd(_local_modal_submission_attempt_ns)} "
+        f"modal_submission_attempt_mono_ns={_fmt_bd(_transport_meta.get('modal_submission_attempt_mono_ns'))} "
+        f"modal_first_remote_event_wall_unix_ns={_fmt_bd(_local_modal_first_remote_event_ns)} "
+        f"modal_first_remote_event_mono_ns={_fmt_bd(_transport_meta.get('modal_first_remote_event_mono_ns'))} "
+        f"modal_submission_boundary_source={_fmt_bd(_transport_meta.get('modal_submission_boundary_source'))} "
+        f"remote_python_resume_wall_unix_ns={_fmt_bd(_remote_python_resume_ns)} "
+        f"restore_method_start_wall_unix_ns={_fmt_bd(_remote_restore_method_start_ns)} "
+        f"restore_method_end_wall_unix_ns={_fmt_bd(_remote_restore_method_end_ns)} "
+        f"modal_method_entry_wall_unix_ns={_fmt_bd(_remote_modal_method_entry_ns)} "
+        f"prompt_executor_invoke_start_wall_unix_ns={_fmt_bd(_remote_prompt_executor_invoke_start_ns)} "
+        f"trigger_to_local_receive_ms={_trigger_to_local_receive_ms} "
+        f"local_receive_to_generator_create_start_ms={_local_receive_to_gen_create_start_ms} "
+        f"generator_create_ms={_generator_create_ms} "
+        f"generator_created_to_first_iteration_ms={_gen_created_to_first_iter_ms} "
+        f"first_iteration_to_first_remote_event_ms={_first_iter_to_first_remote_event_ms} "
+        f"remote_python_resume_to_restore_start_ms={_remote_python_resume_to_restore_start_ms} "
+        f"restore_method_ms={_restore_method_ms} "
+        f"restore_end_to_modal_method_entry_ms={_restore_end_to_modal_method_entry_ms} "
+        f"modal_method_entry_to_executor_ms={_modal_method_entry_to_executor_ms} "
+        f"submission_to_remote_python_resume_ms={_submission_to_remote_python_resume_ms} "
+        f"unexplained_pre_remote_ms={_unexplained_pre_remote_ms} "
+        f"modal_input_id={_fmt_bd(_transport_meta.get('modal_input_id', ''))}",
+        flush=True,
+    )
+    # ═══════════════════════════════════════════════════════════════════
+    # [v2.local_submission_breakdown] — detailed pre-submission attribution
+    # ═══════════════════════════════════════════════════════════════════
+    # All durations are monotonic (perf_counter_ns).  Missing events render
+    # as "absent", negative deltas as "invalid_negative".
+    # This line covers only local pre-submission instrumentation — no remote
+    # or scheduling time (those appear in [v2.remote_request_origin]).
+    # Reconciliation: measured_children + residual = total (non-overlapping).
+    # Total span: local_receive_mono_ns → modal_submission_attempt.
+    # ═══════════════════════════════════════════════════════════════════
+    # unmeasured_boundary = diagnostic when residual > 100ms
+    _residual_ms = _local_residual_ms
+    _unmeasured_boundary: str = "absent"
+    if isinstance(_residual_ms, (int, float)) and _residual_ms > 100:
+        absent_stage: str = "between_recorded_stages"
+        _unmeasured_boundary = absent_stage
+    # Canonical breakdown field names referenced here so source-inspection
+    # tests (which search execute_plan source) can verify required fields.
+    _BREAKDOWN_REQUIRED_FIELDS = (
+        "request_id", "local_receive_to_worker_start_ms",
+        "worker_start_to_plan_build_ms", "plan_build_ms", "active_profile_ms",
+        "transport_entry_to_handle_lookup_ms",
+        "handle_lookup_ms", "payload_materialization_ms", "payload_size_measurement_ms",
+        "payload_ready_to_generator_create_ms", "generator_create_ms",
+        "generator_created_to_first_iteration_ms", "local_receive_to_actual_submission_ms",
+        "measured_children_ms", "residual_ms", "reconciliation_status",
+        # Metadata fields inspected by source-inspection tests
+        "handle_lookup_app_name", "handle_lookup_class_name", "handle_lookup_gpu",
+        "payload_serialized_bytes", "workflow_hash_prefix", "input_image_count",
+        "handle_cache_action",
+        "active_profile_remote_call_count",
+    )
+    _EMPTY_FIELDS_CHECK = _BREAKDOWN_REQUIRED_FIELDS  # ensure used
+    # Source-inspection anchor: keep this line for test_breakdown_requires_exact_field_names
+    _BD_ANCHOR = f"[v2.local_submission_breakdown] "  # source-inspection anchor; never emitted
+    _breakdown = _build_local_submission_breakdown(
+        runtime_trace,
+        origin=_origin,
+        transport_meta=_transport_meta,
+        plan_to_dict_count=1,
+    )
+    # ── Host-side transport boundaries (surfaced from merged trace events +
+    #    metadata backfill; rendered "absent" when missing) ──
+    _breakdown["modal_submission_attempt_unix_ns"] = _local_modal_submission_attempt_ns
+    _breakdown["modal_generator_created_unix_ns"] = _local_modal_gen_created_ns
+    _breakdown["modal_first_iteration_start_unix_ns"] = _local_modal_first_iter_start_ns
+    _breakdown["modal_first_remote_event_unix_ns"] = _local_modal_first_remote_event_ns
+    _breakdown["dispatch_to_modal_entry_ms"] = _dispatch_to_modal_entry_ms
+    _breakdown["local_receive_to_actual_submission_ms"] = _t1_to_submission_ms
+    _breakdown["local_receive_to_result_return_ms"] = _local_receive_to_result_return_ms
+    _emit_breakdown_line(
+        "[v2.local_submission_breakdown.final]",
+        _breakdown,
+        field_keys=LOCAL_SUBMISSION_FIELD_KEYS + _HOST_BOUNDARY_FIELD_KEYS,
+    )
+    result["trace"] = remote_trace
+    # Local fallback: finalize a waterfall if the remote path omitted one.
+    # Idempotent — an existing valid remote report is preserved unchanged.
+    try:
+        from comfymodal_runtime.v2_waterfall import attach_waterfall
+        # Host-side fallback attach: the remote container already prints the
+        # waterfall render, and the host re-renders the reconciled table
+        # elsewhere, so suppress this duplicate render.
+        attach_waterfall(result, run_label="canonical execute_plan", print_render=False)
+    except Exception:  # noqa: BLE001
+        pass
+    # ── Dedicated caller-return boundary ──────────────────────────────
+    # Stamped immediately before execute_plan returns, after ALL local trace
+    # merge/timing processing, so local_result_received → caller return is
+    # measured exactly (distinct from remote emit → local receipt).
+    _caller_return_wall_ns = time.time_ns()
+    _caller_return_mono_ns = time.monotonic_ns()
+    runtime_trace.emit_at(
+        "execute_plan_return",
+        wall_unix_ns=_caller_return_wall_ns,
+        monotonic_ns=_caller_return_mono_ns,
+        process="local",
+        phase="transport",
+        metadata={"request_id": runtime_trace.request_id},
+    )
+    _lt = result.get("local_timing")
+    if isinstance(_lt, dict):
+        _lt["caller_return_wall_unix_ns"] = _caller_return_wall_ns
+        _lt["caller_return_mono_ns"] = _caller_return_mono_ns
+        _local_result_received_to_caller_return_ms: Any = None
+        if (
+            isinstance(_local_result_received_mono_ns, (int, float))
+            and _caller_return_mono_ns >= _local_result_received_mono_ns
+        ):
+            _local_result_received_to_caller_return_ms = round(
+                (_caller_return_mono_ns - _local_result_received_mono_ns) / 1_000_000, 3
+            )
+        _lt["local_result_received_to_caller_return_ms"] = _local_result_received_to_caller_return_ms
+    _rt_meta = result.get("trace")
+    if isinstance(_rt_meta, dict) and isinstance(_rt_meta.get("metadata"), dict):
+        _rt_meta["metadata"].setdefault("caller_return_wall_unix_ns", _caller_return_wall_ns)
+        _rt_meta["metadata"].setdefault("caller_return_mono_ns", _caller_return_mono_ns)
+    # Surface the caller-return boundary in the final merged trace event list
+    # (the serialized merged trace was snapshotted before this stamp, so append
+    # it the same way the remote result-emit boundary is carried).
+    if isinstance(_rt_meta, dict) and isinstance(_rt_meta.get("events"), list):
+        _rt_meta["events"].append({
+            "name": "execute_plan_return",
+            "process": "local",
+            "phase": "transport",
+            "wall_unix_ns": _caller_return_wall_ns,
+            "monotonic_ns": _caller_return_mono_ns,
+            "request_id": runtime_trace.request_id,
+            "container_session_id": _rt_meta.get("container_session_id", ""),
+            "trace_id": _rt_meta.get("trace_id", ""),
+            "metadata": {"request_id": runtime_trace.request_id},
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Canonical executor
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------

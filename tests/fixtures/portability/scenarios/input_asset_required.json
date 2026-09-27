@@ -1,0 +1,43 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §7 raw JSON cannot recreate asset refs",
+    "PHASE_G5 §10 filenames are data"
+  ],
+  "classification": {
+    "asset_reference_only": true,
+    "asset_travels_separately": true,
+    "contains_asset_bytes": false
+  },
+  "description": "LoadImage-like node references fixture_input.png by basename; manifest assets[] carries reference metadata only (no bytes). Graph imports elsewhere but the user asset must travel separately.",
+  "expected": {
+    "issue_codes": [
+      "required_input_asset"
+    ],
+    "risk_level_hint_nonnormative": "medium",
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": true,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/input_asset_required.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "2eda9e2b73b53f2f6a4f50ed6e30192230c1398135a93bfd06eaf7e9c95540c0",
+  "scenario_id": "input_asset_required",
+  "title": "Required user input asset travels separately"
+}

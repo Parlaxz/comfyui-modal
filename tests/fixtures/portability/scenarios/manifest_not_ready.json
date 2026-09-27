@@ -1,0 +1,42 @@
+{
+  "audit_basis": [
+    "PHASE_G5 §3 check_readiness structural",
+    "studio_workflow_manifest.check_readiness"
+  ],
+  "description": "Syntactically valid JSON and a valid v1 manifest whose model ref lacks a sha256, so check_readiness fails. Distinct from malformed JSON (raw/malformed_manifest.txt) and from unknown-root rejection.",
+  "expected": {
+    "issue_codes": [
+      "manifest_not_ready",
+      "model_hash_unpinned"
+    ],
+    "risk_level_hint_nonnormative": "high",
+    "semantic_notes": [
+      "Observed module semantics: a custom_nodes entry lacking repo_url/revision fails full validation, so the only valid-but-not-ready shape is a model without hash."
+    ],
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": false,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/manifest_not_ready.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 1,
+    "ready": false
+  },
+  "manifest_sha256_canonical": "9b11aa518610af0576378fdf684410d072559dc23d0330a0b7b17f14bf31a4b8",
+  "scenario_id": "manifest_not_ready",
+  "title": "Valid manifest failing structural readiness"
+}

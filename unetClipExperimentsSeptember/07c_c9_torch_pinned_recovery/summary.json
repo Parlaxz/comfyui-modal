@@ -1,0 +1,30 @@
+{
+  "campaign": "c9_torch_pinned_recovery",
+  "decision": "STOPPED_AFTER_SMOKE_A_AUDIT_GATE",
+  "workspace": "Testing 7",
+  "environment": "main",
+  "cpu": 12,
+  "memory_mb": 8192,
+  "gpu": "rtx-pro-6000",
+  "torch_pinned_allocation_succeeded": true,
+  "all_smoke_0_worker_buffers_pinned": true,
+  "smoke_a_qd8_c9_total_wall_ms": [
+    2161.54333,
+    2177.490273
+  ],
+  "smoke_a_qd8_physical_read_span_ms": [
+    1883.353444,
+    1950.261862
+  ],
+  "smoke_a_qd8_median_c9_total_wall_ms": 2169.5168015,
+  "smoke_b_qd2_qd4_qd8_walls_ms": null,
+  "qd8_recovered_to_historical_class": false,
+  "beat_approximately_1_6s_unet_class": false,
+  "final_cohort_ran": false,
+  "final_six_run_medians_ms": null,
+  "next_single_ab_difference": "physical source substrate/provider path",
+  "h2d_performed": false,
+  "model_construction_performed": false,
+  "validated_smoke_a_ledger": "smoke_a_validated/ledger.json",
+  "final_report": "FINAL_REPORT.md"
+}

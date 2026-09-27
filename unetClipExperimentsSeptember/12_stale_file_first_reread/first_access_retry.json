@@ -1,0 +1,48 @@
+{
+  "arm": "source_only",
+  "attempt_id": "stale_clip_first_access_retry_25c54c954cdc",
+  "cuda_used": false,
+  "error": "ModuleNotFoundError:No module named 'torch'",
+  "h2d_used": false,
+  "identity": {
+    "accelerator": "none",
+    "container_session_id": "ta-01M1TC62AAB2WVBJ874DEYH7NR",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": null,
+    "hostname": "modal",
+    "image_id": "im-kzKDEGJV4NGUwr7HKb2LwF",
+    "provider": "CLOUD_PROVIDER_AZURE",
+    "region": "westeurope"
+  },
+  "model_construction": false,
+  "model_name": "qwen_3_4b.safetensors",
+  "oracle_wall_ms": 276.8815,
+  "path_resolution": "fixed_read_only_models_mount",
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "status": "error",
+  "torch_imported": false
+}\n

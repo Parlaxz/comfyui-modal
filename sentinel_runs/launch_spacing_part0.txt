@@ -1,0 +1,159 @@
+﻿corpus runs: 108
+inventory (read_mib, qd) -> runs:
+   (32.0, 2): 10
+   (32.0, 4): 10
+   (32.0, 8): 10
+   (64.0, 2): 10
+   (64.0, 4): 10
+   (64.0, 8): 10
+   (128.0, 2): 10
+   (128.0, 4): 10
+   (128.0, 8): 10
+   (256.0, 2): 6
+   (256.0, 4): 6
+   (256.0, 8): 6
+total reads: 13140
+worst preadv per run: min=25 median=259 max=33588 ms
+
+=== gen-0 >=500ms rate by QD (all read sizes) ===
+  qd | runs | gen0 reads | gen0>=250 | gen0>=500 | gen0>=1000
+  QD2 |   36 |         72 |         6 (8.33%) |         4 (5.56%) |          4 (5.56%)
+  QD4 |   36 |        144 |        36 (25.00%) |        22 (15.28%) |         15 (10.42%)
+  QD8 |   36 |        288 |       127 (44.10%) |        88 (30.56%) |         46 (15.97%)
+
+[ALL reads (descriptive context)]  n_total=13032
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1   2692     236     121      60   8.8%/4.5%/2.2%
+       1-2   1145      11       3       0   1.0%/0.3%/0.0%
+       2-4   1494      20       5       2   1.3%/0.3%/0.1%
+       4-8   1995      23       3       2   1.2%/0.2%/0.1%
+      8-16   2617      25      10       4   1.0%/0.4%/0.2%
+     16-32   1903      33      16       9   1.7%/0.8%/0.5%
+     32-64    744      22      11       5   3.0%/1.5%/0.7%
+      >=64    442      84      55      40   19.0%/12.4%/9.0%
+
+[gen 0 only]  n_total=396
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1    309     139      94      54   45.0%/30.4%/17.5%
+       1-2      2       0       0       0   0.0%/0.0%/0.0%
+       4-8      2       0       0       0   0.0%/0.0%/0.0%
+      8-16     15       0       0       0   0.0%/0.0%/0.0%
+     16-32     24       2       1       0   8.3%/4.2%/0.0%
+     32-64     28       3       2       0   10.7%/7.1%/0.0%
+      >=64     16       6       4       1   37.5%/25.0%/6.2%
+
+[gen 0-1]  n_total=900
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1    482     173     107      57   35.9%/22.2%/11.8%
+       1-2     19       2       1       0   10.5%/5.3%/0.0%
+       2-4     19       3       1       0   15.8%/5.3%/0.0%
+       4-8     40       8       1       1   20.0%/2.5%/2.5%
+      8-16     66       9       1       0   13.6%/1.5%/0.0%
+     16-32     88       5       3       1   5.7%/3.4%/1.1%
+     32-64     88      12       7       3   13.6%/8.0%/3.4%
+      >=64     98      33      23      16   33.7%/23.5%/16.3%
+
+[gen 0-3 (early)]  n_total=1896
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1    755     212     118      59   28.1%/15.6%/7.8%
+       1-2     98       7       2       0   7.1%/2.0%/0.0%
+       2-4     97      14       4       1   14.4%/4.1%/1.0%
+       4-8    124      14       2       1   11.3%/1.6%/0.8%
+      8-16    163      14       4       0   8.6%/2.5%/0.0%
+     16-32    225      24      12       7   10.7%/5.3%/3.1%
+     32-64    195      20      11       5   10.3%/5.6%/2.6%
+      >=64    239      60      36      22   25.1%/15.1%/9.2%
+
+[gen 4+ (later)]  n_total=11136
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1   1937      24       3       1   1.2%/0.2%/0.1%
+       1-2   1047       4       1       0   0.4%/0.1%/0.0%
+       2-4   1397       6       1       1   0.4%/0.1%/0.1%
+       4-8   1871       9       1       1   0.5%/0.1%/0.1%
+      8-16   2454      11       6       4   0.4%/0.2%/0.2%
+     16-32   1678       9       4       2   0.5%/0.2%/0.1%
+     32-64    549       2       0       0   0.4%/0.0%/0.0%
+      >=64    203      24      19      18   11.8%/9.4%/8.9%
+
+### 64 MiB / QD4 slice: 10 runs
+
+[64MiB QD4 ΓÇö gen 0 only]  n_total=30
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1     22       6       6       5   27.3%/27.3%/22.7%
+     16-32      5       0       0       0   0.0%/0.0%/0.0%
+      >=64      3       1       1       1   33.3%/33.3%/33.3%
+
+[64MiB QD4 ΓÇö all reads (context)]  n_total=1190
+    gap_ms      n     250     500    1000   rates(>=250/500/1000)
+        <1    183       7       6       5   3.8%/3.3%/2.7%
+       1-2    101       0       0       0   0.0%/0.0%/0.0%
+       2-4    158       1       1       1   0.6%/0.6%/0.6%
+       4-8    166       0       0       0   0.0%/0.0%/0.0%
+      8-16    243       2       2       2   0.8%/0.8%/0.8%
+     16-32    267       3       2       1   1.1%/0.7%/0.4%
+     32-64     57       3       2       2   5.3%/3.5%/3.5%
+      >=64     15       4       4       4   26.7%/26.7%/26.7%
+
+=== launch concentration: fraction of reads having N neighbours launched within the preceding window ===
+  window_ms | mean_neighbours | frac_having_>=1 | frac_having_>=3
+          1 |            0.33 |           20.5% |             3.2%
+          2 |            0.46 |           29.2% |             3.9%
+          4 |            0.64 |           40.6% |             5.6%
+          8 |            0.96 |           55.8% |             9.6%
+         16 |            1.62 |           75.7% |            24.6%
+         32 |            3.43 |           90.2% |            61.1%
+         64 |            7.15 |           95.8% |            82.7%
+
+=== active_at_enter (overlap) for reads >=500ms vs <500ms ===
+      sick >=500ms: n=  237 mean=4.42 median=5 max=7
+    healthy <250ms: n=12667 mean=3.12 median=3 max=7
+
+=== first 4 global launches per run (first 12 runs + all sick runs) ===
+  h100-r128-qd2-rep1                 qd2 128MiB worst=    138ms :: g0w1 t=0.0 gap=- lat=67 act=0 | g0w0 t=0.1 gap=0.13 lat=138 act=1 | g1w1 t=66.7 gap=66.55 lat=62 act=1 | g2w1 t=128.4 gap=61.77 lat=61 act=1
+  h100-r128-qd2-rep2                 qd2 128MiB worst=    165ms :: g0w1 t=0.0 gap=- lat=68 act=0 | g0w0 t=0.1 gap=0.13 lat=165 act=1 | g1w1 t=68.1 gap=68.02 lat=73 act=1 | g2w1 t=141.5 gap=73.32 lat=65 act=1
+  h100-r128-qd2-rep3                 qd2 128MiB worst=    130ms :: g0w1 t=0.0 gap=- lat=62 act=0 | g0w0 t=0.1 gap=0.12 lat=130 act=1 | g1w1 t=62.0 gap=61.83 lat=59 act=1 | g2w1 t=120.8 gap=58.89 lat=63 act=1
+  h100-r128-qd2-rep4                 qd2 128MiB worst=    174ms :: g0w1 t=0.0 gap=- lat=78 act=0 | g0w0 t=0.0 gap=0.03 lat=174 act=1 | g1w1 t=78.0 gap=77.98 lat=74 act=1 | g2w1 t=152.0 gap=74.02 lat=76 act=1
+  h100-r128-qd2                      qd2 128MiB worst=    239ms :: g0w1 t=0.0 gap=- lat=85 act=0 | g0w0 t=0.1 gap=0.11 lat=239 act=1 | g1w1 t=85.0 gap=84.93 lat=111 act=1 | g2w1 t=196.3 gap=111.26 lat=125 act=1
+  h100-r128-qd4-rep1                 qd4 128MiB worst=    322ms :: g0w3 t=0.0 gap=- lat=72 act=0 | g0w2 t=0.0 gap=0.03 lat=143 act=1 | g0w1 t=0.1 gap=0.11 lat=322 act=2 | g0w0 t=0.2 gap=0.02 lat=229 act=3
+  h100-r128-qd4-rep2                 qd4 128MiB worst=    320ms :: g0w3 t=0.0 gap=- lat=66 act=0 | g0w0 t=1.0 gap=0.98 lat=133 act=1 | g0w1 t=1.0 gap=0.04 lat=320 act=2 | g0w2 t=1.0 gap=0.01 lat=207 act=3
+  h100-r128-qd4-rep3                 qd4 128MiB worst=    413ms :: g0w3 t=0.0 gap=- lat=76 act=0 | g0w1 t=0.6 gap=0.56 lat=277 act=1 | g0w0 t=0.6 gap=0.02 lat=146 act=2 | g0w2 t=0.6 gap=0.01 lat=413 act=3
+  h100-r128-qd4-rep4                 qd4 128MiB worst=    378ms :: g0w3 t=0.0 gap=- lat=65 act=0 | g0w0 t=0.0 gap=0.03 lat=265 act=1 | g0w1 t=0.7 gap=0.70 lat=195 act=2 | g0w2 t=0.8 gap=0.04 lat=378 act=3
+  h100-r128-qd4                      qd4 128MiB worst=    402ms :: g0w3 t=0.0 gap=- lat=91 act=0 | g0w0 t=0.7 gap=0.67 lat=180 act=1 | g0w1 t=0.7 gap=0.03 lat=402 act=2 | g0w2 t=0.7 gap=0.03 lat=277 act=3
+  h100-r128-qd8-rep1                 qd8 128MiB worst=   1205ms :: g0w7 t=0.0 gap=- lat=146 act=0 | g0w0 t=0.2 gap=0.18 lat=779 act=1 | g0w2 t=0.2 gap=0.02 lat=310 act=2 | g0w1 t=0.2 gap=0.01 lat=407 act=3
+  h100-r128-qd8-rep2                 qd8 128MiB worst=    783ms :: g0w7 t=0.0 gap=- lat=376 act=0 | g0w1 t=0.1 gap=0.05 lat=704 act=1 | g0w0 t=0.1 gap=0.02 lat=783 act=2 | g0w2 t=0.1 gap=0.01 lat=611 act=3
+  h100-r128-qd8-rep3                 qd8 128MiB worst=  25254ms :: g0w7 t=0.0 gap=- lat=6963 act=0 | g0w0 t=0.2 gap=0.20 lat=15096 act=1 | g0w2 t=0.2 gap=0.02 lat=25251 act=2 | g0w1 t=0.2 gap=0.02 lat=25251 act=3
+  h100-r128-qd8-rep4                 qd8 128MiB worst=   1094ms :: g0w7 t=0.0 gap=- lat=73 act=0 | g0w0 t=0.1 gap=0.12 lat=147 act=1 | g0w1 t=0.2 gap=0.03 lat=298 act=2 | g0w2 t=0.2 gap=0.03 lat=654 act=3
+  h100-r128-qd8                      qd8 128MiB worst=   1303ms :: g0w7 t=0.0 gap=- lat=176 act=0 | g0w0 t=0.1 gap=0.06 lat=176 act=1 | g0w1 t=0.7 gap=0.63 lat=1303 act=2 | g0w2 t=0.7 gap=0.02 lat=663 act=3
+  h100-r256-qd2                      qd2 256MiB worst=  33588ms :: g0w1 t=0.0 gap=- lat=33588 act=0 | g0w0 t=0.1 gap=0.05 lat=33588 act=1 | g1w0 t=33588.0 gap=33587.97 lat=136 act=1 | g1w1 t=33588.1 gap=0.07 lat=21834 act=1
+  h100-r256-qd4                      qd4 256MiB worst=  10200ms :: g0w3 t=0.0 gap=- lat=9629 act=0 | g0w0 t=0.1 gap=0.15 lat=9783 act=1 | g0w1 t=0.2 gap=0.03 lat=9931 act=2 | g0w2 t=0.2 gap=0.02 lat=10200 act=3
+  h100-r256-qd8                      qd8 256MiB worst=   1380ms :: g0w7 t=0.0 gap=- lat=424 act=0 | g0w0 t=0.1 gap=0.05 lat=1219 act=1 | g0w1 t=0.1 gap=0.02 lat=868 act=2 | g0w3 t=0.1 gap=0.01 lat=1219 act=3
+  h100-r32-qd2-rep3                  qd2 32MiB worst=    525ms :: g0w1 t=0.0 gap=- lat=53 act=0 | g0w0 t=0.1 gap=0.07 lat=53 act=1 | g1w0 t=53.0 gap=52.91 lat=525 act=1 | g1w1 t=53.1 gap=0.09 lat=31 act=1
+  h100-r32-qd2                       qd2 32MiB worst=   1529ms :: g0w1 t=0.0 gap=- lat=357 act=0 | g0w0 t=0.2 gap=0.20 lat=495 act=1 | g1w1 t=357.0 gap=356.84 lat=400 act=1 | g1w0 t=494.7 gap=137.69 lat=24 act=1
+  h100-r32-qd4-rep2                  qd4 32MiB worst=   2284ms :: g0w3 t=0.0 gap=- lat=2126 act=0 | g0w0 t=0.2 gap=0.17 lat=2126 act=1 | g0w1 t=0.2 gap=0.04 lat=2143 act=2 | g0w2 t=2126.2 gap=2126.04 lat=929 act=3
+  h100-r32-qd4                       qd4 32MiB worst=    670ms :: g0w3 t=0.0 gap=- lat=586 act=0 | g0w0 t=0.2 gap=0.17 lat=614 act=1 | g0w1 t=0.2 gap=0.02 lat=636 act=2 | g0w2 t=0.2 gap=0.03 lat=670 act=3
+  h100-r32-qd8-rep2                  qd8 32MiB worst=   6466ms :: g0w7 t=0.0 gap=- lat=6001 act=0 | g0w6 t=0.0 gap=0.02 lat=4283 act=1 | g0w0 t=0.1 gap=0.10 lat=4331 act=2 | g0w2 t=0.1 gap=0.01 lat=6466 act=3
+  h100-r32-qd8-rep3                  qd8 32MiB worst=   5669ms :: g0w7 t=0.0 gap=- lat=1253 act=0 | g0w0 t=0.0 gap=0.05 lat=5448 act=1 | g0w2 t=0.1 gap=0.02 lat=4874 act=2 | g0w1 t=0.1 gap=0.02 lat=2009 act=3
+  h100-r32-qd8-rep4                  qd8 32MiB worst=   5725ms :: g0w7 t=0.0 gap=- lat=812 act=0 | g0w1 t=0.0 gap=0.04 lat=1256 act=1 | g0w0 t=0.1 gap=0.09 lat=4232 act=2 | g0w2 t=0.1 gap=0.01 lat=5646 act=3
+  h100-r64-qd4-rep1                  qd4 64MiB worst=   7256ms :: g0w3 t=0.0 gap=- lat=4021 act=0 | g0w2 t=0.1 gap=0.12 lat=7193 act=1 | g0w1 t=0.1 gap=0.02 lat=4066 act=2 | g0w0 t=0.2 gap=0.03 lat=7256 act=3
+  h100-r64-qd4-rep2                  qd4 64MiB worst=   3515ms :: g0w3 t=0.0 gap=- lat=3227 act=0 | g0w0 t=0.0 gap=0.01 lat=3228 act=1 | g0w1 t=0.1 gap=0.11 lat=3228 act=2 | g0w2 t=2916.8 gap=2916.66 lat=3515 act=3
+  h100-r64-qd8-rep2                  qd8 64MiB worst=   5880ms :: g0w7 t=0.0 gap=- lat=2603 act=0 | g0w0 t=0.1 gap=0.07 lat=3705 act=1 | g0w2 t=0.1 gap=0.03 lat=2637 act=2 | g0w1 t=0.1 gap=0.02 lat=2679 act=3
+  h100-r64-qd8-rep3                  qd8 64MiB worst=    631ms :: g0w7 t=0.0 gap=- lat=143 act=0 | g0w0 t=0.1 gap=0.07 lat=289 act=1 | g0w1 t=0.1 gap=0.03 lat=443 act=2 | g0w2 t=0.1 gap=0.01 lat=443 act=3
+  h100-r64-qd8-rep4                  qd8 64MiB worst=    574ms :: g0w7 t=0.0 gap=- lat=239 act=0 | g0w6 t=0.1 gap=0.08 lat=199 act=1 | g0w0 t=0.1 gap=0.02 lat=199 act=2 | g0w2 t=0.1 gap=0.01 lat=159 act=3
+  rtx-r128-qd8-rep1                  qd8 128MiB worst=    837ms :: g0w7 t=0.0 gap=- lat=214 act=0 | g0w5 t=0.2 gap=0.21 lat=213 act=1 | g0w0 t=37.4 gap=37.20 lat=299 act=2 | g0w6 t=37.8 gap=0.38 lat=106 act=3
+  rtx-r128-qd8-rep2                  qd8 128MiB worst=    651ms :: g0w7 t=0.0 gap=- lat=71 act=0 | g0w5 t=0.1 gap=0.05 lat=108 act=1 | g0w0 t=36.3 gap=36.25 lat=115 act=2 | g0w1 t=70.6 gap=34.33 lat=139 act=3
+  rtx-r128-qd8-rep3                  qd8 128MiB worst=    897ms :: g0w7 t=0.0 gap=- lat=36 act=0 | g0w4 t=0.1 gap=0.09 lat=71 act=1 | g0w0 t=35.8 gap=35.71 lat=178 act=2 | g1w7 t=70.9 gap=35.08 lat=142 act=2
+  rtx-r128-qd8-rep4                  qd8 128MiB worst=    828ms :: g0w7 t=0.0 gap=- lat=34 act=0 | g0w2 t=0.4 gap=0.44 lat=68 act=1 | g0w0 t=32.9 gap=32.47 lat=153 act=2 | g1w7 t=67.6 gap=34.66 lat=82 act=2
+  rtx-r128-qd8                       qd8 128MiB worst=    934ms :: g0w7 t=0.0 gap=- lat=206 act=0 | g0w1 t=0.9 gap=0.87 lat=241 act=1 | g0w0 t=0.9 gap=0.05 lat=428 act=2 | g0w2 t=0.9 gap=0.02 lat=284 act=3
+  rtx-r256-qd8-rep1                  qd8 256MiB worst=    684ms :: g0w7 t=0.0 gap=- lat=268 act=0 | g0w0 t=0.4 gap=0.41 lat=136 act=1 | g0w3 t=65.9 gap=65.53 lat=138 act=2 | g0w6 t=136.5 gap=70.51 lat=131 act=3
+  rtx-r256-qd8-rep2                  qd8 256MiB worst=    609ms :: g0w7 t=0.0 gap=- lat=83 act=0 | g0w6 t=0.3 gap=0.28 lat=159 act=1 | g0w0 t=82.4 gap=82.12 lat=149 act=2 | g0w2 t=82.6 gap=0.21 lat=229 act=3
+  rtx-r256-qd8-rep3                  qd8 256MiB worst=    563ms :: g0w7 t=0.0 gap=- lat=228 act=0 | g0w0 t=0.3 gap=0.29 lat=228 act=1 | g0w3 t=53.8 gap=53.52 lat=116 act=2 | g0w5 t=111.1 gap=57.26 lat=117 act=3
+  rtx-r256-qd8-rep4                  qd8 256MiB worst=    585ms :: g0w7 t=0.0 gap=- lat=64 act=0 | g0w4 t=0.1 gap=0.08 lat=129 act=1 | g0w0 t=64.0 gap=63.89 lat=150 act=2 | g0w5 t=64.2 gap=0.24 lat=585 act=3
+  rtx-r256-qd8                       qd8 256MiB worst=    603ms :: g0w7 t=0.0 gap=- lat=57 act=0 | g0w6 t=0.2 gap=0.19 lat=603 act=1 | g0w0 t=57.2 gap=57.01 lat=63 act=2 | g0w3 t=57.3 gap=0.11 lat=135 act=3
+  rtx-r32-qd8-rep3                   qd8 32MiB worst=    501ms :: g0w7 t=0.0 gap=- lat=63 act=0 | g0w5 t=0.3 gap=0.26 lat=43 act=1 | g0w0 t=0.3 gap=0.04 lat=34 act=2 | g0w2 t=18.1 gap=17.81 lat=78 act=3
+  rtx-r64-qd2                        qd2 64MiB worst=   1470ms :: g0w1 t=0.0 gap=- lat=1470 act=0 | g0w0 t=0.1 gap=0.10 lat=1470 act=1 | g1w0 t=1469.7 gap=1469.59 lat=41 act=1 | g1w1 t=1469.8 gap=0.15 lat=40 act=1
+  rtx-r64-qd4-rep2                   qd4 64MiB worst=    723ms :: g0w3 t=0.0 gap=- lat=698 act=0 | g0w1 t=0.5 gap=0.53 lat=723 act=1 | g0w0 t=698.2 gap=697.67 lat=68 act=2 | g1w3 t=698.3 gap=0.11 lat=53 act=2
+  rtx-r64-qd8-rep1                   qd8 64MiB worst=    675ms :: g0w7 t=0.0 gap=- lat=77 act=0 | g0w3 t=0.4 gap=0.35 lat=77 act=1 | g0w0 t=19.9 gap=19.58 lat=149 act=2 | g0w4 t=20.3 gap=0.40 lat=92 act=3
+  rtx-r64-qd8-rep2                   qd8 64MiB worst=    538ms :: g0w7 t=0.0 gap=- lat=25 act=0 | g0w0 t=0.4 gap=0.43 lat=181 act=1 | g0w2 t=24.9 gap=24.44 lat=47 act=2 | g0w6 t=25.3 gap=0.39 lat=155 act=3
+  rtx-r64-qd8-rep3                   qd8 64MiB worst=    775ms :: g0w7 t=0.0 gap=- lat=100 act=0 | g0w6 t=0.3 gap=0.27 lat=99 act=1 | g0w0 t=25.5 gap=25.27 lat=102 act=2 | g0w5 t=25.9 gap=0.40 lat=172 act=3
+  rtx-r64-qd8-rep4                   qd8 64MiB worst=    530ms :: g0w7 t=0.0 gap=- lat=27 act=0 | g0w0 t=0.8 gap=0.83 lat=106 act=1 | g0w2 t=27.3 gap=26.46 lat=103 act=2 | g1w7 t=27.4 gap=0.12 lat=55 act=2
+  rtx-r64-qd8                        qd8 64MiB worst=    739ms :: g0w7 t=0.0 gap=- lat=118 act=0 | g0w1 t=0.3 gap=0.25 lat=118 act=1 | g0w0 t=17.1 gap=16.83 lat=101 act=2 | g0w5 t=36.2 gap=19.07 lat=39 act=3

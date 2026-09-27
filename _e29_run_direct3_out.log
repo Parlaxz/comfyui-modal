@@ -1,0 +1,73 @@
+exit: 1
+elapsed: 11.3
+stdout tail:
+
+deep_model_diag=0
+pagefault_tracking=0
+eviction_enabled=1
+eviction_role=clip_vae
+eviction_idle_seconds=0
+prefill_lanes=critical
+prefill_wait_for_unet=0
+restore_torch_threads=none
+variance_pretouch=0
+fast_cold_orchestration=1
+checkpoint_prewarm=1
+prewarm_threads=4
+prewarm_chunk_mb=8
+unet_fastsafetensors=1
+clip_fast_hydration=1
+clip_snapshot_exclude_weights=1
+critical_gpu_coordination=1
+scoped_cuda_readiness=1
+staged_safetensors=0
+c9qd_extras=0
+staged_source_order=0
+clip_staged_hydration=0
+volume_read_run_count=3
+restore_only_app=stable-modal-comfy-v2-restore-only-shadow
+restore_only_run_count=6
+snapshot_exclude_unet=1
+e10_bucket_first_validation=0
+=== Running one V2 benchmark trial against the existing deployment ===
+=== Deploy first with deploy_and_run_v2_single.bat after source or env changes ===
+=== Fail-closed request preflight (local, no spend
+[v2.run_preflight]
+TARGET_APP=stable-modal-comfy-v2-restore-only-shadow
+TARGET_CLASS=ModalRuntimeEntrypointV2
+TARGET_DEPLOYMENT=e8836804e875020f5f311016
+TARGET_MATCH=YES
+ATOMIC_PROFILE=E19_FINAL_COLD_LOADER == deployed E19_FINAL_COLD_LOADER
+CPU=12 == deployed 12
+MEMORY=32768 == deployed 32768
+BASELINE_CPU=12 == deployed 12
+BASELINE_MEMORY=32768 == deployed 32768
+RUNTIME_FINGERPRINT=f504e296c398bdcb2c4c07e2 == deployed f504e296c398bdcb2c4c07e2
+D1_PROOF_COVERS=true
+RUN_COUNT=1
+FINAL_REQUEST_PREFLIGHT=PASS
+[v2.host] python_first_line_wall_unix_ns=1787183470444545500
+[v2.conditioning_cache_nonce] nonce=20476-21874-24115
+[v2.harness] node_registry_preload_skipped store_generation_entry=yes
+{"guard": {"allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768, "changed_axes": []}, "runtime_shape": {"cpu_request": 12, "malloc_arena_max": null, "memory_request": 32768, "mkl_num_threads": null, "numexpr_num_threads": null, "omp_num_threads": null, "openblas_num_threads": null, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "snapshot_model_order": "O0", "thread_policy": "TBASE", "torch_interop_threads": null, "torch_intraop_threads": null}}
+[v2.harness] registry_load=skipped store_hit=yes
+[v2.plan_proof] fallback=miss frozen=False wf_hash=2e43d4c0ba3b types=43 error=plan validation failed (invalid workflow): {'type': 'missing_node_type', 'message': "Node 'PairConditioningSetProperties' not found. The custom node may not be 
+=== ERROR: Benchmark failed ===
+=== Total command-to-response time: 10.628s ===
+
+stderr tail:
+dal\tools\benchmark_v2_direct.py", line 9953, in main
+    artifacts.append(await _run_one(
+                     ^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\tools\benchmark_v2_direct.py", line 3833, in _run_one
+    plan = build_execution_plan(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\canonical_execution.py", line 1515, in build_execution_plan
+    raise _validation_exc
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\canonical_execution.py", line 1448, in build_execution_plan
+    _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\canonical_execution.py", line 1128, in _collect_plan_validation_proof
+    raise RuntimeError(f"plan validation failed (invalid workflow): {_err_text}")
+RuntimeError: plan validation failed (invalid workflow): {'type': 'missing_node_type', 'message': "Node 'PairConditioningSetProperties' not found. The custom node may not be installed.", 'details': "Node ID '#1014'", 'extra_info': {'node_id': '1014', 'class_type': 'PairConditioningSetProperties', 'node_title': 'PairConditioningSetProperties'}}
+

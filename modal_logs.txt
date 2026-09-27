@@ -1,0 +1,123 @@
+﻿[comfyapp] restore phases (pre-warmup): {'ensure_models_ms': 0.1, 'custom_nodes_sync_ms': 200.7, 'custom_nodes_created': 0, 'early_path_resolve_ms': 22.5, 'gpu_state_ms': 320.0, 'cuda_warmup_ms': 258.1, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 18.5, 'sage_probe_on_restore': 0}
+[comfyapp] restore sanity check done in 0.822s perf={'restore_total_ms': 821.5, 'restore_start_unix_s': 1780798467.7027886, 'restore_end_unix_s': 1780798468.524314, 'warmup_status': 'ok', 'warmup_profile': {}, 'warmup_profile_source': 'none', 'warmup_profile_token': '', 'ensure_models_ms': 0.1, 'custom_nodes_sync_ms': 200.7, 'custom_nodes_created': 0, 'preload_mode': 'workers_2', 'preload_mode_source': 'env_var', 'early_path_resolve_ms': 22.5, 'gpu_state_ms': 320.0, 'cuda_warmup_ms': 258.1, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 18.5, 'sage_mode': 'baked_cuda', 'sage_reason': 'runtime_override', 'sage_env_mode': 'baked_cuda', 'sage_probe_on_restore': 0, 'warmup_preload_ms': 0.0, 'clip_cache_size_after_warmup': 0, 'cpu_cache_hits': {}, 'cpu_cache_misses': {}, 'gpu_cache_eq': {}, 'clip_cache': {'size': 0, 'keys': []}}
+Traceback (most recent call last):
+  File "/root/comfyapp.py", line 5666, in _exec
+    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/comfyapp.py", line 3126, in _execute_in_process
+    raise RuntimeError(f"Workflow validation failed: {'; '.join(parts)}")
+RuntimeError: Workflow validation failed: Prompt has no outputs
+[comfyapp] set_active_warmup_profile token=9377dbcc-1f3c-44e1-a12c-8261b8848973 workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 disable_warmup=0
+Creating CPU memory snapshot for Function.
+[comfyapp] lifecycle=startup snap=True snapshot_mode=full
+[comfyapp] models_symlink created -> /root/models in 3.3ms
+[comfyapp] sync_custom_nodes_into_comfy: created=0 kept=0 removed=0 blocked=0 volume_dirs=0
+[comfyapp] selected backend=in_process
+[comfyapp] total_ram=1024.0G  cache_ram=24.0G
+
+----------------------------------------------------------------------
+[ComfyUI-Manager] NOTICE: Legacy config.ini detected
+  - Old: /root/comfy/ComfyUI/user/default/ComfyUI-Manager/config.ini
+  - New: /root/comfy/ComfyUI/user/__manager/config.ini
+  - Migrating config.ini only (other files are NOT migrated).
+  - Security level below 'normal' will be raised.
+----------------------------------------------------------------------
+
+  - Security level: 'normal' (no change needed)
+
+----------------------------------------------------------------------
+[ComfyUI-Manager] NOTICE: Legacy settings migrated
+  - Old location: /root/comfy/ComfyUI/user/default/ComfyUI-Manager
+  - Backed up to: /root/comfy/ComfyUI/user/__manager/.legacy-manager-backup
+  - Please verify and remove the backup when no longer needed.
+----------------------------------------------------------------------
+
+WARNING:root:[ComfyUI-Manager] Some features are restricted due to your ComfyUI being outdated.
+[comfyapp] sage_policy module=model_optimization_nodes.py found=False baked_cuda_available=False duration=4.5ms
+[comfyapp] in-process backend initialized in 8.250s
+[comfyapp] active backend=in_process
+[comfyapp] startup complete in 10.153s  req_installed=0
+Snapshot created. Restoring Function from memory snapshot.
+Restoring Function from memory snapshot.
+[comfyapp] lifecycle=restore snap=False restore_start_unix=1780798764.3616776
+[comfyapp] models_symlink already exists -> /root/models in 0.0ms
+[comfyapp] sync_custom_nodes_into_comfy: created=0 kept=0 removed=0 blocked=0 volume_dirs=0
+[comfyapp] snapshot_preload_profile source=active_next_profile profile_token=9377dbcc-1f3c-44e1-a12c-8261b8848973 workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 data={'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': '9377dbcc-1f3c-44e1-a12c-8261b8848973', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}}
+[comfyapp] snapshot_preload_paths: deduped 3ΓåÆ2 duplicates=set()
+[comfyapp] snapshot_preload_paths: NOT FOUND bucket=unet name=z_image_turbo_bf16.safetensors in 1.1ms
+[comfyapp] snapshot_preload_paths: NOT FOUND bucket=clip name=qwen_3_4b.safetensors in 0.6ms
+[comfyapp] snapshot_preload_paths: resolved 0 paths: [] per-file: {'z_image_turbo_bf16.safetensors': 1.1, 'qwen_3_4b.safetensors': 0.6}
+[comfyapp] restore warmup selection current_workflow_stack={'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']} selected_warmup_profile={'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': '9377dbcc-1f3c-44e1-a12c-8261b8848973', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}} profile_source=active_next_profile workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 profile_token=9377dbcc-1f3c-44e1-a12c-8261b8848973
+[comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 331.6ms
+[comfyapp] CUDA warmup done device=NVIDIA RTX PRO 6000 Blackwell Server Edition ctx_sync=91.8ms gemm=99.7ms alloc=10.2ms
+[comfyapp] clip_cache: patched CLIPTextEncode.encode mode=model_aware
+[comfyapp] clip_loader_cache: patched CLIPLoader.load_clip
+[comfyapp] clip_loader_cache: patched DualCLIPLoader.load_clip
+[comfyapp] sage_runtime_mode=baked_cuda reason=runtime_override (SAGE_RUNTIME_MODE=baked_cuda)
+[comfyapp] sage_policy module=model_optimization_nodes.py found=False baked_cuda_available=True duration=17.6ms
+[comfyapp] restore phases (pre-warmup): {'ensure_models_ms': 0.1, 'models_volume_reload_ms': 84.2, 'custom_nodes_sync_ms': 108.8, 'custom_nodes_created': 0, 'early_path_resolve_ms': 128.6, 'gpu_state_ms': 331.6, 'cuda_warmup_ms': 201.9, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 17.8, 'sage_probe_on_restore': 0}
+[comfyapp] direct warmup FAILED after 1.1ms: Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found.
+Traceback (most recent call last):
+  File "/root/comfyapp.py", line 4323, in _warmup_direct
+    unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
+  File "/root/comfy/ComfyUI/nodes.py", line 964, in load_unet
+    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/comfy/ComfyUI/folder_paths.py", line 383, in get_full_path_or_raise
+    raise FileNotFoundError(f"Model in folder '{folder_name}' with filename '{filename}' not found.")
+FileNotFoundError: Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found.
+
+[comfyapp] direct warmup FAILED ΓÇö executor bypass disabled
+[comfyapp] restore sanity check done in 0.878s perf={'restore_total_ms': 878.2, 'restore_start_unix_s': 1780798764.3616776, 'restore_end_unix_s': 1780798765.239862, 'warmup_status': 'error', 'warmup_profile': {'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': '9377dbcc-1f3c-44e1-a12c-8261b8848973', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}}, 'warmup_profile_source': 'active_next_profile', 'warmup_profile_token': '9377dbcc-1f3c-44e1-a12c-8261b8848973', 'ensure_models_ms': 0.1, 'models_volume_reload_ms': 84.2, 'custom_nodes_sync_ms': 108.8, 'custom_nodes_created': 0, 'preload_mode': 'workers_2', 'preload_mode_source': 'env_var', 'early_path_resolve_ms': 128.6, 'gpu_state_ms': 331.6, 'cuda_warmup_ms': 201.9, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 17.8, 'sage_mode': 'baked_cuda', 'sage_reason': 'runtime_override', 'sage_env_mode': 'baked_cuda', 'sage_probe_on_restore': 0, 'warmup_preload_ms': 0.0, 'warmup_direct_total_ms': 1.1, 'direct_warmup_load_unet': 1.0, 'direct_warmup_require_cpu_cache_hit': 0.0, 'clip_cache_size_after_warmup': 0, 'cpu_cache_hits': {}, 'cpu_cache_misses': {}, 'gpu_cache_eq': {}, 'clip_cache': {'size': 0, 'keys': []}, 'warmup_error': "Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found."}
+[comfyapp] sync_custom_nodes_into_comfy: created=0 kept=0 removed=0 blocked=0 volume_dirs=0
+[comfyapp] missing workflow nodes before validation: ['Any Switch (rgthree)', 'Anything Everywhere', 'CacheDiT_Model_Optimizer', 'ClownsharKSampler_Beta', 'Image Comparer (rgthree)', 'ImpactIfNone', 'ImpactSwitch', 'JoinStrings', 'LGNoiseInjectionLatent', 'LayerUtility: PurgeVRAM V2', 'SimpleMath+', 'StringToCombo|LP', 'SystemNotification|pysssss', 'easy float', 'easy globalSeed', 'easy ifElse', 'easy imageSize', 'easy indexAnything', 'easy int', 'easy showAnything', 'easy stringToIntList']
+[comfyapp] missing workflow nodes after repair: ['Any Switch (rgthree)', 'Anything Everywhere', 'CacheDiT_Model_Optimizer', 'ClownsharKSampler_Beta', 'Image Comparer (rgthree)', 'ImpactIfNone', 'ImpactSwitch', 'JoinStrings', 'LGNoiseInjectionLatent', 'LayerUtility: PurgeVRAM V2', 'SimpleMath+', 'StringToCombo|LP', 'SystemNotification|pysssss', 'easy float', 'easy globalSeed', 'easy ifElse', 'easy imageSize', 'easy indexAnything', 'easy int', 'easy showAnything', 'easy stringToIntList']
+Traceback (most recent call last):
+  File "/root/comfyapp.py", line 5685, in _exec
+    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/comfyapp.py", line 3137, in _execute_in_process
+    raise RuntimeError(f"Workflow validation failed: {'; '.join(parts)}")
+RuntimeError: Workflow validation failed: Node 'Join Strings' not found. The custom node may not be installed.
+[comfyapp] set_active_warmup_profile token=c96c2504-2543-475c-a3c6-cfe57e19b704 workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 disable_warmup=0
+Restoring Function from memory snapshot.
+[comfyapp] lifecycle=restore snap=False restore_start_unix=1780798841.1567428
+[comfyapp] models_symlink already exists -> /root/models in 0.1ms
+[comfyapp] sync_custom_nodes_into_comfy: created=0 kept=0 removed=0 blocked=0 volume_dirs=0
+[comfyapp] snapshot_preload_profile source=active_next_profile profile_token=c96c2504-2543-475c-a3c6-cfe57e19b704 workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 data={'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': 'c96c2504-2543-475c-a3c6-cfe57e19b704', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}}
+[comfyapp] snapshot_preload_paths: deduped 3ΓåÆ2 duplicates=set()
+[comfyapp] snapshot_preload_paths: NOT FOUND bucket=unet name=z_image_turbo_bf16.safetensors in 0.9ms
+[comfyapp] snapshot_preload_paths: NOT FOUND bucket=clip name=qwen_3_4b.safetensors in 0.4ms
+[comfyapp] snapshot_preload_paths: resolved 0 paths: [] per-file: {'z_image_turbo_bf16.safetensors': 0.9, 'qwen_3_4b.safetensors': 0.4}
+[comfyapp] restore warmup selection current_workflow_stack={'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']} selected_warmup_profile={'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': 'c96c2504-2543-475c-a3c6-cfe57e19b704', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}} profile_source=active_next_profile workflow_hash=e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81 profile_token=c96c2504-2543-475c-a3c6-cfe57e19b704
+[comfyapp] gpu_state restored vram=97250MB ram=1048576MB vram_state=VRAMState.HIGH_VRAM in 309.3ms
+[comfyapp] CUDA warmup done device=NVIDIA RTX PRO 6000 Blackwell Server Edition ctx_sync=85.2ms gemm=92.8ms alloc=9.7ms
+[comfyapp] clip_cache: patched CLIPTextEncode.encode mode=model_aware
+[comfyapp] clip_loader_cache: patched CLIPLoader.load_clip
+[comfyapp] clip_loader_cache: patched DualCLIPLoader.load_clip
+[comfyapp] sage_runtime_mode=baked_cuda reason=runtime_override (SAGE_RUNTIME_MODE=baked_cuda)
+[comfyapp] sage_policy module=model_optimization_nodes.py found=False baked_cuda_available=True duration=17.2ms
+[comfyapp] restore phases (pre-warmup): {'ensure_models_ms': 0.1, 'models_volume_reload_ms': 100.3, 'custom_nodes_sync_ms': 93.3, 'custom_nodes_created': 0, 'early_path_resolve_ms': 162.1, 'gpu_state_ms': 309.4, 'cuda_warmup_ms': 188.0, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 17.5, 'sage_probe_on_restore': 0}
+[comfyapp] direct warmup FAILED after 1.4ms: Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found.
+Traceback (most recent call last):
+  File "/root/comfyapp.py", line 4323, in _warmup_direct
+    unet_loader.load_unet(unet_name=unet_name, weight_dtype="default")
+  File "/root/comfy/ComfyUI/nodes.py", line 964, in load_unet
+    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/comfy/ComfyUI/folder_paths.py", line 383, in get_full_path_or_raise
+    raise FileNotFoundError(f"Model in folder '{folder_name}' with filename '{filename}' not found.")
+FileNotFoundError: Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found.
+
+[comfyapp] direct warmup FAILED ΓÇö executor bypass disabled
+[comfyapp] restore sanity check done in 0.876s perf={'restore_total_ms': 875.9, 'restore_start_unix_s': 1780798841.1567428, 'restore_end_unix_s': 1780798842.0326364, 'warmup_status': 'error', 'warmup_profile': {'clip1': 'qwen_3_4b.safetensors', 'clip2': 'qwen_3_4b.safetensors', 'clip_type': 'lumina2', 'mode': 'split', 'unet': 'z_image_turbo_bf16.safetensors', 'vae': 'ae.safetensors', '_source': 'active_next_profile', '_profile_token': 'c96c2504-2543-475c-a3c6-cfe57e19b704', '_workflow_hash': 'e449ef614070f0b85e72c26827d2e46352d6eba3e1c7876e0b1371bb8af3ef81', '_current_workflow_stack': {'checkpoint': [], 'clip': ['qwen_3_4b.safetensors'], 'clip_type': 'lumina2', 'unet': ['z_image_turbo_bf16.safetensors'], 'vae': ['ae.safetensors']}}, 'warmup_profile_source': 'active_next_profile', 'warmup_profile_token': 'c96c2504-2543-475c-a3c6-cfe57e19b704', 'ensure_models_ms': 0.1, 'models_volume_reload_ms': 100.3, 'custom_nodes_sync_ms': 93.3, 'custom_nodes_created': 0, 'preload_mode': 'workers_2', 'preload_mode_source': 'env_var', 'early_path_resolve_ms': 162.1, 'gpu_state_ms': 309.4, 'cuda_warmup_ms': 188.0, 'clip_cache_clear_requested': 0, 'clip_cache_size_at_start': 0, 'sage_runtime_ms': 17.5, 'sage_mode': 'baked_cuda', 'sage_reason': 'runtime_override', 'sage_env_mode': 'baked_cuda', 'sage_probe_on_restore': 0, 'warmup_preload_ms': 0.0, 'warmup_direct_total_ms': 1.4, 'direct_warmup_load_unet': 1.0, 'direct_warmup_require_cpu_cache_hit': 0.0, 'clip_cache_size_after_warmup': 0, 'cpu_cache_hits': {}, 'cpu_cache_misses': {}, 'gpu_cache_eq': {}, 'clip_cache': {'size': 0, 'keys': []}, 'warmup_error': "Model in folder 'diffusion_models' with filename 'z_image_turbo_bf16.safetensors' not found."}
+[comfyapp] sync_custom_nodes_into_comfy: created=0 kept=0 removed=0 blocked=0 volume_dirs=0
+[comfyapp] missing workflow nodes before validation: ['Any Switch (rgthree)', 'Anything Everywhere', 'CacheDiT_Model_Optimizer', 'ClownsharKSampler_Beta', 'Image Comparer (rgthree)', 'ImpactIfNone', 'ImpactSwitch', 'JoinStrings', 'LGNoiseInjectionLatent', 'LayerUtility: PurgeVRAM V2', 'SimpleMath+', 'StringToCombo|LP', 'SystemNotification|pysssss', 'easy float', 'easy globalSeed', 'easy ifElse', 'easy imageSize', 'easy indexAnything', 'easy int', 'easy showAnything', 'easy stringToIntList']
+[comfyapp] missing workflow nodes after repair: ['Any Switch (rgthree)', 'Anything Everywhere', 'CacheDiT_Model_Optimizer', 'ClownsharKSampler_Beta', 'Image Comparer (rgthree)', 'ImpactIfNone', 'ImpactSwitch', 'JoinStrings', 'LGNoiseInjectionLatent', 'LayerUtility: PurgeVRAM V2', 'SimpleMath+', 'StringToCombo|LP', 'SystemNotification|pysssss', 'easy float', 'easy globalSeed', 'easy ifElse', 'easy imageSize', 'easy indexAnything', 'easy int', 'easy showAnything', 'easy stringToIntList']
+Traceback (most recent call last):
+  File "/root/comfyapp.py", line 5685, in _exec
+    _r = self._execute_in_process(workflow, input_images or {}, trace=server_trace)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/comfyapp.py", line 3137, in _execute_in_process
+    raise RuntimeError(f"Workflow validation failed: {'; '.join(parts)}")
+RuntimeError: Workflow validation failed: Node 'Join Strings' not found. The custom node may not be installed.

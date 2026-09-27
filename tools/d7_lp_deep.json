@@ -1,0 +1,4169 @@
+{
+  "meta": {
+    "device_kind": "cuda",
+    "capability": [
+      8,
+      6
+    ],
+    "torch_version": "2.8.0+cu128",
+    "python_version": "3.11.9",
+    "comfy_version": "unknown",
+    "seed": 1234,
+    "max_length": 77,
+    "batch": 1,
+    "mode": "deep",
+    "repeats": 3,
+    "warmup": 3
+  },
+  "arms": [
+    {
+      "arm": "P0A",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32",
+      "resident_dtype": "fp16",
+      "mechanism": "cast_every_forward",
+      "cast_policy": "cast_every_forward",
+      "tf32": false
+    },
+    {
+      "arm": "P0B",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32",
+      "resident_dtype": "fp32",
+      "mechanism": "no_cast",
+      "cast_policy": "resident",
+      "tf32": false
+    },
+    {
+      "arm": "P1A",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32_tf32",
+      "resident_dtype": "fp16",
+      "mechanism": "cast_every_forward",
+      "cast_policy": "cast_every_forward",
+      "tf32": true
+    },
+    {
+      "arm": "P1B",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32_tf32",
+      "resident_dtype": "fp32",
+      "mechanism": "no_cast",
+      "cast_policy": "resident",
+      "tf32": true
+    },
+    {
+      "arm": "P2A",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16",
+      "resident_dtype": "fp16",
+      "mechanism": "cast_every_forward",
+      "cast_policy": "cast_every_forward",
+      "tf32": false
+    },
+    {
+      "arm": "P2B",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16",
+      "resident_dtype": "bf16",
+      "mechanism": "no_cast",
+      "cast_policy": "resident",
+      "tf32": false
+    },
+    {
+      "arm": "P3A",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp16",
+      "resident_dtype": "fp32",
+      "mechanism": "cast_every_forward",
+      "cast_policy": "cast_every_forward",
+      "tf32": false
+    },
+    {
+      "arm": "P3B",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp16",
+      "resident_dtype": "fp16",
+      "mechanism": "no_cast",
+      "cast_policy": "resident",
+      "tf32": false
+    },
+    {
+      "arm": "P0",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32",
+      "resident_dtype": null,
+      "mechanism": "autocast_legacy",
+      "cast_policy": "autocast",
+      "tf32": false
+    },
+    {
+      "arm": "P1",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp32_tf32",
+      "resident_dtype": null,
+      "mechanism": "autocast_legacy",
+      "cast_policy": "autocast",
+      "tf32": true
+    },
+    {
+      "arm": "P2",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16",
+      "resident_dtype": null,
+      "mechanism": "autocast_legacy",
+      "cast_policy": "autocast",
+      "tf32": false
+    },
+    {
+      "arm": "P3",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "fp16",
+      "resident_dtype": null,
+      "mechanism": "autocast_legacy",
+      "cast_policy": "autocast",
+      "tf32": false
+    },
+    {
+      "arm": "P4",
+      "status": "OK",
+      "reason": null,
+      "compute_dtype": "bf16",
+      "resident_dtype": null,
+      "mechanism": "autocast_legacy",
+      "cast_policy": "autocast",
+      "tf32": false
+    }
+  ],
+  "fixtures": {
+    "xl_llm": {
+      "identity": {
+        "fixture": "xl_llm",
+        "class": [
+          "SDClipModel"
+        ],
+        "param_count": 847726849,
+        "resident_dtype": "torch.float16",
+        "token_count": 77,
+        "batch": 1,
+        "device": "cuda:0",
+        "params_off_device": [],
+        "wrapper_status": null,
+        "tokenize_mode": "synthetic",
+        "shrunk_layers": 0,
+        "configured_layers": 32
+      },
+      "arms": {
+        "P0A": {
+          "identity": {
+            "class": [
+              "SDClipModel"
+            ],
+            "param_count": 847726849,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "fp32",
+            "arm_resident_dtype": "fp16",
+            "mechanism": "cast_every_forward",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": null,
+            "one_time_resident_convert_ms": 0.0,
+            "load_reentry_wall_ms": 19.273899999916466,
+            "forward_wall_median_ms": 44.082999999773165,
+            "forward_wall_mean_ms": 45.58979999986453,
+            "forward_wall_std_ms": 3.512678802666932,
+            "forward_cuda_event_median_ms": 44.066078186035156,
+            "forward_cuda_event_mean_ms": 45.57322565714518,
+            "forward_cuda_event_std_ms": 3.51596506454329,
+            "forward_wall_ms_list": [
+              49.6045,
+              43.0819,
+              44.083
+            ],
+            "forward_cuda_event_ms_list": [
+              49.5915,
+              43.0621,
+              44.0661
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 44.082999999773165
+          },
+          "casting": {
+            "cast_op_count": 225,
+            "cast_bytes": 1695154176,
+            "cast_materialized_count": 224,
+            "cast_materialized_bytes": 3095396352,
+            "cast_wall_ms": 45.08829999986119,
+            "per_forward_weight_rematerialization": true,
+            "per_forward_weight_materialized": true,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 1703973888,
+            "allocated_after": 1703973888,
+            "peak_allocated": 1728334848,
+            "reserved_before": 1914699776,
+            "reserved_after": 1914699776
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "validity": {
+            "valid": true,
+            "gated": true,
+            "requested_compute_dtype": "torch.float32",
+            "actual_linear_input_dtype": "torch.float32",
+            "actual_weight_compute_dtype_seen": "torch.float32",
+            "manual_cast_dtype_during_arm": "torch.float32",
+            "allow_tf32_during_arm": false,
+            "sdpa_input_dtype_observed": "torch.float32",
+            "sdpa_flash_capable": false,
+            "checks": {
+              "linear_input_dtype": true,
+              "weight_compute_dtype": true,
+              "manual_cast_dtype": true,
+              "tf32_enabled": true
+            },
+            "observed_linear_input_dtypes": [
+              "torch.float32"
+            ],
+            "observed_weight_dtypes": [
+              "torch.float32"
+            ]
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 1.0728836059570312e-06,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 7,
+              "cpu_us": 2346.699999999828,
+              "cuda_us": 20203.840000000055
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 862.2999999999702,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 1,
+              "cpu_us": 1157.4000000000979,
+              "cuda_us": 0.0
+            },
+            "ACTIVATION": {
+              "count": 2,
+              "cpu_us": 332.79999999996653,
+              "cuda_us": 154.75400000002628
+            },
+            "COPY": {
+              "count": 13,
+              "cpu_us": 5488.500000000169,
+              "cuda_us": 26551.08999999996
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 3989.800000000003,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 71,
+              "cpu_us": 39944.399999999754,
+              "cuda_us": 26244.616000000235
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.float32"
+              ]
+            },
+            "linear_input_dtypes_global": [
+              "torch.float32"
+            ],
+            "actual_linear_input_dtype": "torch.float32",
+            "actual_weight_compute_dtype_seen": "torch.float32",
+            "weight_dtypes_global": [
+              "torch.float32"
+            ],
+            "cast_pairs": [
+              [
+                "Embedding",
+                null,
+                "torch.float16"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ]
+            ],
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": null
+            },
+            "cast_op_count": 225,
+            "cast_bytes": 1695154176,
+            "cast_materialized_count": 224,
+            "cast_materialized_bytes": 3095396352,
+            "cast_wall_ms": 45.08829999986119,
+            "requested_compute_dtype": "torch.float32"
+          }
+        },
+        "P0B": {
+          "identity": {
+            "class": [
+              "SDClipModel"
+            ],
+            "param_count": 847726849,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "fp32",
+            "arm_resident_dtype": "fp32",
+            "mechanism": "no_cast",
+            "actual_activation_dtype": {
+              "Linear": "torch.float32"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": null,
+            "one_time_resident_convert_ms": 64.8218999999699,
+            "load_reentry_wall_ms": 5.786599999737518,
+            "forward_wall_median_ms": 32.39389999998821,
+            "forward_wall_mean_ms": 32.27716666666917,
+            "forward_wall_std_ms": 0.27430822680405864,
+            "forward_cuda_event_median_ms": 32.379329681396484,
+            "forward_cuda_event_mean_ms": 32.26071548461914,
+            "forward_cuda_event_std_ms": 0.2747721667684774,
+            "forward_wall_ms_list": [
+              32.4738,
+              32.3939,
+              31.9638
+            ],
+            "forward_cuda_event_ms_list": [
+              32.4563,
+              32.3793,
+              31.9466
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 32.39389999998821
+          },
+          "casting": {
+            "cast_op_count": 225,
+            "cast_bytes": 3390308352,
+            "cast_materialized_count": 0,
+            "cast_materialized_bytes": 0,
+            "cast_wall_ms": 35.26130000000194,
+            "per_forward_weight_rematerialization": true,
+            "per_forward_weight_materialized": false,
+            "manual_cast_dtype": "torch.float32",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 5137611264,
+            "allocated_after": 5137611264,
+            "peak_allocated": 5143097856,
+            "reserved_before": 5786042368,
+            "reserved_after": 5786042368
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "validity": {
+            "valid": true,
+            "gated": true,
+            "requested_compute_dtype": "torch.float32",
+            "actual_linear_input_dtype": "torch.float32",
+            "actual_weight_compute_dtype_seen": "torch.float32",
+            "manual_cast_dtype_during_arm": "torch.float32",
+            "allow_tf32_during_arm": false,
+            "sdpa_input_dtype_observed": "torch.float32",
+            "sdpa_flash_capable": false,
+            "checks": {
+              "linear_input_dtype": true,
+              "weight_compute_dtype": true,
+              "manual_cast_dtype": true,
+              "tf32_enabled": true
+            },
+            "observed_linear_input_dtypes": [
+              "torch.float32"
+            ],
+            "observed_weight_dtypes": [
+              "torch.float32"
+            ]
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 1.0728836059570312e-06,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 7,
+              "cpu_us": 1769.9000000000447,
+              "cuda_us": 20704.933000000063
+            },
+            "ATTENTION": {
+              "count": 2,
+              "cpu_us": 652.4999999999663,
+              "cuda_us": 0.0
+            },
+            "NORM": {
+              "count": 1,
+              "cpu_us": 1001.199999999995,
+              "cuda_us": 0.0
+            },
+            "ACTIVATION": {
+              "count": 2,
+              "cpu_us": 290.4999999999959,
+              "cuda_us": 155.3300000000363
+            },
+            "COPY": {
+              "count": 13,
+              "cpu_us": 2319.6000000000836,
+              "cuda_us": 560.0760000000007
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 25.500000000001478,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 71,
+              "cpu_us": 30068.699999999877,
+              "cuda_us": 26749.90899999993
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.float32"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.float32"
+              ]
+            },
+            "linear_input_dtypes_global": [
+              "torch.float32"
+            ],
+            "actual_linear_input_dtype": "torch.float32",
+            "actual_weight_compute_dtype_seen": "torch.float32",
+            "weight_dtypes_global": [
+              "torch.float32"
+            ],
+            "cast_pairs": [
+              [
+                "Embedding",
+                null,
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ],
+              [
+                "Linear",
+                "torch.float32",
+                "torch.float32"
+              ]
+            ],
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": null
+            },
+            "cast_op_count": 225,
+            "cast_bytes": 3390308352,
+            "cast_materialized_count": 0,
+            "cast_materialized_bytes": 0,
+            "cast_wall_ms": 35.26130000000194,
+            "requested_compute_dtype": "torch.float32"
+          }
+        },
+        "P2B": {
+          "identity": {
+            "class": [
+              "SDClipModel"
+            ],
+            "param_count": 847726849,
+            "resident_dtype": "torch.float16",
+            "actual_parameter_dtype": "torch.float16",
+            "token_count": 77,
+            "batch": 1,
+            "device": "cuda",
+            "attention_function": "attention_pytorch",
+            "requested_compute_dtype": "bf16",
+            "arm_resident_dtype": "bf16",
+            "mechanism": "no_cast",
+            "actual_activation_dtype": {
+              "Linear": "torch.bfloat16"
+            }
+          },
+          "timing": {
+            "tokenize_wall_ms": null,
+            "one_time_resident_convert_ms": 30.07630000001882,
+            "load_reentry_wall_ms": 20.349099999748432,
+            "forward_wall_median_ms": 35.61740000031932,
+            "forward_wall_mean_ms": 36.66736666688545,
+            "forward_wall_std_ms": 1.866778943430593,
+            "forward_cuda_event_median_ms": 35.60051345825195,
+            "forward_cuda_event_mean_ms": 36.645941416422524,
+            "forward_cuda_event_std_ms": 1.8673309918945231,
+            "forward_wall_ms_list": [
+              35.562,
+              35.6174,
+              38.8227
+            ],
+            "forward_cuda_event_ms_list": [
+              35.5355,
+              35.6005,
+              38.8018
+            ],
+            "post_forward_ms": 0.0,
+            "total_encode_ms": 35.61740000031932
+          },
+          "casting": {
+            "cast_op_count": 225,
+            "cast_bytes": 1695154176,
+            "cast_materialized_count": 0,
+            "cast_materialized_bytes": 0,
+            "cast_wall_ms": 40.524200000163546,
+            "per_forward_weight_rematerialization": true,
+            "per_forward_weight_materialized": false,
+            "manual_cast_dtype": "torch.bfloat16",
+            "force_cast_weights": true
+          },
+          "cuda": {
+            "allocated_before": 3431409664,
+            "allocated_after": 3431409664,
+            "peak_allocated": 3435426304,
+            "reserved_before": 5913968640,
+            "reserved_after": 5913968640
+          },
+          "classification": {
+            "status": "OK",
+            "reason": null
+          },
+          "validity": {
+            "valid": true,
+            "gated": true,
+            "requested_compute_dtype": "torch.bfloat16",
+            "actual_linear_input_dtype": "torch.bfloat16",
+            "actual_weight_compute_dtype_seen": "torch.bfloat16",
+            "manual_cast_dtype_during_arm": "torch.bfloat16",
+            "allow_tf32_during_arm": false,
+            "sdpa_input_dtype_observed": "torch.bfloat16",
+            "sdpa_flash_capable": true,
+            "checks": {
+              "linear_input_dtype": true,
+              "weight_compute_dtype": true,
+              "manual_cast_dtype": true,
+              "tf32_enabled": true
+            },
+            "observed_linear_input_dtypes": [
+              "torch.bfloat16"
+            ],
+            "observed_weight_dtypes": [
+              "torch.bfloat16"
+            ]
+          },
+          "torch_globals_before": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "torch_globals_after": {
+            "cuda_matmul_allow_tf32": false,
+            "cudnn_allow_tf32": true,
+            "autocast_cuda_enabled": false,
+            "autocast_cpu_enabled": false,
+            "float32_matmul_precision": "highest",
+            "autocast_cuda_dtype": "torch.float16"
+          },
+          "stability": {
+            "cond_max_cosine_deviation": 8.761882781982422e-06,
+            "repeats": 3
+          },
+          "deep": {
+            "GEMM": {
+              "count": 6,
+              "cpu_us": 1661.999999999908,
+              "cuda_us": 7552.1239999999725
+            },
+            "ATTENTION": {
+              "count": 3,
+              "cpu_us": 725.3000000000034,
+              "cuda_us": 333.37900000000855
+            },
+            "NORM": {
+              "count": 1,
+              "cpu_us": 875.6000000000072,
+              "cuda_us": 0.0
+            },
+            "ACTIVATION": {
+              "count": 2,
+              "cpu_us": 264.9999999999636,
+              "cuda_us": 147.64999999994325
+            },
+            "COPY": {
+              "count": 14,
+              "cpu_us": 3219.600000000015,
+              "cuda_us": 1256.8419999999169
+            },
+            "SYNC": {
+              "count": 2,
+              "cpu_us": 105.49999999999864,
+              "cuda_us": 0.0
+            },
+            "OTHER": {
+              "count": 69,
+              "cpu_us": 29740.700000000004,
+              "cuda_us": 12390.046999999882
+            }
+          },
+          "structure": {
+            "warmup_repeats": 3,
+            "timed_repeats": 3,
+            "total_encode_calls": 6
+          },
+          "_restored": true,
+          "verification": {
+            "activation_dtype_by_linear_class": {
+              "Linear": "torch.bfloat16"
+            },
+            "linear_input_dtypes_seen": {
+              "Linear": [
+                "torch.bfloat16"
+              ]
+            },
+            "linear_input_dtypes_global": [
+              "torch.bfloat16"
+            ],
+            "actual_linear_input_dtype": "torch.bfloat16",
+            "actual_weight_compute_dtype_seen": "torch.bfloat16",
+            "weight_dtypes_global": [
+              "torch.bfloat16"
+            ],
+            "cast_pairs": [
+              [
+                "Embedding",
+                null,
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ],
+              [
+                "Linear",
+                "torch.bfloat16",
+                "torch.bfloat16"
+              ]
+            ],
+            "output_dtypes": {
+              "cond": "torch.float32",
+              "pooled": null
+            },
+            "cast_op_count": 225,
+            "cast_bytes": 1695154176,
+            "cast_materialized_count": 0,
+            "cast_materialized_bytes": 0,
+            "cast_wall_ms": 40.524200000163546,
+            "requested_compute_dtype": "torch.bfloat16"
+          }
+        }
+      },
+      "correctness": {
+        "P0B": {
+          "class": "EXACT",
+          "cond": {
+            "shape_ref": [
+              1,
+              77,
+              2304
+            ],
+            "shape_cand": [
+              1,
+              77,
+              2304
+            ],
+            "shape_equal": true,
+            "nan_ref": 0,
+            "nan_cand": 0,
+            "inf_ref": 0,
+            "inf_cand": 0,
+            "finite_percentage": 100.0,
+            "max_abs_error": 0.0,
+            "mean_abs_error": 0.0,
+            "rms_error": 0.0,
+            "relative_error": 0.0,
+            "cosine_similarity": 1.000001072883606,
+            "class": "EXACT"
+          },
+          "pooled": {
+            "class": "UNSUPPORTED",
+            "reason": "encoder produces no pooled output"
+          }
+        },
+        "P2B": {
+          "class": "MATERIAL_DIFFERENCE",
+          "cond": {
+            "shape_ref": [
+              1,
+              77,
+              2304
+            ],
+            "shape_cand": [
+              1,
+              77,
+              2304
+            ],
+            "shape_equal": true,
+            "nan_ref": 0,
+            "nan_cand": 0,
+            "inf_ref": 0,
+            "inf_cand": 0,
+            "finite_percentage": 100.0,
+            "max_abs_error": 0.10238218307495117,
+            "mean_abs_error": 0.013928891159594059,
+            "rms_error": 0.01763116754591465,
+            "relative_error": 0.017507951701722327,
+            "cosine_similarity": 0.9998407959938049,
+            "class": "MATERIAL_DIFFERENCE"
+          },
+          "pooled": {
+            "class": "UNSUPPORTED",
+            "reason": "encoder produces no pooled output"
+          }
+        }
+      },
+      "stability": {
+        "P0A": {
+          "cond_max_cosine_deviation": 1.0728836059570312e-06,
+          "repeats": 3
+        },
+        "P0B": {
+          "cond_max_cosine_deviation": 1.0728836059570312e-06,
+          "repeats": 3
+        },
+        "P2B": {
+          "cond_max_cosine_deviation": 8.761882781982422e-06,
+          "repeats": 3
+        }
+      },
+      "status": "ok"
+    }
+  }
+}

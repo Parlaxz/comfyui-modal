@@ -1,0 +1,16 @@
+{
+  "attempt_id": "20260905T032342_b55a531d_c9_o03_clip_qd8",
+  "block_bytes": 33554432,
+  "block_mib": 32,
+  "campaign_index": 17,
+  "cell_id": "clip_qd8",
+  "classification": "DNF",
+  "error": "NotFoundError:Lookup failed for Function 'run_c9_recovery' from the 'sept-unetclip-c9-recovery-source-only' app: App 'sept-unetclip-c9-recovery-source-only' not found in environment 'main'.",
+  "model_name": "qwen_3_4b.safetensors",
+  "observation": 3,
+  "qd": 8,
+  "role": "clip",
+  "run_id": "20260905T032342_b55a531d",
+  "source_only": true,
+  "status": "error"
+}

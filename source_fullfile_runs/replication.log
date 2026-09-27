@@ -1,0 +1,170 @@
+[rep] start h100-r32-qd2-rep1
+[rep] start rtx-r32-qd2-rep1
+[rep] done rtx-r32-qd2-rep1 status=ok wall_ms=958.604967 gbps=8.392385106429352
+[rep] start rtx-r32-qd2-rep2
+[rep] done h100-r32-qd2-rep1 status=ok wall_ms=2152.687814 gbps=3.7371800944286853
+[rep] start h100-r32-qd2-rep2
+[rep] done rtx-r32-qd2-rep2 status=ok wall_ms=1482.049617 gbps=5.428281182842476
+[rep] start rtx-r32-qd2-rep3
+[rep] done h100-r32-qd2-rep2 status=ok wall_ms=2478.461425 gbps=3.2459581443757997
+[rep] start h100-r32-qd2-rep3
+[rep] done rtx-r32-qd2-rep3 status=ok wall_ms=1346.090186 gbps=5.976555012191435
+[rep] start rtx-r32-qd2-rep4
+[rep] done rtx-r32-qd2-rep4 status=ok wall_ms=1644.608078 gbps=4.891732051920518
+[rep] start rtx-r32-qd4-rep1
+[rep] done h100-r32-qd2-rep3 status=ok wall_ms=2716.055797 gbps=2.9620091225246648
+[rep] start h100-r32-qd2-rep4
+[rep] done rtx-r32-qd4-rep1 status=ok wall_ms=1075.000997 gbps=7.483697290003536
+[rep] start rtx-r32-qd4-rep2
+[rep] done h100-r32-qd2-rep4 status=ok wall_ms=1862.050348 gbps=4.320496519678425
+[rep] start h100-r32-qd4-rep1
+[rep] done rtx-r32-qd4-rep2 status=ok wall_ms=1155.815797 gbps=6.960436142922867
+[rep] start rtx-r32-qd4-rep3
+[rep] done h100-r32-qd4-rep1 status=ok wall_ms=1249.286441 gbps=6.439661701251106
+[rep] start h100-r32-qd4-rep2
+[rep] done rtx-r32-qd4-rep3 status=ok wall_ms=1286.926785 gbps=6.251312927642577
+[rep] start rtx-r32-qd4-rep4
+[rep] done rtx-r32-qd4-rep4 status=ok wall_ms=1349.907147 gbps=5.959655866611987
+[rep] start rtx-r32-qd8-rep1
+[rep] done rtx-r32-qd8-rep1 status=ok wall_ms=1252.350174 gbps=6.4239077975326735
+[rep] start rtx-r32-qd8-rep2
+[rep] done h100-r32-qd4-rep2 status=ok wall_ms=7088.018987 gbps=1.1350113568763214
+[rep] start h100-r32-qd4-rep3
+[rep] done rtx-r32-qd8-rep2 status=ok wall_ms=1555.001399 gbps=5.173617241227961
+[rep] start rtx-r32-qd8-rep3
+[rep] done h100-r32-qd4-rep3 status=ok wall_ms=1443.685923 gbps=5.572529259883903
+[rep] start h100-r32-qd4-rep4
+[rep] done rtx-r32-qd8-rep3 status=ok wall_ms=1594.289844 gbps=5.046122622104591
+[rep] start rtx-r32-qd8-rep4
+[rep] done rtx-r32-qd8-rep4 status=ok wall_ms=1479.148259 gbps=5.438928788273684
+[rep] start rtx-r64-qd2-rep1
+[rep] done h100-r32-qd4-rep4 status=ok wall_ms=1686.930747 gbps=4.769005522192903
+[rep] start h100-r32-qd8-rep1
+[rep] done rtx-r64-qd2-rep1 status=ok wall_ms=1255.747045 gbps=6.406530742025358
+[rep] start rtx-r64-qd2-rep2
+[rep] done h100-r32-qd8-rep1 status=ok wall_ms=1727.857245 gbps=4.656045556587634
+[rep] start h100-r32-qd8-rep2
+[rep] done rtx-r64-qd2-rep2 status=ok wall_ms=1015.304565 gbps=7.923713066334926
+[rep] start rtx-r64-qd2-rep3
+[rep] done rtx-r64-qd2-rep3 status=ok wall_ms=1212.26051 gbps=6.636347535563951
+[rep] start rtx-r64-qd2-rep4
+[rep] done rtx-r64-qd2-rep4 status=ok wall_ms=1122.834861 gbps=7.164884461135376
+[rep] start rtx-r64-qd4-rep1
+[rep] done h100-r32-qd8-rep2 status=ok wall_ms=7668.894123 gbps=1.0490406985633123
+[rep] start h100-r32-qd8-rep3
+[rep] done rtx-r64-qd4-rep1 status=ok wall_ms=966.325075 gbps=8.325337152200051
+[rep] start rtx-r64-qd4-rep2
+[rep] done rtx-r64-qd4-rep2 status=ok wall_ms=1647.674162 gbps=4.882629244021611
+[rep] start rtx-r64-qd4-rep3
+[rep] done rtx-r64-qd4-rep3 status=ok wall_ms=828.947115 gbps=9.705060675674105
+[rep] start rtx-r64-qd4-rep4
+[rep] done h100-r32-qd8-rep3 status=ok wall_ms=6804.140688 gbps=1.1823656236544884
+[rep] start h100-r32-qd8-rep4
+[rep] done rtx-r64-qd4-rep4 status=ok wall_ms=1113.183972 gbps=7.227001331636132
+[rep] start rtx-r64-qd8-rep1
+[rep] done rtx-r64-qd8-rep1 status=ok wall_ms=1410.914977 gbps=5.701960911284592
+[rep] start rtx-r64-qd8-rep2
+[rep] done rtx-r64-qd8-rep2 status=ok wall_ms=1554.665326 gbps=5.17473562538308
+[rep] start rtx-r64-qd8-rep3
+[rep] done h100-r32-qd8-rep4 status=ok wall_ms=6843.750452 gbps=1.1755224133938074
+[rep] start h100-r64-qd2-rep1
+[rep] done rtx-r64-qd8-rep3 status=ok wall_ms=1574.239435 gbps=5.1103929104659995
+[rep] start rtx-r64-qd8-rep4
+[rep] done rtx-r64-qd8-rep4 status=ok wall_ms=1650.184753 gbps=4.875200812135973
+[rep] start rtx-r128-qd2-rep1
+[rep] done h100-r64-qd2-rep1 status=ok wall_ms=1961.486523 gbps=4.101471997725268
+[rep] start h100-r64-qd2-rep2
+[rep] done rtx-r128-qd2-rep1 status=ok wall_ms=1132.149359 gbps=7.105937025045827
+[rep] start rtx-r128-qd2-rep2
+[rep] done h100-r64-qd2-rep2 status=ok wall_ms=1797.581199 gbps=4.475448481812921
+[rep] start h100-r64-qd2-rep3
+[rep] done rtx-r128-qd2-rep2 status=ok wall_ms=1027.259553 gbps=7.8314988889667685
+[rep] start rtx-r128-qd2-rep3
+[rep] done rtx-r128-qd2-rep3 status=ok wall_ms=1172.752991 gbps=6.859911771480615
+[rep] start rtx-r128-qd2-rep4
+[rep] done h100-r64-qd2-rep3 status=ok wall_ms=2036.900328 gbps=3.9496198893046675
+[rep] start h100-r64-qd2-rep4
+[rep] done rtx-r128-qd2-rep4 status=ok wall_ms=1257.948625 gbps=6.395318447921512
+[rep] start rtx-r128-qd4-rep1
+[rep] done h100-r64-qd2-rep4 status=ok wall_ms=1923.777297 gbps=4.181867652012322
+[rep] start h100-r64-qd4-rep1
+[rep] done rtx-r128-qd4-rep1 status=ok wall_ms=1330.250629 gbps=6.047719033252944
+[rep] start rtx-r128-qd4-rep2
+[rep] done rtx-r128-qd4-rep2 status=ok wall_ms=1201.41965 gbps=6.696229787818103
+[rep] start rtx-r128-qd4-rep3
+[rep] done rtx-r128-qd4-rep3 status=ok wall_ms=1338.903189 gbps=6.008636109089139
+[rep] start rtx-r128-qd4-rep4
+[rep] done rtx-r128-qd4-rep4 status=ok wall_ms=989.587021 gbps=8.129635774598544
+[rep] start rtx-r128-qd8-rep1
+[rep] done rtx-r128-qd8-rep1 status=ok wall_ms=1643.208251 gbps=4.895899252638307
+[rep] start rtx-r128-qd8-rep2
+[rep] done h100-r64-qd4-rep1 status=ok wall_ms=10492.909026 gbps=0.7667065470657974
+[rep] start h100-r64-qd4-rep2
+[rep] done rtx-r128-qd8-rep2 status=ok wall_ms=1270.035495 gbps=6.334454493336818
+[rep] start rtx-r128-qd8-rep3
+[rep] done rtx-r128-qd8-rep3 status=ok wall_ms=1651.734141 gbps=4.870627692619693
+[rep] start rtx-r128-qd8-rep4
+[rep] done rtx-r128-qd8-rep4 status=ok wall_ms=1620.236351 gbps=4.965313883394041
+[rep] start rtx-r256-qd2-rep1
+[rep] done h100-r64-qd4-rep2 status=ok wall_ms=7648.504922 gbps=1.051837206100186
+[rep] start h100-r64-qd4-rep3
+[rep] done rtx-r256-qd2-rep1 status=ok wall_ms=1071.652797 gbps=7.507078851024545
+[rep] start rtx-r256-qd2-rep2
+[rep] done rtx-r256-qd2-rep2 status=ok wall_ms=1027.597754 gbps=7.828921401087454
+[rep] start rtx-r256-qd2-rep3
+[rep] done h100-r64-qd4-rep3 status=ok wall_ms=1326.780467 gbps=6.0635366951027025
+[rep] start h100-r64-qd4-rep4
+[rep] done rtx-r256-qd2-rep3 status=ok wall_ms=1221.414018 gbps=6.5866134901359885
+[rep] start rtx-r256-qd2-rep4
+[rep] done h100-r64-qd4-rep4 status=ok wall_ms=1336.46931 gbps=6.019578592493081
+[rep] start h100-r64-qd8-rep1
+[rep] done rtx-r256-qd2-rep4 status=ok wall_ms=1137.004923 gbps=7.075591217998623
+[rep] start rtx-r256-qd4-rep1
+[rep] done h100-r64-qd8-rep1 status=ok wall_ms=1540.536509 gbps=5.2221949957045775
+[rep] start h100-r64-qd8-rep2
+[rep] done rtx-r256-qd4-rep1 status=ok wall_ms=1281.366224 gbps=6.278440852675385
+[rep] start rtx-r256-qd4-rep2
+[rep] done rtx-r256-qd4-rep2 status=ok wall_ms=1119.724631 gbps=7.184786174450065
+[rep] start rtx-r256-qd4-rep3
+[rep] done rtx-r256-qd4-rep3 status=ok wall_ms=1228.065238 gbps=6.550940291333285
+[rep] start rtx-r256-qd4-rep4
+[rep] done h100-r64-qd8-rep2 status=ok wall_ms=6871.550612 gbps=1.1707666147362432
+[rep] start h100-r64-qd8-rep3
+[rep] done rtx-r256-qd4-rep4 status=ok wall_ms=1188.318262 gbps=6.77005673081207
+[rep] start rtx-r256-qd8-rep1
+[rep] done h100-r64-qd8-rep3 status=ok wall_ms=1798.426667 gbps=4.473344504738708
+[rep] start h100-r64-qd8-rep4
+[rep] done rtx-r256-qd8-rep1 status=ok wall_ms=1419.628549 gbps=5.6669627091304715
+[rep] start rtx-r256-qd8-rep2
+[rep] done h100-r64-qd8-rep4 status=ok wall_ms=1645.978355 gbps=4.887659684929454
+[rep] start h100-r128-qd2-rep1
+[rep] done h100-r128-qd2-rep1 status=ok wall_ms=2050.087379 gbps=3.92421422150514
+[rep] start h100-r128-qd2-rep2
+[rep] done h100-r128-qd2-rep2 status=ok wall_ms=2142.142423 gbps=3.755577575805286
+[rep] start h100-r128-qd2-rep3
+[rep] done h100-r128-qd2-rep3 status=ok wall_ms=1974.110505 gbps=4.075244028955714
+[rep] start h100-r128-qd2-rep4
+[rep] done rtx-r256-qd8-rep2 status=ok wall_ms=1365.072529 gbps=5.893446595027039
+[rep] start rtx-r256-qd8-rep3
+[rep] done h100-r128-qd2-rep4 status=ok wall_ms=2175.252996 gbps=3.698412121621553
+[rep] start h100-r128-qd4-rep1
+[rep] done rtx-r256-qd8-rep3 status=ok wall_ms=1280.799839 gbps=6.281217254275435
+[rep] start rtx-r256-qd8-rep4
+[rep] done rtx-r256-qd8-rep4 status=ok wall_ms=1470.069868 gbps=5.472516798772996
+[rep] family rtx finished (48 records)
+[rep] done h100-r128-qd4-rep1 status=ok wall_ms=1336.772262 gbps=6.018214378538624
+[rep] start h100-r128-qd4-rep2
+[rep] done h100-r128-qd4-rep2 status=ok wall_ms=1537.314567 gbps=5.233139801504269
+[rep] start h100-r128-qd4-rep3
+[rep] done h100-r128-qd4-rep3 status=ok wall_ms=1586.245737 gbps=5.071712320699526
+[rep] start h100-r128-qd4-rep4
+[rep] done h100-r128-qd4-rep4 status=ok wall_ms=1589.718636 gbps=5.060632659023568
+[rep] start h100-r128-qd8-rep1
+[rep] done h100-r128-qd8-rep1 status=ok wall_ms=2366.469287 gbps=3.3995717130978345
+[rep] start h100-r128-qd8-rep2
+[rep] done h100-r128-qd8-rep2 status=ok wall_ms=1850.869818 gbps=4.3465952979303495
+[rep] start h100-r128-qd8-rep3
+[rep] done h100-r128-qd8-rep3 status=ok wall_ms=31220.824972 gbps=0.2576799958109704
+[rep] start h100-r128-qd8-rep4
+[rep] done h100-r128-qd8-rep4 status=ok wall_ms=1872.812359 gbps=4.295669029168341
+[rep] family h100 finished (36 records)

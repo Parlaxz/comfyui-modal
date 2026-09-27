@@ -1,0 +1,176 @@
+﻿{
+    "reference_head":  "fe05aa7eadd06281ca8501a19aa38065fbd5999f",
+    "captured_at_utc":  "2026-07-17T22:00:19.9921636Z",
+    "source_files":  [
+                         {
+                             "path":  "comfyapp.py",
+                             "sha256":  "95080343f8b12e9a2dd015c423e88b8fa18a651ae575f593d7f7b265496fd34c",
+                             "reference":  "reference\\runtime-migration\\source\\comfyapp.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "__init__.py",
+                             "sha256":  "31c3788b5c9a12aa969c0862bc249275bd8682f294c41305c6ba1ae9666dedc2",
+                             "reference":  "reference\\runtime-migration\\source\\__init__.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "canonical_execution.py",
+                             "sha256":  "9528ca1b877c8c60d184cc69b48be4dfab748a56a3e176c2048bac291b120e8d",
+                             "reference":  "reference\\runtime-migration\\source\\canonical_execution.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "modal_client.py",
+                             "sha256":  "60c32d84d85e52f839a2acf2a412e73bedda3714b575ef8628f663aa9177661e",
+                             "reference":  "reference\\runtime-migration\\source\\modal_client.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "warmup_profile.py",
+                             "sha256":  "9b30a91afac92aa2f1a2a0e95217c6d429fb5a5894ed6b8663539d7d5390c34e",
+                             "reference":  "reference\\runtime-migration\\source\\warmup_profile.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "optimizations.py",
+                             "sha256":  "ab316aa94320247ddba87ef234f4699be329d7018be7e0901fea56375a6a8661",
+                             "reference":  "reference\\runtime-migration\\source\\optimizations.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "run_prompt_options.py",
+                             "sha256":  "085c6b44358f7545d8af781665cc7a826afa1e1612945ebf94a146af03ac8805",
+                             "reference":  "reference\\runtime-migration\\source\\run_prompt_options.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "deploy_warmup.py",
+                             "sha256":  "32e8697601261be46be9f7a079b885b8f75573c51bf94e166731587765a4843a",
+                             "reference":  "reference\\runtime-migration\\source\\deploy_warmup.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "deployment_guard.py",
+                             "sha256":  "63890aeadcc328f6f8ecbad354a59083af62727c11071620198a0ce8adb01d07",
+                             "reference":  "reference\\runtime-migration\\source\\deployment_guard.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "studio_run_adapter.py",
+                             "sha256":  "fa0431ce2617e84a001395bff999d9cfcb71aaa7416ff62ab167c95e784ceaac",
+                             "reference":  "reference\\runtime-migration\\source\\studio_run_adapter.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "studio_routes.py",
+                             "sha256":  "8c2bee364cc1cc9a1f6154861bd8eff122cfa9d0a01f9bc659d96b1939e97a42",
+                             "reference":  "reference\\runtime-migration\\source\\studio_routes.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "timing_trace.py",
+                             "sha256":  "334fe60d82d88c59f0bacff3e2c33926530711891a7598ee74dae46e0a8d514d",
+                             "reference":  "reference\\runtime-migration\\source\\timing_trace.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "profiler_trace_v4.py",
+                             "sha256":  "13fdda673138c706fd3dab5e77a7c00eb91f8851652646eb20c1a68261b1d51a",
+                             "reference":  "reference\\runtime-migration\\source\\profiler_trace_v4.py.ref",
+                             "tracked":  true
+                         },
+                         {
+                             "path":  "wall_clock_trace_v3.py",
+                             "sha256":  "7065c8eb9c59b8257f2d7ca655c2efb616938a5812d1ce0cfe1667229a5c372e",
+                             "reference":  "reference\\runtime-migration\\source\\wall_clock_trace_v3.py.ref",
+                             "tracked":  true
+                         }
+                     ],
+    "archived_artifacts":  [
+                               {
+                                   "path":  "comfyapp.py.v21610_backup",
+                                   "sha256":  "3ffc3fa653d1f380b5eac6d0911fe3aa2ba9400f2654ea1bef7600778c44b490",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\comfyapp.py.v21610_backup"
+                               },
+                               {
+                                   "path":  "production_workflow.py.v21610_backup",
+                                   "sha256":  "22d2fcc6b6d199a140359f6f2f99eb7bae491653386790afc3ed63f1eb77a060",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\production_workflow.py.v21610_backup"
+                               },
+                               {
+                                   "path":  "before_v2_16_21_staged.patch",
+                                   "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_21_staged.patch"
+                               },
+                               {
+                                   "path":  "before_v2_16_21_full.patch",
+                                   "sha256":  "ff713ea5bc467bd6fb92b496ca99fff964cb75cd0ebb05758adece072cf58be4",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_21_full.patch"
+                               },
+                               {
+                                   "path":  "before_v2_16_20_unstaged.patch",
+                                   "sha256":  "3f400b0440a0347a4d4b56b9e0ae1d181dead5c6fd82c40910cb2728be17d07f",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_20_unstaged.patch"
+                               },
+                               {
+                                   "path":  "before_v2_16_20_status.txt",
+                                   "sha256":  "6f93e704ade4ac994407e2be832c0ffe14ce036e5c22a9fd27180150561f190f",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_20_status.txt"
+                               },
+                               {
+                                   "path":  "before_v2_16_20_staged.patch",
+                                   "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_20_staged.patch"
+                               },
+                               {
+                                   "path":  "before_v2_16_20_full.patch",
+                                   "sha256":  "3f400b0440a0347a4d4b56b9e0ae1d181dead5c6fd82c40910cb2728be17d07f",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_20_full.patch"
+                               },
+                               {
+                                   "path":  "before_v2_16_21_status.txt",
+                                   "sha256":  "ae0e36d883627313b24ef51669d8c79da54c07ce6ce6015160cf153894e85116",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_21_status.txt"
+                               },
+                               {
+                                   "path":  "before_v2_16_21_unstaged.patch",
+                                   "sha256":  "ff713ea5bc467bd6fb92b496ca99fff964cb75cd0ebb05758adece072cf58be4",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\before_v2_16_21_unstaged.patch"
+                               },
+                               {
+                                   "path":  "_trace_debug.log",
+                                   "sha256":  "624fd836c46042bb2289b179c01c5e4a612e3a415915b9f2e264216dc431c387",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\_trace_debug.log"
+                               },
+                               {
+                                   "path":  "_trace_dbg.log",
+                                   "sha256":  "8a8c7f672d61392a30d6eec9727c151ae949b5780db4d67cf7a31fb7d571a5fb",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\_trace_dbg.log"
+                               },
+                               {
+                                   "path":  "_deploy_output.log",
+                                   "sha256":  "a502cb6851092e7baaff5f42dae27919cc7fc54b1cffcfbc7678974251730197",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\_deploy_output.log"
+                               },
+                               {
+                                   "path":  "_last_trace_result.json",
+                                   "sha256":  "b36a371cc5977591f5f91e6e2d5ff4fb725400cdb76a2241504b8b82f9bf6d25",
+                                   "tracked":  true,
+                                   "archived_copy":  "reference\\runtime-migration\\archive\\_last_trace_result.json"
+                               }
+                           ]
+}

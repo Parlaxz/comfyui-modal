@@ -1,0 +1,240 @@
+{
+  "answers": [
+    {
+      "answer": "A: median wall 1.877143 s, mean wall 2.131800 s, fastest wall 1.521959 s; median 6.586236 GB/s, mean 6.218580 GB/s, fastest 8.088174 GB/s. Raw: results_real_unet_validation/raw/real_unet_validation_v1-A1-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-A2-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-A3-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-A4-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-A5-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-A6-attempt001.json.",
+      "number": 1
+    },
+    {
+      "answer": "B: median wall 2.492133 s, mean wall 2.400294 s, fastest wall 1.825540 s; median 4.940542 GB/s, mean 5.205899 GB/s, fastest 6.743137 GB/s. Raw: results_real_unet_validation/raw/real_unet_validation_v1-B1-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-B2-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-B3-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-B4-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-B5-attempt001.json, results_real_unet_validation/raw/real_unet_validation_v1-B6-attempt001.json.",
+      "number": 2
+    },
+    {
+      "answer": "B median improvement over A: wall saved -0.614990 s (-32.762018%); throughput gain -1.645694 GB/s (-24.986868%).",
+      "number": 3
+    },
+    {
+      "answer": "B process startup median: 0.101424 s.",
+      "number": 4
+    },
+    {
+      "answer": "No; A is faster than B by median wall time, so multiprocessing does not win.",
+      "number": 5
+    },
+    {
+      "answer": "B median wall improvement is -32.762018%: A wins (B is slower).",
+      "number": 6
+    },
+    {
+      "answer": "No; do not advance B to a final-RAM/H2D integration test because A wins the real-model read.",
+      "number": 7
+    }
+  ],
+  "arms": {
+    "A": {
+      "arm": "A",
+      "complete": true,
+      "fastest_gb_per_s": 8.088173512277544,
+      "fastest_wall_s": 1.521958744,
+      "mean_gb_per_s": 6.218579779861163,
+      "mean_wall_s": 2.1318003813333335,
+      "median_gb_per_s": 6.586236111037669,
+      "median_startup_wall_s": 0.0,
+      "median_wall_s": 1.8771431275000001,
+      "n": 6,
+      "raw_paths": [
+        "results_real_unet_validation/raw/real_unet_validation_v1-A1-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-A2-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-A3-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-A4-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-A5-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-A6-attempt001.json"
+      ]
+    },
+    "B": {
+      "arm": "B",
+      "complete": true,
+      "fastest_gb_per_s": 6.743136564190457,
+      "fastest_wall_s": 1.82554013,
+      "mean_gb_per_s": 5.205898798402331,
+      "mean_wall_s": 2.400293967,
+      "median_gb_per_s": 4.9405420017947685,
+      "median_startup_wall_s": 0.1014239705,
+      "median_wall_s": 2.4921331020000004,
+      "n": 6,
+      "raw_paths": [
+        "results_real_unet_validation/raw/real_unet_validation_v1-B1-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-B2-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-B3-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-B4-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-B5-attempt001.json",
+        "results_real_unet_validation/raw/real_unet_validation_v1-B6-attempt001.json"
+      ]
+    }
+  },
+  "attempt_count": 12,
+  "authority": {
+    "app_name": "workspace3-testing7-single-volume-parallelism-benchmark-v1",
+    "code_hash": {
+      "benchmark.py": "472ff764aee3503e16e91d3cc9dba67aa45e9e55b0eb3397c5ee46af3618f02c",
+      "real_unet_validation.py": "3141eca4cf96b3c6e905a3a182fe3cb20cb8dce39b297f66762c9428ef19ca54"
+    },
+    "environment_name": "main",
+    "receipts": {
+      "deployment": {
+        "path": "results/deployment/deployment_receipt.json",
+        "sha256": "5a6ad048681e092b6140a2a7569867a2f9ca9adedc480de15a88de2fd8db3138"
+      },
+      "setup": {
+        "path": "results/setup/setup_receipt.json",
+        "sha256": "8be4fc7bd6363b54f34b38f2368d865a002b8d83d3feb517c5ef83ac4cb6332b"
+      },
+      "volume_v1": {
+        "path": "results/setup/volume_v1.json",
+        "sha256": "ecb4cfad5245c1df6d6788a9482e20857a9e9ebaa68cd9c2c02e76758aa0c600"
+      }
+    },
+    "source": {
+      "authoritative_path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+      "bytes": 12309866400,
+      "mounted_path": "/source_models/diffusion_models/z_image_turbo_bf16.safetensors",
+      "proof": "receipt_source_and_volume_v1_durable_verification",
+      "relative_path": "diffusion_models/z_image_turbo_bf16.safetensors",
+      "sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6"
+    },
+    "volume": {
+      "name": "vertical-read-lab-v1-w3-1788630903818706700",
+      "version": 1
+    },
+    "workspace": "Testing 7",
+    "workspace_registry": {
+      "environment_name": "main",
+      "workspace_id": "ws_eaef96004dac",
+      "workspace_label": "Testing 7"
+    }
+  },
+  "b_median_improvement_over_a": {
+    "available": true,
+    "median_gb_per_s_gain": -1.6456941092429007,
+    "median_gb_per_s_percent": -24.986867787581026,
+    "median_wall_percent": -32.76201827609441,
+    "median_wall_s_saved": -0.6149899745000003
+  },
+  "cohort": "real_unet_validation_v1",
+  "complete": true,
+  "h2d_recommendation": "Do not choose an H2D architecture from this incomplete or mixed read result; retain the source-read evidence and validate the UNET loader/H2D boundary separately.",
+  "invalid_attempts": [],
+  "plan": [
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A1",
+      "mode": "threads_shared_fd",
+      "sequence": 1,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B1",
+      "mode": "processes_independent_fd",
+      "sequence": 2,
+      "worker_count": 8
+    },
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A2",
+      "mode": "threads_shared_fd",
+      "sequence": 3,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B2",
+      "mode": "processes_independent_fd",
+      "sequence": 4,
+      "worker_count": 8
+    },
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A3",
+      "mode": "threads_shared_fd",
+      "sequence": 5,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B3",
+      "mode": "processes_independent_fd",
+      "sequence": 6,
+      "worker_count": 8
+    },
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A4",
+      "mode": "threads_shared_fd",
+      "sequence": 7,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B4",
+      "mode": "processes_independent_fd",
+      "sequence": 8,
+      "worker_count": 8
+    },
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A5",
+      "mode": "threads_shared_fd",
+      "sequence": 9,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B5",
+      "mode": "processes_independent_fd",
+      "sequence": 10,
+      "worker_count": 8
+    },
+    {
+      "architecture": "A",
+      "block_size_mib": 128,
+      "fd_policy": "shared",
+      "label": "A6",
+      "mode": "threads_shared_fd",
+      "sequence": 11,
+      "worker_count": 2
+    },
+    {
+      "architecture": "C",
+      "block_size_mib": 4,
+      "fd_policy": "independent",
+      "label": "B6",
+      "mode": "processes_independent_fd",
+      "sequence": 12,
+      "worker_count": 8
+    }
+  ],
+  "primary_metric": "bytes / coordinated_wall_s / 1e9; worker throughput is diagnostic only",
+  "schema": "workspace3.real_unet_validation.summary.v1",
+  "win_classification": "A wins on both primary median metrics",
+  "workspace": "Testing 7"
+}

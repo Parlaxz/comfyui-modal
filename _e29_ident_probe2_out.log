@@ -1,0 +1,11 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+{
+ "deployment_combined_hash": "55fc5f94a3a2810c79fc0f773c8945cabcee6f90185e3491bf0de8db9a0a8044",
+ "custom_nodes_generation": "ac095df4ac142f4b05d12534ea3c6b57",
+ "overall_dependency_hash": "be68be1945de2a29c5bb09360d3056d6f3d6d4e3ed8c203d2d0fa82d86d3076c",
+ "comfyui_version": "0.24.0",
+ "registry_manifest_class_count": 2399,
+ "comfyui_commit": "f49bdb655707b97952dcef40e12e5af1f08d2007",
+ "atomic_profile": "E19_FINAL_COLD_LOADER",
+ "source": "container_readback"
+}

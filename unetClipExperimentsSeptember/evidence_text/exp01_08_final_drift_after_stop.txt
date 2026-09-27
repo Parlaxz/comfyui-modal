@@ -1,0 +1,110 @@
+﻿EVENT=STOP_AFTER_SOURCE_PROBE_PUBLISHER_PREFLIGHT_REFUSAL
+REMOTE_OPERATIONS=STOPPED
+COMMAND=git status --short
+--- status ---
+ M .opencode/skills/comfymodal-golden-ops/SKILL.md
+ M tools/v2_control/cli.py
+?? EXPERIMENT_EVIDENCE_golden_p1_0308695d024e41d5_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0474d478ce3245d6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_133afac7c9004337_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_25606a90ca244cf9_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_2e4d4cdeffde4b3a_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3916d2e167e94868_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3a982925da824d2d_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_48f7057bc7e3487b_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_5fbe85f45830404f_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74364aa898644799_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74920442013c440c_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_7bf4f53dfd404c89_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8020d1eccaeb40e2_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8088a8ce0adc44d0_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b062782af4884be6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b55885b5864a47e1_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_ce6827c491ae47be_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f2787dfec45943ae_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f8514ab2fa8f49ea_2026-09-03.md
+?? RX9P_G_FAILED_SMOKE_REPAIR_AUDIT_2026-09-01.md
+?? RX9P_M_PROFILER_E27_AND_LOGGING_REPAIR_2026-09-02.md
+?? unetClipExperimentsSeptember/
+--- tracked diff (deploy-relevant review set) ---
+diff --git a/.opencode/skills/comfymodal-golden-ops/SKILL.md b/.opencode/skills/comfymodal-golden-ops/SKILL.md
+index 6cb2bee..67b2b33 100644
+--- a/.opencode/skills/comfymodal-golden-ops/SKILL.md
++++ b/.opencode/skills/comfymodal-golden-ops/SKILL.md
+@@ -87,6 +87,8 @@ python tools/v2ctl.py --profile golden_p1 --app <experimental-app> source-probe
+ 
+ python tools/v2ctl.py golden run --app <experimental-app>
+ 
++python tools/v2ctl.py golden run --app <experimental-app> --acknowledge-volume-drift
++
+ python tools/v2ctl.py gate --profile golden_p1 --app <experimental-app>
+ 
+ python tools/v2ctl.py --profile golden_p1 --app <experimental-app> confirm --from <gate-manifest> --runs 5
+@@ -105,6 +107,15 @@ Do not directly use:
+ 
+ If the public Golden interface breaks, fix the public interface instead of bypassing it.
+ 
++`--acknowledge-volume-drift` deliberately skips only the exact-content
++publisher preflight gate (`require_ready`) on `golden run`. The run still
++binds the immutable deployment receipt, still requires source-probe evidence,
++and records `COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT=1` in the run
++manifest. Use it only when the operator explicitly accepts that the shared
++custom-nodes Volume may not match the local tree (e.g. another authorized lane
++is writing publishable files mid-cohort). It never overrides the deployment
++fingerprint, the receipt, or the output contract.
++
+ ## Normal experiment procedure
+ 
+ 1. Choose a new isolated experimental app.
+diff --git a/tools/v2_control/cli.py b/tools/v2_control/cli.py
+index ec85b61..6117449 100644
+--- a/tools/v2_control/cli.py
++++ b/tools/v2_control/cli.py
+@@ -3149,7 +3149,14 @@ def cmd_run(args, repo_root: Path) -> int:
+             if workspace_binding is not None:
+                 _require_receipt_workspace(bound_receipt, workspace_binding, command="run")
+                 assert_workspace_binding_current(repo_root, workspace_binding)
+-                run_publisher_preflight(repo_root, workspace_binding, require_ready=True)
++                ack_drift = bool(getattr(args, "acknowledge_volume_drift", False))
++                if ack_drift:
++                    print(
++                        "[v2ctl.run] WARNING: operator acknowledged volume drift; "
++                        "skipping exact-content publisher preflight gate",
++                        file=sys.stderr,
++                    )
++                run_publisher_preflight(repo_root, workspace_binding, require_ready=not ack_drift)
+         # Run-only: refuse unregistered and deploy-required explicit changes.
+         resolver.check_run_safety(
+             config, run_only=True,
+@@ -3222,6 +3229,8 @@ def cmd_run(args, repo_root: Path) -> int:
+             env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] = val_mod._bound_run_fingerprint(
+                 fingerprints, bound_receipt
+             )
++        if bool(getattr(args, "acknowledge_volume_drift", False)):
++            env["COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT"] = "1"
+         # Forward the canonical selector as the BAT's first positional arg so
+         # the run BAT enters its validation mode (e.g. E28_VALIDATION) instead
+         # of falling into the snapshot_restore_only probe branch.
+@@ -3909,6 +3918,15 @@ def build_parser() -> argparse.ArgumentParser:
+             child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
+             child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                                help="resolve and print, invoke nothing")
++            if name == "run":
++                child.add_argument(
++                    "--acknowledge-volume-drift",
++                    action="store_true",
++                    default=argparse.SUPPRESS,
++                    help="run despite local/Volume content-generation drift; "
++                    "deliberately skips the exact-content publisher preflight gate "
++                    "(operator accepts a stale shared Volume read)",
++                )
+         child.set_defaults(func=cmd_golden)
+ 
+     p = sub.add_parser("source-probe")
+--- deploy-relevant names ---
+tools/v2_control/cli.py
+--- HEAD ---
+c4bee234b871ac24592d3a4bb81980bb8cb36053
+--- branch ---
+TESTING2

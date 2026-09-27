@@ -1,0 +1,46 @@
+{
+  "units_note": "Hashes are SHA-256 hex digests of the encoded output image bytes.",
+  "h100": {
+    "rows": 11,
+    "observed_sha256_counts": {
+      "3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577": 11
+    },
+    "manifest_expected_sha256_counts": {
+      "ab3c08a952521a2d20e2ca31a2deff3c72a45e9aacf95365e62a436cdac7104f": 11
+    },
+    "output_stage_expected_sha256_counts": {
+      "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d": 11
+    },
+    "distinct_observed_count": 1,
+    "output_sha_match_counts": {
+      "match_true": 0,
+      "match_false": 11,
+      "match_unknown": 0,
+      "all_match_true": false
+    },
+    "note": "H100 manifest-level expected SHA and the in-run golden_output expected SHA disagree; both are recorded rather than reconciled."
+  },
+  "rtx": {
+    "rows": 84,
+    "observed_sha256_counts": {
+      "ab3c08a952521a2d20e2ca31a2deff3c72a45e9aacf95365e62a436cdac7104f": 84
+    },
+    "expected_sha256_counts": {
+      "ab3c08a952521a2d20e2ca31a2deff3c72a45e9aacf95365e62a436cdac7104f": 84
+    },
+    "distinct_observed_count": 1,
+    "output_sha_match_counts": {
+      "match_true": 83,
+      "match_false": 0,
+      "match_unknown": 1,
+      "all_match_true": false
+    }
+  },
+  "cross_gpu": {
+    "observed_sha_overlap": [],
+    "h100_observed_subset_of_rtx_observed": false,
+    "rtx_reference_expected_sha": [
+      "ab3c08a952521a2d20e2ca31a2deff3c72a45e9aacf95365e62a436cdac7104f"
+    ]
+  }
+}

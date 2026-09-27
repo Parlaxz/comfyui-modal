@@ -1,0 +1,31 @@
+{
+  "_is_odin": false,
+  "_validity_flags": [
+    "status=error:RuntimeError:no_reads:readers_failed:errors=[]:diag=[{'r': 0, 'st': 'ok', 'claimed': 39, 'why': 'completed_while_idle', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 1, 'st': 'ok', 'claimed': 29, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 2, 'st': 'ok', 'claimed': 24, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 3, 'st': 'ok', 'claimed': 28, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}]"
+  ],
+  "attempt_id": "im-01",
+  "container_session_id": "ta-01M380NP6K0WY39J589W3RN9FR",
+  "error": "RuntimeError:no_reads:readers_failed:errors=[]:diag=[{'r': 0, 'st': 'ok', 'claimed': 39, 'why': 'completed_while_idle', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 1, 'st': 'ok', 'claimed': 29, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 2, 'st': 'ok', 'claimed': 24, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}, {'r': 3, 'st': 'ok', 'claimed': 28, 'why': 'completed_at_loop_top', 'lane': 30, 'prep': 0, 'rec': 0, 'err': None}]",
+  "hostname": "modal",
+  "identity": {
+    "container_session_id": "ta-01M380NP6K0WY39J589W3RN9FR",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "hostname": "modal",
+    "image_id": "im-kyiVuAizKtehGJvdDIA6uG",
+    "observed_gpu": "NVIDIA H100 80GB HBM3",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "asia-south2",
+    "requested_gpu": "h100!"
+  },
+  "image_id": "im-kyiVuAizKtehGJvdDIA6uG",
+  "model_name": "qwen_3_4b.safetensors",
+  "observed_gpu": "NVIDIA H100 80GB HBM3",
+  "pin_cloud": "",
+  "pin_region": "",
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "asia-south2",
+  "requested_gpu": "h100!",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "status": "error"
+}

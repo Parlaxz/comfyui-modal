@@ -1,0 +1,41 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 native-build row",
+    "PHASE_G2 SageAttention-class builds"
+  ],
+  "description": "Custom node declares a CUDA-toolchain native build with system packages. Target decision depends on per-target native-build capability; RunComfy capability is audited UNKNOWN.",
+  "evidence_file": "evidence/target_characteristic_native_build_dependency.evidence.json",
+  "expected": {
+    "issue_codes": [],
+    "provenance_quality": "exact",
+    "risk_level_hint_nonnormative": "medium",
+    "semantic_notes": [
+      "See evidence/target_characteristic_native_build_dependency.evidence.json"
+    ],
+    "signals": {
+      "custom_node_count": 1,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 1,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/native_build_dependency.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "17fdbc09b0b261a2c955220650423b01d9b211b6d85df144f2c6be8cfebc5a37",
+  "scenario_id": "native_build_dependency",
+  "title": "Custom node needing native/system build"
+}

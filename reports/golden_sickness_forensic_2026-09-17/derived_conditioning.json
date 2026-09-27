@@ -1,0 +1,210 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "source": "per_request.json provider/region/arm + thresholds (computed_valid rows only)",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "arm_by_provider": {
+    "CLOUD_PROVIDER_AWS": {
+      "n": 48,
+      "arms": {
+        "sham": 11,
+        "split": 37
+      },
+      "clip_sick": 3,
+      "unet_sick": 0,
+      "clip_sick_rate": 0.0625,
+      "unet_sick_rate": 0.0
+    },
+    "CLOUD_PROVIDER_GCP": {
+      "n": 92,
+      "arms": {
+        "sham": 43,
+        "split": 49
+      },
+      "clip_sick": 11,
+      "unet_sick": 11,
+      "clip_sick_rate": 0.119565,
+      "unet_sick_rate": 0.119565
+    },
+    "CLOUD_PROVIDER_UNSPECIFIED": {
+      "n": 1,
+      "arms": {
+        "sham": 1
+      },
+      "clip_sick": 0,
+      "unet_sick": 1,
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 1.0
+    }
+  },
+  "arm_by_region": {
+    "eu-south-2": {
+      "n": 29,
+      "arms": {
+        "sham": 3,
+        "split": 26
+      },
+      "clip_sick_rate": 0.034483,
+      "unet_sick_rate": 0.0
+    },
+    "us-central1": {
+      "n": 17,
+      "arms": {
+        "sham": 9,
+        "split": 8
+      },
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 0.058824
+    },
+    "us-east-1": {
+      "n": 5,
+      "arms": {
+        "sham": 2,
+        "split": 3
+      },
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 0.0
+    },
+    "us-east-2": {
+      "n": 14,
+      "arms": {
+        "sham": 6,
+        "split": 8
+      },
+      "clip_sick_rate": 0.142857,
+      "unet_sick_rate": 0.0
+    },
+    "us-east1": {
+      "n": 55,
+      "arms": {
+        "sham": 33,
+        "split": 22
+      },
+      "clip_sick_rate": 0.181818,
+      "unet_sick_rate": 0.163636
+    },
+    "us-east4": {
+      "n": 4,
+      "arms": {
+        "sham": 1,
+        "split": 3
+      },
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 0.0
+    },
+    "us-south1": {
+      "n": 5,
+      "arms": {
+        "split": 5
+      },
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 0.0
+    },
+    "us-west1": {
+      "n": 10,
+      "arms": {
+        "sham": 1,
+        "split": 9
+      },
+      "clip_sick_rate": 0.1,
+      "unet_sick_rate": 0.1
+    },
+    "us-west4": {
+      "n": 2,
+      "arms": {
+        "split": 2
+      },
+      "clip_sick_rate": 0.0,
+      "unet_sick_rate": 0.5
+    }
+  },
+  "within_provider_region_arm_contrast": {
+    "CLOUD_PROVIDER_AWS/eu-south-2": {
+      "sham_n": 3,
+      "split_n": 26,
+      "sham_both_sick": 0,
+      "split_both_sick": 0,
+      "sham_clip_sick": 0,
+      "split_clip_sick": 1,
+      "clip_sick_fisher_p": 1.0
+    },
+    "CLOUD_PROVIDER_AWS/us-east-1": {
+      "sham_n": 2,
+      "split_n": 3,
+      "sham_both_sick": 0,
+      "split_both_sick": 0,
+      "sham_clip_sick": 0,
+      "split_clip_sick": 0,
+      "clip_sick_fisher_p": 1.0
+    },
+    "CLOUD_PROVIDER_AWS/us-east-2": {
+      "sham_n": 6,
+      "split_n": 8,
+      "sham_both_sick": 0,
+      "split_both_sick": 0,
+      "sham_clip_sick": 2,
+      "split_clip_sick": 0,
+      "clip_sick_fisher_p": 0.164835
+    },
+    "CLOUD_PROVIDER_GCP/us-central1": {
+      "sham_n": 8,
+      "split_n": 8,
+      "sham_both_sick": 0,
+      "split_both_sick": 0,
+      "sham_clip_sick": 0,
+      "split_clip_sick": 0,
+      "clip_sick_fisher_p": 1.0
+    },
+    "CLOUD_PROVIDER_GCP/us-east1": {
+      "sham_n": 33,
+      "split_n": 22,
+      "sham_both_sick": 5,
+      "split_both_sick": 0,
+      "sham_clip_sick": 6,
+      "split_clip_sick": 4,
+      "clip_sick_fisher_p": 1.0
+    },
+    "CLOUD_PROVIDER_GCP/us-east4": {
+      "sham_n": 1,
+      "split_n": 3,
+      "sham_both_sick": 0,
+      "split_both_sick": 0,
+      "sham_clip_sick": 0,
+      "split_clip_sick": 0,
+      "clip_sick_fisher_p": 1.0
+    },
+    "CLOUD_PROVIDER_GCP/us-west1": {
+      "sham_n": 1,
+      "split_n": 9,
+      "sham_both_sick": 0,
+      "split_both_sick": 1,
+      "sham_clip_sick": 0,
+      "split_clip_sick": 1,
+      "clip_sick_fisher_p": 1.0
+    }
+  },
+  "direct_standardized_rates": {
+    "sham": {
+      "crude_clip_sick_rate": 0.145455,
+      "provider_region_standardized_clip_sick_rate": 0.104019,
+      "standardization_coverage_weight": 0.950355
+    },
+    "split": {
+      "crude_clip_sick_rate": 0.069767,
+      "provider_region_standardized_clip_sick_rate": 0.086713,
+      "standardization_coverage_weight": 0.992908
+    }
+  },
+  "confounding_note": "Arm is strongly imbalanced across provider_region in this corpus; crude arm comparisons are therefore conditioned on provider_region in the table above. Small per-cell counts limit inference."
+}

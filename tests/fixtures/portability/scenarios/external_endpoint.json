@@ -1,0 +1,46 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §5 URLs only inside markdown note text",
+    "PHASE_G1 §9 S9"
+  ],
+  "classification": {
+    "functional_endpoints": [
+      "https://example.invalid/api/fixture-endpoint"
+    ],
+    "inert_note_urls": [
+      "https://example.invalid/docs/fixture-readme"
+    ]
+  },
+  "description": "One functional http(s) value sits in a node input position; a Note node carries a markdown URL that is inert documentation data. Future analysis must distinguish them.",
+  "expected": {
+    "issue_codes": [
+      "external_endpoint_reference"
+    ],
+    "risk_level_hint_nonnormative": "high",
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": true,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/external_endpoint.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "e389a31af622f41bff0a98d9a70257f2490e2d0df33053c018d485e44d97bb55",
+  "scenario_id": "external_endpoint",
+  "title": "Functional HTTP input vs inert note URL"
+}

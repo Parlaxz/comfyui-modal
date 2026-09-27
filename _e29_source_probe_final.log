@@ -1,0 +1,17 @@
+[v2.modal_target] app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 environment=(default) cloud_override=absent with_options_used=0
+[v2ctl.source-probe] profile=e29-tracer
+[v2ctl.source-probe] git_head=79cc9949ff4d
+[v2ctl.source-probe] target app=stable-modal-comfy-v2-restore-only-shadow class=ModalRuntimeEntrypointV2 gpu=rtx-pro-6000
+[v2ctl.source-probe] remote class=ModalRuntimeEntrypointV2 image=im-pFPLw5eASKd7wL5eXPRENo container=eeeefffb706042e0
+[v2ctl.source-probe] remote deployment_combined_hash=8794b9f3cbf02584
+[v2ctl.source-probe] remote cwd=/root/comfy/ComfyUI
+[v2ctl.source-probe] remote comfymodal_runtime __file__=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/modal_app.py: MATCH remote_sha=4d02f456c9e94788 expected_sha=4d02f456c9e94788 path=/root/comfymodal_runtime/modal_app.py
+[v2ctl.source-probe]   comfymodal_runtime/critical_path_ledger.py: MATCH remote_sha=5ccdd3bd04e269e2 expected_sha=5ccdd3bd04e269e2 path=/root/comfymodal_runtime/critical_path_ledger.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_bootstrap.py: MATCH remote_sha=c7235ece376467be expected_sha=c7235ece376467be path=/root/comfymodal_runtime/runtime_bootstrap.py
+[v2ctl.source-probe]   comfymodal_runtime/runtime_executor.py: MATCH remote_sha=d247acc22ba425b5 expected_sha=d247acc22ba425b5 path=/root/comfymodal_runtime/runtime_executor.py
+[v2ctl.source-probe]   comfymodal_runtime/gantt_telemetry.py: MATCH remote_sha=bf61c7db3a931120 expected_sha=bf61c7db3a931120 path=/root/comfymodal_runtime/gantt_telemetry.py
+[v2ctl.source-probe] ledger flag=COMFYMODAL_V2_CRITICAL_PATH_LEDGER enabled=True record_event=True
+[v2ctl.source-probe] verdict=MATCH
+[v2ctl.source-probe] RESULT=PASS source_identity=MATCH
+[v2ctl.source-probe] (manifest status update skipped: 'dict' object has no attribute 'read_text')

@@ -1,0 +1,155 @@
+{
+  "experiment": "04_contemporary_source_ceiling_oracle",
+  "status": "COMPLETE",
+  "PERFORMANCE_COMPARISON": "NOT_PERFORMED",
+  "PERFORMANCE_VERDICT": "NOT_PROVIDED",
+  "decision_category": "SOURCE_CEILING_NOT_RECOVERED",
+  "decision_basis": "All four measured medians remain above the historical reference values; this is a source-ceiling result, not a production promotion decision.",
+  "workspace": "Testing 7",
+  "environment": "main",
+  "app": "sept-unetclip-04-source-ceiling-oracle",
+  "deployment_url": "https://modal.com/apps/testing7/main/deployed/sept-unetclip-04-source-ceiling-oracle",
+  "image_id": "im-v2C7hQYVNqlPjiTAGPuwOh",
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "us-east1",
+  "gpu": "rtx-pro-6000",
+  "models_volume": "comfyui-models",
+  "models_mount": "/root/models",
+  "models_mount_read_only": true,
+  "runner": "tools/run_exp04_source_ceiling.py",
+  "raw_evidence_root": "unetClipExperimentsSeptember/04_source_ceiling_runs",
+  "timing_metric": "FILE_TO_CUDA_WALL_MS",
+  "timing_boundaries": {
+    "qd256": "first physical source syscall -> final required H2D event completion; header/layout/allocation excluded",
+    "fastsafe": "copy_files_to_device entry -> required torch.cuda.synchronize return; header/add_filenames and post-ready validation excluded"
+  },
+  "historical_reference_ms": {
+    "clip": 490.7,
+    "unet": 699.4
+  },
+  "fixed_arms": {
+    "qd256": {
+      "execution_arm": "static_e27",
+      "configured_qd": 4,
+      "producer_count": 4,
+      "source_block_bytes": 268435456,
+      "h2d_target_bytes": 268435456,
+      "aggregation_enabled": false,
+      "physical_syscall_provenance": "golden_serial._read_at",
+      "source_mechanism_proven": "YES"
+    },
+    "fastsafe": {
+      "loader": "fastsafetensors.SafeTensorsFileLoader",
+      "threads": 8,
+      "bbuf_size_kb": 524288,
+      "nogds": true,
+      "use_buf_register": false,
+      "disable_cache": true,
+      "clip_max_copy_block_size": 67108864,
+      "unet_max_copy_block_size": 268435456
+    }
+  },
+  "models": {
+    "clip": {
+      "name": "qwen_3_4b.safetensors",
+      "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+      "file_size_bytes": 8044982048,
+      "payload_bytes": 8044936192
+    },
+    "unet": {
+      "name": "z_image_turbo_bf16.safetensors",
+      "path": "/root/models/diffusion_models/z_image_turbo_bf16.safetensors",
+      "file_size_bytes": 12309866400,
+      "payload_bytes": 12309817472
+    }
+  },
+  "cohort": {
+    "observations": 16,
+    "valid": 16,
+    "dnf": 0,
+    "distinct_container_sessions": 16,
+    "serial": true,
+    "model_construction": false,
+    "byte_validation": "16/16 passed",
+    "snapshot_capture": "not applicable and not counted"
+  },
+  "statistics_ms": {
+    "clip_qd256": {
+      "n": 4,
+      "values": [4088.559566, 1188.259451, 1140.952073, 1086.160162],
+      "min": 1086.160162,
+      "max": 4088.559566,
+      "mean": 1875.982813,
+      "median": 1164.605762,
+      "sample_sd": 1475.641027,
+      "cv": 0.786596,
+      "historical_ms": 490.7,
+      "median_ratio": 2.37,
+      "median_delta_percent": 137.3
+    },
+    "clip_fastsafe": {
+      "n": 4,
+      "values": [1568.3265, 1598.0286, 1624.0889, 1539.873],
+      "min": 1539.873,
+      "max": 1624.0889,
+      "mean": 1582.57925,
+      "median": 1583.17755,
+      "sample_sd": 36.463215,
+      "cv": 0.02304,
+      "historical_ms": 490.7,
+      "median_ratio": 3.23,
+      "median_delta_percent": 222.6
+    },
+    "unet_qd256": {
+      "n": 4,
+      "values": [1929.049539, 2351.572241, 3824.397659, 2722.424772],
+      "min": 1929.049539,
+      "max": 3824.397659,
+      "mean": 2706.861053,
+      "median": 2536.998507,
+      "sample_sd": 812.475884,
+      "cv": 0.300154,
+      "historical_ms": 699.4,
+      "median_ratio": 3.63,
+      "median_delta_percent": 262.7
+    },
+    "unet_fastsafe": {
+      "n": 4,
+      "values": [2446.5955, 2163.8847, 2844.4027, 2496.8009],
+      "min": 2163.8847,
+      "max": 2844.4027,
+      "mean": 2487.92095,
+      "median": 2471.6982,
+      "sample_sd": 279.204451,
+      "cv": 0.112224,
+      "historical_ms": 699.4,
+      "median_ratio": 3.53,
+      "median_delta_percent": 253.4
+    }
+  },
+  "attempts": [
+    {"attempt_id":"clip_qd256_R1","role":"clip","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":4088.559566,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_qd256_R1.json"},
+    {"attempt_id":"clip_qd256_R2","role":"clip","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":1188.259451,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_qd256_R2.json"},
+    {"attempt_id":"clip_qd256_R3","role":"clip","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":1140.952073,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_qd256_R3.json"},
+    {"attempt_id":"clip_qd256_R4","role":"clip","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":1086.160162,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_qd256_R4.json"},
+    {"attempt_id":"clip_fastsafe_R1","role":"clip","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":1568.3265,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_fastsafe_R1.json"},
+    {"attempt_id":"clip_fastsafe_R2","role":"clip","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":1598.0286,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_fastsafe_R2.json"},
+    {"attempt_id":"clip_fastsafe_R3","role":"clip","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":1624.0889,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_fastsafe_R3.json"},
+    {"attempt_id":"clip_fastsafe_R4","role":"clip","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":1539.873,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/clip_fastsafe_R4.json"},
+    {"attempt_id":"unet_qd256_R1","role":"unet","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":1929.049539,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_qd256_R1.json"},
+    {"attempt_id":"unet_qd256_R2","role":"unet","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":2351.572241,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_qd256_R2.json"},
+    {"attempt_id":"unet_qd256_R3","role":"unet","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":3824.397659,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_qd256_R3.json"},
+    {"attempt_id":"unet_qd256_R4","role":"unet","arm":"qd256","status":"ok","FILE_TO_CUDA_WALL_MS":2722.424772,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_qd256_R4.json"},
+    {"attempt_id":"unet_fastsafe_R1","role":"unet","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":2446.5955,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_fastsafe_R1.json"},
+    {"attempt_id":"unet_fastsafe_R2","role":"unet","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":2163.8847,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_fastsafe_R2.json"},
+    {"attempt_id":"unet_fastsafe_R3","role":"unet","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":2844.4027,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_fastsafe_R3.json"},
+    {"attempt_id":"unet_fastsafe_R4","role":"unet","arm":"fastsafe","status":"ok","FILE_TO_CUDA_WALL_MS":2496.8009,"artifact":"unetClipExperimentsSeptember/04_source_ceiling_runs/unet_fastsafe_R4.json"}
+  ],
+  "unavailable": [
+    "deployment receipt path",
+    "deployment fingerprint",
+    "request IDs",
+    "output/durability fields",
+    "ComfyUI stage fields"
+  ]
+}

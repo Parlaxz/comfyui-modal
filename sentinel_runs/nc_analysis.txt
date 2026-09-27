@@ -1,0 +1,105 @@
+﻿
+========================================================================================================
+ncr-01  CLOUD_PROVIDER_GCP/us-east4  gbps=3.71 src_max=596ms  window=0..2171ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=501.7ms canary_max=4.24ms
+  EPISODE#0 t=0..596ms dur=596ms worst=596ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=501.7ms at t=2ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=261ms   separate_pid max_gap_in_episode=2.01ms at t=18ms   canary cpu_delta=530.0ms
+     A_same_file          n=13 max_sched_delay=   499.3ms max_syscall_latency=  19.84ms
+     B_other_volume_file  n=13 max_sched_delay=   499.1ms max_syscall_latency= 309.44ms
+     C_tmpfs_local        n=12 max_sched_delay=   498.9ms max_syscall_latency=  20.06ms
+
+========================================================================================================
+ncr-02  CLOUD_PROVIDER_GCP/us-east4  gbps=4.00 src_max=285ms  window=0..2010ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=133.0ms canary_max=8.93ms
+  EPISODE#0 t=0..286ms dur=285ms worst=285ms workers=[2]
+     main_hb max_gap_in_episode=111.1ms at t=72ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=259ms   separate_pid max_gap_in_episode=2.01ms at t=120ms   canary cpu_delta=240.0ms
+     A_same_file          n=14 max_sched_delay=   162.5ms max_syscall_latency=  19.93ms
+     B_other_volume_file  n=13 max_sched_delay=   182.4ms max_syscall_latency=  21.13ms
+     C_tmpfs_local        n=12 max_sched_delay=   163.1ms max_syscall_latency=  40.96ms
+
+========================================================================================================
+ncr-03  CLOUD_PROVIDER_GCP/us-east  gbps=4.69 src_max=208ms  window=0..1714ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=151.3ms canary_max=2.11ms
+
+========================================================================================================
+ncr-04  CLOUD_PROVIDER_GCP/us-west  gbps=4.48 src_max=208ms  window=0..1797ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=471.4ms canary_max=2.28ms
+
+========================================================================================================
+ncr-05  CLOUD_PROVIDER_GCP/us-east4  gbps=4.05 src_max=245ms  window=0..1988ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=178.9ms canary_max=8.05ms
+
+========================================================================================================
+ncr-06  CLOUD_PROVIDER_GCP/us-east5  gbps=4.89 src_max=212ms  window=0..1646ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=149.2ms canary_max=3.26ms
+
+========================================================================================================
+ncr-07  CLOUD_PROVIDER_GCP/europe-west2  gbps=4.70 src_max=177ms  window=0..1710ms  episodes=0  canary=separate_pid
+  whole-run: main_hb_max=350.2ms canary_max=2.09ms
+
+========================================================================================================
+ncr-08  CLOUD_PROVIDER_GCP/us-east  gbps=4.78 src_max=297ms  window=0..1685ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=217.3ms canary_max=7.60ms
+  EPISODE#0 t=0..297ms dur=297ms worst=297ms workers=[2]
+     main_hb max_gap_in_episode=217.3ms at t=2ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=169ms   separate_pid max_gap_in_episode=2.77ms at t=139ms   canary cpu_delta=240.0ms
+     A_same_file          n=13 max_sched_delay=   209.8ms max_syscall_latency=  21.76ms
+     B_other_volume_file  n=13 max_sched_delay=   209.3ms max_syscall_latency=  21.90ms
+     C_tmpfs_local        n=12 max_sched_delay=   214.5ms max_syscall_latency=  24.09ms
+
+========================================================================================================
+ncr-09  CLOUD_PROVIDER_GCP/us-west  gbps=3.21 src_max=336ms  window=0..2504ms  episodes=1  canary=separate_pid
+  whole-run: main_hb_max=334.1ms canary_max=16.88ms
+  EPISODE#0 t=0..336ms dur=336ms worst=336ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=334.1ms at t=2ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=267ms   separate_pid max_gap_in_episode=2.46ms at t=284ms   canary cpu_delta=290.0ms
+     A_same_file          n= 9 max_sched_delay=   323.7ms max_syscall_latency=  18.43ms
+     B_other_volume_file  n= 8 max_sched_delay=   333.7ms max_syscall_latency=  18.39ms
+     C_tmpfs_local        n= 8 max_sched_delay=   313.4ms max_syscall_latency=  17.27ms
+
+========================================================================================================
+ncr-10  CLOUD_PROVIDER_GCP/us-west  gbps=2.83 src_max=718ms  window=0..2844ms  episodes=3  canary=separate_pid
+  whole-run: main_hb_max=523.9ms canary_max=4.21ms
+  EPISODE#0 t=0..280ms dur=280ms worst=280ms workers=[0, 1, 2]
+     main_hb max_gap_in_episode=278.8ms at t=2ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=243ms   separate_pid max_gap_in_episode=2.01ms at t=125ms   canary cpu_delta=240.0ms
+     A_same_file          n= 9 max_sched_delay=   498.7ms max_syscall_latency= 279.28ms
+     B_other_volume_file  n= 9 max_sched_delay=   280.2ms max_syscall_latency= 523.13ms
+     C_tmpfs_local        n= 9 max_sched_delay=    14.7ms max_syscall_latency= 278.96ms
+  EPISODE#1 t=471..1189ms dur=718ms worst=718ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=508.1ms at t=680ms   SAME-PID-NATIVE max_gap_in_episode=6.70ms at t=505ms   separate_pid max_gap_in_episode=2.10ms at t=505ms   canary cpu_delta=670.0ms
+     A_same_file          n=18 max_sched_delay=   483.5ms max_syscall_latency=   0.66ms
+     B_other_volume_file  n=17 max_sched_delay=   508.3ms max_syscall_latency=   0.38ms
+     C_tmpfs_local        n=18 max_sched_delay=   483.4ms max_syscall_latency=   0.65ms
+  EPISODE#2 t=1573..2066ms dur=492ms worst=492ms workers=[3]
+     main_hb max_gap_in_episode=5.5ms at t=1831ms   SAME-PID-NATIVE max_gap_in_episode=2.00ms at t=1729ms   separate_pid max_gap_in_episode=2.23ms at t=1913ms   canary cpu_delta=420.0ms
+     A_same_file          n=28 max_sched_delay=     1.4ms max_syscall_latency=   0.94ms
+     B_other_volume_file  n=28 max_sched_delay=     1.5ms max_syscall_latency=   1.11ms
+     C_tmpfs_local        n=28 max_sched_delay=     2.6ms max_syscall_latency=   0.75ms
+
+========================================================================================================
+ncr-11  CLOUD_PROVIDER_GCP/us-west  gbps=3.51 src_max=534ms  window=0..2289ms  episodes=2  canary=separate_pid
+  whole-run: main_hb_max=458.4ms canary_max=8.98ms
+  EPISODE#0 t=0..534ms dur=534ms worst=534ms workers=[0, 1, 2, 3]
+     main_hb max_gap_in_episode=349.6ms at t=2ms   SAME-PID-NATIVE max_gap_in_episode=2.65ms at t=178ms   separate_pid max_gap_in_episode=2.21ms at t=7ms   canary cpu_delta=490.0ms
+     A_same_file          n=10 max_sched_delay=   433.5ms max_syscall_latency= 126.34ms
+     B_other_volume_file  n=10 max_sched_delay=   402.4ms max_syscall_latency= 457.60ms
+     C_tmpfs_local        n= 9 max_sched_delay=   395.0ms max_syscall_latency= 126.19ms
+  EPISODE#1 t=594..1029ms dur=435ms worst=435ms workers=[3]
+     main_hb max_gap_in_episode=118.9ms at t=912ms   SAME-PID-NATIVE max_gap_in_episode=2.27ms at t=725ms   separate_pid max_gap_in_episode=2.00ms at t=599ms   canary cpu_delta=380.0ms
+     A_same_file          n=22 max_sched_delay=   401.8ms max_syscall_latency= 126.34ms
+     B_other_volume_file  n=22 max_sched_delay=   402.4ms max_syscall_latency= 126.08ms
+     C_tmpfs_local        n=22 max_sched_delay=   395.0ms max_syscall_latency= 126.19ms
+
+
+========================================================================================================
+SUMMARY  (11 runs)
+run | region | gbps | src_max | eps | worst_ep | py_hb_in_ep | SAME-PID_NATIVE_in_ep | sep-PID_in_ep | A sched/lat | B sched/lat | C sched/lat | class
+| ncr-01 | CLOUD_PROVIDER_GCP/us-east4 | 3.71 | 596 | 1 | 596 | 502 | 2.00 | 2.01 | 499/19.8 | 499/309.4 | 499/20.1 | CASE 1 (python/GIL domain; all fs paths freeze) |
+| ncr-02 | CLOUD_PROVIDER_GCP/us-east4 | 4.00 | 285 | 1 | 285 | 111 | 2.00 | 2.01 | 162/19.9 | 182/21.1 | 163/41.0 | CASE 1 (python/GIL domain; all fs paths freeze) |
+| ncr-03 | CLOUD_PROVIDER_GCP/us-east | 4.69 | 208 | 0 | - | - | - | separate_pid | - | - | - | CLEAN |
+| ncr-04 | CLOUD_PROVIDER_GCP/us-west | 4.48 | 208 | 0 | - | - | - | separate_pid | - | - | - | CLEAN |
+| ncr-05 | CLOUD_PROVIDER_GCP/us-east4 | 4.05 | 245 | 0 | - | - | - | separate_pid | - | - | - | CLEAN |
+| ncr-06 | CLOUD_PROVIDER_GCP/us-east5 | 4.89 | 212 | 0 | - | - | - | separate_pid | - | - | - | CLEAN |
+| ncr-07 | CLOUD_PROVIDER_GCP/europe-west2 | 4.70 | 177 | 0 | - | - | - | separate_pid | - | - | - | CLEAN |
+| ncr-08 | CLOUD_PROVIDER_GCP/us-east | 4.78 | 297 | 1 | 297 | 217 | 2.00 | 2.77 | 210/21.8 | 209/21.9 | 215/24.1 | CASE 1 (python/GIL domain; all fs paths freeze) |
+| ncr-09 | CLOUD_PROVIDER_GCP/us-west | 3.21 | 336 | 1 | 336 | 334 | 2.00 | 2.46 | 324/18.4 | 334/18.4 | 313/17.3 | CASE 1 (python/GIL domain; all fs paths freeze) |
+| ncr-10 | CLOUD_PROVIDER_GCP/us-west | 2.83 | 718 | 3 | 718 | 508 | 6.70 | 2.10 | 484/0.7 | 508/0.4 | 483/0.6 | CASE 1 (python/GIL domain; all fs paths freeze) |
+| ncr-11 | CLOUD_PROVIDER_GCP/us-west | 3.51 | 534 | 2 | 534 | 350 | 2.65 | 2.21 | 433/126.3 | 402/457.6 | 395/126.2 | CASE 1 (python/GIL domain; all fs paths freeze) |

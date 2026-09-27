@@ -1,0 +1,45 @@
+[ff] start h100-r32-qd2
+[ff] start rtx-r32-qd2
+[ff] done rtx-r32-qd2 status=ok gbps=8.861050546512377
+[ff] start rtx-r32-qd4
+[ff] done h100-r32-qd2 status=ok gbps=2.0540049385057735
+[ff] start h100-r32-qd4
+[ff] done rtx-r32-qd4 status=ok gbps=4.177233731888671
+[ff] start rtx-r32-qd8
+[ff] done rtx-r32-qd8 status=ok gbps=5.56963859042696
+[ff] start rtx-r64-qd2
+[ff] done h100-r32-qd4 status=ok gbps=4.104322909509568
+[ff] start h100-r32-qd8
+[ff] done h100-r32-qd8 status=ok gbps=4.078802227246764
+[ff] start h100-r64-qd2
+[ff] done rtx-r64-qd2 status=ok gbps=2.4105266014545847
+[ff] start rtx-r64-qd4
+[ff] done rtx-r64-qd4 status=ok gbps=6.8130887085480385
+[ff] start rtx-r64-qd8
+[ff] done h100-r64-qd2 status=ok gbps=2.7522539826722956
+[ff] start h100-r64-qd4
+[ff] done rtx-r64-qd8 status=ok gbps=6.039918336548212
+[ff] start rtx-r128-qd2
+[ff] done h100-r64-qd4 status=ok gbps=6.140482657348047
+[ff] start h100-r64-qd8
+[ff] done rtx-r128-qd2 status=ok gbps=7.090796945252122
+[ff] start rtx-r128-qd4
+[ff] done rtx-r128-qd4 status=ok gbps=6.431599719594738
+[ff] start rtx-r128-qd8
+[ff] done rtx-r128-qd8 status=ok gbps=4.840686638051733
+[ff] start rtx-r256-qd2
+[ff] done h100-r64-qd8 status=ok gbps=3.8981099145523097
+[ff] start h100-r128-qd2
+[ff] done rtx-r256-qd2 status=ok gbps=7.601472249249476
+[ff] start rtx-r256-qd4
+[ff] done rtx-r256-qd4 status=ok gbps=6.656661045392782
+[ff] start rtx-r256-qd8
+[ff] done rtx-r256-qd8 status=ok gbps=6.568680225523601
+[ff] done h100-r128-qd2 status=ok gbps=2.9312923407176603
+[ff] start h100-r128-qd4
+[ff] done h100-r128-qd4 status=ok gbps=4.569995778513074
+[ff] start h100-r128-qd8
+[ff] done h100-r128-qd8 status=ok gbps=3.3938707150407215
+[ff] start h100-r256-qd2
+[ff] done h100-r256-qd2 status=ok gbps=0.0318639865636475
+[ff] start h100-r256-qd4

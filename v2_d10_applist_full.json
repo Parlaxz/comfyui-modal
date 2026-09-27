@@ -1,0 +1,66 @@
+﻿[
+  {
+    "App ID": "ap-0qo74B4E8fnJEjTjnyaZII",
+    "Description": "comfyui",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-06-12 02:15:54-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-BzRd9TT4crlwsaKBzoD4dh",
+    "Description": "stable-modal-comfy-v2-step3-accept",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-12 11:14:29-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-YUMaiS1I1YathVxYA0k6dT",
+    "Description": "stable-modal-comfy-v2-restore-only-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-12 11:17:33-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-95TbZm3R59pkDj6NvxRsKw",
+    "Description": "stable-modal-comfy-v2-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-13 16:04:03-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-8GHj5BleG7tfbQgpfVu0ZY",
+    "Description": "stable-modal-comfy-v2-variance-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-14 15:53:29-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-FsB4hDO4K67uSCsPqy0yPD",
+    "Description": "stable-modal-comfy-v2-c6probe-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-14 16:16:26-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-A08shD7dlCgj4HOpNjJAxQ",
+    "Description": "stable-modal-comfy-v2-c9qd-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-15 11:43:52-05:00",
+    "Stopped at": null
+  },
+  {
+    "App ID": "ap-gx17n1rfd98IMBJT5VJSW8",
+    "Description": "stable-modal-comfy-v2-cancel-proof-shadow",
+    "State": "deployed",
+    "Tasks": "0",
+    "Created at": "2026-08-16 10:04:35-05:00",
+    "Stopped at": null
+  }
+]

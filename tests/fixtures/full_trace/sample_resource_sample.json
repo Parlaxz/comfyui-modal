@@ -1,0 +1,75 @@
+{
+  "wall_unix_ns": 1785267457906525400,
+  "monotonic_ns": 419607046000000,
+  "session_phase": "restore_tracing",
+  "cgroup_cpu_usage_usec": 1234567,
+  "cgroup_user_usec": 1000000,
+  "cgroup_system_usec": 234567,
+  "cgroup_nr_periods": 500,
+  "cgroup_nr_throttled": 3,
+  "cgroup_throttled_usec": 15000,
+  "memory_current_bytes": 838860800,
+  "memory_peak_bytes": 1073741824,
+  "memory_stat_anon_bytes": 419430400,
+  "memory_stat_file_bytes": 419430400,
+  "memory_stat_inactive_file_bytes": 104857600,
+  "memory_stat_active_file_bytes": 314572800,
+  "memory_stat_pgfault": 12345,
+  "memory_stat_pgmajfault": 67,
+  "io_rbytes": 1572864,
+  "io_wbytes": 3145728,
+  "process_inventory": [
+    {
+      "pid": 1,
+      "ppid": 0,
+      "comm": "bash",
+      "sanitized_cmdline": "bash\x00start.sh",
+      "state": "S (sleeping)",
+      "user_ticks": 1234,
+      "system_ticks": 567,
+      "minor_faults": 9999,
+      "major_faults": 12,
+      "rss_pages": 5000,
+      "thread_count": 1,
+      "read_bytes": 10000,
+      "write_bytes": 5000,
+      "cancelled_write_bytes": 0
+    },
+    {
+      "pid": 42,
+      "ppid": 1,
+      "comm": "python",
+      "sanitized_cmdline": "python\x00main.py\x00--model\x00sd_xl",
+      "state": "S (sleeping)",
+      "user_ticks": 56789,
+      "system_ticks": 1234,
+      "minor_faults": 45678,
+      "major_faults": 3,
+      "rss_pages": 250000,
+      "thread_count": 8,
+      "read_bytes": 500000,
+      "write_bytes": 200000,
+      "cancelled_write_bytes": 50
+    }
+  ],
+  "thread_inventory": [
+    {
+      "tid": 42,
+      "comm": "python-main",
+      "state": "S (sleeping)",
+      "user_ticks": 56000,
+      "system_ticks": 1200,
+      "minor_faults": 45000,
+      "major_faults": 3
+    },
+    {
+      "tid": 43,
+      "comm": "res-sampler",
+      "state": "S (sleeping)",
+      "user_ticks": 100,
+      "system_ticks": 50,
+      "minor_faults": 50,
+      "major_faults": 0
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+﻿
+sn-r01  src_max=299ms gbps=4.24 src_window=0..1897ms
+  MAIN HEARTBEAT (whole process):
+    gap=  1007.6ms at t=  -1095ms  proc_cpu_delta=  2920.0ms (289.8% of gap)  CPU-BUSY
+    gap=   205.5ms at t=     -1ms  proc_cpu_delta=  1580.0ms (768.9% of gap)  CPU-BUSY
+    gap=   188.7ms at t=    664ms  proc_cpu_delta=  1190.0ms (630.8% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    2.46ms at t=   -943ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.14ms at t=   1990ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.07ms at t=   1995ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r02  src_max=1583ms gbps=1.88 src_window=0..4281ms
+  MAIN HEARTBEAT (whole process):
+    gap=  1541.4ms at t=     -0ms  proc_cpu_delta= 11980.0ms (777.2% of gap)  CPU-BUSY
+    gap=  1084.2ms at t=   2049ms  proc_cpu_delta=  7340.0ms (677.0% of gap)  CPU-BUSY
+    gap=   389.7ms at t=   -462ms  proc_cpu_delta=  1100.0ms (282.3% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    6.40ms at t=   1991ms  canary_cpu_delta=n/a  (n/a)
+    gap=    4.13ms at t=   1691ms  canary_cpu_delta=n/a  (n/a)
+    gap=    3.80ms at t=   2017ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r03  src_max=986ms gbps=3.01 src_window=0..2676ms
+  MAIN HEARTBEAT (whole process):
+    gap=   730.6ms at t=    809ms  proc_cpu_delta=  4880.0ms (668.0% of gap)  CPU-BUSY
+    gap=   717.1ms at t=   -804ms  proc_cpu_delta=  2120.0ms (295.6% of gap)  CPU-BUSY
+    gap=   204.7ms at t=      2ms  proc_cpu_delta=  1360.0ms (664.5% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    6.65ms at t=   1378ms  canary_cpu_delta=n/a  (n/a)
+    gap=    4.05ms at t=    934ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.49ms at t=    952ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r04  src_max=130ms gbps=5.09 src_window=0..1581ms
+  MAIN HEARTBEAT (whole process):
+    gap=   128.9ms at t=    113ms  proc_cpu_delta=   740.0ms (574.0% of gap)  CPU-BUSY
+    gap=   113.1ms at t=      0ms  proc_cpu_delta=   680.0ms (601.3% of gap)  CPU-BUSY
+    gap=    38.4ms at t=    690ms  proc_cpu_delta=   170.0ms (442.6% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    3.30ms at t=    994ms  canary_cpu_delta=n/a  (n/a)
+    gap=    3.00ms at t=    150ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.54ms at t=    869ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r05  src_max=140ms gbps=4.91 src_window=0..1640ms
+  MAIN HEARTBEAT (whole process):
+    gap=    95.9ms at t=     44ms  proc_cpu_delta=   550.0ms (573.3% of gap)  CPU-BUSY
+    gap=    64.5ms at t=   1513ms  proc_cpu_delta=   350.0ms (542.4% of gap)  CPU-BUSY
+    gap=    41.9ms at t=      2ms  proc_cpu_delta=   280.0ms (668.1% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    2.01ms at t=   2307ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.01ms at t=   2275ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.00ms at t=   2505ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r06  src_max=453ms gbps=3.74 src_window=0..2154ms
+  MAIN HEARTBEAT (whole process):
+    gap=  4584.6ms at t=  -4670ms  proc_cpu_delta= 13360.0ms (291.4% of gap)  CPU-BUSY
+    gap=   209.9ms at t=     64ms  proc_cpu_delta=  1400.0ms (667.1% of gap)  CPU-BUSY
+    gap=    81.8ms at t=   1883ms  proc_cpu_delta=   470.0ms (574.5% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=  258.66ms at t=  -1055ms  canary_cpu_delta=   250.0ms  ( 96.7% of gap)
+    gap=   44.62ms at t=  -4070ms  canary_cpu_delta=n/a  (n/a)
+    gap=   13.97ms at t=  -1308ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r07  src_max=237ms gbps=4.80 src_window=0..1677ms
+  MAIN HEARTBEAT (whole process):
+    gap=   448.3ms at t=   -520ms  proc_cpu_delta=  1290.0ms (287.8% of gap)  CPU-BUSY
+    gap=   167.1ms at t=     70ms  proc_cpu_delta=  1110.0ms (664.3% of gap)  CPU-BUSY
+    gap=   137.5ms at t=   -658ms  proc_cpu_delta=   260.0ms (189.1% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    4.55ms at t=   1622ms  canary_cpu_delta=n/a  (n/a)
+    gap=    4.40ms at t=   1971ms  canary_cpu_delta=n/a  (n/a)
+    gap=    4.38ms at t=   1352ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r08  src_max=228ms gbps=4.51 src_window=0..1784ms
+  MAIN HEARTBEAT (whole process):
+    gap=   141.1ms at t=   -227ms  proc_cpu_delta=   370.0ms (262.2% of gap)  CPU-BUSY
+    gap=    88.4ms at t=      2ms  proc_cpu_delta=   560.0ms (633.2% of gap)  CPU-BUSY
+    gap=    48.7ms at t=     90ms  proc_cpu_delta=   350.0ms (718.7% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    2.12ms at t=   1045ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.10ms at t=    873ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.09ms at t=    915ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r09  src_max=257ms gbps=4.23 src_window=0..1900ms
+  MAIN HEARTBEAT (whole process):
+    gap=   254.3ms at t=      2ms  proc_cpu_delta=  1690.0ms (664.7% of gap)  CPU-BUSY
+    gap=    38.1ms at t=    706ms  proc_cpu_delta=   100.0ms (262.1% of gap)  CPU-BUSY
+    gap=    26.8ms at t=    -57ms  proc_cpu_delta=    60.0ms (223.5% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    2.41ms at t=     62ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.25ms at t=     64ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.05ms at t=     48ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r10  src_max=143ms gbps=4.86 src_window=0..1654ms
+  MAIN HEARTBEAT (whole process):
+    gap=   157.0ms at t=   1498ms  proc_cpu_delta=   870.0ms (554.0% of gap)  CPU-BUSY
+    gap=   108.7ms at t=     -1ms  proc_cpu_delta=   820.0ms (754.1% of gap)  CPU-BUSY
+    gap=    60.1ms at t=    147ms  proc_cpu_delta=   270.0ms (449.3% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=    2.04ms at t=   1872ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.01ms at t=   1866ms  canary_cpu_delta=n/a  (n/a)
+    gap=    2.00ms at t=   1666ms  canary_cpu_delta=n/a  (n/a)
+
+sn-r11  src_max=998ms gbps=2.68 src_window=0..3004ms
+  MAIN HEARTBEAT (whole process):
+    gap=  1629.2ms at t=  -1720ms  proc_cpu_delta=  4690.0ms (287.9% of gap)  CPU-BUSY
+    gap=   777.8ms at t=      1ms  proc_cpu_delta=  5290.0ms (680.1% of gap)  CPU-BUSY
+    gap=   367.2ms at t=   2453ms  proc_cpu_delta=  2420.0ms (659.0% of gap)  CPU-BUSY
+  SEPARATE-PID CANARY (pure userspace spin):
+    gap=   11.12ms at t=   3311ms  canary_cpu_delta=n/a  (n/a)
+    gap=   10.15ms at t=   2650ms  canary_cpu_delta=n/a  (n/a)
+    gap=    7.30ms at t=      5ms  canary_cpu_delta=n/a  (n/a)

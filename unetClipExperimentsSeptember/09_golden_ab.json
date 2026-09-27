@@ -1,0 +1,8 @@
+{
+  "experiment": "full_golden_decoupled_ab",
+  "status": "NOT_RUN",
+  "reason": "no decoupled integrated winner was measured",
+  "arms": ["current_production_transport", "decoupled_transport"],
+  "requested_observations_per_arm": 5,
+  "raw_evidence_root": "unetClipExperimentsSeptember/09_golden_ab_runs"
+}

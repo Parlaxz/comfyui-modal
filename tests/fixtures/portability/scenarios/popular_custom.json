@@ -1,0 +1,39 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 popular custom nodes row"
+  ],
+  "description": "Popular Manager-common custom node with declared version but no exact commit; no native build required. Carrier fixture for the G3 POPULAR CUSTOM matrix row.",
+  "evidence_file": "evidence/target_characteristic_popular_custom.evidence.json",
+  "expected": {
+    "issue_codes": [
+      "custom_node_unpinned"
+    ],
+    "provenance_quality": "declared",
+    "risk_level_hint_nonnormative": "medium",
+    "signals": {
+      "custom_node_count": 1,
+      "custom_node_revision_pinned": false,
+      "custom_repo_count": 1,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": false
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/popular_custom.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "5e950defce833f433e93d7be6d1dc29e0e5c6419df4751543c21b7b932d6fb16",
+  "scenario_id": "popular_custom",
+  "title": "Manager-common popular custom node"
+}

@@ -1,0 +1,42 @@
+{
+  "basis": [
+    "PHASE_G1 §10 provisional MEDIUM",
+    "PHASE_G2 §1/§11 HIGH",
+    "PHASE_G5 §2 frozen resolution"
+  ],
+  "coexistence": {
+    "policy": "environment_reproducibility_never_forces_workflow_or_target_risk",
+    "reason": "different dimensions; environment never forces workflow risk",
+    "statement": "workflow medium AND environment high hold simultaneously"
+  },
+  "environment_reproducibility": "high",
+  "expected_id": "current_corpus_shape_reconciliation",
+  "expected_issue_codes": [
+    "custom_node_unpinned",
+    "model_hash_unpinned",
+    "model_extraction_gap",
+    "subgraph_frontend_requirement"
+  ],
+  "expected_signals": {
+    "custom_node_count": 4,
+    "custom_node_revision_pinned": false,
+    "custom_repo_count": 4,
+    "env_bound_registry_leak": false,
+    "exact_roundtrip_proven": true,
+    "has_absolute_path": false,
+    "has_external_endpoint": false,
+    "has_unresolved_node_type": false,
+    "model_extraction_gap": true,
+    "model_hash_pinned": false,
+    "model_ref_basename_only": true,
+    "requires_input_asset": false,
+    "unresolved_node_count": 0,
+    "uses_subgraphs": true
+  },
+  "manifest_readiness": {
+    "missing_entries": 3,
+    "ready": false
+  },
+  "normative_for": "G6 risk engine golden reconciliation",
+  "workflow_portability_risk": "medium"
+}

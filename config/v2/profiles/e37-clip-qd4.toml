@@ -1,0 +1,31 @@
+# v2ctl profile: E37 late CLIP QD4 proof gate.
+schema_version = 1
+name = "e37-clip-qd4"
+extends = "e29-tracer"
+owner = "E37"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# E37 control-plane proof requirements.
+COMFYMODAL_MINIMAL_RESTORE = "1"
+COMFYMODAL_V2_E37_STRICT_PROOF = "1"
+COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH = "1"
+# Late CLIP source lane: QD4, 32 MiB blocks, and no pre-exit work.
+COMFYMODAL_V2_CLIP_FAST_HYDRATION = "1"
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+COMFYMODAL_V2_CLIP_QD_QD = "4"
+COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
+COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "after_restore_sensitive_phase"
+# E31 diagnostics/forensics and FP32 cast-once are explicitly OFF.
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+COMFYMODAL_V2_E31_FORENSICS = "0"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"

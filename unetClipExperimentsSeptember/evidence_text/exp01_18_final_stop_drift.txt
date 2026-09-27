@@ -1,0 +1,32 @@
+EVENT=FINAL_DRIFT_AFTER_STOP
+REMOTE_OPERATIONS=STOPPED
+COMMAND=git status --short --untracked-files=all
+--- status ---
+ M .opencode/skills/comfymodal-golden-ops/SKILL.md
+ M tools/v2_control/cli.py
+?? unetClipExperimentsSeptember/exp01_manifest.json
+?? unetClipExperimentsSeptember/evidence_text/exp01_16_pre_run_drift.txt
+?? unetClipExperimentsSeptember/evidence_text/exp01_17_run_S.txt
+?? unetClipExperimentsSeptember/evidence_text/exp01_18_final_stop_drift.txt
+--- HEAD ---
+9f2ce64cfe93b1ae74567b802b30da4c3533e594
+--- golden status ---
+[v2ctl.golden.status]
+schema_version=2
+profile=golden_p1
+target={'app': 'sept-unetclip-01-transport-core', 'class': 'ModalRuntimeEntrypointV2', 'method': 'run_golden_serial_stream'}
+deployment_manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260903-140910_f6b59e42.json
+deployment_fingerprint_current=417dfd21fb8e011c5245f43234da14dbe8eaf2ff1ba1cb30df268b4c128179e8
+deployment_fingerprint_stored=f6b59e429175eaa76fecbe6062a33c3d2e2c3d7bed53c3e4fc295be93e657919
+deployment_fingerprint_match=False
+deployment_target_match=True
+deployed_state_present=True
+deployed_state_target_match=False
+deployed_state_app=batch-ra2-active-patcher
+runtime_health_status=unverified
+source_identity_status=unverified
+runtime_overrides_present=0
+deploy_lock_active=False
+next_request_guarded=False
+remote_checks=not_performed
+ready=False
