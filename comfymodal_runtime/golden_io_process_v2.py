@@ -2833,9 +2833,18 @@ class C0SourceSession:
                     raise C0ProtocolError(response.get("error") or "c0_control_child_fill_failed")
                 return response
             if time.monotonic() >= deadline:
+                base = C0ControlLayout.lane_offset(ticket.lane)
+                state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
+                published = C0ControlLayout._U64.unpack_from(self.shm.buf, base)[0]
+                consumed = C0ControlLayout._U64.unpack_from(self.shm.buf, base + 8)[0]
+                crc_ok = C0ControlLayout.request_crc_valid(self.shm.buf, ticket.lane)
                 with self._lock:
                     self.closed = True
-                raise C0ProtocolError(f"c0_control_fill_timeout:{ticket.request_id}")
+                raise C0ProtocolError(
+                    f"c0_control_fill_timeout:{ticket.request_id}:"
+                    f"lane={ticket.lane}:state={state}:published={published}:"
+                    f"consumed={consumed}:crc={int(bool(crc_ok))}"
+                )
             time.sleep(0.0005)
 
     def consume(self, ticket: C0SessionTicket) -> None:
@@ -3516,7 +3525,7 @@ class SharedArenaRing:
         slot_count: int = C0_SLOT_COUNT,
         slot_bytes: int = C0_SLOT_BYTES,
         device_index: int = 0,
-        control_session: bool = True,
+        control_session: bool = False,
     ) -> None:
         if int(size_bytes) != int(slot_count) * int(slot_bytes):
             raise ValueError("c0_arena_geometry_mismatch")
@@ -4069,7 +4078,7 @@ class SharedArenaRing:
         self._registry.fail_all(self._dead)
 
     # ── fill seam ─────────────────────────────────────────────────────────
-    def fill(self, request: C0FillRequest, *, timeout_s: float = 900.0) -> dict:
+    def fill(self, request: C0FillRequest, *, timeout_s: float = 30.0) -> dict:
         validate_fill_request(request)
         if self._dead is not None:
             raise C0ProtocolError(f"c0_runtime_dead:{self._dead}")
