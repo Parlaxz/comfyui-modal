@@ -9252,6 +9252,12 @@ else:
         "workers_ready": int(_startup_ready),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
+        "control_session": {
+            "enabled": bool(control_name),
+            "lanes": CONTROL_LANES if control_name else 0,
+            "arena_epoch": control_arena_epoch if control_name else None,
+            "session_epoch": control_session_epoch if control_name else None,
+        },
         "source_engine": source_engine,
         "mmap_source": _mmap_ready_evidence,
         "cuda_initialized": False,
