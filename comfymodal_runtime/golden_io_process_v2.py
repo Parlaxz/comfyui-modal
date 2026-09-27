@@ -5896,6 +5896,7 @@ def _control_fill_done(future, lane, sequence):
 
 def _control_loop_impl():
     while not _control_stop.is_set():
+        CONTROL_U64.pack_into(control_buf, 40, time.monotonic_ns())
         found = False
         for lane in range(CONTROL_LANES):
             base = _control_lane_offset(lane)
