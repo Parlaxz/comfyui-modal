@@ -822,6 +822,10 @@ class StageLease:
         self._producer_retired = False
         self.producer_id = producer_id
         self._producer_identity: int | None = producer_id
+        # Optional C0 source-session ticket.  It is consumed only by the
+        # dispatcher's proven CUDA-event completion path.
+        self._c0_session: Any = None
+        self._c0_session_ticket: Any = None
         self.preferred_slot_index = preferred_slot_index
         self.preferred_slot_honored = preferred_slot_honored
 
@@ -1980,6 +1984,17 @@ class TransportDispatcher:
                 self.telemetry.gpu_copy_count = resource.gpu_copy_count
                 self.telemetry.gpu_copy_bytes = resource.gpu_copy_bytes
 
+    @staticmethod
+    def _consume_source_sessions(submission: _DispatchSubmission) -> None:
+        for lease in submission.leases:
+            session = getattr(lease, "_c0_session", None)
+            session_ticket = getattr(lease, "_c0_session_ticket", None)
+            if session is None and session_ticket is None:
+                continue
+            if session is None or session_ticket is None:
+                raise TransportError("C0 session ticket ownership is incomplete")
+            session.consume(session_ticket)
+
     def _poll(self) -> None:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         with self._queue_condition:
@@ -2027,6 +2042,9 @@ class TransportDispatcher:
                         self.telemetry.first_h2d_completion_observed_ns = completion_observed_ns
                     self.telemetry.final_h2d_completion_observed_ns = completion_observed_ns
                     self._record_h2d_complete(key, ticket)
+                    # Source descriptor reuse is deliberately after the CUDA
+                    # event proof, never after child DONE alone.
+                    self._consume_source_sessions(submission)
                     for lease in submission.leases:
                         self.pool._return_completed(lease)
                     release_ticket = getattr(self.backend, "release_ticket", None)
@@ -2120,6 +2138,7 @@ class TransportDispatcher:
                         self.telemetry.h2d_completed_bytes += submission.byte_count
                         self.telemetry.h2d_completed_count += 1
                         self._record_h2d_complete(key, ticket)
+                        self._consume_source_sessions(submission)
                         for lease in submission.leases:
                             if not lease._returned:
                                 self.pool._return_completed(lease)

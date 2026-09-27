@@ -37,6 +37,8 @@ import sys
 import tempfile
 import threading
 import time
+import struct
+import zlib
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Mapping, Optional, Sequence
@@ -2564,6 +2566,303 @@ def validate_fill_reply(request: C0FillRequest, reply: Any) -> int:
     return int(returned)
 
 
+@dataclass(frozen=True)
+class C0SessionTicket:
+    """A control-lane sequence that remains owned until H2D completion."""
+
+    lane: int
+    sequence: int
+    request_id: int
+
+
+class C0ControlLayout:
+    """Binary, aligned layout for the model-level C0 control session.
+
+    The block is deliberately separate from the 512 MiB payload arena and is
+    never passed to CUDA.  ``published``/``consumed`` are monotonically
+    increasing per lane; a descriptor is reusable only after both the child
+    has published DONE and the parent has observed the existing H2D event.
+    """
+
+    MAGIC = b"CM0CTRL2"
+    VERSION = 1
+    LANE_COUNT = 4
+    HEADER_BYTES = 128
+    DESCRIPTOR_BYTES = 1024
+    PATH_BYTES = 512
+    ERROR_BYTES = 192
+    SIZE_BYTES = HEADER_BYTES + LANE_COUNT * DESCRIPTOR_BYTES
+
+    STATE_FREE = 0
+    STATE_REQUESTED = 1
+    STATE_PROCESSING = 2
+    STATE_DONE = 3
+    STATE_ERROR = 4
+
+    # Header and descriptor fields are all naturally aligned.  Keeping these
+    # offsets explicit makes the child copy auditable without importing this
+    # CUDA-owning module.
+    _HEADER = struct.Struct("<8sIIQQQ")
+    _U64 = struct.Struct("<Q")
+    _U32 = struct.Struct("<I")
+    _REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
+    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII")
+
+    @classmethod
+    def lane_offset(cls, lane: int) -> int:
+        if not isinstance(lane, int) or isinstance(lane, bool) or not 0 <= lane < cls.LANE_COUNT:
+            raise C0ProtocolError(f"c0_control_lane_invalid:{lane!r}")
+        return cls.HEADER_BYTES + lane * cls.DESCRIPTOR_BYTES
+
+    @classmethod
+    def create(cls, *, arena_epoch: int, session_epoch: int) -> shared_memory.SharedMemory:
+        shm = shared_memory.SharedMemory(create=True, size=cls.SIZE_BYTES)
+        cls.initialize(shm.buf, arena_epoch=arena_epoch, session_epoch=session_epoch)
+        return shm
+
+    @classmethod
+    def initialize(cls, buf: Any, *, arena_epoch: int, session_epoch: int) -> None:
+        if len(buf) < cls.SIZE_BYTES:
+            raise C0ProtocolError("c0_control_block_too_small")
+        view = memoryview(buf)
+        view[: cls.SIZE_BYTES] = b"\0" * cls.SIZE_BYTES
+        cls._HEADER.pack_into(view, 0, cls.MAGIC, cls.VERSION, cls.LANE_COUNT,
+                              int(arena_epoch), int(session_epoch), 0)
+        for lane in range(cls.LANE_COUNT):
+            base = cls.lane_offset(lane)
+            cls._U32.pack_into(view, base + 16, cls.STATE_FREE)
+
+    @classmethod
+    def validate_header(cls, buf: Any, *, arena_epoch: int, session_epoch: int) -> None:
+        magic, version, lanes, actual_arena, actual_session, _flags = cls._HEADER.unpack_from(buf, 0)
+        if magic != cls.MAGIC or version != cls.VERSION or lanes != cls.LANE_COUNT:
+            raise C0ProtocolError("c0_control_header_mismatch")
+        if actual_arena != int(arena_epoch) or actual_session != int(session_epoch):
+            raise C0ProtocolError("c0_control_epoch_mismatch")
+
+    @classmethod
+    def _crc(cls, payload: bytes) -> int:
+        return int(zlib.crc32(payload) & 0xFFFFFFFF)
+
+    @classmethod
+    def _path_bytes(cls, path: str) -> bytes:
+        raw = os.fsencode(str(path))
+        if len(raw) >= cls.PATH_BYTES:
+            raise C0ProtocolError("c0_control_source_path_too_long")
+        return raw + b"\0" * (cls.PATH_BYTES - len(raw))
+
+    @classmethod
+    def write_request(cls, buf: Any, lane: int, request: C0FillRequest, *, session_epoch: int, sequence: int) -> None:
+        validate_fill_request(request)
+        base = cls.lane_offset(lane)
+        identity = tuple(int(v) for v in (request.source_identity or (0, 0, 0, 0)))
+        if len(identity) != 4:
+            raise C0ProtocolError("c0_control_source_identity_shape")
+        packed = cls._REQUEST.pack(
+            int(sequence), int(request.request_id), int(request.arena_epoch), int(session_epoch),
+            int(request.producer_id), int(request.slot_index), int(request.slot_generation),
+            int(request.source_offset), int(request.destination_offset), int(request.length),
+            *identity, len(os.fsencode(request.source)), 0,
+        )
+        path = cls._path_bytes(request.source)
+        payload = packed[:-4] + path
+        crc = cls._crc(payload)
+        cls._REQUEST.pack_into(buf, base + 24, *cls._REQUEST.unpack(packed[:-4] + cls._U32.pack(crc)))
+        # Role and correlation metadata are fixed-width side fields.
+        role = request.role.encode("ascii")[:15]
+        buf[base + 208 : base + 224] = role + b"\0" * (16 - len(role))
+        buf[base + 224 : base + 224 + cls.PATH_BYTES] = path
+        cls._U64.pack_into(buf, base + 8, int(sequence))
+        cls._U64.pack_into(buf, base + 0, int(sequence))
+        cls._U32.pack_into(buf, base + 16, cls.STATE_REQUESTED)
+
+    @classmethod
+    def read_request(cls, buf: Any, lane: int) -> dict[str, Any]:
+        base = cls.lane_offset(lane)
+        values = cls._REQUEST.unpack_from(buf, base + 24)
+        sequence, request_id, arena_epoch, session_epoch, producer_id, slot, generation, source_offset, destination_offset, length, *tail = values
+        identity = tuple(int(v) for v in tail[:4])
+        path_len = int(tail[4])
+        crc = int(tail[5])
+        path_raw = bytes(buf[base + 224 : base + 224 + cls.PATH_BYTES])
+        path = os.fsdecode(path_raw[:path_len])
+        role_raw = bytes(buf[base + 208 : base + 224]).split(b"\0", 1)[0]
+        role = role_raw.decode("ascii")
+        return {
+            "op": "fill", "request_id": int(request_id), "arena_epoch": int(arena_epoch),
+            "session_epoch": int(session_epoch), "role": role, "path": path,
+            "slot_index": int(slot), "slot_generation": int(generation),
+            "source_offset": int(source_offset), "destination_offset": int(destination_offset),
+            "length": int(length), "producer_id": int(producer_id),
+            "source_identity": None if identity == (0, 0, 0, 0) else identity,
+            "_sequence": int(sequence), "_request_crc": crc,
+        }
+
+    @classmethod
+    def request_crc_valid(cls, buf: Any, lane: int) -> bool:
+        base = cls.lane_offset(lane)
+        values = bytearray(buf[base + 24 : base + 24 + cls._REQUEST.size])
+        stored = cls._REQUEST.unpack_from(values, 0)[-1]
+        values[cls._REQUEST.size - 4 : cls._REQUEST.size] = b"\0" * 4
+        path = bytes(buf[base + 224 : base + 224 + cls.PATH_BYTES])
+        return cls._crc(bytes(values[:-4]) + path) == int(stored)
+
+    @classmethod
+    def write_response(cls, buf: Any, lane: int, sequence: int, result: Mapping[str, Any]) -> None:
+        base = cls.lane_offset(lane)
+        error = str(result.get("error") or "")[: cls.ERROR_BYTES - 1].encode("utf-8", "replace")
+        op = 1 if result.get("op") == "ready" else 2
+        source_engine = 1 if result.get("source_engine") == "mmap_fresh" else 0
+        response = cls._RESPONSE.pack(
+            int(sequence), int(result.get("request_id") or 0), int(result.get("arena_epoch") or 0),
+            int(result.get("slot_index") or 0), int(result.get("slot_generation") or 0),
+            op, int(result.get("returned_bytes") or 0), int(result.get("read_syscalls") or 0),
+            int(result.get("child_read_start_ns") or 0), int(result.get("child_read_end_ns") or 0),
+            int(result.get("fd_open_count") or 0), int(result.get("fd_reuse_count") or 0),
+            int(result.get("fd_close_count") or 0), source_engine,
+        )
+        cls._U32.pack_into(buf, base + 640, cls._crc(response + error))
+        buf[base + 256 : base + 256 + len(response)] = response
+        buf[base + 648 : base + 648 + cls.ERROR_BYTES] = error + b"\0" * (cls.ERROR_BYTES - len(error))
+        buf[base + 16 : base + 20] = struct.pack("<I", cls.STATE_DONE if op == 1 else cls.STATE_ERROR)
+        cls._U64.pack_into(buf, base + 152, int(sequence))
+
+    @classmethod
+    def read_response(cls, buf: Any, lane: int) -> dict[str, Any]:
+        base = cls.lane_offset(lane)
+        values = cls._RESPONSE.unpack_from(buf, base + 256)
+        sequence, request_id, arena_epoch, slot, generation, op, returned, syscalls, start, end, opened, reused, closed, source_engine = values
+        error = bytes(buf[base + 648 : base + 648 + cls.ERROR_BYTES]).split(b"\0", 1)[0].decode("utf-8", "replace")
+        return {
+            "op": "ready" if op == 1 else "error", "request_id": int(request_id),
+            "arena_epoch": int(arena_epoch), "slot_index": int(slot), "slot_generation": int(generation),
+            "returned_bytes": int(returned), "length": int(returned), "read_syscalls": int(syscalls),
+            "child_read_start_ns": int(start) or None, "child_read_end_ns": int(end) or None,
+            "read_duration_ns": max(0, int(end) - int(start)) if start and end else None,
+            "fd_open_count": int(opened), "fd_reuse_count": int(reused), "fd_close_count": int(closed),
+            "source_engine": "mmap_fresh" if source_engine == 1 else "preadv",
+            "error": error or None, "preadv_diagnostics": [], "_sequence": int(sequence),
+        }
+
+    @classmethod
+    def response_crc_valid(cls, buf: Any, lane: int) -> bool:
+        base = cls.lane_offset(lane)
+        response = bytes(buf[base + 256 : base + 256 + cls._RESPONSE.size])
+        error = bytes(buf[base + 648 : base + 648 + cls.ERROR_BYTES]).split(b"\0", 1)[0]
+        stored = cls._U32.unpack_from(buf, base + 640)[0]
+        return cls._crc(response + error) == int(stored)
+
+
+class C0SourceSession:
+    """Parent side of the persistent four-lane C0 control SHM session."""
+
+    def __init__(self, *, arena_epoch: int, child_alive: Any = None) -> None:
+        self.arena_epoch = int(arena_epoch)
+        self.session_epoch = (time.monotonic_ns() ^ (os.getpid() << 17)) & ((1 << 63) - 1)
+        self.shm = C0ControlLayout.create(arena_epoch=self.arena_epoch, session_epoch=self.session_epoch)
+        self._lock = threading.RLock()
+        self._next = [0] * C0ControlLayout.LANE_COUNT
+        self._tickets: dict[tuple[int, int], C0SessionTicket] = {}
+        self._child_alive = child_alive
+        self.closed = False
+
+    @property
+    def name(self) -> str:
+        return self.shm.name
+
+    @property
+    def size(self) -> int:
+        return C0ControlLayout.SIZE_BYTES
+
+    @property
+    def outstanding(self) -> int:
+        with self._lock:
+            return len(self._tickets)
+
+    def _free(self, lane: int) -> bool:
+        base = C0ControlLayout.lane_offset(lane)
+        published = C0ControlLayout._U64.unpack_from(self.shm.buf, base)[0]
+        consumed = C0ControlLayout._U64.unpack_from(self.shm.buf, base + 8)[0]
+        state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
+        return published == consumed and state == C0ControlLayout.STATE_FREE
+
+    def submit(self, request: C0FillRequest, *, timeout_s: float = 900.0) -> C0SessionTicket:
+        validate_fill_request(request)
+        deadline = time.monotonic() + float(timeout_s)
+        with self._lock:
+            while True:
+                if self.closed:
+                    raise C0ProtocolError("c0_control_session_closed")
+                preferred = int(request.producer_id) % C0ControlLayout.LANE_COUNT
+                lanes = [preferred] + [i for i in range(C0ControlLayout.LANE_COUNT) if i != preferred]
+                lane = next((candidate for candidate in lanes if self._free(candidate)), None)
+                if lane is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    raise C0ProtocolError("c0_control_session_no_free_lane")
+                self._lock.release()
+                time.sleep(0.0005)
+                self._lock.acquire()
+            sequence = self._next[lane] + 1
+            self._next[lane] = sequence
+            C0ControlLayout.write_request(self.shm.buf, lane, request, session_epoch=self.session_epoch, sequence=sequence)
+            ticket = C0SessionTicket(lane, sequence, int(request.request_id))
+            self._tickets[(lane, sequence)] = ticket
+            return ticket
+
+    def wait(self, ticket: C0SessionTicket, *, timeout_s: float) -> dict[str, Any]:
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            if self._child_alive is not None and not self._child_alive():
+                raise C0ProtocolError("c0_control_child_dead")
+            base = C0ControlLayout.lane_offset(ticket.lane)
+            state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
+            if state in (C0ControlLayout.STATE_DONE, C0ControlLayout.STATE_ERROR):
+                if not C0ControlLayout.response_crc_valid(self.shm.buf, ticket.lane):
+                    raise C0ProtocolError("c0_control_response_crc_mismatch")
+                response = C0ControlLayout.read_response(self.shm.buf, ticket.lane)
+                request_meta = C0ControlLayout.read_request(self.shm.buf, ticket.lane)
+                if response["_sequence"] != ticket.sequence or response["request_id"] != ticket.request_id:
+                    raise C0ProtocolError("c0_control_response_identity_mismatch")
+                for field in ("source_offset", "destination_offset"):
+                    response[field] = int(request_meta[field])
+                if state == C0ControlLayout.STATE_ERROR:
+                    raise C0ProtocolError(response.get("error") or "c0_control_child_fill_failed")
+                return response
+            if time.monotonic() >= deadline:
+                raise C0ProtocolError(f"c0_control_fill_timeout:{ticket.request_id}")
+            time.sleep(0.0005)
+
+    def consume(self, ticket: C0SessionTicket) -> None:
+        with self._lock:
+            base = C0ControlLayout.lane_offset(ticket.lane)
+            state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
+            sequence = C0ControlLayout._U64.unpack_from(self.shm.buf, base + 152)[0]
+            if state != C0ControlLayout.STATE_DONE or sequence != ticket.sequence:
+                raise C0ProtocolError("c0_control_consume_before_done")
+            C0ControlLayout._U64.pack_into(self.shm.buf, base + 8, ticket.sequence)
+            C0ControlLayout._U32.pack_into(self.shm.buf, base + 16, C0ControlLayout.STATE_FREE)
+            self._tickets.pop((ticket.lane, ticket.sequence), None)
+
+    def abort(self, ticket: C0SessionTicket, reason: str) -> None:
+        with self._lock:
+            self.closed = True
+        raise C0ProtocolError(f"c0_control_session_aborted:{reason}")
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+        try:
+            self.shm.close()
+        finally:
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def c0_source_h2d_overlap_markers(
     *,
     first_source_read_start_mono_ns: Optional[int],
@@ -3212,6 +3511,7 @@ class SharedArenaRing:
         slot_count: int = C0_SLOT_COUNT,
         slot_bytes: int = C0_SLOT_BYTES,
         device_index: int = 0,
+        control_session: bool = True,
     ) -> None:
         if int(size_bytes) != int(slot_count) * int(slot_bytes):
             raise ValueError("c0_arena_geometry_mismatch")
@@ -3219,6 +3519,8 @@ class SharedArenaRing:
         self.slot_count = int(slot_count)
         self.slot_bytes = int(slot_bytes)
         self.device_index = int(device_index)
+        self.control_session_enabled = bool(control_session)
+        self.control_session: Optional[C0SourceSession] = None
         self.created = False
         self.registered = False
         self.epoch = 0
@@ -3395,6 +3697,8 @@ class SharedArenaRing:
             self._tensor[index * self.slot_bytes : (index + 1) * self.slot_bytes]
             for index in range(self.slot_count)
         )
+        if self.control_session_enabled:
+            self.control_session = C0SourceSession(arena_epoch=self.epoch + 1)
         # cudaHostRegister the SAME POSIX-SHM mapping the child writes, unless
         # the deploy-baked selector turned registration OFF.  OFF leaves the
         # mapping, slots, geometry, source engine, and H2D dispatcher byte
@@ -3454,17 +3758,29 @@ class SharedArenaRing:
         # program exceeds the kernel single-argument size limit, so argv
         # spawn fails the launch closed.  argv indexing is unchanged.
         child_source_path = write_c0_child_source_file(_C0_CHILD_SOURCE)
+        child_argv = [
+            sys.executable, child_source_path,
+            str(self._shm.name), str(self.size_bytes),
+            str(self.slot_count), str(self.slot_bytes), str(C0_SOURCE_WORKERS),
+        ]
+        if self.control_session is not None:
+            child_argv.extend([
+                self.control_session.name,
+                str(self.control_session.size),
+                str(self.control_session.arena_epoch),
+                str(self.control_session.session_epoch),
+            ])
         self._proc = subprocess.Popen(
-            [
-                sys.executable, child_source_path,
-                str(self._shm.name), str(self.size_bytes),
-                str(self.slot_count), str(self.slot_bytes), str(C0_SOURCE_WORKERS),
-            ],
+            child_argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=child_env,
         )
         self._stdin = self._proc.stdin
         self._stdout = self._proc.stdout
+        if self.control_session is not None:
+            self.control_session._child_alive = lambda: (
+                self._proc is not None and self._proc.poll() is None and self._dead is None
+            )
         if self.host_register_enabled:
             self.register_start_ns = time.monotonic_ns()
             t0 = time.perf_counter()
@@ -3485,6 +3801,11 @@ class SharedArenaRing:
                 f"c0_child_ready_failed:{_format_child_ready_failure(ready)}"
             )
         self.child_pid = int(ready.get("pid") or 0) or None
+        if self.control_session is not None:
+            advertised = ready.get("control_session")
+            if not isinstance(advertised, dict) or advertised.get("enabled") is not True:
+                self._cleanup_failed_setup()
+                raise RuntimeError("c0_control_session_not_supported")
         self.child_torch_imported = bool(ready.get("torch_imported"))
         self.child_cuda_initialized = bool(ready.get("cuda_initialized"))
         _ready_child_viztracer = ready.get("child_viztracer")
@@ -3664,6 +3985,12 @@ class SharedArenaRing:
                 # Registration failure handling is best-effort; the mapping is
                 # still torn down so a failed setup does not leak a segment.
                 pass
+        if self.control_session is not None:
+            try:
+                self.control_session.close()
+            except Exception:
+                pass
+            self.control_session = None
         self._release_mapping_after_failed_setup()
 
     def _read_child_ready(self, *, timeout_s: float) -> Any:
@@ -3745,6 +4072,19 @@ class SharedArenaRing:
             raise C0ProtocolError("c0_runtime_closing")
         if self._stdin is None or self._stdout is None:
             raise C0ProtocolError("c0_runtime_not_started")
+        if self.control_session is not None:
+            ticket = self.control_session.submit(request, timeout_s=timeout_s)
+            reply = self.control_session.wait(ticket, timeout_s=timeout_s)
+            reply["_c0_session_ticket"] = ticket
+            # The normal READY validation remains authoritative even though the
+            # transport metadata arrived through the binary control block.
+            validate_fill_reply(request, reply)
+            self.fills_submitted += 1
+            self.fills_ready += 1
+            self.physical_read_bytes += request.length
+            self.physical_read_syscalls += int(reply.get("read_syscalls") or 0)
+            self.slot_fills[request.slot_index] += 1
+            return reply
         # Passive one-time probes run outside the fill lock (file I/O only) and
         # can never fail the fill; a diagnostic error is absorbed, not raised.
         try:
@@ -4157,7 +4497,9 @@ class SharedArenaRing:
             # evidence; a None sampler is an explicit disabled/never-started.
             sampler_snapshot = self._stop_live_sampler()
             out["live_sampler"] = sampler_snapshot
-            outstanding = self._registry.outstanding
+            outstanding = self._registry.outstanding + (
+                self.control_session.outstanding if self.control_session is not None else 0
+            )
             out["outstanding_fills"] = outstanding
             if outstanding or self._dead is not None or self._inflight:
                 # An unresolved fill may still be writing the registered
@@ -4201,6 +4543,8 @@ class SharedArenaRing:
                 out["child_runtime_markers"] = (
                     dict(self.child_runtime_markers) if self.child_runtime_markers else None
                 )
+                if self.control_session is not None:
+                    self.control_session.close()
                 out["close_total_ms"] = round((time.perf_counter() - close_t0) * 1000.0, 4)
                 self._closed = True
                 self.cleanup_status = dict(out)
@@ -4241,6 +4585,8 @@ class SharedArenaRing:
                 out["errors"] = errors
             else:
                 out["cleanup_status"] = "released"
+            if self.control_session is not None:
+                self.control_session.close()
             out["teardown_order"] = teardown_order
             out["close_total_ms"] = round((time.perf_counter() - close_t0) * 1000.0, 4)
             out["cleanup_unresolved"] = self.cleanup_unresolved
@@ -4547,6 +4893,15 @@ class SharedArenaRing:
             "slot_count": self.slot_count,
             "slot_bytes": self.slot_bytes,
             "arena_epoch": self.epoch,
+            "control_session_enabled": bool(self.control_session_enabled),
+            "control_session_epoch": (
+                int(self.control_session.session_epoch)
+                if self.control_session is not None else None
+            ),
+            "control_session_lanes": C0ControlLayout.LANE_COUNT if self.control_session_enabled else 0,
+            "control_session_outstanding": (
+                int(self.control_session.outstanding) if self.control_session is not None else 0
+            ),
             "backing_type": "posix",
             "registered": bool(self.registered),
             # Launch-time cudaHostRegister arm selector snapshot.  ``registered``
@@ -4916,6 +5271,12 @@ class C0StageReader:
         # be outstanding per leased slot, so this read is exact for the slot.
         first_fill = int(self._ring.slot_fills[slot_index]) == 0
         reply = self._ring.fill(request)
+        session_ticket = reply.get("_c0_session_ticket") if isinstance(reply, dict) else None
+        if session_ticket is not None:
+            # TransportDispatcher consumes this ticket only from its proven
+            # CUDA-event completion path; source DONE alone is not reusable.
+            lease._c0_session = self._ring.control_session
+            lease._c0_session_ticket = session_ticket
         self.fill_wall_ns += time.monotonic_ns() - started
         self.fills += 1
         self.source_bytes += length
@@ -5426,6 +5787,128 @@ arena_bytes = int(sys.argv[2])
 slot_count = int(sys.argv[3])
 slot_bytes = int(sys.argv[4])
 workers = int(sys.argv[5]) if len(sys.argv) > 5 else 2
+control_name = str(sys.argv[6]) if len(sys.argv) > 6 else ""
+control_bytes = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+control_arena_epoch = int(sys.argv[8]) if len(sys.argv) > 8 else 0
+control_session_epoch = int(sys.argv[9]) if len(sys.argv) > 9 else 0
+
+# Keep this wire definition byte-for-byte aligned with C0ControlLayout.  It is
+# intentionally stdlib-only: this interpreter must remain CUDA sterile.
+CONTROL_MAGIC = b"CM0CTRL2"
+CONTROL_VERSION = 1
+CONTROL_LANES = 4
+CONTROL_HEADER = 128
+CONTROL_DESCRIPTOR = 1024
+CONTROL_PATH_BYTES = 512
+CONTROL_ERROR_BYTES = 192
+CONTROL_STATE_FREE = 0
+CONTROL_STATE_REQUESTED = 1
+CONTROL_STATE_PROCESSING = 2
+CONTROL_STATE_DONE = 3
+CONTROL_STATE_ERROR = 4
+CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
+CONTROL_U64 = struct.Struct("<Q")
+CONTROL_U32 = struct.Struct("<I")
+CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
+CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII")
+
+
+def _control_lane_offset(lane):
+    return CONTROL_HEADER + int(lane) * CONTROL_DESCRIPTOR
+
+
+def _control_crc(payload):
+    import zlib as _zlib
+    return int(_zlib.crc32(payload) & 0xFFFFFFFF)
+
+
+def _control_read_request(lane):
+    base = _control_lane_offset(lane)
+    values = CONTROL_REQUEST.unpack_from(control_buf, base + 24)
+    sequence, request_id, arena_epoch, session_epoch, producer_id, slot, generation, source_offset, destination_offset, length, *tail = values
+    identity = tuple(int(v) for v in tail[:4])
+    path_len = int(tail[4])
+    path = os.fsdecode(bytes(control_buf[base + 224:base + 224 + CONTROL_PATH_BYTES])[:path_len])
+    role = bytes(control_buf[base + 208:base + 224]).split(b"\0", 1)[0].decode("ascii")
+    return {
+        "op": "fill", "request_id": int(request_id), "arena_epoch": int(arena_epoch),
+        "role": role, "path": path, "slot_index": int(slot),
+        "slot_generation": int(generation), "source_offset": int(source_offset),
+        "destination_offset": int(destination_offset), "length": int(length),
+        "producer_id": int(producer_id),
+        "source_identity": None if identity == (0, 0, 0, 0) else identity,
+        "_sequence": int(sequence),
+    }
+
+
+def _control_request_crc_valid(lane):
+    base = _control_lane_offset(lane)
+    values = bytearray(control_buf[base + 24:base + 24 + CONTROL_REQUEST.size])
+    stored = CONTROL_REQUEST.unpack_from(values, 0)[-1]
+    values[CONTROL_REQUEST.size - 4:CONTROL_REQUEST.size] = b"\0" * 4
+    path = bytes(control_buf[base + 224:base + 224 + CONTROL_PATH_BYTES])
+    return _control_crc(bytes(values[:-4]) + path) == int(stored)
+
+
+def _control_publish(lane, sequence, result):
+    base = _control_lane_offset(lane)
+    error = str(result.get("error") or "")[:CONTROL_ERROR_BYTES - 1].encode("utf-8", "replace")
+    op = 1 if result.get("op") == "ready" else 2
+    source_engine = 1 if result.get("source_engine") == "mmap_fresh" else 0
+    response = CONTROL_RESPONSE.pack(
+        int(sequence), int(result.get("request_id") or 0), int(result.get("arena_epoch") or 0),
+        int(result.get("slot_index") or 0), int(result.get("slot_generation") or 0),
+        op, int(result.get("returned_bytes") or 0), int(result.get("read_syscalls") or 0),
+        int(result.get("child_read_start_ns") or 0), int(result.get("child_read_end_ns") or 0),
+        int(result.get("fd_open_count") or 0), int(result.get("fd_reuse_count") or 0),
+        int(result.get("fd_close_count") or 0), source_engine,
+    )
+    CONTROL_U32.pack_into(control_buf, base + 640, _control_crc(response + error))
+    control_buf[base + 648:base + 648 + CONTROL_ERROR_BYTES] = error + b"\0" * (CONTROL_ERROR_BYTES - len(error))
+    control_buf[base + 256:base + 256 + len(response)] = response
+    CONTROL_U64.pack_into(control_buf, base + 152, int(sequence))
+    CONTROL_U32.pack_into(control_buf, base + 16, CONTROL_STATE_DONE if op == 1 else CONTROL_STATE_ERROR)
+
+
+def _control_fill_done(future, lane, sequence):
+    try:
+        result = future.result()
+    except BaseException as exc:
+        result = {"op": "error", "request_id": 0, "arena_epoch": control_arena_epoch,
+                  "error": "%s:%s" % (type(exc).__name__, exc)}
+    _control_publish(lane, sequence, result)
+
+
+def _control_loop():
+    while not _control_stop.is_set():
+        found = False
+        for lane in range(CONTROL_LANES):
+            base = _control_lane_offset(lane)
+            published = CONTROL_U64.unpack_from(control_buf, base)[0]
+            consumed = CONTROL_U64.unpack_from(control_buf, base + 8)[0]
+            state = CONTROL_U32.unpack_from(control_buf, base + 16)[0]
+            if published <= consumed or state != CONTROL_STATE_REQUESTED:
+                continue
+            found = True
+            if not _control_request_crc_valid(lane):
+                _control_publish(lane, published, {"op": "error", "request_id": 0,
+                    "arena_epoch": control_arena_epoch, "error": "c0_control_request_crc_mismatch"})
+                continue
+            CONTROL_U32.pack_into(control_buf, base + 16, CONTROL_STATE_PROCESSING)
+            request = _control_read_request(lane)
+            if (int(request.get("arena_epoch") or 0) != control_arena_epoch
+                    or int(CONTROL_REQUEST.unpack_from(control_buf, base + 24)[3]) != control_session_epoch
+                    or int(request.get("_sequence") or 0) != int(published)):
+                _control_publish(lane, published, {
+                    "op": "error", "request_id": request.get("request_id"),
+                    "arena_epoch": control_arena_epoch,
+                    "error": "c0_control_request_identity_mismatch",
+                })
+                continue
+            future = _pool.submit(_do_fill, request, False)
+            future.add_done_callback(lambda done, _lane=lane, _seq=published: _control_fill_done(done, _lane, _seq))
+        if not found:
+            _control_stop.wait(0.0005)
 
 # Deploy-baked source-engine selector, read once at child launch.  ``preadv``
 # (default) is the exact positioned-read control.  ``mmap_fresh`` replaces ONLY
@@ -5604,6 +6087,23 @@ _sickness_local_control_ready = False
 
 shm = shared_memory.SharedMemory(name=shm_name)
 buf = shm.buf
+control_shm = None
+control_buf = None
+_control_stop = threading.Event()
+if control_name:
+    control_shm = shared_memory.SharedMemory(name=control_name)
+    control_buf = control_shm.buf
+    magic, version, lanes, actual_arena, actual_session, _flags = CONTROL_HEADER_STRUCT.unpack_from(control_buf, 0)
+    if (magic != CONTROL_MAGIC or version != CONTROL_VERSION or lanes != CONTROL_LANES
+            or int(actual_arena) != control_arena_epoch
+            or int(actual_session) != control_session_epoch
+            or len(control_buf) < control_bytes):
+        raise RuntimeError("c0_control_header_mismatch")
+    try:
+        from multiprocessing import resource_tracker as _control_tracker
+        _control_tracker.unregister(control_shm.name, "shared_memory")
+    except Exception:
+        pass
 # The parent owns this POSIX segment.  multiprocessing registers every
 # attachment with a process-local resource tracker; left registered, this
 # child's tracker would unlink the parent's segment when the child exits and
@@ -8250,7 +8750,7 @@ def _mmap_reader_round_trip(reader, blob):
     return payload
 
 
-def _do_fill_mmap(req):
+def _do_fill_mmap(req, emit_result=True):
     base = {
         "request_id": req.get("request_id"),
         "arena_epoch": req.get("arena_epoch"),
@@ -8279,7 +8779,9 @@ def _do_fill_mmap(req):
         rtt_ns = int(max(0, time.monotonic_ns() - rtt_start_ns))
         result = json.loads(payload.decode("utf-8"))
         result["mmap_pipe_rtt_ns"] = rtt_ns
-        _emit(result)
+        if emit_result:
+            _emit(result)
+        return result
     except BaseException as exc:
         err = dict(base)
         fd_open_delta = int(getattr(exc, "fd_open_count", fd_open_delta) or fd_open_delta)
@@ -8299,13 +8801,14 @@ def _do_fill_mmap(req):
             "fd_open_wall_ms": round(fd_open_wall_ns / 1e6, 4),
             "fd_close_wall_ms": round(fd_close_wall_ns / 1e6, 4),
         })
-        _emit(err)
+        if emit_result:
+            _emit(err)
+        return err
 
 
-def _do_fill(req):
+def _do_fill(req, emit_result=True):
     if mmap_engine:
-        _do_fill_mmap(req)
-        return
+        return _do_fill_mmap(req, emit_result=emit_result)
     _tracer_enable_thread()
     rid = req.get("request_id")
     base = {
@@ -8529,7 +9032,9 @@ def _do_fill(req):
                 if source_volume_v1 else "short_read:%d:%d" % (got, length)
             )
         _sickness_attach_reply(result, req, got)
-        _emit(result)
+        if emit_result:
+            _emit(result)
+        return result
     except BaseException as exc:
         err = dict(base)
         err.update({
@@ -8586,7 +9091,9 @@ def _do_fill(req):
         # Diagnostics survive a failed fill exactly as they do on READY.  OFF
         # omits the key entirely so the error reply keeps the control schema.
         _sickness_attach_reply(err, req, got)
-        _emit(err)
+        if emit_result:
+            _emit(err)
+        return err
 
 
 # Distinct C0 direct Volume V1 treatment: load the stdlib transport module and
@@ -8704,6 +9211,10 @@ _startup_evidence = {
     "wall_ms": _startup_wall_ms,
     "threads": [_startup_threads[index] for index in sorted(_startup_threads)],
 }
+_control_thread = None
+if control_name and _startup_error is None and _startup_ready == workers and _volume_setup_error is None:
+    _control_thread = threading.Thread(target=_control_loop, name="c0-control-session", daemon=True)
+    _control_thread.start()
 if (
     _startup_error is not None
     or _startup_ready != workers
@@ -8716,6 +9227,12 @@ if (
         "workers_ready": int(_startup_ready),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
+        "control_session": {
+            "enabled": bool(control_name),
+            "lanes": CONTROL_LANES if control_name else 0,
+            "arena_epoch": control_arena_epoch if control_name else None,
+            "session_epoch": control_session_epoch if control_name else None,
+        },
         "private_split_io": bool(private_split_io),
         "source_volume_v1": bool(source_volume_v1),
         "volume_v1": _volume_evidence(),
@@ -8774,7 +9291,10 @@ try:
             continue
         op = str(req.get("op") or "")
         if op == "fill":
-            _pool.submit(_do_fill, req)
+            if control_name:
+                _emit({"op": "fatal", "error": "c0_control_session_rejects_pipe_fill"})
+            else:
+                _pool.submit(_do_fill, req)
         elif op == "ping":
             _emit({"op": "pong", "request_id": req.get("request_id"), "pid": os.getpid()})
         elif op == "exit":
@@ -8782,6 +9302,12 @@ try:
         else:
             _emit({"op": "error", "request_id": req.get("request_id"), "error": "bad_op:%s" % op})
 finally:
+    _control_stop.set()
+    if _control_thread is not None:
+        try:
+            _control_thread.join(timeout=2.0)
+        except Exception:
+            pass
     # Drain every in-flight fill before touching the cached descriptors: a
     # fill thread may still be mid-preadv on an ON-path fd.  Only after the
     # pool is quiescent do we close cached descriptors and emit the terminal
@@ -8902,6 +9428,13 @@ finally:
         pass
     try:
         shm.close()
+    except Exception:
+        pass
+    try:
+        if control_buf is not None:
+            control_buf.release()
+        if control_shm is not None:
+            control_shm.close()
     except Exception:
         pass
 """
@@ -9048,6 +9581,9 @@ __all__ = [
     "C0_INFLIGHT_LIMIT",
     "resolve_c0_geometry",
     "C0FillRequest",
+    "C0ControlLayout",
+    "C0SessionTicket",
+    "C0SourceSession",
     "C0ProtocolError",
     "C0ReplyRegistry",
     "C0StageReader",
