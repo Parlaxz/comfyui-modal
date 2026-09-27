@@ -2811,7 +2811,10 @@ class C0SourceSession:
             return ticket
 
     def wait(self, ticket: C0SessionTicket, *, timeout_s: float) -> dict[str, Any]:
-        deadline = time.monotonic() + float(timeout_s)
+        # A source descriptor is bounded work.  Never inherit the historical
+        # 900-second pipe timeout into the shared control plane: a dead control
+        # thread must fail the request, not hold a Modal worker for 15 minutes.
+        deadline = time.monotonic() + min(float(timeout_s), 30.0)
         while True:
             if self._child_alive is not None and not self._child_alive():
                 raise C0ProtocolError("c0_control_child_dead")
@@ -2830,6 +2833,8 @@ class C0SourceSession:
                     raise C0ProtocolError(response.get("error") or "c0_control_child_fill_failed")
                 return response
             if time.monotonic() >= deadline:
+                with self._lock:
+                    self.closed = True
                 raise C0ProtocolError(f"c0_control_fill_timeout:{ticket.request_id}")
             time.sleep(0.0005)
 
@@ -5879,7 +5884,7 @@ def _control_fill_done(future, lane, sequence):
     _control_publish(lane, sequence, result)
 
 
-def _control_loop():
+def _control_loop_impl():
     while not _control_stop.is_set():
         found = False
         for lane in range(CONTROL_LANES):
@@ -5909,6 +5914,35 @@ def _control_loop():
             future.add_done_callback(lambda done, _lane=lane, _seq=published: _control_fill_done(done, _lane, _seq))
         if not found:
             _control_stop.wait(0.0005)
+
+
+def _control_loop():
+    # Fail-closed exception boundary: a dead daemon thread must resolve every
+    # active lane instead of leaving the parent at the historical 900-second
+    # fill timeout.
+    try:
+        _control_loop_impl()
+    except BaseException as exc:
+        for lane in range(CONTROL_LANES):
+            try:
+                base = _control_lane_offset(lane)
+                state = CONTROL_U32.unpack_from(control_buf, base + 16)[0]
+                if state in (CONTROL_STATE_REQUESTED, CONTROL_STATE_PROCESSING):
+                    sequence = CONTROL_U64.unpack_from(control_buf, base)[0]
+                    _control_publish(lane, sequence, {
+                        "op": "error",
+                        "request_id": 0,
+                        "arena_epoch": control_arena_epoch,
+                        "error": "c0_control_loop_failed:%s:%s" % (
+                            type(exc).__name__, str(exc)[:160]
+                        ),
+                    })
+            except BaseException:
+                pass
+        _emit({"op": "fatal", "error": "c0_control_loop_failed:%s:%s" % (
+            type(exc).__name__, str(exc)[:160]
+        )})
+        _control_stop.set()
 
 # Deploy-baked source-engine selector, read once at child launch.  ``preadv``
 # (default) is the exact positioned-read control.  ``mmap_fresh`` replaces ONLY
