@@ -259,7 +259,13 @@ async def golden_parallel_execute(
                         _gantt_ext.get("snapshot_restore_ms") if isinstance(_gantt_ext, dict) else None
                     ),
                 )
-                print(_gantt_text, flush=True)
+                # Emit one record per line. Modal log search/indexing can treat
+                # a multiline print as one opaque payload, which made a valid
+                # Gantt disappear from literal log queries.
+                print("[GOLDEN GANTT BEGIN]", flush=True)
+                for _gantt_line in _gantt_text.splitlines():
+                    print(f"[GOLDEN GANTT] {_gantt_line}", flush=True)
+                print("[GOLDEN GANTT END]", flush=True)
                 session.recorder.event("golden_parallel_gantt", gantt=_gantt_text)
             except Exception:
                 pass
