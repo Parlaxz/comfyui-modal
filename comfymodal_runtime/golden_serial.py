@@ -11399,10 +11399,15 @@ async def golden_clip_load(
                     "host_registration_reused": stats.get("host_registration_reused"),
                     "cuda_stream_reused": stats.get("cuda_stream_reused"),
                     "destination_reused": stats.get("destination_reused"),
-                    "layout_resolve_ms": stats.get("layout_resolve_ms"),
-                    "source_go_offset_ms": stats.get("source_go_offset_ms"),
-                    "source_wall_ms": stats.get("source_wall_ms"),
-                    "source_child_wall_ms": stats.get("source_child_wall_ms"),
+                     "layout_resolve_ms": stats.get("layout_resolve_ms"),
+                     "source_go_offset_ms": stats.get("source_go_offset_ms"),
+                     "source_wall_ms": stats.get("source_wall_ms"),
+                     "source_final_byte_complete_ns": stats.get("source_final_byte_complete_ns"),
+                     "final_h2d_submit_ns": stats.get("final_h2d_submit_ns"),
+                     "final_h2d_completion_observed_ns": stats.get("final_h2d_completion_observed_ns"),
+                     "gpu_ready_ns": stats.get("gpu_ready_ns"),
+                     "views_ready_ns": stats.get("views_ready_ns"),
+                     "source_child_wall_ms": stats.get("source_child_wall_ms"),
                     "source_fill_wall_ms": stats.get("source_fill_wall_ms"),
                     "source_gbps": stats.get("source_gbps"),
                     "gpu_ready_wall_ms": stats.get("gpu_ready_wall_ms"),
@@ -11809,8 +11814,10 @@ async def golden_clip_load(
             )
         if clip_transfer is not None:
             set_clip_lifecycle_phase("adoption")
+        adoption_started_ns = time.monotonic_ns()
         with clip_timing.span("storage_adoption"):
             adoption = select_and_validate_qd_adoption_scope("clip", cond_model, combined_views)
+        adoption_end_ns = time.monotonic_ns()
         selected_scope = next(
             (module for path, module in cond_model.named_modules()
              if str(path) == str(adoption["selected_scope"])),
@@ -11994,6 +12001,8 @@ async def golden_clip_load(
                     "skeleton_wall_ms": skeleton_ms,
                     "skeleton_exposed_ms": skeleton_ms,
                     "adoption_ms": adoption_ms,
+                    "adoption_start_ns": adoption_started_ns,
+                    "adoption_end_ns": adoption_end_ns,
                 })
             rec.event(
                 "golden_model_load_waterfall",
@@ -12044,6 +12053,7 @@ async def golden_clip_load(
                 } else {}
             ),
         )
+        load_exit_ns = time.monotonic_ns()
         if _golden_model_transport_enabled() and session.model_transport_records:
             interval = rec.intervals["golden_clip_load"]
             full_load_ms = (
@@ -12052,6 +12062,7 @@ async def golden_clip_load(
             )
             for record in session.model_transport_records[-len(transports):]:
                 record["full_load_ms"] = full_load_ms
+                record["load_exit_ns"] = load_exit_ns
                 record["full_load_minus_source_ms"] = (
                     full_load_ms - float(record["source_wall_ms"])
                     if full_load_ms is not None and record.get("source_wall_ms") is not None else None
@@ -13127,7 +13138,10 @@ async def golden_unet_load(
                         "layout_cache_hit", "fd_cache_hit", "transport_runtime_reused",
                         "reader_pool_reused", "staging_reused", "host_registration_reused",
                         "cuda_stream_reused", "destination_reused", "layout_resolve_ms",
-                        "source_go_offset_ms", "source_wall_ms", "gpu_ready_wall_ms",
+                        "source_go_offset_ms", "source_wall_ms",
+                        "source_final_byte_complete_ns", "final_h2d_submit_ns",
+                        "final_h2d_completion_observed_ns", "gpu_ready_ns", "views_ready_ns",
+                        "gpu_ready_wall_ms",
                         "source_child_wall_ms", "source_fill_wall_ms",
                         "source_gbps",
                         "gpu_ready_tail_ms", "destination_growth_ms", "new_capacity_bytes",
@@ -13168,7 +13182,7 @@ async def golden_unet_load(
         # load_model_weights POPS keys from the dict it receives; pass a copy
         # so `views` survives for the identity measurement below.
         reset_peak_stats()
-        adoption_started_ns = time.perf_counter_ns()
+        adoption_started_ns = time.monotonic_ns()
         with _golden_trace_span("golden.unet.assign_adoption"):
             result = model.load_model_weights(dict(views), "", assign=True)
             missing = getattr(result, "missing_keys", None) if result is not None else None
@@ -13177,7 +13191,8 @@ async def golden_unet_load(
 
         with _golden_trace_span("golden.unet.binding_validation"):
             identity = validate_unet_binding(model, views, expected_count=contract.expected_unet_tensor_count)
-        adoption_wall_ms = (time.perf_counter_ns() - adoption_started_ns) / 1e6
+        adoption_end_ns = time.monotonic_ns()
+        adoption_wall_ms = (adoption_end_ns - adoption_started_ns) / 1e6
         after_adoption = checkpoint("after_assign_adoption")
         post_qd_delta = int(after_adoption["allocated_bytes"]) - int(after_qd["allocated_bytes"])
         if post_qd_delta >= int(transport["stats"]["gpu_bytes"]):
@@ -13207,6 +13222,8 @@ async def golden_unet_load(
                     "skeleton_wall_ms": skeleton_wall_ms,
                     "skeleton_exposed_ms": skeleton_wall_ms,
                     "adoption_ms": adoption_wall_ms,
+                    "adoption_start_ns": adoption_started_ns,
+                    "adoption_end_ns": adoption_end_ns,
                 })
             rec.event(
                 "golden_model_load_waterfall",
@@ -13232,6 +13249,7 @@ async def golden_unet_load(
             peak_measurement_supported=peak_supported,
             transport_stats=build_qd_transport_diagnostics(transport["stats"]),
         )
+        load_exit_ns = time.monotonic_ns()
         if shared_transport is not None and session.model_transport_records:
             interval = rec.intervals["golden_unet_load"]
             full_load_ms = (
@@ -13240,6 +13258,7 @@ async def golden_unet_load(
             )
             record = session.model_transport_records[-1]
             record["full_load_ms"] = full_load_ms
+            record["load_exit_ns"] = load_exit_ns
             record["full_load_minus_source_ms"] = (
                 full_load_ms - float(record["source_wall_ms"])
                 if full_load_ms is not None and record.get("source_wall_ms") is not None else None

@@ -1024,6 +1024,7 @@ class GoldenModelTransport:
         are forked here, and no standalone M2 loader wrapper is entered.
         """
         started_ns = time.perf_counter_ns()
+        started_mono_ns = time.monotonic_ns()
         with self._lock:
             if self._poisoned:
                 raise RuntimeError("persistent_model_transport_poisoned")
@@ -1104,6 +1105,8 @@ class GoldenModelTransport:
             )
             dispatcher.snapshot_quiescence()
             views = self._views(owner.gpu_tensor, layout.tensor_map)
+            views_ready_ns = time.monotonic_ns()
+            qd_timing = result.telemetry if isinstance(result.telemetry, dict) else {}
             # Stages A-D measurement: summarize already-accumulated reader +
             # dispatcher evidence (no I/O, no synchronization).  Full
             # per-window arrays ride only the explicit window-trace selector.
@@ -1135,6 +1138,14 @@ class GoldenModelTransport:
             )
             finished_ns = time.perf_counter_ns()
             total_load_ms = (finished_ns - started_ns) / 1e6
+            source_final_byte_complete_ns = qd_timing.get(
+                "source_final_byte_complete_ns",
+                child_end_ns or None,
+            )
+            final_h2d_submit_ns = qd_timing.get("final_h2d_submit_ns")
+            final_h2d_completion_observed_ns = qd_timing.get(
+                "final_h2d_completion_observed_ns"
+            )
             stats = {
                 "status": "ok",
                 # Identity: C0 execution body, M2 source kernel, C0 shared
@@ -1187,12 +1198,20 @@ class GoldenModelTransport:
                 "fd_cache_hit": bool(getattr(source, "fd_reuse_count", 0)),
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "source_go_offset_ms": (int(getattr(source, "first_source_read_start_mono_ns", 0) or 0) - started_ns) / 1e6,
-                "gpu_ready_wall_ms": (finished_ns - started_ns) / 1e6,
-                # The dispatcher gates every transfer on its completion event
-                # but exposes no per-transfer completion timestamps, so the
-                # exposed source->GPU tail is tracked as full-load overhead
-                # over source (total_load_ms - source_wall_ms), not here.
-                "gpu_ready_tail_ms": None,
+                "source_final_byte_complete_ns": source_final_byte_complete_ns,
+                "final_h2d_submit_ns": final_h2d_submit_ns,
+                "final_h2d_completion_observed_ns": final_h2d_completion_observed_ns,
+                "gpu_ready_ns": final_h2d_completion_observed_ns,
+                "views_ready_ns": views_ready_ns,
+                "gpu_ready_wall_ms": (
+                    (final_h2d_completion_observed_ns - started_mono_ns) / 1e6
+                    if final_h2d_completion_observed_ns else None
+                ),
+                "gpu_ready_tail_ms": (
+                    (final_h2d_completion_observed_ns - source_final_byte_complete_ns) / 1e6
+                    if final_h2d_completion_observed_ns and source_final_byte_complete_ns
+                    else None
+                ),
                 "destination_growth_ms": self._pool.growth_ms,
                 "new_capacity_bytes": owner.capacity_bytes if not owner.reused else None,
                 "total_load_ms": total_load_ms,

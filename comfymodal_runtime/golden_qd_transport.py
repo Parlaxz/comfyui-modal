@@ -1264,6 +1264,10 @@ class _Telemetry:
     h2d_completed_bytes: int = 0
     h2d_submitted_count: int = 0
     h2d_completed_count: int = 0
+    first_h2d_submit_ns: int | None = None
+    final_h2d_submit_ns: int | None = None
+    first_h2d_completion_observed_ns: int | None = None
+    final_h2d_completion_observed_ns: int | None = None
     h2d_submission_sizes: list[int] | None = None
     aggregated_submission_count: int = 0
     non_aggregated_submission_count: int = 0
@@ -1626,8 +1630,13 @@ class _Telemetry:
                     if self.dispatcher_reap_wall_ns is not None else None
                 ),
                 "dispatcher_reap_count": self.dispatcher_reap_count,
-                "h2d_event_completion_latency_ms": latency,
-                "final_drain_wall_ms": drain_wall / 1e6 if drain_wall is not None else None,
+                 "h2d_event_completion_latency_ms": latency,
+                 "first_h2d_submit_ns": self.first_h2d_submit_ns,
+                 "final_h2d_submit_ns": self.final_h2d_submit_ns,
+                 "first_h2d_completion_observed_ns": self.first_h2d_completion_observed_ns,
+                 "final_h2d_completion_observed_ns": self.final_h2d_completion_observed_ns,
+                 "source_final_byte_complete_ns": self.source_end_ns,
+                 "final_drain_wall_ms": drain_wall / 1e6 if drain_wall is not None else None,
                 "parse_count": self.parse_count,
                 "owner": _json_safe(self.owner),
                 "adoption": _json_safe(self.adoption),
@@ -2009,8 +2018,12 @@ class TransportDispatcher:
                     # The completion event is the proof that the submitted
                     # copy finished.  Count it before pool bookkeeping so a
                     # cleanup race cannot make telemetry claim it did not.
+                    completion_observed_ns = time.monotonic_ns()
                     self.telemetry.h2d_completed_bytes += submission.byte_count
                     self.telemetry.h2d_completed_count += 1
+                    if self.telemetry.first_h2d_completion_observed_ns is None:
+                        self.telemetry.first_h2d_completion_observed_ns = completion_observed_ns
+                    self.telemetry.final_h2d_completion_observed_ns = completion_observed_ns
                     self._record_h2d_complete(key, ticket)
                     for lease in submission.leases:
                         self.pool._return_completed(lease)
@@ -2412,6 +2425,10 @@ class TransportDispatcher:
                         # in the core telemetry and can never be reported as a
                         # completed H2D.
                         self._actual_h2d_tokens[group_id] = actual_h2d_token
+                    if self.telemetry.diagnostics_enabled:
+                        if self.telemetry.first_h2d_submit_ns is None:
+                            self.telemetry.first_h2d_submit_ns = submit_ns
+                        self.telemetry.final_h2d_submit_ns = submit_ns
                 except BaseException as exc:
                     if self._cancelled:
                         self._cleanup_cancelled(self._cleanup_deadline)
