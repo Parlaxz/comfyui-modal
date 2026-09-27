@@ -586,6 +586,7 @@ def summarize_dispatcher(dispatcher: Any) -> dict[str, Any]:
         ),
         "min_free_slots": _get(telemetry, "min_free_slots"),
         "source_qd_target": _get(telemetry, "source_qd_target"),
+        "affinity_breaks": _get(telemetry, "affinity_breaks", 0),
         "h2d_submitted": _get(telemetry, "h2d_submitted_bytes"),
         "h2d_completed": _get(telemetry, "h2d_completed_bytes"),
         "gpu_copy_active_union_ms": _get(telemetry, "gpu_copy_active_union_ms"),
