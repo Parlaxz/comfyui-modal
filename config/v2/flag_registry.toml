@@ -739,6 +739,15 @@ owner = "c0-experiment-1"
 description = "Experiment-1 treatment: materialize the fresh 512 MiB C0 SHM with real parallel CPU writes before cudaHostRegister (default OFF = production-005 control)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_READER_GATE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-experiment-4"
+description = "Experiment-4 treatment: enforce the 4 ms source-launch floor inside each forked reader immediately before its expensive access (default OFF = claim-spacing only)."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
 type = "enum"
 default = "serial"

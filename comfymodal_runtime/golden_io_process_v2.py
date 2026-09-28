@@ -1351,6 +1351,18 @@ def c0_mmap_engine_enabled() -> bool:
 
 IO_PROCESS_V2_C0_HOST_REGISTER_ENV = "COMFYMODAL_GOLDEN_C0_HOST_REGISTER"
 C0_SHM_POPULATE_ENV = "COMFYMODAL_GOLDEN_C0_SHM_POPULATE"
+C0_READER_GATE_ENV = "COMFYMODAL_GOLDEN_C0_READER_GATE"
+
+
+def c0_reader_gate_enabled() -> bool:
+    """True only when the Experiment-4 reader-side actual-start gate is ON.
+
+    Deploy-baked, default OFF (existing claim-spacing behavior).  ON adds an
+    interprocess 4 ms launch gate inside each forked source reader immediately
+    before its expensive mmap/memcpy access, so actual materialization starts
+    -- not just coordinator dispatch claims -- are globally spaced.
+    """
+    return str(os.environ.get(C0_READER_GATE_ENV) or "").strip().lower() in _TRUTHY
 
 
 def c0_shm_populate_enabled() -> bool:
@@ -2653,7 +2665,7 @@ class C0ControlLayout:
     """
 
     MAGIC = b"CM0CTRL2"
-    VERSION = 3
+    VERSION = 4
     LANE_COUNT = 4
     HEADER_BYTES = 128
     DESCRIPTOR_BYTES = 1024
@@ -2677,7 +2689,7 @@ class C0ControlLayout:
     # The first fields are the stable control reply.  The trailing passive
     # fields preserve child mmap/CPU/fault evidence through the binary session;
     # zero means that a field was not produced by the selected child engine.
-    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 31)
+    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 32)
 
     @classmethod
     def lane_offset(cls, lane: int) -> int:
@@ -2798,6 +2810,7 @@ class C0ControlLayout:
             int(result.get("mmap_frozen_unmap_ns") or 0),
             int(result.get("mmap_munmap_ns") or 0),
             int(result.get("mmap_launch_gap_wait_ns") or 0),
+            int(result.get("mmap_actual_gate_wait_ns") or 0),
             int(result.get("mmap_pipe_rtt_ns") or 0),
             int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
             int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
@@ -2825,7 +2838,7 @@ class C0ControlLayout:
         (
             reader_pid, reader_index, mmap_map, mmap_memcpy, mmap_memcpy_warm,
             mmap_memcpy_shm_warm, mmap_frozen_copy, mmap_frozen_unmap, mmap_munmap,
-            mmap_gate_wait, mmap_pipe_rtt, mmap_minflt, mmap_majflt,
+            mmap_gate_wait, mmap_actual_gate_wait, mmap_pipe_rtt, mmap_minflt, mmap_majflt,
             mmap_utime, mmap_stime, mmap_sched_run, mmap_sched_wait,
             mmap_cpu_utime, mmap_cpu_stime, mmap_sched_run_delta, mmap_sched_wait_delta,
             copy_start, copy_end, mmap_op_start, mmap_op_end,
@@ -2850,6 +2863,7 @@ class C0ControlLayout:
             "mmap_frozen_unmap_ns": _optional(mmap_frozen_unmap),
             "mmap_munmap_ns": _optional(mmap_munmap),
             "mmap_launch_gap_wait_ns": _optional(mmap_gate_wait),
+            "mmap_actual_gate_wait_ns": _optional(mmap_actual_gate_wait),
             "mmap_pipe_rtt_ns": _optional(mmap_pipe_rtt),
             "mmap_minflt": _optional(mmap_minflt), "mmap_majflt": _optional(mmap_majflt),
             "mmap_ru_utime_ns": _optional(mmap_utime), "mmap_ru_stime_ns": _optional(mmap_stime),
@@ -2976,7 +2990,7 @@ class C0SourceSession:
                         "mmap_map_ns", "mmap_memcpy_ns", "mmap_memcpy_warm_ns",
                         "mmap_memcpy_shm_warm_ns", "mmap_frozen_copy_ns",
                         "mmap_frozen_unmap_ns", "mmap_munmap_ns",
-                        "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
+                        "mmap_launch_gap_wait_ns", "mmap_actual_gate_wait_ns", "mmap_pipe_rtt_ns",
                         "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
                         "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
                         "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
@@ -3773,6 +3787,7 @@ class SharedArenaRing:
         # Read once here (before the mapping exists) and mirrored into evidence
         # so the arm is provable from the arena record, not the live env.
         self.host_register_enabled = c0_host_register_enabled()
+        self.reader_gate_enabled = c0_reader_gate_enabled()
         # Diagnostic-only private source/destination split snapshot.  The child
         # reads the same selector once at spawn; the parent reports what it
         # launched with.  OFF is the exact direct file -> leased SHM path.
@@ -5133,6 +5148,7 @@ class SharedArenaRing:
             # above proves what actually happened; this proves which arm the
             # deploy baked even if registration failed before evidence.
             "host_register_enabled": bool(self.host_register_enabled),
+            "reader_gate_enabled": bool(self.reader_gate_enabled),
             "already_unlinked": bool(self._already_unlinked),
             "backing_create_ms": self.backing_create_ms,
             "backing_create_start_ns": self.backing_create_start_ns,
@@ -5376,6 +5392,7 @@ class C0StageReader:
         self._mmap_frozen_unmap_ns: list[int] = []
         self._mmap_munmap_ns: list[int] = []
         self._mmap_gate_wait_ns: list[int] = []
+        self._mmap_actual_gate_wait_ns: list[int] = []
         self._mmap_pipe_rtt_ns: list[int] = []
         self._source_touch_copy_ns: list[int] = []
         self._mmap_read_records: list[dict] = []
@@ -5569,7 +5586,7 @@ class C0StageReader:
                     "mmap_map_ns", "mmap_memcpy_ns", "mmap_memcpy_warm_ns",
                     "mmap_memcpy_shm_warm_ns", "mmap_frozen_copy_ns",
                     "mmap_frozen_unmap_ns", "mmap_munmap_ns",
-                    "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
+                    "mmap_launch_gap_wait_ns", "mmap_actual_gate_wait_ns", "mmap_pipe_rtt_ns",
                     "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
                     "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
                     "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
@@ -5668,6 +5685,7 @@ class C0StageReader:
             ("_mmap_frozen_unmap_ns", "mmap_frozen_unmap_ns"),
             ("_mmap_munmap_ns", "mmap_munmap_ns"),
             ("_mmap_gate_wait_ns", "mmap_launch_gap_wait_ns"),
+            ("_mmap_actual_gate_wait_ns", "mmap_actual_gate_wait_ns"),
             ("_mmap_pipe_rtt_ns", "mmap_pipe_rtt_ns"),
             ("_mmap_minflt", "mmap_minflt"),
             ("_mmap_majflt", "mmap_majflt"),
@@ -5978,6 +5996,9 @@ class C0StageReader:
                 ),
                 "munmap_ms": _read_duration_summary(self._mmap_munmap_ns),
                 "gate_wait_ms": _read_duration_summary(self._mmap_gate_wait_ns),
+                "actual_gate_wait_ms": _read_duration_summary(
+                    self._mmap_actual_gate_wait_ns
+                ),
                 "pipe_rtt_ms": _read_duration_summary(self._mmap_pipe_rtt_ns),
                 "minflt_total": (
                     sum(self._mmap_minflt) if self._mmap_minflt else None
@@ -6102,7 +6123,7 @@ control_session_epoch = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 # Keep this wire definition byte-for-byte aligned with C0ControlLayout.  It is
 # intentionally stdlib-only: this interpreter must remain CUDA sterile.
 CONTROL_MAGIC = b"CM0CTRL2"
-CONTROL_VERSION = 3
+CONTROL_VERSION = 4
 CONTROL_LANES = 4
 CONTROL_HEADER = 128
 CONTROL_DESCRIPTOR = 1024
@@ -6117,7 +6138,7 @@ CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
 CONTROL_U64 = struct.Struct("<Q")
 CONTROL_U32 = struct.Struct("<I")
 CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
-CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 31)
+CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 32)
 
 
 def _control_lane_offset(lane):
@@ -6177,6 +6198,7 @@ def _control_publish(lane, sequence, result):
         int(result.get("mmap_frozen_unmap_ns") or 0),
         int(result.get("mmap_munmap_ns") or 0),
         int(result.get("mmap_launch_gap_wait_ns") or 0),
+        int(result.get("mmap_actual_gate_wait_ns") or 0),
         int(result.get("mmap_pipe_rtt_ns") or 0),
         int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
         int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
@@ -6290,6 +6312,21 @@ mmap_copy_diag = (
 # few fills of each reader process (one reader == one process == one budget).
 _mmap_diag_budget = 3
 MMAP_LAUNCH_GAP_NS = 4_000_000
+# Experiment-4 reader-side actual-start gate (deploy-baked, default OFF).
+# OFF preserves the exact coordinator claim-spacing behavior.  ON adds an
+# interprocess 4 ms gate inside each forked reader immediately before its
+# expensive mmap/memcpy access, so actual materialization starts -- not just
+# dispatch claims -- are globally spaced across all four readers.
+mmap_reader_gate = (
+    str(os.environ.get("COMFYMODAL_GOLDEN_C0_READER_GATE") or "")
+    .strip().lower() in ("1", "true", "yes", "on")
+)
+# Shared interprocess actual-start state, created by the coordinator before
+# forking readers (inherited MAP_SHARED + lock fd): last recorded reader-side
+# mmap-start instant (int64 ns, monotonic) and an flock-guarded file lock.
+_mmap_actual_gate_mmap = None
+_mmap_actual_gate_lock_fd = None
+_mmap_actual_gate_lock_path = ""
 _PROT_READ = 1
 _MAP_PRIVATE = 2
 _PAGE = 4096
@@ -8788,6 +8825,11 @@ def _mmap_reader_fill(req):
         window_len = ((delta + length + _PAGE - 1) // _PAGE) * _PAGE
         cpu_before_utime_ns, cpu_before_stime_ns = _mmap_cpu_counters()
         sched_before_run_ns, sched_before_wait_ns = _mmap_schedstat_counters()
+        # Experiment-4 actual-start gate: when enabled, the reader enforces the
+        # global 4 ms floor immediately before its own expensive access, so the
+        # recorded mmap/memcpy starts below are truly spaced.  When OFF this is
+        # a 0 ns no-op and the coordinator claim gate alone applies.
+        actual_gate_wait_ns = _mmap_actual_launch_gate()
         read_start_ns = time.monotonic_ns()
         map_end_ns = read_start_ns
         copy_end_ns = read_start_ns
@@ -8917,6 +8959,7 @@ def _mmap_reader_fill(req):
             "reader_index": int(req.get("_reader_index") or 0),
             "mmap_window_bytes": int(window_len),
             "mmap_launch_gap_wait_ns": int(req.get("_launch_gap_wait_ns") or 0),
+            "mmap_actual_gate_wait_ns": int(actual_gate_wait_ns),
             # Per-read phase split so source cost is attributable without a
             # second experiment: map, memcpy, unmap, plus page-fault deltas.
              "mmap_map_ns": int(max(0, map_end_ns - read_start_ns)),
@@ -9034,10 +9077,11 @@ _mmap_last_launch_ns = [0]
 
 
 def _mmap_launch_gate():
-    # One global launch-spacing floor across every reader process.  Sleep the
-    # remaining fraction with the lock RELEASED (frozen-engine semantics), so
-    # readers never serialize behind another reader's wait; the floor spaces
-    # CLAIMS, not reads.
+    # One global dispatch-claim spacing floor across every reader process.
+    # Sleep the remaining fraction with the lock RELEASED (frozen-engine
+    # semantics), so readers never serialize behind another reader's wait.
+    # NOTE: this spaces coordinator CLAIMS, not actual reader-side source
+    # accesses; the Experiment-4 reader gate below spaces actual starts.
     entered = time.monotonic_ns()
     while True:
         with _mmap_gate_lock:
@@ -9050,9 +9094,64 @@ def _mmap_launch_gate():
         time.sleep(remaining / 1e9)
 
 
+def _mmap_actual_gate_setup():
+    # Coordinator-side one-time setup for the reader-side actual-start gate.
+    # Creates one MAP_SHARED int64 (last recorded reader mmap-start, monotonic
+    # ns) plus one flock-guarded lock file; both are inherited across the
+    # reader forks below.  No-op unless the reader gate is enabled.
+    global _mmap_actual_gate_mmap, _mmap_actual_gate_lock_fd, _mmap_actual_gate_lock_path
+    if not mmap_reader_gate or _mmap_actual_gate_mmap is not None:
+        return
+    import mmap as _gate_mmap
+    lock_dir = str(os.environ.get("TMPDIR") or "/tmp")
+    _mmap_actual_gate_lock_path = os.path.join(
+        lock_dir, "comfymodal_c0_actual_gate.%d.lock" % int(os.getpid())
+    )
+    _mmap_actual_gate_lock_fd = os.open(
+        _mmap_actual_gate_lock_path, os.O_CREAT | os.O_RDWR, 0o600
+    )
+    _mmap_actual_gate_mmap = _gate_mmap.mmap(
+        -1, 8,
+        flags=_gate_mmap.MAP_SHARED,
+        prot=_gate_mmap.PROT_READ | _gate_mmap.PROT_WRITE,
+    )
+    _mmap_actual_gate_mmap[0:8] = struct.pack("<q", 0)
+
+
+def _mmap_actual_launch_gate():
+    # Runs INSIDE each forked reader process immediately before its expensive
+    # mmap/memcpy access.  Interprocess 4 ms floor on actual source-access
+    # starts across all readers: lock, wait until last recorded actual start
+    # + 4 ms (lock released while sleeping), record this start, unlock, then
+    # begin materialization immediately.  The lock covers only launch pacing,
+    # never the 30-1000+ ms source operation.  Returns wait ns (0 when OFF).
+    if not mmap_reader_gate:
+        return 0
+    shared = _mmap_actual_gate_mmap
+    lock_fd = _mmap_actual_gate_lock_fd
+    if shared is None or lock_fd is None:
+        return 0
+    import fcntl as _gate_fcntl
+    entered = time.monotonic_ns()
+    while True:
+        _gate_fcntl.flock(lock_fd, _gate_fcntl.LOCK_EX)
+        try:
+            (last,) = struct.unpack("<q", bytes(shared[0:8]))
+            now = time.monotonic_ns()
+            elapsed = now - int(last)
+            if elapsed >= MMAP_LAUNCH_GAP_NS:
+                shared[0:8] = struct.pack("<q", now)
+                return max(0, int(now - entered))
+            remaining = MMAP_LAUNCH_GAP_NS - elapsed
+        finally:
+            _gate_fcntl.flock(lock_fd, _gate_fcntl.LOCK_UN)
+        time.sleep(remaining / 1e9)
+
+
 def _mmap_spawn_readers():
     global _mmap_buf_addr
     _mmap_buf_addr = _mmap_buffer_address()
+    _mmap_actual_gate_setup()
     for index in range(max(1, int(workers))):
         cmd_r, cmd_w = os.pipe()
         res_r, res_w = os.pipe()
@@ -9619,6 +9718,7 @@ if (
         "pid": os.getpid(),
         "workers_configured": int(workers),
         "workers_ready": int(_startup_ready),
+        "reader_gate": bool(mmap_reader_gate),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
         "control_session": {
@@ -9644,6 +9744,7 @@ else:
         "workers": workers,
         "workers_configured": int(workers),
         "workers_ready": int(_startup_ready),
+        "reader_gate": bool(mmap_reader_gate),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
         "control_session": {
