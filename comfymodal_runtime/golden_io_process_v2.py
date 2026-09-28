@@ -3952,6 +3952,9 @@ class SharedArenaRing:
         # arena; no other path reads these fields.
         self.dma_ring_enabled = c0_dma_ring_enabled()
         self.five_slots_enabled = c0_five_slots_enabled()
+        # Passive C0 first-use startup waterfall (observation-only raw
+        # monotonic_ns milestones; filled by ensure(), surfaced in evidence).
+        self.startup_marks: dict[str, int] = {}
         self.dma_ring: Optional[C0DmaRing] = None
         self.pinned_alloc_ms: Optional[float] = None
         # Diagnostic-only private source/destination split snapshot.  The child
@@ -4040,6 +4043,10 @@ class SharedArenaRing:
     def ensure(self) -> "SharedArenaRing":
         if self.created:
             return self
+        # Passive startup waterfall: raw monotonic_ns milestones, dict
+        # inserts only.  Observation-only; never branched on.
+        self.startup_marks = marks = {}
+        marks["c0_ensure_enter"] = int(time.monotonic_ns())
         # Distinct C0 direct Volume V1 treatment: resolve the same-name V1
         # Volume identity once, before the mapping exists, so a failed
         # resolution fails the launch closed without leaking a segment.
@@ -4047,6 +4054,8 @@ class SharedArenaRing:
             self.source_volume_metadata = dict(resolve_c0_source_volume_metadata())
         torch = _require_torch()
         cudart = torch.cuda.cudart()
+        marks["torch_required"] = int(time.monotonic_ns())
+
         register = getattr(cudart, "cudaHostRegister", None)
         if self.host_register_enabled and not callable(register):
             raise RuntimeError("cudaHostRegister_unavailable")
@@ -4055,14 +4064,26 @@ class SharedArenaRing:
         self._shm = shared_memory.SharedMemory(create=True, size=self.size_bytes)
         self.backing_create_end_ns = time.monotonic_ns()
         self.backing_create_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+        marks["shm_create_begin"] = int(self.backing_create_start_ns or 0)
+        marks["shm_create_end"] = int(self.backing_create_end_ns or 0)
+
+        marks["torch_frombuffer_begin"] = int(time.monotonic_ns())
         self._tensor = torch.frombuffer(self._shm.buf, dtype=torch.uint8)
+        marks["torch_frombuffer_end"] = int(time.monotonic_ns())
+
         self._arena_address = _shm_address(self._shm)
+        marks["slot_views_begin"] = int(time.monotonic_ns())
         self._slot_tensors = tuple(
             self._tensor[index * self.slot_bytes : (index + 1) * self.slot_bytes]
             for index in range(self.slot_count)
         )
+        marks["slot_views_end"] = int(time.monotonic_ns())
+
         if self.control_session_enabled:
+            marks["control_shm_create_begin"] = int(time.monotonic_ns())
             self.control_session = C0SourceSession(arena_epoch=self.epoch + 1)
+            marks["control_shm_create_end"] = int(time.monotonic_ns())
+
         # cudaHostRegister the SAME POSIX-SHM mapping the child writes, unless
         # the deploy-baked selector turned registration OFF.  OFF leaves the
         # mapping, slots, geometry, source engine, and H2D dispatcher byte
@@ -4074,6 +4095,7 @@ class SharedArenaRing:
         # cudaHostRegister call, hiding ~100+ ms of fork/exec/python-startup
         # behind registration with no threading and no behavior change; the
         # ready handshake still joins before ensure() returns.
+        marks["child_env_build_begin"] = int(time.monotonic_ns())
         child_env = os.environ.copy()
         child_env["CUDA_VISIBLE_DEVICES"] = ""
         # The CUDA-sterile child loads the stdlib transport module by explicit
@@ -4117,11 +4139,15 @@ class SharedArenaRing:
             child_env[C0_PREADV_SICKNESS_INVOCATION_ID_ENV] = str(
                 self.preadv_sickness_invocation_id or ""
             )
+        marks["child_env_build_end"] = int(time.monotonic_ns())
         self.child_start_ns = time.monotonic_ns()
         # Spawn from a content-hashed file, never ``python -c``: the child
         # program exceeds the kernel single-argument size limit, so argv
         # spawn fails the launch closed.  argv indexing is unchanged.
+        marks["child_source_materialize_begin"] = int(time.monotonic_ns())
         child_source_path = write_c0_child_source_file(_C0_CHILD_SOURCE)
+        marks["child_source_materialize_end"] = int(time.monotonic_ns())
+
         child_argv = [
             sys.executable, child_source_path,
             str(self._shm.name), str(self.size_bytes),
@@ -4134,6 +4160,7 @@ class SharedArenaRing:
                 str(self.control_session.arena_epoch),
                 str(self.control_session.session_epoch),
             ])
+        marks["popen_begin"] = int(time.monotonic_ns())
         self._proc = subprocess.Popen(
             child_argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -4141,6 +4168,8 @@ class SharedArenaRing:
         )
         self._stdin = self._proc.stdin
         self._stdout = self._proc.stdout
+        marks["popen_return"] = int(time.monotonic_ns())
+
         if self.control_session is not None:
             self.control_session._child_alive = lambda: (
                 self._proc is not None and self._proc.poll() is None and self._dead is None
@@ -4181,6 +4210,9 @@ class SharedArenaRing:
                 self._cleanup_failed_setup()
                 raise RuntimeError(f"cudaHostRegister_failed:{rc}:{_cudart_error_str(cudart, rc)}")
             self.registered = True
+            marks["cuda_host_register_begin"] = int(self.register_start_ns or 0)
+            marks["cuda_host_register_end"] = int(self.register_end_ns or 0)
+
         if self.dma_ring_enabled:
             _dma_alloc_t0 = time.perf_counter()
             try:
@@ -4195,8 +4227,12 @@ class SharedArenaRing:
                 f"slot_bytes={C0_DMA_PINNED_SLOT_BYTES} alloc_ms={self.pinned_alloc_ms}",
                 flush=True,
             )
+        marks["parent_wait_child_ready_begin"] = int(time.monotonic_ns())
         ready = self._read_child_ready(timeout_s=180.0)
         self.child_ready_ns = time.monotonic_ns()
+        marks["parent_child_ready_received"] = int(self.child_ready_ns or 0)
+
+        marks["parent_validation_begin"] = int(time.monotonic_ns())
         if not isinstance(ready, dict) or ready.get("op") != "ready_child":
             self._cleanup_failed_setup()
             raise RuntimeError(
@@ -4301,6 +4337,12 @@ class SharedArenaRing:
                 if isinstance(ready.get("mount_identity"), dict)
                 else None
             ),
+            # Passive child startup waterfall (observation-only monotonic_ns).
+            "startup_marks": (
+                dict(ready.get("startup_marks"))
+                if isinstance(ready.get("startup_marks"), dict)
+                else None
+            ),
         }
         if (
             _ready_workers_int != C0_SOURCE_WORKERS
@@ -4312,6 +4354,7 @@ class SharedArenaRing:
                 f"configured={_ready_workers_int}:ready={_ready_worker_count_int}:"
                 f"expected={C0_SOURCE_WORKERS}"
             )
+        marks["parent_validation_end"] = int(time.monotonic_ns())
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="c0-ipc-writer", daemon=True
         )
@@ -5332,6 +5375,7 @@ class SharedArenaRing:
             "reader_gate_enabled": bool(self.reader_gate_enabled),
             "dma_ring_enabled": bool(self.dma_ring_enabled),
             "five_slots_enabled": bool(self.five_slots_enabled),
+            "startup_marks": dict(self.startup_marks),
             "dma_source_slots": (int(C0_DMA_SOURCE_SLOTS) if self.dma_ring_enabled else None),
             "dma_source_slot_bytes": (int(C0_DMA_SOURCE_SLOT_BYTES) if self.dma_ring_enabled else None),
             "dma_pinned_slots": (int(C0_DMA_PINNED_SLOTS) if self.dma_ring_enabled else None),
@@ -6385,6 +6429,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import shared_memory
+# Passive startup waterfall (observation-only raw monotonic_ns; dict inserts
+# only).  Parent and forked readers share CLOCK_MONOTONIC on this host.
+_C0_T0_NS = time.monotonic_ns()
+_C0_T = {"child_python_entry": int(_C0_T0_NS), "child_imports_done": int(_C0_T0_NS)}
+def _c0_mark(name):
+    try:
+        _C0_T[str(name)] = int(time.monotonic_ns())
+    except BaseException:
+        pass
 
 shm_name = str(sys.argv[1])
 arena_bytes = int(sys.argv[2])
@@ -6395,6 +6448,7 @@ control_name = str(sys.argv[6]) if len(sys.argv) > 6 else ""
 control_bytes = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 control_arena_epoch = int(sys.argv[8]) if len(sys.argv) > 8 else 0
 control_session_epoch = int(sys.argv[9]) if len(sys.argv) > 9 else 0
+_c0_mark("child_argv_parsed")
 
 # Keep this wire definition byte-for-byte aligned with C0ControlLayout.  It is
 # intentionally stdlib-only: this interpreter must remain CUDA sterile.
@@ -6755,11 +6809,14 @@ _sickness_heartbeat = {
 }
 _sickness_local_control_ready = False
 
+_c0_mark("child_shm_attach_begin")
 shm = shared_memory.SharedMemory(name=shm_name)
 buf = shm.buf
+_c0_mark("child_shm_attach_end")
 control_shm = None
 control_buf = None
 _control_stop = threading.Event()
+_c0_mark("child_control_attach_begin")
 if control_name:
     control_shm = shared_memory.SharedMemory(name=control_name)
     control_buf = control_shm.buf
@@ -6784,6 +6841,7 @@ try:
     resource_tracker.unregister(shm.name, "shared_memory")
 except Exception:
     pass
+_c0_mark("child_control_attach_end")
 out_q = queue.Queue(maxsize=max(16, slot_count * 8))
 
 
@@ -9321,8 +9379,17 @@ def _mmap_reader_main(index, cmd_r, res_w):
     # Allocate and zero the process-private staging buffer before the first
     # request enters its measured source interval. Each reader process owns one
     # reusable buffer; later fills do not allocate or first-touch it.
+    _reader_entry_ns = time.monotonic_ns()
     if private_split_io:
         _mmap_private_copy_target(slot_bytes)
+    _reader_ready_ns = time.monotonic_ns()
+    try:
+        _reader_blob = json.dumps({"op": "reader_ready", "index": int(index),
+            "pid": int(os.getpid()), "entry_ns": int(_reader_entry_ns),
+            "ready_ns": int(_reader_ready_ns)}, default=str).encode("utf-8")
+        _mmap_send_all(res_w, struct.pack("<I", len(_reader_blob)) + _reader_blob)
+    except Exception:
+        os._exit(1)
     while True:
         header = _mmap_recv_all(cmd_r, 4)
         if header is None:
@@ -9424,13 +9491,58 @@ def _mmap_actual_launch_gate():
         time.sleep(remaining / 1e9)
 
 
+_MMAP_READER_READY_TIMEOUT_S = 120.0
+
+
+def _mmap_await_reader_ready(record):
+    # Consume one reader_ready frame; stamp per-reader startup (fail-closed).
+    deadline = time.monotonic() + _MMAP_READER_READY_TIMEOUT_S
+    def _read_exact(count):
+        chunks = []
+        remaining = int(count)
+        while remaining > 0:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise RuntimeError("mmap_reader_ready_timeout:%d" % int(record["index"]))
+            ready, _w, _x = select.select([record["res_r"]], [], [], budget)
+            if not ready:
+                raise RuntimeError("mmap_reader_ready_timeout:%d" % int(record["index"]))
+            chunk = os.read(record["res_r"], remaining)
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    try:
+        reaped, _status = os.waitpid(record["pid"], os.WNOHANG)
+    except ChildProcessError:
+        reaped = record["pid"]
+    if reaped == record["pid"]:
+        raise RuntimeError("mmap_reader_dead:%d" % int(record["index"]))
+    header = _read_exact(4)
+    if header is None:
+        raise RuntimeError("mmap_reader_ready_eof:%d" % int(record["index"]))
+    (size,) = struct.unpack("<I", header)
+    payload = _read_exact(size)
+    if payload is None:
+        raise RuntimeError("mmap_reader_ready_eof:%d" % int(record["index"]))
+    msg = json.loads(payload.decode("utf-8"))
+    if not isinstance(msg, dict) or msg.get("op") != "reader_ready" or int(msg.get("index", -1)) != int(record["index"]):
+        raise RuntimeError("mmap_reader_ready_bad_frame:%d" % int(record["index"]))
+    record["entry_ns"] = msg.get("entry_ns")
+    record["ready_ns"] = msg.get("ready_ns")
+    record["ready_received_ns"] = int(time.monotonic_ns())
+
+
 def _mmap_spawn_readers():
     global _mmap_buf_addr
     _mmap_buf_addr = _mmap_buffer_address()
     _mmap_actual_gate_setup()
+    _c0_mark("reader_fork_phase_begin")
     for index in range(max(1, int(workers))):
         cmd_r, cmd_w = os.pipe()
         res_r, res_w = os.pipe()
+        fork_begin = time.monotonic_ns()
         pid = os.fork()
         if pid == 0:
             try:
@@ -9440,6 +9552,7 @@ def _mmap_spawn_readers():
                 pass
             _mmap_reader_main(index, cmd_r, res_w)
             os._exit(0)
+        fork_return = time.monotonic_ns()
         os.close(cmd_r)
         os.close(res_w)
         _mmap_readers.append({
@@ -9448,7 +9561,15 @@ def _mmap_spawn_readers():
             "cmd_w": cmd_w,
             "res_r": res_r,
             "lock": threading.Lock(),
+            "fork_begin_ns": int(fork_begin),
+            "fork_return_ns": int(fork_return),
+            "entry_ns": None,
+            "ready_ns": None,
+            "ready_received_ns": None,
         })
+    for record in _mmap_readers:
+        _mmap_await_reader_ready(record)
+    _c0_mark("all_reader_processes_created")
     return len(_mmap_readers)
 
 
@@ -9893,7 +10014,14 @@ _mmap_ready_evidence = {
 if mmap_engine:
     _mmap_spawn_readers()
     _mmap_ready_evidence["readers"] = [
-        {"index": r["index"], "pid": r["pid"]} for r in _mmap_readers
+        {
+            "index": r["index"], "pid": r["pid"],
+            "fork_begin_ns": r.get("fork_begin_ns"),
+            "fork_return_ns": r.get("fork_return_ns"),
+            "entry_ns": r.get("entry_ns"),
+            "ready_ns": r.get("ready_ns"),
+            "ready_received_ns": r.get("ready_received_ns"),
+        } for r in _mmap_readers
     ]
     _mmap_ready_evidence["readers_started"] = len(_mmap_readers)
 
@@ -9929,6 +10057,7 @@ _startup_timeout_s = 30.0
 _startup_barrier = threading.Barrier(workers)
 _startup_lock = threading.Lock()
 _startup_threads = {}
+_startup_probe_done_ns = {}
 
 
 def _startup_probe(index):
@@ -9960,18 +10089,22 @@ def _startup_probe(index):
 
 _startup_t0 = time.perf_counter_ns()
 _startup_deadline = time.monotonic() + _startup_timeout_s
+_c0_mark("startup_probes_submit_begin")
 _startup_futures = [_pool.submit(_startup_probe, index) for index in range(workers)]
+_c0_mark("startup_probes_submit_end")
 _startup_error = None
 _startup_ready = 0
-for future in _startup_futures:
+for _probe_seq, future in enumerate(_startup_futures):
     try:
         future.result(timeout=max(0.0, _startup_deadline - time.monotonic()))
         _startup_ready += 1
+        _startup_probe_done_ns[int(_probe_seq)] = int(time.monotonic_ns())
     except BaseException as exc:
         if _startup_error is None:
             _startup_error = (
                 "%s:%s" % (type(exc).__name__, str(exc) or "startup_barrier_unmet")
             )[:200]
+_c0_mark("all_reader_probes_done")
 _startup_wall_ms = round((time.perf_counter_ns() - _startup_t0) / 1e6, 4)
 _startup_evidence = {
     "configured": int(workers),
@@ -9979,11 +10112,14 @@ _startup_evidence = {
     "ready": int(_startup_ready),
     "wall_ms": _startup_wall_ms,
     "threads": [_startup_threads[index] for index in sorted(_startup_threads)],
+    "probe_done_ns": {int(k): int(v) for k, v in _startup_probe_done_ns.items()},
 }
 _control_thread = None
+_c0_mark("control_thread_start_begin")
 if control_name and _startup_error is None and _startup_ready == workers and _volume_setup_error is None:
     _control_thread = threading.Thread(target=_control_loop, name="c0-control-session", daemon=True)
     _control_thread.start()
+    _c0_mark("control_thread_started")
 if (
     _startup_error is not None
     or _startup_ready != workers
@@ -9997,6 +10133,7 @@ if (
         "reader_gate": bool(mmap_reader_gate),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
+        "startup_marks": dict(_C0_T),
         "control_session": {
             "enabled": bool(control_name),
             "lanes": CONTROL_LANES if control_name else 0,
@@ -10023,6 +10160,7 @@ else:
         "reader_gate": bool(mmap_reader_gate),
         "startup_wall_ms": _startup_wall_ms,
         "startup_barrier": _startup_evidence,
+        "startup_marks": dict(_C0_T),
         "control_session": {
             "enabled": bool(control_name),
             "lanes": CONTROL_LANES if control_name else 0,
@@ -10056,6 +10194,7 @@ else:
         # and the pre-registered control manifest without touching model bytes.
         **_sickness_ready_child_fields(),
     })
+_c0_mark("child_main_loop_enter")
 try:
     for line in iter(sys.stdin.readline, ""):
         line = line.strip()

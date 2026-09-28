@@ -519,11 +519,13 @@ def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
         "shm_populate_enabled": _get("shm_populate_enabled"),
         "dma_ring_enabled": _get("dma_ring_enabled"),
         "five_slots_enabled": _get("five_slots_enabled"),
+        "startup_marks": _get("startup_marks"),
         "pinned_alloc_ms": _get("pinned_alloc_ms"),
         "populate_ms": _get("populate_ms"),
         "populate_cpu_ms": _get("populate_cpu_ms"),
         "populate_workers": _get("populate_workers"),
         "child_pid": _get("child_pid"),
+        "child_ready_evidence": _get("child_ready_evidence"),
         "child_startup_ms": (
             (ready_ns - start_ns) / 1e6
             if isinstance(start_ns, int) and isinstance(ready_ns, int)
@@ -812,11 +814,17 @@ class GoldenModelTransport:
                 from . import golden_io_process_v2 as c0
                 from . import golden_qd_transport as qd_transport
                 self._c0_runtime = c0.ensure_arena_runtime()
+                _c0marks = getattr(self, "_c0_setup_marks", None)
+                if isinstance(_c0marks, dict):
+                    _c0marks["transfer_resources_begin"] = time.monotonic_ns()
                 self._c0_resources = qd_transport.GoldenTransferResources.create_shared(
                     slot_count=int(self._c0_runtime.slot_count),
                     slot_bytes=int(self._c0_runtime.slot_bytes),
                     device=target,
                 )
+                if isinstance(_c0marks, dict):
+                    _c0marks["transfer_resources_end"] = time.monotonic_ns()
+
                 self._pool = GpuDestinationPool(target)
                 self._cuda = {
                     "device": target,
@@ -1074,6 +1082,10 @@ class GoldenModelTransport:
         """
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
+        # Passive per-load setup waterfall (observation-only monotonic_ns).
+        self._c0_setup_marks = marks = {}
+        marks["load_enter"] = int(started_mono_ns)
+
         with self._lock:
             if self._poisoned:
                 raise RuntimeError("persistent_model_transport_poisoned")
@@ -1096,12 +1108,19 @@ class GoldenModelTransport:
             normalized_path = os.path.abspath(str(path))
             layout_cache_hit = normalized_path in self._layout_cache
             layout_started_ns = time.perf_counter_ns()
+            marks["layout_resolve_begin"] = int(time.monotonic_ns())
             layout = self.inspect(path)
+            marks["layout_resolve_end"] = int(time.monotonic_ns())
             layout_end_ns = time.perf_counter_ns()
+            marks["owner_acquire_begin"] = int(time.monotonic_ns())
             owner = self._pool.acquire(layout.data_bytes)
+            marks["owner_acquire_end"] = int(time.monotonic_ns())
+            marks["backend_create_begin"] = int(time.monotonic_ns())
             backend = qd_transport.CudaTransferBackend(
                 owner.gpu_tensor, resources=self._c0_resources
             )
+            marks["backend_create_end"] = int(time.monotonic_ns())
+
             config = qd_transport.TransportConfig(
                 queue_depth=int(geo["queue_depth"]),
                 block_bytes=int(geo["block_bytes"]),
@@ -1115,7 +1134,11 @@ class GoldenModelTransport:
                     else bool(geo["aggregation_enabled"])
                 ),
             )
+            marks["pool_create_begin"] = int(time.monotonic_ns())
             pool = self._c0_runtime.new_stage_pool()
+            marks["pool_create_end"] = int(time.monotonic_ns())
+
+            marks["dispatcher_create_begin"] = int(time.monotonic_ns())
             dispatcher = qd_transport.GoldenQDTransport(
                 config,
                 backend,
@@ -1124,6 +1147,8 @@ class GoldenModelTransport:
                 diagnostics=True,
                 resources=self._c0_resources,
             )
+            marks["dispatcher_create_end"] = int(time.monotonic_ns())
+
             ranges = []
             block_id = 0
             offset = layout.data_start
@@ -1147,6 +1172,10 @@ class GoldenModelTransport:
                 source=layout.path,
                 source_identity=tuple(int(value) for value in layout.identity),
             )
+            marks["range_plan_begin"] = int(time.monotonic_ns())
+            # NOTE: ranges list built above; mark covers plan assembly.
+            marks["range_plan_end"] = int(time.monotonic_ns())
+            marks["dispatcher_execute_enter"] = int(time.monotonic_ns())
             result = dispatcher.execute(
                 ranges,
                 source,
@@ -1167,6 +1196,7 @@ class GoldenModelTransport:
             # selector; OFF does not allocate or retain this evidence.
             source_detail: dict[str, Any] = {
                 "transport_geometry": str(geo["name"]),
+                "load_setup_marks": dict(marks),
                 "arena_ensure": arena_ensure_detail(self._c0_runtime),
                 "reader": summarize_c0_reader(source),
                 "dispatcher": summarize_dispatcher(dispatcher),
@@ -1184,6 +1214,26 @@ class GoldenModelTransport:
                         len(records) > _C0_WINDOW_TRACE_LIMIT or dropped > 0
                     )
                     source_detail["window_trace_dropped"] = int(dropped)
+                    _first_op = None
+                    for _rec in records:
+                        if isinstance(_rec, dict) and _rec.get("operation_ordinal") == 0:
+                            _submits = self._c0_runtime.fill_submit_mono_ns
+                            _first_submit = min(
+                                (int(v) for v in _submits.values() if isinstance(v, int)),
+                                default=None,
+                            )
+                            _first_op = {
+                                "first_control_request_publish_ns": _first_submit,
+                                "first_work_available_ns": _rec.get("work_available_ns"),
+                                "first_reader_claim_ns": _rec.get("reader_claim_ns"),
+                                "first_mmap_begin_ns": _rec.get("mmap_start_ns"),
+                                "first_memcpy_begin_ns": _rec.get("memcpy_start_ns"),
+                                "first_source_done_ns": _rec.get("copy_end_ns"),
+                                "first_reader": _rec.get("reader"),
+                                "first_lane": _rec.get("lane"),
+                            }
+                            break
+                    source_detail["first_op_marks"] = _first_op
                 except BaseException:
                     source_detail["window_trace"] = None
             child_start_ns = int(getattr(source, "first_child_read_start_mono_ns", 0) or 0)
