@@ -5423,7 +5423,7 @@ class C0StageReader:
                 "producer_id": int(producer_id),
                 "reader": int(producer_id),
                 "lane": int(producer_id),
-                "request_id": int(request.request_id),
+                "fill_request_id": int(request.request_id),
                 "record_id": declared.record_id,
                 "fill_index": int(self.fills),
                 "source_offset": int(offset),

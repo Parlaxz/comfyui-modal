@@ -21,8 +21,10 @@ from comfymodal_runtime.golden_qd_transport import (
     FakeBackend,
     GoldenQDTransport,
     SourceRange,
+    StagingPool,
     TransportConfig,
 )
+from tools.benchmark_v2_direct import _golden_p1_request_pairing
 
 
 pytestmark = pytest.mark.fast_unit
@@ -298,6 +300,57 @@ def test_c0_window_trace_is_off_without_changing_source_work(monkeypatch):
 
     assert result.completed_bytes == 16
     assert source.traces == [None, None]
+
+
+def test_c0_window_trace_fill_id_does_not_pollute_golden_request_pairing(monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_WINDOW_TRACE", "1")
+
+    class _Ring:
+        _window_trace_enabled = True
+        _req_cond = threading.Condition()
+        _next_request_id = 0
+        epoch = 7
+        slot_bytes = 8
+        slot_fills = [0]
+        fill_submit_mono_ns = {}
+        fill_ready_mono_ns = {}
+        private_split_io = False
+        source_volume_v1 = False
+        preadv_sickness_diag = False
+
+        def slot_base_address(self, _slot_index):
+            return 0
+
+        def fill(self, request, *, trace):
+            assert trace["fill_request_id"] == request.request_id
+            return {}
+
+    pool = StagingPool(slots=1, block_bytes=8, capacity_class="test")
+    lease = pool.acquire(declared_range=SourceRange(0, 8), producer_id=0)
+    reader = C0StageReader(
+        _Ring(), role="clip", pool=pool, source="/tmp/model.safetensors"
+    )
+    monkeypatch.setattr(c0_io, "_lease_target_address", lambda _target: 0)
+
+    reader.readinto_lease(lease, bytearray(8), 0, producer_id=0)
+    pool.return_lease(lease)
+    records, dropped = reader.window_trace_snapshot()
+
+    assert dropped == 0
+    assert len(records) == 1
+    assert records[0]["fill_request_id"] == 1
+    assert "request_id" not in records[0]
+
+    events = [{
+        "request_id": "golden-request",
+        "source_detail": {"window_trace": records},
+    }]
+    paired, status, observed = _golden_p1_request_pairing(
+        events, "golden-request", "invocation"
+    )
+    assert paired is True
+    assert status == "paired"
+    assert observed["request_id"] == ["golden-request"]
 
 
 def test_child_error_and_exact_coverage_are_not_downgraded():
