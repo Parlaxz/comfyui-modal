@@ -483,6 +483,10 @@ def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
         "backing_create_ms": _get("backing_create_ms"),
         "register_ms": _get("register_ms"),
         "registered": _get("registered"),
+        "shm_populate_enabled": _get("shm_populate_enabled"),
+        "populate_ms": _get("populate_ms"),
+        "populate_cpu_ms": _get("populate_cpu_ms"),
+        "populate_workers": _get("populate_workers"),
         "child_pid": _get("child_pid"),
         "child_startup_ms": (
             (ready_ns - start_ns) / 1e6

@@ -4886,6 +4886,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_HOST_REGISTER": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_HOST_REGISTER", "0"
         ),
+        "COMFYMODAL_GOLDEN_C0_SHM_POPULATE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SHM_POPULATE", "0"
+        ),
         "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
             "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
         ),

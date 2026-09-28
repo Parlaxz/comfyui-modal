@@ -1350,6 +1350,67 @@ def c0_mmap_engine_enabled() -> bool:
 
 
 IO_PROCESS_V2_C0_HOST_REGISTER_ENV = "COMFYMODAL_GOLDEN_C0_HOST_REGISTER"
+C0_SHM_POPULATE_ENV = "COMFYMODAL_GOLDEN_C0_SHM_POPULATE"
+
+
+def c0_shm_populate_enabled() -> bool:
+    """True only when the Experiment-1 SHM page-population treatment is ON.
+
+    Deploy-baked, default OFF (exact production-005 control).  ON
+    materializes the fresh 512 MiB POSIX SHM with real CPU writes across
+    disjoint regions before ``cudaHostRegister`` starts.  No source-file
+    reads, no slot-semantic change, no geometry change.
+    """
+    return str(os.environ.get(C0_SHM_POPULATE_ENV) or "").strip().lower() in _TRUTHY
+
+
+def c0_populate_shm_parallel(arena_address: int, size_bytes: int, *, workers: int = 8) -> dict[str, Any]:
+    """Touch every byte of the fresh SHM arena with disjoint native memsets.
+
+    Each worker owns one disjoint [start, end) slice and issues exactly one
+    libc ``memset`` (real CPU access, GIL released during the C call).  No
+    overlapping writes, no source reads.  Returns wall/cpu timings.
+    """
+    total = int(size_bytes)
+    base = int(arena_address)
+    nworkers = max(1, min(int(workers), 16))
+    # Split into N disjoint page-aligned slices (last slice takes remainder).
+    chunk = (total // nworkers // 4096) * 4096
+    bounds: list[tuple[int, int]] = []
+    for index in range(nworkers):
+        start = base + index * chunk if index < nworkers - 1 else base + index * chunk
+        if index < nworkers - 1:
+            end = start + chunk
+        else:
+            end = base + total
+        bounds.append((int(start), int(end)))
+    wall_start = time.monotonic_ns()
+    cpu_start = time.process_time_ns()
+    worker_ns = [0] * nworkers
+
+    def _run(slot: int) -> None:
+        start, end = bounds[slot]
+        length = int(end - start)
+        if length <= 0:
+            return
+        t0 = time.monotonic_ns()
+        # Portable native memset (releases GIL during the C call).
+        ctypes.memset(start, 0, length)
+        worker_ns[slot] = int(time.monotonic_ns() - t0)
+
+    import concurrent.futures as _futures
+    with _futures.ThreadPoolExecutor(max_workers=nworkers) as pool:
+        list(pool.map(_run, range(nworkers)))
+    wall_end = time.monotonic_ns()
+    cpu_end = time.process_time_ns()
+    return {
+        "workers": int(nworkers),
+        "wall_ms": round((wall_end - wall_start) / 1e6, 4),
+        "cpu_ms": round((cpu_end - cpu_start) / 1e6, 4),
+        "worker_wall_ms": round(sum(worker_ns) / 1e6, 4),
+        "start_ns": int(wall_start),
+        "end_ns": int(wall_end),
+    }
 
 
 def c0_host_register_enabled() -> bool:
@@ -3645,6 +3706,13 @@ class SharedArenaRing:
         self.register_start_ns: Optional[int] = None
         self.register_end_ns: Optional[int] = None
         self.unregister_ms: Optional[float] = None
+        # Experiment-1 SHM page-population treatment (default OFF = control).
+        self.shm_populate_enabled = c0_shm_populate_enabled()
+        self.populate_ms: Optional[float] = None
+        self.populate_cpu_ms: Optional[float] = None
+        self.populate_workers: int = 0
+        self.populate_start_ns: Optional[int] = None
+        self.populate_end_ns: Optional[int] = None
         self.child_pid: Optional[int] = None
         self.child_start_ns: Optional[int] = None
         self.child_ready_ns: Optional[int] = None
@@ -3895,6 +3963,29 @@ class SharedArenaRing:
         if self.control_session is not None:
             self.control_session._child_alive = lambda: (
                 self._proc is not None and self._proc.poll() is None and self._dead is None
+            )
+        # Experiment-1 treatment: materialize SHM pages with real CPU writes
+        # AFTER spawn (child needs only the SHM name) and BEFORE registration.
+        # Child startup still proceeds concurrently; population must complete
+        # before the synchronous cudaHostRegister call below.
+        if self.shm_populate_enabled and self.host_register_enabled:
+            try:
+                stats = c0_populate_shm_parallel(
+                    int(self._arena_address), int(self.size_bytes), workers=8
+                )
+            except BaseException as exc:
+                self._cleanup_failed_setup()
+                raise RuntimeError(f"c0_shm_populate_failed:{type(exc).__name__}:{exc}")
+            self.populate_ms = stats["wall_ms"]
+            self.populate_cpu_ms = stats["cpu_ms"]
+            self.populate_workers = int(stats["workers"])
+            self.populate_start_ns = int(stats["start_ns"])
+            self.populate_end_ns = int(stats["end_ns"])
+            print(
+                "[v2.golden_io_process_v2] "
+                f"event=c0_shm_populate wall_ms={self.populate_ms} "
+                f"cpu_ms={self.populate_cpu_ms} workers={self.populate_workers}",
+                flush=True,
             )
         if self.host_register_enabled:
             self.register_start_ns = time.monotonic_ns()
@@ -5049,6 +5140,12 @@ class SharedArenaRing:
             "register_ms_one_time": self.register_ms,
             "register_start_ns": self.register_start_ns,
             "register_end_ns": self.register_end_ns,
+            "shm_populate_enabled": bool(self.shm_populate_enabled),
+            "populate_ms": self.populate_ms,
+            "populate_cpu_ms": self.populate_cpu_ms,
+            "populate_workers": int(self.populate_workers),
+            "populate_start_ns": self.populate_start_ns,
+            "populate_end_ns": self.populate_end_ns,
             "unregister_ms": self.unregister_ms,
             "child_pid": self.child_pid,
             "child_start_ns": self.child_start_ns,
