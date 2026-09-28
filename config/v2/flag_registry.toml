@@ -757,6 +757,15 @@ owner = "c0-experiment-3"
 description = "Experiment-3 treatment: 5 x 64 MiB global pageable source pool plus 2 x 64 MiB pinned DMA ring (default OFF = production-005 8-slot registered arena)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-composition"
+description = "Composition treatment: 5 x 64 MiB globally shared registered-capable source slots (default OFF = production-005 8-slot geometry)."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
 type = "enum"
 default = "serial"

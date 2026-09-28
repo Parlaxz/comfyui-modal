@@ -1020,6 +1020,13 @@ class StagingPool:
         self._poison_reason: str | None = None
         self._cancelled = False
         self._expected_abort_cleanup: set[int] = set()
+        # Passive slot-pressure telemetry: per-acquire waits plus free-slot
+        # occupancy time (0 / 1 / 2+ free).  O(1) per pool transition, no
+        # I/O, never branched on.
+        self.acquire_wait_ns: list[int] = []
+        self._pressure_free_ns: list[int] = [0, 0, 0]
+        self._pressure_last_ns: int | None = None
+        self._pressure_last_free: int | None = None
 
     @property
     def capacity(self) -> int:
@@ -1068,6 +1075,7 @@ class StagingPool:
             or not 0 <= preferred_slot_index < len(self._slots)
         ):
             raise LeaseError("preferred slot index is invalid")
+        _acquire_entered_ns = time.monotonic_ns()
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._available:
             while True:
@@ -1089,6 +1097,10 @@ class StagingPool:
                             preferred_slot_index is None or slot.index == preferred_slot_index,
                         )
                         slot.lease = lease
+                        self.acquire_wait_ns.append(
+                            int(max(0, time.monotonic_ns() - _acquire_entered_ns))
+                        )
+                        self._note_pressure_locked()
                         return lease
                 if timeout is not None:
                     remaining = (deadline or time.monotonic()) - time.monotonic()
@@ -1119,7 +1131,53 @@ class StagingPool:
         slot.state = SlotState.FREE
         slot.lease = None
         lease._returned = True
+        self._note_pressure_locked()
         self._available.notify_all()
+
+    def _note_pressure_locked(self) -> None:
+        """Fold elapsed time into the previous free-slot bucket (locks held)."""
+        now = time.monotonic_ns()
+        free = sum(1 for slot in self._slots if slot.state == SlotState.FREE)
+        if self._pressure_last_ns is not None and self._pressure_last_free is not None:
+            bucket = min(int(self._pressure_last_free), 2)
+            self._pressure_free_ns[bucket] += max(0, now - int(self._pressure_last_ns))
+        self._pressure_last_ns = now
+        self._pressure_last_free = int(free)
+
+    def pressure_snapshot(self) -> dict[str, Any]:
+        """Summarize slot acquire waits and free-slot occupancy time."""
+        with self._meta:
+            waits = [int(v) for v in self.acquire_wait_ns if isinstance(v, int)]
+            waits.sort()
+            def _at(frac: float) -> float | None:
+                if not waits:
+                    return None
+                pos = frac * (len(waits) - 1)
+                lo = int(pos)
+                hi = min(lo + 1, len(waits) - 1)
+                return (waits[lo] + (waits[hi] - waits[lo]) * (pos - lo)) / 1e6
+            total = sum(waits)
+            return {
+                "slot_count": len(self._slots),
+                "acquires": len(waits),
+                "acquire_wait_ms": {
+                    "count": len(waits),
+                    "min_ms": (waits[0] / 1e6) if waits else None,
+                    "p50_ms": _at(0.50),
+                    "p90_ms": _at(0.90),
+                    "p99_ms": _at(0.99),
+                    "max_ms": (waits[-1] / 1e6) if waits else None,
+                    "total_ms": round(total / 1e6, 4),
+                    "gt_1ms": sum(1 for v in waits if v > 1_000_000),
+                    "gt_4ms": sum(1 for v in waits if v > 4_000_000),
+                    "gt_10ms": sum(1 for v in waits if v > 10_000_000),
+                },
+                "free_ms": {
+                    "zero_free_ms": round(self._pressure_free_ns[0] / 1e6, 4),
+                    "one_free_ms": round(self._pressure_free_ns[1] / 1e6, 4),
+                    "two_plus_free_ms": round(self._pressure_free_ns[2] / 1e6, 4),
+                },
+            }
 
     def _expect_abort_cleanup(self, lease: StageLease) -> None:
         with self._meta:

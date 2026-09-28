@@ -518,6 +518,7 @@ def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
         "registered": _get("registered"),
         "shm_populate_enabled": _get("shm_populate_enabled"),
         "dma_ring_enabled": _get("dma_ring_enabled"),
+        "five_slots_enabled": _get("five_slots_enabled"),
         "pinned_alloc_ms": _get("pinned_alloc_ms"),
         "populate_ms": _get("populate_ms"),
         "populate_cpu_ms": _get("populate_cpu_ms"),
@@ -650,6 +651,12 @@ def summarize_dispatcher(dispatcher: Any) -> dict[str, Any]:
         if isinstance(v, int) and not isinstance(v, bool)
     ]
     out["h2d_latency"] = _percentile_summary(latencies)
+    try:
+        _pool = _get(dispatcher, "pool")
+        _snapshot = getattr(_pool, "pressure_snapshot", None)
+        out["slot_pressure"] = dict(_snapshot()) if callable(_snapshot) else None
+    except BaseException:
+        out["slot_pressure"] = None
     return out
 
 

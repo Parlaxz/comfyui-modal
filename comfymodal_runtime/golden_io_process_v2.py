@@ -1398,6 +1398,40 @@ def c0_dma_ring_enabled() -> bool:
     return str(os.environ.get(C0_DMA_RING_ENV) or "").strip().lower() in _TRUTHY
 
 
+C0_FIVE_SLOTS_ENV = "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS"
+
+
+def c0_five_slots_enabled() -> bool:
+    """True only when the 5-slot registered treatment geometry is ON.
+
+    Deploy-baked, default OFF (production-005 8-slot geometry).  ON selects
+    5 x 64 MiB globally shared source slots (320 MiB) with NO other change:
+    host registration still follows COMFYMODAL_GOLDEN_C0_HOST_REGISTER, the
+    DMA ring stays off unless separately selected, and the reader gate still
+    follows COMFYMODAL_GOLDEN_C0_READER_GATE.
+    """
+    return str(os.environ.get(C0_FIVE_SLOTS_ENV) or "").strip().lower() in _TRUTHY
+
+
+def resolve_c0_source_arena_geometry() -> dict[str, int]:
+    """Resolve (size_bytes, slot_count, slot_bytes) for the C0 source arena.
+
+    The DMA ring and the five-slot treatment share the 5 x 64 MiB source
+    geometry; anything else is the production-005 8 x 64 MiB default.
+    """
+    if c0_dma_ring_enabled() or c0_five_slots_enabled():
+        return {
+            "size_bytes": int(C0_DMA_SOURCE_ARENA_BYTES),
+            "slot_count": int(C0_DMA_SOURCE_SLOTS),
+            "slot_bytes": int(C0_DMA_SOURCE_SLOT_BYTES),
+        }
+    return {
+        "size_bytes": int(C0_ARENA_BYTES),
+        "slot_count": int(C0_SLOT_COUNT),
+        "slot_bytes": int(C0_SLOT_BYTES),
+    }
+
+
 def c0_populate_shm_parallel(arena_address: int, size_bytes: int, *, workers: int = 8) -> dict[str, Any]:
     """Touch every byte of the fresh SHM arena with disjoint native memsets.
 
@@ -3917,6 +3951,7 @@ class SharedArenaRing:
         # DMA ring.  OFF selects the exact production-005 8-slot registered
         # arena; no other path reads these fields.
         self.dma_ring_enabled = c0_dma_ring_enabled()
+        self.five_slots_enabled = c0_five_slots_enabled()
         self.dma_ring: Optional[C0DmaRing] = None
         self.pinned_alloc_ms: Optional[float] = None
         # Diagnostic-only private source/destination split snapshot.  The child
@@ -5296,6 +5331,7 @@ class SharedArenaRing:
             "host_register_enabled": bool(self.host_register_enabled),
             "reader_gate_enabled": bool(self.reader_gate_enabled),
             "dma_ring_enabled": bool(self.dma_ring_enabled),
+            "five_slots_enabled": bool(self.five_slots_enabled),
             "dma_source_slots": (int(C0_DMA_SOURCE_SLOTS) if self.dma_ring_enabled else None),
             "dma_source_slot_bytes": (int(C0_DMA_SOURCE_SLOT_BYTES) if self.dma_ring_enabled else None),
             "dma_pinned_slots": (int(C0_DMA_PINNED_SLOTS) if self.dma_ring_enabled else None),
@@ -5388,7 +5424,10 @@ class SharedArenaRing:
             "capacity_class": C0_CAPACITY_CLASS,
             "source_workers": C0_SOURCE_WORKERS,
             "source_qd": C0_SOURCE_WORKERS,
-            "slot_owners": (None if self.dma_ring_enabled else list(C0_SLOT_OWNERS)),
+            "slot_owners": (
+                None if int(self.slot_count) != int(C0_SLOT_COUNT)
+                else list(C0_SLOT_OWNERS)
+            ),
             "slot_fills": list(self.slot_fills),
             "slot_reuse_count": max(0, self._registered_fill_total - self.slot_count),
             "fills_submitted": self.fills_submitted,
@@ -10190,11 +10229,16 @@ def ensure_arena_runtime() -> SharedArenaRing:
     global _C0_RUNTIME
     if _C0_RUNTIME is not None and _C0_RUNTIME.created:
         return _C0_RUNTIME
-    if c0_dma_ring_enabled():
+    _geo = resolve_c0_source_arena_geometry()
+    if (
+        _geo["size_bytes"] != C0_ARENA_BYTES
+        or _geo["slot_count"] != C0_SLOT_COUNT
+        or _geo["slot_bytes"] != C0_SLOT_BYTES
+    ):
         runtime = SharedArenaRing(
-            size_bytes=C0_DMA_SOURCE_ARENA_BYTES,
-            slot_count=C0_DMA_SOURCE_SLOTS,
-            slot_bytes=C0_DMA_SOURCE_SLOT_BYTES,
+            size_bytes=_geo["size_bytes"],
+            slot_count=_geo["slot_count"],
+            slot_bytes=_geo["slot_bytes"],
         )
     else:
         runtime = SharedArenaRing()
