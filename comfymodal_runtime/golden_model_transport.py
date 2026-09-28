@@ -418,6 +418,39 @@ def _percentile_summary(values: list[Any]) -> dict[str, Any]:
     }
 
 
+def _summarize_dma_stage(values: Any) -> dict[str, Any]:
+    """Extended distribution for SHM->pinned stage copies (Exp. 3).
+
+    Median/p90/p95/p99/max plus the mandatory >=5/10/20 ms counters.
+    """
+    samples = sorted(
+        int(value) for value in (values or [])
+        if isinstance(value, int) and not isinstance(value, bool)
+    )
+    if not samples:
+        return {"count": 0}
+    def at(frac: float) -> float:
+        pos = frac * (len(samples) - 1)
+        lo = int(pos)
+        hi = min(lo + 1, len(samples) - 1)
+        return samples[lo] + (samples[hi] - samples[lo]) * (pos - lo)
+    total = sum(samples)
+    return {
+        "count": len(samples),
+        "min_ms": samples[0] / 1e6,
+        "p50_ms": at(0.50) / 1e6,
+        "p90_ms": at(0.90) / 1e6,
+        "p95_ms": at(0.95) / 1e6,
+        "p99_ms": at(0.99) / 1e6,
+        "max_ms": samples[-1] / 1e6,
+        "sum_ms": total / 1e6,
+        "mean_ms": (total / len(samples)) / 1e6,
+        "ge_5ms": sum(1 for v in samples if v >= 5_000_000),
+        "ge_10ms": sum(1 for v in samples if v >= 10_000_000),
+        "ge_20ms": sum(1 for v in samples if v >= 20_000_000),
+    }
+
+
 def _mean_ns(values: Any) -> float | None:
     samples = [
         int(value) for value in (values or [])
@@ -484,6 +517,8 @@ def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
         "register_ms": _get("register_ms"),
         "registered": _get("registered"),
         "shm_populate_enabled": _get("shm_populate_enabled"),
+        "dma_ring_enabled": _get("dma_ring_enabled"),
+        "pinned_alloc_ms": _get("pinned_alloc_ms"),
         "populate_ms": _get("populate_ms"),
         "populate_cpu_ms": _get("populate_cpu_ms"),
         "populate_workers": _get("populate_workers"),
@@ -531,6 +566,8 @@ def summarize_c0_reader(source: Any) -> dict[str, Any]:
         "munmap": _percentile_summary(_get("_mmap_munmap_ns", [])),
         "pipe_rtt": _percentile_summary(_get("_mmap_pipe_rtt_ns", [])),
         "gate_wait": _percentile_summary(_get("_mmap_gate_wait_ns", [])),
+        "dma_stage_copy": _summarize_dma_stage(_get("_dma_stage_ns", [])),
+        "dma_acquire_wait": _summarize_dma_stage(_get("_dma_acquire_wait_ns", [])),
         "memcpy_first_ms": _mean_ns(_get("_mmap_memcpy_first_ns", [])),
         "memcpy_reuse_ms": _mean_ns(_get("_mmap_memcpy_reuse_ns", [])),
         "map_first_ms": _mean_ns(_get("_mmap_map_first_ns", [])),
@@ -1039,6 +1076,7 @@ class GoldenModelTransport:
             assert self._c0_runtime is not None
             assert self._c0_resources is not None
             from . import golden_qd_transport as qd_transport
+            from . import golden_io_process_v2 as c0
 
             geo = resolve_c0_transport_geometry()
             if int(self._c0_runtime.slot_bytes) != int(geo["required_slot_bytes"]):
@@ -1065,7 +1103,10 @@ class GoldenModelTransport:
                 producer_workers=int(geo["producer_workers"]),
                 capacity_class=str(geo["capacity_class"]),
                 h2d_target_bytes=int(geo["h2d_target_bytes"]),
-                aggregation_enabled=bool(geo["aggregation_enabled"]),
+                aggregation_enabled=(
+                    False if c0.c0_dma_ring_enabled()
+                    else bool(geo["aggregation_enabled"])
+                ),
             )
             pool = self._c0_runtime.new_stage_pool()
             dispatcher = qd_transport.GoldenQDTransport(

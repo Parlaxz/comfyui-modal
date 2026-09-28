@@ -1190,6 +1190,32 @@ class StagingPool:
             slot = self._validate_locked(lease)
             if slot.state != SlotState.IN_FLIGHT or not lease._producer_retired:
                 raise LeaseError("dispatcher may access only a retired in-flight lease")
+            # Experiment 3: a staged lease H2Ds from its pinned DMA view,
+            # never from the (already released) source slot.
+            dma_view = getattr(lease, "_dma_view", None)
+            if dma_view is not None:
+                dma_bytes = getattr(lease, "_dma_bytes", None)
+                if dma_bytes is None or int(nbytes) != int(dma_bytes):
+                    raise LeaseError(
+                        "DMA dispatch byte count does not match staged bytes"
+                    )
+                try:
+                    import torch as _dma_torch
+                    _dma_ok = (
+                        isinstance(dma_view, _dma_torch.Tensor)
+                        and dma_view.dtype == getattr(_dma_torch, "uint8")
+                        and dma_view.dim() == 1
+                        and not bool(dma_view.is_cuda)
+                    )
+                except (ImportError, TypeError, ValueError, RuntimeError):
+                    _dma_ok = False
+                if not _dma_ok:
+                    raise LeaseError("DMA dispatch source is not a 1-D CPU uint8 tensor")
+                if int(nbytes) > int(dma_view.numel()):
+                    raise LeaseError("DMA dispatch overruns the staged DMA slot")
+                if int(nbytes) == int(dma_view.numel()):
+                    return dma_view
+                return dma_view[: int(nbytes)]
             # Full-block CPU torch staging is submitted as the original slot
             # object.  The source reader gets a separate bytes-compatible view
             # of that same storage; the backend must retain the tensor API.
@@ -1209,6 +1235,9 @@ class StagingPool:
     def _buffer_for_dispatch_group(self, leases: Sequence[StageLease], nbytes: int) -> Any:
         if not leases:
             raise LeaseError("H2D group requires at least one lease")
+        for _dma_lease in leases:
+            if getattr(_dma_lease, "_dma_view", None) is not None:
+                raise LeaseError("DMA mode forbids grouped H2D dispatch")
         with self._meta:
             slots = [self._validate_locked(lease) for lease in leases]
             if any(slot.state != SlotState.IN_FLIGHT or not lease._producer_retired for slot, lease in zip(slots, leases)):
@@ -2011,13 +2040,40 @@ class TransportDispatcher:
         for lease in submission.leases:
             session = getattr(lease, "_c0_session", None)
             session_ticket = getattr(lease, "_c0_session_ticket", None)
-            if session is None and session_ticket is None:
+            dma_ring = getattr(lease, "_dma_ring", None)
+            dma_slot_index = getattr(lease, "_dma_slot_index", None)
+            if (
+                session is None and session_ticket is None
+                and dma_ring is None and dma_slot_index is None
+            ):
                 continue
-            if session is None or session_ticket is None:
-                raise TransportError("C0 session ticket ownership is incomplete")
-            session.consume(session_ticket)
-            if trace_enabled:
-                _c0_trace_stamp(lease, "control_consume_ns")
+            if session is not None or session_ticket is not None:
+                if session is None or session_ticket is None:
+                    raise TransportError("C0 session ticket ownership is incomplete")
+                session.consume(session_ticket)
+                if trace_enabled:
+                    _c0_trace_stamp(lease, "control_consume_ns")
+            if dma_ring is not None or dma_slot_index is not None:
+                # Experiment 3: the pinned DMA lease ends here.  This runs
+                # only on the proven CUDA-completion path, so reuse is safe.
+                if dma_ring is None or dma_slot_index is None:
+                    raise TransportError("DMA slot ownership is incomplete")
+                dma_generation = getattr(lease, "_dma_generation", None)
+                if dma_generation is None:
+                    raise TransportError("DMA slot generation is missing")
+                try:
+                    dma_ring.release(int(dma_slot_index), int(dma_generation))
+                except BaseException as exc:
+                    raise TransportError(
+                        f"DMA slot release failed:{type(exc).__name__}:{exc}"
+                    ) from exc
+                lease._dma_ring = None
+                lease._dma_slot_index = None
+                lease._dma_generation = None
+                lease._dma_view = None
+                lease._dma_bytes = None
+                if trace_enabled:
+                    _c0_trace_stamp(lease, "dma_release_ns")
 
     def _poll(self) -> None:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None

@@ -1376,6 +1376,28 @@ def c0_shm_populate_enabled() -> bool:
     return str(os.environ.get(C0_SHM_POPULATE_ENV) or "").strip().lower() in _TRUTHY
 
 
+C0_DMA_RING_ENV = "COMFYMODAL_GOLDEN_C0_DMA_RING"
+# Experiment-3 bounded architecture: 5 x 64 MiB global pageable source
+# slots (320 MiB, never cudaHostRegister'ed) plus a 2 x 64 MiB parent-owned
+# pinned DMA ring.  Four QD readers lease any free source slot; the fifth
+# slot is the elasticity slot.
+C0_DMA_SOURCE_SLOTS = 5
+C0_DMA_SOURCE_SLOT_BYTES = 64 * 1024 * 1024
+C0_DMA_SOURCE_ARENA_BYTES = C0_DMA_SOURCE_SLOTS * C0_DMA_SOURCE_SLOT_BYTES
+C0_DMA_PINNED_SLOTS = 2
+C0_DMA_PINNED_SLOT_BYTES = 64 * 1024 * 1024
+
+
+def c0_dma_ring_enabled() -> bool:
+    """True only when the Experiment-3 DMA-ring treatment is ON.
+
+    Deploy-baked, default OFF (exact production-005 control: 8 x 64 MiB
+    registered source arena, direct H2D, no staging copy).  ON selects the
+    5-slot pageable source pool plus the 2-slot pinned DMA ring.
+    """
+    return str(os.environ.get(C0_DMA_RING_ENV) or "").strip().lower() in _TRUTHY
+
+
 def c0_populate_shm_parallel(arena_address: int, size_bytes: int, *, workers: int = 8) -> dict[str, Any]:
     """Touch every byte of the fresh SHM arena with disjoint native memsets.
 
@@ -3685,6 +3707,109 @@ def write_c0_child_source_file(source: str) -> str:
     return path
 
 
+
+class C0DmaRing:
+    """Parent-owned 2 x 64 MiB pinned DMA ring (Experiment 3).
+
+    Real pinned host memory via the runtime's existing PyTorch pinned
+    allocator.  A source slot lease ends after the SHM->pinned CPU copy;
+    a DMA slot lease ends only after CUDA completion proves reuse safe.
+    Fail-closed: acquire timeouts, oversized stages, and stale/generation-
+    mismatched releases raise instead of silently reusing storage.
+    """
+
+    def __init__(self, *, torch: Any, slot_bytes: int = C0_DMA_PINNED_SLOT_BYTES,
+                 slot_count: int = C0_DMA_PINNED_SLOTS) -> None:
+        t0 = time.perf_counter()
+        self.slot_bytes = int(slot_bytes)
+        self.slot_count = int(slot_count)
+        self.tensors: list[Any] = [
+            torch.empty(int(slot_bytes), dtype=torch.uint8, pin_memory=True)
+            for _ in range(int(slot_count))
+        ]
+        self.addresses: list[int] = [int(t.data_ptr()) for t in self.tensors]
+        self.alloc_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+        for index, tensor in enumerate(self.tensors):
+            if not bool(tensor.is_pinned()):
+                raise C0ProtocolError(f"c0_dma_slot_not_pinned:{index}")
+        self._cond = threading.Condition()
+        self._free: list[int] = list(range(int(slot_count)))
+        self._generations: list[int] = [0] * int(slot_count)
+        self._occupied = 0
+        self.acquires = 0
+        self.acquire_waits = 0
+        self.acquire_wait_ns = 0
+        self.releases = 0
+        self.stale_release_errors = 0
+        self.peak_occupied = 0
+        self.both_occupied_events = 0
+
+    def acquire(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        entered = time.monotonic_ns()
+        waited = False
+        deadline = time.monotonic() + float(timeout_s)
+        with self._cond:
+            while not self._free:
+                waited = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise C0ProtocolError("c0_dma_slot_acquire_timeout")
+                self._cond.wait(timeout=remaining)
+            index = int(self._free.pop(0))
+            self._generations[index] += 1
+            generation = int(self._generations[index])
+            self._occupied += 1
+            if self._occupied > self.peak_occupied:
+                self.peak_occupied = int(self._occupied)
+            if self._occupied >= self.slot_count:
+                self.both_occupied_events += 1
+            self.acquires += 1
+            if waited:
+                self.acquire_waits += 1
+            wait_ns = int(max(0, time.monotonic_ns() - entered))
+            self.acquire_wait_ns += wait_ns
+            return {
+                "index": index,
+                "generation": generation,
+                "tensor": self.tensors[index],
+                "address": int(self.addresses[index]),
+                "wait_ns": wait_ns,
+            }
+
+    def release(self, index: int, generation: int) -> None:
+        with self._cond:
+            if not 0 <= int(index) < self.slot_count:
+                raise C0ProtocolError(f"c0_dma_slot_index_out_of_range:{index}")
+            if int(generation) != int(self._generations[int(index)]):
+                self.stale_release_errors += 1
+                raise C0ProtocolError(
+                    f"c0_dma_slot_generation_mismatch:{index}:{generation}"
+                )
+            if int(index) in self._free:
+                self.stale_release_errors += 1
+                raise C0ProtocolError(f"c0_dma_slot_double_release:{index}")
+            self._free.append(int(index))
+            self._occupied = max(0, self._occupied - 1)
+            self.releases += 1
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._cond:
+            return {
+                "slot_count": int(self.slot_count),
+                "slot_bytes": int(self.slot_bytes),
+                "alloc_ms": self.alloc_ms,
+                "acquires": int(self.acquires),
+                "releases": int(self.releases),
+                "acquire_waits": int(self.acquire_waits),
+                "acquire_wait_ms": round(self.acquire_wait_ns / 1e6, 4),
+                "peak_occupied": int(self.peak_occupied),
+                "both_occupied_events": int(self.both_occupied_events),
+                "occupied": int(self._occupied),
+                "stale_release_errors": int(self.stale_release_errors),
+            }
+
+
 class SharedArenaRing:
     """Parent-owned 512 MiB POSIX arena + persistent CUDA-sterile filler child.
 
@@ -3788,6 +3913,12 @@ class SharedArenaRing:
         # so the arm is provable from the arena record, not the live env.
         self.host_register_enabled = c0_host_register_enabled()
         self.reader_gate_enabled = c0_reader_gate_enabled()
+        # Experiment-3 DMA ring: 5-slot pageable source pool + 2-slot pinned
+        # DMA ring.  OFF selects the exact production-005 8-slot registered
+        # arena; no other path reads these fields.
+        self.dma_ring_enabled = c0_dma_ring_enabled()
+        self.dma_ring: Optional[C0DmaRing] = None
+        self.pinned_alloc_ms: Optional[float] = None
         # Diagnostic-only private source/destination split snapshot.  The child
         # reads the same selector once at spawn; the parent reports what it
         # launched with.  OFF is the exact direct file -> leased SHM path.
@@ -4002,7 +4133,8 @@ class SharedArenaRing:
                 f"cpu_ms={self.populate_cpu_ms} workers={self.populate_workers}",
                 flush=True,
             )
-        if self.host_register_enabled:
+        _do_register = bool(self.host_register_enabled) and not bool(self.dma_ring_enabled)
+        if _do_register:
             self.register_start_ns = time.monotonic_ns()
             t0 = time.perf_counter()
             rc = int(register(self._arena_address, self.size_bytes, _CUDA_HOST_REGISTER_DEFAULT))
@@ -4014,6 +4146,20 @@ class SharedArenaRing:
                 self._cleanup_failed_setup()
                 raise RuntimeError(f"cudaHostRegister_failed:{rc}:{_cudart_error_str(cudart, rc)}")
             self.registered = True
+        if self.dma_ring_enabled:
+            _dma_alloc_t0 = time.perf_counter()
+            try:
+                self.dma_ring = C0DmaRing(torch=_require_torch(), slot_bytes=self.slot_bytes)
+            except BaseException as exc:
+                self._cleanup_failed_setup()
+                raise RuntimeError(f"c0_dma_ring_alloc_failed:{type(exc).__name__}:{exc}")
+            self.pinned_alloc_ms = round((time.perf_counter() - _dma_alloc_t0) * 1000.0, 4)
+            print(
+                "[v2.golden_io_process_v2] "
+                f"event=c0_dma_ring_alloc slots={C0_DMA_PINNED_SLOTS} "
+                f"slot_bytes={C0_DMA_PINNED_SLOT_BYTES} alloc_ms={self.pinned_alloc_ms}",
+                flush=True,
+            )
         ready = self._read_child_ready(timeout_s=180.0)
         self.child_ready_ns = time.monotonic_ns()
         if not isinstance(ready, dict) or ready.get("op") != "ready_child":
@@ -5149,6 +5295,13 @@ class SharedArenaRing:
             # deploy baked even if registration failed before evidence.
             "host_register_enabled": bool(self.host_register_enabled),
             "reader_gate_enabled": bool(self.reader_gate_enabled),
+            "dma_ring_enabled": bool(self.dma_ring_enabled),
+            "dma_source_slots": (int(C0_DMA_SOURCE_SLOTS) if self.dma_ring_enabled else None),
+            "dma_source_slot_bytes": (int(C0_DMA_SOURCE_SLOT_BYTES) if self.dma_ring_enabled else None),
+            "dma_pinned_slots": (int(C0_DMA_PINNED_SLOTS) if self.dma_ring_enabled else None),
+            "dma_pinned_slot_bytes": (int(C0_DMA_PINNED_SLOT_BYTES) if self.dma_ring_enabled else None),
+            "pinned_alloc_ms": self.pinned_alloc_ms,
+            "dma_ring": (self.dma_ring.snapshot() if self.dma_ring is not None else None),
             "already_unlinked": bool(self._already_unlinked),
             "backing_create_ms": self.backing_create_ms,
             "backing_create_start_ns": self.backing_create_start_ns,
@@ -5235,7 +5388,7 @@ class SharedArenaRing:
             "capacity_class": C0_CAPACITY_CLASS,
             "source_workers": C0_SOURCE_WORKERS,
             "source_qd": C0_SOURCE_WORKERS,
-            "slot_owners": list(C0_SLOT_OWNERS),
+            "slot_owners": (None if self.dma_ring_enabled else list(C0_SLOT_OWNERS)),
             "slot_fills": list(self.slot_fills),
             "slot_reuse_count": max(0, self._registered_fill_total - self.slot_count),
             "fills_submitted": self.fills_submitted,
@@ -5393,6 +5546,10 @@ class C0StageReader:
         self._mmap_munmap_ns: list[int] = []
         self._mmap_gate_wait_ns: list[int] = []
         self._mmap_actual_gate_wait_ns: list[int] = []
+        # Experiment-3 DMA staging evidence (empty unless the DMA ring is
+        # enabled): every resident SHM->pinned copy plus DMA acquire waits.
+        self._dma_stage_ns: list[int] = []
+        self._dma_acquire_wait_ns: list[int] = []
         self._mmap_pipe_rtt_ns: list[int] = []
         self._source_touch_copy_ns: list[int] = []
         self._mmap_read_records: list[dict] = []
@@ -5610,12 +5767,86 @@ class C0StageReader:
                 or ready_ns > self.last_source_read_end_mono_ns
             ):
                 self.last_source_read_end_mono_ns = ready_ns
-            # The child wrote directly into the registered slot; the validated
+            if getattr(self._ring, "dma_ring_enabled", False):
+                # Experiment 3: stage READY bytes into the pinned DMA ring
+                # and end the source lease now; the dispatcher H2Ds from
+                # pinned storage instead of the source slot.
+                self._dma_stage_and_release(
+                    lease, slot_index, destination_in_slot, length, trace,
+                )
+            # The child wrote directly into the source slot; the validated
             # reply is the only proof that lets the dispatcher publish READY.
+            # (In DMA mode the bytes now live in the pinned ring instead.)
             return length
         finally:
             if trace is not None:
                 self._store_window_trace(trace)
+
+    def _dma_stage_and_release(
+        self, lease: Any, slot_index: int, destination_in_slot: int,
+        length: int, trace: dict[str, Any] | None,
+    ) -> None:
+        """Stage one READY SHM slot into the pinned DMA ring (Exp. 3).
+
+        Copies exactly ``length`` bytes from the leased source slot into a
+        leased pinned DMA slot with a native resident memcpy, then ends the
+        5-slot source lease (early C0-ticket consume) so the source slot is
+        immediately reusable.  The pinned DMA lease ends only at CUDA
+        completion via the dispatcher's proven completion path.  Fail-closed
+        on oversize stages, missing tickets, or consume errors.
+        """
+        ring = self._ring
+        dma = ring.dma_ring
+        if dma is None:
+            raise C0ProtocolError("c0_dma_ring_not_ready")
+        if int(length) > int(dma.slot_bytes):
+            raise C0ProtocolError(
+                f"c0_dma_stage_length_exceeds_pinned_slot:{int(length)}"
+            )
+        acquired = dma.acquire(timeout_s=30.0)
+        src_addr = int(ring.slot_base_address(int(slot_index))) + int(destination_in_slot)
+        copy_start = time.monotonic_ns()
+        try:
+            ctypes.memmove(int(acquired["address"]), src_addr, int(length))
+        except BaseException as exc:
+            try:
+                dma.release(int(acquired["index"]), int(acquired["generation"]))
+            except BaseException:
+                pass
+            raise C0ProtocolError(f"c0_dma_stage_copy_failed:{type(exc).__name__}") from exc
+        copy_ns = int(max(0, time.monotonic_ns() - copy_start))
+        self._dma_stage_ns.append(copy_ns)
+        session = getattr(lease, "_c0_session", None)
+        ticket = getattr(lease, "_c0_session_ticket", None)
+        if session is None or ticket is None:
+            try:
+                dma.release(int(acquired["index"]), int(acquired["generation"]))
+            except BaseException:
+                pass
+            raise C0ProtocolError("c0_dma_stage_ticket_missing")
+        try:
+            session.consume(ticket)
+        except BaseException as exc:
+            try:
+                dma.release(int(acquired["index"]), int(acquired["generation"]))
+            except BaseException:
+                pass
+            raise C0ProtocolError(f"c0_dma_stage_consume_failed:{type(exc).__name__}") from exc
+        # Source lease ends here; the pinned DMA lease now owns the bytes.
+        lease._c0_session = None
+        lease._c0_session_ticket = None
+        lease._dma_ring = dma
+        lease._dma_slot_index = int(acquired["index"])
+        lease._dma_generation = int(acquired["generation"])
+        lease._dma_view = acquired["tensor"]
+        lease._dma_bytes = int(length)
+        lease._dma_acquire_wait_ns = int(acquired["wait_ns"])
+        self._dma_acquire_wait_ns.append(int(acquired["wait_ns"]))
+        if isinstance(trace, dict):
+            trace["dma_slot_index"] = int(acquired["index"])
+            trace["dma_generation"] = int(acquired["generation"])
+            trace["dma_acquire_wait_ns"] = int(acquired["wait_ns"])
+            trace["dma_stage_copy_ns"] = int(copy_ns)
 
     def _record_fill_telemetry(
         self, *, producer_id: int, length: int, reply: Any, first_fill: bool
@@ -5998,6 +6229,12 @@ class C0StageReader:
                 "gate_wait_ms": _read_duration_summary(self._mmap_gate_wait_ns),
                 "actual_gate_wait_ms": _read_duration_summary(
                     self._mmap_actual_gate_wait_ns
+                ),
+                "dma_stage_copy_ms": _read_duration_summary(
+                    self._dma_stage_ns
+                ),
+                "dma_acquire_wait_ms": _read_duration_summary(
+                    self._dma_acquire_wait_ns
                 ),
                 "pipe_rtt_ms": _read_duration_summary(self._mmap_pipe_rtt_ns),
                 "minflt_total": (
@@ -9953,7 +10190,14 @@ def ensure_arena_runtime() -> SharedArenaRing:
     global _C0_RUNTIME
     if _C0_RUNTIME is not None and _C0_RUNTIME.created:
         return _C0_RUNTIME
-    runtime = SharedArenaRing()
+    if c0_dma_ring_enabled():
+        runtime = SharedArenaRing(
+            size_bytes=C0_DMA_SOURCE_ARENA_BYTES,
+            slot_count=C0_DMA_SOURCE_SLOTS,
+            slot_bytes=C0_DMA_SOURCE_SLOT_BYTES,
+        )
+    else:
+        runtime = SharedArenaRing()
     runtime.ensure()
     _C0_RUNTIME = runtime
     return runtime

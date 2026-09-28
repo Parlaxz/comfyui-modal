@@ -4892,6 +4892,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_READER_GATE": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_READER_GATE", "0"
         ),
+        "COMFYMODAL_GOLDEN_C0_DMA_RING": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_DMA_RING", "0"
+        ),
         "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
             "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
         ),
