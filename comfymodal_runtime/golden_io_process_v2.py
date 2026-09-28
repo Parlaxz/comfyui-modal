@@ -2592,7 +2592,7 @@ class C0ControlLayout:
     """
 
     MAGIC = b"CM0CTRL2"
-    VERSION = 2
+    VERSION = 3
     LANE_COUNT = 4
     HEADER_BYTES = 128
     DESCRIPTOR_BYTES = 1024
@@ -2616,7 +2616,7 @@ class C0ControlLayout:
     # The first fields are the stable control reply.  The trailing passive
     # fields preserve child mmap/CPU/fault evidence through the binary session;
     # zero means that a field was not produced by the selected child engine.
-    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 27)
+    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 31)
 
     @classmethod
     def lane_offset(cls, lane: int) -> int:
@@ -2741,6 +2741,9 @@ class C0ControlLayout:
             int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
             int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
             int(result.get("mmap_sched_run_ns") or 0), int(result.get("mmap_sched_wait_ns") or 0),
+            int(result.get("mmap_cpu_utime_ns") or 0), int(result.get("mmap_cpu_stime_ns") or 0),
+            int(result.get("mmap_sched_run_delta_ns") or 0),
+            int(result.get("mmap_sched_wait_delta_ns") or 0),
             int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
             int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
             int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
@@ -2763,6 +2766,7 @@ class C0ControlLayout:
             mmap_memcpy_shm_warm, mmap_frozen_copy, mmap_frozen_unmap, mmap_munmap,
             mmap_gate_wait, mmap_pipe_rtt, mmap_minflt, mmap_majflt,
             mmap_utime, mmap_stime, mmap_sched_run, mmap_sched_wait,
+            mmap_cpu_utime, mmap_cpu_stime, mmap_sched_run_delta, mmap_sched_wait_delta,
             copy_start, copy_end, mmap_op_start, mmap_op_end,
             mmap_start, mmap_end, memcpy_start, memcpy_end, munmap_start, munmap_end,
         ) = phases
@@ -2789,6 +2793,10 @@ class C0ControlLayout:
             "mmap_minflt": _optional(mmap_minflt), "mmap_majflt": _optional(mmap_majflt),
             "mmap_ru_utime_ns": _optional(mmap_utime), "mmap_ru_stime_ns": _optional(mmap_stime),
             "mmap_sched_run_ns": _optional(mmap_sched_run), "mmap_sched_wait_ns": _optional(mmap_sched_wait),
+            "mmap_cpu_utime_ns": _optional(mmap_cpu_utime),
+            "mmap_cpu_stime_ns": _optional(mmap_cpu_stime),
+            "mmap_sched_run_delta_ns": _optional(mmap_sched_run_delta),
+            "mmap_sched_wait_delta_ns": _optional(mmap_sched_wait_delta),
             "copy_start_ns": _optional(copy_start), "copy_end_ns": _optional(copy_end),
             "mmap_op_start_ns": _optional(mmap_op_start), "mmap_op_end_ns": _optional(mmap_op_end),
             "mmap_start_ns": _optional(mmap_start), "mmap_end_ns": _optional(mmap_end),
@@ -2910,6 +2918,8 @@ class C0SourceSession:
                         "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
                         "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
                         "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
+                        "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
+                        "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
                         "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
                         "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
                         "munmap_start_ns", "munmap_end_ns",
@@ -5465,6 +5475,8 @@ class C0StageReader:
                     "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
                     "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
                     "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
+                    "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
+                    "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
                     "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
                     "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
                     "munmap_start_ns", "munmap_end_ns",
@@ -5610,6 +5622,10 @@ class C0StageReader:
                     "mmap_munmap_ns": source.get("mmap_munmap_ns"),
                     "mmap_op_ns": source.get("mmap_op_ns", source.get("read_duration_ns")),
                     "mmap_pipe_rtt_ns": source.get("mmap_pipe_rtt_ns"),
+                    "mmap_cpu_utime_ns": source.get("mmap_cpu_utime_ns"),
+                    "mmap_cpu_stime_ns": source.get("mmap_cpu_stime_ns"),
+                    "mmap_sched_run_delta_ns": source.get("mmap_sched_run_delta_ns"),
+                    "mmap_sched_wait_delta_ns": source.get("mmap_sched_wait_delta_ns"),
                     "pipe_excess_ns": (
                         int(source["mmap_pipe_rtt_ns"])
                         - int(source.get("mmap_op_ns", source.get("read_duration_ns")))
@@ -5989,7 +6005,7 @@ control_session_epoch = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 # Keep this wire definition byte-for-byte aligned with C0ControlLayout.  It is
 # intentionally stdlib-only: this interpreter must remain CUDA sterile.
 CONTROL_MAGIC = b"CM0CTRL2"
-CONTROL_VERSION = 2
+CONTROL_VERSION = 3
 CONTROL_LANES = 4
 CONTROL_HEADER = 128
 CONTROL_DESCRIPTOR = 1024
@@ -6004,7 +6020,7 @@ CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
 CONTROL_U64 = struct.Struct("<Q")
 CONTROL_U32 = struct.Struct("<I")
 CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
-CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 27)
+CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 31)
 
 
 def _control_lane_offset(lane):
@@ -6068,6 +6084,9 @@ def _control_publish(lane, sequence, result):
         int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
         int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
         int(result.get("mmap_sched_run_ns") or 0), int(result.get("mmap_sched_wait_ns") or 0),
+        int(result.get("mmap_cpu_utime_ns") or 0), int(result.get("mmap_cpu_stime_ns") or 0),
+        int(result.get("mmap_sched_run_delta_ns") or 0),
+        int(result.get("mmap_sched_wait_delta_ns") or 0),
         int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
         int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
         int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
@@ -8571,6 +8590,17 @@ def _mmap_schedstat_counters():
         return None, None
 
 
+def _mmap_counter_delta(before, after):
+    # Counters are best-effort and can be unavailable on non-Linux hosts.
+    # Never expose a negative sample when a counter is rounded or reset.
+    if before is None or after is None:
+        return None
+    try:
+        return max(0, int(after) - int(before))
+    except BaseException:
+        return None
+
+
 def _mmap_reader_fill(req):
     base = {
         "request_id": req.get("request_id"),
@@ -8659,6 +8689,8 @@ def _mmap_reader_fill(req):
         window_start = (offset // _PAGE) * _PAGE
         delta = offset - window_start
         window_len = ((delta + length + _PAGE - 1) // _PAGE) * _PAGE
+        cpu_before_utime_ns, cpu_before_stime_ns = _mmap_cpu_counters()
+        sched_before_run_ns, sched_before_wait_ns = _mmap_schedstat_counters()
         read_start_ns = time.monotonic_ns()
         map_end_ns = read_start_ns
         copy_end_ns = read_start_ns
@@ -8735,6 +8767,8 @@ def _mmap_reader_fill(req):
             _mmap_libc.munmap(win, window_len)
             munmap_end_ns = time.monotonic_ns()
             unmap_end_ns = munmap_end_ns
+        cpu_after_utime_ns, cpu_after_stime_ns = _mmap_cpu_counters()
+        sched_after_run_ns, sched_after_wait_ns = _mmap_schedstat_counters()
         faults_after = _mmap_fault_counters()
         # Passive CPU/scheduling attribution for this reader process, taken
         # from the same getrusage call family as the fault counters plus
@@ -8748,6 +8782,18 @@ def _mmap_reader_fill(req):
         if faults_before[0] is not None and faults_after[0] is not None:
             minflt = int(faults_after[0] - faults_before[0])
             majflt = int(faults_after[1] - faults_before[1])
+        cpu_utime_delta_ns = _mmap_counter_delta(
+            cpu_before_utime_ns, cpu_after_utime_ns
+        )
+        cpu_stime_delta_ns = _mmap_counter_delta(
+            cpu_before_stime_ns, cpu_after_stime_ns
+        )
+        sched_run_delta_ns = _mmap_counter_delta(
+            sched_before_run_ns, sched_after_run_ns
+        )
+        sched_wait_delta_ns = _mmap_counter_delta(
+            sched_before_wait_ns, sched_after_wait_ns
+        )
         result = dict(base)
         result.update({
             "op": "ready",
@@ -8805,6 +8851,10 @@ def _mmap_reader_fill(req):
             "mmap_ru_stime_ns": cpu_stime_ns,
             "mmap_sched_run_ns": sched_run_ns,
             "mmap_sched_wait_ns": sched_wait_ns,
+            "mmap_cpu_utime_ns": cpu_utime_delta_ns,
+            "mmap_cpu_stime_ns": cpu_stime_delta_ns,
+            "mmap_sched_run_delta_ns": sched_run_delta_ns,
+            "mmap_sched_wait_delta_ns": sched_wait_delta_ns,
             "mmap_memcpy_warm_ns": warm_ns,
             "mmap_memcpy_shm_warm_ns": shm_warm_ns,
             "mmap_frozen_copy_ns": frozen_copy_ns,

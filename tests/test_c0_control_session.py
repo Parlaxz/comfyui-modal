@@ -158,7 +158,13 @@ def test_control_response_preserves_child_phases_and_trace_lifecycle(monkeypatch
                 "mmap_minflt": 66,
                 "mmap_majflt": 7,
                  "mmap_ru_utime_ns": 88,
+                 "mmap_ru_stime_ns": 89,
+                 "mmap_sched_run_ns": 90,
                  "mmap_sched_wait_ns": 99,
+                 "mmap_cpu_utime_ns": 91,
+                 "mmap_cpu_stime_ns": 92,
+                 "mmap_sched_run_delta_ns": 93,
+                 "mmap_sched_wait_delta_ns": 94,
                  "mmap_start_ns": 1001,
                  "mmap_end_ns": 1002,
                  "memcpy_start_ns": 1002,
@@ -175,6 +181,14 @@ def test_control_response_preserves_child_phases_and_trace_lifecycle(monkeypatch
         assert response["mmap_munmap_ns"] == 33
         assert response["mmap_pipe_rtt_ns"] == 55
         assert response["mmap_majflt"] == 7
+        assert response["mmap_ru_utime_ns"] == 88
+        assert response["mmap_ru_stime_ns"] == 89
+        assert response["mmap_sched_run_ns"] == 90
+        assert response["mmap_sched_wait_ns"] == 99
+        assert response["mmap_cpu_utime_ns"] == 91
+        assert response["mmap_cpu_stime_ns"] == 92
+        assert response["mmap_sched_run_delta_ns"] == 93
+        assert response["mmap_sched_wait_delta_ns"] == 94
         assert response["mmap_start_ns"] == 1001
         assert response["mmap_end_ns"] == 1002
         assert response["memcpy_start_ns"] == 1002
@@ -185,6 +199,11 @@ def test_control_response_preserves_child_phases_and_trace_lifecycle(monkeypatch
         for name in (
             "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
             "munmap_start_ns", "munmap_end_ns",
+        ):
+            assert trace[name] == response[name]
+        for name in (
+            "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
+            "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
         ):
             assert trace[name] == response[name]
         assert all(trace.get(name) for name in ("control_submit_ns", "control_enqueue_ns", "reply_observed_ns"))
@@ -201,7 +220,41 @@ def test_control_protocol_version_matches_child_and_response_fits_descriptor():
     match = re.search(r"^CONTROL_VERSION = (\d+)$", _C0_CHILD_SOURCE, re.MULTILINE)
     assert match is not None
     assert int(match.group(1)) == C0ControlLayout.VERSION
+    assert C0ControlLayout.VERSION == 3
+    assert 'CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 31)' in _C0_CHILD_SOURCE
     assert 256 + C0ControlLayout._RESPONSE.size <= C0ControlLayout.DESCRIPTOR_BYTES
+
+
+def test_mmap_delta_fields_are_present_in_child_and_parent_telemetry_paths():
+    fields = (
+        "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
+        "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
+    )
+    for field in fields:
+        assert field in _C0_CHILD_SOURCE
+    before = _C0_CHILD_SOURCE.index("cpu_before_utime_ns")
+    operation = _C0_CHILD_SOURCE.index("_mmap_libc.mmap(", before)
+    after = _C0_CHILD_SOURCE.index("cpu_after_utime_ns", operation)
+    assert before < operation < after
+    reader = _trace_reader(enabled=False)
+    reader._record_fill_telemetry(
+        producer_id=0,
+        length=8,
+        first_fill=True,
+        reply={
+            "source_engine": "mmap_fresh",
+            "reader_pid": 12,
+            "copy_start_ns": 10,
+            "copy_end_ns": 20,
+            "returned_bytes": 8,
+            "source_range": [0, 8],
+            **{field: index + 1 for index, field in enumerate(fields)},
+        },
+    )
+    record = reader._mmap_read_records[0]
+    assert {field: record[field] for field in fields} == {
+        field: index + 1 for index, field in enumerate(fields)
+    }
 
 
 def _trace_reader(*, enabled: bool | None) -> C0StageReader:
