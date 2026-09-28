@@ -1217,13 +1217,9 @@ class GoldenModelTransport:
                     _first_op = None
                     for _rec in records:
                         if isinstance(_rec, dict) and _rec.get("operation_ordinal") == 0:
-                            _submits = self._c0_runtime.fill_submit_mono_ns
-                            _first_submit = min(
-                                (int(v) for v in _submits.values() if isinstance(v, int)),
-                                default=None,
-                            )
                             _first_op = {
-                                "first_control_request_publish_ns": _first_submit,
+                                "first_control_request_publish_ns": _rec.get("control_submit_ns"),
+                                "first_control_enqueue_ns": _rec.get("control_enqueue_ns"),
                                 "first_work_available_ns": _rec.get("work_available_ns"),
                                 "first_reader_claim_ns": _rec.get("reader_claim_ns"),
                                 "first_mmap_begin_ns": _rec.get("mmap_start_ns"),

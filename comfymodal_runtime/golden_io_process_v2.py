@@ -10120,6 +10120,7 @@ if control_name and _startup_error is None and _startup_ready == workers and _vo
     _control_thread = threading.Thread(target=_control_loop, name="c0-control-session", daemon=True)
     _control_thread.start()
     _c0_mark("control_thread_started")
+_c0_mark("ready_child_emit")
 if (
     _startup_error is not None
     or _startup_ready != workers
