@@ -1111,18 +1111,27 @@ class GoldenModelTransport:
             qd_timing = result.telemetry if isinstance(result.telemetry, dict) else {}
             # Stages A-D measurement: summarize already-accumulated reader +
             # dispatcher evidence (no I/O, no synchronization).  Full
-            # per-window arrays ride only the explicit window-trace selector.
+            # Per-fill raw lifecycle records ride only the explicit window-trace
+            # selector; OFF does not allocate or retain this evidence.
             source_detail: dict[str, Any] = {
                 "transport_geometry": str(geo["name"]),
                 "arena_ensure": arena_ensure_detail(self._c0_runtime),
                 "reader": summarize_c0_reader(source),
                 "dispatcher": summarize_dispatcher(dispatcher),
             }
-            if _c0_window_trace_enabled():
+            if bool(getattr(source, "_window_trace_enabled", False)):
                 try:
-                    records = list(getattr(source, "_mmap_read_records", []) or [])
+                    snapshot = getattr(source, "window_trace_snapshot", None)
+                    if callable(snapshot):
+                        records, dropped = snapshot()
+                    else:
+                        records = list(getattr(source, "_window_trace_records", []) or [])
+                        dropped = int(getattr(source, "_window_trace_dropped", 0) or 0)
                     source_detail["window_trace"] = records[:_C0_WINDOW_TRACE_LIMIT]
-                    source_detail["window_trace_truncated"] = len(records) > _C0_WINDOW_TRACE_LIMIT
+                    source_detail["window_trace_truncated"] = (
+                        len(records) > _C0_WINDOW_TRACE_LIMIT or dropped > 0
+                    )
+                    source_detail["window_trace_dropped"] = int(dropped)
                 except BaseException:
                     source_detail["window_trace"] = None
             child_start_ns = int(getattr(source, "first_child_read_start_mono_ns", 0) or 0)

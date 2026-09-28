@@ -46,6 +46,7 @@ from typing import Any, Mapping, Optional, Sequence
 IO_PROCESS_V2_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2"
 IO_PROCESS_V2_BACKING_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING"
 IO_PROCESS_V2_SOURCE_GEOMETRY_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY"
+C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
 _TRUTHY = {"1", "true", "yes", "on"}
 _BACKING_TYPES = ("posix", "sysv")
 _SOURCE_GEOMETRIES = {
@@ -94,6 +95,12 @@ _MAX_SIZE_MIB = 24000
 # Verification sample for large backings (full-payload hashing is not required
 # to prove the mechanism; the 256 MiB gate already proved whole-buffer exactness).
 _SAMPLE_VERIFY_BYTES = 64 * 1024 * 1024
+_C0_WINDOW_TRACE_LIMIT = 4096
+
+
+def c0_window_trace_enabled() -> bool:
+    """Return whether bounded raw C0 lifecycle records are requested."""
+    return str(os.environ.get(C0_WINDOW_TRACE_ENV) or "").strip().lower() in _TRUTHY
 
 
 def io_process_v2_enabled() -> bool:
@@ -2585,7 +2592,7 @@ class C0ControlLayout:
     """
 
     MAGIC = b"CM0CTRL2"
-    VERSION = 1
+    VERSION = 2
     LANE_COUNT = 4
     HEADER_BYTES = 128
     DESCRIPTOR_BYTES = 1024
@@ -2606,7 +2613,10 @@ class C0ControlLayout:
     _U64 = struct.Struct("<Q")
     _U32 = struct.Struct("<I")
     _REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
-    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII")
+    # The first fields are the stable control reply.  The trailing passive
+    # fields preserve child mmap/CPU/fault evidence through the binary session;
+    # zero means that a field was not produced by the selected child engine.
+    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 27)
 
     @classmethod
     def lane_offset(cls, lane: int) -> int:
@@ -2719,6 +2729,23 @@ class C0ControlLayout:
             int(result.get("child_read_start_ns") or 0), int(result.get("child_read_end_ns") or 0),
             int(result.get("fd_open_count") or 0), int(result.get("fd_reuse_count") or 0),
             int(result.get("fd_close_count") or 0), source_engine,
+            int(result.get("reader_pid") or 0), int(result.get("reader_index") or 0),
+            int(result.get("mmap_map_ns") or 0), int(result.get("mmap_memcpy_ns") or 0),
+            int(result.get("mmap_memcpy_warm_ns") or 0),
+            int(result.get("mmap_memcpy_shm_warm_ns") or 0),
+            int(result.get("mmap_frozen_copy_ns") or 0),
+            int(result.get("mmap_frozen_unmap_ns") or 0),
+            int(result.get("mmap_munmap_ns") or 0),
+            int(result.get("mmap_launch_gap_wait_ns") or 0),
+            int(result.get("mmap_pipe_rtt_ns") or 0),
+            int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
+            int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
+            int(result.get("mmap_sched_run_ns") or 0), int(result.get("mmap_sched_wait_ns") or 0),
+            int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
+            int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
+            int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
+            int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
+            int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
         )
         cls._U32.pack_into(buf, base + 640, cls._crc(response + error))
         buf[base + 256 : base + 256 + len(response)] = response
@@ -2730,7 +2757,17 @@ class C0ControlLayout:
     def read_response(cls, buf: Any, lane: int) -> dict[str, Any]:
         base = cls.lane_offset(lane)
         values = cls._RESPONSE.unpack_from(buf, base + 256)
-        sequence, request_id, arena_epoch, slot, generation, op, returned, syscalls, start, end, opened, reused, closed, source_engine = values
+        sequence, request_id, arena_epoch, slot, generation, op, returned, syscalls, start, end, opened, reused, closed, source_engine, *phases = values
+        (
+            reader_pid, reader_index, mmap_map, mmap_memcpy, mmap_memcpy_warm,
+            mmap_memcpy_shm_warm, mmap_frozen_copy, mmap_frozen_unmap, mmap_munmap,
+            mmap_gate_wait, mmap_pipe_rtt, mmap_minflt, mmap_majflt,
+            mmap_utime, mmap_stime, mmap_sched_run, mmap_sched_wait,
+            copy_start, copy_end, mmap_op_start, mmap_op_end,
+            mmap_start, mmap_end, memcpy_start, memcpy_end, munmap_start, munmap_end,
+        ) = phases
+        def _optional(value: int) -> int | None:
+            return int(value) if int(value) else None
         error = bytes(buf[base + 648 : base + 648 + cls.ERROR_BYTES]).split(b"\0", 1)[0].decode("utf-8", "replace")
         return {
             "op": "ready" if op == 1 else "error", "request_id": int(request_id),
@@ -2740,6 +2777,23 @@ class C0ControlLayout:
             "read_duration_ns": max(0, int(end) - int(start)) if start and end else None,
             "fd_open_count": int(opened), "fd_reuse_count": int(reused), "fd_close_count": int(closed),
             "source_engine": "mmap_fresh" if source_engine == 1 else "preadv",
+            "reader_pid": _optional(reader_pid), "reader_index": _optional(reader_index),
+            "mmap_map_ns": _optional(mmap_map), "mmap_memcpy_ns": _optional(mmap_memcpy),
+            "mmap_memcpy_warm_ns": _optional(mmap_memcpy_warm),
+            "mmap_memcpy_shm_warm_ns": _optional(mmap_memcpy_shm_warm),
+            "mmap_frozen_copy_ns": _optional(mmap_frozen_copy),
+            "mmap_frozen_unmap_ns": _optional(mmap_frozen_unmap),
+            "mmap_munmap_ns": _optional(mmap_munmap),
+            "mmap_launch_gap_wait_ns": _optional(mmap_gate_wait),
+            "mmap_pipe_rtt_ns": _optional(mmap_pipe_rtt),
+            "mmap_minflt": _optional(mmap_minflt), "mmap_majflt": _optional(mmap_majflt),
+            "mmap_ru_utime_ns": _optional(mmap_utime), "mmap_ru_stime_ns": _optional(mmap_stime),
+            "mmap_sched_run_ns": _optional(mmap_sched_run), "mmap_sched_wait_ns": _optional(mmap_sched_wait),
+            "copy_start_ns": _optional(copy_start), "copy_end_ns": _optional(copy_end),
+            "mmap_op_start_ns": _optional(mmap_op_start), "mmap_op_end_ns": _optional(mmap_op_end),
+            "mmap_start_ns": _optional(mmap_start), "mmap_end_ns": _optional(mmap_end),
+            "memcpy_start_ns": _optional(memcpy_start), "memcpy_end_ns": _optional(memcpy_end),
+            "munmap_start_ns": _optional(munmap_start), "munmap_end_ns": _optional(munmap_end),
             "error": error or None, "preadv_diagnostics": [], "_sequence": int(sequence),
         }
 
@@ -2760,8 +2814,10 @@ class C0SourceSession:
         self.session_epoch = (time.monotonic_ns() ^ (os.getpid() << 17)) & ((1 << 63) - 1)
         self.shm = C0ControlLayout.create(arena_epoch=self.arena_epoch, session_epoch=self.session_epoch)
         self._lock = threading.RLock()
+        self._window_trace_enabled = c0_window_trace_enabled()
         self._next = [0] * C0ControlLayout.LANE_COUNT
         self._tickets: dict[tuple[int, int], C0SessionTicket] = {}
+        self.peak_outstanding = 0
         self._child_alive = child_alive
         self.closed = False
 
@@ -2785,8 +2841,13 @@ class C0SourceSession:
         state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
         return published == consumed and state == C0ControlLayout.STATE_FREE
 
-    def submit(self, request: C0FillRequest, *, timeout_s: float = 900.0) -> C0SessionTicket:
+    def submit(
+        self, request: C0FillRequest, *, timeout_s: float = 900.0,
+        trace: dict[str, Any] | None = None,
+    ) -> C0SessionTicket:
         validate_fill_request(request)
+        if isinstance(trace, dict) and self._window_trace_enabled:
+            trace["control_submit_ns"] = int(time.monotonic_ns())
         deadline = time.monotonic() + float(timeout_s)
         with self._lock:
             while True:
@@ -2807,9 +2868,15 @@ class C0SourceSession:
             C0ControlLayout.write_request(self.shm.buf, lane, request, session_epoch=self.session_epoch, sequence=sequence)
             ticket = C0SessionTicket(lane, sequence, int(request.request_id))
             self._tickets[(lane, sequence)] = ticket
+            self.peak_outstanding = max(self.peak_outstanding, len(self._tickets))
+            if isinstance(trace, dict) and self._window_trace_enabled:
+                trace["control_enqueue_ns"] = int(time.monotonic_ns())
             return ticket
 
-    def wait(self, ticket: C0SessionTicket, *, timeout_s: float) -> dict[str, Any]:
+    def wait(
+        self, ticket: C0SessionTicket, *, timeout_s: float,
+        trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         # A source descriptor is bounded work.  Never inherit the historical
         # 900-second pipe timeout into the shared control plane: a dead control
         # thread must fail the request, not hold a Modal worker for 15 minutes.
@@ -2820,6 +2887,8 @@ class C0SourceSession:
             base = C0ControlLayout.lane_offset(ticket.lane)
             state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
             if state in (C0ControlLayout.STATE_DONE, C0ControlLayout.STATE_ERROR):
+                if isinstance(trace, dict) and self._window_trace_enabled:
+                    trace["reply_observed_ns"] = int(time.monotonic_ns())
                 if not C0ControlLayout.response_crc_valid(self.shm.buf, ticket.lane):
                     raise C0ProtocolError("c0_control_response_crc_mismatch")
                 response = C0ControlLayout.read_response(self.shm.buf, ticket.lane)
@@ -2828,6 +2897,25 @@ class C0SourceSession:
                     raise C0ProtocolError("c0_control_response_identity_mismatch")
                 for field in ("source_offset", "destination_offset"):
                     response[field] = int(request_meta[field])
+                response["source_range"] = [
+                    int(request_meta["source_offset"]),
+                    int(request_meta["source_offset"] + request_meta["length"]),
+                ]
+                if isinstance(trace, dict) and self._window_trace_enabled:
+                    for key in (
+                        "source_engine", "reader_pid", "reader_index", "source_range",
+                        "mmap_map_ns", "mmap_memcpy_ns", "mmap_memcpy_warm_ns",
+                        "mmap_memcpy_shm_warm_ns", "mmap_frozen_copy_ns",
+                        "mmap_frozen_unmap_ns", "mmap_munmap_ns",
+                        "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
+                        "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
+                        "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
+                        "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
+                        "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
+                        "munmap_start_ns", "munmap_end_ns",
+                    ):
+                        if key in response:
+                            trace[key] = response[key]
                 if state == C0ControlLayout.STATE_ERROR:
                     raise C0ProtocolError(response.get("error") or "c0_control_child_fill_failed")
                 return response
@@ -2847,7 +2935,7 @@ class C0SourceSession:
                 )
             time.sleep(0.0005)
 
-    def consume(self, ticket: C0SessionTicket) -> None:
+    def consume(self, ticket: C0SessionTicket, trace: dict[str, Any] | None = None) -> None:
         with self._lock:
             base = C0ControlLayout.lane_offset(ticket.lane)
             state = C0ControlLayout._U32.unpack_from(self.shm.buf, base + 16)[0]
@@ -2857,6 +2945,8 @@ class C0SourceSession:
             C0ControlLayout._U64.pack_into(self.shm.buf, base + 8, ticket.sequence)
             C0ControlLayout._U32.pack_into(self.shm.buf, base + 16, C0ControlLayout.STATE_FREE)
             self._tickets.pop((ticket.lane, ticket.sequence), None)
+            if isinstance(trace, dict) and self._window_trace_enabled:
+                trace["control_consume_ns"] = int(time.monotonic_ns())
 
     def abort(self, ticket: C0SessionTicket, reason: str) -> None:
         with self._lock:
@@ -3572,6 +3662,7 @@ class SharedArenaRing:
         self._registry = C0ReplyRegistry()
         self._requests: list[dict] = []
         self._req_cond = threading.Condition()
+        self._window_trace_enabled = c0_window_trace_enabled()
         self._next_request_id = 0
         self._inflight = 0
         self._writer_thread: Optional[threading.Thread] = None
@@ -4078,7 +4169,10 @@ class SharedArenaRing:
         self._registry.fail_all(self._dead)
 
     # ── fill seam ─────────────────────────────────────────────────────────
-    def fill(self, request: C0FillRequest, *, timeout_s: float = 30.0) -> dict:
+    def fill(
+        self, request: C0FillRequest, *, timeout_s: float = 30.0,
+        trace: dict[str, Any] | None = None,
+    ) -> dict:
         validate_fill_request(request)
         if self._dead is not None:
             raise C0ProtocolError(f"c0_runtime_dead:{self._dead}")
@@ -4087,12 +4181,14 @@ class SharedArenaRing:
         if self._stdin is None or self._stdout is None:
             raise C0ProtocolError("c0_runtime_not_started")
         if self.control_session is not None:
-            ticket = self.control_session.submit(request, timeout_s=timeout_s)
-            reply = self.control_session.wait(ticket, timeout_s=timeout_s)
+            ticket = self.control_session.submit(request, timeout_s=timeout_s, trace=trace)
+            reply = self.control_session.wait(ticket, timeout_s=timeout_s, trace=trace)
             reply["_c0_session_ticket"] = ticket
             # The normal READY validation remains authoritative even though the
             # transport metadata arrived through the binary control block.
             validate_fill_reply(request, reply)
+            if isinstance(trace, dict) and self._window_trace_enabled:
+                trace["ready_observed_ns"] = int(time.monotonic_ns())
             self.fills_submitted += 1
             self.fills_ready += 1
             self.physical_read_bytes += request.length
@@ -4155,6 +4251,9 @@ class SharedArenaRing:
                 raise C0ProtocolError(str(error))
             reply = waiter.get("reply")
             validate_fill_reply(request, reply)
+            if isinstance(trace, dict) and self._window_trace_enabled:
+                trace["reply_observed_ns"] = int(time.monotonic_ns())
+                trace["ready_observed_ns"] = int(time.monotonic_ns())
             # Passive stamp: the instant the validated fill became READY.
             ready_ns = time.monotonic_ns()
             previous_ready = self.fill_ready_mono_ns.get(request.role)
@@ -4916,6 +5015,17 @@ class SharedArenaRing:
             "control_session_outstanding": (
                 int(self.control_session.outstanding) if self.control_session is not None else 0
             ),
+            "control_session_peak_outstanding": (
+                int(self.control_session.peak_outstanding) if self.control_session is not None else 0
+            ),
+            "control_session_capacity": (
+                C0ControlLayout.LANE_COUNT if self.control_session is not None else 0
+            ),
+            "control_session_occupancy": {
+                "current": int(self.control_session.outstanding) if self.control_session is not None else 0,
+                "peak": int(self.control_session.peak_outstanding) if self.control_session is not None else 0,
+                "capacity": C0ControlLayout.LANE_COUNT if self.control_session is not None else 0,
+            },
             "backing_type": "posix",
             "registered": bool(self.registered),
             # Launch-time cudaHostRegister arm selector snapshot.  ``registered``
@@ -5123,6 +5233,11 @@ class C0StageReader:
         self._pool = pool
         self._source = os.path.abspath(str(source))
         self._source_identity = source_identity
+        ring_trace_enabled = getattr(ring, "_window_trace_enabled", None)
+        self._window_trace_enabled = (
+            c0_window_trace_enabled()
+            if ring_trace_enabled is None else bool(ring_trace_enabled)
+        )
         self.open_count = 0
         self.fill_wall_ns = 0
         self.fills = 0
@@ -5195,6 +5310,8 @@ class C0StageReader:
         # replies.  The parent never synthesizes a record: absent replies leave
         # this empty and ``fd_telemetry`` reports an empty list.
         self._preadv_diagnostics: list[dict] = []
+        self._window_trace_records: list[dict] = []
+        self._window_trace_dropped = 0
         # Distinct C0 direct Volume V1 telemetry copied verbatim from child
         # replies: one summary per logical extent plus the flattened per-block
         # diagnostics.  Empty (never fabricated) when the treatment is OFF.
@@ -5215,6 +5332,20 @@ class C0StageReader:
         with self._ring._req_cond:
             self._ring._next_request_id += 1
             return self._ring._next_request_id
+
+    def _store_window_trace(self, trace: dict[str, Any]) -> None:
+        """Append one raw trace or count its drop without exceeding the cap."""
+        if not self._window_trace_enabled:
+            return
+        with self._ring._req_cond:
+            if len(self._window_trace_records) >= _C0_WINDOW_TRACE_LIMIT:
+                self._window_trace_dropped += 1
+                return
+            self._window_trace_records.append(trace)
+
+    def window_trace_snapshot(self) -> tuple[list[dict], int]:
+        with self._ring._req_cond:
+            return list(self._window_trace_records), int(self._window_trace_dropped)
 
     def readinto_lease(self, lease: Any, target: Any, offset: int, producer_id: Optional[int] = None) -> int:
         from .golden_qd_transport import StageLease
@@ -5280,42 +5411,85 @@ class C0StageReader:
         )
         validate_fill_request(request)
         started = time.monotonic_ns()
+        trace: dict[str, Any] | None = None
+        if self._window_trace_enabled:
+            trace = getattr(lease, "_c0_window_trace", None)
+            if not isinstance(trace, dict):
+                trace = {}
+                lease._c0_window_trace = trace
+            trace.update({
+                "role": self._role,
+                "model": self._role,
+                "producer_id": int(producer_id),
+                "reader": int(producer_id),
+                "lane": int(producer_id),
+                "request_id": int(request.request_id),
+                "record_id": declared.record_id,
+                "fill_index": int(self.fills),
+                "source_offset": int(offset),
+                "offset": int(offset),
+                "length": int(length),
+                "slot_index": int(slot_index),
+                "slot_generation": int(lease.generation),
+                "slot": int(slot_index),
+                "generation": int(lease.generation),
+                "arena_epoch": int(request.arena_epoch),
+            })
         # FIRST_FILL vs REUSED_SLOT classification, taken from the ring's own
         # slot-fill counter before this fill increments it.  Only one fill can
         # be outstanding per leased slot, so this read is exact for the slot.
         first_fill = int(self._ring.slot_fills[slot_index]) == 0
-        reply = self._ring.fill(request)
-        session_ticket = reply.get("_c0_session_ticket") if isinstance(reply, dict) else None
-        if session_ticket is not None:
-            # TransportDispatcher consumes this ticket only from its proven
-            # CUDA-event completion path; source DONE alone is not reusable.
-            lease._c0_session = self._ring.control_session
-            lease._c0_session_ticket = session_ticket
-        self.fill_wall_ns += time.monotonic_ns() - started
-        self.fills += 1
-        self.source_bytes += length
-        self._record_fill_telemetry(
-            producer_id=int(producer_id),
-            length=length,
-            reply=reply,
-            first_fill=bool(first_fill),
-        )
-        # Passive: mirror the ring's per-role stamps into this stage reader.
-        submit_ns = self._ring.fill_submit_mono_ns.get(self._role)
-        if submit_ns is not None and (
-            self.first_source_read_start_mono_ns is None
-            or submit_ns < self.first_source_read_start_mono_ns
-        ):
-            self.first_source_read_start_mono_ns = submit_ns
-        ready_ns = self._ring.fill_ready_mono_ns.get(self._role)
-        if ready_ns is not None and (
-            self.last_source_read_end_mono_ns is None
-            or ready_ns > self.last_source_read_end_mono_ns
-        ):
-            self.last_source_read_end_mono_ns = ready_ns
-        # The child wrote directly into the registered slot; the validated
-        # reply is the only proof that lets the dispatcher publish READY.
-        return length
+        try:
+            reply = self._ring.fill(request, trace=trace)
+            session_ticket = reply.get("_c0_session_ticket") if isinstance(reply, dict) else None
+            if session_ticket is not None:
+                # TransportDispatcher consumes this ticket only from its proven
+                # CUDA-event completion path; source DONE alone is not reusable.
+                lease._c0_session = self._ring.control_session
+                lease._c0_session_ticket = session_ticket
+            self.fill_wall_ns += time.monotonic_ns() - started
+            self.fills += 1
+            self.source_bytes += length
+            self._record_fill_telemetry(
+                producer_id=int(producer_id),
+                length=length,
+                reply=reply,
+                first_fill=bool(first_fill),
+            )
+            if trace is not None and isinstance(reply, dict):
+                for key in (
+                    "source_engine", "reader_pid", "reader_index", "source_range",
+                    "mmap_map_ns", "mmap_memcpy_ns", "mmap_memcpy_warm_ns",
+                    "mmap_memcpy_shm_warm_ns", "mmap_frozen_copy_ns",
+                    "mmap_frozen_unmap_ns", "mmap_munmap_ns",
+                    "mmap_launch_gap_wait_ns", "mmap_pipe_rtt_ns",
+                    "mmap_minflt", "mmap_majflt", "mmap_ru_utime_ns",
+                    "mmap_ru_stime_ns", "mmap_sched_run_ns", "mmap_sched_wait_ns",
+                    "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
+                    "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
+                    "munmap_start_ns", "munmap_end_ns",
+                ):
+                    if key in reply:
+                        trace[key] = reply[key]
+            # Passive: mirror the ring's per-role stamps into this stage reader.
+            submit_ns = self._ring.fill_submit_mono_ns.get(self._role)
+            if submit_ns is not None and (
+                self.first_source_read_start_mono_ns is None
+                or submit_ns < self.first_source_read_start_mono_ns
+            ):
+                self.first_source_read_start_mono_ns = submit_ns
+            ready_ns = self._ring.fill_ready_mono_ns.get(self._role)
+            if ready_ns is not None and (
+                self.last_source_read_end_mono_ns is None
+                or ready_ns > self.last_source_read_end_mono_ns
+            ):
+                self.last_source_read_end_mono_ns = ready_ns
+            # The child wrote directly into the registered slot; the validated
+            # reply is the only proof that lets the dispatcher publish READY.
+            return length
+        finally:
+            if trace is not None:
+                self._store_window_trace(trace)
 
     def _record_fill_telemetry(
         self, *, producer_id: int, length: int, reply: Any, first_fill: bool
@@ -5418,9 +5592,15 @@ class C0StageReader:
                 self._mmap_read_records.append({
                     "producer_id": int(producer_id),
                     "reader_pid": source.get("reader_pid"),
-                    "copy_start_ns": int(copy_start),
-                    "copy_end_ns": int(copy_end),
-                    "returned_bytes": int(returned),
+                     "copy_start_ns": int(copy_start),
+                     "copy_end_ns": int(copy_end),
+                     "mmap_start_ns": source.get("mmap_start_ns"),
+                     "mmap_end_ns": source.get("mmap_end_ns"),
+                     "memcpy_start_ns": source.get("memcpy_start_ns"),
+                     "memcpy_end_ns": source.get("memcpy_end_ns"),
+                     "munmap_start_ns": source.get("munmap_start_ns"),
+                     "munmap_end_ns": source.get("munmap_end_ns"),
+                     "returned_bytes": int(returned),
                     "source_offset": source.get("source_offset"),
                     "source_range": source.get("source_range"),
                     "mmap_map_ns": source.get("mmap_map_ns"),
@@ -5809,7 +5989,7 @@ control_session_epoch = int(sys.argv[9]) if len(sys.argv) > 9 else 0
 # Keep this wire definition byte-for-byte aligned with C0ControlLayout.  It is
 # intentionally stdlib-only: this interpreter must remain CUDA sterile.
 CONTROL_MAGIC = b"CM0CTRL2"
-CONTROL_VERSION = 1
+CONTROL_VERSION = 2
 CONTROL_LANES = 4
 CONTROL_HEADER = 128
 CONTROL_DESCRIPTOR = 1024
@@ -5824,7 +6004,7 @@ CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
 CONTROL_U64 = struct.Struct("<Q")
 CONTROL_U32 = struct.Struct("<I")
 CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
-CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII")
+CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 27)
 
 
 def _control_lane_offset(lane):
@@ -5876,6 +6056,23 @@ def _control_publish(lane, sequence, result):
         int(result.get("child_read_start_ns") or 0), int(result.get("child_read_end_ns") or 0),
         int(result.get("fd_open_count") or 0), int(result.get("fd_reuse_count") or 0),
         int(result.get("fd_close_count") or 0), source_engine,
+        int(result.get("reader_pid") or 0), int(result.get("reader_index") or 0),
+        int(result.get("mmap_map_ns") or 0), int(result.get("mmap_memcpy_ns") or 0),
+        int(result.get("mmap_memcpy_warm_ns") or 0),
+        int(result.get("mmap_memcpy_shm_warm_ns") or 0),
+        int(result.get("mmap_frozen_copy_ns") or 0),
+        int(result.get("mmap_frozen_unmap_ns") or 0),
+        int(result.get("mmap_munmap_ns") or 0),
+        int(result.get("mmap_launch_gap_wait_ns") or 0),
+        int(result.get("mmap_pipe_rtt_ns") or 0),
+        int(result.get("mmap_minflt") or 0), int(result.get("mmap_majflt") or 0),
+        int(result.get("mmap_ru_utime_ns") or 0), int(result.get("mmap_ru_stime_ns") or 0),
+        int(result.get("mmap_sched_run_ns") or 0), int(result.get("mmap_sched_wait_ns") or 0),
+        int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
+        int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
+        int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
+        int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
+        int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
     )
     CONTROL_U32.pack_into(control_buf, base + 640, _control_crc(response + error))
     control_buf[base + 648:base + 648 + CONTROL_ERROR_BYTES] = error + b"\0" * (CONTROL_ERROR_BYTES - len(error))
@@ -8467,6 +8664,8 @@ def _mmap_reader_fill(req):
         copy_end_ns = read_start_ns
         private_to_shm_start_ns = None
         private_to_shm_end_ns = None
+        munmap_start_ns = read_start_ns
+        munmap_end_ns = read_start_ns
         unmap_end_ns = read_start_ns
         win = int(_mmap_libc.mmap(
             None, window_len, _PROT_READ, _MAP_PRIVATE, fd, window_start
@@ -8532,8 +8731,10 @@ def _mmap_reader_fill(req):
             if copy_end_ns == read_start_ns:
                 copy_end_ns = time.monotonic_ns()
             # Synchronous unmap: the fresh window never outlives the read.
+            munmap_start_ns = time.monotonic_ns()
             _mmap_libc.munmap(win, window_len)
-            unmap_end_ns = time.monotonic_ns()
+            munmap_end_ns = time.monotonic_ns()
+            unmap_end_ns = munmap_end_ns
         faults_after = _mmap_fault_counters()
         # Passive CPU/scheduling attribution for this reader process, taken
         # from the same getrusage call family as the fault counters plus
@@ -8582,15 +8783,17 @@ def _mmap_reader_fill(req):
              # raw-disk or page-in-only measurement.
              "copy_start_ns": int(map_end_ns),
              "copy_end_ns": int(copy_end_ns),
+             # Absolute child-boundary phase instants.  The legacy duration
+             # fields above remain compatibility aliases.
+             "mmap_start_ns": int(read_start_ns),
+             "mmap_end_ns": int(map_end_ns),
+             "memcpy_start_ns": int(map_end_ns),
+             "memcpy_end_ns": int(copy_end_ns),
+              "munmap_start_ns": int(munmap_start_ns),
+              "munmap_end_ns": int(munmap_end_ns),
              "source_touch_copy_ns": int(max(0, copy_end_ns - map_end_ns)),
              "mmap_memcpy_ns": int(max(0, copy_end_ns - map_end_ns)),
-             "mmap_munmap_ns": int(max(
-                 0,
-                 unmap_end_ns - (
-                     private_to_shm_end_ns
-                     if private_to_shm_end_ns is not None else copy_end_ns
-                 ),
-             )),
+              "mmap_munmap_ns": int(max(0, munmap_end_ns - munmap_start_ns)),
              "mmap_op_start_ns": int(read_start_ns),
              "mmap_op_end_ns": int(read_end_ns),
              "mmap_op_ns": int(max(0, read_end_ns - read_start_ns)),

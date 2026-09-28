@@ -65,6 +65,22 @@ H2D_TARGET_BYTES_BY_ROLE = {
     "unet": 128 * 1024 * 1024,
     "vae": 32 * 1024 * 1024,
 }
+C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+
+
+def _c0_window_trace_enabled() -> bool:
+    """Read the existing deploy-baked C0 raw-trace selector."""
+    return str(os.environ.get(C0_WINDOW_TRACE_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _c0_trace_stamp(lease: Any, name: str, value: int | None = None) -> None:
+    """Stamp an observation on a trace owned by the C0 reader, when enabled."""
+    trace = getattr(lease, "_c0_window_trace", None)
+    if not isinstance(trace, dict):
+        return
+    trace.setdefault(name, int(time.monotonic_ns() if value is None else value))
 
 
 def resolve_h2d_target_bytes(role: str) -> int:
@@ -826,6 +842,7 @@ class StageLease:
         # dispatcher's proven CUDA-event completion path.
         self._c0_session: Any = None
         self._c0_session_ticket: Any = None
+        self._c0_window_trace: dict[str, Any] | None = None
         self.preferred_slot_index = preferred_slot_index
         self.preferred_slot_honored = preferred_slot_honored
 
@@ -1851,6 +1868,7 @@ class TransportDispatcher:
 
     def __init__(self, pool: StagingPool, backend: TransportBackend, config: TransportConfig, telemetry: _Telemetry, destination_size: int | None = None, aggregation_ranges: Sequence[SourceRange] | None = None) -> None:
         self.pool, self.backend, self.config, self.telemetry = pool, backend, config, telemetry
+        self._c0_window_trace_enabled = _c0_window_trace_enabled()
         self.destination_size = destination_size
         self._queue: list[tuple[StageLease, ReadyRecord]] = []
         self._queue_condition = threading.Condition()
@@ -1936,6 +1954,8 @@ class TransportDispatcher:
                     raise CancellationError("transport was quiesced before publish")
                 # This call does not call back into the dispatcher condition.
                 self.pool._mark_ready(lease, record, self.destination_size)
+                if self._c0_window_trace_enabled:
+                    _c0_trace_stamp(lease, "ready_publish_ns")
                 self._queue.append((lease, record))
                 if self.telemetry.diagnostics_enabled:
                     self.telemetry.ready_depth = len(self._queue)
@@ -1985,7 +2005,9 @@ class TransportDispatcher:
                 self.telemetry.gpu_copy_bytes = resource.gpu_copy_bytes
 
     @staticmethod
-    def _consume_source_sessions(submission: _DispatchSubmission) -> None:
+    def _consume_source_sessions(
+        submission: _DispatchSubmission, *, trace_enabled: bool = False
+    ) -> None:
         for lease in submission.leases:
             session = getattr(lease, "_c0_session", None)
             session_ticket = getattr(lease, "_c0_session_ticket", None)
@@ -1994,6 +2016,8 @@ class TransportDispatcher:
             if session is None or session_ticket is None:
                 raise TransportError("C0 session ticket ownership is incomplete")
             session.consume(session_ticket)
+            if trace_enabled:
+                _c0_trace_stamp(lease, "control_consume_ns")
 
     def _poll(self) -> None:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
@@ -2036,6 +2060,9 @@ class TransportDispatcher:
                     # copy finished.  Count it before pool bookkeeping so a
                     # cleanup race cannot make telemetry claim it did not.
                     completion_observed_ns = time.monotonic_ns()
+                    if self._c0_window_trace_enabled:
+                        for lease in submission.leases:
+                            _c0_trace_stamp(lease, "h2d_completion_observed_ns", completion_observed_ns)
                     self.telemetry.h2d_completed_bytes += submission.byte_count
                     self.telemetry.h2d_completed_count += 1
                     if self.telemetry.first_h2d_completion_observed_ns is None:
@@ -2044,9 +2071,13 @@ class TransportDispatcher:
                     self._record_h2d_complete(key, ticket)
                     # Source descriptor reuse is deliberately after the CUDA
                     # event proof, never after child DONE alone.
-                    self._consume_source_sessions(submission)
+                    self._consume_source_sessions(
+                        submission, trace_enabled=self._c0_window_trace_enabled
+                    )
                     for lease in submission.leases:
                         self.pool._return_completed(lease)
+                        if self._c0_window_trace_enabled:
+                            _c0_trace_stamp(lease, "slot_return_ns")
                     release_ticket = getattr(self.backend, "release_ticket", None)
                     if callable(release_ticket):
                         release_ticket(ticket)
@@ -2135,13 +2166,21 @@ class TransportDispatcher:
                     continue
                 if proven:
                     try:
+                        completion_ns = time.monotonic_ns()
+                        if self._c0_window_trace_enabled:
+                            for lease in submission.leases:
+                                _c0_trace_stamp(lease, "h2d_completion_observed_ns", completion_ns)
                         self.telemetry.h2d_completed_bytes += submission.byte_count
                         self.telemetry.h2d_completed_count += 1
                         self._record_h2d_complete(key, ticket)
-                        self._consume_source_sessions(submission)
+                        self._consume_source_sessions(
+                            submission, trace_enabled=self._c0_window_trace_enabled
+                        )
                         for lease in submission.leases:
                             if not lease._returned:
                                 self.pool._return_completed(lease)
+                                if self._c0_window_trace_enabled:
+                                    _c0_trace_stamp(lease, "slot_return_ns")
                         release_ticket = getattr(self.backend, "release_ticket", None)
                         if callable(release_ticket):
                             release_ticket(ticket)
@@ -2404,6 +2443,9 @@ class TransportDispatcher:
                                 else self.pool._buffer_for_dispatch(lease, record.nbytes)
                             )
                     submit_ns = time.monotonic_ns()
+                    if self._c0_window_trace_enabled:
+                        for member in submission.leases:
+                            _c0_trace_stamp(member, "h2d_submit_ns", submit_ns)
                     actual_h2d_token = None
                     if self.telemetry.actual_source is not None:
                         # This is deliberately before submit_h2d: the core
@@ -2605,6 +2647,9 @@ class GoldenQDTransport:
         self.telemetry = _Telemetry(
             execution_arm=self.arm, diagnostics_enabled=bool(diagnostics)
         )
+        # The selector is deploy-baked.  Read it once so the default-off path
+        # does not re-read the environment for every lease acquisition.
+        self._c0_window_trace_enabled = _c0_window_trace_enabled()
         self.dispatcher: TransportDispatcher | None = None
         self._active_producers = 0
         self._active_lock = threading.Lock()
@@ -2631,10 +2676,26 @@ class GoldenQDTransport:
     ) -> StageLease:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         try:
-            return self.pool.acquire(
+            if not self._c0_window_trace_enabled:
+                return self.pool.acquire(
+                    timeout=timeout, declared_range=declared_range, producer_id=producer_id,
+                    preferred_slot_index=preferred_slot_index,
+                )
+            trace_started = time.monotonic_ns()
+            lease = self.pool.acquire(
                 timeout=timeout, declared_range=declared_range, producer_id=producer_id,
                 preferred_slot_index=preferred_slot_index,
             )
+            if trace_started is not None:
+                lease._c0_window_trace = {
+                    "lease_request_ns": int(trace_started),
+                    "lease_acquire_ns": int(time.monotonic_ns()),
+                    "slot_index": int(lease.slot_index),
+                    "slot_generation": int(lease.generation),
+                    "slot": int(lease.slot_index),
+                    "generation": int(lease.generation),
+                }
+            return lease
         finally:
             waited = (
                 time.monotonic_ns() - started
@@ -3177,6 +3238,9 @@ class GoldenQDTransport:
         if self.telemetry.diagnostics_enabled:
             self.telemetry.source_start_ns = time.monotonic_ns()
         read_source, direct_readinto = self._open_source(reader)
+        trace_role = getattr(read_source, "_role", None)
+        if trace_role is None:
+            trace_role = getattr(read_source, "role", None)
         if self.arm == STATIC_E27_ARM and not direct_readinto:
             close_errors = self._close_source()
             error = ReconciliationError("static E27 arm requires direct readinto source")
@@ -3249,6 +3313,13 @@ class GoldenQDTransport:
         index = 0
         index_lock = threading.Lock()
         static_cursors = [0] * producer_count
+        # Raw C0 lifecycle evidence is assigned at the same claim point as the
+        # real source scheduler.  Keep the small amount of bookkeeping under
+        # the existing item-selection lock; the OFF path does not allocate or
+        # touch any of it.
+        next_operation_ordinal = 0
+        reader_operation_counts = [0] * producer_count
+        previous_claims: dict[int, dict[str, Any]] = {}
 
         def note_worker_error(exc: BaseException) -> None:
             with errors_lock:
@@ -3256,7 +3327,7 @@ class GoldenQDTransport:
             self._request_abort()
 
         def worker(producer_id: int) -> None:
-            nonlocal index
+            nonlocal index, next_operation_ordinal
             with self._active_lock:
                 self._active_producers += 1
             try:
@@ -3265,9 +3336,13 @@ class GoldenQDTransport:
                     if self.arm == STATIC_E27_ARM and self._static_work is not None
                     else None
                 )
+                claim_trace: dict[str, Any] | None = None
+                work_available_ns = 0
                 while not self._abort_requested:
                     if static_items is not None:
                         with index_lock:
+                            if self._c0_window_trace_enabled:
+                                work_available_ns = time.monotonic_ns()
                             item = None
                             if static_cursors[producer_id] < len(static_items):
                                 item = static_items[static_cursors[producer_id]]
@@ -3285,12 +3360,80 @@ class GoldenQDTransport:
                                         break
                             if item is None:
                                 return
+                            if self._c0_window_trace_enabled:
+                                reader_ordinal = reader_operation_counts[producer_id]
+                                reader_operation_counts[producer_id] += 1
+                                operation_ordinal = next_operation_ordinal
+                                next_operation_ordinal += 1
+                                reader_claim_ns = time.monotonic_ns()
+                                claim_trace = {
+                                    "work_available_ns": int(work_available_ns),
+                                    "reader_claim_ns": int(reader_claim_ns),
+                                    "producer_id": int(producer_id),
+                                    "record_id": item.record_id,
+                                    "operation_ordinal": int(operation_ordinal),
+                                    "ordinal": int(operation_ordinal),
+                                    "reader_ordinal": int(reader_ordinal),
+                                    "reader_count": int(reader_ordinal + 1),
+                                    "reader_operation_ordinal": int(reader_ordinal),
+                                     "reader_operation_count": int(reader_ordinal + 1),
+                                     "role": trace_role,
+                                     "model": trace_role,
+                                     "reader": int(producer_id),
+                                     "lane": int(producer_id),
+                                     "is_model_first_operation": operation_ordinal == 0,
+                                    "is_reader_first_operation": reader_ordinal == 0,
+                                    "is_first_4": operation_ordinal < 4,
+                                    "is_first_8": operation_ordinal < 8,
+                                    "is_first_16": operation_ordinal < 16,
+                                    "next_work_visible_ns": None,
+                                    "source_offset": int(item.source_offset),
+                                    "offset": int(item.source_offset),
+                                    "length": int(item.length),
+                                }
                     else:
                         with index_lock:
+                            if self._c0_window_trace_enabled:
+                                work_available_ns = time.monotonic_ns()
                             if index >= len(source_ranges):
                                 return
                             item = source_ranges[index]
                             index += 1
+                            if self._c0_window_trace_enabled:
+                                reader_ordinal = reader_operation_counts[producer_id]
+                                reader_operation_counts[producer_id] += 1
+                                operation_ordinal = next_operation_ordinal
+                                next_operation_ordinal += 1
+                                reader_claim_ns = time.monotonic_ns()
+                                claim_trace = {
+                                    "work_available_ns": int(work_available_ns),
+                                    "reader_claim_ns": int(reader_claim_ns),
+                                    "producer_id": int(producer_id),
+                                    "record_id": item.record_id,
+                                    "operation_ordinal": int(operation_ordinal),
+                                    "ordinal": int(operation_ordinal),
+                                    "reader_ordinal": int(reader_ordinal),
+                                    "reader_count": int(reader_ordinal + 1),
+                                    "reader_operation_ordinal": int(reader_ordinal),
+                                     "reader_operation_count": int(reader_ordinal + 1),
+                                     "role": trace_role,
+                                     "model": trace_role,
+                                     "reader": int(producer_id),
+                                     "lane": int(producer_id),
+                                     "is_model_first_operation": operation_ordinal == 0,
+                                    "is_reader_first_operation": reader_ordinal == 0,
+                                    "is_first_4": operation_ordinal < 4,
+                                    "is_first_8": operation_ordinal < 8,
+                                    "is_first_16": operation_ordinal < 16,
+                                    "next_work_visible_ns": None,
+                                    "source_offset": int(item.source_offset),
+                                    "offset": int(item.source_offset),
+                                    "length": int(item.length),
+                                }
+                    if self._c0_window_trace_enabled and claim_trace is not None:
+                        previous = previous_claims.get(producer_id)
+                        if previous is not None:
+                            previous["next_work_visible_ns"] = int(claim_trace["work_available_ns"])
                     lease: StageLease | None = None
                     try:
                         preferred_slot = (
@@ -3305,6 +3448,14 @@ class GoldenQDTransport:
                             producer_id=producer_id,
                             preferred_slot_index=preferred_slot,
                         )
+                        if self._c0_window_trace_enabled and claim_trace is not None:
+                            # acquire() owns the lease lifecycle timestamps;
+                            # merge the scheduler claim fields into that same
+                            # bounded record before the source read begins.
+                            lease_trace = lease._c0_window_trace
+                            if isinstance(lease_trace, dict):
+                                lease_trace.update(claim_trace)
+                                previous_claims[producer_id] = lease_trace
                         if self.telemetry.diagnostics_enabled:
                             self.telemetry.source_read_begin()
                         try:
