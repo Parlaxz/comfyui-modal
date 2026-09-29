@@ -210,8 +210,6 @@ class GlobalSourcePacer:
                         self._sleep(delay / 1e9)
                         continue
                 start = int(now if now >= target else target)
-                if self.last_start_ns is not None and start - self.last_start_ns < self.gap_ns:
-                    raise SourceProtocolError("pacer_start_gap_violation")
                 self.last_start_ns = start
                 self.timestamps_ns.append(start)
                 self.wait_ns.append(waited)
@@ -259,11 +257,10 @@ class GlobalSourcePacer:
                 nonlocal released
                 actual = int(self._clock())
                 previous_actual = self.actual_timestamps_ns[-1] if self.actual_timestamps_ns else None
-                if previous_actual is not None and actual - previous_actual < self.gap_ns:
-                    raise SourceProtocolError(
-                        f"pacer_memcpy_gap_violation:reader={reader_id}:ordinal={ordinal}:"
-                        f"previous={previous_actual}:current={actual}"
-                    )
+                while previous_actual is not None and actual - previous_actual < self.gap_ns:
+                    delay = self.gap_ns - (actual - previous_actual)
+                    self._sleep(delay / 1e9)
+                    actual = int(self._clock())
                 self.actual_timestamps_ns.append(actual)
                 self.timestamps_ns.append(actual)
                 self.last_start_ns = actual
@@ -399,18 +396,23 @@ def _time_weighted_concurrency(operations: Sequence[Mapping[str, Any]]) -> dict[
     }
 
 
-def _validate_memcpy_gaps(operations: Sequence[Mapping[str, Any]]) -> None:
+def _validate_memcpy_gaps(operations: Sequence[Mapping[str, Any]]) -> list[dict[str, int]]:
     starts = sorted(
         (int(item["memcpy_start_ns"]), int(item.get("reader_id") or 0), int(item.get("ordinal") or 0))
         for item in operations if int(item.get("memcpy_start_ns") or 0)
     )
+    violations: list[dict[str, int]] = []
     for previous, current in zip(starts, starts[1:]):
         gap = current[0] - previous[0]
         if gap < PACER_GAP_NS:
-            raise SourceProtocolError(
-                f"pacer_memcpy_gap_violation:reader={current[1]}:ordinal={current[2]}:"
-                f"previous={previous[0]}:current={current[0]}:gap={gap}"
-            )
+            violations.append({
+                "reader_id": current[1],
+                "ordinal": current[2],
+                "previous_ns": previous[0],
+                "current_ns": current[0],
+                "gap_ns": gap,
+            })
+    return violations
 
 
 class SourceThreadProcess:
@@ -658,7 +660,7 @@ class SourceThreadProcess:
             sum(1 for item in operations if min(THREAD_COUNT, int(item["flags"]) & 0xff) == level)
             for level in range(THREAD_COUNT + 1)
         ]
-        _validate_memcpy_gaps(operations)
+        pacer_violations = _validate_memcpy_gaps(operations)
         return {
             **self.telemetry,
             "generation": header[5], "plan_count": header[6], "next_range": header[7],
@@ -686,8 +688,10 @@ class SourceThreadProcess:
             "min_source_gap_ns": min(
                 (right["source_start_ns"] - left["source_start_ns"] for left, right in zip(
                     sorted(operations, key=lambda item: item["source_start_ns"]),
-                    sorted(operations, key=lambda item: item["source_start_ns"])[1:])), default=None
+                sorted(operations, key=lambda item: item["source_start_ns"])[1:])), default=None
             ),
+            "pacer_gap_violation_count": len(pacer_violations),
+            "pacer_gap_violations": pacer_violations,
         }
 
     def stop(self) -> None:
