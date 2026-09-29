@@ -14993,6 +14993,15 @@ async def golden_teardown(session: GoldenSession) -> dict:
         if runner is not None:
             _assert_runner_quiescence(runner)
 
+        # The threaded-source arm establishes one persistent dispatcher during
+        # restore.  Stop that dispatcher at request teardown before the generic
+        # Golden worker assertion; the transport/arena owner remains alive until
+        # its normal single-use-container shutdown path.
+        model_transport = getattr(session, "model_transport", None)
+        source_transport = getattr(model_transport, "_c0_source_transport", None)
+        if source_transport is not None:
+            source_transport.shutdown(timeout=10.0)
+
         # Leak checks on ALL Golden-owned handles this module created: the
         # exact thread registry first, then a name scan as a backstop.
         with _GOLDEN_THREAD_LOCK:
