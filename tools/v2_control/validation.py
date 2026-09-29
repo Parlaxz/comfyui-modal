@@ -2304,6 +2304,11 @@ def build_run_record_from_result(
         except (OSError, ValueError):
             data = None
         if isinstance(data, dict):
+            nested_golden = data.get("golden_telemetry")
+            if isinstance(nested_golden, dict):
+                for key in ("fresh", "restored", "v2ctl_config"):
+                    if key not in telemetry and nested_golden.get(key) is not None:
+                        telemetry[key] = nested_golden[key]
             if "request_id" not in telemetry and isinstance(data.get("request_id"), str):
                 telemetry["request_id"] = data["request_id"]
             if "correlation_id" not in telemetry:
