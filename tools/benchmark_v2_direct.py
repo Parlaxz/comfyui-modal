@@ -10521,7 +10521,7 @@ def _golden_p1_request_payload(
     deep_trace: bool = False,
     golden_mode: str = "serial",
     c0_mmap_lifecycle: str | None = None,
-    c0_source_threads: bool = False,
+    c0_source_threads: bool | None = None,
 ) -> dict[str, Any]:
     """Compatibility wrapper for the dependency-free payload builder."""
     from tools.v2_control.golden_payload import _golden_p1_request_payload as build
@@ -11813,11 +11813,10 @@ async def _run_golden_p1(
                 cpu_qd2_prefetch=cpu_qd2_prefetch,
                 deep_trace=deep_trace,
                 golden_mode=golden_mode,
-                c0_mmap_lifecycle=os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"),
-                c0_source_threads=(
-                    str(os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS", ""))
-                    .strip().lower() in {"1", "true", "yes", "on"}
+                c0_mmap_lifecycle=(
+                    os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE") or None
                 ),
+                c0_source_threads=None,
             )
             # The selected remote stream is consumed through its terminal
             # result before dispatching the next attempt.
