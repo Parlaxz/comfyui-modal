@@ -1109,6 +1109,7 @@ def _child_main(arena_name: str, control_name: str, lock_path: str) -> int:
                         raise SourceProtocolError("source_previous_plan_stop_timeout")
                 actual = _validate_identity(str(message["path"]), message["identity"])
                 plan_data = {
+                    "generation": int(message["generation"]),
                     "path": str(message["path"]), "identity": tuple(message["identity"]),
                     "ranges": list(message["ranges"]), "destination_size": int(message["destination_size"]),
                     "mmap_lifecycle": str(message.get("mmap_lifecycle") or "fresh").lower(),
