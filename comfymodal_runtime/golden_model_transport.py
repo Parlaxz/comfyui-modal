@@ -515,6 +515,8 @@ def arena_ensure_detail(runtime: Any) -> dict[str, Any]:
         "slot_bytes": _get("slot_bytes"),
         "backing_create_ms": _get("backing_create_ms"),
         "register_ms": _get("register_ms"),
+        "registration_diagnostic": _get("registration_diagnostic"),
+        "registration_order": _get("registration_order"),
         "registered": _get("registered"),
         "shm_populate_enabled": _get("shm_populate_enabled"),
         "dma_ring_enabled": _get("dma_ring_enabled"),

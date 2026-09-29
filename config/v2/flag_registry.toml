@@ -739,6 +739,25 @@ owner = "c0-experiment-1"
 description = "Experiment-1 treatment: materialize the fresh 512 MiB C0 SHM with real parallel CPU writes before cudaHostRegister (default OFF = production-005 control)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"
+type = "enum"
+default = "fresh"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "testing9-c0-mmap"
+enum_values = ["fresh", "whole", "epoch"]
+description = "TESTING9-only C0 mmap lifecycle diagnostic; fresh is the current exact-window control, whole keeps one mapping per model/path, and epoch uses aligned approximately 1 GiB mappings."
+
+[[flag]]
+name = "COMFYMODAL_PHASE1_C0_ARENA"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "testing9-c0-arena"
+description = "TESTING9-only deployment gate for the isolated process/thread/shared-arena microbenchmark endpoint."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_C0_READER_GATE"
 type = "bool"
 default = "0"
@@ -764,6 +783,43 @@ consumed_at = "restore"
 change_requires = "deploy"
 owner = "c0-composition"
 description = "Composition treatment: 5 x 64 MiB globally shared registered-capable source slots (default OFF = production-005 8-slot geometry)."
+
+[[flag]]
+name = "COMFYMODAL_TESTING8_INSTANTTENSOR"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "testing8-gds-instanttensor"
+description = "TESTING8-only installation gate for isolated InstantTensor transport probes; never used by Golden loaders."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+description = "Observation-only deep cudaHostRegister identity, mapping, proc-state, rusage, and context diagnostics; default OFF."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER"
+type = "enum"
+default = "overlap"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+enum_values = ["overlap", "register_first"]
+description = "Diagnostic-only registration ordering arm; overlap preserves Popen-before-register and register_first registers before child startup."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+description = "Diagnostic-only primary-context preinitialization before cudaHostRegister; default OFF."
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"

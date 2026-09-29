@@ -1,0 +1,462 @@
+{
+  "capability": {
+    "cuda_runtime": {
+      "argv": [
+        "nvcc",
+        "--version"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Jul_16_07:30:01_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.48\nBuild cuda_13.0.r13.0/compiler.36260728_0\n"
+    },
+    "cufile_config": {
+      "content": "{\n    // NOTE : Application can override custom configuration via export CUFILE_ENV_PATH_JSON=<filepath>\n    // e.g : export CUFILE_ENV_PATH_JSON=\"/home/<xxx>/cufile.json\"\n\n            \"logging\": {\n                            // log directory, if not enabled will create log file under current working directory\n                            //\"dir\": \"/home/<xxxx>\",\n\n                            // NOTICE|ERROR|WARN|INFO|DEBUG|TRACE (in decreasing order of severity)\n                            \"level\": \"ERROR\"\n            },\n\n            \"profile\": {\n                            // nvtx profiling on/off\n                            \"nvtx\": false,\n                            // cufile stats level(0-3)\n                            \"cufile_stats\": 0\n            },\n\n            \"execution\" : {\n                    // max number of workitems in the queue;\n                    \"max_io_queue_depth\": 128,\n                    // max number of host threads per gpu to spawn for parallel IO\n                    \"max_io_threads\" : 4,\n                    // enable support for parallel IO\n                    \"parallel_io\" : true,\n                    // minimum IO threshold before splitting the IO\n                    \"min_io_threshold_size_kb\" : 8192,\n\t\t    // maximum parallelism for a single request\n\t\t    \"max_request_parallelism\" : 4\n            },\n\n            \"properties\": {\n                            // max IO chunk size (parameter should be multiples of 64K) used by cuFileRead/Write internally per IO request\n                            \"max_direct_io_size_kb\" : 16384,\n                            // device memory size (parameter should be 4K aligned) for reserving bounce buffers for the entire GPU\n                            \"max_device_cache_size_kb\" : 131072,\n                            // per-io bounce-buffer size (parameter should be multiples of 64K) ranging from 1024kb to 16384kb\n                            // Note: ensure (max_device_cache_size_kb / per_buffer_cache_size_kb) >= io_batchsize\n                            \"per_buffer_cache_size_kb\": 1024,\n                            // limit on maximum device memory size (parameter should be 4K aligned) that can be pinned for a given process\n                            \"max_device_pinned_mem_size_kb\" : 33554432,\n                            // Posix pool slab sizes. Must be page aligned.\n                            \"posix_pool_slab_size_kb\" : [4, 1024, 16384],\n                            // Number of entries per slab. Slabs are defined by posix_pool_slab_size_kb\n                            \"posix_pool_slab_count\" : [128, 64, 64],\n                            // true or false (true will enable asynchronous io submission to nvidia-fs driver)\n                            // Note : currently the overall IO will still be synchronous\n                            \"use_poll_mode\" : false,\n                            // maximum IO request size (parameter should be 4K aligned) within or equal to which library will use polling for IO completion\n                            \"poll_mode_max_size_kb\": 4,\n                            // allow p2pdma, this will enable use of cuFile without nvme patches \n                            \"use_pci_p2pdma\": false,\n                            // allow compat mode, this will enable use of cuFile posix read/writes\n                            \"allow_compat_mode\": true,\n                            // enable GDS write support for RDMA based storage\n                            \"gds_rdma_write_support\": true,\n                            // GDS batch size\n                            \"io_batchsize\": 128,\n                            // enable io priority w.r.t compute streams\n                            // valid options are \"default\", \"low\", \"med\", \"high\"\n                            \"io_priority\": \"default\",\n                            // client-side rdma addr list for user-space file-systems(e.g [\"10.0.1.0\", \"10.0.2.0\"])\n                            \"rdma_dev_addr_list\": [ ],\n                            // load balancing policy for RDMA memory registration(MR), (RoundRobin, RoundRobinMaxMin)\n                            // In RoundRobin, MRs will be distributed uniformly across NICS closest to a GPU\n                            // In RoundRobinMaxMin, MRs will be distributed across NICS closest to a GPU\n                            // with minimal sharing of NICS acros GPUS\n                            \"rdma_load_balancing_policy\": \"RoundRobin\",\n\t\t\t    //32-bit dc key value in hex\n\t\t\t    //\"rdma_dc_key\": \"0xffeeddcc\", \n\t\t\t    //To enable/disable different rdma OPs use the below bit map\n\t\t\t    //Bit 0 - If set enables Local RDMA WRITE\n\t\t\t    //Bit 1 - If set enables Remote RDMA WRITE\n\t\t\t    //Bit 2 - If set enables Remote RDMA READ\n\t\t\t    //Bit 3 - If set enables REMOTE RDMA Atomics\n\t\t\t    //Bit 4 - If set enables Relaxed ordering.\n\t\t\t    //\"rdma_access_mask\": \"0x1f\",\n                            \n                            // In platforms where IO transfer to a GPU will cause cross RootPort PCie transfers, enabling this feature\n                            // might help improve overall BW provided there exists a GPU(s) with Root Port common to that of the storage NIC(s).\n                            // If this feature is enabled, please provide the ip addresses used by the mount either in file-system specific\n                            // section for mount_table or in the rdma_dev_addr_list property in properties section\n                            \"rdma_dynamic_routing\": false,\n                            // The order describes the sequence in which a policy is selected for dynamic routing for cross Root Port transfers\n                            // If the first policy is not applicable, it will fallback to the next and so on.\n                            // policy GPU_MEM_NVLINKS: use GPU memory with NVLink to transfer data between GPUs\n                            // policy GPU_MEM: use GPU memory with PCIe to transfer data between GPUs\n                            // policy SYS_MEM: use system memory with PCIe to transfer data to GPU\n                            // policy P2P: use P2P PCIe to transfer across between NIC and GPU\n                            \"rdma_dynamic_routing_order\": [ \"GPU_MEM_NVLINKS\", \"GPU_MEM\", \"SYS_MEM\", \"P2P\" ]\n            },\n\n            \"fs\": {\n                    \"generic\": {\n\n                            // for unaligned writes, setting it to true will, cuFileWrite use posix write internally instead of regular GDS write\n                            \"posix_unaligned_writes\" : false\n                    },\n\n\t\t    \"beegfs\" : {\n                            // IO threshold for read/write (param should be 4K aligned)) equal to or below which cuFile will use posix read/write\n                            \"posix_gds_min_kb\" : 0\n\n                            // To restrict the IO to selected IP list, when dynamic routing is enabled\n                            // if using a single BeeGFS mount, provide the ip addresses here\n                            //\"rdma_dev_addr_list\" : []\n\n                            // if using multiple lustre mounts, provide ip addresses used by respective mount here \n                            //\"mount_table\" : {\n                            //                    \"/beegfs/client1\" : {\n                            //                                    \"rdma_dev_addr_list\" : [\"172.172.1.40\", \"172.172.1.42\"]\n                            //                    },\n\n                            //                    \"/beegfs/client2\" : {\n                            //                                    \"rdma_dev_addr_list\" : [\"172.172.2.40\", \"172.172.2.42\"]\n                            //                    }\n                            //}\n\n\t\t    },\n                    \"lustre\": {\n\n                            // IO threshold for read/write (param should be 4K aligned)) equal to or below which cuFile will use posix read/write\n                            \"posix_gds_min_kb\" : 0\n\n                            // To restrict the IO to selected IP list, when dynamic routing is enabled\n                            // if using a single lustre mount, provide the ip addresses here (use : sudo lnetctl net show)\n                            //\"rdma_dev_addr_list\" : []\n\n                            // if using multiple lustre mounts, provide ip addresses used by respective mount here \n                            //\"mount_table\" : {\n                            //                    \"/lustre/ai200_01/client\" : {\n                            //                                    \"rdma_dev_addr_list\" : [\"172.172.1.40\", \"172.172.1.42\"]\n                            //                    },\n\n                            //                    \"/lustre/ai200_02/client\" : {\n                            //                                    \"rdma_dev_addr_list\" : [\"172.172.2.40\", \"172.172.2.42\"]\n                            //                    }\n                            //}\n                    },\n\n                    \"nfs\": {\n\n                           // To restrict the IO to selected IP list, when dynamic routing is enabled\n                           //\"rdma_dev_addr_list\" : []\n\n                           //\"mount_table\" : {\n                           //                     \"/mnt/nfsrdma_01/\" : {\n                           //                                     \"rdma_dev_addr_list\" : []\n                           //                     },\n\n                           //                     \"/mnt/nfsrdma_02/\" : {\n                           //                                     \"rdma_dev_addr_list\" : []\n                           //                     }\n                           //}\n                    },\n                    \n\t\t    \"gpfs\": {\n                           //allow GDS writes with GPFS\n                           \"gds_write_support\": false,\n\n                           //allow Async support\n                           \"gds_async_support\": true\n\n                           //\"rdma_dev_addr_list\" : []\n\n                           //\"mount_table\" : {\n                           //                     \"/mnt/gpfs_01\" : {\n                           //                                     \"rdma_dev_addr_list\" : []\n                           //                     },\n\n                           //                     \"/mnt/gpfs_02/\" : {\n                           //                                     \"rdma_dev_addr_list\" : []\n                           //                     }\n                           //}\n                    },\n\n                    \"weka\": {\n\n                            // enable/disable RDMA write\n                            \"rdma_write_support\" : false\n                    }\n            },\n\n            \"denylist\": {\n                            // specify list of vendor driver modules to deny for nvidia-fs (e.g. [\"nvme\" , \"nvme_rdma\"])\n                            \"drivers\":  [ ],\n\n                            // specify list of block devices to prevent IO using cuFile (e.g. [ \"/dev/nvme0n1\" ])\n                            \"devices\": [ ],\n\n                            // specify list of mount points to prevent IO using cuFile (e.g. [\"/mnt/test\"])\n                            \"mounts\": [ ],\n\n                            // specify list of file-systems to prevent IO using cuFile (e.g [\"lustre\", \"wekafs\"])\n                            \"filesystems\": [ ]\n            },\n        \n            \"miscellaneous\": {\n                            // enable only for enforcing strict checks at API level for debugging\n                            \"api_check_aggressive\": false\n\t    }\n}\n\n",
+      "path": "/etc/cufile.json",
+      "readable": true
+    },
+    "cufile_header": {
+      "paths": [
+        "/usr/local/cuda/include/cufile.h",
+        "/usr/local/cuda-13.0/include/cufile.h"
+      ]
+    },
+    "devices": {
+      "/dev/cufile": {
+        "error": "FileNotFoundError: [Errno 2] No such file or directory: '/dev/cufile'",
+        "exists": false,
+        "path": "/dev/cufile"
+      },
+      "/dev/nvidia-fs": {
+        "error": "FileNotFoundError: [Errno 2] No such file or directory: '/dev/nvidia-fs'",
+        "exists": false,
+        "path": "/dev/nvidia-fs"
+      },
+      "/dev/nvidia-uvm": {
+        "exists": true,
+        "is_regular": false,
+        "mode": "crw-rw-rw-",
+        "path": "/dev/nvidia-uvm",
+        "size": 0
+      },
+      "/dev/nvidia0": {
+        "error": "FileNotFoundError: [Errno 2] No such file or directory: '/dev/nvidia0'",
+        "exists": false,
+        "path": "/dev/nvidia0"
+      },
+      "/dev/nvidiactl": {
+        "exists": true,
+        "is_regular": false,
+        "mode": "crw-rw-rw-",
+        "path": "/dev/nvidiactl",
+        "size": 0
+      }
+    },
+    "filesystem": {
+      "mount_command": {
+        "argv": [
+          "findmnt",
+          "-T",
+          "/root/models/text_encoders/qwen_3_4b.safetensors",
+          "-o",
+          "TARGET,SOURCE,FSTYPE,OPTIONS"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "TARGET           SOURCE FSTYPE OPTIONS\n/__modal/volumes none   9p     rw,nosuid,trans=fd,rfdno=11,wfdno=11,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=0,cache=remote_revalidating,disable_fifo_open,directfs\n"
+      },
+      "statfs_command": {
+        "argv": [
+          "stat",
+          "-f",
+          "-c",
+          "%T %S %B",
+          "/root/models/text_encoders/qwen_3_4b.safetensors"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "v9fs 4096 ?\n"
+      }
+    },
+    "gdscheck": null,
+    "gpu": {
+      "argv": [
+        "nvidia-smi",
+        "--query-gpu=name,driver_version",
+        "--format=csv,noheader"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "NVIDIA H100 80GB HBM3, 580.95.05\n"
+    },
+    "kernel_gvisor": {
+      "cgroup": {
+        "argv": [
+          "cat",
+          "/proc/1/cgroup"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "7:pids:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n6:memory:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n5:job:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n4:devices:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n3:cpuset:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n2:cpuacct:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n1:cpu:/ta-01M3NDEQ80PYQ1C5C4XF2TG9AR\n"
+      },
+      "proc_version": {
+        "argv": [
+          "cat",
+          "/proc/version"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Linux version 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016\n"
+      },
+      "uname": {
+        "argv": [
+          "uname",
+          "-a"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "Linux modal 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64 x86_64 x86_64 GNU/Linux\n"
+      }
+    },
+    "libcufile": {
+      "ctypes_find": "libcufile.so.0",
+      "ldconfig": {
+        "argv": [
+          "sh",
+          "-lc",
+          "ldconfig -p 2>/dev/null | grep -i libcufile || true"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "\tlibcufile_rdma.so.1 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcufile_rdma.so.1\n\tlibcufile_rdma.so (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcufile_rdma.so\n\tlibcufile.so.0 (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcufile.so.0\n\tlibcufile.so (libc6,x86-64) => /usr/local/cuda/targets/x86_64-linux/lib/libcufile.so\n"
+      },
+      "paths": [
+        "/usr/local/cuda/lib64/libcufile.so",
+        "/usr/local/cuda-13.0/lib64/libcufile.so",
+        "libcufile.so.0"
+      ]
+    },
+    "model": {
+      "exists": true,
+      "is_regular": true,
+      "mode": "-rw-r--r--",
+      "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+      "size": 8044982048
+    },
+    "nvidia_fs": {
+      "module": {
+        "argv": [
+          "sh",
+          "-lc",
+          "lsmod 2>/dev/null | grep -i nvidia_fs || true"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "proc": {
+        "error": "FileNotFoundError: [Errno 2] No such file or directory: '/proc/driver/nvidia-fs'",
+        "exists": false,
+        "path": "/proc/driver/nvidia-fs"
+      }
+    },
+    "provider_region_env": {
+      "AUX_ORT_PROVIDERS": "CUDAExecutionProvider,DirectMLExecutionProvider,OpenVINOExecutionProvider,ROCMExecutionProvider,CPUExecutionProvider,CoreMLExecutionProvider",
+      "COMFYMODAL_CANONICAL_IMAGE_PLAN_PATH": "/opt/comfymodal/canonical_image_plan.json",
+      "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+      "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+      "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
+      "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
+      "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
+      "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
+      "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
+      "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE": "0",
+      "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_BYTES": "",
+      "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_MAX_ENTRIES": "",
+      "COMFYMODAL_EXACT_CLIP_CONDITIONING_CACHE_ROOT": "",
+      "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
+      "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
+      "COMFYMODAL_GOLDEN_C0_DMA_RING": "0",
+      "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS": "0",
+      "COMFYMODAL_GOLDEN_C0_HOST_REGISTER": "1",
+      "COMFYMODAL_GOLDEN_C0_READER_GATE": "0",
+      "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT": "0",
+      "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG": "0",
+      "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER": "overlap",
+      "COMFYMODAL_GOLDEN_C0_SHM_POPULATE": "0",
+      "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY": "qd4_64",
+      "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE": "0",
+      "COMFYMODAL_GOLDEN_CLIP_LOADER": "m2",
+      "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": "1",
+      "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": "overlap",
+      "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME": "one_shot_events",
+      "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH": "1",
+      "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES": "33554432",
+      "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "33554432",
+      "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "4",
+      "COMFYMODAL_GOLDEN_IO_PROCESS": "0",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2": "1",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING": "posix",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG": "0",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS": "1",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": "mmap_fresh",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY": "qd4_64",
+      "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING": "1",
+      "COMFYMODAL_GOLDEN_LOADER_PROCESS": "0",
+      "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT": "0",
+      "COMFYMODAL_GOLDEN_MINIMAL_RESTORE": "1",
+      "COMFYMODAL_GOLDEN_QD2_DEFER_H2D": "0",
+      "COMFYMODAL_GOLDEN_QD2_TELEMETRY": "light",
+      "COMFYMODAL_GOLDEN_QD_TRANSPORT": "static_e27",
+      "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION": "1",
+      "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE": "overlap",
+      "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "33554432",
+      "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "8",
+      "COMFYMODAL_GOLDEN_SOURCE_QD": "4",
+      "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS": "0",
+      "COMFYMODAL_MINIMAL_RESTORE": "1",
+      "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
+      "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
+      "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
+      "COMFYMODAL_PRELOAD_MODE": "clip_only",
+      "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
+      "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
+      "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
+      "COMFYMODAL_RESTORED_INSTANCE_ID": "aa5001b1b21f4d319cf0b5c2d49bf836",
+      "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
+      "COMFYMODAL_RESTORE_CLIP_READ_PROBE": "0",
+      "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE": "models_volume",
+      "COMFYMODAL_RUNTIME": "1",
+      "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
+      "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+      "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+      "COMFYMODAL_SAMPLING_DEEP_PROFILE": "blocks",
+      "COMFYMODAL_V2CTL_PROFILE": "golden_p1_parallel_testing8_gds_instanttensor_h100",
+      "COMFYMODAL_V2_ALLOCATOR_PURGE": "1",
+      "COMFYMODAL_V2_ANON_UNET_SNAPSHOT": "0",
+      "COMFYMODAL_V2_APP_NAME": "batch-testing8-gds-instanttensor-sep28",
+      "COMFYMODAL_V2_ATOMIC_PROFILE": "0",
+      "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS": "1",
+      "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": "1",
+      "COMFYMODAL_V2_C9QD_EXTRAS": "0",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM": "0",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": "64",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_JOIN_MS": "1000",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB": "0",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS": "0",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_PINNED_RESERVE_MB": "512",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_RAM_FALLBACK_MB": "512",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS": "1000",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_SAFETY_RESERVE_MB": "2048",
+      "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": "4",
+      "COMFYMODAL_V2_CLEAN_LANE": "0",
+      "COMFYMODAL_V2_CLIP_COLD_FORENSICS": "0",
+      "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": "0",
+      "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": "0",
+      "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE": "1",
+      "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": "256",
+      "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": "16777216",
+      "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": "4",
+      "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "0",
+      "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "0",
+      "COMFYMODAL_V2_CLIP_QD_ARTIFACT": "",
+      "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": "32",
+      "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": "restore_earliest",
+      "COMFYMODAL_V2_CLIP_QD_QD": "4",
+      "COMFYMODAL_V2_CLIP_QD_READER": "0",
+      "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+      "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": "0",
+      "COMFYMODAL_V2_CLOUD": "",
+      "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": "0",
+      "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT": "0",
+      "COMFYMODAL_V2_CPU_REQUEST": "12",
+      "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": "0",
+      "COMFYMODAL_V2_DEEP_MODEL_DIAG": "0",
+      "COMFYMODAL_V2_E27_FORENSICS": "1",
+      "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": "1024",
+      "COMFYMODAL_V2_E31_FORENSICS": "0",
+      "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0",
+      "COMFYMODAL_V2_E37_CLEAN_LANE": "0",
+      "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": "",
+      "COMFYMODAL_V2_ENV_PROFILE": "inherit",
+      "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT": "0",
+      "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS": "0",
+      "COMFYMODAL_V2_EVICT_RETAIN_ROLE": "none",
+      "COMFYMODAL_V2_EXACT_CACHE_PERSIST": "1",
+      "COMFYMODAL_V2_EXECUTION_PREFILL": "1",
+      "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS": "0",
+      "COMFYMODAL_V2_FAST_COLD_COMMIT_WAIT_MS": "10000",
+      "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "0",
+      "COMFYMODAL_V2_FULL_TRACE": "1",
+      "COMFYMODAL_V2_FULL_TRACE_ENTRIES": "8000000",
+      "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH": "64",
+      "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS": "50",
+      "COMFYMODAL_V2_FULL_TRACE_TORCH": "0",
+      "COMFYMODAL_V2_GANTT_TELEMETRY": "1",
+      "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND": "comfy_kitchen",
+      "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH": "0",
+      "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": "1",
+      "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": "1",
+      "COMFYMODAL_V2_GPU": "H100!",
+      "COMFYMODAL_V2_GPU_FAST_RETURN": "1",
+      "COMFYMODAL_V2_GRAPH_PRELOAD": "1",
+      "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS": "0",
+      "COMFYMODAL_V2_HOST_DIAGNOSTICS": "0",
+      "COMFYMODAL_V2_INPUT_TYPES_WARM": "1",
+      "COMFYMODAL_V2_LEAN_SNAPSHOT": "0",
+      "COMFYMODAL_V2_M2_PRODUCTION_LOADER": "0",
+      "COMFYMODAL_V2_MEMORY_MB": "24576",
+      "COMFYMODAL_V2_MEMORY_REQUEST": "24576",
+      "COMFYMODAL_V2_MODEL_PRELOAD": "1",
+      "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "1",
+      "COMFYMODAL_V2_OBSERVABILITY_MODE": "full",
+      "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": "0",
+      "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": "0",
+      "COMFYMODAL_V2_PAGEFAULT_TRACKING": "0",
+      "COMFYMODAL_V2_PAGE_PATH_PROBE": "0",
+      "COMFYMODAL_V2_PAGE_READINESS_MODE": "",
+      "COMFYMODAL_V2_PREFILL_LANES": "critical",
+      "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": "0",
+      "COMFYMODAL_V2_PROFILE_VOLUME": "comfymodal-v2-profiles",
+      "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE": "0",
+      "COMFYMODAL_V2_QUIET": "0",
+      "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST": "1",
+      "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS": "0",
+      "COMFYMODAL_V2_RESOURCE_TELEMETRY": "0",
+      "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN": "0",
+      "COMFYMODAL_V2_RUNTIME_REVISION": "c40da235af09633a",
+      "COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT": "b4d794988a312e4ff3adbea6",
+      "COMFYMODAL_V2_SCOPED_CUDA_READINESS": "0",
+      "COMFYMODAL_V2_SINGLE_USE_CONTAINERS": "1",
+      "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE": "0",
+      "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": "0",
+      "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "0",
+      "COMFYMODAL_V2_SNAPSHOT_MANIFEST": "1",
+      "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER": "O0",
+      "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": "0",
+      "COMFYMODAL_V2_STAGED_ASYNC_H2D": "1",
+      "COMFYMODAL_V2_STAGED_BUCKET_MB": "256",
+      "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS": "0",
+      "COMFYMODAL_V2_STAGED_CPU_CAST": "1",
+      "COMFYMODAL_V2_STAGED_POOL_MB": "1024",
+      "COMFYMODAL_V2_STAGED_PRODUCERS": "4",
+      "COMFYMODAL_V2_STAGED_SAFETENSORS": "0",
+      "COMFYMODAL_V2_STAGED_SOURCE_ORDER": "0",
+      "COMFYMODAL_V2_STATE_VOLUME_ROOT": "/mnt/comfymodal_runtime_state",
+      "COMFYMODAL_V2_SYNTH_H2D_PROBE": "0",
+      "COMFYMODAL_V2_THREAD_POLICY": "TBASE",
+      "COMFYMODAL_V2_UNET_ACTIVATION_MODE": "late",
+      "COMFYMODAL_V2_UNET_BACKING_VERIFY": "0",
+      "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "0",
+      "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+      "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": "256",
+      "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": "16777216",
+      "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": "4",
+      "COMFYMODAL_V2_UNET_FORENSICS": "0",
+      "COMFYMODAL_V2_UNET_FORWARD_DIAG": "0",
+      "COMFYMODAL_V2_UNET_META_DIRECT": "",
+      "COMFYMODAL_V2_UNET_PINNED_RING": "",
+      "COMFYMODAL_V2_UNET_PRETOUCH": "0",
+      "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE": "",
+      "COMFYMODAL_V2_UNET_REHOME_AFTER_RESTORE": "0",
+      "COMFYMODAL_V2_UNET_SALVAGE_PROBE": "",
+      "COMFYMODAL_V2_VAE_ACTIVATION_MODE": "late",
+      "COMFYMODAL_V2_VAE_EARLY_START_MS": "0",
+      "COMFYMODAL_V2_VAE_POLICY": "v1",
+      "COMFYMODAL_V2_VAE_PREFETCH_MODE": "off",
+      "COMFYMODAL_V2_VAE_SNAPSHOT": "0",
+      "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": "0",
+      "COMFYMODAL_WARMUP_TEXT": "warmup",
+      "CUDA_VERSION": "13.0.0",
+      "CUDA_VISIBLE_DEVICES": "0",
+      "MODAL_CLOUD_PROVIDER": "CLOUD_PROVIDER_GCP",
+      "MODAL_CONTAINER_ARGUMENTS_PATH": "/__modal/.container-arguments/data.bin",
+      "MODAL_ENABLE_SNAP_RESTORE": "1",
+      "MODAL_ENVIRONMENT": "main",
+      "MODAL_IMAGE_ID": "im-ho33kOHqBiwQoQCXZ1moJ3",
+      "MODAL_IS_REMOTE": "1",
+      "MODAL_REGION": "ap-northeast",
+      "MODAL_SERVER_URL": "unix:/run/modal.sock",
+      "MODAL_SNAPSHOT_DEBUG": "0",
+      "MODAL_TASK_ID": "ta-01M3NDEQ80PYQ1C5C4XF2TG9AR",
+      "NVIDIA_DRIVER_CAPABILITIES": "all",
+      "NVIDIA_PRODUCT_NAME": "CUDA",
+      "NVIDIA_REQUIRE_CUDA": "cuda>=13.0 brand=unknown,driver>=535,driver<536 brand=grid,driver>=535,driver<536 brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=535,driver<536 brand=quadro,driver>=535,driver<536 brand=quadrortx,driver>=535,driver<536 brand=nvidiartx,driver>=535,driver<536 brand=vapps,driver>=535,driver<536 brand=vpc,driver>=535,driver<536 brand=vcs,driver>=535,driver<536 brand=vws,driver>=535,driver<536 brand=cloudgaming,driver>=535,driver<536 brand=unknown,driver>=550,driver<551 brand=grid,driver>=550,driver<551 brand=tesla,driver>=550,driver<551 brand=nvidia,driver>=550,driver<551 brand=quadro,driver>=550,driver<551 brand=quadrortx,driver>=550,driver<551 brand=nvidiartx,driver>=550,driver<551 brand=vapps,driver>=550,driver<551 brand=vpc,driver>=550,driver<551 brand=vcs,driver>=550,driver<551 brand=vws,driver>=550,driver<551 brand=cloudgaming,driver>=550,driver<551 brand=unknown,driver>=565,driver<566 brand=grid,driver>=565,driver<566 brand=tesla,driver>=565,driver<566 brand=nvidia,driver>=565,driver<566 brand=quadro,driver>=565,driver<566 brand=quadrortx,driver>=565,driver<566 brand=nvidiartx,driver>=565,driver<566 brand=vapps,driver>=565,driver<566 brand=vpc,driver>=565,driver<566 brand=vcs,driver>=565,driver<566 brand=vws,driver>=565,driver<566 brand=cloudgaming,driver>=565,driver<566 brand=unknown,driver>=570,driver<571 brand=grid,driver>=570,driver<571 brand=tesla,driver>=570,driver<571 brand=nvidia,driver>=570,driver<571 brand=quadro,driver>=570,driver<571 brand=quadrortx,driver>=570,driver<571 brand=nvidiartx,driver>=570,driver<571 brand=vapps,driver>=570,driver<571 brand=vpc,driver>=570,driver<571 brand=vcs,driver>=570,driver<571 brand=vws,driver>=570,driver<571 brand=cloudgaming,driver>=570,driver<571 brand=unknown,driver>=575,driver<576 brand=grid,driver>=575,driver<576 brand=tesla,driver>=575,driver<576 brand=nvidia,driver>=575,driver<576 brand=quadro,driver>=575,driver<576 brand=quadrortx,driver>=575,driver<576 brand=nvidiartx,driver>=575,driver<576 brand=vapps,driver>=575,driver<576 brand=vpc,driver>=575,driver<576 brand=vcs,driver>=575,driver<576 brand=vws,driver>=575,driver<576 brand=cloudgaming,driver>=575,driver<576",
+      "NVIDIA_VISIBLE_DEVICES": "GPU-439c3213-8019-cd10-2623-c9214fb6d056",
+      "NV_CUDA_CUDART_DEV_VERSION": "13.0.48-1",
+      "NV_CUDA_CUDART_VERSION": "13.0.48-1",
+      "NV_CUDA_LIB_VERSION": "13.0.0-1",
+      "NV_CUDA_NSIGHT_COMPUTE_DEV_PACKAGE": "cuda-nsight-compute-13-0=13.0.0-1",
+      "NV_CUDA_NSIGHT_COMPUTE_VERSION": "13.0.0-1",
+      "PYTORCH_NVML_BASED_CUDA_CHECK": "1"
+    }
+  },
+  "compat_mode_disabled": true,
+  "compile": {
+    "compiler": "/usr/bin/g++",
+    "header_paths": [
+      "/usr/local/cuda/include/cufile.h",
+      "/usr/local/cuda-13.0/include/cufile.h"
+    ],
+    "library_paths": [
+      "/usr/local/cuda/lib64/libcufile.so",
+      "/usr/local/cuda-13.0/lib64/libcufile.so",
+      "libcufile.so.0"
+    ],
+    "result": {
+      "argv": [
+        "/usr/bin/g++",
+        "/tmp/testing8-gds-2jvrlxv5/gds_probe.cc",
+        "-std=c++17",
+        "-O2",
+        "-I",
+        "/usr/local/cuda/include",
+        "-L",
+        "/usr/local/cuda/lib64",
+        "-Wl,-rpath,/usr/local/cuda/lib64",
+        "-lcufile",
+        "-lcuda",
+        "-o",
+        "/tmp/testing8-gds-2jvrlxv5/gds_probe"
+      ],
+      "returncode": 0,
+      "stderr": "/tmp/testing8-gds-2jvrlxv5/gds_probe.cc:2: warning: \"_GNU_SOURCE\" redefined\n    2 | #define _GNU_SOURCE\n      | \n<command-line>: note: this is the location of the previous definition\n",
+      "stdout": ""
+    }
+  },
+  "helper": {
+    "parsed": {
+      "driver_open_err": {
+        "cu_err": 0,
+        "err": 5001
+      },
+      "driver_open_ok": false,
+      "native_success": false
+    },
+    "returncode": 0,
+    "stderr": "Error opening file\nError opening file\n",
+    "stdout": "{\"driver_open_err\":{\"err\":5001,\"cu_err\":0},\"driver_open_ok\":false,\"native_success\":false}"
+  },
+  "model_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "phase": "native_gds",
+  "status": "no",
+  "strict_config": {
+    "content": {
+      "logging": {
+        "level": "INFO"
+      },
+      "properties": {
+        "allow_compat_mode": false,
+        "force_compat_mode": false
+      }
+    },
+    "env": {
+      "CUFILE_ENV_PATH_JSON": "/tmp/testing8-gds-2jvrlxv5/cufile.json",
+      "CUFILE_FORCE_COMPAT_MODE": "false"
+    },
+    "path": "/tmp/testing8-gds-2jvrlxv5/cufile.json"
+  },
+  "waterfall": {
+    "method": "run_testing8_gds_instanttensor_probe",
+    "status": "non_applicable"
+  }
+}

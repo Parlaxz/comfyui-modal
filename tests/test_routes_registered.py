@@ -200,6 +200,11 @@ class RouteRegistrationTests(unittest.TestCase):
         fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments/compile")
         self.assertIsNotNone(fn)
 
+    def test_docs_page_route(self):
+        fn = _handler_for(self.init_mod, "GET", "/comfymodal/docs")
+        self.assertIsNotNone(fn)
+        self.assertTrue((REPO_ROOT / "web" / "docs.html").is_file())
+
     def test_experiment_create_route(self):
         fn = _handler_for(self.init_mod, "POST", "/comfymodal/experiments")
         self.assertIsNotNone(fn)

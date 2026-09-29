@@ -4844,6 +4844,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
         ),
+        "COMFYMODAL_PHASE1_C0_ARENA": os.environ.get(
+            "COMFYMODAL_PHASE1_C0_ARENA", "0"
+        ),
         # Golden attention is a request-bound selector.  The profile value is
         # carried into the container and consumed when constructing the actual
         # GoldenRequest; it is not evidence-only metadata.
@@ -4877,6 +4880,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS": os.environ.get(
             "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS", "0"
         ),
+        "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"
+        ),
         "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": os.environ.get(
             "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "preadv"
         ),
@@ -4897,6 +4903,15 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER", "overlap"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT", "0"
         ),
         "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
             "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
@@ -5719,6 +5734,12 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         }
 
     image = getattr(plan, "final_image", None) or _reference_image()
+    if str(os.environ.get("COMFYMODAL_PHASE1_C0_ARENA") or "").strip() == "1":
+        phase1_path = Path(__file__).resolve().parents[1] / "tools" / "phase1_c0_arena.py"
+        if phase1_path.is_file():
+            image = image.add_local_file(
+                str(phase1_path), "/opt/comfymodal/phase1_c0_arena.py", copy=True
+            )
     models_volume = _modal.Volume.from_name(runtime_spec.models_volume_name, create_if_missing=True)
     custom_nodes_volume = _modal.Volume.from_name(runtime_spec.custom_nodes_volume_name, create_if_missing=True)
     runtime_state_volume = _modal.Volume.from_name(runtime_spec.runtime_state_volume_name, create_if_missing=True)
@@ -20206,6 +20227,99 @@ class ModalRuntimeEntrypoint:
         _result.setdefault("status", "ok")
         return _result
 
+    def run_registration_probe(
+        self,
+        mapping_kind: str = "posix_shm",
+        size_mib: int = 320,
+        device_index: int = 0,
+    ) -> dict[str, Any]:
+        """One-shot host-registration mechanism probe; never used by Golden."""
+        from comfymodal_runtime.registration_probe import run_registration_probe as _run
+
+        try:
+            return _run(
+                mapping_kind=str(mapping_kind),
+                size_mib=int(size_mib),
+                device_index=int(device_index),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "mapping_kind": str(mapping_kind),
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
+    def run_phase1_c0_arena(
+        self,
+        size_mib: float = 128.0,
+        copies: int = 8,
+        warmups: int = 5,
+        samples: int = 30,
+        seed: int = 20260928,
+    ) -> dict[str, Any]:
+        """Run the isolated TESTING9 process/thread arena benchmark."""
+        path = "/opt/comfymodal/phase1_c0_arena.py"
+        try:
+            spec = importlib.util.spec_from_file_location("testing9_phase1_c0_arena", path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("phase1_harness_import_spec_unavailable")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            config = module.BenchmarkConfig(
+                size=int(float(size_mib) * 1024 * 1024),
+                copies=int(copies),
+                warmups=int(warmups),
+                samples=int(samples),
+                arms=list(module.DEFAULT_ARMS),
+                workers=[1, 4],
+                seed=int(seed),
+                start_method="fork" if "fork" in module.mp.get_all_start_methods() else module.mp.get_start_method(),
+                barrier_timeout=120.0,
+                percentiles=[10.0, 50.0, 90.0, 95.0],
+                stall_ms=25.0,
+                stall_ratio=2.0,
+            )
+            result = module.run_benchmark(config, module.Path("/tmp/phase1_c0_arena"))
+            result["remote_identity"] = {
+                "provider": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+                "region": os.environ.get("MODAL_REGION", ""),
+                "gpu": os.environ.get("COMFYMODAL_V2_GPU", ""),
+                "platform": platform.platform(),
+                "kernel": platform.release(),
+            }
+            return result
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
+    def run_testing8_gds_instanttensor_probe(
+        self,
+        operation: str = "gds",
+        model_path: str = "",
+        backend: str = "",
+        copy_mode: bool = False,
+        validate: bool = False,
+    ) -> dict[str, Any]:
+        """TESTING8-only strict GDS/InstantTensor probe; never used by Golden."""
+        from comfymodal_runtime.testing8_gds_instanttensor_probe import run_probe
+
+        try:
+            return run_probe(
+                operation=str(operation),
+                model_path=str(model_path),
+                backend=str(backend),
+                copy_mode=bool(copy_mode),
+                validate=bool(validate),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "operation": str(operation),
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
     def run_e27_followup_probe(
         self,
         kind: str,
@@ -23939,6 +24053,9 @@ def _build_decorated_v2_class() -> type:
         "run_unet_qd_probe",
         "run_clip_qd_probe",
         "run_source_race_oracle",
+        "run_registration_probe",
+        "run_phase1_c0_arena",
+        "run_testing8_gds_instanttensor_probe",
         "run_e27_followup_probe",
         "source_identity_probe",
     )
@@ -23960,6 +24077,9 @@ def _build_decorated_v2_class() -> type:
         "run_unet_qd_probe",
         "run_clip_qd_probe",
         "run_source_race_oracle",
+        "run_registration_probe",
+        "run_phase1_c0_arena",
+        "run_testing8_gds_instanttensor_probe",
         "run_e27_followup_probe",
         "source_identity_probe",
     })
@@ -24097,6 +24217,16 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_source_race_oracle",
         _modal.method()(cls.run_source_race_oracle),
+    )
+    setattr(
+        cls,
+        "run_registration_probe",
+        _modal.method()(cls.run_registration_probe),
+    )
+    setattr(
+        cls,
+        "run_testing8_gds_instanttensor_probe",
+        _modal.method()(cls.run_testing8_gds_instanttensor_probe),
     )
     setattr(
         cls,

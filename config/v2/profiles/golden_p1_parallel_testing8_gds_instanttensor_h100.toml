@@ -1,0 +1,11 @@
+schema_version = 1
+name = "golden_p1_parallel_testing8_gds_instanttensor_h100"
+extends = "golden_p1_parallel_m2clip_h100"
+owner = "testing8-gds-instanttensor"
+
+[target]
+app = "batch-testing8-gds-instanttensor-sep28"
+
+[environment]
+COMFYMODAL_TESTING8_INSTANTTENSOR = "1"
+COMFYMODAL_V2_C9QD_EXTRAS = "0"

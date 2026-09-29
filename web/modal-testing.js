@@ -107,11 +107,19 @@ function buildShell() {
   });
   const header = el("div", { class: "comfymodal-studio-header" }, [
     el("h1", { id: "comfymodal-studio-heading", text: "Modal GPU" }),
-    el("button", {
-      class: "comfymodal-testing-close",
-      "aria-label": "Close modal",
-      text: "✕",
-    }),
+    el("div", { class: "comfymodal-studio-header-actions" }, [
+      el("button", {
+        class: "comfymodal-studio-help",
+        "aria-label": "Open documentation",
+        title: "Open documentation",
+        text: "?",
+      }),
+      el("button", {
+        class: "comfymodal-testing-close",
+        "aria-label": "Close modal",
+        text: "✕",
+      }),
+    ]),
   ]);
   const body = el("div", { class: "comfymodal-studio-body", "data-testid": "body" });
   modal.appendChild(header);
@@ -257,6 +265,9 @@ export function open_testing_modal(tabName) {
 
   // Close handler
   shell.header.querySelector(".comfymodal-testing-close").addEventListener("click", close_testing_modal);
+  shell.header.querySelector(".comfymodal-studio-help").addEventListener("click", () => {
+    window.open("/extensions/comfyui-modal/docs.html?v=" + Date.now(), "_blank", "noopener,noreferrer");
+  });
   shell.overlay.addEventListener("click", (e) => {
     if (e.target === shell.overlay) close_testing_modal();
   });

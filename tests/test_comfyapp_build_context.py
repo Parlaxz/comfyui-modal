@@ -542,6 +542,8 @@ class ComfyAppBuildContextTests(unittest.TestCase):
                       "pip command must have fail-fast guard")
         self.assertIn("return 1", search_window,
                       "_pip_node must return 1 on failure")
+        self.assertIn("2>&1", search_window,
+                      "pip stderr must be captured in the build log")
         # Check that the for loop checks exit code
         self.assertIn('_pip_node "$d" || exit 1', search_window,
                       "for loop must exit on _pip_node failure")
@@ -702,6 +704,15 @@ class ComfyAppBuildContextTests(unittest.TestCase):
 
             self.assertNotEqual(id_a, id_b,
                 "Different lock file content must produce different identity")
+
+    def test_runtime_import_does_not_rebuild_canonical_plan(self):
+        """Runtime imports must not rebuild host-only canonical identity."""
+        with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
+            source = f.read()
+        start = source.index("if _PUBLISHER_ONLY:")
+        block = source[start:source.index("download_image =", start)]
+        self.assertIn("elif _INSIDE_MODAL_CONTAINER:", block)
+        self.assertIn("CANONICAL_IMAGE_PLAN = None", block)
 
 
 if __name__ == "__main__":

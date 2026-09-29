@@ -3672,6 +3672,10 @@ async def _scan_swap_plan(workspace: dict) -> dict:
 _workspace_store.migrate_from_legacy_toml(_WORKSPACES_FILE, _MODAL_TOML_PATH)
 
 if _server:
+    @_server.routes.get("/comfymodal/docs")
+    async def comfymodal_docs(request: web.Request) -> web.Response:
+        return web.FileResponse(Path(_NODE_DIR) / "web" / "docs.html")
+
     @_server.routes.get("/comfymodal/auth/status")
     async def modal_auth_status(request: web.Request) -> web.Response:
         return web.json_response({"connected": _is_modal_token_set()})

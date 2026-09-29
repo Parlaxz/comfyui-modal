@@ -43,10 +43,18 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Mapping, Optional, Sequence
 
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover - Windows control host
+    _resource = None
+
 IO_PROCESS_V2_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2"
 IO_PROCESS_V2_BACKING_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING"
 IO_PROCESS_V2_SOURCE_GEOMETRY_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY"
 C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+C0_REGISTRATION_DIAG_ENV = "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG"
+C0_REGISTRATION_ORDER_ENV = "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER"
+C0_REGISTRATION_CONTEXT_PREINIT_ENV = "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT"
 _TRUTHY = {"1", "true", "yes", "on"}
 _BACKING_TYPES = ("posix", "sysv")
 _SOURCE_GEOMETRIES = {
@@ -101,6 +109,21 @@ _C0_WINDOW_TRACE_LIMIT = 4096
 def c0_window_trace_enabled() -> bool:
     """Return whether bounded raw C0 lifecycle records are requested."""
     return str(os.environ.get(C0_WINDOW_TRACE_ENV) or "").strip().lower() in _TRUTHY
+
+
+def c0_registration_diag_enabled() -> bool:
+    return str(os.environ.get(C0_REGISTRATION_DIAG_ENV) or "").strip().lower() in _TRUTHY
+
+
+def c0_registration_order() -> str:
+    selected = str(os.environ.get(C0_REGISTRATION_ORDER_ENV) or "overlap").strip().lower()
+    if selected not in {"overlap", "register_first"}:
+        raise ValueError(f"{C0_REGISTRATION_ORDER_ENV}_invalid:{selected}")
+    return selected
+
+
+def c0_registration_context_preinit_enabled() -> bool:
+    return str(os.environ.get(C0_REGISTRATION_CONTEXT_PREINIT_ENV) or "").strip().lower() in _TRUTHY
 
 
 def io_process_v2_enabled() -> bool:
@@ -166,6 +189,212 @@ def _proc_status_kb(pid: int, key: str) -> Optional[int]:
 
 def _shm_address(shm: "shared_memory.SharedMemory") -> int:
     return int(ctypes.addressof(ctypes.c_char.from_buffer(shm.buf)))
+
+
+def _proc_mapping_snapshot(address: int, size: int) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "maps": None,
+        "smaps": None,
+        "numa_maps": None,
+        "smaps_reliability": "unknown",
+    }
+    start = int(address)
+    end = start + int(size)
+    try:
+        maps_line = None
+        with open("/proc/self/maps", "r", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split(None, 5)
+                lo, hi = (int(value, 16) for value in fields[0].split("-", 1))
+                if lo <= start < hi and end <= hi:
+                    maps_line = line.rstrip("\n")
+                    break
+        out["maps"] = maps_line
+        if maps_line is None:
+            return out
+        fields = maps_line.split(None, 5)
+        target_lo = fields[0].split("-", 1)[0]
+        smaps: dict[str, Any] = {"header": maps_line}
+        active = False
+        with open("/proc/self/smaps", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.split(None, 1)[0].split("-", 1)[0] == target_lo and "-" in line.split(None, 1)[0]:
+                    active = True
+                elif active and line and not line[0].isspace() and "-" in line.split(None, 1)[0]:
+                    break
+                if active and ":" in line:
+                    key, value = line.split(":", 1)
+                    smaps[key] = value.strip()
+        out["smaps"] = smaps
+        out["smaps_reliability"] = "supporting_only_on_gvisor"
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+    try:
+        with open("/proc/self/numa_maps", "r", encoding="utf-8") as handle:
+            for line in handle:
+                token = line.split(None, 1)[0]
+                if "-" in token:
+                    lo, hi = (int(value, 16) for value in token.split("-", 1))
+                    if lo <= start < hi and end <= hi:
+                        out["numa_maps"] = line.rstrip("\n")
+                        break
+    except Exception as exc:
+        out["numa_maps_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+    return out
+
+
+def _registration_rusage() -> dict[str, Any]:
+    if _resource is None:
+        return {"available": False}
+
+    def one(which: int) -> dict[str, Any]:
+        try:
+            value = _resource.getrusage(which)
+            return {
+                "user_s": float(value.ru_utime),
+                "system_s": float(value.ru_stime),
+                "minor_faults": int(value.ru_minflt),
+                "major_faults": int(value.ru_majflt),
+                "voluntary_context_switches": int(value.ru_nvcsw),
+                "involuntary_context_switches": int(value.ru_nivcsw),
+            }
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}:{str(exc)[:160]}"}
+
+    result = {"available": True, "process": one(_resource.RUSAGE_SELF)}
+    thread_kind = getattr(_resource, "RUSAGE_THREAD", None)
+    if thread_kind is not None:
+        result["thread"] = one(thread_kind)
+    return result
+
+
+def _cuda_registration_identity(torch: Any, cudart: Any, device_index: int) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "device_index": int(device_index),
+        "torch_version": str(getattr(torch, "__version__", "")),
+        "torch_cuda_version": str(getattr(getattr(torch, "version", None), "cuda", "") or ""),
+        "runtime_api": "torch.cuda.cudart().cudaHostRegister",
+    }
+    try:
+        result["device_name"] = str(torch.cuda.get_device_name(int(device_index)))
+        result["current_device"] = int(torch.cuda.current_device())
+        result["device_capability"] = list(torch.cuda.get_device_capability(int(device_index)))
+    except Exception as exc:
+        result["torch_device_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+    try:
+        driver_version = getattr(torch._C, "_cuda_getDriverVersion", None)
+        if callable(driver_version):
+            result["cuda_driver_version"] = int(driver_version())
+    except Exception:
+        pass
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+        current = ctypes.c_void_p()
+        get_current = getattr(lib, "cuCtxGetCurrent")
+        get_current.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        get_current.restype = ctypes.c_int
+        rc = int(get_current(ctypes.byref(current)))
+        result["context_current_rc"] = rc
+        result["context_handle_before_or_after"] = hex(int(current.value or 0))
+        result["context_source"] = "current_cuda_runtime_context"
+        result["context_type"] = "PyTorch primary-context path (inferred from torch.cuda)"
+    except Exception as exc:
+        result["context_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+    return result
+
+
+def _preinit_primary_context(device_index: int) -> dict[str, Any]:
+    lib = ctypes.CDLL("libcuda.so.1")
+    ci = ctypes.c_int
+    cp = ctypes.c_void_p
+    cu_init = getattr(lib, "cuInit")
+    cu_init.argtypes = [ctypes.c_uint]
+    cu_init.restype = ci
+    cu_device_get = getattr(lib, "cuDeviceGet")
+    cu_device_get.argtypes = [ctypes.POINTER(ci), ci]
+    cu_device_get.restype = ci
+    cu_retain = getattr(lib, "cuDevicePrimaryCtxRetain")
+    cu_retain.argtypes = [ctypes.POINTER(cp), ci]
+    cu_retain.restype = ci
+    cu_set = getattr(lib, "cuCtxSetCurrent")
+    cu_set.argtypes = [cp]
+    cu_set.restype = ci
+    for rc, name in ((cu_init(0), "cuInit"),):
+        if int(rc) != 0:
+            raise RuntimeError(f"{name}_failed:{int(rc)}")
+    device = ci()
+    rc = int(cu_device_get(ctypes.byref(device), ci(int(device_index))))
+    if rc != 0:
+        raise RuntimeError(f"cuDeviceGet_failed:{rc}")
+    context = cp()
+    rc = int(cu_retain(ctypes.byref(context), device))
+    if rc != 0:
+        raise RuntimeError(f"cuDevicePrimaryCtxRetain_failed:{rc}")
+    rc = int(cu_set(context))
+    if rc != 0:
+        raise RuntimeError(f"cuCtxSetCurrent_failed:{rc}")
+    return {
+        "mode": "driver_primary_context_retain_set_current",
+        "device": int(device.value),
+        "context_handle": hex(int(context.value or 0)),
+    }
+
+
+def _registration_state(
+    *, torch: Any, cudart: Any, shm: Any, address: int, size: int, device_index: int
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "pid": os.getpid(),
+        "tid": threading.get_native_id(),
+        "wall_monotonic_ns": time.monotonic_ns(),
+        "process_cpu_ns": time.process_time_ns(),
+        "thread_cpu_ns": time.thread_time_ns(),
+        "rusage": _registration_rusage(),
+        "identity": _cuda_registration_identity(torch, cudart, device_index),
+        "pointer": int(address),
+        "bytes": int(size),
+        "alignment": {
+            "mod_4k": int(address) % 4096,
+            "mod_64k": int(address) % 65536,
+            "mod_2m": int(address) % (2 * 1024 * 1024),
+        },
+        "page_size": int(os.sysconf("SC_PAGE_SIZE")) if hasattr(os, "sysconf") else None,
+        "mapping": _proc_mapping_snapshot(address, size),
+    }
+    try:
+        fd = int(getattr(shm, "_fd"))
+        state["shm"] = {
+            "name": str(getattr(shm, "name", "")),
+            "fd": fd,
+            "fd_link": os.readlink(f"/proc/{os.getpid()}/fd/{fd}"),
+            "fstat": {
+                "mode": int(os.fstat(fd).st_mode),
+                "size": int(os.fstat(fd).st_size),
+                "device": int(os.fstat(fd).st_dev),
+                "inode": int(os.fstat(fd).st_ino),
+            },
+        }
+    except Exception as exc:
+        state["shm_error"] = f"{type(exc).__name__}:{str(exc)[:160]}"
+    return state
+
+
+def _registration_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    delta: dict[str, Any] = {
+        "wall_ns": int(after["wall_monotonic_ns"]) - int(before["wall_monotonic_ns"]),
+        "process_cpu_ns": int(after["process_cpu_ns"]) - int(before["process_cpu_ns"]),
+        "thread_cpu_ns": int(after["thread_cpu_ns"]) - int(before["thread_cpu_ns"]),
+    }
+    for scope in ("process", "thread"):
+        lhs = (before.get("rusage") or {}).get(scope) or {}
+        rhs = (after.get("rusage") or {}).get(scope) or {}
+        if lhs and rhs and "error" not in lhs and "error" not in rhs:
+            delta.setdefault("rusage", {})[scope] = {
+                key: rhs.get(key, 0) - lhs.get(key, 0)
+                for key in rhs
+                if isinstance(rhs.get(key), (int, float)) and key in lhs
+            }
+    return delta
 
 
 def _shm_fs_info() -> dict:
@@ -1331,6 +1560,8 @@ def io_process_v2_streaming_enabled() -> bool:
 
 IO_PROCESS_V2_SOURCE_ENGINE_ENV = "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE"
 _SOURCE_ENGINES = ("preadv", "mmap_fresh")
+IO_PROCESS_V2_MMAP_LIFECYCLE_ENV = "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"
+_MMAP_LIFECYCLES = ("fresh", "whole", "epoch")
 
 
 def resolve_c0_source_engine(value: Any = None) -> str:
@@ -1347,6 +1578,16 @@ def resolve_c0_source_engine(value: Any = None) -> str:
 def c0_mmap_engine_enabled() -> bool:
     """True only when the frozen mmap source engine is selected."""
     return resolve_c0_source_engine() == "mmap_fresh"
+
+
+def resolve_c0_mmap_lifecycle(value: Any = None) -> str:
+    selected = os.environ.get(IO_PROCESS_V2_MMAP_LIFECYCLE_ENV) if value is None else value
+    selected = str(selected if selected is not None else "fresh").strip().lower()
+    if selected not in _MMAP_LIFECYCLES:
+        raise ValueError(
+            f"invalid C0 mmap lifecycle {selected!r}; expected one of {_MMAP_LIFECYCLES}"
+        )
+    return selected
 
 
 IO_PROCESS_V2_C0_HOST_REGISTER_ENV = "COMFYMODAL_GOLDEN_C0_HOST_REGISTER"
@@ -2565,6 +2806,7 @@ class C0FillRequest:
     record_id: str | int | None = None
     fill_index: int | None = None
     source_identity: tuple[int, int, int, int] | None = None
+    mmap_lifecycle: str = "fresh"
 
     def as_message(self) -> dict:
         return {
@@ -2582,6 +2824,7 @@ class C0FillRequest:
             "record_id": self.record_id,
             "fill_index": self.fill_index,
             "source_identity": self.source_identity,
+            "mmap_lifecycle": str(self.mmap_lifecycle),
         }
 
 
@@ -2662,6 +2905,8 @@ def validate_fill_request(request: C0FillRequest) -> None:
             for value in request.source_identity
         ):
             raise C0ProtocolError(f"c0_invalid_source_identity:{request.source_identity!r}")
+    if request.mmap_lifecycle not in _MMAP_LIFECYCLES:
+        raise C0ProtocolError(f"c0_invalid_mmap_lifecycle:{request.mmap_lifecycle!r}")
     slot_index = _require_plain_int(request.slot_index, "slot_index")
     if slot_index >= C0_SLOT_COUNT:
         raise C0ProtocolError(f"c0_slot_out_of_range:{slot_index}")
@@ -2741,11 +2986,11 @@ class C0ControlLayout:
     _HEADER = struct.Struct("<8sIIQQQ")
     _U64 = struct.Struct("<Q")
     _U32 = struct.Struct("<I")
-    _REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
+    _REQUEST = struct.Struct("<QQQQIIQQQQ4QIQI")
     # The first fields are the stable control reply.  The trailing passive
     # fields preserve child mmap/CPU/fault evidence through the binary session;
     # zero means that a field was not produced by the selected child engine.
-    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 32)
+    _RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 35)
 
     @classmethod
     def lane_offset(cls, lane: int) -> int:
@@ -2802,6 +3047,7 @@ class C0ControlLayout:
             int(request.producer_id), int(request.slot_index), int(request.slot_generation),
             int(request.source_offset), int(request.destination_offset), int(request.length),
             *identity, len(os.fsencode(request.source)), 0,
+            int({"fresh": 1, "whole": 2, "epoch": 3}[request.mmap_lifecycle]),
         )
         path = cls._path_bytes(request.source)
         payload = packed[:-4] + path
@@ -2821,6 +3067,7 @@ class C0ControlLayout:
         sequence, request_id, arena_epoch, session_epoch, producer_id, slot, generation, source_offset, destination_offset, length, *tail = values
         identity = tuple(int(v) for v in tail[:4])
         path_len = int(tail[4])
+        mmap_lifecycle = {1: "fresh", 2: "whole", 3: "epoch"}.get(int(tail[5]), "invalid")
         crc = int(tail[5])
         path_raw = bytes(buf[base + 224 : base + 224 + cls.PATH_BYTES])
         path = os.fsdecode(path_raw[:path_len])
@@ -2833,6 +3080,7 @@ class C0ControlLayout:
             "source_offset": int(source_offset), "destination_offset": int(destination_offset),
             "length": int(length), "producer_id": int(producer_id),
             "source_identity": None if identity == (0, 0, 0, 0) else identity,
+            "mmap_lifecycle": mmap_lifecycle,
             "_sequence": int(sequence), "_request_crc": crc,
         }
 
@@ -2876,9 +3124,12 @@ class C0ControlLayout:
             int(result.get("mmap_sched_wait_delta_ns") or 0),
             int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
             int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
-            int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
-            int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
-            int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
+             int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
+             int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
+             int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
+             int(result.get("mmap_mapping_id") or 0),
+             int(result.get("mmap_lifecycle_code") or 0),
+             int(result.get("mmap_epoch_index") or 0),
         )
         cls._U32.pack_into(buf, base + 640, cls._crc(response + error))
         buf[base + 256 : base + 256 + len(response)] = response
@@ -2897,8 +3148,9 @@ class C0ControlLayout:
             mmap_gate_wait, mmap_actual_gate_wait, mmap_pipe_rtt, mmap_minflt, mmap_majflt,
             mmap_utime, mmap_stime, mmap_sched_run, mmap_sched_wait,
             mmap_cpu_utime, mmap_cpu_stime, mmap_sched_run_delta, mmap_sched_wait_delta,
-            copy_start, copy_end, mmap_op_start, mmap_op_end,
-            mmap_start, mmap_end, memcpy_start, memcpy_end, munmap_start, munmap_end,
+             copy_start, copy_end, mmap_op_start, mmap_op_end,
+             mmap_start, mmap_end, memcpy_start, memcpy_end, munmap_start, munmap_end,
+             mmap_mapping_id, mmap_lifecycle_code, mmap_epoch_index,
         ) = phases
         def _optional(value: int) -> int | None:
             return int(value) if int(value) else None
@@ -2931,8 +3183,11 @@ class C0ControlLayout:
             "copy_start_ns": _optional(copy_start), "copy_end_ns": _optional(copy_end),
             "mmap_op_start_ns": _optional(mmap_op_start), "mmap_op_end_ns": _optional(mmap_op_end),
             "mmap_start_ns": _optional(mmap_start), "mmap_end_ns": _optional(mmap_end),
-            "memcpy_start_ns": _optional(memcpy_start), "memcpy_end_ns": _optional(memcpy_end),
-            "munmap_start_ns": _optional(munmap_start), "munmap_end_ns": _optional(munmap_end),
+             "memcpy_start_ns": _optional(memcpy_start), "memcpy_end_ns": _optional(memcpy_end),
+             "munmap_start_ns": _optional(munmap_start), "munmap_end_ns": _optional(munmap_end),
+             "mmap_mapping_id": _optional(mmap_mapping_id),
+             "mmap_lifecycle_code": _optional(mmap_lifecycle_code),
+             "mmap_epoch_index": _optional(mmap_epoch_index),
             "error": error or None, "preadv_diagnostics": [], "_sequence": int(sequence),
         }
 
@@ -3052,8 +3307,9 @@ class C0SourceSession:
                         "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
                         "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
                         "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
-                        "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
-                        "munmap_start_ns", "munmap_end_ns",
+                         "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
+                         "munmap_start_ns", "munmap_end_ns", "mmap_mapping_id",
+                         "mmap_lifecycle_code", "mmap_epoch_index",
                     ):
                         if key in response:
                             trace[key] = response[key]
@@ -3942,10 +4198,19 @@ class SharedArenaRing:
         # once at spawn; the parent must report the value it launched with, not
         # whatever the environment says at evidence time.
         self.persistent_fds = io_process_v2_persistent_fds_enabled()
+        self.mmap_lifecycle = resolve_c0_mmap_lifecycle()
         # Deploy-baked cudaHostRegister selector for the C0 POSIX-SHM arena.
         # Read once here (before the mapping exists) and mirrored into evidence
         # so the arm is provable from the arena record, not the live env.
         self.host_register_enabled = c0_host_register_enabled()
+        self.registration_diag_enabled = c0_registration_diag_enabled()
+        self.registration_order = c0_registration_order()
+        self.registration_context_preinit = c0_registration_context_preinit_enabled()
+        self.registration_diagnostic: dict[str, Any] = {
+            "enabled": bool(self.registration_diag_enabled),
+            "order": self.registration_order,
+            "context_preinit": bool(self.registration_context_preinit),
+        }
         self.reader_gate_enabled = c0_reader_gate_enabled()
         # Experiment-3 DMA ring: 5-slot pageable source pool + 2-slot pinned
         # DMA ring.  OFF selects the exact production-005 8-slot registered
@@ -4039,6 +4304,57 @@ class SharedArenaRing:
         self.source_inflight_samples += 1
         self.source_inflight_occupancy[min(value, _C0_QD_DISTRIBUTION_MAX)] += 1
 
+    def _register_arena(self, *, torch: Any, register: Any, cudart: Any, marks: dict[str, int]) -> None:
+        if self._arena_address is None or self._shm is None:
+            raise RuntimeError("c0_arena_not_allocated")
+        before = None
+        if self.registration_diag_enabled:
+            before = _registration_state(
+                torch=torch,
+                cudart=cudart,
+                shm=self._shm,
+                address=int(self._arena_address),
+                size=int(self.size_bytes),
+                device_index=int(self.device_index),
+            )
+        self.register_start_ns = time.monotonic_ns()
+        marks["cuda_host_register_begin"] = int(self.register_start_ns)
+        t0 = time.perf_counter()
+        error = None
+        try:
+            rc = int(register(self._arena_address, self.size_bytes, _CUDA_HOST_REGISTER_DEFAULT))
+        except BaseException as exc:
+            rc = -1
+            error = f"{type(exc).__name__}:{str(exc)[:300]}"
+        self.register_end_ns = time.monotonic_ns()
+        marks["cuda_host_register_end"] = int(self.register_end_ns)
+        self.register_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+        self.registration_diagnostic.update({
+            "api": "torch.cuda.cudart().cudaHostRegister",
+            "flags": int(_CUDA_HOST_REGISTER_DEFAULT),
+            "return_code": int(rc),
+            "error": error,
+            "wall_monotonic_ns": int(self.register_end_ns - self.register_start_ns),
+        })
+        if self.registration_diag_enabled:
+            after = _registration_state(
+                torch=torch,
+                cudart=cudart,
+                shm=self._shm,
+                address=int(self._arena_address),
+                size=int(self.size_bytes),
+                device_index=int(self.device_index),
+            )
+            self.registration_diagnostic.update({
+                "before": before,
+                "after": after,
+                "delta": _registration_delta(before or {}, after),
+            })
+        if rc != 0:
+            self._cleanup_failed_setup()
+            raise RuntimeError(f"cudaHostRegister_failed:{rc}:{error or _cudart_error_str(cudart, rc)}")
+        self.registered = True
+
     # ── lifecycle ─────────────────────────────────────────────────────────
     def ensure(self) -> "SharedArenaRing":
         if self.created:
@@ -4055,6 +4371,16 @@ class SharedArenaRing:
         torch = _require_torch()
         cudart = torch.cuda.cudart()
         marks["torch_required"] = int(time.monotonic_ns())
+
+        if self.registration_context_preinit:
+            marks["registration_context_preinit_begin"] = int(time.monotonic_ns())
+            context_t0 = time.perf_counter()
+            context_info = _preinit_primary_context(int(self.device_index))
+            self.registration_diagnostic["context_preinit_ms"] = round(
+                (time.perf_counter() - context_t0) * 1000.0, 4
+            )
+            self.registration_diagnostic["context_preinit"] = context_info
+            marks["registration_context_preinit_end"] = int(time.monotonic_ns())
 
         register = getattr(cudart, "cudaHostRegister", None)
         if self.host_register_enabled and not callable(register):
@@ -4083,6 +4409,10 @@ class SharedArenaRing:
             marks["control_shm_create_begin"] = int(time.monotonic_ns())
             self.control_session = C0SourceSession(arena_epoch=self.epoch + 1)
             marks["control_shm_create_end"] = int(time.monotonic_ns())
+
+        _do_register = bool(self.host_register_enabled) and not bool(self.dma_ring_enabled)
+        if _do_register and self.registration_order == "register_first":
+            self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
 
         # cudaHostRegister the SAME POSIX-SHM mapping the child writes, unless
         # the deploy-baked selector turned registration OFF.  OFF leaves the
@@ -4197,19 +4527,8 @@ class SharedArenaRing:
                 f"cpu_ms={self.populate_cpu_ms} workers={self.populate_workers}",
                 flush=True,
             )
-        _do_register = bool(self.host_register_enabled) and not bool(self.dma_ring_enabled)
-        if _do_register:
-            self.register_start_ns = time.monotonic_ns()
-            t0 = time.perf_counter()
-            rc = int(register(self._arena_address, self.size_bytes, _CUDA_HOST_REGISTER_DEFAULT))
-            self.register_end_ns = time.monotonic_ns()
-            self.register_ms = round((time.perf_counter() - t0) * 1000.0, 4)
-            if rc != 0:
-                # The child was already spawned above (spawn/register overlap),
-                # so full cleanup -- not just mapping release -- is required.
-                self._cleanup_failed_setup()
-                raise RuntimeError(f"cudaHostRegister_failed:{rc}:{_cudart_error_str(cudart, rc)}")
-            self.registered = True
+        if _do_register and self.registration_order != "register_first":
+            self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
             marks["cuda_host_register_begin"] = int(self.register_start_ns or 0)
             marks["cuda_host_register_end"] = int(self.register_end_ns or 0)
 
@@ -5372,6 +5691,8 @@ class SharedArenaRing:
             # above proves what actually happened; this proves which arm the
             # deploy baked even if registration failed before evidence.
             "host_register_enabled": bool(self.host_register_enabled),
+            "registration_diagnostic": dict(self.registration_diagnostic),
+            "registration_order": self.registration_order,
             "reader_gate_enabled": bool(self.reader_gate_enabled),
             "dma_ring_enabled": bool(self.dma_ring_enabled),
             "five_slots_enabled": bool(self.five_slots_enabled),
@@ -5457,6 +5778,7 @@ class SharedArenaRing:
                 self.child_ready_evidence.get("source_engine")
                 if self.child_ready_evidence else None
             ),
+            "mmap_lifecycle": self.mmap_lifecycle,
             "source_engine_fallback": {
                 "selected": (
                     self.child_ready_evidence.get("source_engine")
@@ -5832,8 +6154,9 @@ class C0StageReader:
                     "mmap_cpu_utime_ns", "mmap_cpu_stime_ns",
                     "mmap_sched_run_delta_ns", "mmap_sched_wait_delta_ns",
                     "copy_start_ns", "copy_end_ns", "mmap_op_start_ns", "mmap_op_end_ns",
-                    "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
-                    "munmap_start_ns", "munmap_end_ns",
+                     "mmap_start_ns", "mmap_end_ns", "memcpy_start_ns", "memcpy_end_ns",
+                     "munmap_start_ns", "munmap_end_ns", "mmap_mapping_id",
+                     "mmap_lifecycle_code", "mmap_epoch_index",
                 ):
                     if key in reply:
                         trace[key] = reply[key]
@@ -6050,7 +6373,10 @@ class C0StageReader:
                     ),
                     "mmap_munmap_ns": source.get("mmap_munmap_ns"),
                     "mmap_op_ns": source.get("mmap_op_ns", source.get("read_duration_ns")),
-                    "mmap_pipe_rtt_ns": source.get("mmap_pipe_rtt_ns"),
+                      "mmap_pipe_rtt_ns": source.get("mmap_pipe_rtt_ns"),
+                     "mmap_mapping_id": source.get("mmap_mapping_id"),
+                     "mmap_lifecycle_code": source.get("mmap_lifecycle_code"),
+                     "mmap_epoch_index": source.get("mmap_epoch_index"),
                     "mmap_cpu_utime_ns": source.get("mmap_cpu_utime_ns"),
                     "mmap_cpu_stime_ns": source.get("mmap_cpu_stime_ns"),
                     "mmap_sched_run_delta_ns": source.get("mmap_sched_run_delta_ns"),
@@ -6468,7 +6794,7 @@ CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
 CONTROL_U64 = struct.Struct("<Q")
 CONTROL_U32 = struct.Struct("<I")
 CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
-CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 32)
+CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 35)
 
 
 def _control_lane_offset(lane):
@@ -6538,10 +6864,13 @@ def _control_publish(lane, sequence, result):
         int(result.get("mmap_sched_wait_delta_ns") or 0),
         int(result.get("copy_start_ns") or 0), int(result.get("copy_end_ns") or 0),
         int(result.get("mmap_op_start_ns") or 0), int(result.get("mmap_op_end_ns") or 0),
-        int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
-        int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
-        int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
-    )
+         int(result.get("mmap_start_ns") or 0), int(result.get("mmap_end_ns") or 0),
+         int(result.get("memcpy_start_ns") or 0), int(result.get("memcpy_end_ns") or 0),
+         int(result.get("munmap_start_ns") or 0), int(result.get("munmap_end_ns") or 0),
+         int(result.get("mmap_mapping_id") or 0),
+         int(result.get("mmap_lifecycle_code") or 0),
+         int(result.get("mmap_epoch_index") or 0),
+     )
     CONTROL_U32.pack_into(control_buf, base + 640, _control_crc(response + error))
     control_buf[base + 648:base + 648 + CONTROL_ERROR_BYTES] = error + b"\0" * (CONTROL_ERROR_BYTES - len(error))
     control_buf[base + 256:base + 256 + len(response)] = response
@@ -6632,6 +6961,14 @@ source_engine = (
     .strip().lower()
 )
 mmap_engine = source_engine == "mmap_fresh"
+mmap_lifecycle = (
+    str(os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE") or "fresh")
+    .strip().lower()
+)
+if mmap_lifecycle not in ("fresh", "whole", "epoch"):
+    raise RuntimeError("invalid_c0_mmap_lifecycle:%s" % mmap_lifecycle)
+MMAP_LIFECYCLE_CODE = {"fresh": 1, "whole": 2, "epoch": 3}[mmap_lifecycle]
+MMAP_EPOCH_BYTES = 1 << 30
 # Diagnostic-only (default OFF): an extra warm copy per read, used once to split
 # source page-in from destination-copy cost.  Never enabled for production.
 mmap_copy_diag = (
@@ -6663,6 +7000,8 @@ _PAGE = 4096
 _mmap_libc = None
 _mmap_buf_addr = 0
 _mmap_reader_fds = {}
+_mmap_reader_maps = {}
+_mmap_next_mapping_id = 0
 _mmap_readers = []
 if mmap_engine:
     _mmap_libc = ctypes.CDLL(None, use_errno=True)
@@ -9063,6 +9402,70 @@ def _mmap_counter_delta(before, after):
     # Never expose a negative sample when a counter is rounded or reset.
     if before is None or after is None:
         return None
+
+
+def _mmap_release_cached_maps(path=None):
+    global _mmap_reader_maps
+    for key, entry in list(_mmap_reader_maps.items()):
+        if path is not None and entry.get("path") == path:
+            continue
+        try:
+            _mmap_libc.munmap(int(entry["address"]), int(entry["length"]))
+        except BaseException:
+            pass
+        _mmap_reader_maps.pop(key, None)
+
+
+def _mmap_cached_mapping(fd_key, fd, offset, length, file_size):
+    global _mmap_next_mapping_id
+    lifecycle = mmap_lifecycle
+    if lifecycle == "fresh":
+        map_start = (int(offset) // _PAGE) * _PAGE
+        map_length = ((int(offset) - map_start + int(length) + _PAGE - 1) // _PAGE) * _PAGE
+        map_length = min(map_length, int(file_size) - map_start)
+        key = None
+        epoch_index = 0
+    elif lifecycle == "whole":
+        map_start = 0
+        map_length = int(file_size)
+        key = (fd_key, "whole")
+        epoch_index = 0
+    else:
+        epoch_index = int(offset) // MMAP_EPOCH_BYTES
+        map_start = epoch_index * MMAP_EPOCH_BYTES
+        map_length = min(MMAP_EPOCH_BYTES, int(file_size) - map_start)
+        key = (fd_key, epoch_index)
+    if map_length <= 0 or map_start < 0:
+        raise OSError("mmap_range_invalid")
+    if key is not None:
+        for old_key, old_entry in list(_mmap_reader_maps.items()):
+            if old_entry.get("fd_key") == fd_key and old_key != key:
+                try:
+                    _mmap_libc.munmap(int(old_entry["address"]), int(old_entry["length"]))
+                except BaseException:
+                    pass
+                _mmap_reader_maps.pop(old_key, None)
+        cached = _mmap_reader_maps.get(key)
+        if cached is not None:
+            return cached, 0.0, True, epoch_index
+    started = time.monotonic_ns()
+    address = int(_mmap_libc.mmap(None, map_length, _PROT_READ, _MAP_PRIVATE, fd, map_start))
+    map_ns = max(0, time.monotonic_ns() - started)
+    if address in (0, -1) or address == 0xFFFFFFFFFFFFFFFF:
+        raise OSError("mmap_failed errno=%d" % int(ctypes.get_errno()))
+    _mmap_next_mapping_id += 1
+    entry = {
+        "address": address,
+        "length": map_length,
+        "map_start": map_start,
+        "mapping_id": int(_mmap_next_mapping_id),
+        "fd_key": fd_key,
+        "path": fd_key[0],
+        "epoch_index": epoch_index,
+    }
+    if key is not None:
+        _mmap_reader_maps[key] = entry
+    return entry, map_ns / 1e6, False, epoch_index
     try:
         return max(0, int(after) - int(before))
     except BaseException:
@@ -9154,9 +9557,17 @@ def _mmap_reader_fill(req):
             if not private_addr or private_len < length:
                 raise RuntimeError("mmap_private_buffer_unavailable")
             source_dest_addr = private_addr
-        window_start = (offset // _PAGE) * _PAGE
+        file_size = int(os.fstat(fd).st_size)
+        if offset + length > file_size:
+            raise ValueError("source_range_exceeds_file")
+        _mmap_release_cached_maps(path=fd_key_path)
+        mapping, map_ms, mapping_reused, epoch_index = _mmap_cached_mapping(
+            fd_key, fd, offset, length, file_size
+        )
+        window_start = int(mapping["map_start"])
         delta = offset - window_start
-        window_len = ((delta + length + _PAGE - 1) // _PAGE) * _PAGE
+        window_len = int(mapping["length"])
+        mapping_id = int(mapping["mapping_id"])
         cpu_before_utime_ns, cpu_before_stime_ns = _mmap_cpu_counters()
         sched_before_run_ns, sched_before_wait_ns = _mmap_schedstat_counters()
         # Experiment-4 actual-start gate: when enabled, the reader enforces the
@@ -9172,12 +9583,8 @@ def _mmap_reader_fill(req):
         munmap_start_ns = read_start_ns
         munmap_end_ns = read_start_ns
         unmap_end_ns = read_start_ns
-        win = int(_mmap_libc.mmap(
-            None, window_len, _PROT_READ, _MAP_PRIVATE, fd, window_start
-        ))
-        if win in (0, -1) or win == 0xFFFFFFFFFFFFFFFF:
-            raise OSError("mmap_failed errno=%d" % int(ctypes.get_errno()))
-        map_end_ns = time.monotonic_ns()
+        win = int(mapping["address"])
+        map_end_ns = read_start_ns + int(map_ms * 1e6)
         faults_before = _mmap_fault_counters()
         warm_ns = None
         shm_warm_ns = None
@@ -9235,10 +9642,13 @@ def _mmap_reader_fill(req):
         finally:
             if copy_end_ns == read_start_ns:
                 copy_end_ns = time.monotonic_ns()
-            # Synchronous unmap: the fresh window never outlives the read.
-            munmap_start_ns = time.monotonic_ns()
-            _mmap_libc.munmap(win, window_len)
-            munmap_end_ns = time.monotonic_ns()
+            if mmap_lifecycle == "fresh":
+                munmap_start_ns = time.monotonic_ns()
+                _mmap_libc.munmap(win, window_len)
+                munmap_end_ns = time.monotonic_ns()
+            else:
+                munmap_start_ns = time.monotonic_ns()
+                munmap_end_ns = munmap_start_ns
             unmap_end_ns = munmap_end_ns
         cpu_after_utime_ns, cpu_after_stime_ns = _mmap_cpu_counters()
         sched_after_run_ns, sched_after_wait_ns = _mmap_schedstat_counters()
@@ -9291,7 +9701,10 @@ def _mmap_reader_fill(req):
             "source_engine": "mmap_fresh",
             "reader_pid": os.getpid(),
             "reader_index": int(req.get("_reader_index") or 0),
-            "mmap_window_bytes": int(window_len),
+             "mmap_window_bytes": int(window_len),
+             "mmap_mapping_id": int(mapping_id),
+             "mmap_lifecycle_code": int(MMAP_LIFECYCLE_CODE),
+             "mmap_epoch_index": int(epoch_index),
             "mmap_launch_gap_wait_ns": int(req.get("_launch_gap_wait_ns") or 0),
             "mmap_actual_gate_wait_ns": int(actual_gate_wait_ns),
             # Per-read phase split so source cost is attributable without a
@@ -9574,6 +9987,7 @@ def _mmap_spawn_readers():
 
 
 def _mmap_shutdown_readers():
+    _mmap_release_cached_maps()
     for reader in _mmap_readers:
         try:
             os.close(reader["cmd_w"])
@@ -10007,6 +10421,8 @@ if source_volume_v1:
 _mmap_ready_evidence = {
     "enabled": bool(mmap_engine),
     "source_engine": source_engine,
+    "lifecycle": mmap_lifecycle,
+    "epoch_bytes": int(MMAP_EPOCH_BYTES),
     "launch_gap_ns": int(MMAP_LAUNCH_GAP_NS) if mmap_engine else None,
     "readers": [],
     "readers_started": 0,
@@ -10469,7 +10885,9 @@ __all__ = [
     "IO_PROCESS_V2_STREAMING_ENV",
     "IO_PROCESS_V2_PERSISTENT_FDS_ENV",
     "IO_PROCESS_V2_SOURCE_ENGINE_ENV",
+    "IO_PROCESS_V2_MMAP_LIFECYCLE_ENV",
     "resolve_c0_source_engine",
+    "resolve_c0_mmap_lifecycle",
     "c0_mmap_engine_enabled",
     "IO_PROCESS_V2_C0_PRIVATE_SPLIT_IO_ENV",
     "IO_PROCESS_V2_C0_SOURCE_VOLUME_V1_ENV",

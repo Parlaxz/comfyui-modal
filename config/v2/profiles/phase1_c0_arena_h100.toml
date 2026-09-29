@@ -1,0 +1,26 @@
+schema_version = 1
+name = "phase1_c0_arena_h100"
+owner = "testing9-c0-arena"
+
+[target]
+app = "testing9-c0-arena-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_phase1_c0_arena"
+
+[resources]
+gpu = "H100!"
+cpu = 12
+memory_mb = 24576
+
+[workload]
+fresh_required = true
+run_count = 1
+
+[environment]
+COMFYMODAL_PHASE1_C0_ARENA = "1"
+COMFYMODAL_V2_GPU = "H100!"
+COMFYMODAL_V2_CPU_REQUEST = "12"
+COMFYMODAL_V2_MEMORY_MB = "24576"
+COMFYMODAL_V2_MEMORY_REQUEST = "24576"
+COMFYMODAL_V2_BASELINE_MEMORY_REQUEST = "24576"
+COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"

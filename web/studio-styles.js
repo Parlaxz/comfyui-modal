@@ -45,6 +45,50 @@ body.comfymodal-body-scroll-lock {
   min-height: 40px;
 }
 
+.comfymodal-studio-header h1 {
+  margin: 0;
+  color: #e0e0e0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.comfymodal-studio-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.comfymodal-studio-help,
+.comfymodal-testing-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: #777;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.comfymodal-studio-help:hover,
+.comfymodal-testing-close:hover {
+  border-color: #333;
+  background: #1a1a1a;
+  color: #e0e0e0;
+}
+
+.comfymodal-studio-help:focus-visible,
+.comfymodal-testing-close:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 2px;
+}
+
 .comfymodal-studio-header h2 {
   margin: 0;
   font-size: 12px;
@@ -80,6 +124,11 @@ body.comfymodal-body-scroll-lock {
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .comfymodal-studio-help {
+    min-width: 44px;
+    min-height: 44px;
   }
 
   /* Feature tabs — ensure minimum tap height */

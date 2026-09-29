@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # Allow import of repo modules (comfymodal_runtime) from tools/.
@@ -131,22 +132,35 @@ async def _call_deployment_identity(workspace: dict, app_name: str, gpu: str) ->
 
     from comfymodal_runtime.modal_transport import ModalTransport
 
-    handle = await asyncio.to_thread(
-        ModalTransport()._v2_handle, workspace=workspace, gpu=gpu,
-    )
-    fn = handle.get_deployment_identity_static
-    remote = getattr(fn, "remote", None)
-    if remote is not None and callable(getattr(remote, "aio", None)):
-        result = remote.aio()
-        if asyncio.iscoroutine(result):
-            result = await result
-    elif asyncio.iscoroutinefunction(fn):
-        result = await fn()
-    else:
-        result = await asyncio.to_thread(fn)
-    if not isinstance(result, dict):
-        raise RuntimeError(f"remote returned non-dict: {type(result).__name__}")
-    return result
+    delays = (0.0, 3.0, 8.0, 15.0, 25.0)
+    last_error: BaseException | None = None
+    for delay in delays:
+        if delay:
+            await asyncio.to_thread(time.sleep, delay)
+        try:
+            handle = await asyncio.to_thread(
+                ModalTransport()._v2_handle, workspace=workspace, gpu=gpu,
+            )
+            fn = handle.get_deployment_identity_static
+            remote = getattr(fn, "remote", None)
+            if remote is not None and callable(getattr(remote, "aio", None)):
+                result = remote.aio()
+                if asyncio.iscoroutine(result):
+                    result = await result
+            elif asyncio.iscoroutinefunction(fn):
+                result = await fn()
+            else:
+                result = await asyncio.to_thread(fn)
+            if not isinstance(result, dict):
+                raise RuntimeError(f"remote returned non-dict: {type(result).__name__}")
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            text = str(exc).lower()
+            if not any(token in text for token in ("notfounderror", "not found", "lookup failed")):
+                raise
+    assert last_error is not None
+    raise last_error
 
 
 def _write_state(state: dict) -> None:
@@ -169,10 +183,24 @@ def main() -> int:
     try:
         workspace = _load_active_workspace()
 
-        # Mirror deploy_and_run_v2_single.bat: expose credentials via env for
-        # any downstream Modal SDK handle resolution.
+        # Mirror source-probe's destination binding: inherited Modal profile and
+        # environment variables must not override the config-owned workspace.
+        for name in list(os.environ):
+            if name.startswith("MODAL_") or name in {
+                "COMFYMODAL_ENVIRONMENT",
+                "COMFYMODAL_V2_ENVIRONMENT",
+                "COMFYMODAL_MODAL_PROFILE",
+            }:
+                os.environ.pop(name, None)
+        # Expose only the configured workspace credentials to downstream Modal
+        # SDK handle resolution.
         os.environ["MODAL_TOKEN_ID"] = workspace["token_id"]
         os.environ["MODAL_TOKEN_SECRET"] = workspace["token_secret"]
+        environment = str(workspace.get("environment") or "(default)")
+        if environment != "(default)":
+            os.environ["MODAL_ENVIRONMENT"] = environment
+            os.environ["COMFYMODAL_ENVIRONMENT"] = environment
+            os.environ["COMFYMODAL_V2_ENVIRONMENT"] = environment
 
         app_name = _resolve_app_name()
         gpu = os.environ.get("COMFYMODAL_V2_GPU", "rtx-pro-6000").strip() or "rtx-pro-6000"

@@ -8259,7 +8259,7 @@ if not _INSIDE_MODAL_CONTAINER:
         '  _total_req=$((_total_req+1)); '
         '  local t0; t0=$(__ts_ms); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-        '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
+         '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet 2>&1 || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
         '  local t1; t1=$(__ts_ms); '
         '  local dur; dur=$((t1 - t0)); '
         '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
@@ -8272,7 +8272,7 @@ if not _INSIDE_MODAL_CONTAINER:
         'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
         # CacheDiT final family reinstall (after all custom-node reqs)
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
-        'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
+         'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet 2>&1 || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
         # CacheDiT image-build import gate
         # Override compiler cache envs to /tmp paths — the image env sets
@@ -8359,6 +8359,9 @@ def _build_canonical_accelerator_images(base: Any) -> tuple[Any, Any]:
     if env_flag("COMFYMODAL_V2_C9QD_EXTRAS"):
         # Explicit diagnostic/benchmark opt-in; never part of the normal image.
         accelerator = accelerator.pip_install("runai-model-streamer==0.16.1")
+    if env_flag("COMFYMODAL_TESTING8_INSTANTTENSOR"):
+        # TESTING8-only transport probe dependency; never enabled by production profiles.
+        accelerator = accelerator.pip_install("instanttensor")
     accelerator = accelerator.run_commands(
         "CXX_APPEND_FLAGS=-std=c++20 NVCC_APPEND_FLAGS=-std=c++20 "
         "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
@@ -8793,6 +8796,14 @@ if _PUBLISHER_ONLY:
         modal.Image.debian_slim(python_version="3.11")
     ).env({"COMFYMODAL_PUBLISHER_ONLY": "1"})
     image = publisher_image
+elif _INSIDE_MODAL_CONTAINER:
+    # Runtime containers already have their deploy image. Rebuilding the host
+    # dependency identity during module import breaks lightweight functions.
+    CANONICAL_IMAGE_PLAN = None
+    image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    )
+    publisher_image = image
 else:
     CANONICAL_IMAGE_PLAN = build_canonical_image_plan()
     image = CANONICAL_IMAGE_PLAN.final_image

@@ -221,7 +221,7 @@ def test_control_protocol_version_matches_child_and_response_fits_descriptor():
     assert match is not None
     assert int(match.group(1)) == C0ControlLayout.VERSION
     assert C0ControlLayout.VERSION == 4
-    assert 'CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 32)' in _C0_CHILD_SOURCE
+    assert 'CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 35)' in _C0_CHILD_SOURCE
     assert 256 + C0ControlLayout._RESPONSE.size <= C0ControlLayout.DESCRIPTOR_BYTES
 
 
