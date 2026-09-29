@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import os
+from pathlib import Path
+import tomllib
 from typing import Any
 
 
@@ -25,6 +27,27 @@ def _contains_true_selector(value: Any, selector: str) -> bool:
     return False
 
 
+def _profile_deploy_environment(name: str) -> str | None:
+    """Read one deploy-owned flag for a local run harness.
+
+    v2ctl deliberately does not copy deploy-only flags from the ambient shell
+    into the benchmark subprocess.  The request still needs an identity echo
+    for restore-owned architecture validation, so read only the selected
+    profile's declarative environment when the caller did not provide a value.
+    """
+    profile = str(os.environ.get("COMFYMODAL_V2CTL_PROFILE") or "").strip()
+    if not profile or any(token in profile for token in ("/", "\\", "..")):
+        return None
+    filename = profile if profile.endswith(".toml") else f"{profile}.toml"
+    path = Path(__file__).resolve().parents[2] / "config" / "v2" / "profiles" / filename
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        value = (data.get("environment") or {}).get(name)
+        return None if value is None else str(value)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def _golden_p1_request_payload(
     source: dict[str, Any],
     *,
@@ -36,18 +59,28 @@ def _golden_p1_request_payload(
     cpu_qd2_prefetch: bool = False,
     deep_trace: bool = False,
     c0_mmap_lifecycle: str | None = None,
-    c0_source_threads: bool = False,
+    c0_source_threads: bool | None = None,
 ) -> dict[str, Any]:
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
     if not isinstance(deep_trace, bool):
         raise ValueError("golden_deep_trace_must_be_bool")
+    if c0_source_threads is None:
+        c0_source_threads = str(
+            os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS")
+            or _profile_deploy_environment("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS")
+            or "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
     if not isinstance(c0_source_threads, bool):
         raise ValueError("golden_c0_source_threads_must_be_bool")
     lifecycle = str(
         c0_mmap_lifecycle
         if c0_mmap_lifecycle is not None
-        else os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh")
+        else (
+            os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE")
+            or _profile_deploy_environment("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE")
+            or "fresh"
+        )
     ).strip().lower()
     if lifecycle not in {"fresh", "whole", "epoch"}:
         raise ValueError("golden_c0_mmap_lifecycle_invalid")
