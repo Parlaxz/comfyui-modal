@@ -60,7 +60,7 @@ def _profile_deploy_environment(name: str) -> str | None:
     for receipt_path in sorted(deployment_dir.glob("receipt_*.json")):
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            target = receipt.get("target") or {}
+            target = receipt.get("target") or receipt.get("deployment_identity") or {}
             if str(target.get("app") or target.get("app_name") or "") != app:
                 continue
             if fingerprint and str(receipt.get("deploy_fingerprint") or "") != fingerprint:
