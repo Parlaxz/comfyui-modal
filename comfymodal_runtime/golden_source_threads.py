@@ -578,7 +578,8 @@ class SourceThreadProcess:
                             raise SourceProtocolError("ready_plan_generation_mismatch")
                         return ReadyRecord(index, generation, source, destination, length,
                                            range_index, producer_id, ready_ns,
-                                           self._planned_records.get((plan_generation, int(range_index))))
+                                           self._planned_records.get((plan_generation, int(range_index))),
+                                           plan_generation)
             time.sleep(0.0005)
         return None
 
