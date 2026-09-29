@@ -111,6 +111,11 @@ class SourceRange:
     destination_offset: int
     record_id: str | int | None = None
 
+    @property
+    def target_offset(self) -> int:
+        """Match GoldenQDTransport.SourceRange's destination spelling."""
+        return int(self.destination_offset)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "source_offset": self.source_offset,
