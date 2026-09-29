@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any
 
 
@@ -34,11 +35,22 @@ def _golden_p1_request_payload(
     invocation_id: str | None = None,
     cpu_qd2_prefetch: bool = False,
     deep_trace: bool = False,
+    c0_mmap_lifecycle: str | None = None,
+    c0_source_threads: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(cpu_qd2_prefetch, bool):
         raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
     if not isinstance(deep_trace, bool):
         raise ValueError("golden_deep_trace_must_be_bool")
+    if not isinstance(c0_source_threads, bool):
+        raise ValueError("golden_c0_source_threads_must_be_bool")
+    lifecycle = str(
+        c0_mmap_lifecycle
+        if c0_mmap_lifecycle is not None
+        else os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh")
+    ).strip().lower()
+    if lifecycle not in {"fresh", "whole", "epoch"}:
+        raise ValueError("golden_c0_mmap_lifecycle_invalid")
     if cpu_qd2_prefetch and _contains_true_selector(source, "instant_tensor"):
         raise ValueError("golden_cpu_qd2_prefetch_instant_tensor_conflict")
     mode = str(golden_mode).strip().lower()
@@ -68,6 +80,8 @@ def _golden_p1_request_payload(
             + ", ".join(GOLDEN_ATTENTION_BACKENDS)
         )
     payload["attention_backend"] = normalized
+    payload["c0_mmap_lifecycle"] = lifecycle
+    payload["request_origin_info"]["c0_mmap_lifecycle"] = lifecycle
     # Keep the control payload byte-compatible: the optional request selector
     # is emitted only for the explicit QD2 arm.
     if cpu_qd2_prefetch:
@@ -76,6 +90,9 @@ def _golden_p1_request_payload(
     if deep_trace:
         payload["deep_trace"] = True
         payload["request_origin_info"]["golden_deep_trace"] = True
+    if c0_source_threads:
+        payload["c0_source_threads"] = True
+        payload["request_origin_info"]["c0_source_threads"] = True
     if invocation_id:
         payload["request_origin_info"]["v2ctl_invocation_id"] = str(invocation_id)
     return payload

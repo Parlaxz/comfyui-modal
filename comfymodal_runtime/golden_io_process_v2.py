@@ -2807,6 +2807,7 @@ class C0FillRequest:
     fill_index: int | None = None
     source_identity: tuple[int, int, int, int] | None = None
     mmap_lifecycle: str = "fresh"
+    mmap_generation: int = 0
 
     def as_message(self) -> dict:
         return {
@@ -2825,6 +2826,7 @@ class C0FillRequest:
             "fill_index": self.fill_index,
             "source_identity": self.source_identity,
             "mmap_lifecycle": str(self.mmap_lifecycle),
+            "mmap_generation": int(self.mmap_generation),
         }
 
 
@@ -2907,6 +2909,7 @@ def validate_fill_request(request: C0FillRequest) -> None:
             raise C0ProtocolError(f"c0_invalid_source_identity:{request.source_identity!r}")
     if request.mmap_lifecycle not in _MMAP_LIFECYCLES:
         raise C0ProtocolError(f"c0_invalid_mmap_lifecycle:{request.mmap_lifecycle!r}")
+    _require_plain_int(request.mmap_generation, "mmap_generation")
     slot_index = _require_plain_int(request.slot_index, "slot_index")
     if slot_index >= C0_SLOT_COUNT:
         raise C0ProtocolError(f"c0_slot_out_of_range:{slot_index}")
@@ -2986,7 +2989,7 @@ class C0ControlLayout:
     _HEADER = struct.Struct("<8sIIQQQ")
     _U64 = struct.Struct("<Q")
     _U32 = struct.Struct("<I")
-    _REQUEST = struct.Struct("<QQQQIIQQQQ4QIQI")
+    _REQUEST = struct.Struct("<QQQQIIQQQQ4QIQQI")
     # The first fields are the stable control reply.  The trailing passive
     # fields preserve child mmap/CPU/fault evidence through the binary session;
     # zero means that a field was not produced by the selected child engine.
@@ -3046,8 +3049,8 @@ class C0ControlLayout:
             int(sequence), int(request.request_id), int(request.arena_epoch), int(session_epoch),
             int(request.producer_id), int(request.slot_index), int(request.slot_generation),
             int(request.source_offset), int(request.destination_offset), int(request.length),
-            *identity, len(os.fsencode(request.source)), 0,
-            int({"fresh": 1, "whole": 2, "epoch": 3}[request.mmap_lifecycle]),
+            *identity, len(os.fsencode(request.source)), int(request.mmap_generation),
+            int({"fresh": 1, "whole": 2, "epoch": 3}[request.mmap_lifecycle]), 0,
         )
         path = cls._path_bytes(request.source)
         payload = packed[:-4] + path
@@ -3067,7 +3070,8 @@ class C0ControlLayout:
         sequence, request_id, arena_epoch, session_epoch, producer_id, slot, generation, source_offset, destination_offset, length, *tail = values
         identity = tuple(int(v) for v in tail[:4])
         path_len = int(tail[4])
-        mmap_lifecycle = {1: "fresh", 2: "whole", 3: "epoch"}.get(int(tail[5]), "invalid")
+        mmap_generation = int(tail[5])
+        mmap_lifecycle = {1: "fresh", 2: "whole", 3: "epoch"}.get(int(tail[6]), "invalid")
         crc = int(tail[5])
         path_raw = bytes(buf[base + 224 : base + 224 + cls.PATH_BYTES])
         path = os.fsdecode(path_raw[:path_len])
@@ -3081,6 +3085,7 @@ class C0ControlLayout:
             "length": int(length), "producer_id": int(producer_id),
             "source_identity": None if identity == (0, 0, 0, 0) else identity,
             "mmap_lifecycle": mmap_lifecycle,
+            "mmap_generation": mmap_generation,
             "_sequence": int(sequence), "_request_crc": crc,
         }
 
@@ -4124,6 +4129,18 @@ class SharedArenaRing:
         self.slot_bytes = int(slot_bytes)
         self.device_index = int(device_index)
         self.control_session_enabled = bool(control_session)
+        self.source_thread_mode = (
+            str(os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or "")
+            .strip().lower() in {"1", "true", "yes", "on"}
+        )
+        if self.source_thread_mode:
+            if self.size_bytes != 512 * 1024 * 1024 or self.slot_count != 8 or self.slot_bytes != 64 * 1024 * 1024:
+                raise RuntimeError("source_threads_requires_8x64m_arena")
+            if not c0_host_register_enabled():
+                raise RuntimeError("source_threads_requires_cuda_host_register")
+            if resolve_c0_mmap_lifecycle() not in {"fresh", "whole"}:
+                raise RuntimeError("source_threads_unsupported_mmap_lifecycle")
+        self.control_session_enabled = self.control_session_enabled and not self.source_thread_mode
         self.control_session: Optional[C0SourceSession] = None
         self.created = False
         self.registered = False
@@ -4162,6 +4179,8 @@ class SharedArenaRing:
         self._arena_address: Optional[int] = None
         self._slot_tensors: tuple[Any, ...] = ()
         self._proc = None
+        self._source_thread_process: Any = None
+        self._source_thread_snapshot: Optional[dict[str, Any]] = None
         self._stdin = None
         self._stdout = None
         self._closing = threading.Event()
@@ -4171,6 +4190,7 @@ class SharedArenaRing:
         self._req_cond = threading.Condition()
         self._window_trace_enabled = c0_window_trace_enabled()
         self._next_request_id = 0
+        self._next_mmap_generation = 0
         self._inflight = 0
         self._writer_thread: Optional[threading.Thread] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -4413,6 +4433,48 @@ class SharedArenaRing:
         _do_register = bool(self.host_register_enabled) and not bool(self.dma_ring_enabled)
         if _do_register and self.registration_order == "register_first":
             self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
+
+        if self.source_thread_mode:
+            # The opt-in arm has one source process containing four persistent
+            # threads.  It attaches to this exact registered mapping and never
+            # creates the historical nested reader/control session.
+            if not _do_register:
+                raise RuntimeError("source_threads_requires_registered_arena")
+            if self.registration_order != "register_first":
+                self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
+            from . import golden_source_threads
+            marks["source_thread_start_begin"] = int(time.monotonic_ns())
+            self._source_thread_process = golden_source_threads.SourceThreadProcess(
+                self._shm.name,
+                mmap_lifecycle=self.mmap_lifecycle,
+            )
+            try:
+                ready = self._source_thread_process.start()
+            except BaseException:
+                self._source_thread_process.stop()
+                self._source_thread_process = None
+                self._cleanup_failed_setup()
+                raise
+            marks["source_thread_ready"] = int(time.monotonic_ns())
+            source_process = self._source_thread_process.process
+            self.child_pid = int(getattr(source_process, "pid", 0) or 0) or None
+            self.child_start_ns = marks["source_thread_start_begin"]
+            self.child_ready_ns = marks["source_thread_ready"]
+            self.child_ready_evidence = {
+                "architecture": "source_threads",
+                "workers_configured": golden_source_threads.THREAD_COUNT,
+                "workers_ready": golden_source_threads.THREAD_COUNT,
+                "thread_identities": list((ready.get("telemetry") or {}).get("thread_identities") or []),
+                "process_id": (ready.get("telemetry") or {}).get("process_id"),
+                "mmap_lifecycle": self.mmap_lifecycle,
+                "fallback": False,
+            }
+            self.child_torch_imported = False
+            self.child_cuda_initialized = False
+            self.epoch += 1
+            self.created = True
+            marks["source_thread_start_end"] = int(time.monotonic_ns())
+            return self
 
         # cudaHostRegister the SAME POSIX-SHM mapping the child writes, unless
         # the deploy-baked selector turned registration OFF.  OFF leaves the
@@ -4737,6 +4799,13 @@ class SharedArenaRing:
         return out
 
     def _cleanup_failed_setup(self) -> None:
+        if self.source_thread_mode and self._source_thread_process is not None:
+            try:
+                self._source_thread_process.stop()
+            except Exception:
+                pass
+            self._source_thread_snapshot = None
+            self._source_thread_process = None
         try:
             if self._proc is not None:
                 self._proc.kill()
@@ -5003,10 +5072,14 @@ class SharedArenaRing:
     def stage_reader(
         self, *, role: str, pool: Any, source: str,
         source_identity: tuple[int, int, int, int] | None = None,
+        mmap_lifecycle: str | None = None,
     ) -> "C0StageReader":
+        self._next_mmap_generation += 1
         reader = C0StageReader(
             self, role=role, pool=pool, source=source,
             source_identity=source_identity,
+            mmap_lifecycle=mmap_lifecycle,
+            mmap_generation=self._next_mmap_generation,
         )
         # Retain the reader so its child-reported per-(path, producer)
         # descriptor lifecycle survives into arena teardown evidence.
@@ -5269,6 +5342,51 @@ class SharedArenaRing:
             # evidence; a None sampler is an explicit disabled/never-started.
             sampler_snapshot = self._stop_live_sampler()
             out["live_sampler"] = sampler_snapshot
+            if self.source_thread_mode:
+                # Source-thread mode has no historical IPC writer/reader or
+                # nested child to join.  Stop its one process first, then use
+                # the same parent-owned unregister and mapping release proof.
+                source_stop_ok = self._source_thread_process is None
+                if self._source_thread_process is not None:
+                    source_stop_ok = True
+                    try:
+                        self._source_thread_snapshot = self._source_thread_process.snapshot()
+                    except Exception as exc:
+                        out.setdefault("errors", []).append(
+                            f"source_snapshot:{type(exc).__name__}:{exc}"[:200]
+                        )
+                    try:
+                        self._source_thread_process.stop()
+                    except BaseException as exc:
+                        source_stop_ok = False
+                        out.setdefault("errors", []).append(
+                            f"source_stop:{type(exc).__name__}:{exc}"[:200]
+                        )
+                    self._source_thread_process = None
+                teardown_order = ["source_process_stop"]
+                try:
+                    if not source_stop_ok:
+                        raise RuntimeError("source_process_stop_unproven; mapping retained")
+                    self._unregister()
+                    teardown_order.append("unregister")
+                    out["release_status"] = self._release_mapping()
+                    teardown_order.append("release_mapping")
+                    out.setdefault("cleanup_status", "released")
+                except BaseException as exc:
+                    self.cleanup_unresolved = True
+                    out["cleanup_status"] = "cleanup_unresolved"
+                    out.setdefault("errors", []).append(
+                        f"source_release:{type(exc).__name__}:{exc}"[:200]
+                    )
+                out["teardown_order"] = teardown_order
+                out["source_thread"] = dict(self._source_thread_snapshot or {})
+                out["source_thread_identity"] = dict(self.child_ready_evidence or {})
+                out["cleanup_unresolved"] = self.cleanup_unresolved
+                out["unregister_ms"] = self.unregister_ms
+                out["close_total_ms"] = round((time.perf_counter() - close_t0) * 1000.0, 4)
+                self._closed = True
+                self.cleanup_status = dict(out)
+                return out
             outstanding = self._registry.outstanding + (
                 self.control_session.outstanding if self.control_session is not None else 0
             )
@@ -5658,7 +5776,7 @@ class SharedArenaRing:
                 entry = {}
                 models[f"{role}_load"] = entry
             entry["fd_telemetry"] = reader.fd_telemetry()
-        return {
+        result = {
             "active": True,
             "mode": "golden_io_process_v2_c0_streaming_arena",
             "arena_bytes": self.size_bytes,
@@ -5870,6 +5988,35 @@ class SharedArenaRing:
             "persistence": self._persistence_evidence(),
             "models": models,
         }
+        if self.source_thread_mode:
+            result.update({
+                "architecture": "source_threads",
+                "mode": "golden_c0_source_threads",
+                "control_session_enabled": False,
+                "historical_child_started": False,
+                "historical_ipc_threads_started": False,
+                "source_thread_identity": dict(self.child_ready_evidence or {}),
+                "source_thread_telemetry": (
+                    dict(self._source_thread_process.snapshot())
+                    if self._source_thread_process is not None else
+                    dict(self._source_thread_snapshot or {})
+                ),
+                "source_geometry": {
+                    "arena_bytes": int(self.size_bytes),
+                    "slot_count": int(self.slot_count),
+                    "slot_bytes": int(self.slot_bytes),
+                    "thread_count": 4,
+                    "mmap_lifecycle": self.mmap_lifecycle,
+                },
+                "source_engine": "native_mmap",
+                "mmap_lifecycle": self.mmap_lifecycle,
+                "capacity_class": "source-threads-qd4-64m",
+                "source_workers": 4,
+                "source_qd": 4,
+                "slot_owners": None,
+                "source_engine_fallback": {"fallback": False, "reason": None},
+            })
+        return result
 
 
 def _lease_target_address(target: Any) -> int:
@@ -5906,6 +6053,8 @@ class C0StageReader:
     def __init__(
         self, ring: SharedArenaRing, *, role: str, pool: Any, source: str,
         source_identity: tuple[int, int, int, int] | None = None,
+        mmap_lifecycle: str | None = None,
+        mmap_generation: int = 0,
     ) -> None:
         if role not in C0_VALID_ROLES:
             raise C0ProtocolError(f"c0_invalid_role:{role!r}")
@@ -5914,6 +6063,8 @@ class C0StageReader:
         self._pool = pool
         self._source = os.path.abspath(str(source))
         self._source_identity = source_identity
+        self._mmap_lifecycle = resolve_c0_mmap_lifecycle(mmap_lifecycle)
+        self._mmap_generation = int(mmap_generation)
         ring_trace_enabled = getattr(ring, "_window_trace_enabled", None)
         self._window_trace_enabled = (
             c0_window_trace_enabled()
@@ -6094,6 +6245,8 @@ class C0StageReader:
             record_id=declared.record_id,
             fill_index=int(self.fills),
             source_identity=self._source_identity,
+            mmap_lifecycle=self._mmap_lifecycle,
+            mmap_generation=self._mmap_generation,
         )
         validate_fill_request(request)
         started = time.monotonic_ns()
@@ -6793,7 +6946,7 @@ CONTROL_STATE_ERROR = 4
 CONTROL_HEADER_STRUCT = struct.Struct("<8sIIQQQ")
 CONTROL_U64 = struct.Struct("<Q")
 CONTROL_U32 = struct.Struct("<I")
-CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QII")
+CONTROL_REQUEST = struct.Struct("<QQQQIIQQQQ4QIQQI")
 CONTROL_RESPONSE = struct.Struct("<QQQQQIIIQQIIII" + "Q" * 35)
 
 
@@ -6812,6 +6965,8 @@ def _control_read_request(lane):
     sequence, request_id, arena_epoch, session_epoch, producer_id, slot, generation, source_offset, destination_offset, length, *tail = values
     identity = tuple(int(v) for v in tail[:4])
     path_len = int(tail[4])
+    mmap_generation = int(tail[5])
+    mmap_lifecycle = {1: "fresh", 2: "whole", 3: "epoch"}.get(int(tail[6]), "invalid")
     path = os.fsdecode(bytes(control_buf[base + 224:base + 224 + CONTROL_PATH_BYTES])[:path_len])
     role = bytes(control_buf[base + 208:base + 224]).split(b"\0", 1)[0].decode("ascii")
     return {
@@ -6821,6 +6976,8 @@ def _control_read_request(lane):
         "destination_offset": int(destination_offset), "length": int(length),
         "producer_id": int(producer_id),
         "source_identity": None if identity == (0, 0, 0, 0) else identity,
+        "mmap_lifecycle": mmap_lifecycle,
+        "mmap_generation": mmap_generation,
         "_sequence": int(sequence),
     }
 
@@ -9416,9 +9573,8 @@ def _mmap_release_cached_maps(path=None):
         _mmap_reader_maps.pop(key, None)
 
 
-def _mmap_cached_mapping(fd_key, fd, offset, length, file_size):
+def _mmap_cached_mapping(fd_key, fd, offset, length, file_size, mmap_generation, lifecycle):
     global _mmap_next_mapping_id
-    lifecycle = mmap_lifecycle
     if lifecycle == "fresh":
         map_start = (int(offset) // _PAGE) * _PAGE
         map_length = ((int(offset) - map_start + int(length) + _PAGE - 1) // _PAGE) * _PAGE
@@ -9428,13 +9584,13 @@ def _mmap_cached_mapping(fd_key, fd, offset, length, file_size):
     elif lifecycle == "whole":
         map_start = 0
         map_length = int(file_size)
-        key = (fd_key, "whole")
+        key = (fd_key, "whole", int(mmap_generation))
         epoch_index = 0
     else:
         epoch_index = int(offset) // MMAP_EPOCH_BYTES
         map_start = epoch_index * MMAP_EPOCH_BYTES
         map_length = min(MMAP_EPOCH_BYTES, int(file_size) - map_start)
-        key = (fd_key, epoch_index)
+        key = (fd_key, epoch_index, int(mmap_generation))
     if map_length <= 0 or map_start < 0:
         raise OSError("mmap_range_invalid")
     if key is not None:
@@ -9483,6 +9639,10 @@ def _mmap_reader_fill(req):
         "destination_offset": req.get("destination_offset"),
     }
     producer_id = int(req.get("producer_id") or 0)
+    mmap_lifecycle = str(req.get("mmap_lifecycle") or "fresh").strip().lower()
+    if mmap_lifecycle not in ("fresh", "whole", "epoch"):
+        raise ValueError("mmap_lifecycle_invalid")
+    mmap_lifecycle_code = {"fresh": 1, "whole": 2, "epoch": 3}[mmap_lifecycle]
     path = str(req.get("path"))
     fd_key_path = os.path.normpath(path)
     fd_key_producer = int(producer_id)
@@ -9562,7 +9722,7 @@ def _mmap_reader_fill(req):
             raise ValueError("source_range_exceeds_file")
         _mmap_release_cached_maps(path=fd_key_path)
         mapping, map_ms, mapping_reused, epoch_index = _mmap_cached_mapping(
-            fd_key, fd, offset, length, file_size
+            fd_key, fd, offset, length, file_size, int(req.get("mmap_generation") or 0), mmap_lifecycle
         )
         window_start = int(mapping["map_start"])
         delta = offset - window_start
@@ -9703,7 +9863,7 @@ def _mmap_reader_fill(req):
             "reader_index": int(req.get("_reader_index") or 0),
              "mmap_window_bytes": int(window_len),
              "mmap_mapping_id": int(mapping_id),
-             "mmap_lifecycle_code": int(MMAP_LIFECYCLE_CODE),
+             "mmap_lifecycle_code": int(mmap_lifecycle_code),
              "mmap_epoch_index": int(epoch_index),
             "mmap_launch_gap_wait_ns": int(req.get("_launch_gap_wait_ns") or 0),
             "mmap_actual_gate_wait_ns": int(actual_gate_wait_ns),
@@ -10786,6 +10946,18 @@ def ensure_arena_runtime() -> SharedArenaRing:
     if _C0_RUNTIME is not None and _C0_RUNTIME.created:
         return _C0_RUNTIME
     _geo = resolve_c0_source_arena_geometry()
+    source_threads = (
+        str(os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or "")
+        .strip().lower() in {"1", "true", "yes", "on"}
+    )
+    if source_threads:
+        # This arm is deliberately independent of the qd4_128 treatment.  Its
+        # identity is always the source-thread profile's 8x64 MiB geometry.
+        _geo = {
+            "size_bytes": 512 * 1024 * 1024,
+            "slot_count": 8,
+            "slot_bytes": 64 * 1024 * 1024,
+        }
     if (
         _geo["size_bytes"] != C0_ARENA_BYTES
         or _geo["slot_count"] != C0_SLOT_COUNT

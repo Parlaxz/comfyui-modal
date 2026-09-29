@@ -742,11 +742,20 @@ description = "Experiment-1 treatment: materialize the fresh 512 MiB C0 SHM with
 name = "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"
 type = "enum"
 default = "fresh"
-consumed_at = "restore"
-change_requires = "deploy"
+consumed_at = "request"
+change_requires = "run"
 owner = "testing9-c0-mmap"
 enum_values = ["fresh", "whole", "epoch"]
 description = "TESTING9-only C0 mmap lifecycle diagnostic; fresh is the current exact-window control, whole keeps one mapping per model/path, and epoch uses aligned approximately 1 GiB mappings."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_THREADS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "testing9-c0-source-threads"
+description = "Explicit TESTING9 experimental arm: one CUDA-sterile source subprocess with four persistent in-process reader threads and self-serve 8 x 64 MiB shared slots. Default OFF; no fallback is permitted when selected."
 
 [[flag]]
 name = "COMFYMODAL_PHASE1_C0_ARENA"

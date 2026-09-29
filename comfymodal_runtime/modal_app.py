@@ -23161,6 +23161,29 @@ class ModalRuntimeEntrypoint:
             requested_mode = str(request.get("golden_mode", "serial")).strip().lower()
             if requested_mode not in {"serial", "parallel"}:
                 raise ValueError("golden_mode_invalid")
+            c0_mmap_lifecycle = str(
+                request.get(
+                    "c0_mmap_lifecycle",
+                    os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"),
+                )
+                or "fresh"
+            ).strip().lower()
+            if c0_mmap_lifecycle not in {"fresh", "whole", "epoch"}:
+                raise ValueError("golden_c0_mmap_lifecycle_invalid")
+            source_threads_deployed = str(
+                os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            source_threads_requested = request.get("c0_source_threads", False)
+            if not isinstance(source_threads_requested, bool):
+                raise ValueError("golden_c0_source_threads_must_be_bool")
+            if source_threads_requested != source_threads_deployed:
+                raise ValueError("golden_c0_source_threads_deployment_mismatch")
+            if source_threads_deployed and c0_mmap_lifecycle != "whole":
+                raise ValueError("golden_c0_source_threads_requires_whole_lifecycle")
+            # The source-thread arm is restore/deploy-owned.  Never mutate the
+            # process environment per request; a mismatch fails closed above.
+            if not source_threads_deployed:
+                os.environ["COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"] = c0_mmap_lifecycle
             # The resolved value is placed on GoldenRequest below.  This is a
             # real request selector, not an evidence-only environment marker.
             attention_backend = normalize_attention_backend(
@@ -23193,6 +23216,8 @@ class ModalRuntimeEntrypoint:
                 attention_backend or "auto"
             )
             identity_telemetry["golden_mode"] = requested_mode
+            identity_telemetry["c0_mmap_lifecycle"] = c0_mmap_lifecycle
+            identity_telemetry["c0_source_threads"] = source_threads_deployed
             identity_telemetry["deep_trace_level_requested"] = _deep_trace_level
             identity_telemetry["deep_trace_level_effective"] = "off"
             identity_telemetry["output_durability_mode"] = output_policy.mode

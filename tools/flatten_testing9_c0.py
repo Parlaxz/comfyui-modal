@@ -211,6 +211,27 @@ def main() -> int:
                 },
             }
     (OUT / "phase2_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    audit: dict[str, Any] = {"apps": {}}
+    for app in APPS:
+        app_rows = [row for row in operations if row["app"] == app]
+        audit["apps"][app] = {
+            "operation_count": len(app_rows),
+            "lifecycle_codes": {
+                str(code): sum(1 for row in app_rows if row.get("lifecycle_code") == code)
+                for code in sorted({row.get("lifecycle_code") for row in app_rows})
+            },
+            "munmap_nonzero_count": sum(
+                1 for row in app_rows if isinstance(row.get("munmap_ms"), (int, float)) and row["munmap_ms"] > 0
+            ),
+            "mapping_ids_by_run_model": {},
+        }
+        for key in sorted({(row["run"], row["model"]) for row in app_rows}):
+            run, model = key
+            subset = [row for row in app_rows if row["run"] == run and row["model"] == model]
+            audit["apps"][app]["mapping_ids_by_run_model"][f"{run}:{model}"] = sorted({row.get("mapping_id") for row in subset})
+    (OUT / "phase2_execution_identity_audit.json").write_text(
+        json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

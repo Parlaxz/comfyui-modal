@@ -18,6 +18,41 @@ from typing import Any
 
 from . import m2_source_core
 from . import source_race_gpu
+from . import golden_source_threads
+
+
+class _DeferredC0Backend:
+    """Restore-owned backend shell; a model only binds its CUDA destination."""
+
+    def __init__(self) -> None:
+        self._backend: Any = None
+
+    @property
+    def destination(self) -> Any:
+        return getattr(self._backend, "destination", None)
+
+    def bind(self, backend: Any) -> None:
+        self._backend = backend
+
+    def submit_h2d(self, source: Any, destination_offset: int) -> Any:
+        return self._require().submit_h2d(source, destination_offset)
+
+    def poll_event(self, event: Any) -> Any:
+        return self._require().poll_event(event)
+
+    def cancel_event(self, event: Any) -> None:
+        self._require().cancel_event(event)
+
+    def _require(self) -> Any:
+        if self._backend is None:
+            raise RuntimeError("c0_backend_not_bound")
+        return self._backend
+
+    def __getattr__(self, name: str) -> Any:
+        backend = self._backend
+        if backend is None:
+            raise RuntimeError("c0_backend_not_bound")
+        return getattr(backend, name)
 
 QD = 4
 BLOCK_BYTES = 64 * 1024 * 1024
@@ -703,12 +738,21 @@ class GoldenModelTransport:
         # the source byte-producer semantics inside the C0 child workers.
         self._c0_runtime: Any = None
         self._c0_resources: Any = None
+        self._c0_source_transport: Any = None
+        self._c0_source_pool: Any = None
+        self._c0_source_backend = _DeferredC0Backend()
+        self._c0_restore_setup_marks: dict[str, int] = {}
         self._c0_enabled = (
             str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
             in {"1", "true", "yes", "on"}
             and str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE") or "").strip().lower()
             == "mmap_fresh"
         )
+        self._c0_source_threads_enabled = golden_source_threads.enabled()
+        if self._c0_source_threads_enabled and not self._c0_enabled:
+            raise RuntimeError(
+                "golden_c0_source_threads_requires_c0_streaming_mmap_fresh"
+            )
         if (
             str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -828,6 +872,29 @@ class GoldenModelTransport:
                     _c0marks["transfer_resources_end"] = time.monotonic_ns()
 
                 self._pool = GpuDestinationPool(target)
+                if self._c0_source_threads_enabled:
+                    config = qd_transport.TransportConfig(
+                        queue_depth=golden_source_threads.THREAD_COUNT,
+                        block_bytes=golden_source_threads.SLOT_BYTES,
+                        staging_slots=golden_source_threads.SLOT_COUNT,
+                        ready_queue_capacity=golden_source_threads.SLOT_COUNT,
+                        producer_workers=golden_source_threads.THREAD_COUNT,
+                        capacity_class="source-threads-qd4-64m",
+                        h2d_target_bytes=golden_source_threads.SLOT_BYTES,
+                        aggregation_enabled=False,
+                        cleanup_timeout=10.0,
+                    )
+                    self._c0_source_pool = self._c0_runtime.new_stage_pool(config.capacity_class)
+                    # The dispatcher and its worker are restore/container
+                    # resources.  A model load only binds a destination and
+                    # resets operation telemetry.
+                    self._c0_source_transport = qd_transport.GoldenQDTransport(
+                        config, self._c0_source_backend, pool=self._c0_source_pool,
+                        diagnostics=True, resources=self._c0_resources,
+                        persistent_dispatcher=True,
+                    )
+                    self._c0_source_transport.start(destination_size=None)
+                    self._c0_restore_setup_marks["source_transport_created_once"] = time.monotonic_ns()
                 self._cuda = {
                     "device": target,
                     "device_index": device_index,
@@ -1072,6 +1139,173 @@ class GoldenModelTransport:
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
+    def _load_c0_source_threads_sync(self, path: str) -> LoadedSafetensors:
+        """Load through the restore-created source process and shared arena."""
+        started_ns = time.perf_counter_ns()
+        started_mono_ns = time.monotonic_ns()
+        self._c0_setup_marks = marks = {"load_enter": int(started_mono_ns)}
+        from . import golden_io_process_v2 as c0
+        from . import golden_qd_transport as qd_transport
+
+        with self._lock:
+            if self._poisoned:
+                raise RuntimeError("persistent_model_transport_poisoned")
+            runtime = self._c0_runtime
+            resources = self._c0_resources
+            manager = getattr(runtime, "_source_thread_process", None)
+            transport = self._c0_source_transport
+            if runtime is None or resources is None or manager is None or transport is None:
+                raise RuntimeError("source_threads_runtime_not_ready")
+            if (
+                int(runtime.slot_count) != golden_source_threads.SLOT_COUNT
+                or int(runtime.slot_bytes) != golden_source_threads.SLOT_BYTES
+            ):
+                raise RuntimeError("source_threads_geometry_mismatch")
+            if c0.resolve_c0_mmap_lifecycle() not in {"fresh", "whole"}:
+                raise RuntimeError("source_threads_unsupported_mmap_lifecycle")
+
+            normalized_path = os.path.abspath(str(path))
+            layout_cache_hit = normalized_path in self._layout_cache
+            layout_started_ns = time.perf_counter_ns()
+            marks["layout_resolve_begin"] = time.monotonic_ns()
+            layout = self.inspect(path)
+            marks["layout_resolve_end"] = time.monotonic_ns()
+            layout_end_ns = time.perf_counter_ns()
+            owner = self._pool.acquire(layout.data_bytes)
+            backend = qd_transport.CudaTransferBackend(owner.gpu_tensor, resources=resources)
+            self._c0_source_backend.bind(backend)
+            transport.begin_operation(backend, destination_size=layout.data_bytes)
+            ranges = []
+            offset = layout.data_start
+            destination = 0
+            ordinal = 0
+            while destination < layout.data_bytes:
+                length = min(golden_source_threads.SLOT_BYTES, layout.data_bytes - destination)
+                ranges.append(qd_transport.SourceRange(offset, length, destination, ordinal))
+                offset += length
+                destination += length
+                ordinal += 1
+            marks["range_plan_begin"] = time.monotonic_ns()
+            marks["range_plan_end"] = time.monotonic_ns()
+            resources.transport_enter()
+            try:
+                bridge = golden_source_threads.SourcePlanBridge(manager, transport)
+                marks["plan_publish_begin"] = time.monotonic_ns()
+                published = bridge.publish_all(
+                    ranges,
+                    generation=self._load_count + 1,
+                    path=layout.path,
+                    identity=layout.identity,
+                    destination_size=layout.data_bytes,
+                )
+                marks["plan_publish_end"] = time.monotonic_ns()
+                result = transport.finalize_external_ready(
+                    ranges, destination_size=layout.data_bytes, materialize_output=False,
+                )
+                resources.finish_span()
+            except BaseException:
+                # Abort is bounded.  GoldenQDTransport remains the sole owner
+                # of submitted H2D tickets; release the destination only after
+                # it proves no event/lease is live.  Otherwise poison and keep
+                # the owner reachable rather than unregistering live storage.
+                transport._owner_lifetime = owner
+                try:
+                    transport.cancel(timeout=5.0)
+                except BaseException:
+                    self._poisoned = True
+                try:
+                    manager.wait_quiescent(timeout_s=5.0)
+                except BaseException:
+                    self._poisoned = True
+                resources.transport_exit(poisoned=True)
+                if not self._poisoned and transport.backend_owner_release_allowed():
+                    owner.release_storage()
+                else:
+                    self._poisoned = True
+                raise
+            resources.transport_exit(poisoned=transport.pool.poisoned)
+            # The dispatcher has released every source-process slot only after
+            # completion events.  This gate proves no source ownership crosses
+            # the model boundary.
+            manager.wait_quiescent()
+            source_telemetry = manager.snapshot()
+            views = self._views(owner.gpu_tensor, layout.tensor_map)
+            views_ready_ns = time.monotonic_ns()
+            finished_ns = time.perf_counter_ns()
+            exact = (
+                result.submitted_bytes == layout.data_bytes
+                and result.completed_bytes == layout.data_bytes
+                and len(result.records) == len(ranges)
+            )
+            if not exact:
+                raise qd_transport.ReconciliationError("source_threads_exact_coverage_failed")
+            stats = {
+                "status": "ok",
+                "execution_architecture": "source_threads",
+                "execution_arm": "source_threads",
+                "source_engine": "native_mmap",
+                "mmap_lifecycle": c0.resolve_c0_mmap_lifecycle(),
+                "fallback": {"count": 0, "reason": None},
+                "c0_arena_bytes": int(runtime.size_bytes),
+                "c0_arena_created": bool(runtime.created),
+                "c0_arena_reused": bool(self._load_count > 0),
+                "source_read_count": published,
+                "source_read_bytes": layout.data_bytes,
+                "bytes_read": layout.data_bytes,
+                "gpu_bytes": layout.data_bytes,
+                "h2d_submitted_bytes": int(result.submitted_bytes),
+                "h2d_completed_bytes": int(result.completed_bytes),
+                "coverage": {
+                    "ok": True,
+                    "covers_entire_file_exactly_once": True,
+                    "source_bytes": layout.data_bytes,
+                    "source_blocks": len(ranges),
+                },
+                "h2d_coverage": {
+                    "ok": True,
+                    "bytes": int(result.completed_bytes),
+                    "blocks": len(result.records),
+                },
+                "source_thread_telemetry": source_telemetry,
+                "source_detail": {
+                    "arena_ensure": arena_ensure_detail(runtime),
+                    "dispatcher": result.telemetry,
+                    "load_setup_marks": {
+                        **dict(self._c0_restore_setup_marks), **dict(marks),
+                    },
+                    "lifecycle": c0.resolve_c0_mmap_lifecycle(),
+                },
+                "quiescence": {
+                    "workers_joined": False,
+                    "reader_pool_persistent": True,
+                    "h2d_events_waited": True,
+                    "copies_complete": True,
+                    "operation_live": False,
+                    "source_slots_free": True,
+                },
+                "reader_pool_reused": True,
+                "staging_reused": True,
+                "host_registration_reused": bool(self._load_count > 0),
+                "cuda_stream_reused": bool(self._load_count > 0),
+                "destination_reused": bool(owner.reused),
+                "transport_runtime_reused": True,
+                "layout_cache_hit": bool(layout_cache_hit),
+                "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
+                "gpu_ready_ns": result.telemetry.get("final_h2d_completion_observed_ns"),
+                "views_ready_ns": views_ready_ns,
+                "total_load_ms": (finished_ns - started_ns) / 1e6,
+                "source": {
+                    "source_first_enter_ns": source_telemetry.get("source_start_ns", [None])[0]
+                    if source_telemetry.get("source_start_ns") else None,
+                    "source_last_exit_ns": source_telemetry.get("source_operation_records", [{}])[-1].get("ready_ns")
+                    if source_telemetry.get("source_operation_records") else None,
+                    "readers": source_telemetry.get("thread_identities", []),
+                },
+                "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
+            }
+            self._load_count += 1
+            return LoadedSafetensors(layout.path, views, owner, layout, stats)
+
     def _load_c0_sync(self, path: str) -> LoadedSafetensors:
         """Load one checkpoint through the persistent C0 shared arena.
 
@@ -1082,6 +1316,8 @@ class GoldenModelTransport:
         completion gating.  No M2 staging arena is built, no reader processes
         are forked here, and no standalone M2 loader wrapper is entered.
         """
+        if self._c0_source_threads_enabled:
+            return self._load_c0_source_threads_sync(path)
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
         # Passive per-load setup waterfall (observation-only monotonic_ns).
@@ -1173,6 +1409,7 @@ class GoldenModelTransport:
                 pool=pool,
                 source=layout.path,
                 source_identity=tuple(int(value) for value in layout.identity),
+                mmap_lifecycle=c0.resolve_c0_mmap_lifecycle(),
             )
             marks["range_plan_begin"] = int(time.monotonic_ns())
             # NOTE: ranges list built above; mark covers plan assembly.
@@ -1590,14 +1827,25 @@ class GoldenModelTransport:
                 # C0 teardown: release the shared dispatcher resources and the
                 # arena runtime.  No M2 staging/registration/stream exists here.
                 try:
+                    if self._c0_source_transport is not None:
+                        self._c0_source_transport.shutdown(timeout=10.0)
+                except BaseException as exc:
+                    # Do not unregister the shared arena while a dispatcher
+                    # may still own a CUDA event/ticket.  Retain every owner
+                    # reachable for a later bounded cleanup attempt.
+                    self._poisoned = True
+                    raise RuntimeError("c0_source_transport_shutdown_unproven") from exc
+                try:
                     self._c0_resources.close()
-                except BaseException:
-                    pass
+                except BaseException as exc:
+                    self._poisoned = True
+                    raise RuntimeError("c0_transfer_resources_close_unproven") from exc
                 try:
                     from . import golden_io_process_v2 as c0
                     c0.close_runtime()
                 except BaseException:
-                    pass
+                    self._poisoned = True
+                    raise
                 self._closed = True
                 return
             if self._cuda_ready:

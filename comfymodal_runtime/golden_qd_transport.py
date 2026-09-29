@@ -838,6 +838,10 @@ class StageLease:
         self._producer_retired = False
         self.producer_id = producer_id
         self._producer_identity: int | None = producer_id
+        # Experimental shared-source ownership is released only by the
+        # dispatcher after it has observed CUDA completion.  The callback is
+        # intentionally not used by producer or queued-cleanup paths.
+        self._external_release_callback: Callable[[], Any] | None = None
         # Optional C0 source-session ticket.  It is consumed only by the
         # dispatcher's proven CUDA-event completion path.
         self._c0_session: Any = None
@@ -1059,6 +1063,7 @@ class StagingPool:
         declared_range: SourceRange | None = None,
         producer_id: int | None = None,
         preferred_slot_index: int | None = None,
+        preferred_only: bool = False,
     ) -> StageLease:
         requested = self.capacity_class if capacity_class is None else capacity_class
         if requested != self.capacity_class:
@@ -1086,7 +1091,11 @@ class StagingPool:
                 candidates = self._slots
                 if preferred_slot_index is not None:
                     preferred = self._slots[preferred_slot_index]
-                    candidates = [preferred] + [slot for slot in self._slots if slot is not preferred]
+                    candidates = (
+                        [preferred]
+                        if preferred_only
+                        else [preferred] + [slot for slot in self._slots if slot is not preferred]
+                    )
                 for slot in candidates:
                     if slot.state == SlotState.FREE:
                         slot.generation += 1
@@ -1425,6 +1434,7 @@ class _Telemetry:
     producer_destination_offsets: dict[int, list[int]] | None = None
     producer_destination_offset_monotonic: bool | None = True
     producer_ids: tuple[int, ...] = ()
+    source_correlations: dict[str, dict[str, int | None]] | None = None
     affinity_breaks: int = 0
     poisoned: bool = False
     poison_reason: str | None = None
@@ -1482,6 +1492,7 @@ class _Telemetry:
         self.producer_read_bytes = {}
         self.producer_read_counts = {}
         self.producer_last_source_offset = {}
+        self.source_correlations = {}
 
     def note_aggregation_fallback(self, reason: str) -> None:
         self.aggregation_fallback_count += 1
@@ -1535,6 +1546,16 @@ class _Telemetry:
             if offsets and record.destination_offset < offsets[-1]:
                 self.producer_destination_offset_monotonic = False
             offsets.append(record.destination_offset)
+
+    def note_source_correlation(self, record: ReadyRecord, values: Mapping[str, Any]) -> None:
+        if not self.diagnostics_enabled or self.source_correlations is None:
+            return
+        key = str(record.record_id if record.record_id is not None else record.destination_offset)
+        self.source_correlations[key] = {
+            str(name): (int(value) if value is not None else None)
+            for name, value in values.items()
+            if value is None or isinstance(value, int)
+        }
 
     def _source_qd_transition(self, delta: int) -> None:
         if not self.diagnostics_enabled:
@@ -1761,6 +1782,7 @@ class _Telemetry:
                 "direct_readinto_count": self.direct_readinto_count,
                 "static_regions": list(self.static_regions) if self.static_regions is not None else None,
                  "producer_ids": list(self.producer_ids),
+                 "source_correlations": _json_safe(self.source_correlations),
                  "affinity_breaks": self.affinity_breaks,
                 "producer_read_bytes": dict(self.producer_read_bytes or {}),
                 "producer_read_counts": dict(self.producer_read_counts or {}),
@@ -1953,7 +1975,7 @@ class _DispatchSubmission:
 class TransportDispatcher:
     """One owner for H2D submit, event lifecycle, reaping, and slot return."""
 
-    def __init__(self, pool: StagingPool, backend: TransportBackend, config: TransportConfig, telemetry: _Telemetry, destination_size: int | None = None, aggregation_ranges: Sequence[SourceRange] | None = None) -> None:
+    def __init__(self, pool: StagingPool, backend: TransportBackend, config: TransportConfig, telemetry: _Telemetry, destination_size: int | None = None, aggregation_ranges: Sequence[SourceRange] | None = None, *, persistent: bool = False) -> None:
         self.pool, self.backend, self.config, self.telemetry = pool, backend, config, telemetry
         self._c0_window_trace_enabled = _c0_window_trace_enabled()
         self.destination_size = destination_size
@@ -1979,6 +2001,10 @@ class TransportDispatcher:
         self._cancelled = False
         self._cleanup_deadline: float | None = None
         self._thread: threading.Thread | None = None
+        self._persistent = bool(persistent)
+        self._operation_done = threading.Event()
+        self._persistent_wake = threading.Event()
+        self._shutdown = False
         self._next_group_id = 0
         self._submitted_keys: set[tuple[int, int, int, str | int | None]] = set()
         self._aggregation_order = tuple(
@@ -2015,6 +2041,9 @@ class TransportDispatcher:
     def start(self) -> None:
         if self._thread is not None:
             raise TransportError("dispatcher already started")
+        if self._persistent:
+            self._stop = True
+            self._operation_done.set()
         self._thread = threading.Thread(target=self._run, name="golden-qd-dispatcher", daemon=True)
         self._thread.start()
 
@@ -2174,6 +2203,10 @@ class TransportDispatcher:
                     # copy finished.  Count it before pool bookkeeping so a
                     # cleanup race cannot make telemetry claim it did not.
                     completion_observed_ns = time.monotonic_ns()
+                    for completed_record in submission.records:
+                        self.telemetry.note_source_correlation(
+                            completed_record, {"h2d_completion_observed_ns": completion_observed_ns}
+                        )
                     if self._c0_window_trace_enabled:
                         for lease in submission.leases:
                             _c0_trace_stamp(lease, "h2d_completion_observed_ns", completion_observed_ns)
@@ -2190,6 +2223,14 @@ class TransportDispatcher:
                     )
                     for lease in submission.leases:
                         self.pool._return_completed(lease)
+                        release_source = getattr(lease, "_external_release_callback", None)
+                        if callable(release_source):
+                            release_source()
+                            lease._external_release_callback = None
+                        if getattr(lease, "_source_thread_correlation", None) is not None:
+                            self.telemetry.note_source_correlation(
+                                submission.records[0], {"source_slot_release_ns": time.monotonic_ns()}
+                            )
                         if self._c0_window_trace_enabled:
                             _c0_trace_stamp(lease, "slot_return_ns")
                     release_ticket = getattr(self.backend, "release_ticket", None)
@@ -2293,6 +2334,10 @@ class TransportDispatcher:
                         for lease in submission.leases:
                             if not lease._returned:
                                 self.pool._return_completed(lease)
+                                release_source = getattr(lease, "_external_release_callback", None)
+                                if callable(release_source):
+                                    release_source()
+                                    lease._external_release_callback = None
                                 if self._c0_window_trace_enabled:
                                     _c0_trace_stamp(lease, "slot_return_ns")
                         release_ticket = getattr(self.backend, "release_ticket", None)
@@ -2531,6 +2576,11 @@ class TransportDispatcher:
                     self._cleanup_cancelled(self._cleanup_deadline)
                     return
                 if done:
+                    if self._persistent:
+                        self._operation_done.set()
+                        self._persistent_wake.wait()
+                        self._persistent_wake.clear()
+                        continue
                     return
                 if not can_take:
                     with self._queue_condition:
@@ -2557,6 +2607,10 @@ class TransportDispatcher:
                                 else self.pool._buffer_for_dispatch(lease, record.nbytes)
                             )
                     submit_ns = time.monotonic_ns()
+                    for submitted_record in submission.records:
+                        self.telemetry.note_source_correlation(
+                            submitted_record, {"h2d_submit_ns": submit_ns}
+                        )
                     if self._c0_window_trace_enabled:
                         for member in submission.leases:
                             _c0_trace_stamp(member, "h2d_submit_ns", submit_ns)
@@ -2669,6 +2723,17 @@ class TransportDispatcher:
         thread = self._thread
         if thread is None:
             return
+        if self._persistent:
+            self.quiesce()
+            if not bounded:
+                self._operation_done.wait()
+                return
+            if deadline is None:
+                budget = self.config.cleanup_timeout if timeout is None else max(0.0, timeout)
+                deadline = time.monotonic() + budget
+            if not self._operation_done.wait(max(0.0, deadline - time.monotonic())):
+                raise TransportError("persistent dispatcher did not reach bounded quiescence")
+            return
         if not bounded:
             thread.join()
             return
@@ -2720,6 +2785,48 @@ class TransportDispatcher:
         if thread.is_alive():
             self._note_cleanup(TransportError("dispatcher thread did not stop within bounded drain"))
 
+    def reset_for_operation(
+        self, backend: TransportBackend, destination_size: int | None,
+        aggregation_ranges: Sequence[SourceRange] | None,
+        telemetry: _Telemetry,
+    ) -> None:
+        if not self._persistent:
+            raise TransportError("dispatcher is not reusable")
+        with self._queue_condition:
+            if not self._operation_done.is_set() and self._thread is not None:
+                raise TransportError("dispatcher reset while previous operation is live")
+            self.backend = backend
+            self.destination_size = destination_size
+            self.telemetry = telemetry
+            self._aggregation_order = tuple(
+                (item.source_offset, item.target_offset, item.length, item.record_id)
+                for item in sorted(aggregation_ranges or (), key=lambda item: (item.source_offset, item.target_offset))
+            )
+            self._aggregation_index = {key: index for index, key in enumerate(self._aggregation_order)}
+            self._completed_records.clear()
+            self._submitted_keys.clear()
+            self._next_group_id = 0
+            self._dispatcher_error = None
+            self._cleanup_errors.clear()
+            self._cancelled = False
+            self._stop = False
+            self._cancel_requested = False if hasattr(self, "_cancel_requested") else False
+            self._operation_done.clear()
+            self._persistent_wake.set()
+            self._queue_condition.notify_all()
+
+    def shutdown(self, deadline: float | None = None) -> None:
+        if not self._persistent:
+            return
+        with self._queue_condition:
+            self._shutdown = True
+            self._stop = True
+            self._cancelled = True
+            self._persistent_wake.set()
+            self._queue_condition.notify_all()
+        if self._thread is not None:
+            self._thread.join(max(0.0, (deadline or (time.monotonic() + 10.0)) - time.monotonic()))
+
 
 class GoldenQDTransport:
     """Explicit integration seam for a dispatcher-backed Golden stage."""
@@ -2733,6 +2840,7 @@ class GoldenQDTransport:
         pool: StagingPool | None = None,
         diagnostics: bool = True,
         resources: GoldenTransferResources | None = None,
+        persistent_dispatcher: bool = False,
     ) -> None:
         self.config = config or TransportConfig()
         # This class is the dispatcher implementation.  The legacy default is
@@ -2779,6 +2887,7 @@ class GoldenQDTransport:
         self._owner_lifetime: Any = None
         self._static_regions: tuple[tuple[int, int], ...] | None = None
         self._static_work: tuple[tuple[SourceRange, ...], ...] | None = None
+        self._persistent_dispatcher = bool(persistent_dispatcher)
 
     def acquire(
         self,
@@ -2787,18 +2896,19 @@ class GoldenQDTransport:
         declared_range: SourceRange | None = None,
         producer_id: int | None = None,
         preferred_slot_index: int | None = None,
+        preferred_only: bool = False,
     ) -> StageLease:
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         try:
             if not self._c0_window_trace_enabled:
                 return self.pool.acquire(
                     timeout=timeout, declared_range=declared_range, producer_id=producer_id,
-                    preferred_slot_index=preferred_slot_index,
+                    preferred_slot_index=preferred_slot_index, preferred_only=preferred_only,
                 )
             trace_started = time.monotonic_ns()
             lease = self.pool.acquire(
                 timeout=timeout, declared_range=declared_range, producer_id=producer_id,
-                preferred_slot_index=preferred_slot_index,
+                preferred_slot_index=preferred_slot_index, preferred_only=preferred_only,
             )
             if trace_started is not None:
                 lease._c0_window_trace = {
@@ -2834,14 +2944,34 @@ class GoldenQDTransport:
             raise TransportError("transport already started")
         self.dispatcher = TransportDispatcher(
             self.pool, self.backend, self.config, self.telemetry, destination_size,
-            aggregation_ranges,
+            aggregation_ranges, persistent=self._persistent_dispatcher,
         )
         self.dispatcher.start()
+
+    def begin_operation(
+        self, backend: TransportBackend, *, destination_size: int,
+        aggregation_ranges: Sequence[SourceRange] | None = None,
+    ) -> None:
+        """Bind a model destination to restore-owned dispatcher resources."""
+        if self.dispatcher is None:
+            raise TransportError("persistent transport is not started")
+        self.backend = backend
+        self.telemetry = _Telemetry(
+            execution_arm=self.arm, diagnostics_enabled=self.telemetry.diagnostics_enabled
+        )
+        self.dispatcher.reset_for_operation(
+            backend, destination_size, aggregation_ranges, self.telemetry
+        )
 
     def publish(self, lease: StageLease, record: ReadyRecord) -> None:
         if self.dispatcher is None:
             raise TransportError("transport is not started")
         self.dispatcher.publish(lease, record)
+        correlation = getattr(lease, "_source_thread_correlation", None)
+        if isinstance(correlation, Mapping):
+            self.telemetry.note_source_correlation(
+                record, {**correlation, "ready_publish_ns": time.monotonic_ns()}
+            )
 
     def quiesce(self) -> None:
         if self.dispatcher is not None:
@@ -2862,6 +2992,67 @@ class GoldenQDTransport:
             if self.telemetry.diagnostics_enabled:
                 self.telemetry.final_drain_end_ns = time.monotonic_ns()
 
+    def finalize_external_ready(
+        self, ranges: Iterable[SourceRange], *, destination_size: int,
+        materialize_output: bool = False,
+    ) -> TransportResult:
+        """Finalize records published by an external source producer.
+
+        The source-thread bridge may claim/write slots, but it never owns the
+        dispatcher lifecycle.  This seam uses the same dispatcher drain,
+        completion-event proof, pool return, coverage reconciliation, and
+        telemetry shape as ``execute`` without inventing a second H2D path.
+        """
+        if self.dispatcher is None:
+            raise TransportError("external-ready finalization requires a started dispatcher")
+        expected_ranges = self._record_ranges(ranges, int(destination_size))
+        # External source finalization is part of request cleanup, not an
+        # unbounded join.  The dispatcher poisons/retains uncertain ownership
+        # when this deadline cannot prove completion.
+        self.drain(max(5.0, float(self.config.cleanup_timeout)), bounded=True)
+        completed = self.dispatcher.completed_records
+        expected = {
+            (item.source_offset, item.target_offset, item.length, item.record_id)
+            for item in expected_ranges
+        }
+        actual = {
+            (item.source_offset, item.destination_offset, item.nbytes, item.record_id)
+            for item in completed
+        }
+        self.telemetry.coverage_ok = actual == expected and len(completed) == len(expected_ranges)
+        self.telemetry.h2d_reconciled = (
+            self.telemetry.h2d_submitted_bytes == self.telemetry.h2d_completed_bytes
+        )
+        ownership_quiescent = all(state == SlotState.FREE for state in self.pool.states())
+        telemetry = self.telemetry.snapshot(
+            self.config.queue_depth,
+            sum(state == SlotState.FREE for state in self.pool.states()),
+        )
+        telemetry = dict(telemetry)
+        telemetry.update({
+            "external_ready": True,
+            "coverage_ok": bool(self.telemetry.coverage_ok),
+            "h2d_reconciled": bool(self.telemetry.h2d_reconciled),
+            "ownership_quiescent": ownership_quiescent,
+        })
+        if self.dispatcher.dispatcher_error is not None:
+            raise TransportFailure(self.dispatcher.dispatcher_error, telemetry=telemetry)
+        if not self.telemetry.coverage_ok or not self.telemetry.h2d_reconciled or not ownership_quiescent:
+            raise TransportFailure(
+                ReconciliationError("external-ready coverage or H2D reconciliation failed"),
+                telemetry=telemetry,
+            )
+        output = None
+        if materialize_output:
+            output = _read_destination(getattr(self.backend, "destination", None), destination_size)
+        return TransportResult(
+            tuple(sorted(completed, key=lambda item: (item.destination_offset, item.source_offset))),
+            self.telemetry.h2d_submitted_bytes,
+            self.telemetry.h2d_completed_bytes,
+            output,
+            telemetry,
+        )
+
     def cancel(self, timeout: float | None = None) -> None:
         self._cancel_requested = True
         # Compute the effective deadline once.  Every participant in this
@@ -2872,6 +3063,10 @@ class GoldenQDTransport:
         if self.dispatcher is not None:
             self.dispatcher.cancel(deadline=deadline)
             self.dispatcher.drain(bounded=True, deadline=deadline)
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        if self.dispatcher is not None:
+            self.dispatcher.shutdown(time.monotonic() + max(0.0, timeout))
 
     def _request_abort(self) -> None:
         self._begin_abort()
