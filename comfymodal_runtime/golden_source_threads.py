@@ -63,6 +63,8 @@ OP_OFFSET = SLOT_OFFSET + SLOT_COUNT * SLOT.size
 MAX_OPS = (CONTROL_BYTES - OP_OFFSET) // OP.size
 COUNTER_OFFSET = HEADER.size
 COUNTERS = struct.Struct("<QQQQQQQ")
+ERROR_OFFSET = COUNTER_OFFSET + COUNTERS.size
+ERROR_BYTES = 1024
 
 FREE = 0
 FILLING = 1
@@ -327,6 +329,17 @@ def _bump_counter(buf: memoryview, index: int, amount: int = 1) -> None:
     COUNTERS.pack_into(buf, COUNTER_OFFSET, *values)
 
 
+def _write_error(buf: memoryview, message: str) -> None:
+    encoded = str(message).encode("utf-8", "replace")[: ERROR_BYTES - 1]
+    buf[ERROR_OFFSET : ERROR_OFFSET + ERROR_BYTES] = encoded + b"\0" * (ERROR_BYTES - len(encoded))
+
+
+def _read_error(buf: memoryview) -> str:
+    return bytes(buf[ERROR_OFFSET : ERROR_OFFSET + ERROR_BYTES]).split(b"\0", 1)[0].decode(
+        "utf-8", "replace"
+    )
+
+
 def _time_weighted_concurrency(operations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Summarize mapped-copy concurrency over the complete source span."""
     intervals = [
@@ -538,7 +551,8 @@ class SourceThreadProcess:
         with self._lock:
             failed = _read_header(self.control.buf)[-1]
         if failed:
-            raise SourceProtocolError("source_thread_failed")
+            detail = _read_error(self.control.buf)
+            raise SourceProtocolError(f"source_thread_failed:{detail or 'unknown'}")
 
     def wait_ready(self, timeout_s: float = 30.0) -> ReadyRecord | None:
         deadline = time.monotonic() + timeout_s
@@ -1053,6 +1067,7 @@ def _child_main(arena_name: str, control_name: str, lock_path: str) -> int:
                             completed_count=values[9],
                             failed_count=values[10] + 1,
                         )
+                        _write_error(control.buf, f"{type(exc).__name__}:{exc}")
                 except BaseException:
                     pass
                 fatal.append(f"{type(exc).__name__}:{exc}")
