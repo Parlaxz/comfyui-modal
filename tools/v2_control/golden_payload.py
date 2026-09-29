@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from pathlib import Path
 import tomllib
@@ -36,16 +37,40 @@ def _profile_deploy_environment(name: str) -> str | None:
     profile's declarative environment when the caller did not provide a value.
     """
     profile = str(os.environ.get("COMFYMODAL_V2CTL_PROFILE") or "").strip()
-    if not profile or any(token in profile for token in ("/", "\\", "..")):
+    if profile and not any(token in profile for token in ("/", "\\", "..")):
+        filename = profile if profile.endswith(".toml") else f"{profile}.toml"
+        path = Path(__file__).resolve().parents[2] / "config" / "v2" / "profiles" / filename
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            value = (data.get("environment") or {}).get(name)
+            if value is not None:
+                return str(value)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    # The Windows run wrapper may not preserve the profile name, but v2ctl
+    # still carries the config-owned app/deployment identity.  Resolve the
+    # exact receipt rather than selecting a newest file by mtime.
+    app = str(os.environ.get("COMFYMODAL_V2_APP_NAME") or "").strip()
+    fingerprint = str(os.environ.get("COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT") or "").strip()
+    if not app:
         return None
-    filename = profile if profile.endswith(".toml") else f"{profile}.toml"
-    path = Path(__file__).resolve().parents[2] / "config" / "v2" / "profiles" / filename
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-        value = (data.get("environment") or {}).get(name)
-        return None if value is None else str(value)
-    except (OSError, ValueError, TypeError):
-        return None
+    deployment_dir = Path(__file__).resolve().parents[2] / ".v2ctl" / "deployments"
+    matches: list[str] = []
+    for receipt_path in sorted(deployment_dir.glob("receipt_*.json")):
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            target = receipt.get("target") or {}
+            if str(target.get("app") or target.get("app_name") or "") != app:
+                continue
+            if fingerprint and str(receipt.get("deploy_fingerprint") or "") != fingerprint:
+                continue
+            value = (receipt.get("effective_environment") or {}).get(name)
+            if value is not None:
+                matches.append(str(value))
+        except (OSError, ValueError, TypeError):
+            continue
+    return matches[0] if len(set(matches)) == 1 else None
 
 
 def _golden_p1_request_payload(
@@ -79,7 +104,7 @@ def _golden_p1_request_payload(
         else (
             os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE")
             or _profile_deploy_environment("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE")
-            or "fresh"
+            or ("whole" if c0_source_threads else "fresh")
         )
     ).strip().lower()
     if lifecycle not in {"fresh", "whole", "epoch"}:
