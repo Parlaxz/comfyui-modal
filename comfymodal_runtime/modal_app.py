@@ -19373,6 +19373,8 @@ class ModalRuntimeEntrypoint:
 
         modules = (
             "comfymodal_runtime.modal_app",
+            "comfymodal_runtime.config_authority",
+            "comfymodal_runtime.deployment_spec",
             "comfymodal_runtime.critical_path_ledger",
             "comfymodal_runtime.runtime_bootstrap",
             "comfymodal_runtime.runtime_executor",

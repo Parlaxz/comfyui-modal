@@ -81,6 +81,11 @@ _V2_EFFECTIVE_RUNTIME_DEFAULTS = {
     "COMFYMODAL_V2_PREFILL_LANES": "critical",
     "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "0",
     "COMFYMODAL_SAMPLING_DEEP_PROFILE": "off",
+    # Golden source-thread/lifecycle selectors are restore-owned in the
+    # experimental arm; carry the resolved deploy values into the late image
+    # environment instead of relying on the host run wrapper.
+    "COMFYMODAL_GOLDEN_C0_SOURCE_THREADS": "0",
+    "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": "fresh",
 }
 
 

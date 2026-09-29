@@ -31,6 +31,8 @@ def repo_root(tmp_path: Path) -> Path:
     runtime.mkdir(parents=True)
     payloads = {
         "modal_app.py": CONTENT_A,
+        "config_authority.py": b"# module config\nvalue = 0\n",
+        "deployment_spec.py": b"# module deployment\nvalue = 0\n",
         "critical_path_ledger.py": CONTENT_B,
         "runtime_bootstrap.py": b"# module C\nvalue = 3\n",
         "runtime_executor.py": b"# module D\nvalue = 4\n",

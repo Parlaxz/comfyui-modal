@@ -33,6 +33,8 @@ from typing import Any
 # Modules that must byte-match the deployed image.
 REQUIRED_MODULES = (
     "comfymodal_runtime/modal_app.py",
+    "comfymodal_runtime/config_authority.py",
+    "comfymodal_runtime/deployment_spec.py",
     "comfymodal_runtime/critical_path_ledger.py",
     "comfymodal_runtime/runtime_bootstrap.py",
     "comfymodal_runtime/runtime_executor.py",
@@ -51,6 +53,8 @@ REQUIRED_MODULES = (
 # Remote module names (dotted, as imported inside the container).
 REMOTE_MODULE_NAMES = {
     "comfymodal_runtime/modal_app.py": "comfymodal_runtime.modal_app",
+    "comfymodal_runtime/config_authority.py": "comfymodal_runtime.config_authority",
+    "comfymodal_runtime/deployment_spec.py": "comfymodal_runtime.deployment_spec",
     "comfymodal_runtime/critical_path_ledger.py": "comfymodal_runtime.critical_path_ledger",
     "comfymodal_runtime/runtime_bootstrap.py": "comfymodal_runtime.runtime_bootstrap",
     "comfymodal_runtime/runtime_executor.py": "comfymodal_runtime.runtime_executor",
