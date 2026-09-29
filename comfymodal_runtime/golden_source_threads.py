@@ -733,7 +733,21 @@ class SourcePlanBridge:
                 budget = max(0.01, deadline - time.monotonic())
                 record = self.manager.wait_ready(budget)
                 if record is None:
-                    raise SourceProtocolError("source_ready_timeout")
+                    try:
+                        snapshot = self.manager.snapshot()
+                        raise SourceProtocolError(
+                            "source_ready_timeout:"
+                            f"next_range={snapshot.get('next_range')}:"
+                            f"failed={snapshot.get('failed_count')}:"
+                            f"slots={snapshot.get('slot_states')}:"
+                            f"operations={snapshot.get('source_operations')}"
+                        )
+                    except SourceProtocolError:
+                        raise
+                    except BaseException as exc:
+                        raise SourceProtocolError(
+                            f"source_ready_timeout:snapshot_error={type(exc).__name__}"
+                        ) from exc
                 record = self.manager.claim_ready(record)
                 claimed.append(record)
                 item = normalized[record.range_index]
