@@ -870,6 +870,19 @@ class BackendRunner:
             if p not in seen:
                 candidate_dirs.append(p)
                 seen.add(p)
+        for match in _MANIFEST_PATH_RE.finditer(backend_result_stdout or ""):
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            manifest_path = Path(raw)
+            if not manifest_path.exists() and "\\" in raw:
+                manifest_path = Path(raw.replace("\\", os.sep))
+            if not manifest_path.is_absolute():
+                manifest_path = self._repo_root / manifest_path
+            parent = manifest_path.parent
+            if parent not in seen:
+                candidate_dirs.append(parent)
+                seen.add(parent)
 
         output_dir: Path | None = None
         run_artifact: Path | None = None
