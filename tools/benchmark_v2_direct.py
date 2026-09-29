@@ -11762,6 +11762,10 @@ async def _run_golden_p1(
         artifact: dict[str, Any] = {
             "run_index": index,
             "v2ctl_invocation_id": invocation_id,
+            "profile": str(os.environ.get("COMFYMODAL_V2CTL_PROFILE", "") or ""),
+            "profile_config_fingerprint": str(
+                os.environ.get("COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT", "") or ""
+            ),
             "request_id": req_id,
             "mode": cohort_mode,
             "method": remote_method,
