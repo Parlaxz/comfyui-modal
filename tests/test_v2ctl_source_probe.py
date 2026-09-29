@@ -16,6 +16,8 @@ import pytest
 
 from tools.v2_control import source_probe as sp
 
+pytestmark = pytest.mark.fast_unit
+
 # A real expected-local module dict for a temp file.
 CONTENT_A = b"# module A\nvalue = 1\n"
 CONTENT_B = b"# module B\nvalue = 2\n"
@@ -35,11 +37,14 @@ def repo_root(tmp_path: Path) -> Path:
         "gantt_telemetry.py": b"# module E\nvalue = 5\n",
         "model_preload.py": b"# module F\nvalue = 6\n",
         "clip_fast_hydration_wiring.py": b"# module G\nvalue = 7\n",
-        "registry_proof_store.py": b"# module H\nvalue = 8\n",
-        "golden_serial.py": b"# module I\nvalue = 9\n",
-        "golden_qd_transport.py": b"# module J\nvalue = 10\n",
-        "output_durability.py": b"# module K\nvalue = 11\n",
-    }
+    "registry_proof_store.py": b"# module H\nvalue = 8\n",
+    "golden_serial.py": b"# module I\nvalue = 9\n",
+    "golden_io_process_v2.py": b"# module J\nvalue = 10\n",
+    "golden_model_transport.py": b"# module K\nvalue = 11\n",
+    "golden_qd_transport.py": b"# module L\nvalue = 12\n",
+    "golden_source_threads.py": b"# module M\nvalue = 13\n",
+    "output_durability.py": b"# module N\nvalue = 14\n",
+}
     for name, data in payloads.items():
         (runtime / name).write_bytes(data)
     return root
@@ -98,9 +103,11 @@ def test_sha256_file_deterministic(repo_root: Path) -> None:
 def test_compute_expected_local(repo_root: Path) -> None:
     expected = sp.compute_expected_local(repo_root)
     assert "comfymodal_runtime/registry_proof_store.py" in sp.REQUIRED_MODULES
-    assert sp.REQUIRED_MODULES[-3:] == (
-        "comfymodal_runtime/golden_serial.py",
+    assert sp.REQUIRED_MODULES[-5:] == (
+        "comfymodal_runtime/golden_io_process_v2.py",
+        "comfymodal_runtime/golden_model_transport.py",
         "comfymodal_runtime/golden_qd_transport.py",
+        "comfymodal_runtime/golden_source_threads.py",
         "comfymodal_runtime/output_durability.py",
     )
     assert expected["modules"]["comfymodal_runtime/modal_app.py"]["sha256"] == sp.sha256_file(

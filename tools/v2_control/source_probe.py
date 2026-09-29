@@ -41,7 +41,10 @@ REQUIRED_MODULES = (
     "comfymodal_runtime/clip_fast_hydration_wiring.py",
     "comfymodal_runtime/registry_proof_store.py",
     "comfymodal_runtime/golden_serial.py",
+    "comfymodal_runtime/golden_io_process_v2.py",
+    "comfymodal_runtime/golden_model_transport.py",
     "comfymodal_runtime/golden_qd_transport.py",
+    "comfymodal_runtime/golden_source_threads.py",
     "comfymodal_runtime/output_durability.py",
 )
 
@@ -56,7 +59,10 @@ REMOTE_MODULE_NAMES = {
     "comfymodal_runtime/clip_fast_hydration_wiring.py": "comfymodal_runtime.clip_fast_hydration_wiring",
     "comfymodal_runtime/registry_proof_store.py": "comfymodal_runtime.registry_proof_store",
     "comfymodal_runtime/golden_serial.py": "comfymodal_runtime.golden_serial",
+    "comfymodal_runtime/golden_io_process_v2.py": "comfymodal_runtime.golden_io_process_v2",
+    "comfymodal_runtime/golden_model_transport.py": "comfymodal_runtime.golden_model_transport",
     "comfymodal_runtime/golden_qd_transport.py": "comfymodal_runtime.golden_qd_transport",
+    "comfymodal_runtime/golden_source_threads.py": "comfymodal_runtime.golden_source_threads",
     "comfymodal_runtime/output_durability.py": "comfymodal_runtime.output_durability",
 }
 
