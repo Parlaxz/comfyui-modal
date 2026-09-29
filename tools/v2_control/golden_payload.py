@@ -53,7 +53,7 @@ def _profile_deploy_environment(name: str) -> str | None:
     # exact receipt rather than selecting a newest file by mtime.
     app = str(os.environ.get("COMFYMODAL_V2_APP_NAME") or "").strip()
     fingerprint = str(os.environ.get("COMFYMODAL_V2CTL_DEPLOY_FINGERPRINT") or "").strip()
-    if not app:
+    if not app and not fingerprint:
         return None
     deployment_dir = Path(__file__).resolve().parents[2] / ".v2ctl" / "deployments"
     matches: list[str] = []
@@ -61,11 +61,22 @@ def _profile_deploy_environment(name: str) -> str | None:
         try:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             target = receipt.get("target") or receipt.get("deployment_identity") or {}
-            if str(target.get("app") or target.get("app_name") or "") != app:
+            target_app = str(target.get("app") or target.get("app_name") or "")
+            if app and target_app != app:
                 continue
             if fingerprint and str(receipt.get("deploy_fingerprint") or "") != fingerprint:
                 continue
             value = (receipt.get("effective_environment") or {}).get(name)
+            if value is None:
+                receipt_profile = str(receipt.get("profile") or "").strip()
+                if receipt_profile and not any(token in receipt_profile for token in ("/", "\\", "..")):
+                    filename = receipt_profile if receipt_profile.endswith(".toml") else f"{receipt_profile}.toml"
+                    profile_path = Path(__file__).resolve().parents[2] / "config" / "v2" / "profiles" / filename
+                    try:
+                        profile_data = tomllib.loads(profile_path.read_text(encoding="utf-8"))
+                        value = (profile_data.get("environment") or {}).get(name)
+                    except (OSError, ValueError, TypeError):
+                        value = None
             if value is not None:
                 matches.append(str(value))
         except (OSError, ValueError, TypeError):
