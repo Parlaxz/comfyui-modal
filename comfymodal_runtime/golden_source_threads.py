@@ -241,21 +241,23 @@ class GlobalSourcePacer:
         the native copy; the marker validates the real observed start order and
         fails closed if scheduling ever creates a sub-4 ms gap.
         """
-        with self._lock:
+        self._lock.acquire()
+        released = False
+        try:
             waited = 0
             while True:
                 now = int(self._clock())
-                target = now if self.last_start_ns is None else max(now, self.last_start_ns + self.gap_ns)
+                previous_actual = self.actual_timestamps_ns[-1] if self.actual_timestamps_ns else None
+                target = now if previous_actual is None else max(now, previous_actual + self.gap_ns)
                 if target <= now:
                     break
                 delay = target - now
                 waited += delay
                 self._sleep(delay / 1e9)
             access_start = int(self._clock())
-
-        def mark_actual_start() -> int:
-            actual = int(self._clock())
-            with self._lock:
+            def mark_actual_start() -> int:
+                nonlocal released
+                actual = int(self._clock())
                 previous_actual = self.actual_timestamps_ns[-1] if self.actual_timestamps_ns else None
                 if previous_actual is not None and actual - previous_actual < self.gap_ns:
                     raise SourceProtocolError(
@@ -264,14 +266,20 @@ class GlobalSourcePacer:
                     )
                 self.actual_timestamps_ns.append(actual)
                 self.timestamps_ns.append(actual)
+                self.last_start_ns = actual
                 self.wait_ns.append(waited)
                 if waited == 0:
                     self.zero_delay_count += 1
-            return actual
+                self._lock.release()
+                released = True
+                return actual
 
-        result = callback(mark_actual_start)
-        memcpy_start = int(result if result is not None else self._clock())
-        return access_start, memcpy_start, waited
+            result = callback(mark_actual_start)
+            memcpy_start = int(result if result is not None else self._clock())
+            return access_start, memcpy_start, waited
+        finally:
+            if not released:
+                self._lock.release()
 
 
 class _FileLock:
