@@ -3637,6 +3637,14 @@ def cmd_run(args, repo_root: Path) -> int:
             _apply_workspace_binding_to_env(env, workspace_binding)
         if bound_receipt is not None:
             env = _receipt_effective_env(env, bound_receipt)
+            # The receipt contains the deployment invocation identity.  A run
+            # must retain the current run invocation so its artifact binds to
+            # this request rather than being misattributed to deployment.
+            env["COMFYMODAL_V2CTL_INVOCATION_ID"] = invocation_id
+            env["COMFYMODAL_V2CTL_PROFILE"] = str(config.profile_name)
+            env["COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT"] = (
+                fingerprints.profile_config_fingerprint()
+            )
             env["COMFYMODAL_V2CTL_RUN_FINGERPRINT"] = val_mod._bound_run_fingerprint(
                 fingerprints, bound_receipt
             )
