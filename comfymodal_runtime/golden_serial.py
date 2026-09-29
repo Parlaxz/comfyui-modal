@@ -9683,10 +9683,14 @@ async def golden_restore(session: GoldenSession) -> dict:
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise RuntimeError(f"restore_metadata_boundary_invalid:{key}")
         rec.record_external_restore(metadata)
+        source_threads_restore = str(
+            os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         preload_workers = [
             t.name
             for t in threading.enumerate()
-            if "preload" in t.name.lower() or t.name.startswith("golden-qd")
+            if "preload" in t.name.lower()
+            or (t.name.startswith("golden-qd") and not source_threads_restore)
         ]
         if preload_workers:
             raise RuntimeError(f"restore_preload_workers_present:{preload_workers}")
