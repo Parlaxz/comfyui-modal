@@ -1027,6 +1027,20 @@ def _child_main(arena_name: str, control_name: str, lock_path: str) -> int:
                     if thread_id in active_claims:
                         active_claims.discard(thread_id)
                         active_workers = max(0, active_workers - 1)
+                try:
+                    with lock:
+                        values = list(_read_header(control.buf))
+                        _write_header(
+                            control.buf,
+                            generation=values[5],
+                            plan_count=values[6],
+                            next_range=values[7],
+                            ready_count=values[8],
+                            completed_count=values[9],
+                            failed_count=values[10] + 1,
+                        )
+                except BaseException:
+                    pass
                 fatal.append(f"{type(exc).__name__}:{exc}")
                 stop.set()
                 plan_ready.set()
