@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import concurrent.futures
 import dataclasses
 import hashlib
 import importlib.util
@@ -3270,3 +3271,86 @@ def test_sampler_prepare_only_inspects_nodes_executed_during_prep():
 
     assert details["executed_nodes"] == ["prep"]
     assert session.recorder.intervals["golden_sampler_prepare"].details["executed_nodes"] == ["prep"]
+
+
+def test_clip_skeleton_overlap_join_awaits_completed_future_and_refusal():
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    clip = object()
+    overlap = gs._ClipSkeletonOverlap(
+        executor.submit(lambda: {
+            "outcome": "ok",
+            "clip": clip,
+            "construct_start_ns": 1,
+            "construct_end_ns": 2,
+            "meta_sd_build_ms": 0.1,
+        }),
+        executor,
+    )
+    assert asyncio.run(overlap.join()) is clip
+
+    refusal_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    refusal = gs._ClipSkeletonOverlap(
+        refusal_executor.submit(lambda: {"outcome": "refused", "reason": "header:test"}),
+        refusal_executor,
+    )
+    assert asyncio.run(refusal.join()) is None
+
+
+def test_clip_skeleton_overlap_cancellation_does_not_block_event_loop():
+    started = threading.Event()
+    release = threading.Event()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def blocked():
+        started.set()
+        release.wait(1.0)
+        return {"outcome": "refused", "reason": "released"}
+
+    future = executor.submit(blocked)
+    overlap = gs._ClipSkeletonOverlap(future, executor)
+
+    async def exercise():
+        task = asyncio.create_task(overlap.join())
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.1)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        future.result(timeout=1.0)
+
+
+def test_clip_skeleton_overlap_timeout_is_bounded_and_does_not_fall_back(
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def blocked():
+        started.set()
+        release.wait(1.0)
+        return {"outcome": "ok", "clip": object()}
+
+    future = executor.submit(blocked)
+    overlap = gs._ClipSkeletonOverlap(future, executor)
+    monkeypatch.setattr(gs, "CLIP_SKELETON_OVERLAP_TIMEOUT_S", 0.02)
+
+    async def exercise():
+        await asyncio.to_thread(started.wait)
+        tick = asyncio.create_task(asyncio.sleep(0.005))
+        started_at = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError, match="clip_skeleton_overlap_timeout"):
+            await overlap.join()
+        elapsed = asyncio.get_running_loop().time() - started_at
+        await tick
+        assert elapsed < 0.2
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        future.result(timeout=1.0)

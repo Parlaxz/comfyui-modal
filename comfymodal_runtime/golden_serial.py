@@ -2041,6 +2041,10 @@ def _stage_diagnostics_enabled() -> bool:
 
 
 CLIP_SKELETON_OVERLAP_ENV = "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP"
+# The overlap worker is an optimization, not a second loader authority.  A
+# timeout therefore aborts the attempt instead of allowing the serial
+# constructor to race a still-running worker.
+CLIP_SKELETON_OVERLAP_TIMEOUT_S = 30.0
 
 
 def clip_skeleton_overlap_enabled() -> bool:
@@ -2083,21 +2087,82 @@ def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str]:
 
 
 class _ClipSkeletonOverlap:
-    def __init__(self, future: Any, executor: Any) -> None:
+    def __init__(self, future: Any, executor: Any, *, started_ns: int | None = None) -> None:
         self.future = future
         self.executor = executor
+        self.started_ns = started_ns if started_ns is not None else time.monotonic_ns()
 
-    def join(self, *, rec: Any = None, source_start_ns: int | None = None,
-             source_end_ns: int | None = None) -> Any:
-        payload = self.future.result()
+    def _shutdown_executor(self) -> None:
         try:
-            self.executor.shutdown(wait=False)
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # Python versions before 3.9 do not expose cancel_futures.
+            try:
+                self.executor.shutdown(wait=False)
+            except Exception:
+                pass
         except Exception:
             pass
-        if payload.get("outcome") != "ok":
+
+    async def join(self, *, rec: Any = None, source_start_ns: int | None = None,
+                   source_end_ns: int | None = None) -> Any:
+        """Await the worker without blocking the request event loop.
+
+        Cancellation and timeout deliberately do not return ``None``: the
+        worker may still be running and the canonical constructor must not be
+        started concurrently with it.  Only a completed refusal permits the
+        caller to use the serial constructor.
+        """
+        join_started_ns = time.monotonic_ns()
+        wrapped = asyncio.wrap_future(self.future)
+        timeout_s = max(
+            0.0,
+            float(CLIP_SKELETON_OVERLAP_TIMEOUT_S)
+            - max(0.0, time.monotonic_ns() - self.started_ns) / 1e9,
+        )
+        try:
+            if self.future.done():
+                # A completed refusal is safe to hand back to the canonical
+                # constructor even if source transport used the full budget.
+                payload = dict(await wrapped)
+            else:
+                payload = dict(await asyncio.wait_for(wrapped, timeout=timeout_s))
+        except asyncio.TimeoutError as exc:
+            if rec is not None:
+                try:
+                    rec.event(
+                        "clip_skeleton_overlap_timeout",
+                        timeout_s=float(CLIP_SKELETON_OVERLAP_TIMEOUT_S),
+                        elapsed_s=round(
+                            max(0.0, time.monotonic_ns() - self.started_ns) / 1e9, 3
+                        ),
+                    )
+                except Exception:
+                    pass
+            raise TimeoutError("clip_skeleton_overlap_timeout") from exc
+        except asyncio.CancelledError:
+            if rec is not None:
+                try:
+                    rec.event("clip_skeleton_overlap_cancelled")
+                except Exception:
+                    pass
+            raise
+        finally:
+            # Never wait for a running constructor here.  cancel_futures
+            # prevents queued work from surviving cancellation where the
+            # executor supports it; a running worker remains isolated and its
+            # text_encoder_initial_device restoration still runs in build().
+            self._shutdown_executor()
+
+        payload["join_wait_ms"] = (
+            time.monotonic_ns() - join_started_ns
+        ) / 1e6
+        if payload.get("outcome") == "refused":
             if rec is not None:
                 rec.event("clip_skeleton_overlap_refused", reason=payload.get("reason"))
             return None
+        if payload.get("outcome") != "ok":
+            raise RuntimeError("clip_skeleton_overlap_invalid_outcome")
         if rec is not None:
             rec.event(
                 "clip_skeleton_overlap_join",
@@ -2165,10 +2230,11 @@ def _start_clip_skeleton_overlap(session: Any, *, spec: Any, rec: Any) -> Option
             return {"outcome": "refused", "reason": f"construct:{type(exc).__name__}"}
 
     from concurrent.futures import ThreadPoolExecutor
+    overlap_started_ns = time.monotonic_ns()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-skeleton")
     future = executor.submit(build)
     rec.event("clip_skeleton_overlap_start", checkpoints=len(paths), clip_paths=paths)
-    return _ClipSkeletonOverlap(future, executor)
+    return _ClipSkeletonOverlap(future, executor, started_ns=overlap_started_ns)
 
 
 def _allocator_state() -> dict[str, Any]:
@@ -11686,7 +11752,7 @@ async def golden_clip_load(
         clip = None
         if overlap_construct is not None:
             with clip_timing.span("skeleton_patcher_construction"):
-                clip = overlap_construct.join(
+                clip = await overlap_construct.join(
                     rec=rec,
                     source_start_ns=overlap_source_start_ns,
                     source_end_ns=overlap_source_end_ns,
