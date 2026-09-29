@@ -11918,6 +11918,18 @@ async def _run_golden_p1(
             artifact["cold_evidence"] = cold
             artifact["true_cold"] = cold["true_cold"]
             artifact["valid"] = bool(valid and cold["true_cold"])
+            # Project the already-validated host acceptance proof into the
+            # compact telemetry surface consumed by v2ctl gate/confirm.  The
+            # runtime identity is authoritative; these fields do not invent a
+            # new cold state or replace the raw identity evidence.
+            if isinstance(artifact.get("golden_telemetry"), dict):
+                artifact["golden_telemetry"]["fresh"] = bool(cold["true_cold"])
+                artifact["golden_telemetry"]["restored"] = False
+                artifact["golden_telemetry"]["v2ctl_config"] = (
+                    f"deploy={artifact.get('deployment_identity', '')} "
+                    f"run={artifact.get('run_fingerprint', '')} "
+                    f"profile={artifact.get('profile', '')}"
+                )
             if not cold["true_cold"] and cold["reason_not_cold"] not in failures:
                 failures.append(cold["reason_not_cold"])
             artifact["failures"] = failures
