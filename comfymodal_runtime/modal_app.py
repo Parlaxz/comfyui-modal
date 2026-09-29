@@ -12563,6 +12563,22 @@ class ModalRuntimeEntrypoint:
             self._golden_minimal_restore_logical_gpu_state()
             _mark("logical_gpu_repair_ms", _t)
 
+            # The experimental source-thread arm deliberately establishes its
+            # one-time CUDA/arena/source-process/dispatcher resources during
+            # restore.  The ordinary minimal-restore path remains CUDA-lazy;
+            # only the explicitly deploy-owned arm pays this cost here so it
+            # cannot reappear in CLIP model-load pre-source.
+            _source_threads_enabled = str(
+                os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if _source_threads_enabled:
+                _t = time.perf_counter()
+                from .golden_model_transport import get_golden_model_transport
+
+                get_golden_model_transport().initialize_cuda()
+                _mark("source_thread_restore_setup_ms", _t)
+                telemetry["source_thread_restore_setup"] = "initialized"
+
             _t = time.perf_counter()
             _models_decision = self._golden_minimal_assert_models_generation()
             _mark("models_generation_check_ms", _t)
