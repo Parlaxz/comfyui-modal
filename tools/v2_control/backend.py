@@ -959,7 +959,10 @@ class BackendRunner:
                     kind = None
                     if name == "campaign_manifest.json":
                         kind = "manifest"
-                    elif name.startswith("run_") and name.endswith(".json"):
+                    elif (
+                        (name.startswith("run_") or name.startswith("attempt_"))
+                        and name.endswith(".json")
+                    ):
                         kind = "run"
                     elif name.startswith("summary") and name.endswith(".json"):
                         kind = "summary"
