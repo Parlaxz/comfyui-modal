@@ -76,6 +76,10 @@ def _progress_enabled() -> bool:
 
 def _hb(stage: str) -> None:
     _PROGRESS_STATE["last_stage"] = stage
+    # Also feed the shared mark list so the recorder event emitted before
+    # telemetry persist carries the inner stage decomposition, not just the
+    # wrapper's entry mark.
+    _OUTER_MARKS.append((stage, time.monotonic_ns(), 0, ""))
     if not _progress_enabled():
         return
     t0 = int(_PROGRESS_STATE.get("t0_ns") or 0)
