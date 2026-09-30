@@ -76,7 +76,13 @@ def test_models_generation_invalidates_layout_cache_without_recreating_runtime(t
 
 def test_transport_load_is_role_neutral_and_path_driven():
     signature = inspect.signature(GoldenModelTransport.load)
-    assert tuple(signature.parameters) == ("self", "path")
+    assert tuple(signature.parameters) == ("self", "path", "role")
+    # The role is a diagnostic label for the 30 s per-model-load gate only.
+    # It must never become a dispatch input: the loader still runs entirely
+    # off the resolved path, and an unlabelled caller keeps the neutral default.
+    role = signature.parameters["role"]
+    assert role.kind is inspect.Parameter.KEYWORD_ONLY
+    assert role.default == "model"
 
 
 def test_transport_geometry_is_fixed_to_proven_m2_contract(monkeypatch):

@@ -92,8 +92,11 @@ def test_parallel_c0_profile_keeps_overlap_and_selects_c0_shared_arena():
     assert "load_m2_safetensors" not in transport
     assert '"execution_architecture": "c0_parallel"' in transport
     assert '"source_engine": "m2_exact_window"' in transport
-    assert "transport.load_sync(path)" in serial
-    assert "shared_transport.load(unet_path)" in serial
+    # Each major model load names its role so the 30 s load gate can fail as
+    # golden_clip_load_timeout_30s / golden_unet_load_timeout_30s.  The role is
+    # a label on the gate, never a change of which loader runs.
+    assert "transport.load_sync(path, role=role)" in serial
+    assert 'shared_transport.load(unet_path, role="unet")' in serial
     assert 'model_transport.load(session.model_paths["vae"])' in serial
 
 

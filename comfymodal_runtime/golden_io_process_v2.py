@@ -1590,6 +1590,33 @@ def resolve_c0_mmap_lifecycle(value: Any = None) -> str:
     return selected
 
 
+C0_SOURCE_WORKER_KIND_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
+_C0_SOURCE_WORKER_KINDS = ("thread", "process")
+
+
+def resolve_c0_source_worker_kind(value: Any = None) -> str:
+    """Explicit, fail-closed source reader-isolation selector.
+
+    ``thread``  : one source owner process with four reader threads (one
+                  address space, one descriptor, one whole-file mapping).
+    ``process`` : one CUDA-sterile supervisor with four independent persistent
+                  reader processes (one address space, one descriptor and one
+                  whole-file mapping each).
+
+    Any other value fails closed rather than silently falling back.
+    """
+    selected = (
+        os.environ.get(C0_SOURCE_WORKER_KIND_ENV, "thread") if value is None else value
+    )
+    selected = str(selected if selected is not None else "thread").strip().lower()
+    if selected not in _C0_SOURCE_WORKER_KINDS:
+        raise ValueError(
+            f"invalid C0 source worker kind {selected!r}; "
+            f"expected one of {_C0_SOURCE_WORKER_KINDS}"
+        )
+    return selected
+
+
 IO_PROCESS_V2_C0_HOST_REGISTER_ENV = "COMFYMODAL_GOLDEN_C0_HOST_REGISTER"
 C0_SHM_POPULATE_ENV = "COMFYMODAL_GOLDEN_C0_SHM_POPULATE"
 C0_READER_GATE_ENV = "COMFYMODAL_GOLDEN_C0_READER_GATE"
@@ -4133,11 +4160,16 @@ class SharedArenaRing:
             str(os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or "")
             .strip().lower() in {"1", "true", "yes", "on"}
         )
+        self.source_worker_kind = (
+            resolve_c0_source_worker_kind() if self.source_thread_mode else "thread"
+        )
         if self.source_thread_mode:
             if self.size_bytes != 512 * 1024 * 1024 or self.slot_count != 8 or self.slot_bytes != 64 * 1024 * 1024:
                 raise RuntimeError("source_threads_requires_8x64m_arena")
             if not c0_host_register_enabled():
                 raise RuntimeError("source_threads_requires_cuda_host_register")
+            # Report the lifecycle the implementation actually runs, never a
+            # value forced to satisfy an older identity gate.
             if resolve_c0_mmap_lifecycle() not in {"fresh", "whole"}:
                 raise RuntimeError("source_threads_unsupported_mmap_lifecycle")
         self.control_session_enabled = self.control_session_enabled and not self.source_thread_mode
@@ -4435,21 +4467,45 @@ class SharedArenaRing:
             self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
 
         if self.source_thread_mode:
-            # The opt-in arm has one source process containing four persistent
-            # threads.  It attaches to this exact registered mapping and never
-            # creates the historical nested reader/control session.
+            # The opt-in arm has one source owner with four persistent readers
+            # (threads, or independent processes).  It attaches to this exact
+            # mapping and never creates the historical nested reader/control
+            # session.
             if not _do_register:
                 raise RuntimeError("source_threads_requires_registered_arena")
-            if self.registration_order != "register_first":
-                self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
             from . import golden_source_threads
-            marks["source_thread_start_begin"] = int(time.monotonic_ns())
+            marks["source_thread_spawn_begin"] = int(time.monotonic_ns())
             self._source_thread_process = golden_source_threads.SourceThreadProcess(
                 self._shm.name,
                 mmap_lifecycle=self.mmap_lifecycle,
+                worker_kind=self.source_worker_kind,
             )
             try:
-                ready = self._source_thread_process.start()
+                self._source_thread_process.spawn()
+            except BaseException:
+                # Nothing is registered yet, so release only the control
+                # segment the constructor created.
+                self._source_thread_process = None
+                self._cleanup_failed_setup()
+                raise
+            marks["source_thread_spawn_end"] = int(time.monotonic_ns())
+            # Restore the historical overlap.  The source owner's startup
+            # (interpreter boot, imports, shared-memory attach) is independent
+            # of the parent's arena registration except for the mapping
+            # identity, which spawn() has already fixed.  Register the arena
+            # while it boots instead of serializing the two.
+            if self.registration_order != "register_first":
+                marks["source_thread_register_begin"] = int(time.monotonic_ns())
+                try:
+                    self._register_arena(torch=torch, register=register, cudart=cudart, marks=marks)
+                except BaseException:
+                    self._source_thread_process.stop()
+                    self._source_thread_process = None
+                    self._cleanup_failed_setup()
+                    raise
+                marks["source_thread_register_end"] = int(time.monotonic_ns())
+            try:
+                ready = self._source_thread_process.await_ready()
             except BaseException:
                 self._source_thread_process.stop()
                 self._source_thread_process = None
@@ -4458,16 +4514,27 @@ class SharedArenaRing:
             marks["source_thread_ready"] = int(time.monotonic_ns())
             source_process = self._source_thread_process.process
             self.child_pid = int(getattr(source_process, "pid", 0) or 0) or None
-            self.child_start_ns = marks["source_thread_start_begin"]
+            self.child_start_ns = marks["source_thread_spawn_begin"]
             self.child_ready_ns = marks["source_thread_ready"]
             self.child_ready_evidence = {
-                "architecture": "source_threads",
-                "workers_configured": golden_source_threads.THREAD_COUNT,
-                "workers_ready": golden_source_threads.THREAD_COUNT,
-                "thread_identities": list((ready.get("telemetry") or {}).get("thread_identities") or []),
+                "architecture": "source_owner",
+                "source_worker_kind": self.source_worker_kind,
+                "workers_configured": golden_source_threads.READER_COUNT,
+                "workers_ready": golden_source_threads.READER_COUNT,
+                "reader_identities": list((ready.get("telemetry") or {}).get("reader_identities") or []),
                 "process_id": (ready.get("telemetry") or {}).get("process_id"),
                 "mmap_lifecycle": self.mmap_lifecycle,
                 "fallback": False,
+                "initialization_critical_path_ns": (
+                    marks["source_thread_ready"] - marks["c0_ensure_enter"]
+                ),
+                "spawn_return_ns": marks["source_thread_spawn_end"] - marks["source_thread_spawn_begin"],
+                "register_ns": int(marks.get("source_thread_register_end", 0))
+                - int(marks.get("source_thread_register_begin", 0)),
+                "source_startup_ns": (
+                    marks["source_thread_ready"] - marks["source_thread_spawn_begin"]
+                ),
+                "overlapped_spawn_and_register": self.registration_order != "register_first",
             }
             self.child_torch_imported = False
             self.child_cuda_initialized = False

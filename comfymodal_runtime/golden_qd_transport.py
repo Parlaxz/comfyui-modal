@@ -1031,6 +1031,11 @@ class StagingPool:
         self._pressure_free_ns: list[int] = [0, 0, 0]
         self._pressure_last_ns: int | None = None
         self._pressure_last_free: int | None = None
+        # Set by the first external adoption.  From then on this pool belongs to
+        # one external slot owner, so the ordinary producer ``acquire`` path is
+        # refused: two ownership machines for the same physical slots is the
+        # duplication this replaces.
+        self._external_owner_bound = False
 
     @property
     def capacity(self) -> int:
@@ -1088,6 +1093,11 @@ class StagingPool:
                     raise PoolPoisonedError(self._poison_reason or "staging pool is poisoned")
                 if self._cancelled:
                     raise CancellationError("staging pool acquisition was cancelled")
+                if self._external_owner_bound:
+                    raise LeaseError(
+                        "staging pool is bound to an external slot owner; "
+                        "ordinary producer acquire is not permitted"
+                    )
                 candidates = self._slots
                 if preferred_slot_index is not None:
                     preferred = self._slots[preferred_slot_index]
@@ -1118,6 +1128,73 @@ class StagingPool:
                     self._available.wait(remaining)
                 else:
                     self._available.wait()
+
+    def adopt_external_slot(
+        self,
+        *,
+        slot_index: int,
+        external_generation: int,
+        declared_range: SourceRange,
+        producer_id: int | None = None,
+        destination_size: int | None = None,
+    ) -> StageLease:
+        """Bind one already-filled physical slot to its external owner.
+
+        The C0 source owner has already claimed the physical slot and filled it.
+        There is therefore no ``FREE -> FILLING -> READY`` round trip and no
+        second generation here: the pool *adopts* the external
+        ``(slot_index, generation)`` token, making that token the single
+        authority for the physical slot.  Slot reuse is then gated by exactly
+        one generation instead of two that can drift apart.
+
+        Ordinary producer callers keep using :meth:`acquire`.  The two paths are
+        mutually exclusive on a pool: the first external adoption binds the pool
+        to the external owner, and any later ordinary acquire fails closed.
+        """
+        with self._available:
+            if self._poisoned:
+                raise PoolPoisonedError(self._poison_reason or "staging pool is poisoned")
+            if self._cancelled:
+                raise CancellationError("staging pool adoption was cancelled")
+            index = int(slot_index)
+            if not 0 <= index < len(self._slots):
+                raise LeaseError("external slot index is invalid")
+            generation = int(external_generation)
+            if generation <= 0:
+                raise LeaseError("external slot generation must be positive")
+            if declared_range is None:
+                raise LeaseError("an external slot must declare its source range")
+            if producer_id is not None and (
+                not isinstance(producer_id, int) or isinstance(producer_id, bool) or producer_id < 0
+            ):
+                raise LeaseError("producer_id must be a non-negative integer")
+            slot = self._slots[index]
+            if slot.state != SlotState.FREE:
+                raise LeaseError("external slot is not free in the staging pool")
+            if generation <= slot.generation:
+                # Fail closed.  An external token that does not strictly advance
+                # this slot's generation could be a replay of an already
+                # completed block rather than a new one.
+                raise LeaseError("external slot generation must strictly advance")
+            if destination_size is not None and (
+                int(declared_range.target_offset) + int(declared_range.length) > int(destination_size)
+            ):
+                raise ReconciliationError("external slot exceeds destination bounds")
+            if int(declared_range.length) > self.block_bytes:
+                raise ReconciliationError("external slot exceeds the staging block size")
+            self._external_owner_bound = True
+            slot.generation = generation
+            lease = StageLease(
+                self, slot, generation, declared_range, producer_id, index, True
+            )
+            # The external owner already wrote the bytes; the lease enters the
+            # dispatcher queue filled and retired, so no producer fill step runs.
+            lease._filled = int(declared_range.length)
+            lease._producer_retired = True
+            slot.lease = lease
+            slot.state = SlotState.READY
+            self._note_pressure_locked()
+            return lease
 
     def _cancel_waiters(self) -> None:
         with self._available:
@@ -1208,11 +1285,23 @@ class StagingPool:
     def _buffer_for_read(self, lease: StageLease, nbytes: int) -> Any:
         return lease._read_target(nbytes)
 
-    def _mark_ready(self, lease: StageLease, record: ReadyRecord, destination_size: int | None = None) -> None:
+    def _mark_ready(
+        self,
+        lease: StageLease,
+        record: ReadyRecord,
+        destination_size: int | None = None,
+        *,
+        externally_filled: bool = False,
+    ) -> None:
         _validate_ready_record(record)
         with self._meta:
             slot = self._validate_locked(lease)
-            if slot.state != SlotState.FILLING or lease._producer_retired:
+            if externally_filled:
+                # An adopted external lease is already filled and retired by its
+                # owner; there is no producer fill step to run.
+                if slot.state != SlotState.READY or not lease._producer_retired:
+                    raise LeaseError("only an adopted external lease may be published as pre-filled")
+            elif slot.state != SlotState.FILLING or lease._producer_retired:
                 raise LeaseError("only an unretired filling lease can be published")
             expected = lease._declared_range
             if expected is not None:
@@ -1583,6 +1672,20 @@ class _Telemetry:
             assert self.source_qd_timeline is not None
             self.source_qd_depth_samples.append(next_depth)
             self.source_qd_timeline.append({"timestamp_ns": now, "depth": next_depth})
+
+    def note_external_source_span(self, start_ns: int | None, end_ns: int | None) -> None:
+        """Record the authoritative source span for an external slot owner.
+
+        The ordinary execution path sets the source span itself.  When an
+        external owner (the C0 source process) produces the bytes, that span is
+        only known to the owner, so it is handed over explicitly.  Without it
+        ``source_final_byte_complete_ns`` and ``gpu_ready_tail_ms`` would be
+        null and the H2D tail could not be attributed to anything.
+        """
+        if start_ns is not None:
+            self.source_start_ns = int(start_ns)
+        if end_ns is not None:
+            self.source_end_ns = int(end_ns)
 
     def snapshot(self, queue_depth: int, free_slots: int, total_end_ns: int | None = None) -> dict[str, Any]:
         if self.diagnostics_enabled:
@@ -2047,7 +2150,7 @@ class TransportDispatcher:
         self._thread = threading.Thread(target=self._run, name="golden-qd-dispatcher", daemon=True)
         self._thread.start()
 
-    def publish(self, lease: StageLease, record: ReadyRecord) -> None:
+    def publish(self, lease: StageLease, record: ReadyRecord, *, externally_filled: bool = False) -> None:
         _validate_ready_record(record)
         started = time.monotonic_ns() if self.telemetry.diagnostics_enabled else None
         blocked = False
@@ -2069,7 +2172,9 @@ class TransportDispatcher:
                 if self._stop:
                     raise CancellationError("transport was quiesced before publish")
                 # This call does not call back into the dispatcher condition.
-                self.pool._mark_ready(lease, record, self.destination_size)
+                self.pool._mark_ready(
+                    lease, record, self.destination_size, externally_filled=externally_filled
+                )
                 if self._c0_window_trace_enabled:
                     _c0_trace_stamp(lease, "ready_publish_ns")
                 self._queue.append((lease, record))
@@ -2963,10 +3068,40 @@ class GoldenQDTransport:
             backend, destination_size, aggregation_ranges, self.telemetry
         )
 
-    def publish(self, lease: StageLease, record: ReadyRecord) -> None:
+    def note_external_source_span(self, start_ns: int | None, end_ns: int | None) -> None:
+        """Hand the external source owner's authoritative span to telemetry."""
+        self.telemetry.note_external_source_span(start_ns, end_ns)
+
+    def adopt_external_slot(
+        self,
+        *,
+        slot_index: int,
+        external_generation: int,
+        declared_range: SourceRange,
+        producer_id: int | None = None,
+    ) -> StageLease:
+        """Hand the dispatcher one exact physical slot owned by the source side.
+
+        This is the narrow external-slot path.  The source owner already claimed
+        and filled the physical slot, so the pool adopts its
+        ``(slot_index, generation)`` token instead of minting a second
+        generation around a fake FILLING producer lease.
+        """
+        dispatcher = getattr(self, "dispatcher", None)
+        return self.pool.adopt_external_slot(
+            slot_index=slot_index,
+            external_generation=external_generation,
+            declared_range=declared_range,
+            producer_id=producer_id,
+            destination_size=getattr(dispatcher, "destination_size", None),
+        )
+
+    def publish(
+        self, lease: StageLease, record: ReadyRecord, *, externally_filled: bool = False
+    ) -> None:
         if self.dispatcher is None:
             raise TransportError("transport is not started")
-        self.dispatcher.publish(lease, record)
+        self.dispatcher.publish(lease, record, externally_filled=externally_filled)
         correlation = getattr(lease, "_source_thread_correlation", None)
         if isinstance(correlation, Mapping):
             self.telemetry.note_source_correlation(

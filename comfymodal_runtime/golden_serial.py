@@ -11267,12 +11267,12 @@ def _golden_model_transport_enabled() -> bool:
     return _golden_m2_clip_enabled() or selected in {"1", "true", "yes", "on", "m2", "persistent"}
 
 
-def _read_golden_m2_clip(path: str, *, transport: Any = None) -> dict[str, Any]:
+def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip") -> dict[str, Any]:
     """Adapt the canonical M2 loader to Golden's transport contract."""
     from .golden_model_transport import get_golden_model_transport
 
     transport = transport or get_golden_model_transport()
-    loaded = transport.load_sync(path)
+    loaded = transport.load_sync(path, role=role)
     source = loaded.stats.get("source") or {}
     stats = dict(loaded.stats)
     stats.update({
@@ -13060,7 +13060,7 @@ async def golden_unet_load(
             shared_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
             session.model_transport = shared_transport
             shared_layout = shared_transport.inspect(unet_path)
-            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path))
+            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path, role="unet"))
             await asyncio.sleep(0)
 
         with _golden_trace_span("golden.unet.header_config_preflight"):

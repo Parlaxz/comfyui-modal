@@ -742,27 +742,32 @@ class GoldenModelTransport:
         self._c0_source_pool: Any = None
         self._c0_source_backend = _DeferredC0Backend()
         self._c0_restore_setup_marks: dict[str, int] = {}
-        self._c0_enabled = (
+        c0_streaming = (
             str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
             in {"1", "true", "yes", "on"}
-            and str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE") or "").strip().lower()
-            == "mmap_fresh"
         )
+        source_engine = str(
+            os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE") or ""
+        ).strip().lower()
         self._c0_source_threads_enabled = golden_source_threads.enabled()
-        if self._c0_source_threads_enabled and not self._c0_enabled:
+        # The C0 source-owner arm declares its own source kernel: native libc
+        # mmap + memmove over MAP_PRIVATE, with its own explicit, fail-closed
+        # fresh|whole lifecycle.  Requiring the historical M2 engine string
+        # here would force that arm to publish a source identity it does not
+        # have, so gate it on the streaming request it actually needs.
+        self._c0_enabled = c0_streaming and (
+            source_engine == "mmap_fresh" or self._c0_source_threads_enabled
+        )
+        if self._c0_source_threads_enabled and not c0_streaming:
             raise RuntimeError(
-                "golden_c0_source_threads_requires_c0_streaming_mmap_fresh"
+                "golden_c0_source_threads_requires_c0_streaming"
             )
-        if (
-            str(os.environ.get("COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING") or "").strip().lower()
-            in {"1", "true", "yes", "on"}
-            and not self._c0_enabled
-        ):
+        if c0_streaming and not self._c0_enabled:
             # Fail closed: C0 streaming is armed, so the caller requested the
             # C0 shared arena.  Running the standalone M2 execution arm here
             # would silently execute the wrong architecture.  Either select
-            # the frozen exact-window engine (mmap_fresh) or do not enter this
-            # transport under a C0 streaming request.
+            # the frozen exact-window engine (mmap_fresh), enable the C0
+            # source-owner arm, or do not enter this transport at all.
             raise RuntimeError(
                 "golden_model_transport_c0_streaming_requires_mmap_fresh"
             )
@@ -978,15 +983,15 @@ class GoldenModelTransport:
             self._layout_cache.popitem(last=False)
         return layout
 
-    async def load(self, path: str) -> LoadedSafetensors:
-        return await asyncio.to_thread(self._load_sync, path)
+    async def load(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+        return await asyncio.to_thread(self._load_sync, path, role=role)
 
-    def load_sync(self, path: str) -> LoadedSafetensors:
-        return self._load_sync(path)
+    def load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
+        return self._load_sync(path, role=role)
 
-    def _load_sync(self, path: str) -> LoadedSafetensors:
+    def _load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         if self._c0_enabled:
-            return self._load_c0_sync(path)
+            return self._load_c0_sync(path, role=role)
         started_ns = time.perf_counter_ns()
         with self._lock:
             if self._poisoned:
@@ -1139,7 +1144,7 @@ class GoldenModelTransport:
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_source_threads_sync(self, path: str) -> LoadedSafetensors:
+    def _load_c0_source_threads_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         """Load through the restore-created source process and shared arena."""
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
@@ -1175,6 +1180,9 @@ class GoldenModelTransport:
             backend = qd_transport.CudaTransferBackend(owner.gpu_tensor, resources=resources)
             self._c0_source_backend.bind(backend)
             transport.begin_operation(backend, destination_size=layout.data_bytes)
+            # The range plan is the actual work of sizing every 64 MiB source
+            # extent and its destination offset, so the stamps must bracket it.
+            marks["range_plan_begin"] = time.monotonic_ns()
             ranges = []
             offset = layout.data_start
             destination = 0
@@ -1185,23 +1193,38 @@ class GoldenModelTransport:
                 offset += length
                 destination += length
                 ordinal += 1
-            marks["range_plan_begin"] = time.monotonic_ns()
             marks["range_plan_end"] = time.monotonic_ns()
             resources.transport_enter()
             try:
                 bridge = golden_source_threads.SourcePlanBridge(manager, transport)
-                marks["plan_publish_begin"] = time.monotonic_ns()
+                # PLAN publication only.  It must not imply the source span.
+                marks["plan_install_begin"] = time.monotonic_ns()
                 published = bridge.publish_all(
                     ranges,
                     generation=self._load_count + 1,
                     path=layout.path,
                     identity=layout.identity,
                     destination_size=layout.data_bytes,
+                    role=role,
                 )
-                marks["plan_publish_end"] = time.monotonic_ns()
+                marks["plan_install_end"] = time.monotonic_ns()
+                # The source pipeline span covers every range published through
+                # the last H2D submit.  It is not "plan publication".
+                source_pipeline_end_ns = time.monotonic_ns()
+                marks["source_pipeline_end"] = source_pipeline_end_ns
+                # Hand the source owner's authoritative span to the dispatcher
+                # telemetry before it snapshots, so source_final_byte_complete_ns
+                # and gpu_ready_tail_ms are real numbers rather than nulls.
+                source_span = golden_source_threads.canonical_source_span(
+                    manager.snapshot().get("source_operation_records") or []
+                )
+                transport.note_external_source_span(
+                    source_span.get("source_start_ns"), source_span.get("source_end_ns")
+                )
                 result = transport.finalize_external_ready(
                     ranges, destination_size=layout.data_bytes, materialize_output=False,
                 )
+                marks["final_drain_end"] = time.monotonic_ns()
                 resources.finish_span()
             except BaseException:
                 # Abort is bounded.  GoldenQDTransport remains the sole owner
@@ -1217,6 +1240,15 @@ class GoldenModelTransport:
                     manager.wait_quiescent(timeout_s=5.0)
                 except BaseException:
                     self._poisoned = True
+                finally:
+                    # The control segment is owned by the runtime ring, which
+                    # owns the source process; stop it even when quiescence
+                    # could not be proven, or the segment is leaked for the
+                    # lifetime of the process.
+                    try:
+                        manager.stop()
+                    except BaseException:
+                        self._poisoned = True
                 resources.transport_exit(poisoned=True)
                 if not self._poisoned and transport.backend_owner_release_allowed():
                     owner.release_storage()
@@ -1239,11 +1271,37 @@ class GoldenModelTransport:
             )
             if not exact:
                 raise qd_transport.ReconciliationError("source_threads_exact_coverage_failed")
+            # Canonical model-level source boundaries.  Operation records are
+            # appended on completion, so the first record is NOT the first
+            # source start: derive the span from the minimum actual source start
+            # and the maximum actual source completion, in one monotonic clock
+            # domain, exactly as _load_c0_sync does for the historical reader.
+            span = golden_source_threads.canonical_source_span(
+                source_telemetry.get("source_operation_records") or []
+            )
+            source_start_ns = span.get("source_start_ns")
+            source_end_ns = span.get("source_end_ns")
+            source_wall_ms = span.get("source_wall_ms")
+            source_child_wall_ms = source_wall_ms
+            source_gbps = (
+                layout.data_bytes / ((source_wall_ms / 1000.0) * 1e9)
+                if source_wall_ms and source_wall_ms > 0 else None
+            )
+            dispatcher_timing = result.telemetry if isinstance(result.telemetry, dict) else {}
+            source_final_byte_complete_ns = dispatcher_timing.get(
+                "source_final_byte_complete_ns", source_end_ns
+            )
+            final_h2d_submit_ns = dispatcher_timing.get("final_h2d_submit_ns")
+            final_h2d_completion_observed_ns = dispatcher_timing.get(
+                "final_h2d_completion_observed_ns"
+            )
             stats = {
                 "status": "ok",
-                "execution_architecture": "source_threads",
-                "execution_arm": "source_threads",
-                "source_engine": "native_mmap",
+                "execution_architecture": "c0_parallel",
+                "execution_arm": "c0_parallel",
+                "source_engine": "c0_source_owner",
+                "source_worker_kind": manager.worker_kind,
+                "h2d_engine": "c0_dispatcher_async",
                 "mmap_lifecycle": c0.resolve_c0_mmap_lifecycle(),
                 "fallback": {"count": 0, "reason": None},
                 "c0_arena_bytes": int(runtime.size_bytes),
@@ -1255,6 +1313,26 @@ class GoldenModelTransport:
                 "gpu_bytes": layout.data_bytes,
                 "h2d_submitted_bytes": int(result.submitted_bytes),
                 "h2d_completed_bytes": int(result.completed_bytes),
+                "source_wall_ms": source_wall_ms,
+                "source_child_wall_ms": source_child_wall_ms,
+                "qd_source_io_wall_ms": source_wall_ms,
+                "source_gbps": source_gbps,
+                "source_go_offset_ms": (
+                    (source_start_ns - started_ns) / 1e6 if source_start_ns else None
+                ),
+                "source_final_byte_complete_ns": source_final_byte_complete_ns,
+                "final_h2d_submit_ns": final_h2d_submit_ns,
+                "final_h2d_completion_observed_ns": final_h2d_completion_observed_ns,
+                "gpu_ready_ns": final_h2d_completion_observed_ns,
+                "gpu_ready_wall_ms": (
+                    (final_h2d_completion_observed_ns - started_mono_ns) / 1e6
+                    if final_h2d_completion_observed_ns else None
+                ),
+                "gpu_ready_tail_ms": (
+                    (final_h2d_completion_observed_ns - source_final_byte_complete_ns) / 1e6
+                    if final_h2d_completion_observed_ns and source_final_byte_complete_ns
+                    else None
+                ),
                 "coverage": {
                     "ok": True,
                     "covers_entire_file_exactly_once": True,
@@ -1274,6 +1352,59 @@ class GoldenModelTransport:
                         **dict(self._c0_restore_setup_marks), **dict(marks),
                     },
                     "lifecycle": c0.resolve_c0_mmap_lifecycle(),
+                    # Scalar-only source concurrency summary.  The full
+                    # per-operation record set is far too large to persist, and
+                    # these are the numbers that decide whether the source side
+                    # is actually running four readers wide or effectively one.
+                    "source_concurrency": {
+                        "source_operations": int(source_telemetry.get("source_operations") or 0),
+                        "effective_reader_concurrency": source_telemetry.get(
+                            "effective_reader_concurrency"
+                        ),
+                        "effective_reader_concurrency_distribution": source_telemetry.get(
+                            "effective_reader_concurrency_distribution"
+                        ),
+                        "time_weighted_effective_concurrency": (
+                            source_telemetry.get("time_weighted_reader_concurrency") or {}
+                        ).get("effective_concurrency"),
+                        "time_weighted_levels_ms": {
+                            key: ((value or {}).get("ns") or 0) / 1e6
+                            for key, value in (
+                                (source_telemetry.get("time_weighted_reader_concurrency") or {}).get(
+                                    "levels"
+                                ) or {}
+                            ).items()
+                        },
+                        "longest_zero_reader_ms": (
+                            (source_telemetry.get("time_weighted_reader_concurrency") or {}).get(
+                                "longest_zero_reader_ns"
+                            ) or 0
+                        ) / 1e6,
+                        "below_four_reader_ms": (
+                            (source_telemetry.get("time_weighted_reader_concurrency") or {}).get(
+                                "below_four_reader_ns"
+                            ) or 0
+                        ) / 1e6,
+                        "slot_wait_ms": (source_telemetry.get("slot_acquire_wait_ns") or 0) / 1e6,
+                        "slot_wait_count": source_telemetry.get("slot_acquire_wait_count"),
+                        "all_slots_occupied_count": source_telemetry.get(
+                            "all_slots_occupied_count"
+                        ),
+                        "capacity_wait_ms": (source_telemetry.get("capacity_wait_ns") or 0) / 1e6,
+                        "capacity_wait_count": source_telemetry.get("capacity_wait_count"),
+                        "ready_queue_wait_ms": (source_telemetry.get("ready_queue_wait_ns") or 0) / 1e6,
+                        "ready_queue_wait_count": source_telemetry.get("ready_queue_wait_count"),
+                        "release_count": source_telemetry.get("release_count"),
+                        "pacing_wait_count": source_telemetry.get("pacing_wait_count"),
+                        "pacing_zero_delay_count": source_telemetry.get("pacing_zero_delay_count"),
+                        "min_source_gap_ms": (source_telemetry.get("min_source_gap_ns") or 0) / 1e6,
+                        "pacer_gap_violation_count": source_telemetry.get(
+                            "pacer_gap_violation_count"
+                        ),
+                        "mmap_map_count": source_telemetry.get("mmap_map_count"),
+                        "mmap_unmap_count": source_telemetry.get("mmap_unmap_count"),
+                        "source_span_ms": span.get("source_wall_ms"),
+                    },
                 },
                 "quiescence": {
                     "workers_joined": False,
@@ -1291,22 +1422,19 @@ class GoldenModelTransport:
                 "transport_runtime_reused": True,
                 "layout_cache_hit": bool(layout_cache_hit),
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
-                "gpu_ready_ns": result.telemetry.get("final_h2d_completion_observed_ns"),
                 "views_ready_ns": views_ready_ns,
                 "total_load_ms": (finished_ns - started_ns) / 1e6,
                 "source": {
-                    "source_first_enter_ns": source_telemetry.get("source_start_ns", [None])[0]
-                    if source_telemetry.get("source_start_ns") else None,
-                    "source_last_exit_ns": source_telemetry.get("source_operation_records", [{}])[-1].get("ready_ns")
-                    if source_telemetry.get("source_operation_records") else None,
-                    "readers": source_telemetry.get("thread_identities", []),
+                    "source_first_enter_ns": source_start_ns,
+                    "source_last_exit_ns": source_end_ns,
+                    "readers": source_telemetry.get("reader_identities", []),
                 },
                 "transport_lifecycle": self.lifecycle_telemetry(reused=self._load_count > 0),
             }
             self._load_count += 1
             return LoadedSafetensors(layout.path, views, owner, layout, stats)
 
-    def _load_c0_sync(self, path: str) -> LoadedSafetensors:
+    def _load_c0_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         """Load one checkpoint through the persistent C0 shared arena.
 
         C0 body, M2 engines: the 512 MiB C0 arena stays the backing resource,
@@ -1317,7 +1445,7 @@ class GoldenModelTransport:
         are forked here, and no standalone M2 loader wrapper is entered.
         """
         if self._c0_source_threads_enabled:
-            return self._load_c0_source_threads_sync(path)
+            return self._load_c0_source_threads_sync(path, role=role)
         started_ns = time.perf_counter_ns()
         started_mono_ns = time.monotonic_ns()
         # Passive per-load setup waterfall (observation-only monotonic_ns).

@@ -4883,6 +4883,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"
         ),
+        # Reader isolation for the C0 source owner.  Without this the container
+        # always resolved "thread", which made the four-process arm silently
+        # unreachable no matter what the profile or --set selected.
+        "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND", "thread"
+        ),
         "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": os.environ.get(
             "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "preadv"
         ),
@@ -23199,8 +23205,17 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_c0_source_threads_must_be_bool")
             if source_threads_requested != source_threads_deployed:
                 raise ValueError("golden_c0_source_threads_deployment_mismatch")
-            if source_threads_deployed and c0_mmap_lifecycle != "whole":
-                raise ValueError("golden_c0_source_threads_requires_whole_lifecycle")
+            if source_threads_deployed and c0_mmap_lifecycle not in {
+                "fresh", "whole",
+            }:
+                # The C0 source owner implements both exact-window (fresh) and
+                # one-whole-file-mapping (whole) lifecycles behind the same
+                # selector, so both are valid arms of the source architecture
+                # comparison.  Only lifecycles it does not implement are
+                # refused.  This gate used to hard-require "whole", which
+                # pinned the architecture to one lifecycle and made the
+                # fresh/whole comparison impossible.
+                raise ValueError("golden_c0_source_threads_unsupported_lifecycle")
             # The source-thread arm is restore/deploy-owned.  Never mutate the
             # process environment per request; a mismatch fails closed above.
             if not source_threads_deployed:

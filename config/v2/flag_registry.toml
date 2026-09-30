@@ -754,8 +754,18 @@ type = "bool"
 default = "0"
 consumed_at = "restore"
 change_requires = "deploy"
-owner = "testing9-c0-source-threads"
-description = "Explicit TESTING9 experimental arm: one CUDA-sterile source subprocess with four persistent in-process reader threads and self-serve 8 x 64 MiB shared slots. Default OFF; no fallback is permitted when selected."
+owner = "golden-c0-source"
+description = "C0 source owner arm: one CUDA-sterile source process owning the 512 MiB / 8 x 64 MiB shared C0 arena, with four persistent self-serve readers. Reader isolation is selected by COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND. Default OFF; no fallback is permitted when selected."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
+type = "enum"
+enum_values = ["thread", "process"]
+default = "thread"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-c0-source"
+description = "Reader isolation for the C0 source owner. 'thread' = one source process with four reader threads sharing one address space, one descriptor and at most one whole-file mapping. 'process' = one CUDA-sterile supervisor with four independent persistent reader processes, each with its own address space, descriptor and whole-file mapping. Any other value fails closed; there is no fallback between the two."
 
 [[flag]]
 name = "COMFYMODAL_PHASE1_C0_ARENA"
