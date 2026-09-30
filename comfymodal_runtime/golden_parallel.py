@@ -145,6 +145,9 @@ def _install_post_request_exit_bound(gate_s: float = POST_REQUEST_EXIT_GATE_S) -
     _PROGRESS_STATE["exit_timer"] = timer
 
 
+_OUTER_MARKS: list = []
+
+
 class _OuterLifetime:
     """Passive outer-method lifetime marks for the streaming adapter.
 
@@ -164,7 +167,9 @@ class _OuterLifetime:
 
     def mark(self, name: str, *, detail: str = "") -> int:
         now_ns = time.monotonic_ns()
-        self.marks.append((name, now_ns, now_ns - self.t0_ns, detail))
+        entry = (name, now_ns, now_ns - self.t0_ns, detail)
+        self.marks.append(entry)
+        _OUTER_MARKS.append(entry)
         print(
             f"[v2.golden.outer] {name} t_ns={now_ns} "
             f"elapsed_ms={(now_ns - self.t0_ns) / 1e6:.3f}"
@@ -448,6 +453,20 @@ async def golden_parallel_execute(
 
     try:
         _hb("telemetry_persist_begin")
+        # Emit outer/progress marks through the recorder BEFORE persisting, so
+        # they are part of the telemetry event stream that v2ctl collects in
+        # full.  Container stdout is not captured, and attempt_0.json is a
+        # curated schema that drops unknown top-level keys.
+        try:
+            session.recorder.event(
+                "golden_outer_marks",
+                marks=[
+                    {"mark": name, "elapsed_ms": round(elapsed / 1e6, 3), "detail": detail}
+                    for name, _t_ns, elapsed, detail in list(_OUTER_MARKS)
+                ],
+            )
+        except BaseException:
+            pass
         _persist_final_telemetry(session)
         _hb("telemetry_persist_done")
     except BaseException:
