@@ -100,20 +100,6 @@ def _anon(size: int, *, align: int = 4096) -> int:
     return int(ctypes.cast(addr, ctypes.c_void_p).value or 0)
 
 
-def _file_map(path: str, length: int | None = None) -> tuple[int, int]:
-    """Whole-file MAP_PRIVATE|PROT_READ mapping, exactly as production does."""
-    _init()
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-    try:
-        size = length if length is not None else os.fstat(fd).st_size
-        addr = _LIBC.mmap(None, ctypes.c_size_t(size), 1, 2, fd, 0)  # PROT_READ, MAP_PRIVATE
-        if not addr or int(ctypes.cast(addr, ctypes.c_void_p).value or 0) == ctypes.c_void_p(-1).value:
-            raise RuntimeError(f"file_mmap_failed errno={ctypes.get_errno()}")
-        return int(ctypes.cast(addr, ctypes.c_void_p).value or 0), int(size)
-    finally:
-        os.close(fd)
-
-
 def _file_window(path: str, offset: int, length: int, page: int = 4096) -> tuple[int, int]:
     """Map only ``[offset, offset+length)`` of ``path``, page-aligned down.
 
@@ -612,46 +598,58 @@ class CopyProbe:
                 path = model_paths.get(role)
                 if not path or not os.path.exists(path):
                     continue
-                faddr, fsize = _file_map(path)
+                fsize = os.path.getsize(path)
+                st = os.stat(path)
+                # production data_start = 8 + safetensors header length
+                with open(path, "rb") as fh:
+                    data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+                result.setdefault("models", {})[role] = {
+                    "path": path, "file_size": fsize, "data_start": data_start,
+                    "data_start_align": _align_report(data_start),
+                    "relative_mod64": data_start % 64,
+                    "relative_mod4096": data_start % 4096,
+                    "dev": st.st_dev, "inode": st.st_ino,
+                    "st_blocks": getattr(st, "st_blocks", None),
+                }
+                reps = 2 if lv < 3 else 3
+                off0 = data_start
+                # Window-map only the ranges under test.  A whole-file mapping
+                # here would duplicate the production loader's own Whole mmap of
+                # the same 8 GB / 12 GB safetensors inside one process; the
+                # window keeps resident cost bounded while still reading
+                # genuinely file-backed pages at the exact production offset.
+                waddr, delta = _file_window(path, off0, n)
                 try:
-                    st = os.stat(path)
-                    # production data_start = 8 + safetensors header length
-                    with open(path, "rb") as fh:
-                        data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
-                    result.setdefault("models", {})[role] = {
-                        "path": path, "file_size": fsize, "data_start": data_start,
-                        "data_start_align": _align_report(data_start),
-                        "relative_mod64": data_start % 64,
-                        "relative_mod4096": data_start % 4096,
-                        "dev": st.st_dev, "inode": st.st_ino,
-                        "st_blocks": getattr(st, "st_blocks", None),
-                    }
-                    reps = 2 if lv < 3 else 3
-                    off0 = data_start
+                    src = waddr + delta
                     # S1: first touch of a file-backed range (never accessed yet)
                     for dname, dptr in dests.items():
-                        _memset(dptr, n)  # clean destination so S1 measures source only
-                        self._time_copy(f"S1->{dname}", "memmove", dptr, faddr + off0, n,
+                        _memset(dptr, n)  # clean dest so S1 measures source only
+                        self._time_copy(f"S1->{dname}", "memmove", dptr, src, n,
                                         reps=reps, source_kind="file_first_touch",
-                                        dest_kind=dname, condition="S1", role=role, offset=off0)
+                                        dest_kind=dname, condition="S1", role=role,
+                                        offset=off0)
                     # S2: the SAME range immediately again (now resident)
                     for dname, dptr in dests.items():
                         _memset(dptr, n)
-                        self._time_copy(f"S2->{dname}", "memmove", dptr, faddr + off0, n,
+                        self._time_copy(f"S2->{dname}", "memmove", dptr, src, n,
                                         reps=reps, source_kind="file_resident",
-                                        dest_kind=dname, condition="S2", role=role, offset=off0)
-                    # a different, untouched file range for a second S1 sample
-                    if lv >= 3:
-                        off1 = data_start + n
-                        if off1 + n <= fsize:
-                            for dname, dptr in dests.items():
-                                _memset(dptr, n)
-                                self._time_copy(f"S1b->{dname}", "memmove", dptr, faddr + off1, n,
-                                                reps=reps, source_kind="file_first_touch",
-                                                dest_kind=dname, condition="S1b",
-                                                role=role, offset=off1)
+                                        dest_kind=dname, condition="S2", role=role,
+                                        offset=off0)
                 finally:
-                    _unmap(faddr, fsize)
+                    _unmap(waddr, delta + n)
+                # a different, untouched file range for a second S1 sample
+                if lv >= 3 and off0 + 2 * n <= fsize:
+                    off1 = off0 + n
+                    w2, d2 = _file_window(path, off1, n)
+                    try:
+                        for dname, dptr in dests.items():
+                            _memset(dptr, n)
+                            self._time_copy(f"S1b->{dname}", "memmove", dptr, w2 + d2, n,
+                                            reps=reps, source_kind="file_first_touch",
+                                            dest_kind=dname, condition="S1b",
+                                            role=role, offset=off1)
+                    finally:
+                        _unmap(w2, d2 + n)
 
             # ---- destination write path (memset controls) ----
             for dname, dptr in dests.items():
@@ -661,11 +659,11 @@ class CopyProbe:
                 # ---- memmove vs memcpy on the same resident file range ----
                 p = model_paths.get("clip")
                 if p and os.path.exists(p):
-                    faddr, fsize = _file_map(p)
+                    with open(p, "rb") as fh:
+                        data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+                    waddr, delta = _file_window(p, data_start, n)
                     try:
-                        with open(p, "rb") as fh:
-                            data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
-                        src = faddr + data_start
+                        src = waddr + delta
                         _memmove(anon_dst, src, n)  # make it resident
                         for prim in ("memmove", "memcpy"):
                             for dname, dptr in dests.items():
@@ -674,7 +672,7 @@ class CopyProbe:
                                                 source_kind="file_resident", dest_kind=dname,
                                                 condition="primitive_compare")
                     finally:
-                        _unmap(faddr, fsize)
+                        _unmap(waddr, delta + n)
 
                 # ---- alignment variants: relative offset 0/32 on anon buffers ----
                 for soff in (0, 32):

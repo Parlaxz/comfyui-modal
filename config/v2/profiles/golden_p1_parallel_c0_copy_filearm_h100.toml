@@ -1,0 +1,36 @@
+# v2ctl profile: M1-CB level-2 inline arm (file-backed), H100.
+#
+# Same app, image, H100!, CPU=12, 24 GiB, gVisor and model volume as the
+# level-1 sentinel profile, and the only configuration delta is the probe level.
+#
+# Why the file-backed arm runs inline rather than in a separate standalone lab:
+# the original belief that a second whole-file mapping of the 8 GB CLIP / 12 GB
+# UNET safetensors would exhaust the container turned out to be a hypothesis,
+# never a demonstrated cause.  The actual segfault was probe buffers mapped
+# PROT_READ.  With that fixed, every file range is window-mapped instead
+# (page-rounded window at the exact production file offset), so resident cost is
+# bounded and the arm is safe to run through the already-validated golden run
+# path instead of requiring a new, unwired Modal invocation.
+#
+# This arm is the direct test of the dimension the level-1 sentinel could not
+# see: first-touch on genuinely file-backed pages versus resident file pages,
+# across private, shared and registered destinations.
+#
+# This profile must never be used for a counted or performance claim.
+schema_version = 1
+name = "golden_p1_parallel_c0_copy_filearm_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "m1-copy-rootcause"
+
+[target]
+app = "batch-c0-copy-rootcause-h100"
+
+[workload]
+run_count = 1
+
+[environment]
+COMFYMODAL_M1B_COPY_PROBE = "1"
+# Level 2 = file-backed S1/S2/S3 per destination kind + destination memset
+# controls + the shared (/dev/shm) destination.  Level 3 adds alignment,
+# memmove-vs-memcpy and the second untouched file range.
+COMFYMODAL_M1B_LEVEL = "2"
