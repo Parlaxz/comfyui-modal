@@ -347,113 +347,129 @@ class CopyProbe:
         _init()
         self.fingerprint()
         n = SLOT_BYTES
-        result: dict[str, Any] = {"schema": "m1cb_copy_probe_v1", "level": level(),
+        lv = level()
+        result: dict[str, Any] = {"schema": "m1cb_copy_probe_v1", "level": lv,
                                   "nbytes": n, "rows": self.rows}
         try:
+            # Levels are cumulative and each one adds a destination kind, so a
+            # level that overruns the container can be abandoned without losing
+            # the cheaper evidence.  Level 1 deliberately touches nothing shared
+            # and nothing registered: two private anonymous buffers and one
+            # read-only file map, ~8 copies total.
             anon_src = _anon(n + _SLACK)
             anon_dst = _anon(n + _SLACK)
-            shm_name = "m1cb_probe_shm"
-            _shm_create(shm_name, n + _SLACK)
-            shm_dst = _shm_map(shm_name, n + _SLACK)
             result["buffers"] = {
                 "anon_src": _align_report(anon_src), "anon_dst": _align_report(anon_dst),
-                "shm_dst": _align_report(shm_dst), "arena_addr": _align_report(arena_addr) if arena_addr else None,
             }
-            # warm every destination once so the FIRST measurement is a real
-            # first-touch of SOURCE, not of an untouched destination.
-            _memset(anon_dst, n); _memset(shm_dst, n)
-            if arena_addr:
-                _memset(arena_addr, n)
+            dests = {"anon_private": anon_dst}
+            if lv >= 2:
+                shm_name = "m1cb_probe_shm"
+                _shm_create(shm_name, n + _SLACK)
+                shm_dst = _shm_map(shm_name, n + _SLACK)
+                result["buffers"]["shm_dst"] = _align_report(shm_dst)
+                dests["shm_unregistered"] = shm_dst
+            if lv >= 3:
+                if arena_addr:
+                    result["buffers"]["arena_addr"] = _align_report(arena_addr)
+                    dests["arena_registered"] = arena_addr
+                else:
+                    result["arena_note"] = "arena handle unavailable; arena rows skipped"
 
-            dests = {"anon_private": anon_dst, "shm_unregistered": shm_dst}
-            if arena_addr:
-                dests["arena_registered"] = arena_addr
+            # Warm every destination once so the FIRST measurement is a real
+            # first-touch of SOURCE, not of an untouched destination.
+            for dptr in dests.values():
+                _memset(dptr, n)
 
             # ---- S3: resident anonymous -> each destination (raw floor) ----
             _memset(anon_src, n)  # materialize the anonymous source
             for dname, dptr in dests.items():
-                self._time_copy(f"S3->{dname}", "memmove", dptr, anon_src, n, reps=3,
+                self._time_copy(f"S3->{dname}", "memmove", dptr, anon_src, n, reps=2,
                                 source_kind="anon_resident", dest_kind=dname, condition="S3")
 
             # ---- model file sources ----
-            for role, path in model_paths.items():
+            # Level 1 measures CLIP only; the wider sweep lands at level 3.
+            roles = ["clip"] if lv < 3 else ["clip", "unet"]
+            for role in roles:
+                path = model_paths.get(role)
                 if not path or not os.path.exists(path):
                     continue
                 faddr, fsize = _file_map(path)
                 try:
                     st = os.stat(path)
-                    data_start = fsize - 8 - 0  # refined below
-                    # production data_start = file_size - data_bytes; recover
-                    # data_bytes from the known 64MiB extent plan shape instead:
+                    # production data_start = 8 + safetensors header length
                     with open(path, "rb") as fh:
-                        fh.seek(0)
-                        raw = fh.read(8)
-                        hdr_len = struct.unpack("<Q", raw)[0]
-                        data_start = 8 + int(hdr_len)
+                        data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
                     result.setdefault("models", {})[role] = {
                         "path": path, "file_size": fsize, "data_start": data_start,
                         "data_start_align": _align_report(data_start),
                         "relative_mod64": data_start % 64,
                         "relative_mod4096": data_start % 4096,
-                        "dev": st.st_dev, "inode": st.st_ino, "st_blocks": getattr(st, "st_blocks", None),
+                        "dev": st.st_dev, "inode": st.st_ino,
+                        "st_blocks": getattr(st, "st_blocks", None),
                     }
-                    # S1: first touch of a file-backed range (never accessed yet)
+                    reps = 2 if lv < 3 else 3
                     off0 = data_start
+                    # S1: first touch of a file-backed range (never accessed yet)
                     for dname, dptr in dests.items():
                         _memset(dptr, n)  # clean destination so S1 measures source only
                         self._time_copy(f"S1->{dname}", "memmove", dptr, faddr + off0, n,
-                                        reps=3, source_kind="file_first_touch",
+                                        reps=reps, source_kind="file_first_touch",
                                         dest_kind=dname, condition="S1", role=role, offset=off0)
                     # S2: the SAME range immediately again (now resident)
                     for dname, dptr in dests.items():
                         _memset(dptr, n)
                         self._time_copy(f"S2->{dname}", "memmove", dptr, faddr + off0, n,
-                                        reps=3, source_kind="file_resident",
+                                        reps=reps, source_kind="file_resident",
                                         dest_kind=dname, condition="S2", role=role, offset=off0)
                     # a different, untouched file range for a second S1 sample
-                    off1 = data_start + n
-                    if off1 + n <= fsize:
-                        for dname, dptr in dests.items():
-                            _memset(dptr, n)
-                            self._time_copy(f"S1b->{dname}", "memmove", dptr, faddr + off1, n,
-                                            reps=3, source_kind="file_first_touch",
-                                            dest_kind=dname, condition="S1b", role=role, offset=off1)
+                    if lv >= 3:
+                        off1 = data_start + n
+                        if off1 + n <= fsize:
+                            for dname, dptr in dests.items():
+                                _memset(dptr, n)
+                                self._time_copy(f"S1b->{dname}", "memmove", dptr, faddr + off1, n,
+                                                reps=reps, source_kind="file_first_touch",
+                                                dest_kind=dname, condition="S1b",
+                                                role=role, offset=off1)
                 finally:
                     _unmap(faddr, fsize)
-
-            # ---- memmove vs memcpy on the same resident file range ----
-            if model_paths.get("clip") and os.path.exists(model_paths["clip"]):
-                p = model_paths["clip"]
-                faddr, fsize = _file_map(p)
-                try:
-                    with open(p, "rb") as fh:
-                        data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
-                    src = faddr + data_start
-                    _memmove(anon_dst, src, n)  # make it resident
-                    for prim in ("memmove", "memcpy"):
-                        for dname, dptr in dests.items():
-                            _memset(dptr, n)
-                            self._time_copy(f"prim_{prim}_{dname}", prim, dptr, src, n, reps=5,
-                                            source_kind="file_resident", dest_kind=dname,
-                                            condition="primitive_compare")
-                finally:
-                    _unmap(faddr, fsize)
-
-            # ---- alignment variants: relative offset 0/32 on anon buffers ----
-            for soff in (0, 32):
-                for doff in (0, 32):
-                    _memset(anon_dst, n)
-                    self._time_copy(f"align_s{soff}_d{doff}", "memmove",
-                                    anon_dst + doff, anon_src + soff, n, reps=5,
-                                    source_kind="anon_resident", dest_kind="anon_private",
-                                    condition="alignment", forced_src_off=soff, forced_dst_off=doff)
 
             # ---- destination write path (memset controls) ----
             for dname, dptr in dests.items():
-                self._time_memset(f"memset_{dname}", dptr, n, reps=3, dest_kind=dname)
+                self._time_memset(f"memset_{dname}", dptr, n, reps=2, dest_kind=dname)
 
-            # ---- thread scaling on resident anonymous ----
-            self.thread_scaling(n)
+            if lv >= 3:
+                # ---- memmove vs memcpy on the same resident file range ----
+                p = model_paths.get("clip")
+                if p and os.path.exists(p):
+                    faddr, fsize = _file_map(p)
+                    try:
+                        with open(p, "rb") as fh:
+                            data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+                        src = faddr + data_start
+                        _memmove(anon_dst, src, n)  # make it resident
+                        for prim in ("memmove", "memcpy"):
+                            for dname, dptr in dests.items():
+                                _memset(dptr, n)
+                                self._time_copy(f"prim_{prim}_{dname}", prim, dptr, src, n, reps=3,
+                                                source_kind="file_resident", dest_kind=dname,
+                                                condition="primitive_compare")
+                    finally:
+                        _unmap(faddr, fsize)
+
+                # ---- alignment variants: relative offset 0/32 on anon buffers ----
+                for soff in (0, 32):
+                    for doff in (0, 32):
+                        _memset(anon_dst, n)
+                        self._time_copy(f"align_s{soff}_d{doff}", "memmove",
+                                        anon_dst + doff, anon_src + soff, n, reps=3,
+                                        source_kind="anon_resident", dest_kind="anon_private",
+                                        condition="alignment", forced_src_off=soff,
+                                        forced_dst_off=doff)
+
+            if lv >= 4:
+                # ---- thread scaling on resident anonymous ----
+                self.thread_scaling(n)
 
             result["sha256_probe"] = "not-computed"
         except Exception as exc:  # never let a probe failure break the request
