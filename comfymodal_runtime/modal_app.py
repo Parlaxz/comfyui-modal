@@ -23843,6 +23843,11 @@ class ModalRuntimeEntrypoint:
             }
             result_data["images"] = [image_entry]
             result_data["include_base64"] = True
+            # The PNG now lives in images[0].data.  Leaving the flat
+            # image_data key in place duplicated the full 3 MB payload, which
+            # base64-encodes to ~4 MB and is serialized onto the Modal wire
+            # between yield and method return.
+            result_data.pop("image_data", None)
         # The adapter result is the authoritative request-scoped Golden
         # identity surface.  Keep a named copy as well as the conventional
         # result identity key so host projection can consume either terminal
@@ -23912,6 +23917,12 @@ class ModalRuntimeEntrypoint:
             _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
         )
         if telemetry is not None:
+            # The result carries the byte-identical persisted telemetry document.
+            # That equality is a deliberate contract (asserted by
+            # test_p2_golden_snapshot_adapter), not incidental structure: the
+            # terminal result must be self-describing and independently
+            # verifiable without re-reading the volume.  Trimming the ~99 KB
+            # event stream here to save wire time would break it, so it stays.
             result_data["golden_telemetry"] = telemetry
             observed_attention = str(
                 telemetry.get("attention_backend_resolved", "missing")
