@@ -444,8 +444,13 @@ async def golden_parallel_execute(
                     _paths["unet"] = str(session.model_paths.get("unet") or "")
                 except Exception:
                     _paths = {}
-                _payload = _m1cb.CopyProbe().run(_paths)
-                session.recorder.event("m1cb_copy_probe", **_payload)
+                _probe = _m1cb.CopyProbe()
+                # Checkpoint after every phase: a native-memory fault in a later
+                # phase must not erase the phases that already completed.
+                _emit = lambda phase, res: session.recorder.event(
+                    "m1cb_copy_probe", phase=phase, **res)
+                _payload = _probe.run_phased(_paths, emit=_emit)
+                session.recorder.event("m1cb_copy_probe", phase="final", **_payload)
             except BaseException as _m1cb_exc:  # never fail the request for a probe
                 session.recorder.event(
                     "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"

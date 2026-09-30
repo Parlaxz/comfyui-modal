@@ -29,6 +29,12 @@ from typing import Any
 
 MIB = 1 << 20
 SLOT_BYTES = 64 * MIB
+# mmap(2) constants used by the probe.  PROT_READ is 1, so read/write is 3;
+# mapping a destination PROT_READ is a guaranteed SIGSEGV on first write.
+_PROT_READ = 1
+_PROT_RW = 3
+_MAP_PRIVATE = 2
+_MAP_PRIVATE_ANON = 0x22  # MAP_PRIVATE | MAP_ANONYMOUS
 # Headroom past every probe buffer so the +32 alignment variants, which copy a
 # full SLOT_BYTES starting at a 32-byte offset, never read or write past the
 # end of their mapping.
@@ -80,10 +86,15 @@ def _init() -> None:
 
 # ── small allocation helpers ────────────────────────────────────────────────
 def _anon(size: int, *, align: int = 4096) -> int:
-    """Anonymous memory, page-aligned, zero-filled by the kernel on first touch."""
+    """Anonymous memory, page-aligned, zero-filled by the kernel on first touch.
+
+    PROT_READ|PROT_WRITE (3) is mandatory: every probe buffer is both a copy
+    source and a copy destination, and mapping PROT_READ alone segfaults on the
+    first write.  That was the cause of every "Server has lost track of input".
+    """
     _init()
     extra = align if (size % align) else 0
-    addr = _LIBC.mmap(None, ctypes.c_size_t(size + extra), 1, 0x22, -1, 0)  # PROT_READ|WRITE, MAP_PRIVATE|ANON
+    addr = _LIBC.mmap(None, ctypes.c_size_t(size + extra), _PROT_RW, _MAP_PRIVATE_ANON, -1, 0)
     if not addr or int(ctypes.cast(addr, ctypes.c_void_p).value or 0) == ctypes.c_void_p(-1).value:
         raise RuntimeError(f"anon_mmap_failed errno={ctypes.get_errno()}")
     return int(ctypes.cast(addr, ctypes.c_void_p).value or 0)
@@ -127,9 +138,11 @@ def _file_window(path: str, offset: int, length: int, page: int = 4096) -> tuple
         span = delta + length
         if page_start + span > size:
             raise RuntimeError(f"window_past_eof offset={offset} length={length} size={size}")
-        addr = _LIBC.mmap(ctypes.c_void_p(page_start), ctypes.c_size_t(span),
-                          ctypes.c_int(1), ctypes.c_int(2), ctypes.c_int(fd),
-                          ctypes.c_long(page_start))
+        # Read-only source window: PROT_READ | MAP_PRIVATE, address hint NULL
+        # (page_start is the file OFFSET, not a usable address).
+        addr = _LIBC.mmap(None, ctypes.c_size_t(span),
+                          ctypes.c_int(_PROT_READ), ctypes.c_int(_MAP_PRIVATE),
+                          ctypes.c_int(fd), ctypes.c_long(page_start))
         if not addr or int(ctypes.cast(addr, ctypes.c_void_p).value or 0) == ctypes.c_void_p(-1).value:
             raise RuntimeError(f"file_window_mmap_failed errno={ctypes.get_errno()}")
         return int(ctypes.cast(addr, ctypes.c_void_p).value or 0), delta
@@ -490,6 +503,54 @@ class CopyProbe:
             "s1_over_s2": (s1 / s2) if (s1 and s2) else None,
             "s1_over_s3": (s1 / s3) if (s1 and s3) else None,
         }
+
+    # ---- phased driver -----------------------------------------------------
+    def run_phased(self, model_paths: dict, arena_addr: int | None = None,
+                   emit=None) -> dict:
+        """Run the probe, checkpointing after each phase.
+
+        The probe is a native-memory harness, so a fault in any phase can take
+        the process with it and destroy everything measured so far.  Each phase
+        is therefore run independently and reported as soon as it completes, so
+        a later fault costs only that phase.  ``emit`` is called with
+        ``(phase_name, cumulative_result)`` after every phase.
+        """
+        result: dict[str, Any] = {"schema": "m1cb_copy_probe_v2",
+                                  "phases_completed": []}
+        phases = [("libc_init", lambda: self._phase_libc(result)),
+                  ("fingerprint", lambda: self._phase_fingerprint(result)),
+                  ("copy_matrix", lambda: self._phase_matrix(model_paths, result,
+                                                              arena_addr))]
+        for name, fn in phases:
+            try:
+                fn()
+            except Exception as exc:
+                result.setdefault("phase_errors", {})[name] = (
+                    f"{type(exc).__name__}: {exc}")
+                break
+            result["phases_completed"].append(name)
+            if emit is not None:
+                try:
+                    emit(name, result)
+                except Exception:
+                    pass
+        return result
+
+    def _phase_libc(self, result: dict) -> None:
+        _init()
+        result["libc"] = {"resolved": _LIBC is not None,
+                          "memmove": bool(_MEMMOVE), "memcmp": bool(_MEMCMP)}
+
+    def _phase_fingerprint(self, result: dict) -> None:
+        self.fingerprint()
+        result["fingerprint"] = dict(self.meta)
+
+    def _phase_matrix(self, model_paths: dict, result: dict,
+                      arena_addr: int | None) -> None:
+        inner = self.run(model_paths, arena_addr=arena_addr)
+        result["probe"] = inner
+        if inner.get("error"):
+            raise RuntimeError(inner["error"])
 
     # ---- main entry --------------------------------------------------------
     def run(self, model_paths: dict[str, str], arena_addr: int | None = None) -> dict:
