@@ -29,6 +29,10 @@ from typing import Any
 
 MIB = 1 << 20
 SLOT_BYTES = 64 * MIB
+# Headroom past every probe buffer so the +32 alignment variants, which copy a
+# full SLOT_BYTES starting at a 32-byte offset, never read or write past the
+# end of their mapping.
+_SLACK = MIB
 PROBE_ENV = "COMFYMODAL_M1B_COPY_PROBE"
 LEVEL_ENV = "COMFYMODAL_M1B_LEVEL"
 
@@ -291,9 +295,25 @@ class CopyProbe:
         return rec
 
     # ---- phase 7: thread scaling ------------------------------------------
-    def thread_scaling(self, anon_src: int, anon_dst: int, shm_dst: int, n: int) -> None:
+    def thread_scaling(self, n: int) -> None:
+        """Fan one 64 MiB block across 1..4 threads.
+
+        Each thread owns a disjoint ``n``-byte slice, so this arm needs
+        ``4 * n`` of source and of destination per destination kind.  The
+        single-slot buffers used by the serial matrix are far too small here and
+        would fault, so this arm allocates its own widest-case regions.
+        """
         import threading
-        for label, base in (("anon_private", anon_dst), ("anon_shared_registered", shm_dst)):
+        width = 4 * n + _SLACK
+        src = _anon(width)
+        _memset(src, width)
+        scale_shm = "m1cb_probe_shm_scaling"
+        _shm_create(scale_shm, width)
+        dests = {"anon_private": _anon(width),
+                 "shm_unregistered": _shm_map(scale_shm, width)}
+        for dptr in dests.values():
+            _memset(dptr, width)
+        for label, base in dests.items():
             for nthreads in (1, 2, 3, 4):
                 bar = threading.Barrier(nthreads)
                 out: list = [0] * nthreads
@@ -303,7 +323,7 @@ class CopyProbe:
                     bar.wait()
                     c0 = _tcpu()
                     t0 = _now()
-                    _MEMMOVE(ctypes.c_void_p(base + i * n), ctypes.c_void_p(anon_src + i * n),
+                    _MEMMOVE(ctypes.c_void_p(base + i * n), ctypes.c_void_p(src + i * n),
                              ctypes.c_size_t(n))
                     t1 = _now()
                     out[i] = t1 - t0
@@ -320,7 +340,7 @@ class CopyProbe:
                           span_wall_ns=slowest,
                           per_thread_gbps=[n / (w / 1e9) if w else None for w in out],
                           aggregate_gbps=(nthreads * n) / (slowest / 1e9) if slowest else None,
-                          dst=_align_report(base), src=_align_report(anon_src))
+                          dst=_align_report(base), src=_align_report(src))
 
     # ---- main entry --------------------------------------------------------
     def run(self, model_paths: dict[str, str], arena_addr: int | None = None) -> dict:
@@ -330,11 +350,11 @@ class CopyProbe:
         result: dict[str, Any] = {"schema": "m1cb_copy_probe_v1", "level": level(),
                                   "nbytes": n, "rows": self.rows}
         try:
-            anon_src = _anon(n)
-            anon_dst = _anon(n)
+            anon_src = _anon(n + _SLACK)
+            anon_dst = _anon(n + _SLACK)
             shm_name = "m1cb_probe_shm"
-            _shm_create(shm_name, n)
-            shm_dst = _shm_map(shm_name, n)
+            _shm_create(shm_name, n + _SLACK)
+            shm_dst = _shm_map(shm_name, n + _SLACK)
             result["buffers"] = {
                 "anon_src": _align_report(anon_src), "anon_dst": _align_report(anon_dst),
                 "shm_dst": _align_report(shm_dst), "arena_addr": _align_report(arena_addr) if arena_addr else None,
@@ -433,7 +453,7 @@ class CopyProbe:
                 self._time_memset(f"memset_{dname}", dptr, n, reps=3, dest_kind=dname)
 
             # ---- thread scaling on resident anonymous ----
-            self.thread_scaling(anon_src, anon_dst, shm_dst, n)
+            self.thread_scaling(n)
 
             result["sha256_probe"] = "not-computed"
         except Exception as exc:  # never let a probe failure break the request
