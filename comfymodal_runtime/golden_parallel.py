@@ -446,9 +446,14 @@ async def golden_parallel_execute(
                 _arena = None
                 try:
                     from . import golden_model_transport as _gmt
-                    _rt = getattr(_gmt, "M1C_ARENA_RUNTIME", None)
-                    if _rt is not None and hasattr(_rt, "_backing_address"):
-                        _arena = int(_rt._backing_address())
+                    _arena = getattr(_gmt, "M1C_ARENA_ADDRESS", None)
+                    if _arena is None:
+                        _rt = getattr(_gmt, "M1C_ARENA_RUNTIME", None)
+                        _ba = getattr(_rt, "_backing_address", None)
+                        if callable(_ba):
+                            _arena = int(_ba())
+                    if _arena is not None:
+                        _arena = int(_arena)
                 except Exception:
                     _arena = None
                 _final = None

@@ -361,6 +361,7 @@ C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
 # production arena rather than a stand-in. Observation only; never read by
 # production logic.
 M1C_ARENA_RUNTIME: Any = None
+M1C_ARENA_ADDRESS: Any = None
 _C0_TRANSPORT_GEOMETRIES = ("qd4_64", "qd2_128", "qd4_64_h2d128", "qd4_128")
 _C0_WINDOW_TRACE_LIMIT = 4096
 
@@ -873,8 +874,14 @@ class GoldenModelTransport:
                 # M1C diagnostic: publish the live arena runtime for the Q3
                 # registered-destination test. Observation only.
                 try:
-                    global M1C_ARENA_RUNTIME
+                    global M1C_ARENA_RUNTIME, M1C_ARENA_ADDRESS
                     M1C_ARENA_RUNTIME = self._c0_runtime
+                    # Publish the ADDRESS as well as the object: the runtime
+                    # handle can be released before the post-durability hook
+                    # reads it, but the mapping is still live at that point.
+                    _ba = getattr(self._c0_runtime, "_backing_address", None)
+                    if callable(_ba):
+                        M1C_ARENA_ADDRESS = int(_ba())
                 except Exception:
                     pass
                 _c0marks = getattr(self, "_c0_setup_marks", None)
