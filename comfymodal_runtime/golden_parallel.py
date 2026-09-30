@@ -145,6 +145,46 @@ def _install_post_request_exit_bound(gate_s: float = POST_REQUEST_EXIT_GATE_S) -
     _PROGRESS_STATE["exit_timer"] = timer
 
 
+class _OuterLifetime:
+    """Passive outer-method lifetime marks for the streaming adapter.
+
+    Modal-reported execution time is the OUTER method wall, while the Golden
+    waterfall only covers the inner call.  This records the real seam: an async
+    generator suspends at every ``yield``, so the interval between a result
+    becoming available to the caller and Python resuming is measurable here
+    rather than inferred.  Same monotonic clock the path already treats as
+    authoritative; one monotonic read and one print per boundary.
+    """
+
+    __slots__ = ("t0_ns", "marks")
+
+    def __init__(self) -> None:
+        self.t0_ns = time.monotonic_ns()
+        self.marks: list[tuple[str, int, int, str]] = []
+
+    def mark(self, name: str, *, detail: str = "") -> int:
+        now_ns = time.monotonic_ns()
+        self.marks.append((name, now_ns, now_ns - self.t0_ns, detail))
+        print(
+            f"[v2.golden.outer] {name} t_ns={now_ns} "
+            f"elapsed_ms={(now_ns - self.t0_ns) / 1e6:.3f}"
+            + (f" detail={detail}" if detail else ""),
+            flush=True,
+        )
+        return now_ns
+
+    def report(self) -> None:
+        if not self.marks:
+            return
+        first, last = self.marks[0], self.marks[-1]
+        wall_ms = (last[1] - first[1]) / 1e6
+        print(
+            f"[v2.golden.outer] OUTER_SUMMARY outer_wall_ms={wall_ms:.3f} "
+            f"marks={len(self.marks)} first={first[0]} last={last[0]}",
+            flush=True,
+        )
+
+
 async def golden_parallel_execute(
     request: GoldenRequest,
     *,

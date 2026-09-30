@@ -23099,7 +23099,13 @@ class ModalRuntimeEntrypoint:
         marker selects ``golden_parallel_execute`` at the final orchestration
         seam; no serial loader or sampler implementation is duplicated.
         """
+        outer_mark_lifetime = __import__(
+            "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
+        )._OuterLifetime
+        outer = outer_mark_lifetime()
+        outer.mark("remote_method_entry")
         if not isinstance(request, Mapping):
+            outer.mark("remote_method_return")
             yield {
                 "type": "error",
                 "request_id": "",
@@ -23109,7 +23115,13 @@ class ModalRuntimeEntrypoint:
         parallel_request = dict(request)
         parallel_request["golden_mode"] = "parallel"
         async for event in self._run_golden_stream_impl(parallel_request):
+            # pre-yield / post-yield-resume are the seam that decides whether a
+            # Modal-reported execution time includes caller-side suspension.
+            outer.mark("pre_yield", detail=str(event.get("type", "")))
             yield event
+            outer.mark("post_yield_resume")
+        outer.mark("remote_method_return")
+        outer.report()
 
     async def run_golden_serial_stream(
         self,
