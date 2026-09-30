@@ -13378,36 +13378,6 @@ async def golden_unet_load(
             transport_stats=build_qd_transport_diagnostics(transport["stats"]),
         )
         load_exit_ns = time.monotonic_ns()
-        # M1-CB diagnostic: physical copy root-cause calibration. Runs only when
-        # explicitly gated, strictly AFTER both model loads have completed and
-        # quiesced, so it can never perturb a measured source window or the
-        # correctness of the request. The probe verifies its own byte integrity
-        # and any failure is recorded rather than raised.
-        if str(os.environ.get("COMFYMODAL_M1B_COPY_PROBE") or "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }:
-            try:
-                from . import m1_copy_probe as _m1cb
-
-                _paths = {}
-                try:
-                    _paths["clip"] = str(session.model_paths.get("clip") or "")
-                    _paths["unet"] = str(session.model_paths.get("unet") or "")
-                except Exception:
-                    _paths = {}
-                _arena = None
-                try:
-                    from . import golden_model_transport as _gmt
-
-                    _rt = getattr(_gmt, "M1CB_ARENA_RUNTIME", None)
-                    if _rt is not None and hasattr(_rt, "_backing_address"):
-                        _arena = int(_rt._backing_address())
-                except Exception:
-                    _arena = None
-                _payload = _m1cb.CopyProbe().run(_paths, arena_addr=_arena)
-                rec.event("m1cb_copy_probe", **_payload)
-            except BaseException as _m1cb_exc:  # never fail the request for a probe
-                rec.event("m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}")
         if shared_transport is not None and session.model_transport_records:
             interval = rec.intervals["golden_unet_load"]
             full_load_ms = (
@@ -15540,6 +15510,38 @@ async def golden_serial_execute(
                 )
             session.recorder.mark_true_durable()
         result = session.build_final_result()
+        # M1-CB diagnostic: minimal inline copy sentinel.
+        #
+        # Placement is load-bearing and was originally wrong.  Running this at
+        # the end of golden_unet_load is NOT "after the loads": with
+        # COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP=1 that function completes at
+        # the start of the clip_forward/unet window, so the probe allocated and
+        # moved memory while the source owner was still servicing it.  That
+        # segfaulted the runner (exit 139, v2ctl "Server has lost track of
+        # input") on 5/8 runs while the untouched control was 0/52.
+        #
+        # Here the generation has finished, the result is committed and durable,
+        # and the source owner has no work in flight, so the allocation cannot
+        # perturb any measured load window or the output SHA.  Failures are
+        # recorded, never raised: a probe must not fail the request.
+        if str(os.environ.get("COMFYMODAL_M1B_COPY_PROBE") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            try:
+                from . import m1_copy_probe as _m1cb
+
+                _paths = {}
+                try:
+                    _paths["clip"] = str(session.model_paths.get("clip") or "")
+                    _paths["unet"] = str(session.model_paths.get("unet") or "")
+                except Exception:
+                    _paths = {}
+                _payload = _m1cb.CopyProbe().run(_paths)
+                session.recorder.event("m1cb_copy_probe", **_payload)
+            except BaseException as _m1cb_exc:  # never fail the request for a probe
+                session.recorder.event(
+                    "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"
+                )
         session.recorder.event(EVENT_RESULT_ASSEMBLED, request_id=request.request_id)
     except BaseException as exc:
         # Primary failure: mandatory teardown still runs exactly once.  Its
