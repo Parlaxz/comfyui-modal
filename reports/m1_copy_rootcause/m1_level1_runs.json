@@ -1,0 +1,976 @@
+[
+ {
+  "receipt": "run_20260930-033018_004fca96.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 30153.53,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 1685.120458,
+    "source_gbps": 4.774101550905271,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.8011998119127934,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 35.527831,
+      "2": 55.918556,
+      "3": 116.581659,
+      "4": 1477.092412
+     },
+     "slot_wait_ms": 183.66417,
+     "ready_queue_wait_ms": 1461.23136,
+     "pacing_wait_count": 20,
+     "below_four_reader_ms": 208.028046,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      3,
+      4,
+      112
+     ]
+    },
+    "probe": null,
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 231.24735939502716,
+     "final_drain_wall_ms": 0.419554,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 74.945466
+    }
+   },
+   "unet": {
+    "source_wall_ms": 2856.652937,
+    "source_gbps": 4.309175018274193,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.6885529538865365,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 260.656315,
+      "2": 6.545555,
+      "3": 94.636064,
+      "4": 2494.815003
+     },
+     "slot_wait_ms": 0.0,
+     "ready_queue_wait_ms": 3902.009508,
+     "pacing_wait_count": 14,
+     "below_four_reader_ms": 361.837934,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      1,
+      181
+     ]
+    },
+    "probe": null,
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 346.25110256671906,
+     "final_drain_wall_ms": 117.596248,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 89.894127
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-033655_a8305331.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 67875.419,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 1490.633854,
+    "source_gbps": 5.396990126322463,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.734094031920464,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 58.099552,
+      "2": 43.986944,
+      "3": 134.095894,
+      "4": 1254.451464
+     },
+     "slot_wait_ms": 241.003746,
+     "ready_queue_wait_ms": 1224.279005,
+     "pacing_wait_count": 14,
+     "below_four_reader_ms": 236.18239,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      4,
+      3,
+      112
+     ]
+    },
+    "probe": null,
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 204.80806410312653,
+     "final_drain_wall_ms": 0.510361,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 74.379108
+    }
+   },
+   "unet": {
+    "source_wall_ms": 2409.511757,
+    "source_gbps": 5.108843082519974,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.5590326704515016,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 296.620994,
+      "2": 21.081674,
+      "3": 130.489635,
+      "4": 1961.319454
+     },
+     "slot_wait_ms": 14.712556,
+     "ready_queue_wait_ms": 3192.277672,
+     "pacing_wait_count": 25,
+     "below_four_reader_ms": 448.192303,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      4,
+      178
+     ]
+    },
+    "probe": null,
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 325.8765774965286,
+     "final_drain_wall_ms": 0.135517,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 89.856573
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-034517_21555e1f.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 44088.71,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 2559.543618,
+    "source_gbps": 3.1431135361100924,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.9489976939318563,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 14.730061,
+      "2": 15.898244,
+      "3": 54.555956,
+      "4": 2474.359357
+     },
+     "slot_wait_ms": 0.0,
+     "ready_queue_wait_ms": 2206.841694,
+     "pacing_wait_count": 9,
+     "below_four_reader_ms": 85.184261,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      1,
+      117
+     ]
+    },
+    "probe": {
+     "records_env_raw": null,
+     "records_env_enabled": false,
+     "level_env_raw": null,
+     "owner_level": 0,
+     "owner_active_op_size": 144,
+     "owner_field_count": 18,
+     "owner_max_ops": 3174,
+     "retained_records": 120,
+     "sample_keys": [
+      "access_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": false,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 160.98751938343048,
+     "final_drain_wall_ms": 0.398095,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 41.188814
+    }
+   },
+   "unet": {
+    "source_wall_ms": 7568.442629,
+    "source_gbps": 1.6264663782787327,
+    "n_ops": 0,
+    "qc": {
+     "time_weighted_effective_concurrency": 2.984240769092576,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 1995.852719,
+      "2": 768.645106,
+      "3": 162.867095,
+      "4": 4641.077709
+     },
+     "slot_wait_ms": 84.525683,
+     "ready_queue_wait_ms": 5390.856638,
+     "pacing_wait_count": 18,
+     "below_four_reader_ms": 2927.36492,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      1,
+      181
+     ]
+    },
+    "probe": {
+     "records_env_raw": null,
+     "records_env_enabled": false,
+     "level_env_raw": null,
+     "owner_level": 0,
+     "owner_active_op_size": 144,
+     "owner_field_count": 18,
+     "owner_max_ops": 3174,
+     "retained_records": 184,
+     "sample_keys": [
+      "access_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": false,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 261.83097648620605,
+     "final_drain_wall_ms": 0.536247,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 67.248968
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-035227_13076d45.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 88464.354,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 2076.385388,
+    "source_gbps": 3.874490852465968,
+    "n_ops": 120,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.792618032524895,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 55.320736,
+      "2": 50.862398,
+      "3": 162.917883,
+      "4": 1807.284371
+     },
+     "slot_wait_ms": 188.492588,
+     "ready_queue_wait_ms": 1809.046882,
+     "pacing_wait_count": 17,
+     "below_four_reader_ms": 269.101017,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      4,
+      3,
+      112
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 120,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 200.09100759029388,
+     "final_drain_wall_ms": 0.419378,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 111.845292
+    }
+   },
+   "unet": {
+    "source_wall_ms": 2401.338232,
+    "source_gbps": 5.126232243321898,
+    "n_ops": 184,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.854061359899258,
+     "time_weighted_levels_ms": {
+      "0": 25.256095,
+      "1": 30.457666,
+      "2": 27.02502,
+      "3": 104.000618,
+      "4": 2214.598833
+     },
+     "slot_wait_ms": 198.851394,
+     "ready_queue_wait_ms": 4173.969915,
+     "pacing_wait_count": 25,
+     "below_four_reader_ms": 186.739399,
+     "effective_reader_concurrency_distribution": [
+      0,
+      2,
+      2,
+      3,
+      177
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 184,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 254.55478429794312,
+     "final_drain_wall_ms": 0.394322,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 42.713918
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-035423_13076d45.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 86473.69,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 1979.285913,
+    "source_gbps": 4.06456497222592,
+    "n_ops": 120,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.824083564323332,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 36.311836,
+      "2": 39.751229,
+      "3": 159.750957,
+      "4": 1743.471891
+     },
+     "slot_wait_ms": 165.559171,
+     "ready_queue_wait_ms": 1684.767727,
+     "pacing_wait_count": 14,
+     "below_four_reader_ms": 235.814022,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      3,
+      3,
+      113
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 120,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 593.1746897697449,
+     "final_drain_wall_ms": 0.652703,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 136.752882
+    }
+   },
+   "unet": {
+    "source_wall_ms": 3050.818612,
+    "source_gbps": 4.034922765837643,
+    "n_ops": 184,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.640507582559615,
+     "time_weighted_levels_ms": {
+      "0": 172.167565,
+      "1": 56.686125,
+      "2": 17.871622,
+      "3": 202.274279,
+      "4": 2601.819021
+     },
+     "slot_wait_ms": 818.138997,
+     "ready_queue_wait_ms": 4668.190524,
+     "pacing_wait_count": 31,
+     "below_four_reader_ms": 448.999591,
+     "effective_reader_concurrency_distribution": [
+      0,
+      2,
+      2,
+      4,
+      176
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 184,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 894.9726712703705,
+     "final_drain_wall_ms": 0.616962,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 142.093404
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-035455_13076d45.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 29337.156,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 1712.679557,
+    "source_gbps": 4.697280445205898,
+    "n_ops": 120,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.9020907020728806,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 14.109275,
+      "2": 17.655443,
+      "3": 90.048542,
+      "4": 1590.866297
+     },
+     "slot_wait_ms": 41.202717,
+     "ready_queue_wait_ms": 1560.598511,
+     "pacing_wait_count": 8,
+     "below_four_reader_ms": 121.81326,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      3,
+      115
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 120,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 169.06278443336487,
+     "final_drain_wall_ms": 0.394238,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 72.192407
+    }
+   },
+   "unet": {
+    "source_wall_ms": 2163.667955,
+    "source_gbps": 5.689328366468321,
+    "n_ops": 184,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.929980550088611,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 8.487465,
+      "2": 15.52645,
+      "3": 94.983545,
+      "4": 2044.670495
+     },
+     "slot_wait_ms": 0.0,
+     "ready_queue_wait_ms": 3673.777481,
+     "pacing_wait_count": 28,
+     "below_four_reader_ms": 118.99746,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      1,
+      181
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 184,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 260.12428855895996,
+     "final_drain_wall_ms": 0.379548,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 57.598551
+    }
+   }
+  }
+ },
+ {
+  "receipt": "run_20260930-035604_13076d45.json",
+  "valid": true,
+  "sha_ok": true,
+  "duration_ms": 66440.669,
+  "roles": {
+   "clip": {
+    "source_wall_ms": 3881.856397,
+    "source_gbps": 2.072445595415981,
+    "n_ops": 120,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.957902025915669,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 13.310356,
+      "2": 18.014235,
+      "3": 87.458752,
+      "4": 3763.073054
+     },
+     "slot_wait_ms": 0.0,
+     "ready_queue_wait_ms": 2515.767369,
+     "pacing_wait_count": 18,
+     "below_four_reader_ms": 118.783343,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      2,
+      116
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 120,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 8044936192,
+     "h2d_submitted_count": 120,
+     "GPU_COPY_ACTIVE_SUM_MS": 308.7524485588074,
+     "final_drain_wall_ms": 0.489089,
+     "h2d_min_submission_bytes": 58981376,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 55.213136
+    }
+   },
+   "unet": {
+    "source_wall_ms": 5100.387504,
+    "source_gbps": 2.413506319342594,
+    "n_ops": 184,
+    "qc": {
+     "time_weighted_effective_concurrency": 3.963133540764788,
+     "time_weighted_levels_ms": {
+      "0": 0.0,
+      "1": 10.04872,
+      "2": 18.373303,
+      "3": 121.140462,
+      "4": 4950.825019
+     },
+     "slot_wait_ms": 0.0,
+     "ready_queue_wait_ms": 6737.829168,
+     "pacing_wait_count": 21,
+     "below_four_reader_ms": 149.562485,
+     "effective_reader_concurrency_distribution": [
+      0,
+      1,
+      1,
+      3,
+      179
+     ]
+    },
+    "probe": {
+     "records_env_raw": "1",
+     "records_env_enabled": true,
+     "level_env_raw": "1",
+     "owner_level": 1,
+     "owner_active_op_size": 208,
+     "owner_field_count": 26,
+     "owner_max_ops": 2197,
+     "retained_records": 184,
+     "sample_keys": [
+      "access_start_ns",
+      "claim_cpu_ns",
+      "claim_wall_ns",
+      "copy_thread_cpu_end_ns",
+      "copy_thread_cpu_start_ns",
+      "flags",
+      "generation",
+      "map_start_ns",
+      "memcpy_end_ns",
+      "memcpy_start_ns",
+      "munmap_end_ns",
+      "munmap_start_ns",
+      "nbytes",
+      "ordinal",
+      "pacing_wait_ns",
+      "plan_generation",
+      "reader",
+      "reader_id",
+      "ready_ns",
+      "rusage_majflt",
+      "rusage_minflt",
+      "rusage_nivcsw",
+      "rusage_nvcsw",
+      "slot",
+      "slot_index",
+      "slot_wait_ns",
+      "source_offset",
+      "source_start_ns",
+      "thread",
+      "thread_id"
+     ],
+     "thread_cpu_available": true,
+     "rusage_available": false
+    },
+    "dispatcher": {
+     "h2d_completed_bytes": 12309817472,
+     "h2d_submitted_count": 184,
+     "GPU_COPY_ACTIVE_SUM_MS": 480.34342432022095,
+     "final_drain_wall_ms": 0.472751,
+     "h2d_min_submission_bytes": 28895360,
+     "h2d_max_submission_bytes": 67108864,
+     "dispatcher_reap_wall_ms": 84.333082
+    }
+   }
+  }
+ }
+]

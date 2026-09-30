@@ -4795,6 +4795,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # spec rebuild (identity.gpu / gpu_requested_order) reflects the actual
         # deploy request instead of the parse_gpu_request() default.
         "COMFYMODAL_V2_GPU": os.environ.get("COMFYMODAL_V2_GPU", ""),
+        # Physical source-copy diagnostic selectors (M1B/M1C), default OFF.
+        # COMFYMODAL_M1B_COPY_PROBE must be present in the container env before
+        # the runtime is imported, because the Golden Parallel hook reads it.
+        "COMFYMODAL_M1B_COPY_PROBE": os.environ.get(
+            "COMFYMODAL_M1B_COPY_PROBE", "0"
+        ),
+        "COMFYMODAL_M1B_LEVEL": os.environ.get("COMFYMODAL_M1B_LEVEL", "1"),
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
         ),

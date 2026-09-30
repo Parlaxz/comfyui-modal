@@ -414,6 +414,48 @@ async def golden_parallel_execute(
                 )
             session.recorder.mark_true_durable()
         result = session.build_final_result()
+        # Physical source-copy diagnostic (M1B/M1C), default OFF.
+        #
+        # Placement and module are both load-bearing and were both wrong first
+        # time, so they are recorded here deliberately:
+        #  * module: run_golden_parallel_stream is orchestrated by
+        #    golden_parallel, NOT golden_serial.  A hook placed in the serial
+        #    runner's post-result path never executes and silently yields no
+        #    probe event, which looks like a passing run.
+        #  * placement: the end of golden_unet_load is NOT "after the loads".
+        #    With COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP=1 that function
+        #    completes at the START of the clip_forward/unet window, so a probe
+        #    there allocates and moves memory while the source owner is still
+        #    servicing that window.  Here generation is finished, the result is
+        #    committed and durable, and the source owner is idle.
+        # The probe is a native-memory harness; failures are recorded, never
+        # raised, and phases are emitted as they complete so a later fault
+        # cannot erase completed measurements.
+        if str(os.environ.get("COMFYMODAL_M1B_COPY_PROBE") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            try:
+                from . import m1_copy_probe as _m1cb
+
+                _paths = {}
+                try:
+                    _paths["clip"] = str(session.model_paths.get("clip") or "")
+                    _paths["unet"] = str(session.model_paths.get("unet") or "")
+                except Exception:
+                    _paths = {}
+                _final = None
+                for _phase, _res in _m1cb.CopyProbe().run_phased(_paths):
+                    session.recorder.event("m1cb_copy_probe", phase=_phase, **_res)
+                    _final = _res
+                if _final is not None:
+                    _inner = _final.get("probe") or {}
+                    if _inner.get("sentinel"):
+                        session.recorder.event(
+                            "m1cb_copy_probe", phase="sentinel", **_inner)
+            except BaseException as _m1cb_exc:
+                session.recorder.event(
+                    "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"
+                )
         session.recorder.event("RESULT_ASSEMBLED", request_id=request.request_id)
         # ── Strict CPU-I/O process evidence (experimental; default OFF) ────
         # Records child CUDA-sterility and the shared->pinned copy cost.  The
