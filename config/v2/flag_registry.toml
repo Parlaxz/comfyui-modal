@@ -1507,3 +1507,21 @@ consumed_at = "method_entry"
 change_requires = "deploy"
 owner = "golden-loader-ab"
 description = "Experimental: spawn the persistent CPU-only loader worker before snapshot capture so worker startup is removed from request time. On restore the same worker PID + IPC channel are verified (PING/PONG, no respawn) and then used for the three full loads. Default OFF."
+
+[[flag]]
+name = "COMFYMODAL_M1B_COPY_PROBE"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "m1-copy-rootcause"
+description = "M1-CB diagnostic: run the post-load physical source-copy calibration harness (factorial source/destination matrix, first-copy vs repeat, memmove vs memcpy, alignment variants, destination write path, 1/2/3/4-thread raw-copy scaling) inside the same container as the production loader. Runs strictly after both model loads complete and quiesce, so it cannot perturb a measured source window or affect the output SHA. Default OFF."
+
+[[flag]]
+name = "COMFYMODAL_M1B_LEVEL"
+type = "int"
+default = "1"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "m1-copy-rootcause"
+description = "M1-CB diagnostic detail level for the copy calibration harness. 1 = core matrix. Default 1."

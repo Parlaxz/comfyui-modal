@@ -4883,6 +4883,13 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"
         ),
+        # M1-CB physical copy root-cause calibration selectors. The probe runs
+        # post-load, but these must be present in the container environment
+        # before the runtime is imported.
+        "COMFYMODAL_M1B_COPY_PROBE": os.environ.get(
+            "COMFYMODAL_M1B_COPY_PROBE", "0"
+        ),
+        "COMFYMODAL_M1B_LEVEL": os.environ.get("COMFYMODAL_M1B_LEVEL", "1"),
         # Reader isolation for the C0 source owner.  Without this the container
         # always resolved "thread", which made the four-process arm silently
         # unreachable no matter what the profile or --set selected.

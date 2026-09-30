@@ -1,0 +1,25 @@
+# v2ctl profile: M1-CB physical source-copy root cause, H100.
+#
+# Identical to the production-006 counted profile except for the two M1-CB
+# diagnostic selectors. The calibration harness runs strictly AFTER both model
+# loads complete and quiesce, so the CLIP/UNET source measurements in this
+# request remain production-faithful and the output SHA is unaffected.
+#
+# Every performance mechanic (QD, reader count, worker kind, whole lifecycle,
+# geometry, pacing, H2D, arena, gates) is inherited byte-identically.
+# Never use this profile for a counted/performance claim.
+schema_version = 1
+name = "golden_p1_parallel_c0_copy_rootcause_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "m1-copy-rootcause"
+
+[target]
+# Dedicated diagnostic app; the production anchor is never mutated.
+app = "batch-c0-copy-rootcause-h100"
+
+[workload]
+run_count = 1
+
+[environment]
+COMFYMODAL_M1B_COPY_PROBE = "1"
+COMFYMODAL_M1B_LEVEL = "1"

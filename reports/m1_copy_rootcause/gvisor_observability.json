@@ -1,0 +1,83 @@
+{
+  "schema": "m1_gvisor_observability_v1",
+  "provenance": {
+    "profile": "golden_p1_parallel_c0_source_h100_m1_l2",
+    "deploy_fingerprint": "aefe3302696ab83f449f786b17b9ec9a2499156e69ea885c1fabb5f43a8776b6",
+    "app": "batch-c0-source-h100-m1",
+    "destination": "Testing 9 / ws_ee7221847f7d",
+    "run_receipt": "run_20260930-042450_28704bbe.json",
+    "run_valid": true,
+    "run_sha_match": true,
+    "probe_taken": "post-quiescence, parent (CUDA) process and CUDA-sterile source owner"
+  },
+  "clock": {
+    "monotonic_implementation": "clock_gettime(CLOCK_MONOTONIC)",
+    "monotonic": true,
+    "adjustable": false,
+    "resolution_ns": 1e-09,
+    "thread_time_ns_available": true,
+    "thread_time_ns_resolution_ms": 10,
+    "thread_time_ns_note": "all 41 distinct per-extent CPU deltas were exact multiples of 10 ms"
+  },
+  "cpu": {
+    "sched_getaffinity_present": true,
+    "logical_cpus": 28,
+    "reader_threads": 4,
+    "oversubscription_ratio": 7.0,
+    "sched_getcpu_present": false,
+    "cpu_now": null,
+    "physical_topology": "UNAVAILABLE"
+  },
+  "procfs": {
+    "proc_self_status": "AVAILABLE",
+    "proc_self_smaps_rollup": "UNAVAILABLE: FileNotFoundError",
+    "proc_pressure_cpu": "UNAVAILABLE: FileNotFoundError",
+    "proc_pressure_memory": "UNAVAILABLE: FileNotFoundError",
+    "proc_pressure_io": "UNAVAILABLE: FileNotFoundError",
+    "proc_self_task_schedstat": "UNAVAILABLE: FileNotFoundError (all 16 sampled tids)",
+    "proc_self_task_status": "AVAILABLE but context switches always 0"
+  },
+  "cgroup": {
+    "cpu_stat": "UNAVAILABLE: FileNotFoundError",
+    "memory_current": "UNAVAILABLE: FileNotFoundError",
+    "cpu_pressure": "UNAVAILABLE: FileNotFoundError",
+    "memory_pressure": "UNAVAILABLE: FileNotFoundError"
+  },
+  "rusage": {
+    "ru_minflt": "0 on 1216/1216 extents (silent zero, not an error)",
+    "ru_majflt": "0 on 1216/1216 extents",
+    "ru_nvcsw": "0 on 1216/1216 extents",
+    "ru_nivcsw": "0 on 1216/1216 extents",
+    "corroborated_by": "/proc/self/task/<tid>/status also reports 0 for both context-switch fields"
+  },
+  "model_files": {
+    "clip": {
+      "path": "/root/comfy/ComfyUI/models/text_encoders/qwen_3_4b.safetensors",
+      "size_bytes": 8044982048,
+      "size_confirmed_bytes": 8044982048,
+      "dev": 31,
+      "inode": 7,
+      "st_blksize": 4096,
+      "st_blocks": 15712856,
+      "header_bytes_derived": 45856,
+      "data_section_bytes_measured": 8044936192
+    },
+    "unet": {
+      "path": "/root/comfy/ComfyUI/models/diffusion_models/z_image_turbo_bf16.safetensors",
+      "size_bytes": 12309866400,
+      "size_confirmed_bytes": 12309866400,
+      "dev": 31,
+      "inode": 55,
+      "st_blksize": 4096,
+      "st_blocks": 24042708,
+      "header_bytes_derived": 48928,
+      "data_section_bytes_measured": 12309817472
+    },
+    "filesystem_type": "NOT ASSERTED - mountinfo opens but contains no model-related mount lines; paths are not labelled as any provider storage"
+  },
+  "headline_conclusion": {
+    "page_service_vs_memcpy": "copy is CPU/memcpy-dominated: median CPU/wall = 0.938 (CLIP) / 0.942 (UNET) over 1216 extents",
+    "exact_split_of_residual": "UNRESOLVED - no in-guest surface can separate page service from runqueue wait",
+    "level3_justified": false
+  }
+}
