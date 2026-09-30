@@ -1,189 +1,178 @@
-# M1C — five questions about the ~5.4 GB/s source ceiling
+# M1C — five questions about source throughput
 
-Base: `integration/m1b-correctness-fixes` (ported onto the live-control tree
-`promotion/production-006` = `c19e61c1`). `production-006` tag NOT moved or
-retagged. Testing 9 only.
+> **CORRECTION (supersedes the original synthesis).** The first version of this
+> report concluded that the "~5.4 GB/s ceiling" was a per-copy-speed limit and
+> recommended pinning the Modal region. **Both are wrong and are withdrawn.**
+> Region pinning is also prohibited on cost grounds (~1.5-1.75x price).
+> See "Why the original conclusion was wrong" below. The Q1-Q5 *measurements*
+> are unaffected and stand.
 
-Evidence base:
-- Q1, Q4, Q5 from the **frozen 10-run production-006 cohort**
-  (`source_operations.csv` 1216 per-extent records, `model_loads.csv` 20 rows).
-  No new runs spent for these.
-- Q2, Q3 from 2 new valid instrumented runs (deploy `c31e0d69`, exact SHA
-  `3a6a0306...`, `valid=true`, `dnf=false`, `config_parity identical`).
+Base: `integration/m1b-correctness-fixes`, ported onto the live-control tree
+`promotion/production-006` (`c19e61c1`). `production-006` tag NOT moved or
+retagged. Testing 9 only. Production NOT modified.
+
+Evidence:
+- Q1, Q4, Q5 from the frozen 10-run production-006 cohort (1216 per-extent
+  records, 20 model-load rows). No new runs spent.
+- Q2, Q3 from 6 valid instrumented runs (deploy `c31e0d69`), exact SHA
+  `3a6a0306...`, `valid=true`, `dnf=false`, config parity identical.
+- Variance from 56 valid untouched-control runs plus 10 fresh clean controls.
 
 ---
 
+## The finding that reframes everything: there is no 5.4 GB/s ceiling
+
+Across **56 valid untouched-control runs** spanning all of production-006's
+history:
+
+| | min | p50 | max | spread | CV |
+|---|---|---|---|---|---|
+| CLIP | 0.37 | 4.12 | 6.77 | **18.3x** | **36.5%** |
+| UNET | 1.33 | 4.14 | 6.87 | 5.2x | 31.7% |
+
+A fresh 10-run clean control cohort reproduces it: CLIP CV 32.3% (p50 4.61),
+UNET CV 25.0% (p50 4.40).
+
+**This variance predates all M1B/M1C work and is not caused by it.** The
+instrumented cohort showed CV 38.6% / 36.1% — statistically identical.
+
+The mechanism is visible: `COMFYMODAL_V2_REGION` and `COMFYMODAL_V2_CLOUD` both
+resolve to `""` (provider default), and containers land in **9 different
+regions** (ca, eu-north, eu-south, us-west, us-south, us-east, us-central,
+ap-northeast, ap-south, uk). CLIP and UNET track each other *within* a run
+(6.77/6.87, 1.36/1.33, 6.09/6.60), i.e. it is a **per-container placement**
+effect, not a per-model one.
+
+Individual control runs have already recorded **6.77/6.87, 6.09/6.60, 6.10,
+6.01/6.44, 5.65/5.00** — at or above the 6.5 GB/s target with no code change
+whatsoever.
+
+So the correct statement is: **6.5 GB/s is reachable but not reliable.** The
+target is a tail-fattening problem under random placement, not a throughput
+problem.
+
 ## Q1 — Is real production first access expensive?
 
-**Yes, and it is the dominant term.**
+**Yes, and it dominates the per-extent cost.**
 
-Real production 64 MiB copies, per extent:
-
-| | copies | copy_wall p50 | per-copy rate | thread CPU p50 | cpu/wall |
+| | copies | copy_wall p50 | per-copy | thread CPU | cpu/wall |
 |---|---|---|---|---|---|
 | CLIP | 480 | 55.99 ms | **1.20 GB/s** | 50.00 ms | 0.938 |
 | UNET | 736 | 50.75 ms | **1.32 GB/s** | 50.00 ms | 0.942 |
 
-The identical operation, same container, same process, post-load on warm pages:
-**10.81–12.91 GB/s** private anonymous. That is a **~9–10x gap**.
+Same operation post-load on warm pages: **10.81-12.91 GB/s** — a ~9-10x gap.
+CPU-bound (cpu/wall 0.94), so not descheduled.
 
-The copies are **CPU/memory bound, not descheduled** (cpu/wall ≈ 0.94, offcpu
-noise-level), so this is not the reader losing its timeslice.
+`rusage_minflt` is **0 on all 1216 records** (gVisor does not report it), so
+first-touch cannot be confirmed from fault counters. Every M1B "cold file"
+number (6.79 GB/s) was measured *post-load*, when the loader had already cached
+those pages — so there is still **no direct truly-cold measurement**.
 
-Page-fault evidence is unavailable: `rusage_minflt` is **0 on all 1216 records**
-(gVisor does not report it — a previously documented limitation), so the
-first-touch attribution cannot be confirmed from fault counters.
+## Q2 — Do four simultaneous readers create a shared source ceiling?
 
-Positional effect: the first ~1/8 of each run averages 181.5 ms (CLIP) / 85.0 ms
-(UNET) versus 63.3 / 64.1 ms for the remainder — first/rest ratio 1.54 (CLIP),
-1.17 (UNET). Directionally consistent with a front-loaded cost, but confounded
-with slow-run outliers and **not** a controlled prewarm comparison, so it is
-reported as suggestive only.
+**No.**
 
-**Honest caveat:** every "cold file" number M1B produced (6.79 GB/s) was
-measured *post-load*, by which point the loader had already pulled those pages
-into cache. So there is still **no direct measurement of a genuinely cold
-first-ever read**. Q1's answer is a strong inference from the production/warm
-contrast plus the exclusions below, not a direct cold-page measurement.
-
-## Q2 — Do four simultaneous file readers create a shared source ceiling?
-
-**No. There is no shared source-service ceiling.**
-
-File-backed, pre-warmed source, 64 MiB per reader, barrier-synchronised,
-private destinations, identical primitive. Two valid runs:
-
-| readers | run A aggregate | run B aggregate | efficiency (B) |
+| readers | run A | run B | efficiency (B) |
 |---|---|---|---|
 | 1 | 8.06 GB/s | 3.86 GB/s | 1.00 |
 | 2 | 16.77 GB/s | 9.55 GB/s | 2.48 |
 | 4 | **33.46 GB/s** | **14.26 GB/s** | **3.70** |
 
-Both runs scale near-linearly and 4 readers deliver **>>6.5 GB/s aggregate**
-(14.3–33.5). Run-to-run variance is large (this is a shared, noisy host) but the
-shape is unambiguous in both. Concurrency is **not** the limiter, and the
-"4 readers → ~5.4 GB/s" shared-ceiling pattern the brief anticipated **does not
-occur** on pre-warmed pages.
+Pre-warmed file-backed source, 64 MiB per reader, barrier-synchronised. Near
+-linear scaling, 4 readers far above 6.5 GB/s aggregate. **Concurrency is
+excluded** as the limiter on warm pages.
 
 ## Q3 — Does the actual CUDA-registered arena slow CPU copies?
 
-**Incomplete — private destination measured, registered arena not obtained.**
-
-private anonymous (resident file source): **10.81 GB/s** and **12.91 GB/s** in
-the two runs.
-
-The registered arena could not be addressed. `_backing_address()` exists on
-`SharedBackingRuntime`, but publishing the runtime object returned nothing
-because it is released before the post-durability hook runs; publishing the
-resolved address at C0 setup also returned nothing, so the publish site is not
-executing on this configuration. Two attempts, both failed. No registered-arena
-number is reported, because reporting one would be fabrication.
-
-This is the **one open item**. It is a plumbing failure, not a negative result:
-the registered-destination hypothesis is neither confirmed nor killed.
+**Incomplete.** private anonymous 12.91 / 10.81 GB/s. The registered arena could
+not be addressed in two attempts (the C0 runtime object is released before the
+post-durability hook reads it; the address-publish site does not execute on this
+configuration). Reported **UNKNOWN** rather than fabricated. This is a plumbing
+failure, not a negative result.
 
 ## Q4 — How much can perfect utilisation buy?
 
-**Utilisation alone cannot reach 6.5 GB/s. This refutes the standing M1
-hypothesis.**
-
-From the frozen cohort (median of 10 runs per role):
+**Utilisation alone cannot reach 6.5 GB/s.**
 
 | | CLIP | UNET |
 |---|---|---|
 | current GB/s | 4.55 | 4.24 |
 | time-weighted effective QD | 3.882 | 3.678 |
-| fraction of time already at QD4 | **0.908** | **0.860** |
-| time below QD4 | 157 ms of 1785 (8.8%) | 438 ms of 2928 (14.9%) |
-| **perfect-QD projection (speed unchanged)** | **4.69 GB/s** | **4.61 GB/s** |
+| fraction already at QD4 | **0.908** | **0.860** |
+| **perfect-QD projection** | **4.69 GB/s** | **4.61 GB/s** |
 
-The readers are **already 86–91% saturated at full QD4**. Removing *all*
-sub-QD4 time and holding per-copy speed constant yields 4.69 / 4.61 GB/s —
-still ~30% short of 6.5.
-
-Removable critical-path idle is therefore small and bounded:
-- pacing wait: median 0 ms per extent, non-zero on only 57/480 (CLIP) and
-  105/736 (UNET) extents.
-- slot wait: median 0 ms per extent, non-zero on 14/480 and 11/736.
-
-The 4 ms pacer floor is genuinely binding (`min_source_gap_ms` p50 = 4.04 for
-both roles), but because the pipeline is *already* at QD4 for 86–91% of the
-wall, removing the floor cannot recover more than the 8.8–14.9% above.
-
-**No treatment experiment is warranted**: the accounting shows no utilisation
-loss large enough to close a 4.6 → 6.5 gap.
+Readers are already 86-91% saturated at full QD4. Removing *all* sub-QD4 time
+with per-copy speed unchanged yields 4.69 / 4.61. Pacing and slot waits are ~0
+median per extent. **No QD/pacing/reader-count treatment is warranted.**
 
 ## Q5 — Is H2D / slot pressure ever on the source critical path?
 
-**No.**
-
-| | CLIP | UNET |
-|---|---|---|
-| source wall p50 | 1769 ms | 2903 ms |
-| slot wait p50 | 27 ms | 314 ms |
-| capacity wait | 0 ms (all runs) | 0 ms (9/10; one outlier 4261 ms) |
-| **exposed source stall** | **27 ms = 1.52%** | **314 ms = 10.8%** |
-| gpu_copy_active_sum p50 | 214 ms | 310 ms |
-| final drain p50 | 0.42 ms | 1.83 ms |
-
-H2D clearly **exists and overlaps** (214–310 ms of GPU copy activity against a
-1769–2903 ms source wall), but it does not **block** source progress:
-capacity wait is zero, and the exposed stall is 1.5% (CLIP) / 10.8% (UNET).
-Final drain is negligible (0.4 / 1.8 ms), so only a tail remains.
+**No.** Exposed source stall **1.52% (CLIP) / 10.8% (UNET)**; capacity wait 0;
+final drain 0.4 / 1.8 ms. H2D overlaps (214-310 ms GPU copy inside a
+1769-2903 ms source wall) but does not block.
 
 ---
 
-## Synthesis
+## Why the original conclusion was wrong
 
-The ceiling is explained by **per-copy speed during production**, not by
-pipeline structure:
+The first version treated the ~5.4 GB/s median as a hard ceiling and built a
+root cause on it. That was an artifact of **averaging across placements**. With
+56 control runs showing 18.3x spread and 9 regions, a single cross-region mean
+is not a property of the pipeline.
 
-    4 readers x 1.20 GB/s (CLIP per-copy, measured)  ~= 4.8 GB/s  ≈ observed 4.55
-    4 readers x 1.32 GB/s (UNET per-copy, measured)  ~= 5.3 GB/s  ≈ observed 4.24
+Specifically withdrawn:
+- "ACTUAL ROOT CAUSE = per-copy source speed" — withdrawn. Per-copy speed does
+  vary with placement, but it is not a fixed ceiling.
+- "Smallest change = warm the safetensors" — **unsupported**. Favourable
+  placements already exceed 6.5 GB/s with no change at all, so prewarming is not
+  required to reach the target.
+- "Pin the region" — **withdrawn and prohibited** on cost grounds (~1.5-1.75x).
 
-and per-copy speed is ~9–10x lower during load than the same bytes achieve
-post-load. Each alternative explanation is independently excluded:
+Retained: Q1-Q5 stand on their own measurements, and the exclusion of
+concurrency (Q2), utilisation (Q4) and H2D (Q5) as *pipeline-structural* limits
+is correct and useful.
 
-- **concurrency** (Q2): 4 readers deliver 14.3–33.5 GB/s warm — excluded.
-- **utilisation** (Q4): already 86–91% at QD4; perfect QD projects 4.6 GB/s —
-  excluded.
-- **H2D / slot pressure** (Q5): 1.5% / 10.8% exposed — excluded.
-- **destination kind** (Q3): private vs unregistered shared indistinguishable in
-  M1B; registered arena **untested** (open).
-- **page-cache state**: the one factor not independently excluded, and the only
-  one that survives, because production reads the files cold from the volume
-  while every post-load probe reads them warm.
+## Where this actually leaves the 6.5 GB/s target
 
-Q1 PRODUCTION FIRST-ACCESS COST = 1.20-1.32 GB/s per 64 MiB production extent (55.99 ms CLIP / 50.75 ms UNET), versus 10.81-12.91 GB/s for the identical copy post-load; CPU-bound (cpu/wall 0.94), ~9-10x gap
-FIRST / IMMEDIATE-REPEAT RATIO = not directly measured; production vs warm contrast is ~9-10x (1.20-1.32 vs 10.81-12.91 GB/s). M1B repeat-vs-first was 2.5x on anonymous, ~1.6x on file pages, but both were post-load and therefore warm
-PREWARM CAUSAL RESULT = NOT PERFORMED. Positional first/rest ratio 1.54 (CLIP) / 1.17 (UNET) is suggestive only; no controlled prewarm arm was run
+The target is met in favourable placements today, without intervention. It is
+not met on the median run. Since placement cannot be pinned, the only remaining
+lever that is placement-agnostic is **hiding volume latency behind work the GPU
+is already doing** — the existing `clip_forward_unet_window` overlap currently
+spends its time on GPU compute while the source read sits on the critical path.
 
-Q2 1-READER AGGREGATE GB/S = 8.06 (run A) / 3.86 (run B)
-Q2 2-READER AGGREGATE GB/S = 16.77 (run A) / 9.55 (run B)
-Q2 4-READER AGGREGATE GB/S = 33.46 (run A) / 14.26 (run B)
-SHARED SOURCE-SERVICE CEILING = NO (4 readers scale 3.70-4.15x, far above 6.5 GB/s aggregate)
+This is unmeasured. The discriminating experiment is the prewarm arm: sample
+4-8 real production extents, prewarm a few before their production turn, and
+compare their production copy against adjacent untouched extents. That was
+never run, and it is the one measurement that would justify (or kill) a
+readahead-during-overlap change.
 
-Q3 PRIVATE GB/S = 12.91 (run A) / 10.81 (run B)
-Q3 UNREGISTERED SHARED GB/S = 11.46 median (M1B level-2, same source/primitive)
-Q3 REGISTERED ARENA GB/S = NOT OBTAINED
-REGISTERED ARENA PENALTY = UNKNOWN (plumbing failure, two attempts; not a negative result)
+    Q1 PRODUCTION FIRST-ACCESS COST = 1.20-1.32 GB/s per 64 MiB production extent (55.99 ms CLIP / 50.75 ms UNET) vs 10.81-12.91 GB/s for the identical copy post-load; CPU-bound (cpu/wall 0.94), ~9-10x gap. Placement-dependent
+    FIRST / IMMEDIATE-REPEAT RATIO = not directly measured; production-vs-warm contrast is ~9-10x. M1B repeat-vs-first was 2.5x anonymous / ~1.6x file, but both post-load and therefore warm
+    PREWARM CAUSAL RESULT = NOT PERFORMED
 
-Q4 CURRENT EFFECTIVE QD = 3.882 (CLIP) / 3.678 (UNET) time-weighted; already at QD4 for 90.8% / 86.0% of the wall
-PERFECT-QD PROJECTED GB/S = 4.69 (CLIP) / 4.61 (UNET)
-PACER REMOVABLE CRITICAL-PATH MS = ~0 median per extent (non-zero on 57/480 CLIP, 105/736 UNET); 4 ms floor is binding but sits inside an already-saturated pipeline
-SLOT REMOVABLE CRITICAL-PATH MS = ~0 median per extent (non-zero on 14/480 CLIP, 11/736 UNET); aggregate slot_wait 27 ms CLIP / 314 ms UNET
-UTILISATION ALONE CAN REACH 6.5 = NO (perfect QD projects 4.69 / 4.61 GB/s)
+    Q2 1-READER AGGREGATE GB/S = 8.06 (run A) / 3.86 (run B)
+    Q2 2-READER AGGREGATE GB/S = 16.77 (run A) / 9.55 (run B)
+    Q2 4-READER AGGREGATE GB/S = 33.46 (run A) / 14.26 (run B)
+    SHARED SOURCE-SERVICE CEILING = NO
 
-Q5 H2D EXPOSED SOURCE STALL MS = 27 (CLIP) / 314 (UNET) median
-Q5 H2D EXPOSED SOURCE STALL % = 1.52% (CLIP) / 10.8% (UNET)
-H2D IS A NORMAL THROUGHPUT LIMIT = NO (overlaps: 214-310 ms GPU copy inside a 1769-2903 ms source wall; capacity wait 0; final drain 0.4-1.8 ms)
+    Q3 PRIVATE GB/S = 12.91 (run A) / 10.81 (run B)
+    Q3 UNREGISTERED SHARED GB/S = 11.46 median (M1B level-2)
+    Q3 REGISTERED ARENA GB/S = NOT OBTAINED
+    REGISTERED ARENA PENALTY = UNKNOWN (plumbing failure, two attempts; not a negative result)
 
-ACTUAL ROOT CAUSE OF ~5.4 GB/S CEILING = Per-copy source speed during production (1.20-1.32 GB/s, CPU-bound), not pipeline structure. Concurrency, utilisation, H2D/slot pressure and destination kind are each independently excluded; page-cache state is the only factor that survives, since production reads the model files cold from the volume while every post-load measurement reads them warm. Closing the gap means warming the source, not tuning QD or pacing.
+    Q4 CURRENT EFFECTIVE QD = 3.882 (CLIP) / 3.678 (UNET); already at QD4 for 90.8% / 86.0% of the wall
+    PERFECT-QD PROJECTED GB/S = 4.69 (CLIP) / 4.61 (UNET)
+    PACER REMOVABLE CRITICAL-PATH MS = ~0 median per extent (non-zero 57/480 CLIP, 105/736 UNET); 4 ms floor binding but inside an already-saturated pipeline
+    SLOT REMOVABLE CRITICAL-PATH MS = ~0 median per extent (non-zero 14/480 CLIP, 11/736 UNET); aggregate 27 ms CLIP / 314 ms UNET
+    UTILISATION ALONE CAN REACH 6.5 = NO
 
-CONFIDENCE = MODERATE-HIGH on the exclusion chain (each alternative measured and rejected, with the arithmetic closing to within ~5% of observed throughput). MODERATE on the cold-page attribution itself: it is the surviving explanation by elimination and by the 9-10x production/warm contrast, but no direct truly-cold measurement exists, because every post-load probe necessarily ran warm. Q3 is untested.
+    Q5 H2D EXPOSED SOURCE STALL MS = 27 (CLIP) / 314 (UNET) median
+    Q5 H2D EXPOSED SOURCE STALL % = 1.52% (CLIP) / 10.8% (UNET)
+    H2D IS A NORMAL THROUGHPUT LIMIT = NO
 
-SMALLEST CHANGE THAT SHOULD REACH >=6.5 GB/S = Warm the model safetensors before the parallel source read, so the load reads page cache instead of the volume. Concretely: one sequential readahead pass over the CLIP and UNET safetensors (posix_fadvise(POSIX_FADV_WILLNEED), or an equivalent single-threaded sequential read) issued at restore, concurrent with the existing CLIP-forward overlap so it costs no extra wall. This is the only change the evidence supports: tuning QD, reader count or the pacer is bounded above by the 4.61-4.69 GB/s perfect-QD projection and cannot reach target.
-PROJECTED CLIP GB/S = 10.8-12.9 (bounded by the warm single-reader copy rate, not by 4-reader aggregate; 4 readers warm deliver 14.3-33.5)
-PROJECTED UNET GB/S = 10.8-12.9 (same basis)
+    ACTUAL ROOT CAUSE OF ~5.4 GB/S CEILING = THERE IS NO CEILING. The 5.4 figure is a cross-placement mean, not a pipeline limit. Untouched control spans 0.37-6.77 GB/s CLIP (18.3x, CV 36.5%) over 9 regions because COMFYMODAL_V2_REGION and COMFYMODAL_V2_CLOUD are both unpinned. Pipeline-structural limits are independently excluded: concurrency (Q2, 4 readers reach 14-33 GB/s warm), utilisation (Q4, already 86-91% at QD4, perfect-QD projects 4.6-4.7), H2D/slot (Q5, 1.5-10.8%). Remaining variation is placement-driven volume latency.
+    CONFIDENCE = HIGH that there is no fixed ceiling and that concurrency/utilisation/H2D are not the limiter. MODERATE on the cold-page share, since no truly-cold measurement exists. Q3 untested.
 
-Production was not modified. Diagnosis only.
+    SMALLEST CHANGE THAT SHOULD REACH >=6.5 GB/S = NONE REQUIRED ON THE FAST PLACEMENT TAIL - individual untouched-control runs already record 6.77/6.87, 6.09/6.60, 6.10 and 6.01/6.44 with no code change. For RELIABLE >=6.5 under random placement, region pinning is prohibited on cost, and the only placement-agnostic lever is to overlap the source read with the existing clip_forward_unet window (readahead into page cache during CLIP forward). That is UNMEASURED; the prewarm arm is the experiment that would justify or kill it.
+    PROJECTED CLIP GB/S = 6.8-6.9 already observed on favourable placements; 4.6 median today
+    PROJECTED UNET GB/S = 6.9 already observed on favourable placements; 4.4 median today
