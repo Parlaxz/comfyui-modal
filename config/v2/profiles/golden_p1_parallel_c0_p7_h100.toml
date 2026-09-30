@@ -1,0 +1,29 @@
+# v2ctl profile: Production 7 Golden Parallel on H100 with the C0 source owner.
+#
+# COUNTED PERFORMANCE profile.  Identical mechanical shape to the healthy
+# production-006 control (golden_p1_parallel_c0_source_h100): same resources,
+# same method, same workload, same expected output SHA, forced-miss conditioning
+# and fresh-run requirement.  The only difference is the target app, so
+# Production 7 can be deployed and accepted without mutating the
+# production-006 anchor.
+#
+# Performance/tail optimizations carried forward from production-006:
+#   ec76b64c  minimal post-request GPU teardown on single-use containers
+#             (inherited via COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN = "1" below)
+#   5ac6f704  stop duplicating the output image in the terminal result
+#
+# Correctness fix retained from production-006:
+#   ce0a765e  recover READY ownership from the slot table instead of aborting
+#             on a stale doorbell
+#
+# No M1B/M1C copy probes, diagnostic profiles, arena globals or other
+# experiment-only machinery are present in this lineage.
+schema_version = 1
+name = "golden_p1_parallel_c0_p7_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "production-007"
+
+[target]
+app = "batch-c0-p7-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
