@@ -1010,11 +1010,17 @@ class SourceThreadProcess:
                 raise SourceProtocolError("ready_plan_generation_mismatch")
             if state != READY or int(slot_generation) != generation:
                 # A doorbell for a slot the consumer already owns, or one a
-                # newer generation has replaced.  Skip only a stale duplicate
-                # announcement; fail closed on a real mismatch.
-                if state == FREE or int(slot_generation) > generation:
-                    return None
-                raise SourceProtocolError("stale_ready_generation")
+                # newer generation has replaced.  Either way this announcement
+                # cannot be honoured, so it is dropped rather than raised: the
+                # shared control block is the authority, and wait_ready
+                # immediately re-derives the real READY token from the slot
+                # table.  Raising here instead aborted the whole generation
+                # with stale_ready_generation on a slow (degraded-throughput)
+                # run, where a doorbell can legitimately land against a slot
+                # that is IN_FLIGHT under an earlier generation.  claim_ready
+                # still enforces the exact (slot, generation) token, so
+                # recovering from the table cannot transfer the wrong bytes.
+                return None
         return ReadyRecord(
             slot_index, int(slot_generation), int(source), int(destination), int(length),
             int(range_index), int(producer_id), int(ready_ns),
