@@ -103,6 +103,40 @@ def _file_map(path: str, length: int | None = None) -> tuple[int, int]:
         os.close(fd)
 
 
+def _file_window(path: str, offset: int, length: int, page: int = 4096) -> tuple[int, int]:
+    """Map only ``[offset, offset+length)`` of ``path``, page-aligned down.
+
+    The inline sentinel must NOT whole-file map the model: the production loader
+    already holds a Whole mmap of the same safetensors in this process, and a
+    second whole-file mapping of an 8 GB CLIP / 12 GB UNET file inside the
+    gVisor container is what killed it (InternalFailure, zero telemetry, even
+    with four copies).  Windowing keeps the resident cost at one page-rounded
+    window while still reading genuinely file-backed pages at the production
+    file offset.
+
+    Returns ``(window_addr, delta)`` where ``delta`` is the byte position of
+    ``offset`` inside the mapping, so ``window_addr + delta`` addresses the
+    exact same file offset with the exact same alignment relationship.
+    """
+    _init()
+    page_start = offset - (offset % page)
+    delta = offset - page_start
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        size = os.fstat(fd).st_size
+        span = delta + length
+        if page_start + span > size:
+            raise RuntimeError(f"window_past_eof offset={offset} length={length} size={size}")
+        addr = _LIBC.mmap(ctypes.c_void_p(page_start), ctypes.c_size_t(span),
+                          ctypes.c_int(1), ctypes.c_int(2), ctypes.c_int(fd),
+                          ctypes.c_long(page_start))
+        if not addr or int(ctypes.cast(addr, ctypes.c_void_p).value or 0) == ctypes.c_void_p(-1).value:
+            raise RuntimeError(f"file_window_mmap_failed errno={ctypes.get_errno()}")
+        return int(ctypes.cast(addr, ctypes.c_void_p).value or 0), delta
+    finally:
+        os.close(fd)
+
+
 def _unmap(addr: int, size: int) -> None:
     _init()
     _LIBC.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
@@ -381,16 +415,18 @@ class CopyProbe:
         if not path or not os.path.exists(path):
             result["sentinel_note"] = "clip file unavailable; anonymous control only"
         else:
-            faddr, fsize = _file_map(path)
+            fsize = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+            st = os.stat(path)
+            result["sentinel_source"] = {
+                "path": path, "file_size": fsize, "data_start": data_start,
+                "relative_mod64": data_start % 64, "dev": st.st_dev,
+            }
+            # Window-map only the ranges under test, never the whole file.
+            waddr, delta = _file_window(path, data_start, n)
             try:
-                with open(path, "rb") as fh:
-                    data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
-                st = os.stat(path)
-                result["sentinel_source"] = {
-                    "path": path, "file_size": fsize, "data_start": data_start,
-                    "relative_mod64": data_start % 64, "dev": st.st_dev,
-                }
-                src = faddr + data_start
+                src = waddr + delta
                 # S1: first touch of a file-backed range -> its own destination
                 self._time_copy("sentinel_S1", "memmove", dst_a, src, n, reps=1,
                                 source_kind="file_first_touch", dest_kind="anon_a",
@@ -405,16 +441,20 @@ class CopyProbe:
                                 condition="sentinel")
                 exact = {"S1_dst_a": _memcmp(dst_a, src, n),
                          "S2_dst_b": _memcmp(dst_b, src, n)}
-                # a second untouched range: a second independent first-touch sample
-                if data_start + 2 * n <= fsize:
-                    src2 = faddr + data_start + n
-                    self._time_copy("sentinel_S1b", "memmove", dst_b, src2, n, reps=1,
-                                    source_kind="file_first_touch", dest_kind="anon_b",
-                                    condition="sentinel", offset=data_start + n)
-                    exact["S1b_dst_b"] = _memcmp(dst_b, src2, n)
                 result["exact_match"] = exact
             finally:
-                _unmap(faddr, fsize)
+                _unmap(waddr, delta + n)
+            # a second untouched range: an independent first-touch sample,
+            # in its own window so it is genuinely never-touched
+            if data_start + 2 * n <= fsize:
+                w2, d2 = _file_window(path, data_start + n, n)
+                try:
+                    self._time_copy("sentinel_S1b", "memmove", dst_b, w2 + d2, n, reps=1,
+                                    source_kind="file_first_touch", dest_kind="anon_b",
+                                    condition="sentinel", offset=data_start + n)
+                    result["exact_match"]["S1b_dst_b"] = _memcmp(dst_b, w2 + d2, n)
+                finally:
+                    _unmap(w2, d2 + n)
 
         wall = {r["tag"]: (r.get("wall_ns") or [None])[0] for r in self.rows}
         s1, s2, s3 = wall.get("sentinel_S1"), wall.get("sentinel_S2"), wall.get("sentinel_S3")

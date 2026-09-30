@@ -21,8 +21,8 @@ app = "batch-c0-copy-rootcause-h100"
 run_count = 1
 
 [environment]
-# Isolation arm: identical tree and config to the live control, probe OFF.
-# Used to separate "my code/deployment kills the container" from "the probe
-# perturbs Golden".  Flip to "1" once this arm is proven healthy.
-COMFYMODAL_M1B_COPY_PROBE = "0"
+# Level 1 = minimal inline sentinel (4 x 64 MiB copies, window-mapped file
+# ranges only, no shared memory, no registered arena, no threads).
+# The isolation arm with this "0" proved the app and tree are healthy.
+COMFYMODAL_M1B_COPY_PROBE = "1"
 COMFYMODAL_M1B_LEVEL = "1"
