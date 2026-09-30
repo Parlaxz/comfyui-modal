@@ -40,6 +40,7 @@ _LIBC: Any = None
 _MEMMOVE: Any = None
 _MEMCPY: Any = None
 _MEMSET: Any = None
+_MEMCMP: Any = None
 
 
 def enabled() -> bool:
@@ -55,7 +56,7 @@ def level() -> int:
 
 def _init() -> None:
     """Resolve the libc surface ONCE. ctypes.CDLL releases the GIL per call."""
-    global _LIBC, _MEMMOVE, _MEMCPY, _MEMSET
+    global _LIBC, _MEMMOVE, _MEMCPY, _MEMSET, _MEMCMP
     if _LIBC is not None:
         return
     _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -64,6 +65,8 @@ def _init() -> None:
                            ctypes.c_int, ctypes.c_int, ctypes.c_long]
     _LIBC.munmap.restype = ctypes.c_int
     _LIBC.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _LIBC.memcmp.restype = ctypes.c_int
+    _LIBC.memcmp.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
     for name in ("memmove", "memcpy", "memset"):
         fn = getattr(_LIBC, name)
         fn.restype = ctypes.c_void_p
@@ -72,6 +75,7 @@ def _init() -> None:
         else:
             fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
     _MEMMOVE, _MEMCPY, _MEMSET = _LIBC.memmove, _LIBC.memcpy, _LIBC.memset
+    _MEMCMP = _LIBC.memcmp
 
 
 # ── small allocation helpers ────────────────────────────────────────────────
@@ -187,6 +191,16 @@ def _memmove(dst: int, src: int, n: int) -> None:
 
 def _align_report(addr: int) -> dict:
     return {f"mod{m}": addr % m for m in (16, 32, 64, 128, 256, 4096, SLOT_BYTES)}
+
+
+def _memcmp(a: int, b: int, n: int) -> bool:
+    """Exact whole-range byte equality via libc memcmp.
+
+    A sampled checksum cannot prove a diagnostic copy transferred the right
+    bytes, and the task requires exact correctness, so compare every byte.
+    """
+    rc = _MEMCMP(ctypes.c_void_p(a), ctypes.c_void_p(b), ctypes.c_size_t(n))
+    return int(rc) == 0
 
 
 # ── the harness ─────────────────────────────────────────────────────────────
@@ -342,6 +356,80 @@ class CopyProbe:
                           aggregate_gbps=(nthreads * n) / (slowest / 1e9) if slowest else None,
                           dst=_align_report(base), src=_align_report(src))
 
+    # ---- minimal inline sentinel (level 1) --------------------------------
+    def sentinel(self, model_paths: dict, n: int, result: dict) -> None:
+        """Tiny post-load correlation probe.
+
+        Purpose is only to link this container's copy condition to the real
+        CLIP/UNET load that just finished, so it copies four 64 MiB blocks and
+        nothing more.  S1 and S2 target *independent* destinations so the
+        repeat cannot inherit first-touch cost from an already-dirty one, and
+        S3 is the anonymous control that separates "file-backed service is
+        slow" from "raw memory copy is slow" (CASE 1 vs CASE 2).
+        """
+        dst_a = _anon(n + _SLACK)
+        dst_b = _anon(n + _SLACK)
+        anon_src = _anon(n + _SLACK)
+        result["buffers"] = {
+            "dst_a": _align_report(dst_a), "dst_b": _align_report(dst_b),
+            "anon_src": _align_report(anon_src),
+        }
+        for d in (dst_a, dst_b, anon_src):
+            _memset(d, n)
+
+        path = model_paths.get("clip")
+        if not path or not os.path.exists(path):
+            result["sentinel_note"] = "clip file unavailable; anonymous control only"
+        else:
+            faddr, fsize = _file_map(path)
+            try:
+                with open(path, "rb") as fh:
+                    data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+                st = os.stat(path)
+                result["sentinel_source"] = {
+                    "path": path, "file_size": fsize, "data_start": data_start,
+                    "relative_mod64": data_start % 64, "dev": st.st_dev,
+                }
+                src = faddr + data_start
+                # S1: first touch of a file-backed range -> its own destination
+                self._time_copy("sentinel_S1", "memmove", dst_a, src, n, reps=1,
+                                source_kind="file_first_touch", dest_kind="anon_a",
+                                condition="sentinel", offset=data_start)
+                # S2: the SAME now-resident range -> an INDEPENDENT destination
+                self._time_copy("sentinel_S2", "memmove", dst_b, src, n, reps=1,
+                                source_kind="file_resident", dest_kind="anon_b",
+                                condition="sentinel", offset=data_start)
+                # S3: anonymous control, resident source -> private destination
+                self._time_copy("sentinel_S3", "memmove", dst_a, anon_src, n, reps=1,
+                                source_kind="anon_resident", dest_kind="anon_a",
+                                condition="sentinel")
+                exact = {"S1_dst_a": _memcmp(dst_a, src, n),
+                         "S2_dst_b": _memcmp(dst_b, src, n)}
+                # a second untouched range: a second independent first-touch sample
+                if data_start + 2 * n <= fsize:
+                    src2 = faddr + data_start + n
+                    self._time_copy("sentinel_S1b", "memmove", dst_b, src2, n, reps=1,
+                                    source_kind="file_first_touch", dest_kind="anon_b",
+                                    condition="sentinel", offset=data_start + n)
+                    exact["S1b_dst_b"] = _memcmp(dst_b, src2, n)
+                result["exact_match"] = exact
+            finally:
+                _unmap(faddr, fsize)
+
+        wall = {r["tag"]: (r.get("wall_ns") or [None])[0] for r in self.rows}
+        s1, s2, s3 = wall.get("sentinel_S1"), wall.get("sentinel_S2"), wall.get("sentinel_S3")
+
+        def gbps(ns):
+            return (n / (ns / 1e9)) if ns else None
+
+        result["sentinel"] = {
+            "s1_first_copy_ns": s1, "s1_gbps": gbps(s1),
+            "s2_repeat_copy_ns": s2, "s2_gbps": gbps(s2),
+            "s3_anon_copy_ns": s3, "s3_gbps": gbps(s3),
+            "s1_over_s2": (s1 / s2) if (s1 and s2) else None,
+            "s1_over_s3": (s1 / s3) if (s1 and s3) else None,
+        }
+
     # ---- main entry --------------------------------------------------------
     def run(self, model_paths: dict[str, str], arena_addr: int | None = None) -> dict:
         _init()
@@ -351,11 +439,18 @@ class CopyProbe:
         result: dict[str, Any] = {"schema": "m1cb_copy_probe_v1", "level": lv,
                                   "nbytes": n, "rows": self.rows}
         try:
-            # Levels are cumulative and each one adds a destination kind, so a
-            # level that overruns the container can be abandoned without losing
-            # the cheaper evidence.  Level 1 deliberately touches nothing shared
-            # and nothing registered: two private anonymous buffers and one
-            # read-only file map, ~8 copies total.
+            if lv == 1:
+                # Minimal inline sentinel only: no shared memory, no registered
+                # arena, no thread scaling, no alignment sweep.  If even this
+                # perturbs Golden, the file-backed arm moves to the standalone
+                # lab and only the anonymous control stays inline.
+                self.sentinel(model_paths, n, result)
+                result["sha256_probe"] = "exact-memcmp"
+                return result
+
+            # Levels 2-4 are the wide factorial sweep.  Those belong to the
+            # standalone copy lab, not to the inline Golden request: the full
+            # matrix inlined is what killed the container at 497s.
             anon_src = _anon(n + _SLACK)
             anon_dst = _anon(n + _SLACK)
             result["buffers"] = {
