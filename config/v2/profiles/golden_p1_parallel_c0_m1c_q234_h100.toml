@@ -1,0 +1,33 @@
+# v2ctl profile: M1C five-question diagnostic (Q2 concurrency ceiling, Q3 registered
+# arena, Q4 utilisation, Q5 H2D exposure), H100.
+#
+# Ported from the M1B diagnostic branch so future experiments inherit the
+# corrected harness instead of rediscovering its bugs.  Two properties are
+# deliberate and were both learned the hard way:
+#
+#  * The probe is default OFF.  Nothing here changes Golden behaviour unless
+#    COMFYMODAL_M1B_COPY_PROBE is explicitly set to 1.
+#  * It targets a SEPARATE diagnostic app.  The production-006 anchor is never
+#    mutated, and this profile must never be used for a counted or performance
+#    claim.
+#
+# Level 3 = matrix + the M1C phase: 1/2/4-reader file-backed concurrency with
+# pre-warmed source pages, and the private/unregistered/REGISTERED arena A/B/C.
+#
+# The probe runs at each entrypoint's post-durability point (see the hook in
+# golden_parallel), where generation is complete, the result is committed, and
+# the source owner is idle.
+schema_version = 1
+name = "golden_p1_parallel_c0_m1c_q234_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "m1c-five-questions"
+
+[target]
+app = "batch-c0-m1c-h100"
+
+[workload]
+run_count = 1
+
+[environment]
+COMFYMODAL_M1B_COPY_PROBE = "1"
+COMFYMODAL_M1B_LEVEL = "3"

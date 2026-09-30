@@ -356,6 +356,11 @@ def _parse_layout(path: str, identity: tuple[int, int, int, int]) -> Safetensors
 
 C0_TRANSPORT_GEOMETRY_ENV = "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY"
 C0_WINDOW_TRACE_ENV = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+# M1C diagnostic handle: the live C0 arena runtime, published so the Q3
+# registered-destination A/B/C test can measure the ACTUAL cudaHostRegister'd
+# production arena rather than a stand-in. Observation only; never read by
+# production logic.
+M1C_ARENA_RUNTIME: Any = None
 _C0_TRANSPORT_GEOMETRIES = ("qd4_64", "qd2_128", "qd4_64_h2d128", "qd4_128")
 _C0_WINDOW_TRACE_LIMIT = 4096
 
@@ -865,6 +870,13 @@ class GoldenModelTransport:
                 from . import golden_io_process_v2 as c0
                 from . import golden_qd_transport as qd_transport
                 self._c0_runtime = c0.ensure_arena_runtime()
+                # M1C diagnostic: publish the live arena runtime for the Q3
+                # registered-destination test. Observation only.
+                try:
+                    global M1C_ARENA_RUNTIME
+                    M1C_ARENA_RUNTIME = self._c0_runtime
+                except Exception:
+                    pass
                 _c0marks = getattr(self, "_c0_setup_marks", None)
                 if isinstance(_c0marks, dict):
                     _c0marks["transfer_resources_begin"] = time.monotonic_ns()

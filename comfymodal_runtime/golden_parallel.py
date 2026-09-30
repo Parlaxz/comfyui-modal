@@ -443,8 +443,16 @@ async def golden_parallel_execute(
                     _paths["unet"] = str(session.model_paths.get("unet") or "")
                 except Exception:
                     _paths = {}
+                _arena = None
+                try:
+                    from . import golden_model_transport as _gmt
+                    _rt = getattr(_gmt, "M1C_ARENA_RUNTIME", None)
+                    if _rt is not None and hasattr(_rt, "_backing_address"):
+                        _arena = int(_rt._backing_address())
+                except Exception:
+                    _arena = None
                 _final = None
-                for _phase, _res in _m1cb.CopyProbe().run_phased(_paths):
+                for _phase, _res in _m1cb.CopyProbe().run_phased(_paths, arena_addr=_arena):
                     session.recorder.event("m1cb_copy_probe", phase=_phase, **_res)
                     _final = _res
                 if _final is not None:

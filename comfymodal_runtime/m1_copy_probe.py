@@ -495,6 +495,129 @@ class CopyProbe:
             "s1_over_s3": (s1 / s3) if (s1 and s3) else None,
         }
 
+    @staticmethod
+    def _med_gbps(walls, n: int):
+        """Median GB/s over the repeat samples of a timed copy (excludes rep 0)."""
+        if not walls:
+            return None
+        reps = [w for w in walls[1:]] or list(walls)
+        reps.sort()
+        mid = reps[len(reps) // 2]
+        return ((n / (mid / 1e9)) / 1e9) if mid else None
+
+    # ---- M1C: concurrency ceiling + registered-arena A/B/C ----------------
+    def concurrency_and_arena(self, model_paths: dict, arena_addr: int | None,
+                              n: int, result: dict) -> None:
+        """Answer Q2 (shared source-service ceiling) and Q3 (registered arena).
+
+        Q2: N threads each copy their own distinct 64 MiB *file-backed* window
+        into private destinations, with a barrier so they overlap.  Source pages
+        are pre-warmed first so this measures concurrency, not first-touch.
+        If aggregate collapses from ~1 reader to ~4 readers, a shared
+        file/gVisor source service is the ceiling.
+
+        Q3: the same already-resident file range copied into three destination
+        kinds -- private anonymous, unregistered shared, and the ACTUAL
+        cudaHostRegister'd production arena -- so the registered-destination
+        hypothesis is tested directly rather than inferred.
+        """
+        import threading
+
+        role = "clip" if model_paths.get("clip") else "unet"
+        path = model_paths.get(role)
+        if not path or not os.path.exists(path):
+            result["m1c_note"] = "no model file for concurrency/arena test"
+            return
+        fsize = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            data_start = 8 + struct.unpack("<Q", fh.read(8))[0]
+        result["m1c_source"] = {"role": role, "path": path, "file_size": fsize,
+                                "data_start": data_start}
+
+        nthreads_max = 4
+        need = data_start + nthreads_max * n
+        if need > fsize:
+            result["m1c_note"] = "file too small for 4 x 64 MiB windows"
+            return
+
+        # Window-map the whole 4-window span read-only, then pre-warm every page
+        # so Q2 measures concurrency rather than first-touch.
+        waddr, delta = _file_window(path, data_start, nthreads_max * n)
+        try:
+            warm = _anon(nthreads_max * n + _SLACK)
+            _memset(warm, nthreads_max * n)
+            _memmove(warm, waddr + delta, nthreads_max * n)
+            dsts = [_anon(n + _SLACK) for _ in range(nthreads_max)]
+            for d in dsts:
+                _memset(d, n)
+
+            conc = []
+            for k in (1, 2, 4):
+                bar = threading.Barrier(k, timeout=120)
+                walls = [0] * k
+                cpus = [0] * k
+
+                def work(i: int, _k=k) -> None:
+                    try:
+                        bar.wait()
+                    except threading.BrokenBarrierError:
+                        return
+                    c0 = _tcpu()
+                    t0 = _now()
+                    _MEMMOVE(ctypes.c_void_p(dsts[i]), ctypes.c_void_p(waddr + delta + i * n),
+                             ctypes.c_size_t(n))
+                    t1 = _now()
+                    walls[i] = t1 - t0
+                    cpus[i] = _tcpu() - c0
+
+                ths = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(k)]
+                for t in ths:
+                    t.start()
+                for t in ths:
+                    t.join(180)
+                slowest = max(walls) if any(walls) else None
+                per = [(n / (w / 1e9)) / 1e9 for w in walls if w]
+                conc.append({
+                    "nthreads": k,
+                    "per_reader_gbps": per,
+                    "per_reader_median_gbps": (sorted(per)[len(per) // 2] if per else None),
+                    "span_wall_ns": slowest,
+                    "aggregate_gbps": ((k * n) / (slowest / 1e9)) / 1e9 if slowest else None,
+                    "scaling_efficiency": None,
+                    "thread_cpu_ns": cpus,
+                })
+            base = conc[0].get("aggregate_gbps")
+            for c in conc:
+                if base and c.get("aggregate_gbps"):
+                    c["scaling_efficiency"] = c["aggregate_gbps"] / base
+            result["m1c_concurrency"] = conc
+
+            # ---- Q3: registered arena A/B/C on one resident file range ----
+            src = waddr + delta
+            abc = {}
+            for dname, dptr in (("private_anon", dsts[0]),):
+                _memset(dptr, n)
+                rec = self._time_copy(f"arena_{dname}", "memmove", dptr, src, n, reps=5,
+                                      source_kind="file_resident", dest_kind=dname,
+                                      condition="arena_abc")
+                abc[dname] = self._med_gbps(rec.get("wall_ns"), n)
+            if arena_addr:
+                for dname in ("registered_arena",):
+                    _memset(arena_addr, n)
+                    rec = self._time_copy(f"arena_{dname}", "memmove", arena_addr, src, n,
+                                          reps=5, source_kind="file_resident",
+                                          dest_kind=dname, condition="arena_abc")
+                    abc[dname] = self._med_gbps(rec.get("wall_ns"), n)
+            else:
+                result["arena_note"] = "arena handle unavailable; Q3 incomplete"
+            result["m1c_arena_abc_gbps"] = abc
+            base = abc.get("private_anon")
+            reg = abc.get("registered_arena")
+            if base and reg:
+                result["registered_arena_penalty_pct"] = (1.0 - reg / base) * 100.0
+        finally:
+            _unmap(waddr, delta + nthreads_max * n)
+
     # ---- phased driver -----------------------------------------------------
     def run_phased(self, model_paths: dict, arena_addr: int | None = None):
         """Run the probe as a generator, yielding after each phase.
@@ -522,6 +645,20 @@ class CopyProbe:
                 return
             result["phases_completed"].append(name)
             yield name, result
+        if level() >= 3:
+            # M1C phase: concurrency ceiling (Q2) and registered arena (Q3).
+            # Separate from copy_matrix so a fault here cannot erase the
+            # already-emitted matrix.
+            try:
+                self.concurrency_and_arena(model_paths, arena_addr, SLOT_BYTES,
+                                           result)
+            except Exception as exc:
+                result.setdefault("phase_errors", {})["m1c"] = (
+                    f"{type(exc).__name__}: {exc}")
+                yield "failed", result
+                return
+            result["phases_completed"].append("m1c")
+            yield "m1c", result
         yield "final", result
 
     def _phase_libc(self, result: dict) -> None:
