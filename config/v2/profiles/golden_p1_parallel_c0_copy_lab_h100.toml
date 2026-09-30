@@ -1,0 +1,33 @@
+# v2ctl profile: M1-CB standalone physical copy lab (tier B), H100.
+#
+# Same app, image, H100!, CPU=12, 24 GiB, gVisor and model volume as the
+# inline-sentinel profile, so the two tiers measure the same container shape.
+# Only the invoked method differs: run_copy_lab performs the wide factorial
+# matrix and runs NO Golden generation.
+#
+# That separation is required, not stylistic.  Inside the Golden request the
+# production loader already holds its own Whole mmap of these safetensors, so a
+# second whole-file mapping of the 8 GB CLIP / 12 GB UNET file exhausts the
+# container.  Here nothing competes, so levels 2-4 (file-backed first-touch vs
+# resident, shared/registered vs private destinations, remap, alignment,
+# memmove vs memcpy, 1/2/3/4-thread scaling) can run safely and slowly.
+#
+# This profile must never be used for a counted or performance claim.
+schema_version = 1
+name = "golden_p1_parallel_c0_copy_lab_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "m1-copy-rootcause"
+
+[target]
+# Dedicated diagnostic app; the production anchor is never mutated.
+app = "batch-c0-copy-rootcause-h100"
+class_name = "ModalRuntimeEntrypointV2"
+method = "run_copy_lab"
+
+[workload]
+run_count = 1
+
+[environment]
+# Level 2 = core matrix incl. the file-backed arm and the shared destination.
+COMFYMODAL_M1B_COPY_PROBE = "1"
+COMFYMODAL_M1B_LEVEL = "2"

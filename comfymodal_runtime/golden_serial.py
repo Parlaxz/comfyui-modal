@@ -15536,8 +15536,16 @@ async def golden_serial_execute(
                     _paths["unet"] = str(session.model_paths.get("unet") or "")
                 except Exception:
                     _paths = {}
-                _payload = _m1cb.CopyProbe().run(_paths)
-                session.recorder.event("m1cb_copy_probe", **_payload)
+                _probe = _m1cb.CopyProbe()
+                _final = None
+                for _phase, _res in _probe.run_phased(_paths):
+                    session.recorder.event("m1cb_copy_probe", phase=_phase, **_res)
+                    _final = _res
+                if _final is not None:
+                    inner = _final.get("probe") or {}
+                    if inner.get("sentinel"):
+                        session.recorder.event(
+                            "m1cb_copy_probe", phase="sentinel", **inner)
             except BaseException as _m1cb_exc:  # never fail the request for a probe
                 session.recorder.event(
                     "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"

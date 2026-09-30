@@ -445,12 +445,18 @@ async def golden_parallel_execute(
                 except Exception:
                     _paths = {}
                 _probe = _m1cb.CopyProbe()
-                # Checkpoint after every phase: a native-memory fault in a later
-                # phase must not erase the phases that already completed.
-                _emit = lambda phase, res: session.recorder.event(
-                    "m1cb_copy_probe", phase=phase, **res)
-                _payload = _probe.run_phased(_paths, emit=_emit)
-                session.recorder.event("m1cb_copy_probe", phase="final", **_payload)
+                # Stream each phase into telemetry as it completes: a native
+                # fault in a later phase must not erase the phases that already
+                # succeeded.
+                _final = None
+                for _phase, _res in _probe.run_phased(_paths):
+                    session.recorder.event("m1cb_copy_probe", phase=_phase, **_res)
+                    _final = _res
+                if _final is not None:
+                    inner = _final.get("probe") or {}
+                    if inner.get("sentinel"):
+                        session.recorder.event(
+                            "m1cb_copy_probe", phase="sentinel", **inner)
             except BaseException as _m1cb_exc:  # never fail the request for a probe
                 session.recorder.event(
                     "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"

@@ -510,36 +510,33 @@ class CopyProbe:
         }
 
     # ---- phased driver -----------------------------------------------------
-    def run_phased(self, model_paths: dict, arena_addr: int | None = None,
-                   emit=None) -> dict:
-        """Run the probe, checkpointing after each phase.
+    def run_phased(self, model_paths: dict, arena_addr: int | None = None):
+        """Run the probe as a generator, yielding after each phase.
 
         The probe is a native-memory harness, so a fault in any phase can take
         the process with it and destroy everything measured so far.  Each phase
-        is therefore run independently and reported as soon as it completes, so
-        a later fault costs only that phase.  ``emit`` is called with
-        ``(phase_name, cumulative_result)`` after every phase.
+        therefore runs independently and is yielded the moment it completes, so
+        a later fault costs only that phase and the caller can persist what
+        already succeeded.  The final yield is the cumulative result.
         """
         result: dict[str, Any] = {"schema": "m1cb_copy_probe_v2",
                                   "phases_completed": []}
-        phases = [("libc_init", lambda: self._phase_libc(result)),
+        yield "start", result
+        phases = (("libc_init", lambda: self._phase_libc(result)),
                   ("fingerprint", lambda: self._phase_fingerprint(result)),
                   ("copy_matrix", lambda: self._phase_matrix(model_paths, result,
-                                                              arena_addr))]
+                                                              arena_addr)))
         for name, fn in phases:
             try:
                 fn()
             except Exception as exc:
                 result.setdefault("phase_errors", {})[name] = (
                     f"{type(exc).__name__}: {exc}")
-                break
+                yield "failed", result
+                return
             result["phases_completed"].append(name)
-            if emit is not None:
-                try:
-                    emit(name, result)
-                except Exception:
-                    pass
-        return result
+            yield name, result
+        yield "final", result
 
     def _phase_libc(self, result: dict) -> None:
         _init()
