@@ -1,0 +1,7 @@
+run,valid,sha_ok,level,S1->anon_private_first,S1->anon_private_rep,S2->anon_private_first,S2->anon_private_rep,S3->anon_private_first,S3->anon_private_rep,S1->shm_unregistered_first,S2->shm_unregistered_rep,clip_gbps,unet_gbps
+run_20260930-134721_4c19c1d9.json,True,True,1,,,,,,,,,0.7660,1.5460
+run_20260930-134828_4c19c1d9.json,True,True,1,,,,,,,,,4.5911,4.8983
+run_20260930-140105_4c19c1d9.json,True,True,1,,,,,,,,,5.8909,5.6687
+run_20260930-142658_5118f65b.json,True,True,2,6.2461,10.6884,10.7252,9.8772,10.8693,11.9056,11.4872,11.4617,5.4572,5.6637
+run_20260930-142831_5118f65b.json,True,True,2,6.7929,10.1878,10.9507,11.4148,12.8222,14.1214,10.4355,11.2459,5.4994,5.4425
+run_20260930-142909_5118f65b.json,True,True,2,7.2479,10.5115,11.7559,12.1569,14.2743,16.8885,9.3411,12.3707,5.2973,5.1364
