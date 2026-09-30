@@ -52,6 +52,11 @@ from typing import Any
 # also dumps every thread stack -- which is what makes the next stall
 # self-diagnosing instead of a forensic reconstruction.
 GOLDEN_REQUEST_WALL_GATE_S = 40.0
+# The adapter's post-request return is bounded separately.  It is armed only
+# after Golden completed and its telemetry is durable on the volume, so an exit
+# hang can never destroy a good result -- only cap how long the container holds
+# the GPU while failing to return.
+POST_REQUEST_EXIT_GATE_S = 15.0
 PROGRESS_HEARTBEAT_ENV = "COMFYMODAL_GOLDEN_PROGRESS_HEARTBEAT"
 
 _PROGRESS_STATE: dict[str, Any] = {"t0_ns": 0, "last_stage": "none"}
@@ -102,7 +107,42 @@ def _install_request_wall_gate(gate_s: float = GOLDEN_REQUEST_WALL_GATE_S):
     timer = threading.Timer(gate_s, _fire)
     timer.daemon = True
     timer.start()
+    _PROGRESS_STATE["gate_timer"] = timer
     return timer
+
+
+def _cancel_request_wall_gate() -> None:
+    """Disarm the Golden request wall gate once the request is complete."""
+    timer = _PROGRESS_STATE.pop("gate_timer", None)
+    if timer is not None:
+        try:
+            timer.cancel()
+        except BaseException:
+            pass
+
+
+def _install_post_request_exit_bound(gate_s: float = POST_REQUEST_EXIT_GATE_S) -> None:
+    """Bound the Modal adapter's post-request return.
+
+    Golden completed and its telemetry is already durable on the volume before
+    this is armed, so an exit hang can no longer destroy a good result -- but an
+    unbounded exit still holds the H100 until the platform timeout.  This fires
+    only if the container has not returned, and says so explicitly.
+    """
+
+    def _fire() -> None:
+        print(
+            f"[v2.golden.exit_gate] FAILED post_request_exit_gate_s={gate_s} "
+            f"last_stage={_PROGRESS_STATE.get('last_stage')} "
+            f"telemetry=persisted action=force_exit",
+            flush=True,
+        )
+        os._exit(71)
+
+    timer = threading.Timer(gate_s, _fire)
+    timer.daemon = True
+    timer.start()
+    _PROGRESS_STATE["exit_timer"] = timer
 
 
 async def golden_parallel_execute(
@@ -333,13 +373,21 @@ async def golden_parallel_execute(
         _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
 
     try:
+        _hb("telemetry_persist_begin")
         _persist_final_telemetry(session)
+        _hb("telemetry_persist_done")
     except BaseException:
         if primary_error is not None:
             raise primary_error
         if teardown_error is not None:
             raise teardown_error
         raise
+    # The Golden request has finished and its telemetry is durable on the
+    # volume.  Cancel the request wall gate here: it exists to bound Golden
+    # work, and leaving it armed would kill an otherwise successful request
+    # whose container simply cannot return.  The post-request exit is bounded
+    # separately, below, so it can never hold an H100 either way.
+    _cancel_request_wall_gate()
     if primary_error is not None:
         raise primary_error
     if teardown_error is not None:
@@ -347,6 +395,11 @@ async def golden_parallel_execute(
     if result is None:
         raise RuntimeError("parallel_result_missing")
     result.telemetry_persist_ms = session.telemetry_persist_ms
+    # Golden succeeded and its telemetry is durable.  From here the only thing
+    # that can still go wrong is the adapter failing to return, so bound that
+    # instead of letting the container sit on the GPU.
+    _hb("return_armed")
+    _install_post_request_exit_bound()
     return result
 
 
