@@ -78,14 +78,17 @@ def _hb(stage: str) -> None:
     _PROGRESS_STATE["last_stage"] = stage
     # Also feed the shared mark list so the recorder event emitted before
     # telemetry persist carries the inner stage decomposition, not just the
-    # wrapper's entry mark.
-    _OUTER_MARKS.append((stage, time.monotonic_ns(), 0, ""))
+    # wrapper's entry mark.  Elapsed is measured against the request clock set
+    # at execute_enter, never a literal zero.
+    _now_ns = time.monotonic_ns()
+    _t0_ns = int(_PROGRESS_STATE.get("t0_ns") or 0)
+    _elapsed_ns = (_now_ns - _t0_ns) if _t0_ns else 0
+    _OUTER_MARKS.append((stage, _now_ns, _elapsed_ns, ""))
     if not _progress_enabled():
         return
-    t0 = int(_PROGRESS_STATE.get("t0_ns") or 0)
-    elapsed_ms = (time.monotonic_ns() - t0) / 1e6 if t0 else 0.0
     print(
-        f"[v2.golden.progress] stage={stage} elapsed_ms={elapsed_ms:.3f}",
+        f"[v2.golden.progress] stage={stage} "
+        f"elapsed_ms={_elapsed_ns / 1e6:.3f}",
         flush=True,
     )
 
