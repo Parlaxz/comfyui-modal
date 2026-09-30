@@ -82,9 +82,14 @@ def test_probe_failures_degrade_to_none_instead_of_raising():
 
 
 def test_restore_baseline_carries_container_facts():
-    """The capture must actually reach the persisted restore baseline."""
+    """The capture must actually reach the persisted restore baseline.
+
+    The caller discards the returned baseline, so the facts must also be
+    recorded on the stage itself or they never reach the artifacts.
+    """
     source = SERIAL.read_text(encoding="utf-8", errors="replace")
     assert '"container_facts": _container_restore_facts(),' in source
+    assert 'container_facts=baseline["container_facts"],' in source
 
 
 def test_probe_uses_stable_names_and_captures_region_when_present():

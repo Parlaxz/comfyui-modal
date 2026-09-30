@@ -9826,6 +9826,9 @@ async def golden_restore(session: GoldenSession) -> dict:
             observation_only=True,
             external_restore_interval=metadata,
             device=str(baseline["device"]),
+            # The caller discards the returned baseline, so the facts must be
+            # recorded on the stage itself to survive into the artifacts.
+            container_facts=baseline["container_facts"],
         )
         return baseline
     except BaseException as exc:
