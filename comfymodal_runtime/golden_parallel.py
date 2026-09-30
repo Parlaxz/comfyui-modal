@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -414,6 +415,41 @@ async def golden_parallel_execute(
                 )
             session.recorder.mark_true_durable()
         result = session.build_final_result()
+        # M1-CB diagnostic: minimal inline copy sentinel.
+        #
+        # Placement is load-bearing.  Running this at the end of golden_unet_load
+        # is NOT "after the loads": with CLIP_SKELETON_OVERLAP=1 that function
+        # completes at the START of the clip_forward/unet window, so the probe
+        # allocated and moved memory while the source owner was still servicing
+        # it.  That segfaulted the runner (exit 139, surfaced by v2ctl as
+        # InternalFailure: Server has lost track of input) on 5/8 diagnostic runs
+        # against 0/52 for the untouched control, and it reproduced with only
+        # three anonymous copies and no file mapping.
+        #
+        # Here the generation is finished, the result is committed and durable,
+        # and the source owner is idle, so the allocation cannot perturb a
+        # measured load window or the output SHA.  Note this must live in the
+        # module that actually orchestrates the request: run_golden_parallel_stream
+        # is golden_parallel, not golden_serial, so a hook placed in the serial
+        # runner never executes and silently yields no probe event.
+        if str(os.environ.get("COMFYMODAL_M1B_COPY_PROBE") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            try:
+                from . import m1_copy_probe as _m1cb
+
+                _paths = {}
+                try:
+                    _paths["clip"] = str(session.model_paths.get("clip") or "")
+                    _paths["unet"] = str(session.model_paths.get("unet") or "")
+                except Exception:
+                    _paths = {}
+                _payload = _m1cb.CopyProbe().run(_paths)
+                session.recorder.event("m1cb_copy_probe", **_payload)
+            except BaseException as _m1cb_exc:  # never fail the request for a probe
+                session.recorder.event(
+                    "m1cb_copy_probe", error=f"{type(_m1cb_exc).__name__}: {_m1cb_exc}"
+                )
         session.recorder.event("RESULT_ASSEMBLED", request_id=request.request_id)
         # ── Strict CPU-I/O process evidence (experimental; default OFF) ────
         # Records child CUDA-sterility and the shared->pinned copy cost.  The
