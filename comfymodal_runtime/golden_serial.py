@@ -9692,6 +9692,56 @@ def validate_attention_backend_diagnostics(
         )
 
 
+def _container_restore_facts() -> dict:
+    """Capture container-side facts that explain source-read throughput.
+
+    Model-load bandwidth on this lane spans roughly 1.5-7 GB/s between
+    otherwise identical runs, and the only known mechanism that would force a
+    cold model re-read is a failed memory-snapshot restore.  Neither the Modal
+    execution region nor the snapshot outcome is recoverable from the produced
+    artifacts, so record them at the restore boundary where the metadata is
+    already persisted.
+
+    Strictly observation-only: every lookup is individually guarded and any
+    unexpected condition degrades to ``None`` rather than raising, because
+    telemetry must never be able to fail a production request.
+    """
+
+    def _safe(fn):
+        try:
+            return fn()
+        except BaseException:
+            return None
+
+    facts: dict = {
+        # Whether this app asked Modal for a memory snapshot at all.  The
+        # resolver defaults to True, so a restore failure here means a cold
+        # container start and a full model re-read.
+        "memory_snapshot_enabled": _safe(
+            lambda: (
+                os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", "").strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+        ),
+        "memory_snapshot_env_raw": _safe(
+            lambda: os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT")
+        ),
+    }
+    # Modal does not expose the execution region as a stable documented env var,
+    # so probe the plausible spellings instead of assuming one.
+    for name in (
+        "MODAL_REGION",
+        "MODAL_DEFAULT_REGION",
+        "MODAL_ENVIRONMENT",
+        "MODAL_CONTAINER_ID",
+        "MODAL_TASK_ID",
+    ):
+        value = _safe(lambda n=name: os.environ.get(n))
+        if value:
+            facts[name.lower()] = value
+    return facts
+
+
 async def golden_restore(session: GoldenSession) -> dict:
     """Observe the adapter's already-completed REAL RESTORE handoff.
 
@@ -9767,6 +9817,7 @@ async def golden_restore(session: GoldenSession) -> dict:
             "request_id": session.request.request_id,
             "observation_only": True,
             "external_restore_interval": metadata,
+            "container_facts": _container_restore_facts(),
         }
         session.restore_baseline = baseline
         rec.end_stage(
