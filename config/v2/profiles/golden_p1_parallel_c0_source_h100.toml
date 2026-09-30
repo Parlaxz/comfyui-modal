@@ -75,6 +75,18 @@ COMFYMODAL_GOLDEN_C0_HOST_REGISTER = "1"
 COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME = "one_shot_events"
 COMFYMODAL_GOLDEN_MINIMAL_RESTORE = "1"
 
+# ── Post-request teardown ─────────────────────────────────────────────────
+# Every counted run here is single-use (min_containers=0): Modal destroys the
+# container immediately after the method returns, so there is no next request to
+# release a GPU for.  The full post-request path still runs by default because
+# COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST resolves to 1 by ambient inheritance,
+# which overrides _release_gpu_after_request's own single-use default and forces
+# unload_all_models + the reference-clear stages.  That is a multi-second,
+# load-proportional tail on the container wall after the result is already
+# durable, and it is pure overhead on a container about to be deleted.
+# Minimal teardown keeps the cheap branches and drops the heavyweight unload.
+COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN = "1"
+
 # ── Counted profile: all intrusive diagnostics OFF ───────────────────────
 # Child VizTracer.  full_execution_trace.py imports and starts VizTracer as
 # soon as this is 1, so it is not a capability flag for a counted request.
