@@ -220,9 +220,14 @@ def _memset(dst: int, n: int, val: int = 0xAB) -> tuple[int, int]:
 
 
 def _checksum(addr: int, n: int, stride: int = 4096) -> int:
-    """Sampled integrity check. Proves the copy actually moved bytes."""
+    """Sampled integrity check. Proves the copy actually moved bytes.
+
+    Indexing a ``c_char`` array yields a one-byte ``bytes`` object, not an int,
+    so the accumulator must be a ``c_ubyte`` array.  (This was a real
+    ``int + bytes`` TypeError that aborted the copy phase.)
+    """
     _init()
-    buf = (ctypes.c_char * n).from_address(addr)
+    buf = (ctypes.c_ubyte * n).from_address(addr)
     acc = 0
     for off in range(0, n, stride):
         acc = (acc * 31 + buf[off]) & 0xFFFFFFFF
