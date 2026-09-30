@@ -37,6 +37,74 @@ from .golden_serial import (
 )
 
 
+import faulthandler
+import os
+import threading
+import time
+from typing import Any
+
+# ── Request wall gate + progress heartbeat ────────────────────────────────
+# The per-model-load gates in golden_source_threads bound the SOURCE span
+# only.  Everything else in a Golden request (skeleton overlap, the CLIP/UNET
+# constructors and their adoption proofs, clip forward, sampling, VAE decode,
+# output) was unbounded, so a stall there hung until the outer timeout.  This
+# gate bounds the whole request, and because it fires from a watchdog thread it
+# also dumps every thread stack -- which is what makes the next stall
+# self-diagnosing instead of a forensic reconstruction.
+GOLDEN_REQUEST_WALL_GATE_S = 40.0
+PROGRESS_HEARTBEAT_ENV = "COMFYMODAL_GOLDEN_PROGRESS_HEARTBEAT"
+
+_PROGRESS_STATE: dict[str, Any] = {"t0_ns": 0, "last_stage": "none"}
+
+
+def _progress_enabled() -> bool:
+    """Always-on unless explicitly disabled; no dependency on stage diagnostics.
+
+    The counted profile sets COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS=0, which is
+    why a previous stall printed nothing between restore and completion and
+    could not be localised from the streamed log.
+    """
+    return str(os.environ.get(PROGRESS_HEARTBEAT_ENV, "1")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _hb(stage: str) -> None:
+    _PROGRESS_STATE["last_stage"] = stage
+    if not _progress_enabled():
+        return
+    t0 = int(_PROGRESS_STATE.get("t0_ns") or 0)
+    elapsed_ms = (time.monotonic_ns() - t0) / 1e6 if t0 else 0.0
+    print(
+        f"[v2.golden.progress] stage={stage} elapsed_ms={elapsed_ms:.3f}",
+        flush=True,
+    )
+
+
+def _install_request_wall_gate(gate_s: float = GOLDEN_REQUEST_WALL_GATE_S):
+    def _fire() -> None:
+        print(
+            f"[v2.golden.request_gate] FAILED wall_gate_s={gate_s} "
+            f"last_stage={_PROGRESS_STATE.get('last_stage')}",
+            flush=True,
+        )
+        print("[v2.golden.request_gate] BEGIN thread stacks", flush=True)
+        try:
+            faulthandler.dump_traceback(all_threads=True)
+        except BaseException as exc:  # noqa: BLE001 - diagnostics are best effort
+            print(f"[v2.golden.request_gate] stack dump failed: {exc}", flush=True)
+        print("[v2.golden.request_gate] END thread stacks", flush=True)
+        # Hard fail-closed: a blocking native call cannot be interrupted
+        # safely, so the container is terminated rather than left holding an
+        # H100 indefinitely.  The stack dump above is the evidence.
+        os._exit(70)
+
+    timer = threading.Timer(gate_s, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 async def golden_parallel_execute(
     request: GoldenRequest,
     *,
@@ -98,8 +166,13 @@ async def golden_parallel_execute(
         _io_process_active = _io_process_enabled()
         # No task is created here on purpose.  This is the P1 parallel control
         # plane and evidence foundation; overlap belongs to a later change.
+        _PROGRESS_STATE["t0_ns"] = time.monotonic_ns()
+        _PROGRESS_STATE["last_stage"] = "execute_enter"
+        _install_request_wall_gate()
+        _hb("execute_enter")
         with _golden_trace_span("golden_parallel_execute"):
             await golden_restore(session)
+        _hb("restore_done")
         if _io_process_active:
             # Diagnostic probe BEFORE the first CLIP/model read: report exactly
             # which of {child, control Pipe, shared ring} survived restore.
@@ -130,6 +203,7 @@ async def golden_parallel_execute(
             session.recorder.event("presnapshot_worker_probe", **probe_evidence)
         with _golden_trace_span("golden_request_setup"):
             await golden_request_setup(session)
+        _hb("request_setup_done")
         if presnapshot_active:
             loader_worker = get_pre_snapshot_worker()
             init_evidence = loader_worker.initialize_session(
@@ -171,27 +245,37 @@ async def golden_parallel_execute(
             )
         with _golden_trace_span("golden_clip_load"):
             with _loader_worker_stage(session, loader_worker, "clip", "transports") as _preloaded:
+                _hb("clip_load_begin")
                 await golden_clip_load(session, preloaded_transports=_preloaded)
+                _hb("clip_load_done")
         clip_unet_schedule = _resolve_clip_unet_schedule()
         sampling_vae_schedule = _resolve_sampling_vae_schedule()
+        _hb("clip_forward_unet_window_begin")
         await golden_clip_forward_unet_window(
             session,
             schedule=clip_unet_schedule,
             unet_load=lambda: _unet_load_with_worker_stage(session, loader_worker),
         )
+        _hb("clip_forward_unet_window_done")
         with _golden_trace_span("golden_sampler_prepare"):
             await golden_sampler_prepare(session)
+        _hb("sampler_prepare_done")
+        _hb("sampling_vae_window_begin")
         await golden_sampling_vae_window(
             session,
             schedule=sampling_vae_schedule,
             vae_load=lambda: _vae_load_with_worker_stage(session, loader_worker),
         )
+        _hb("sampling_vae_window_done")
         with _golden_trace_span("golden_sampler_tail"):
             await golden_sampler_tail(session)
+        _hb("sampler_tail_done")
         with _golden_trace_span("golden_vae_decode"):
             await golden_vae_decode(session)
+        _hb("vae_decode_done")
         with _golden_trace_span("golden_output"):
             await golden_output(session)
+        _hb("output_done")
         if session.output_durability_mode == "strict":
             if session.pending_durability is None:
                 raise RuntimeError("parallel_durable_commit_pending_missing")
