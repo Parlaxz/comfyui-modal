@@ -23122,6 +23122,18 @@ class ModalRuntimeEntrypoint:
             outer.mark("post_yield_resume")
         outer.mark("remote_method_return")
         outer.report()
+        # Container stdout is not captured into run artifacts, so the marks must
+        # be persisted into the Golden telemetry JSON, which v2ctl does collect.
+        _telemetry_path = getattr(self, "_golden_telemetry_path", None)
+        if _telemetry_path:
+            _inject = __import__(
+                "comfymodal_runtime.golden_parallel",
+                fromlist=["inject_outer_marks_into_telemetry"],
+            ).inject_outer_marks_into_telemetry
+            outer.marks.insert(
+                0, ("golden_call_telemetry_path", time.monotonic_ns(), 0, "")
+            )
+            _inject(_telemetry_path, outer.marks)
 
     async def run_golden_serial_stream(
         self,
@@ -23290,6 +23302,10 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_request_id_unsanitizable")
             golden_dir = Path(RUNTIME_STATE_PATH, "golden")
             telemetry_path = golden_dir / f"{sanitized}.json"
+            # Published for the outer-lifetime instrumentation in the streaming
+            # wrapper, which flushes its marks into this file once the method
+            # has returned; stdout alone is not captured into run artifacts.
+            self._golden_telemetry_path = str(telemetry_path)
             if telemetry_path.resolve().parent != golden_dir.resolve():
                 raise ValueError("golden_telemetry_path_traversal_blocked")
             golden_dir.mkdir(parents=True, exist_ok=True)
