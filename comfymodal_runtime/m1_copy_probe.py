@@ -408,11 +408,32 @@ class CopyProbe:
             "dst_a": _align_report(dst_a), "dst_b": _align_report(dst_b),
             "anon_src": _align_report(anon_src),
         }
-        for d in (dst_a, dst_b, anon_src):
+        # Only the destinations are pre-faulted.  anon_src is left untouched so
+        # S1 is a genuine first touch of source pages and S2 is the repeat.
+        for d in (dst_a, dst_b):
             _memset(d, n)
 
+        # Anonymous first-touch / repeat contrast.  This is the whole inline
+        # sentinel: no file mapping, no shared memory, no registered arena.
+        self._time_copy("sentinel_S1", "memmove", dst_a, anon_src, n, reps=1,
+                        source_kind="anon_first_touch", dest_kind="anon_a",
+                        condition="sentinel")
+        self._time_copy("sentinel_S2", "memmove", dst_b, anon_src, n, reps=1,
+                        source_kind="anon_resident", dest_kind="anon_b",
+                        condition="sentinel")
+        self._time_copy("sentinel_S3", "memmove", dst_a, anon_src, n, reps=1,
+                        source_kind="anon_resident", dest_kind="anon_a",
+                        condition="sentinel")
+        result["exact_match"] = {"S1_dst_a": _memcmp(dst_a, anon_src, n),
+                                 "S2_dst_b": _memcmp(dst_b, anon_src, n)}
+
         path = model_paths.get("clip")
-        if not path or not os.path.exists(path):
+        if level() < 2:
+            result["sentinel_note"] = (
+                "inline level 1 measures the anonymous path only; the file-backed "
+                "arm belongs to the standalone copy lab (level>=2)"
+            )
+        elif not path or not os.path.exists(path):
             result["sentinel_note"] = "clip file unavailable; anonymous control only"
         else:
             fsize = os.path.getsize(path)
