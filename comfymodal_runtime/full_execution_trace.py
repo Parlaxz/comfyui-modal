@@ -251,6 +251,42 @@ def bind_golden_tracer(tracer: Any):
         _GOLDEN_TRACER.reset(token)
 
 
+def thread_traced(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap *fn* so the thread running it installs this request's profile hook.
+
+    ``VizTracer.enable_thread_tracing()`` only reaches threads created *after* it
+    is called.  Golden's asyncio default executor already exists by the time a
+    request runs, so ``asyncio.to_thread`` reuses worker threads that never
+    receive the hook and produce no events at all.
+
+    That is measurable, and it is not a code difference: on trace
+    ``a4a4eaaf52fe456cbcd3583527068891`` golden_unet_load reports
+    ``source_read_count = 184`` against golden_clip_load's 120, i.e. it drove
+    *more* of the C0 source pool, yet recorded zero frames.  The asymmetry is
+    the dispatch path -- clip loads via ``load_sync`` on the request task thread,
+    while unet dispatches ``load`` -> ``asyncio.to_thread(_load_sync)`` onto the
+    stale executor thread.  Everything under that call is plain Python
+    (``wait_ready``, ``_read_message``, ``select.select``) and should be traced.
+
+    ``sys.setprofile`` only ever affects the calling thread, so the hook has to be
+    installed from inside the worker.  The tracer is resolved at call time, not
+    captured, so the binding stays authoritative and an unbound tracer makes this
+    a plain passthrough.  Tracing failures never escape into the load.
+    """
+    @functools.wraps(fn)
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            tracer = _GOLDEN_TRACER.get()
+            thread_hook = getattr(tracer, "threadtracefunc", None)
+            if callable(thread_hook):
+                sys.setprofile(thread_hook)
+        except BaseException:
+            pass
+        return fn(*args, **kwargs)
+
+    return _run
+
+
 @contextlib.contextmanager
 def golden_trace_span(name: str):
     """Record a Golden duration event on the request-bound VizTracer.
