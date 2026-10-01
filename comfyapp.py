@@ -9303,9 +9303,13 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
         ).env({
             _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
         })
-    source = _add_custom_node_verification_layer(
-        source, _V2_CUSTOM_NODE_REQUIREMENT_NAMES
-    )
+        # Build-time only.  This layer needs the per-node requirement names bound
+        # above, which exist solely on the local deploy path.  Inside a Modal
+        # container the image is already built, so referencing the name here
+        # raised NameError and broke container startup.
+        source = _add_custom_node_verification_layer(
+            source, _V2_CUSTOM_NODE_REQUIREMENT_NAMES
+        )
     return CanonicalImagePlan(
         foundation=_FOUNDATION_IMAGE,
         third_party_dependency_environment=_THIRD_PARTY_DEPENDENCY_IMAGE,
