@@ -37,6 +37,20 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     ".preset_blobs", ".v2ctl", ".comfymodal_control", "tests", "test", "examples", "benchmarks",
     "benchmark", "traces", "logs", "scripts", ".github", "MagicMock",
     "reference", "docs",
+    # Host-side experiment evidence.  These two directories alone accounted for
+    # ~1.66 GB (68.7%) of the published custom-node payload while contributing
+    # no runtime code: tracked references exist only in local benchmark/report
+    # tooling, never inside the container.  Shipping them forced Modal to walk,
+    # hash, and issue a per-file existence RPC for 1,569 files on every deploy.
+    # They stay tracked in git; this only prunes them from the published tree.
+    "golden_history", "unetClipExperimentsSeptember",
+})
+
+# Named subset of EXCLUDED_DIR_NAMES holding host-side experiment evidence.
+# Kept separate so tests can pin the deploy-latency contract against exactly
+# these names instead of the whole conservative exclusion set.
+EVIDENCE_ONLY_DIR_NAMES: frozenset[str] = frozenset({
+    "golden_history", "unetClipExperimentsSeptember",
 })
 
 # Compatibility spelling used by existing callers/tests.

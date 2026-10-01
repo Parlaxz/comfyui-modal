@@ -199,6 +199,60 @@ class SourceIdentityPublicationTests(unittest.TestCase):
                 build_deployment_identity(runtime_root, custom_node_paths=[root]).combined_hash,
             )
 
+    def test_experiment_evidence_dirs_are_not_published(self):
+        """Host-side evidence must never reach the image or the identity.
+
+        ``golden_history`` and ``unetClipExperimentsSeptember`` were ~68.7% of
+        the published custom-node payload (1.66 GB / 1,569 files) while
+        contributing no runtime code.  Every deploy paid to walk, hash, and
+        per-file-RPC them.  They stay tracked in git; this pins only that they
+        are pruned from publication, from the image ignore patterns, and from
+        the publication generation.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "custom_nodes"
+            node = root / "comfyui-modal"
+            node.mkdir(parents=True)
+            (node / "source.py").write_text("canonical", encoding="utf-8")
+
+            for name in publication_policy.EVIDENCE_ONLY_DIR_NAMES:
+                evidence = node / name
+                evidence.mkdir()
+                # A .py file so only the directory exclusion can prune it.
+                (evidence / "evidence.py").write_text("evidence", encoding="utf-8")
+                nested = evidence / "nested"
+                nested.mkdir()
+                (nested / "deep.py").write_text("deep", encoding="utf-8")
+
+            published = {
+                path.relative_to(root).as_posix()
+                for path in publication_policy.iter_publication_files(root)
+            }
+            self.assertIn("comfyui-modal/source.py", published)
+            for name in publication_policy.EVIDENCE_ONLY_DIR_NAMES:
+                self.assertFalse(
+                    [p for p in published if f"/{name}/" in p or p.endswith(f"/{name}")],
+                    msg=f"{name} must not be published",
+                )
+
+            # The same policy drives the image ignore patterns Modal prunes on.
+            ignore_patterns = publication_policy.image_ignore_patterns()
+            for name in publication_policy.EVIDENCE_ONLY_DIR_NAMES:
+                self.assertTrue(
+                    any(name in str(pattern) for pattern in ignore_patterns),
+                    msg=f"{name} must appear in the image ignore patterns",
+                )
+
+            # Changing evidence content must not move the publication
+            # generation: the generation is what makes a redeploy look dirty.
+            before = publication_policy.compute_publication_generation(root)
+            for name in publication_policy.EVIDENCE_ONLY_DIR_NAMES:
+                (node / name / "evidence.py").write_text("mutated", encoding="utf-8")
+            self.assertEqual(
+                before,
+                publication_policy.compute_publication_generation(root),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
