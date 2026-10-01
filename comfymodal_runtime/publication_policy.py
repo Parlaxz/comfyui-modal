@@ -94,6 +94,15 @@ EVIDENCE_ONLY_DIR_NAMES: frozenset[str] = frozenset({
     ".scratch", ".unlazy", "_tools", "diag1",
 })
 
+# These are first-party benchmark harness nodes, not runtime custom nodes.
+# This filter is deliberately applied only to the top-level node selection
+# below; adding these names to EXCLUDED_DIR_NAMES would prune same-named
+# runtime directories inside unrelated third-party nodes.
+FIRST_PARTY_BENCHMARK_NODE_NAMES: frozenset[str] = frozenset({
+    "modal-single-volume-parallelism",
+    "modal-volume-read-ceiling",
+})
+
 # The evidence names are the ones added for deploy latency; they are part of
 # the exclusion contract too, so keep one authoritative set.
 EXCLUDED_DIR_NAMES = EXCLUDED_DIR_NAMES | EVIDENCE_ONLY_DIR_NAMES
@@ -125,6 +134,7 @@ EXCLUDED_FILENAMES: frozenset[str] = frozenset({
 
 EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
     ".pyc", ".pyo", ".md", ".tmp", ".ref", ".log", ".trace", ".jsonl",
+    ".bat", ".pid",
     ".whl", ".patch", ".diff", ".gz", ".zip", ".tar", ".bundle",
 })
 
@@ -266,9 +276,13 @@ def iter_syncable_custom_node_dirs(root: str | Path) -> list[str]:
     root_path = os.fspath(root)
     if not os.path.isdir(root_path):
         return []
+    first_party_benchmark_names = {
+        name.casefold() for name in FIRST_PARTY_BENCHMARK_NODE_NAMES
+    }
     return sorted(
         name for name in os.listdir(root_path)
-        if custom_node_filter_reason(name, os.path.join(root_path, name)) is None
+        if name.casefold() not in first_party_benchmark_names
+        and custom_node_filter_reason(name, os.path.join(root_path, name)) is None
     )
 
 
