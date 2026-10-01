@@ -306,28 +306,29 @@ RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 
 
 def _ensure_custom_nodes_compat_symlink() -> None:
-    """Expose the volume at the legacy path without mounting it twice."""
+    """Verify the image-baked import symlink reaches the mounted Volume.
+
+    Modal rejects a Volume mount whose target already contains files.  The
+    image therefore mounts the Volume at ``CUSTOM_NODES_PATH`` (an empty
+    target) and bakes the symlink in the opposite direction: ComfyUI's
+    discovery path points at that mount.  This check is deliberately
+    read-only at runtime; creating the link here would be too late to avoid
+    Modal's mount validation.
+    """
     if CUSTOM_NODE_DELIVERY != "volume":
         return
 
-    target = CUSTOM_NODES_IMPORT_PATH
-    link = CUSTOM_NODES_PATH
+    target = CUSTOM_NODES_PATH
+    link = CUSTOM_NODES_IMPORT_PATH
     try:
         if not os.path.isdir(target):
             raise RuntimeError(
                 f"mounted custom-node Volume path is missing or not a directory: {target}"
             )
-        if os.path.lexists(link):
-            if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target):
-                return
+        if not os.path.islink(link) or os.path.realpath(link) != os.path.realpath(target):
             raise RuntimeError(
-                f"legacy custom-node path already exists and is not the compatibility "
-                f"symlink: {link}"
-            )
-        os.symlink(target, link, target_is_directory=True)
-        if os.path.realpath(link) != os.path.realpath(target):
-            raise RuntimeError(
-                f"compatibility symlink does not resolve to mounted custom-node path: "
+                f"ComfyUI custom-node import path is not the image-baked compatibility "
+                f"symlink to the mounted Volume: "
                 f"{link} -> {target}"
             )
     except Exception as exc:
@@ -24459,9 +24460,9 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         spec.models_path: resources["models_volume"],
     }
     if CUSTOM_NODE_DELIVERY == "volume":
-        # Mount the shared Volume only at ComfyUI's discovery root.  The
-        # legacy CUSTOM_NODES_PATH is linked to this path at container start.
-        _volumes[CUSTOM_NODES_IMPORT_PATH] = resources["custom_nodes_volume"]
+        # Mount only at the empty image compatibility path.  The image-baked
+        # symlink makes ComfyUI's discovery root resolve to this Volume.
+        _volumes[CUSTOM_NODES_PATH] = resources["custom_nodes_volume"]
     else:
         _volumes[spec.custom_nodes_path] = resources["custom_nodes_volume"]
     _volumes[spec.runtime_state_path] = resources["runtime_state_volume"]

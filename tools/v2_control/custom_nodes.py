@@ -39,6 +39,7 @@ RECEIPT_SCHEMA_VERSION = 2
 PACKAGING_POLICY_VERSION = 1
 PUBLICATION_PROTOCOL_VERSION = 2
 GENERATION_RECORD_SCHEMA_VERSION = 2
+CANDIDATE_READBACK_SAMPLE_SIZE = 128
 PUBLISHER_MARKER = "comfyui-modal-golden"
 RECEIPT_PATH = ".comfymodal_control/custom_nodes_publication_receipt.json"
 GENERATION_RECORD_PATH = ".comfymodal_control/custom_nodes_generation.json"
@@ -741,8 +742,9 @@ async def _remote_content_mismatch(
 
     The generation record authenticates the candidate generation, but it does
     not prove that a failed replacement removed files from the shared Volume.
-    Read the old paths that should have disappeared and every candidate path;
-    any missing, stale, or unreadable path keeps the publication incomplete.
+    Read every old path that should have disappeared.  Candidate content is
+    checked using a deterministic path-hash sample so publish cost is bounded;
+    the sample proves those candidate files, not every candidate file.
     """
     previous_packages = _manifest_map(previous)
     desired_packages = _manifest_map(desired)
@@ -778,7 +780,12 @@ async def _remote_content_mismatch(
     candidate_by_path = {
         path: (size, digest) for path, size, digest in desired.files
     }
-    for path, (expected_size, expected_digest) in sorted(candidate_by_path.items()):
+    candidate_readback_paths = sorted(
+        candidate_by_path,
+        key=lambda path: (hashlib.sha256(path.encode("utf-8")).digest(), path),
+    )[:CANDIDATE_READBACK_SAMPLE_SIZE]
+    for path in sorted(candidate_readback_paths):
+        expected_size, expected_digest = candidate_by_path[path]
         try:
             data = await _read_volume_file_async(volume, path)
         except FileNotFoundError:
@@ -1046,6 +1053,7 @@ __all__ = [
     "SemanticFile", "ReceiptError", "IDENTITY_SCHEMA_VERSION",
     "RECEIPT_SCHEMA_VERSION", "PACKAGING_POLICY_VERSION",
     "PUBLICATION_PROTOCOL_VERSION", "GENERATION_RECORD_SCHEMA_VERSION",
+    "CANDIDATE_READBACK_SAMPLE_SIZE",
     "RECEIPT_PATH", "GENERATION_RECORD_PATH",
     "CUSTOM_NODES_VOLUME_NAME", "CUSTOM_NODES_PUBLISHER_APP_NAME",
     "collect_semantic_files", "build_source_identity", "build_archive",

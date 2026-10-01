@@ -4020,6 +4020,23 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
             req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
             state.append((name, stat.st_mtime_ns, req_mtime_ns))
 
+    if os.path.realpath(volume_root) == os.path.realpath(comfy_custom_nodes_root):
+        # Volume delivery exposes the Volume itself at ComfyUI's discovery
+        # root.  Do not turn its real package directories into self-links.
+        result = {
+            "created": [],
+            "removed": [],
+            "kept": sorted(volume_dirs),
+            "blocked": [],
+        }
+        if include_state:
+            result["state"] = tuple(state)
+        print(
+            "[comfyapp] sync_custom_nodes_into_comfy: direct Volume root; "
+            f"nodes={len(volume_dirs)}"
+        )
+        return result
+
     removed = []
     created = []
     kept = []
@@ -8999,6 +9016,18 @@ if not _INSIDE_MODAL_CONTAINER:
         print(
             "[comfyapp] custom_node_delivery=volume; skipping custom-node source "
             "add_local_dir (publisher Volume is the runtime source)"
+        )
+        # Modal cannot mount a Volume over the non-empty ComfyUI discovery
+        # directory.  Mount the Volume at the empty compatibility path and
+        # make ComfyUI resolve its normal import path to that mount in the
+        # built image; runtime code only verifies this link.
+        _image_base = _image_base.run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "ln -s /root/custom_nodes_vol /root/comfy/ComfyUI/custom_nodes"
+        )
+        print(
+            "[comfyapp] custom_node_delivery=volume; baked import-path symlink "
+            "/root/comfy/ComfyUI/custom_nodes -> /root/custom_nodes_vol"
         )
     elif CUSTOM_NODE_COPY_MODE == "combined":
         _image_base = _image_base.add_local_dir(

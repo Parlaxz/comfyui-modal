@@ -102,6 +102,16 @@ def test_volume_delivery_skips_custom_node_source_copy():
     module, image = _load_comfyapp("volume")
     assert module.CUSTOM_NODE_DELIVERY == "volume"
     assert not _custom_node_copy_calls(image)
+    commands = [
+        call[1][0]
+        for call in image.calls
+        if call[0] == "run_commands"
+        and call[1][0].startswith("rm -rf /root/comfy/ComfyUI/custom_nodes")
+    ]
+    assert commands == [
+        "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+        "ln -s /root/custom_nodes_vol /root/comfy/ComfyUI/custom_nodes"
+    ]
 
 
 def test_invalid_delivery_warns_and_falls_back_to_image(capsys):
@@ -111,7 +121,7 @@ def test_invalid_delivery_warns_and_falls_back_to_image(capsys):
     assert _custom_node_copy_calls(image)
 
 
-def test_volume_mode_mounts_volume_only_at_import_path():
+def test_volume_mode_mounts_volume_only_at_empty_compatibility_path():
     from comfymodal_runtime import modal_app
 
     class FakeApp:
@@ -137,8 +147,8 @@ def test_volume_mode_mounts_volume_only_at_import_path():
         modal_app._register_remote_entrypoint(resources, spec)
     volumes = app.kwargs["volumes"]
     custom_mounts = [path for path, volume in volumes.items() if volume is custom_volume]
-    assert custom_mounts == [modal_app.CUSTOM_NODES_IMPORT_PATH]
-    assert spec.custom_nodes_path not in volumes
+    assert custom_mounts == [modal_app.CUSTOM_NODES_PATH]
+    assert modal_app.CUSTOM_NODES_IMPORT_PATH not in volumes
 
 
 def test_image_mode_keeps_legacy_custom_nodes_mount():
@@ -170,53 +180,58 @@ def test_image_mode_keeps_legacy_custom_nodes_mount():
     assert modal_app.CUSTOM_NODES_IMPORT_PATH not in volumes
 
 
-def test_volume_mode_creates_legacy_compatibility_symlink(tmp_path):
+def test_volume_mode_verifies_image_baked_import_compatibility_symlink(tmp_path):
     from comfymodal_runtime import modal_app
 
-    mounted_path = tmp_path / "comfy" / "ComfyUI" / "custom_nodes"
-    mounted_path.mkdir(parents=True)
-    legacy_path = tmp_path / "custom_nodes_vol"
-    created: dict[str, object] = {}
+    mounted_path = tmp_path / "custom_nodes_vol"
+    mounted_path.mkdir()
+    import_path = tmp_path / "comfy" / "ComfyUI" / "custom_nodes"
+    import_path.parent.mkdir(parents=True)
     realpath = os.path.realpath
 
-    def fake_symlink(target, link, *, target_is_directory):
-        created.update(
-            target=target,
-            link=link,
-            target_is_directory=target_is_directory,
-        )
-
     def fake_realpath(path):
-        if path == str(legacy_path):
+        if path == str(import_path):
             return realpath(mounted_path)
         return realpath(path)
 
     with patch.object(modal_app, "CUSTOM_NODE_DELIVERY", "volume"), \
-         patch.object(modal_app, "CUSTOM_NODES_IMPORT_PATH", str(mounted_path)), \
-         patch.object(modal_app, "CUSTOM_NODES_PATH", str(legacy_path)), \
-         patch.object(modal_app.os, "symlink", side_effect=fake_symlink), \
+         patch.object(modal_app, "CUSTOM_NODES_IMPORT_PATH", str(import_path)), \
+         patch.object(modal_app, "CUSTOM_NODES_PATH", str(mounted_path)), \
+         patch.object(modal_app.os.path, "islink", return_value=True), \
          patch.object(modal_app.os.path, "realpath", side_effect=fake_realpath):
-        modal_app._ensure_custom_nodes_compat_symlink()
-    assert created == {
-        "target": str(mounted_path),
-        "link": str(legacy_path),
-        "target_is_directory": True,
-    }
-    assert fake_realpath(str(legacy_path)) == fake_realpath(str(mounted_path))
+         modal_app._ensure_custom_nodes_compat_symlink()
+    assert fake_realpath(str(import_path)) == fake_realpath(str(mounted_path))
 
 
 def test_volume_mode_symlink_failure_fails_closed(tmp_path):
     from comfymodal_runtime import modal_app
 
-    mounted_path = tmp_path / "custom_nodes"
+    mounted_path = tmp_path / "custom_nodes_vol"
     mounted_path.mkdir()
-    legacy_path = tmp_path / "custom_nodes_vol"
-    legacy_path.mkdir()
+    import_path = tmp_path / "custom_nodes"
+    import_path.mkdir()
     with patch.object(modal_app, "CUSTOM_NODE_DELIVERY", "volume"), \
-         patch.object(modal_app, "CUSTOM_NODES_IMPORT_PATH", str(mounted_path)), \
-         patch.object(modal_app, "CUSTOM_NODES_PATH", str(legacy_path)):
+         patch.object(modal_app, "CUSTOM_NODES_IMPORT_PATH", str(import_path)), \
+         patch.object(modal_app, "CUSTOM_NODES_PATH", str(mounted_path)):
         with pytest.raises(RuntimeError, match="compatibility symlink setup failed"):
             modal_app._ensure_custom_nodes_compat_symlink()
+
+
+def test_volume_mode_does_not_resync_the_volume_root_into_itself(tmp_path):
+    from comfyapp import sync_custom_nodes_into_comfy
+
+    package = tmp_path / "custom_nodes_vol" / "NodeA"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n")
+    result = sync_custom_nodes_into_comfy(
+        str(tmp_path / "custom_nodes_vol"),
+        str(tmp_path / "custom_nodes_vol"),
+        include_state=True,
+    )
+    assert result["created"] == []
+    assert result["removed"] == []
+    assert result["kept"] == ["NodeA"]
+    assert (package / "__init__.py").is_file()
 
 
 def test_volume_gate_fails_closed_for_empty_volume_and_generation_mismatch():
