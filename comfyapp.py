@@ -432,6 +432,10 @@ CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined"
 if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_COPY_MODE={CUSTOM_NODE_COPY_MODE!r}, falling back to 'combined'")
     CUSTOM_NODE_COPY_MODE = "combined"
+CUSTOM_NODE_DELIVERY = os.getenv("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_DELIVERY={CUSTOM_NODE_DELIVERY!r}, falling back to 'image'")
+    CUSTOM_NODE_DELIVERY = "image"
 
 # Generic collector for custom-node import/entrypoint failures during startup.
 # Populated by the logging.warning patch in _start_in_process_backend.
@@ -3795,6 +3799,92 @@ def _safe_listdir(path: str) -> list[str]:
     if not os.path.isdir(path):
         return []
     return sorted(os.listdir(path))
+
+
+def decide_custom_node_volume_gate(
+    *,
+    volume_entries: list[str] | None,
+    importable_node_count: int | None,
+    generation_record: dict | None,
+    expected_generation: str,
+) -> dict:
+    """Decide whether a Volume-backed custom-node tree may be imported.
+
+    This is deliberately pure so the startup contract can be tested without a
+    Modal container.  The caller supplies the directory and record reads; any
+    missing or unreadable input is represented by ``None`` and fails closed.
+    """
+    reasons: list[str] = []
+    if volume_entries is None:
+        reasons.append("volume_directory_missing_or_unreadable")
+    elif not volume_entries:
+        reasons.append("volume_directory_empty")
+    if not isinstance(importable_node_count, int) or importable_node_count < 1:
+        reasons.append("no_importable_custom_node_init_py")
+
+    actual_generation = ""
+    if not isinstance(generation_record, dict):
+        reasons.append("generation_record_missing_or_unreadable")
+    else:
+        actual_generation = str(generation_record.get("content_generation", "") or "").strip()
+        if not actual_generation:
+            reasons.append("generation_record_missing_or_unreadable")
+    expected_generation = str(expected_generation or "").strip()
+    if not expected_generation:
+        reasons.append("deployment_expected_generation_missing")
+    elif actual_generation and actual_generation != expected_generation:
+        reasons.append("generation_mismatch")
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "volume_entries": len(volume_entries) if volume_entries is not None else None,
+        "importable_node_count": importable_node_count,
+        "actual_generation": actual_generation,
+        "expected_generation": expected_generation,
+    }
+
+
+def verify_custom_node_volume_gate(
+    volume_root: str,
+    generation_record_path: str,
+    expected_generation: str,
+) -> dict:
+    """Read the mounted Volume inputs and return the fail-closed gate result."""
+    try:
+        volume_entries = sorted(os.listdir(volume_root)) if os.path.isdir(volume_root) else None
+    except OSError:
+        volume_entries = None
+    importable_node_count = 0
+    if volume_entries is not None:
+        for name in volume_entries:
+            node_root = os.path.join(volume_root, name)
+            if os.path.isdir(node_root) and os.path.isfile(os.path.join(node_root, "__init__.py")):
+                importable_node_count += 1
+    try:
+        with open(generation_record_path, "r", encoding="utf-8") as record_file:
+            generation_record = json.load(record_file)
+    except (OSError, TypeError, ValueError):
+        generation_record = None
+    if isinstance(generation_record, dict):
+        content_generation = generation_record.get("content_generation")
+        if (
+            generation_record.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION
+            or not isinstance(content_generation, str)
+            or not content_generation.strip()
+            or content_generation != content_generation.strip()
+            or (
+                "generation" in generation_record
+                and generation_record["generation"] != content_generation
+            )
+        ):
+            generation_record = None
+    return decide_custom_node_volume_gate(
+        volume_entries=volume_entries,
+        importable_node_count=importable_node_count,
+        generation_record=generation_record,
+        expected_generation=expected_generation,
+    )
 
 
 # Shared hash-input policy.  Keep this compatibility alias because diagnostics
@@ -7847,9 +7937,14 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
 
     # Task 8: Verify actual build order
     _node_names = _iter_syncable_custom_node_dirs(source_root)
+    print(f"[comfyapp] custom_node_delivery={CUSTOM_NODE_DELIVERY}")
     print(f"[comfyapp] custom_node_copy_mode={CUSTOM_NODE_COPY_MODE}")
     print(f"[comfyapp] syncable_custom_nodes={len(_node_names)}")
-    _combined_layers = 1 if CUSTOM_NODE_COPY_MODE == "combined" else len(_node_names)
+    _combined_layers = (
+        0 if CUSTOM_NODE_DELIVERY == "volume"
+        else 1 if CUSTOM_NODE_COPY_MODE == "combined"
+        else len(_node_names)
+    )
     print(f"[comfyapp] source_copy_layers={_combined_layers}")
     print(f"[comfyapp] local_custom_node_root={source_root}")
     combined_excluded_ok = (
@@ -7870,7 +7965,10 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"  9. install/verify comfy-kitchen==0.2.31")
     print(f"  10. install/verify fastsafetensors and SageAttention")
     print(f"  11. apply late runtime env vars")
-    print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print("  12. mount publisher custom-node Volume at ComfyUI import path")
+    else:
+        print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
     print(f"  13. generate/add baked dependency manifest")
     print(
         f"  14. golden GPU first-party source | comfyapp + runtime modules | "
@@ -8874,7 +8972,7 @@ _STABLE_DEPENDENCY_IMAGE = _ACCELERATOR_NATIVE_IMAGE
 _LATE_CONFIG_IMAGE = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
 _image_base = _LATE_CONFIG_IMAGE
 
-# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
+# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source delivery (image or Volume) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
@@ -8897,7 +8995,12 @@ if not _INSIDE_MODAL_CONTAINER:
             f"[comfyapp] custom_node_filter: excluding ComfyModal duplicate dirs "
             f"from image ({len(_duplicate_node_names)}): {_duplicate_node_names}"
         )
-    if CUSTOM_NODE_COPY_MODE == "combined":
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print(
+            "[comfyapp] custom_node_delivery=volume; skipping custom-node source "
+            "add_local_dir (publisher Volume is the runtime source)"
+        )
+    elif CUSTOM_NODE_COPY_MODE == "combined":
         _image_base = _image_base.add_local_dir(
             _LOCAL_CUSTOM_NODES,
             "/root/comfy/ComfyUI/custom_nodes",

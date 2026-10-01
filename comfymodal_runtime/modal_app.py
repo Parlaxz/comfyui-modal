@@ -294,6 +294,14 @@ CUSTOM_NODES_VOLUME_NAME = os.environ.get(
 RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
+CUSTOM_NODES_IMPORT_PATH = "/root/comfy/ComfyUI/custom_nodes"
+CUSTOM_NODE_DELIVERY = os.environ.get("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
+    print(
+        f"[modal_app] WARNING: invalid COMFYMODAL_CUSTOM_NODE_DELIVERY={CUSTOM_NODE_DELIVERY!r}, "
+        "falling back to 'image'"
+    )
+    CUSTOM_NODE_DELIVERY = "image"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
 _RESTORE_CLIP_PROBE_SOURCE_ENV = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
 _RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH = os.path.join(
@@ -4795,6 +4803,7 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         # spec rebuild (identity.gpu / gpu_requested_order) reflects the actual
         # deploy request instead of the parse_gpu_request() default.
         "COMFYMODAL_V2_GPU": os.environ.get("COMFYMODAL_V2_GPU", ""),
+        "COMFYMODAL_CUSTOM_NODE_DELIVERY": CUSTOM_NODE_DELIVERY,
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
         ),
@@ -10643,6 +10652,39 @@ class ModalRuntimeEntrypoint:
         )
         self._runtime_configured = True
 
+    def _verify_custom_node_volume_before_startup(self) -> None:
+        """Refuse to start ComfyUI when the published Volume is not exact."""
+        module = self._legacy_module
+        if module is None or CUSTOM_NODE_DELIVERY != "volume":
+            return
+        manifest = module.load_baked_custom_node_dependency_manifest()
+        expected_generation = str(
+            manifest.get("production_custom_node_generation", "") or ""
+        ) if isinstance(manifest, Mapping) else ""
+        decision = module.verify_custom_node_volume_gate(
+            CUSTOM_NODES_IMPORT_PATH,
+            module.CUSTOM_NODES_GENERATION_CONTROL_PATH,
+            expected_generation,
+        )
+        if not decision.get("ok"):
+            print(
+                "[comfyapp] custom_node_volume_gate FAILED "
+                f"path={CUSTOM_NODES_IMPORT_PATH} reasons={','.join(decision['reasons'])} "
+                f"actual_generation={decision.get('actual_generation') or '<missing>'} "
+                f"expected_generation={decision.get('expected_generation') or '<missing>'}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "custom-node Volume gate failed before ComfyUI node discovery: "
+                + ",".join(decision["reasons"])
+            )
+        print(
+            "[comfyapp] custom_node_volume_gate PASSED "
+            f"nodes={decision['importable_node_count']} "
+            f"generation={decision['actual_generation'][:16]}",
+            flush=True,
+        )
+
     def _ensure_golden_models_generation_record(self) -> dict[str, Any]:
         """Establish the canonical models-generation record for Golden.
 
@@ -11102,6 +11144,9 @@ class ModalRuntimeEntrypoint:
         self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
         identity = _capture_remote_identity()
         self._configure_runtime()
+        # This must precede bootstrap.startup(), whose start_backend callback
+        # imports ComfyUI/nodes and discovers custom nodes.
+        self._verify_custom_node_volume_before_startup()
         # Direct Golden bypasses ComfyAPI.startup, so establish the canonical
         # models-generation control record before bootstrap/snapshot work can
         # complete.  The profile gate keeps every non-Golden lifecycle path
@@ -24375,6 +24420,10 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         spec.custom_nodes_path: resources["custom_nodes_volume"],
         spec.runtime_state_path: resources["runtime_state_volume"],
     }
+    if CUSTOM_NODE_DELIVERY == "volume":
+        # Keep the legacy control-record mount while exposing the same Volume
+        # directly at ComfyUI's discovery root; no startup copy is required.
+        _volumes[CUSTOM_NODES_IMPORT_PATH] = resources["custom_nodes_volume"]
     # Add profile volume mount when full-trace is enabled
     if _V2_FULL_TRACE_ENABLED:
         _pv = resources.get("profile_volume")
