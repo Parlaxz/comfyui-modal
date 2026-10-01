@@ -15,6 +15,25 @@ IMPORT_PATH = "/root/comfy/ComfyUI/custom_nodes"
 pytestmark = pytest.mark.fast_unit
 
 
+@pytest.fixture(autouse=True)
+def _minimal_custom_node_tree(tmp_path_factory, monkeypatch):
+    """Point the build at a minimal node tree instead of the host's real one.
+
+    Each ``_load_comfyapp`` call executes the whole module-level image plan,
+    which walks ``COMFYMODAL_LOCAL_CUSTOM_NODES``.  Left unset, that walked the
+    host's actual custom-node tree (thousands of files) and dominated these
+    tests at roughly 2.8s each.  The delivery-mode contract under test does not
+    depend on tree contents, so a one-node fixture keeps identical coverage at
+    about a fifth of the cost and removes a dependency on what the host happens
+    to have installed.
+    """
+    root = tmp_path_factory.mktemp("custom_nodes")
+    node = root / "fixture-node"
+    node.mkdir()
+    (node / "__init__.py").write_text("NODE_CLASS_MAPPINGS = {}\n", encoding="utf-8")
+    monkeypatch.setenv("COMFYMODAL_LOCAL_CUSTOM_NODES", str(root))
+
+
 class _FakeImage:
     def __init__(self):
         self.calls: list[tuple[str, tuple, dict]] = []
