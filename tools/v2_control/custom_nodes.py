@@ -732,6 +732,65 @@ async def _content_generation_readback_async(volume: Any) -> str | None:
         return None
 
 
+async def _remote_content_mismatch(
+    volume: Any,
+    previous: PublicationReceipt | None,
+    desired: CustomNodeSourceIdentity,
+) -> str | None:
+    """Verify the file-level content represented by the publication manifests.
+
+    The generation record authenticates the candidate generation, but it does
+    not prove that a failed replacement removed files from the shared Volume.
+    Read the old paths that should have disappeared and every candidate path;
+    any missing, stale, or unreadable path keeps the publication incomplete.
+    """
+    previous_packages = _manifest_map(previous)
+    desired_packages = _manifest_map(desired)
+    if previous is not None and previous.file_count and not previous_packages:
+        return "previous package manifest unavailable"
+    for name, package in previous_packages.items():
+        raw_paths = package.get("path_list")
+        file_count = int(package.get("file_count", 0) or 0)
+        if file_count and (
+            not isinstance(raw_paths, (list, tuple)) or len(raw_paths) != file_count
+        ):
+            return f"previous package manifest unavailable: {name}"
+
+    previous_paths = {
+        str(path)
+        for package in previous_packages.values()
+        for path in package.get("path_list", ()) or ()
+    }
+    desired_paths = {
+        str(path)
+        for package in desired_packages.values()
+        for path in package.get("path_list", ()) or ()
+    }
+    for path in sorted(previous_paths - desired_paths):
+        try:
+            await _read_volume_file_async(volume, path)
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # noqa: BLE001 - remote readback is fail-closed
+            return f"unable to verify removed remote path {path}: {type(exc).__name__}"
+        return f"stale remote path remains: {path}"
+
+    candidate_by_path = {
+        path: (size, digest) for path, size, digest in desired.files
+    }
+    for path, (expected_size, expected_digest) in sorted(candidate_by_path.items()):
+        try:
+            data = await _read_volume_file_async(volume, path)
+        except FileNotFoundError:
+            return f"candidate package path is missing remotely: {path}"
+        except Exception as exc:  # noqa: BLE001 - remote readback is fail-closed
+            return f"unable to read candidate remote path {path}: {type(exc).__name__}"
+        actual_digest = hashlib.sha256(data).hexdigest()
+        if len(data) != expected_size or actual_digest != expected_digest:
+            return f"candidate remote content differs: {path}"
+    return None
+
+
 def _is_host_modal_volume(volume: Any) -> bool:
     """Identify a real host-side Modal Volume without importing Modal eagerly."""
     volume_type = type(volume)
@@ -946,6 +1005,15 @@ async def publish_or_skip(
         or readback_content_generation != identity.content_generation
     ):
         return PublicationDecision("publish", "publication_incomplete", identity, result=result)
+    content_mismatch = await _remote_content_mismatch(
+        volume, verified_previous, identity
+    )
+    if content_mismatch is not None:
+        incomplete_result = dict(result) if isinstance(result, Mapping) else {}
+        incomplete_result["remote_content_mismatch"] = content_mismatch
+        return PublicationDecision(
+            "publish", "publication_incomplete", identity, result=incomplete_result
+        )
     receipt = PublicationReceipt.create(
         identity,
         volume_name,

@@ -135,6 +135,11 @@ def _root(tmp_path: Path) -> Path:
 
 
 def _generation_record(volume: FakeVolume, identity) -> None:
+    for path in list(volume.files):
+        if not path.startswith(".comfymodal_control/"):
+            del volume.files[path]
+    for item in collect_semantic_files(identity.source_root):
+        volume.files[item.path] = item.data
     volume.files[GENERATION_RECORD_PATH] = json.dumps({
         "schema_version": 2,
         "content_generation": identity.content_generation,

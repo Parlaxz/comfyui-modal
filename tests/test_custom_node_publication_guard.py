@@ -26,6 +26,7 @@ from tools.v2_control.custom_nodes import (
     RECEIPT_PATH,
     build_source_identity,
     check_publication_safety,
+    collect_semantic_files,
     prepare_publication,
     publish_or_skip,
 )
@@ -83,6 +84,11 @@ def _publishing_fake(volume: FakeVolume, root: Path, calls: list):
     async def publisher(_archive: bytes):
         calls.append(True)
         candidate = build_source_identity(root)
+        for path in list(volume.files):
+            if not path.startswith(".comfymodal_control/"):
+                del volume.files[path]
+        for item in collect_semantic_files(root):
+            volume.files[item.path] = item.data
         volume.files[GENERATION_RECORD_PATH] = json.dumps({
             "schema_version": 2,
             "content_generation": candidate.content_generation,
@@ -90,6 +96,11 @@ def _publishing_fake(volume: FakeVolume, root: Path, calls: list):
         return {"status": "ok", "content_generation": candidate.content_generation}
 
     return publisher
+
+
+def _materialize_candidate(volume: FakeVolume, root: Path) -> None:
+    for item in collect_semantic_files(root):
+        volume.files[item.path] = item.data
 
 
 def _run(root, volume, publisher, **kwargs):
@@ -269,6 +280,34 @@ def test_override_allowed_and_recorded_in_receipt(tmp_path):
     assert check_publication_safety(
         prev_receipt, decision.identity, allow_destructive=True
     )["allowed"] is True
+
+
+def test_override_with_stale_excluded_package_is_incomplete(tmp_path):
+    _write(tmp_path, "ext-stale", {"stale.py": b"old"})
+    previous, _archive, _files = prepare_publication(tmp_path)
+    volume = FakeVolume()
+    _seed(volume, previous)
+    shutil.rmtree(tmp_path / "ext-stale")
+    _write(tmp_path, "ext-stale", {"notes.md": b"excluded by policy"})
+    _write(tmp_path, "ext-current", {"current.py": b"new"})
+
+    async def publisher(_archive: bytes):
+        candidate = build_source_identity(tmp_path)
+        _materialize_candidate(volume, tmp_path)
+        volume.files[GENERATION_RECORD_PATH] = json.dumps({
+            "schema_version": 2,
+            "content_generation": candidate.content_generation,
+        }).encode()
+        return {"status": "ok", "content_generation": candidate.content_generation}
+
+    # Simulate the defective publisher: an excluded package is left behind.
+    volume.files["ext-stale/stale.py"] = b"old"
+    decision = _run(
+        tmp_path, volume, publisher, allow_destructive=True,
+    )
+    assert decision.action == "publish"
+    assert decision.reason == "publication_incomplete"
+    assert "ext-stale/stale.py" in decision.result["remote_content_mismatch"]
 
 
 # (9) blocked publication performs zero remote mutation.
