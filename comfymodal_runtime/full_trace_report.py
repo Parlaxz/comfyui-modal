@@ -1006,29 +1006,35 @@ def _detect_stack_inconsistencies(calls: list[dict[str, Any]]) -> list[dict[str,
     Returns a list of issue dicts with event_index and description.
     """
     issues: list[dict[str, Any]] = []
+    # Index event_index once.  This used to rescan every call for every call --
+    # O(n^2), which on a 1.26M-event Golden request is ~1.6e12 comparisons and
+    # dominated the entire analysis by hours.  First match wins, as before.
+    by_index: dict[Any, dict[str, Any]] = {}
+    for other in calls:
+        ei = other.get("event_index")
+        if ei is not None and ei not in by_index:
+            by_index[ei] = other
     for c in calls:
         pi = c.get("parent_event_index")
-        if pi is not None:
-            found = False
-            for other in calls:
-                if other["event_index"] == pi:
-                    found = True
-                    if (other.get("end_us") is not None
-                            and c.get("start_us") is not None
-                            and other["end_us"] < c["start_us"]):
-                        issues.append({
-                            "event_index": c["event_index"],
-                            "description": (
-                                f"Child {c['name']} starts at {c['start_us']}us "
-                                f"after parent {other['name']} ends at {other['end_us']}us"
-                            ),
-                        })
-                    break
-            if not found:
-                issues.append({
-                    "event_index": c["event_index"],
-                    "description": f"Parent index {pi} not found for {c['name']}",
-                })
+        if pi is None:
+            continue
+        other = by_index.get(pi)
+        if other is None:
+            issues.append({
+                "event_index": c["event_index"],
+                "description": f"Parent index {pi} not found for {c['name']}",
+            })
+            continue
+        if (other.get("end_us") is not None
+                and c.get("start_us") is not None
+                and other["end_us"] < c["start_us"]):
+            issues.append({
+                "event_index": c["event_index"],
+                "description": (
+                    f"Child {c['name']} starts at {c['start_us']}us "
+                    f"after parent {other['name']} ends at {other['end_us']}us"
+                ),
+            })
     return issues
 
 

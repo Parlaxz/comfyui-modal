@@ -1379,6 +1379,25 @@ def _comfyui_root_candidates(here: Path | None) -> list[Path]:
     return uniq
 
 
+#: VizTracer ``min_duration`` floor, in milliseconds.  Tracing every Python call
+#: in a Golden request produced ~1.25M events, which is a ~400 MB JSON trace and
+#: dominates the analysis loop.  A 10us floor drops the sub-frame bookkeeping
+#: noise while preserving every call a human would read in a call tree.
+#: Override with COMFYMODAL_V2_TRACE_MIN_DURATION_MS (0 disables the filter).
+TRACE_MIN_DURATION_MS_DEFAULT = 0.01
+
+
+def _trace_min_duration_ms() -> float:
+    raw = str(os.environ.get("COMFYMODAL_V2_TRACE_MIN_DURATION_MS", "")).strip()
+    if not raw:
+        return TRACE_MIN_DURATION_MS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return TRACE_MIN_DURATION_MS_DEFAULT
+    return value if value >= 0 else TRACE_MIN_DURATION_MS_DEFAULT
+
+
 def _resolve_trace_include_paths() -> dict[str, Any]:
     """Resolve VizTracer include file paths from known project layout.
 
@@ -1980,14 +1999,16 @@ class FullExecutionTraceSession:
                 file_info=True,
                 register_global=True,
                 trace_self=False,
-                min_duration=0,
+                min_duration=_trace_min_duration_ms(),
                 minimize_memory=True,
                 output_file=str(self._base_dir / "raw" / "viztracer.json"),
             )
-            if inc["resolved"]:
-                viz_kwargs["include_files"] = inc["resolved"]
-            else:
-                viz_kwargs["exclude_files"] = inc["excluded"]
+            # Blacklist, never the include_files whitelist -- same reasoning as the
+            # request tracer below. A rejected call increments VizTracer's
+            # thread-local ignore_stack_depth and suppresses every descendant
+            # without re-testing its own filename, so a whitelist that omits
+            # asyncio/threading/concurrent.futures hides whole subtrees.
+            viz_kwargs["exclude_files"] = inc["excluded"]
 
             # Attempt creation with full kwargs; fall back on keyword rejection
             try:
@@ -1997,9 +2018,11 @@ class FullExecutionTraceSession:
                 minimal_kwargs: dict[str, Any] = dict(
                     tracer_entries=entries,
                     max_stack_depth=stack,
+                    # Keep the blacklist on the fallback path too. Falling back
+                    # to the include_files whitelist here would silently
+                    # reinstate the subtree-poisoning this replaced.
+                    exclude_files=inc["excluded"],
                 )
-                if inc["resolved"]:
-                    minimal_kwargs["include_files"] = inc["resolved"]
                 self._viztracer = _VT(**minimal_kwargs)
 
             self._viztracer.start()
@@ -2091,7 +2114,7 @@ class FullExecutionTraceSession:
                 "pid_suffix": False,
                 "ignore_c_function": True,
                 "ignore_frozen": True,
-                "min_duration": 0,
+                "min_duration": _trace_min_duration_ms(),
             }
             # Use a BLACKLIST, never the include_files whitelist.
             #

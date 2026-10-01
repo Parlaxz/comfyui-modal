@@ -1676,3 +1676,26 @@ def test_request_tracing_uses_blacklist_not_include_files():
     excluded = fet._resolve_trace_include_paths()["excluded"]
     for scheduler_frame in ("asyncio", "threading", "concurrent"):
         assert not any(scheduler_frame in e for e in excluded)
+
+
+def test_no_tracer_configures_include_files():
+    """No VizTracer construction may use the whitelist, including fallbacks.
+
+    The session tracer and its TypeError fallback both used include_files after
+    only the request tracer had been converted, so either could silently
+    reinstate the subtree poisoning.
+    """
+    import re
+
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "comfymodal_runtime"
+        / "full_execution_trace.py"
+    ).read_text(encoding="utf-8")
+    offenders = [
+        line.strip()
+        for line in src.splitlines()
+        if re.search(r'\[\s*["\']include_files["\']\s*\]\s*=', line)
+        or re.search(r'\binclude_files\s*=', line)
+    ]
+    assert offenders == []

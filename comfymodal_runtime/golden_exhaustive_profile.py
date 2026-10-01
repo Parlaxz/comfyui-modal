@@ -34,6 +34,9 @@ import gzip
 import io
 import json
 import os
+import sys
+import time
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -721,6 +724,15 @@ def _attach_ambiguous_containment(
         if not call.get("span_ok"):
             continue
         by_context.setdefault(_context_key(call), []).append(call)
+    # Membership per parent bucket.  This used to rescan the parent's existing
+    # children for every call, which is O(n^2) across wide frames -- the root
+    # alone holds hundreds of thousands of children on a 1.26M event request,
+    # and that sweep was costing ~100s.  Seeded from the buckets the explicit
+    # parent_event_index pass already filled, so nothing is attached twice.
+    attached: dict[tuple[Any, Any], set[int]] = {
+        key: {id(existing) for existing in bucket}
+        for key, bucket in children.items()
+    }
     for context_calls in by_context.values():
         context_calls.sort(key=lambda c: (
             float(c["span_start_us"]), -float(c["span_end_us"]),
@@ -741,10 +753,12 @@ def _attach_ambiguous_containment(
             if parent is not None:
                 parent_key = (parent.get("pid"), parent.get("event_index"))
                 call_key = (call.get("pid"), call.get("event_index"))
-                if call_key != parent_key and not any(
-                    existing is call for existing in children.get(parent_key, ())
-                ):
+                seen = attached.get(parent_key)
+                if seen is None:
+                    seen = attached[parent_key] = set()
+                if call_key != parent_key and id(call) not in seen:
                     children.setdefault(parent_key, []).append(call)
+                    seen.add(id(call))
             stack.append(call)
 
 
@@ -1860,6 +1874,120 @@ def blocking_wait_ms(
     return round(_us_to_ms(_union_length(iv) or 0.0) or 0.0, 3)
 
 
+#: Spans longer than this are answered by bisect on their start and end rather
+#: than by the sorted walk, whose prefix-maximum pruning any single long span
+#: defeats. 1ms keeps the "short" side small enough for the pruning to bite
+#: while leaving the bisect side sparse inside any one query window.
+_LONG_SPAN_US = 1000.0
+
+
+def _build_lane_interval_index(
+    calls: Sequence[Mapping[str, Any]],
+) -> dict[
+    tuple[Any, Any],
+    tuple[
+        list[float], list[tuple[float, float]], list[float],
+        list[float], list[tuple[float, float]],
+        list[float], list[tuple[float, float]],
+    ],
+]:
+    """Index every span once, per lane, for fast overlap queries.
+
+    ``blocking_wait_ms`` used to rescan all calls for every call -- O(calls^2).
+    Indexing alone was not enough: pruning the walk with a running maximum of the
+    ends is defeated by any long span, because the root's own span covers the
+    whole request and keeps that maximum above every window, so the walk still
+    ran to index 0 on all 1.26M queries (~10 minutes).
+
+    Each lane is therefore split by duration.  Short spans keep the sorted
+    structure with the prefix-maximum pruning, which works because no short span
+    reaches across the whole request.  Long spans are answered by identity:
+    a span overlaps ``[a, b]`` without containing it exactly when its start lies
+    in ``(a, b)`` or its end lies in ``(a, b)``, so both are a bisect away.
+    """
+    lanes: dict[tuple[Any, Any], list[tuple[float, float]]] = {}
+    for c in calls:
+        if not c.get("span_ok"):
+            continue
+        span = _span(c)
+        if span is None:
+            continue
+        lanes.setdefault((c.get("pid"), c.get("tid")), []).append(span)
+    index: dict[
+        tuple[Any, Any],
+        tuple[
+            list[float], list[tuple[float, float]], list[float],
+            list[float], list[tuple[float, float]],
+            list[float], list[tuple[float, float]],
+        ],
+    ] = {}
+    for key, spans in lanes.items():
+        spans.sort()
+        short = [s for s in spans if (s[1] - s[0]) <= _LONG_SPAN_US]
+        long_spans = [s for s in spans if (s[1] - s[0]) > _LONG_SPAN_US]
+        starts = [s[0] for s in short]
+        prefix_max_end: list[float] = []
+        running = float("-inf")
+        for s in short:
+            if s[1] > running:
+                running = s[1]
+            prefix_max_end.append(running)
+        by_start = sorted(long_spans, key=lambda s: s[0])
+        by_end = sorted(long_spans, key=lambda s: s[1])
+        index[key] = (
+            starts,
+            short,
+            prefix_max_end,
+            [s[0] for s in by_start],
+            by_start,
+            [s[1] for s in by_end],
+            by_end,
+        )
+    return index
+
+
+def _blocking_wait_ms_indexed(
+    call: Mapping[str, Any],
+    index: Mapping[Any, Any],
+) -> float:
+    """Indexed equivalent of :func:`blocking_wait_ms`.
+
+    Same overlap test and same "merely contains the wait" exclusion as the
+    linear scan, so the unioned result is identical.
+    """
+    span = _span(call)
+    if span is None:
+        return 0.0
+    start, end = span
+    own = (call.get("pid"), call.get("tid"))
+    iv: list[tuple[float, float]] = []
+    for key, lane in index.items():
+        if key == own:
+            continue
+        (
+            starts, short, prefix_max_end,
+            long_start_keys, long_by_start,
+            long_end_keys, long_by_end,
+        ) = lane
+        hi = bisect_left(starts, end - 1e-6)
+        j = hi - 1
+        while j >= 0 and prefix_max_end[j] > start + 1e-6:
+            o_start, o_end = short[j]
+            if o_end > start + 1e-6 and o_start < end - 1e-6:
+                if not (o_start <= start + 1e-6 and o_end >= end - 1e-6):
+                    iv.append(short[j])
+            j -= 1
+        lo_i = bisect_right(long_start_keys, start + 1e-6)
+        hi_i = bisect_left(long_start_keys, end - 1e-6)
+        for o in long_by_start[lo_i:hi_i]:
+            iv.append(o)
+        lo_j = bisect_right(long_end_keys, start + 1e-6)
+        hi_j = bisect_left(long_end_keys, end - 1e-6)
+        for o in long_by_end[lo_j:hi_j]:
+            iv.append(o)
+    return round(_us_to_ms(_union_length(iv) or 0.0) or 0.0, 3)
+
+
 def stage_diagnosis(
     *,
     stage: str,
@@ -2374,9 +2502,20 @@ def analyze(
     is :func:`write_artifacts`, so the analysis stays testable without touching
     the filesystem beyond reads.
     """
+    _t0 = time.perf_counter()
+
+    def _lap(label: str) -> None:
+        print(
+            "    [gep.analyze] %s elapsed_s=%.1f"
+            % (label, time.perf_counter() - _t0),
+            flush=True,
+        )
+
     session_dir = Path(session_dir)
+    _lap("ENTER session=%s" % (session_dir,))
     config = dict(trace_config or {})
     processes = discover_process_traces(session_dir, trace_config=config)
+    _lap("discover_process_traces processes=%d" % len(processes))
     clock_alignment = calibrate_clocks(processes)
 
     registry: dict[str, Any] = {}
@@ -2389,14 +2528,21 @@ def analyze(
     for process in processes:
         thread_names.update(process.thread_names)
 
+    _lap("parent_calls=%s" % (
+        len(parent_calls) if parent_calls is not None else "none",
+    ))
     calls = build_exhaustive_calls(
         processes,
         parent_calls=list(parent_calls) if parent_calls is not None else None,
     )
+    _lap("build_exhaustive_calls calls=%d" % len(calls))
     children = _children_map(calls)
+    _lap("_children_map")
     annotate_exclusive_time(calls, children)
+    _lap("annotate_exclusive_time")
 
     root_selection = select_authoritative_root(calls)
+    _lap("select_authoritative_root")
     root = root_selection.get("root")
     if root is not None:
         # The process that actually owns the authoritative Golden root is the
@@ -2413,7 +2559,9 @@ def analyze(
         processes, registry=registry, thread_names=thread_names,
     )
     lanes = build_lanes(calls, thread_names)
+    _lap("build_lanes")
     thread_coverage = assess_thread_coverage(processes, lanes)
+    _lap("assess_thread_coverage")
 
     threshold = visual_threshold_ms(env)
     profile: dict[str, Any] = {
@@ -2514,14 +2662,39 @@ def analyze(
         return profile
 
     descendants = resolve_descendants(root, calls, children)
+    _lap("resolve_descendants descendants=%d" % len(descendants))
     observed_stages = sorted({
         _basename(c.get("name")) for c in descendants
         if _basename(c.get("name")) in CANONICAL_STAGE_ORDER
     })
+    _lap("observed_stages=%s" % (",".join(observed_stages) or "none"))
     required = required_stages(config)
 
+    # Index calls by (pid, tid) once.  The per-stage ownership scan below walked
+    # every call for every stage -- O(stages x calls), with a span computation per
+    # candidate, which is ~15M iterations on a 1.25M-event request and dominated
+    # the entire analysis.  Bucketing by the very same (pid, tid) key that scan
+    # already tested makes it O(calls + stages) with identical results.
+    calls_by_ctx: dict[tuple[Any, Any], list[Mapping[str, Any]]] = {}
+    for _call in calls:
+        calls_by_ctx.setdefault(
+            (_call.get("pid"), _call.get("tid")), []
+        ).append(_call)
+
     stage_records: list[dict[str, Any]] = []
+    _analyze_stage_t0 = time.perf_counter()
     for stage in CANONICAL_STAGE_ORDER:
+        if stage not in observed_stages:
+            continue
+        # Heartbeat per canonical stage.  This loop is where the analysis spends
+        # its time, and it used to emit nothing at all between "normalized
+        # calls" and "analyzed", so a multi-minute stall looked identical to a
+        # hang.  The delta between consecutive lines is the previous stage's cost.
+        print(
+            "    [gep.analyze] stage=%s elapsed_s=%.1f"
+            % (stage, time.perf_counter() - _analyze_stage_t0),
+            flush=True,
+        )
         if stage not in observed_stages:
             continue
         resolved = resolve_stage(stage, descendants, root)
@@ -2546,10 +2719,8 @@ def analyze(
         # stage body runs on a different thread than the root.
         stage_ctx = (stage_call.get("pid"), stage_call.get("tid"))
         owner_calls: list[Mapping[str, Any]] = []
-        for candidate in calls:
+        for candidate in calls_by_ctx.get(stage_ctx, ()):
             if not candidate.get("span_ok"):
-                continue
-            if (candidate.get("pid"), candidate.get("tid")) != stage_ctx:
                 continue
             span = _span(candidate)
             if span is None:
@@ -2649,9 +2820,12 @@ def analyze(
     root_wall_ms = (
         _us_to_ms(root_span[1] - root_span[0]) if root_span else None
     )
+    _lap("post_loop_enter")
     root_subtree = resolve_descendants(root, calls, children)
+    _lap("resolve_descendants(root) n=%d" % len(root_subtree))
     root_children = children.get((root.get("pid"), root.get("event_index")), ())
     root_functions = aggregate_functions(root_subtree, wall_ms=root_wall_ms)
+    _lap("aggregate_functions")
 
     # Request-level bubbles use the same definition as the per-stage ones, over
     # the root's own wall, so Section 5 is comparable with Section 4.
@@ -2677,12 +2851,26 @@ def analyze(
     # task has no same-thread children for the duration, so plain
     # `wall - child_union` charges the whole wait to its own self time and reads
     # as CPU burn. Recorded per call so every table can show both.
+    _lap("analyze_bubbles(root)")
+    # Split every call's self time into real self time and time spent blocked on
+    # another lane. A frame that waits on a pipe, a volume read or a sibling
+    # task has no same-thread children for the duration, so plain
+    # `wall - child_union` charges the whole wait to its own self time and reads
+    # as CPU burn. Recorded per call so every table can show both.
+    #
+    # blocking_wait_ms() scans every call looking for overlapping intervals on
+    # other lanes, so this loop is O(calls^2) -- ~1.6e12 iterations on a 1.26M
+    # event request. The per-lane index answers the same question without it.
+    _lane_interval_index = _build_lane_interval_index(calls)
     for call in calls:
-        call["blocking_wait_ms"] = blocking_wait_ms(call, calls)
+        call["blocking_wait_ms"] = _blocking_wait_ms_indexed(
+            call, _lane_interval_index,
+        )
         self_ms = _safe_float(call.get("exclusive_self_ms")) or 0.0
         call["self_after_blocking_ms"] = round(
             max(0.0, self_ms - float(call["blocking_wait_ms"])), 3,
         )
+    _lap("blocking_wait n=%d" % len(calls))
 
     profile.update({
         "root": {
