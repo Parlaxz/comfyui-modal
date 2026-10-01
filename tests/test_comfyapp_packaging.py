@@ -85,15 +85,18 @@ class ComfyAppPackagingTests(unittest.TestCase):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("/root/comfy-build/custom_node_requirements", source)
 
-    def test_image_uses_combined_requirements_add_local_dir(self):
+    def test_image_uses_per_node_requirements_add_local_dir(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
         self.assertIn("_LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR", source)
-        self.assertNotIn("_custom_node_requirements_context_dir(_node_name)", source)
+        self.assertIn("_add_custom_node_requirement_layers", source)
+        self.assertIn("_custom_node_requirement_context_hash", source)
 
-    def test_image_uses_monolithic_requirements_install_loop(self):
+    def test_image_uses_independent_requirements_install_layers(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")
-        self.assertIn("_pip_node", source)
-        self.assertIn('for d in /root/comfy-build/custom_node_requirements/*/; do', source)
+        self.assertNotIn("_pip_node", source)
+        self.assertNotIn('for d in /root/comfy-build/custom_node_requirements/*/; do', source)
+        self.assertIn("CUSTOM_NODE_PREREQ_UNSATISFIED node=", source)
+        self.assertIn("force_build=True", source)
 
     def test_image_uses_per_node_add_local_dir_not_monolithic(self):
         source = COMFYAPP_PATH.read_text(encoding="utf-8")

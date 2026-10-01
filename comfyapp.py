@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -7430,7 +7431,7 @@ _V2_DEPENDENCY_CACHE_IDENTITY_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     _V2_DEPENDENCY_CACHE_IDENTITY_FILENAME,
 )
-_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-loop-v2"
+_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-per-node-v3"
 _V2_DEPENDENCY_BASE_INPUTS = {
     "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
     "python": "3.11",
@@ -8349,50 +8350,391 @@ _FIRST_PARTY_SOURCE_FILE_COUNT, _FIRST_PARTY_SOURCE_BYTES = (
     _prepare_first_party_source_build_context()
 )
 
-# Combined requirements layer: one COPY + one pip loop (single cache unit).
-# When no requirements.txt changes, the layer is cached (~5s deploy).
-# Changed requirements cause all pip installs to re-run within this layer.
+# Custom-node requirements are copied and installed one node at a time.  The
+# staged context is deliberately split here as well as in the shell commands:
+# a changed node must not invalidate an unchanged node's parent layer.
+def _staged_custom_node_requirement_names(requirements_root: str) -> tuple[str, ...]:
+    """Return deterministic staged node names that have requirements.txt."""
+    return tuple(
+        node_name
+        for node_name in _iter_syncable_custom_node_dirs(requirements_root)
+        if os.path.isfile(
+            os.path.join(requirements_root, node_name, "requirements.txt")
+        )
+    )
+
+
+def _custom_node_requirement_context_hash(context_dir: str) -> str:
+    """Hash only the canonical staged dependency context for one node."""
+    return stable_hash(_build_requirements_context_manifest(context_dir))
+
+
+def _custom_node_install_command(node_name: str, context_hash: str) -> str:
+    """Build a deterministic, fail-closed install command for one node."""
+    # The destination is an image path and the node name is the stable
+    # published directory name; no host path is embedded in this command.
+    node_path = shlex.quote(node_name)
+    return (
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        f'_req_root="/root/comfy-build/custom_node_requirements"; '
+        f'echo "CUSTOM_NODE_PREREQ_INSTALL node={node_name} '
+        f'context_sha256={context_hash}"; '
+        f'cd "$_req_root"/{node_path} && '
+        'python -m pip install --disable-pip-version-check --no-input '
+        '-r requirements.txt -c "$_lock" --quiet 2>&1 || '
+        '{ echo "CUSTOM_NODE_PREREQ_FAILED"; exit 1; }'
+    )
+
+
+_CUSTOM_NODE_PREREQ_CHECK_PROGRAM = r"""
+_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*([^,\s]+)(?:\s*,\s*(.*))?$")
+_VERSION_RE = re.compile(
+    r"^[vV]?(\d+(?:\.\d+)*)(?:(a|alpha|b|beta|rc|c|pre|preview)(\d*))?"
+    r"(?:\.post(\d+))?(?:\.dev(\d+))?(?:\+([0-9A-Za-z.-]+))?$"
+)
+_MARKER_RE = re.compile(
+    r"^(sys_platform|platform_system|python_version|python_full_version|"
+    r"implementation_name)\s*(==|!=|in|not in)\s*(['\"])(.*?)\3$"
+)
+
+
+def _version_key(value):
+    match = _VERSION_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    release = tuple(int(part) for part in match.group(1).split("."))
+    release = release + (0,) * (4 - len(release))
+    stage_name, stage_number = match.group(2), int(match.group(3) or 0)
+    if stage_name is None:
+        stage = 3
+    elif stage_name in ("a", "alpha"):
+        stage = 0
+    elif stage_name in ("b", "beta"):
+        stage = 1
+    elif stage_name in ("rc", "c", "pre", "preview"):
+        stage = 2
+    else:
+        stage = 3
+    post = int(match.group(4) or 0)
+    dev = int(match.group(5) or 0)
+    return release, stage, stage_number, post, dev
+
+
+def _split_specifiers(specifiers):
+    if not specifiers:
+        return []
+    parts = []
+    remainder = specifiers
+    while remainder:
+        match = _SPEC_RE.match(remainder)
+        if not match:
+            return None
+        parts.append((match.group(1), match.group(2)))
+        remainder = match.group(3) or ""
+    return parts
+
+
+def _satisfies(installed, specifiers):
+    parts = _split_specifiers(specifiers)
+    if parts is None:
+        return None
+    if not parts:
+        return bool(installed)
+    installed_key = _version_key(installed)
+    if installed_key is None:
+        return None
+    for operator, expected in parts:
+        if operator == "===":
+            satisfied = installed == expected
+        else:
+            wildcard = expected.endswith(".*")
+            expected_base = expected[:-2] if wildcard else expected
+            expected_key = _version_key(expected_base)
+            if expected_key is None:
+                return None
+            if operator in ("==", "!=") and wildcard:
+                prefix = expected_base.split(".")
+                actual_prefix = installed.lstrip("vV").split(".")[: len(prefix)]
+                satisfied = actual_prefix == prefix
+                if operator == "!=":
+                    satisfied = not satisfied
+            elif operator == "==":
+                satisfied = installed_key == expected_key
+            elif operator == "!=":
+                satisfied = installed_key != expected_key
+            elif operator == ">=":
+                satisfied = installed_key >= expected_key
+            elif operator == "<=":
+                satisfied = installed_key <= expected_key
+            elif operator == ">":
+                satisfied = installed_key > expected_key
+            elif operator == "<":
+                satisfied = installed_key < expected_key
+            elif operator == "~=":
+                expected_parts = tuple(int(part) for part in expected_base.split("."))
+                upper_parts = list(expected_parts)
+                upper_index = max(0, len(upper_parts) - 2)
+                upper_parts[upper_index] += 1
+                upper_parts = upper_parts[: upper_index + 1]
+                upper_key = _version_key(".".join(str(part) for part in upper_parts))
+                satisfied = installed_key >= expected_key and installed_key < upper_key
+            else:
+                return None
+        if not satisfied:
+            return False
+    return True
+
+
+def _marker_applies(marker):
+    if not marker:
+        return True
+    if " and " in marker or " or " in marker:
+        return None
+    match = _MARKER_RE.fullmatch(marker.strip())
+    if not match:
+        return None
+    key, operator, _, expected = match.groups()
+    values = {
+        "sys_platform": sys.platform,
+        "platform_system": __import__("platform").system(),
+        "python_version": ".".join(str(part) for part in sys.version_info[:2]),
+        "python_full_version": ".".join(str(part) for part in sys.version_info[:3]),
+        "implementation_name": __import__("platform").python_implementation().lower(),
+    }
+    actual = values[key]
+    if operator == "==":
+        return actual == expected
+    if operator == "!=":
+        return actual != expected
+    if operator == "in":
+        return actual in expected
+    if operator == "not in":
+        return actual not in expected
+    return None
+
+
+def _parse_requirement(raw):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return "skip", None, None
+    line = line.split(" #", 1)[0].strip()
+    if not line:
+        return "skip", None, None
+    if line.startswith("-e ") or line.startswith("--editable"):
+        return "unchecked", line, "editable"
+    if line.startswith("-"):
+        return "skip", None, None
+    if line.startswith(("git+", "hg+", "svn+", "bzr+", "http://", "https://", "file:")):
+        return "unchecked", line, "vcs_or_url"
+    if line.startswith(("./", "../", "/", "~/")) or " @ " in line:
+        return "unchecked", line, "path_or_direct_url"
+    requirement, _, marker = line.partition(";")
+    match = _NAME_RE.match(requirement.strip())
+    if not match:
+        return "unchecked", line, "unparseable"
+    name = match.group(0)
+    remainder = requirement.strip()[match.end() :].strip()
+    if remainder.startswith("["):
+        end = remainder.find("]")
+        if end < 0:
+            return "unchecked", line, "unparseable"
+        remainder = remainder[end + 1 :].strip()
+    if remainder and remainder[0] not in "<>!=~":
+        return "unchecked", line, "unparseable"
+    applies = _marker_applies(marker.strip())
+    if applies is None:
+        return "unchecked", line, "unsupported_marker"
+    if not applies:
+        return "conditional_skip", None, None
+    return "check", (name, remainder, line), None
+
+
+def check_requirement_lines(lines, version_lookup):
+    checked = []
+    unsatisfied = []
+    unchecked = []
+    for raw in lines:
+        status, parsed, reason = _parse_requirement(raw)
+        if status in ("skip", "conditional_skip"):
+            continue
+        if status == "unchecked":
+            unchecked.append({
+                "req": parsed,
+                "reason": reason,
+                "fatal": reason not in ("editable", "vcs_or_url", "path_or_direct_url"),
+            })
+            continue
+        name, specifiers, requirement = parsed
+        try:
+            installed = version_lookup(name)
+        except Exception as exc:
+            if exc.__class__.__name__ == "PackageNotFoundError":
+                installed = None
+            else:
+                unchecked.append({"req": requirement, "reason": "metadata_error", "fatal": True})
+                continue
+        if installed is None:
+            unsatisfied.append({"req": requirement, "installed": None})
+            continue
+        satisfied = _satisfies(installed, specifiers)
+        if satisfied is None:
+            unchecked.append({"req": requirement, "reason": "unsupported_specifier", "fatal": True})
+        elif satisfied:
+            checked.append({"req": requirement, "installed": installed})
+        else:
+            unsatisfied.append({"req": requirement, "installed": installed})
+    return {
+        "checked": sorted(checked, key=lambda item: item["req"]),
+        "unsatisfied": sorted(unsatisfied, key=lambda item: item["req"]),
+        "unchecked": sorted(unchecked, key=lambda item: item["req"]),
+    }
+
+
+def verify_nodes(node_requirements, version_lookup):
+    return [
+        (node, check_requirement_lines(node_requirements[node], version_lookup))
+        for node in sorted(node_requirements)
+    ]
+
+
+def render_results(results):
+    output = []
+    for node, result in results:
+        for item in result["unsatisfied"]:
+            installed = item["installed"] or "missing"
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNSATISFIED node={node} req={item['req']} installed={installed}"
+            )
+        for item in result["unchecked"]:
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNCHECKED node={node} req={item['req']} "
+                f"reason={item['reason']} fatal={int(item['fatal'])}"
+            )
+        marker = "CUSTOM_NODE_PREREQ_PASSED"
+        if result["unsatisfied"] or any(item["fatal"] for item in result["unchecked"]):
+            marker = "CUSTOM_NODE_PREREQ_FAILED"
+        output.append(
+            f"{marker} node={node} checked={len(result['checked'])} "
+            f"unchecked={len(result['unchecked'])} unsatisfied={len(result['unsatisfied'])}"
+        )
+    checked = sum(len(result["checked"]) for _, result in results)
+    unchecked = sum(len(result["unchecked"]) for _, result in results)
+    unsatisfied = sum(len(result["unsatisfied"]) for _, result in results)
+    output.append(
+        f"CUSTOM_NODE_PREREQ_SUMMARY nodes={len(results)} checked={checked} "
+        f"unchecked={unchecked} unsatisfied={unsatisfied}"
+    )
+    return "\n".join(output)
+
+
+def results_ok(results):
+    return not any(
+        result["unsatisfied"]
+        or any(item["fatal"] for item in result["unchecked"])
+        for _, result in results
+    )
+""".strip()
+
+
+def _custom_node_verification_command(node_names: tuple[str, ...]) -> str:
+    """Build the uncached final-environment requirement verification layer."""
+    # This preserves the false-positive guarantee: every checkable requirement
+    # is compared with the installed distribution's version, so no requirement
+    # is left unsatisfied in the final environment.  Re-resolving the graph
+    # would only repeat work for installed candidates (already checked here) or
+    # require a network install, which this layer does not permit.  A cached
+    # install layer can only be absent or wrong-version, and this catches both.
+    command = 'python3 << "PYEOF"\n'
+    if not node_names:
+        return command + 'print("CUSTOM_NODE_PREREQ_VERIFY no_requirements")\nPYEOF\n'
+    command += (
+        'import importlib.metadata as metadata\n'
+        'import os\n'
+        'import re\n'
+        'import sys\n'
+        f'ROOT = {json.dumps("/root/comfy-build/custom_node_requirements")}\n'
+        f'NODES = {json.dumps(sorted(node_names))}\n'
+        + _CUSTOM_NODE_PREREQ_CHECK_PROGRAM
+        + '\n'
+        'results = verify_nodes(\n'
+        '    {node: open(os.path.join(ROOT, node, "requirements.txt"), encoding="utf-8").read().splitlines() for node in NODES},\n'
+        '    metadata.version,\n'
+        ')\n'
+        'print(render_results(results))\n'
+        'if not results_ok(results):\n'
+        '    raise SystemExit(1)\n'
+        'PYEOF\n'
+    )
+    return command
+
+
+def _add_custom_node_requirement_layers(
+    image: Any, requirements_root: str
+) -> tuple[Any, tuple[str, ...]]:
+    """Add one cached install layer per staged node."""
+    node_names = _staged_custom_node_requirement_names(requirements_root)
+    for node_name in node_names:
+        context_dir = os.path.join(requirements_root, node_name)
+        image = image.add_local_dir(
+            context_dir,
+            f"/root/comfy-build/custom_node_requirements/{node_name}",
+            copy=True,
+        ).run_commands(
+            _custom_node_install_command(
+                node_name,
+                _custom_node_requirement_context_hash(context_dir),
+            )
+        )
+
+    return image, node_names
+
+
+def _add_custom_node_verification_layer(
+    image: Any, node_names: tuple[str, ...]
+) -> Any:
+    """Add the forced check after all dependency/image layers are complete."""
+    # This is deliberately the final image layer.  It checks the assembled
+    # environment even when an earlier per-node install layer was cached,
+    # without forcing any expensive descendant layer to rebuild.
+    return image.run_commands(
+        _custom_node_verification_command(node_names),
+        force_build=True,
+    )
+
+
 # Only runs during local deploy. Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _image_base = _image_base.add_local_file(
         _CACHEDIT_LOCK_SRC,
         _CACHEDIT_LOCK_DST,
         copy=True,
-    ).add_local_dir(
-        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
-        "/root/comfy-build/custom_node_requirements",
-        copy=True,
-    ).run_commands(
+    )
+    _image_base = _image_base.run_commands(
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CUSTOM_NODE_PREREQ_INSTALL_START"; '
+        'echo "CUSTOM_NODE_PREREQ_CONTEXT_READY"'
+    )
+    _image_base, _V2_CUSTOM_NODE_REQUIREMENT_NAMES = _add_custom_node_requirement_layers(
+        _image_base,
+        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    )
+
+    # CacheDiT final family reinstall (after all custom-node reqs).
+    _image_base = _image_base.run_commands(
         '__ts_ms() { python3 -c "import time; print(int(time.time()*1000))"; }; '
-        '_lock="' + _CACHEDIT_LOCK_DST + '"; '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_START ts_ms=$(__ts_ms)"; '
-        '_total_req=0; _total_installed=0; _total_skipped=0; '
-        '_pip_node() { local d="$1"; '
-        '  local name; name=$(basename "$d"); '
-        '  [ -f "$d/requirements.txt" ] || { _total_skipped=$((_total_skipped+1)); return 0; }; '
-        '  _total_req=$((_total_req+1)); '
-        '  local t0; t0=$(__ts_ms); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-         '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet 2>&1 || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
-        '  local t1; t1=$(__ts_ms); '
-        '  local dur; dur=$((t1 - t0)); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
-        '  _total_installed=$((_total_installed+1)); '
-        '}; '
-        'for d in /root/comfy-build/custom_node_requirements/*/; do '
-        '  _pip_node "$d" || exit 1; '
-        'done; '
-        '_end_ts=$(__ts_ms); '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
-        # CacheDiT final family reinstall (after all custom-node reqs)
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_START ts_ms=$(__ts_ms)"; '
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
-         'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet 2>&1 || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
-        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
-        # CacheDiT image-build import gate
-        # Override compiler cache envs to /tmp paths — the image env sets
-        # TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache,
-        # so imports during the gate would create content under the future
-        # volume mount point and cause "cannot mount volume on non-empty path".
+        'python -m pip install --disable-pip-version-check --no-input --no-deps '
+        '-r "$_lock" --quiet 2>&1 || '
+        '{ echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
+        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"'
+    )
+
+    # CacheDiT image-build import gate.  Override compiler cache envs to /tmp
+    # paths so the gate cannot populate the future volume mount point.
+    _image_base = _image_base.run_commands(
         'export TORCHINDUCTOR_CACHE_DIR=/tmp/build_gate_inductor_cache; '
         'export TRITON_CACHE_DIR=/tmp/build_gate_triton_cache; '
         'python3 << "PYEOF"\n'
@@ -8858,6 +9200,9 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
         ).env({
             _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
         })
+    source = _add_custom_node_verification_layer(
+        source, _V2_CUSTOM_NODE_REQUIREMENT_NAMES
+    )
     return CanonicalImagePlan(
         foundation=_FOUNDATION_IMAGE,
         third_party_dependency_environment=_THIRD_PARTY_DEPENDENCY_IMAGE,
