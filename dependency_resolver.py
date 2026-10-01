@@ -9,13 +9,16 @@ states and every public method is guarded so it never raises.
 from __future__ import annotations
 
 import re
+import math
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from custom_node_registry import CustomNodeDiscovery, CustomNodeRegistryStore
 from model_manifest import WORKFLOW_ROLE_FOLDERS
 from model_library import ModelLibraryStore, record_is_installed
+import remote_inventory
 from studio_store import StudioStoreError
+from workflow_dependency_overrides import DependencyOverrideStore
 from workflow_metadata import (
     extract_ui_graph_model_refs,
     extract_workflow_model_refs,
@@ -448,6 +451,111 @@ def _basename_of_ref(filename: str) -> str:
     return filename.replace("\\", "/").rsplit("/", 1)[-1]
 
 
+class _RemoteInventory:
+    """Small normalized lookup over one raw volume-status payload."""
+
+    def __init__(self, payload: Any) -> None:
+        self.models: dict[str, list[dict[str, Any]]] = {}
+        self.custom_node_dirs: set[str] = set()
+        if not isinstance(payload, dict):
+            return
+        for entry in payload.get("models") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            folder = entry.get("folder")
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(folder, str):
+                folder = ""
+            model = {"name": name, "folder": folder, "size": entry.get("size")}
+            self.models.setdefault(_basename_of_ref(name).casefold(), []).append(model)
+        for name in payload.get("custom_nodes") or []:
+            if isinstance(name, str) and name:
+                self.custom_node_dirs.add(name.casefold())
+
+    @staticmethod
+    def _has_content(model: dict[str, Any]) -> bool:
+        size = model.get("size")
+        if not isinstance(size, (int, float)) or isinstance(size, bool):
+            return False
+        try:
+            return math.isfinite(size) and size > 0
+        except (OverflowError, TypeError, ValueError):
+            return False
+
+    def model_for(
+        self, role: str, filename: str, preferred_folder: Any = ""
+    ) -> dict[str, Any] | None:
+        candidates = self.models.get(_basename_of_ref(filename).casefold(), [])
+        if not candidates:
+            return None
+        preferred = str(preferred_folder or "").casefold()
+        if preferred:
+            for model in candidates:
+                if str(model.get("folder") or "").casefold() == preferred:
+                    return model
+        aliases = _role_alias_folders(role)
+        if aliases:
+            for model in candidates:
+                if str(model.get("folder") or "").casefold() in aliases:
+                    return model
+        return candidates[0]
+
+    def model_available(self, model: dict[str, Any]) -> bool:
+        return self._has_content(model)
+
+
+def _remote_lookup(remote: Any) -> _RemoteInventory | None:
+    if remote is None:
+        return None
+    if isinstance(remote, _RemoteInventory):
+        return remote
+    return _RemoteInventory(remote)
+
+
+def _apply_remote_model(
+    row: dict[str, Any],
+    remote: _RemoteInventory | None,
+    role: str,
+    filename: str,
+) -> None:
+    if remote is None:
+        return
+    match = remote.model_for(role, filename, row.get("folder"))
+    if match is None:
+        return
+    available = remote.model_available(match)
+    row["remote_model"] = dict(match)
+    row["remote_available"] = available
+    if available:
+        row["state"] = "installed"
+        row["installed"] = True
+        if "required_hash" in row:
+            row["required_hash"] = None
+
+
+def _pack_directory_name(row: dict[str, Any]) -> str:
+    """Return the physical custom-node directory name used by the volume join."""
+    for field in ("install_path", "cnr_id", "aux_id", "repository_url"):
+        value = _identity_text(row.get(field)).replace("\\", "/").rstrip("/")
+        if value:
+            return value.rsplit("/", 1)[-1]
+    return ""
+
+
+def _apply_remote_custom_nodes(
+    rows: list[dict[str, Any]], remote: _RemoteInventory | None
+) -> list[dict[str, Any]]:
+    """Apply positive remote pack evidence without treating absence as missing."""
+    if remote is None:
+        return rows
+    for row in rows:
+        if _pack_directory_name(row).casefold() in remote.custom_node_dirs:
+            row["state"] = "installed"
+    return rows
+
+
 class DependencyResolver:
     """Resolve the model + custom-node dependencies declared by a version."""
 
@@ -457,6 +565,7 @@ class DependencyResolver:
         self._models = ModelLibraryStore(self.library_root)
         self._registry = CustomNodeRegistryStore(self.library_root)
         self._node_discovery = CustomNodeDiscovery(self.library_root)
+        self._overrides = DependencyOverrideStore(self.library_root)
         self._discovery_cache: Optional[tuple[list, set[str]]] = None
 
     # ── model refs ────────────────────────────────────────────────────────
@@ -487,11 +596,22 @@ class DependencyResolver:
                             "filename": filename,
                         }
         prompt = (version or {}).get("executable_prompt") or {}
+        # A stack entry that no live reference backs is not on the critical
+        # path. Captures taken before disabled nodes were skipped recorded such
+        # entries, so classify here from the persisted graph rather than
+        # re-capturing: a muted/bypassed node is off, and only an active node can
+        # make a model essential. The executable prompt is the primary active
+        # source (ComfyUI drops disabled nodes from it); active UI graph nodes
+        # contribute the custom-loader widgets the prompt cannot name. The
+        # stored model_stack is deliberately NOT an active source — it is the
+        # thing being classified.
+        active: set[str] = set()
         if isinstance(prompt, dict):
             for ref in extract_workflow_model_refs(prompt):
                 role = str(ref.get("role", ""))
                 filename = ref.get("filename")
                 if isinstance(filename, str) and filename:
+                    active.add(filename)
                     refs[(role, filename)] = {"role": role, "filename": filename}
         # Older persisted versions predate graph-widget extraction; recover any
         # model refs their stored UI graph recorded by name (same guards).
@@ -500,9 +620,41 @@ class DependencyResolver:
                 role = str(ref.get("role", ""))
                 filename = ref.get("filename")
                 if isinstance(filename, str) and filename:
+                    active.add(filename)
                     refs.setdefault(
                         (role, filename), {"role": role, "filename": filename}
                     )
+        # A filename carried under two roles is one physical model seen twice;
+        # never demote it on the strength of the weaker role's reference.
+        roles_by_filename: dict[str, set[str]] = {}
+        for (role, filename) in refs:
+            if role != "__non_str__" and isinstance(filename, str):
+                roles_by_filename.setdefault(filename, set()).add(role)
+        # A dependency the user explicitly marked unnecessary stays unnecessary
+        # even when a live node names it; that decision belongs to them, not to
+        # the graph. Versions stay immutable, so this lives beside them.
+        overrides = self._overrides.keys_for(
+            str((version or {}).get("workflow_id") or "")
+        )
+        for (role, _key_name), ref in refs.items():
+            # The dict KEY carries the "__non_str__" sentinel, but the ref's own
+            # filename holds the real (non-string) value. Judge the ref, never the
+            # key: a model we could not even name must stay a blocking "unknown",
+            # not be demoted to advisory for want of a reference.
+            value = ref.get("filename")
+            if role == "__non_str__" or not isinstance(value, str) or not value:
+                continue
+            if f"{role}|{value}" in overrides:
+                # The user called it unnecessary. Wins over detection, and is
+                # reported as a deliberate choice so the UI can say so.
+                ref["nonessential"] = True
+                ref["nonessential_source"] = "user"
+                continue
+            if len(roles_by_filename.get(value, ())) > 1:
+                continue
+            if value not in active:
+                ref["nonessential"] = True
+                ref["nonessential_source"] = "no_active_reference"
         return list(refs.values())
 
     @staticmethod
@@ -539,19 +691,33 @@ class DependencyResolver:
                 records = preferred
         return records
 
-    def resolve_model_refs(self, version: dict[str, Any]) -> list[dict[str, Any]]:
+    def resolve_model_refs(
+        self,
+        version: dict[str, Any],
+        remote: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """Resolve each model ref to installed / missing / wrong_version / unknown."""
+        remote_lookup = _remote_lookup(remote)
+        refs = self._model_refs(version)
+        # Nonessential is a property of the REFERENCE, not of how a row happens to
+        # resolve. Applying it per-branch silently dropped it for every model that
+        # has a library record, so it is resolved once here and stamped onto each
+        # row below regardless of which branch produced it.
+        nonessential = {
+            f"{r.get('role')}|{r.get('filename')}": r.get("nonessential_source")
+            for r in refs
+            if r.get("nonessential")
+        }
         dependency_metadata = (version or {}).get("dependency_metadata") or {}
         required_models = dependency_metadata.get("required_models") or {}
         if not isinstance(required_models, dict):
             required_models = {}
         results: list[dict[str, Any]] = []
-        for ref in self._model_refs(version):
+        for ref in refs:
             role = ref.get("role", "")
             filename = ref.get("filename")
             if not isinstance(filename, str) or not filename:
-                results.append(
-                    {
+                row = {
                         "key": f"{role}|{filename}",
                         "role": role,
                         "filename": str(filename),
@@ -564,13 +730,12 @@ class DependencyResolver:
                         "source_urls": [],
                         "installed": False,
                     }
-                )
+                results.append(row)
                 continue
             try:
                 records = self._records_for_ref(role, filename)
             except (StudioStoreError, OSError):
-                results.append(
-                    {
+                row = {
                         "key": f"{role}|{filename}",
                         "role": role,
                         "filename": str(filename),
@@ -584,7 +749,8 @@ class DependencyResolver:
                         "installed": False,
                         "reason": "library store unreadable",
                     }
-                )
+                _apply_remote_model(row, remote_lookup, role, filename)
+                results.append(row)
                 continue
             installed_records = [r for r in records if record_is_installed(r)]
             req_hash = required_models.get(filename)
@@ -594,8 +760,7 @@ class DependencyResolver:
                 required_hash = req_hash if isinstance(req_hash, str) else ""
                 if required_hash and rec.get("hash") != required_hash:
                     state = "wrong_version"
-                results.append(
-                    {
+                row = {
                         "key": f"{role}|{filename}",
                         "role": role,
                         "filename": filename,
@@ -609,12 +774,12 @@ class DependencyResolver:
                         "installed": True,
                         "required_hash": required_hash if state == "wrong_version" else None,
                     }
-                )
+                _apply_remote_model(row, remote_lookup, role, filename)
+                results.append(row)
                 continue
             if records:
                 rec = self._most_recent(records)
-                results.append(
-                    {
+                row = {
                         "key": f"{role}|{filename}",
                         "role": role,
                         "filename": filename,
@@ -627,10 +792,10 @@ class DependencyResolver:
                         "source_urls": list(rec.get("source_urls") or []),
                         "installed": False,
                     }
-                )
+                _apply_remote_model(row, remote_lookup, role, filename)
+                results.append(row)
                 continue
-            results.append(
-                {
+            row = {
                     "key": f"{role}|{filename}",
                     "role": role,
                     "filename": filename,
@@ -643,10 +808,21 @@ class DependencyResolver:
                     "source_urls": [],
                     "installed": False,
                 }
-            )
+            _apply_remote_model(row, remote_lookup, role, filename)
+            results.append(row)
+        for row in results:
+            source = nonessential.get(str(row.get("key") or ""))
+            if source:
+                row["nonessential"] = True
+                row["nonessential_source"] = source
         return results
 
     # ── custom node resolution ────────────────────────────────────────────
+
+    @property
+    def overrides(self) -> DependencyOverrideStore:
+        """Store of user-declared nonessential dependencies, per workflow."""
+        return self._overrides
 
     def _ensure_discovery(self) -> tuple[list, set[str]]:
         if self._discovery_cache is None:
@@ -654,12 +830,17 @@ class DependencyResolver:
             self._discovery_cache = (records, core)
         return self._discovery_cache
 
-    def resolve_custom_nodes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
+    def resolve_custom_nodes(
+        self,
+        version: dict[str, Any],
+        remote: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """Resolve required node classes, grouped one row per pack.
 
         Graph artifacts (non-identifier class strings) are excluded here
         and reported via unresolvable_classes instead.
         """
+        remote_lookup = _remote_lookup(remote)
         dependency_metadata = (version or {}).get("dependency_metadata") or {}
         # Union declared classes with the stored graph node types so UI-only
         # nodes and covers from old captures (predating the metadata union)
@@ -777,7 +958,7 @@ class DependencyResolver:
                     "classes": [cls],
                 }
             )
-        return _group_node_rows(results)
+        return _apply_remote_custom_nodes(_group_node_rows(results), remote_lookup)
 
     def unresolvable_classes(self, version: dict[str, Any]) -> list[dict[str, Any]]:
         """Class strings that can never resolve to a pack.
@@ -852,18 +1033,40 @@ class DependencyResolver:
 
     # ── aggregate ─────────────────────────────────────────────────────────
 
-    def resolve_version(self, version: dict[str, Any]) -> dict[str, Any]:
+    def resolve_version(
+        self,
+        version: dict[str, Any],
+        remote: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Full dependency report: models + custom nodes + summary.
 
         Graph artifacts that can never resolve are listed under
         ``unresolvable`` and excluded from the summary counts.
+
+        ``remote`` defaults to the process-wide inventory snapshot, exactly as
+        :meth:`reasons_for` does, so the report and the derived version state
+        are always answering from the same evidence. Pass ``remote={}`` to
+        force the local-only answer.
         """
-        models = self.resolve_model_refs(version)
-        custom_nodes = self.resolve_custom_nodes(version)
+        if remote is None:
+            remote = remote_inventory.current()
+        remote_lookup = _remote_lookup(remote)
+        models = self.resolve_model_refs(
+            version, remote=cast(dict[str, Any] | None, remote_lookup)
+        )
+        custom_nodes = self.resolve_custom_nodes(
+            version, remote=cast(dict[str, Any] | None, remote_lookup)
+        )
         m_installed = sum(1 for m in models if m["state"] == "installed")
-        m_missing = sum(1 for m in models if m["state"] == "missing")
-        m_wrong = sum(1 for m in models if m["state"] == "wrong_version")
-        m_unknown = sum(1 for m in models if m["state"] == "unknown")
+        m_missing = sum(
+            1 for m in models if m["state"] == "missing" and not m.get("nonessential")
+        )
+        m_wrong = sum(
+            1 for m in models if m["state"] == "wrong_version" and not m.get("nonessential")
+        )
+        m_unknown = sum(
+            1 for m in models if m["state"] == "unknown" and not m.get("nonessential")
+        )
         n_installed = sum(1 for n in custom_nodes if n["state"] == "installed")
         n_missing = sum(1 for n in custom_nodes if n["state"] == "missing")
         n_wrong = sum(1 for n in custom_nodes if n["state"] == "wrong_revision")
@@ -886,14 +1089,27 @@ class DependencyResolver:
             },
         }
 
-    def reasons_for(self, version: dict[str, Any]) -> list[str]:
+    def reasons_for(
+        self, version: dict[str, Any], remote: dict[str, Any] | None = None
+    ) -> list[str]:
         """Exact human-readable reasons for every unresolved dependency.
 
         Never raises; a malformed version dict yields ``[]``.
+
+        ``remote`` defaults to the process-wide inventory snapshot, so version
+        state derived on a synchronous path (the version card, the run gate)
+        agrees with the dependency report instead of re-deriving local-only
+        truth. Pass ``remote={}`` to force the local-only answer.
         """
+        if remote is None:
+            remote = remote_inventory.current()
         reasons: list[str] = []
         try:
-            for entry in self.resolve_model_refs(version):
+            for entry in self.resolve_model_refs(version, remote=remote):
+                if entry.get("nonessential"):
+                    # No live node references it, so it cannot block readiness
+                    # or the run gate; the row is still reported, just advisory.
+                    continue
                 state = entry.get("state")
                 if state == "missing":
                     reasons.append(
@@ -909,7 +1125,7 @@ class DependencyResolver:
                     reasons.append(
                         f"model dependency '{entry.get('key')}' could not be identified"
                     )
-            for entry in self.resolve_custom_nodes(version):
+            for entry in self.resolve_custom_nodes(version, remote=remote):
                 state = entry.get("state")
                 if state == "missing":
                     reasons.append(

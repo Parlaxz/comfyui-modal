@@ -9,6 +9,7 @@ module is registered in ``sys.modules`` so core classes (e.g.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from tests import _test_env  # noqa: F401  (hide real ComfyUI from sys.path)
 from custom_node_registry import CustomNodeRegistryStore
 from dependency_resolver import DependencyResolver
 from model_library import ModelLibraryService
+import remote_inventory
 from studio_domain import (
     WorkflowDomainService,
     WorkflowPresetValidationError,
@@ -1346,6 +1348,499 @@ class DependencyResolverTestCase(unittest.TestCase):
             self.assertNotIn(panel, names, panel + " must not become a dependency")
             self.assertNotIn(panel, unres, panel + " must not be reported as a dep")
         self.assertIn("DonutEditStudio", names)
+
+    # ── remote inventory reconciliation ──────────────────────────────────
+    #
+    # The resolver answers "what does the Modal app have" by joining the
+    # workflow's requirements against one `get_volume_status` payload. Models
+    # join on basename+folder; custom-node packs join on the directory name the
+    # volume preserves from the local pack. Remote evidence can promote a row
+    # to installed but never newly demote one: the custom-node volume is a
+    # full-replace mirror of local custom_nodes/, so absence proves little.
+
+    def _remote(self, models=None, custom_nodes=None):
+        payload = {}
+        if models is not None:
+            payload["models"] = models
+        if custom_nodes is not None:
+            payload["custom_nodes"] = custom_nodes
+        return payload
+
+    def _remote_model(self, filename, folder="checkpoints", size=1024):
+        return {"name": filename, "folder": folder, "size": size}
+
+    def _version_with_model(self, filename="krea_model.safetensors"):
+        workflow = self._create_workflow()
+        prompt = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": filename}},
+            "2": {"class_type": "SaveImage", "inputs": {}},
+        }
+        version = self._create_version(workflow["workflow_id"], prompt)
+        return self.service.store.get_version(version["workflow_version_id"]) or {}
+
+    def test_remote_model_present_upgrades_locally_missing(self):
+        # The regression this whole change exists for: the model is on the
+        # Modal volume and absent from the PC, so the local disk check says
+        # "missing" and the report wrongly blocks the workflow.
+        version = self._version_with_model()
+
+        local_only = self.resolver.resolve_version(version)
+        self.assertEqual(local_only["models"][0]["state"], "missing")
+        self.assertFalse(local_only["summary"]["ready"])
+
+        remote = self.resolver.resolve_version(
+            version, remote=self._remote(models=[self._remote_model("krea_model.safetensors")])
+        )
+        row = remote["models"][0]
+        self.assertEqual(row["state"], "installed")
+        self.assertTrue(row["installed"])
+        self.assertTrue(row["remote_available"])
+        self.assertEqual(row["remote_model"]["size"], 1024)
+        self.assertTrue(remote["summary"]["ready"])
+        self.assertEqual(remote["summary"]["attention"], 0)
+
+    def test_remote_model_absent_leaves_row_missing(self):
+        version = self._version_with_model("absent_everywhere.safetensors")
+
+        remote = self.resolver.resolve_version(
+            version, remote=self._remote(models=[self._remote_model("something_else.safetensors")])
+        )
+        row = remote["models"][0]
+        self.assertEqual(row["state"], "missing")
+        self.assertNotIn("remote_model", row)
+        self.assertFalse(remote["summary"]["ready"])
+
+    def test_remote_model_zero_size_does_not_install(self):
+        # A zero-byte volume entry is a placeholder, exactly like a zero-byte
+        # local file is; it must not read as installed.
+        version = self._version_with_model()
+
+        remote = self.resolver.resolve_version(
+            version,
+            remote=self._remote(models=[self._remote_model("krea_model.safetensors", size=0)]),
+        )
+        row = remote["models"][0]
+        self.assertEqual(row["state"], "missing")
+        self.assertFalse(row["remote_available"])
+        self.assertEqual(row["remote_model"]["size"], 0)
+        self.assertFalse(remote["summary"]["ready"])
+
+    def test_remote_model_matches_through_role_folder_alias(self):
+        # A ref stored folder-qualified resolves against the alias folder the
+        # volume actually uses, so unet/diffusion_models are one identity.
+        version = self._version_with_model("weights/krea_model.safetensors")
+
+        remote = self.resolver.resolve_version(
+            version,
+            remote=self._remote(
+                models=[self._remote_model("krea_model.safetensors", folder="diffusion_models")]
+            ),
+        )
+        self.assertEqual(remote["models"][0]["state"], "installed")
+        self.assertEqual(
+            remote["models"][0]["remote_model"]["folder"], "diffusion_models"
+        )
+
+    def test_remote_pack_installs_classes_with_no_local_record(self):
+        # The pack is on the volume and was never installed locally, so there is
+        # no local registry record at all. Matching the captured pack identity
+        # against the volume directory name is what makes "pack present implies
+        # its classes are present" work.
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"], custom_prompt())
+        version_id = version["workflow_version_id"]
+        raw = self._inject_requirements(
+            version_id, {"SomeCustomClass": {"cnr_id": "comfyui-kjnodes"}}
+        )
+
+        self.assertEqual(
+            [n["state"] for n in self.resolver.resolve_version(raw)["custom_nodes"]
+             if n["name"] != "ComfyUI core"],
+            ["missing"],
+        )
+
+        remote = self.resolver.resolve_version(
+            raw,
+            remote=self._remote(
+                models=[self._remote_model("krea_model.safetensors")],
+                custom_nodes=["ComfyUI-KJNodes"],
+            ),
+        )
+        kj = [n for n in remote["custom_nodes"] if n["name"] == "comfyui-kjnodes"]
+        self.assertTrue(kj)
+        self.assertEqual(kj[0]["state"], "installed")
+        self.assertTrue(remote["summary"]["ready"])
+
+    def test_remote_pack_absent_never_demotes_an_installed_pack(self):
+        # Absence from the volume is weak evidence (the volume mirrors local
+        # custom_nodes/ wholesale), so it must not invent a missing row.
+        self._seed_registry()
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"], custom_prompt())
+        raw = self.service.store.get_version(version["workflow_version_id"]) or {}
+
+        remote = self.resolver.resolve_version(
+            raw, remote=self._remote(custom_nodes=["SomeOtherPack"])
+        )
+        kj = [n for n in remote["custom_nodes"] if n["name"] == "ComfyUI-KJNodes"]
+        self.assertTrue(kj)
+        self.assertEqual(kj[0]["state"], "installed")
+
+    def test_remote_clears_wrong_version_when_the_model_is_on_the_volume(self):
+        # The volume listing carries no hash, so remote truth cannot verify a
+        # revision; a present model is reported installed and the stale
+        # required_hash is dropped rather than left contradicting the state.
+        self._seed_model()
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"])
+        version_id = version["workflow_version_id"]
+        store = self.service.store
+        raw = dict(store.get_version(version_id) or {})
+        dep = dict(raw.get("dependency_metadata") or {})
+        dep["required_models"] = {"krea_model.safetensors": "deadbeef"}
+        raw["dependency_metadata"] = dep
+
+        def _mutate(rows: list) -> None:
+            for i, record in enumerate(rows):
+                if record.get("workflow_version_id") == version_id:
+                    rows[i] = raw
+                    return
+
+        store.versions.update(_mutate)
+
+        self.assertEqual(
+            self.resolver.resolve_version(raw)["models"][0]["state"], "wrong_version"
+        )
+
+        remote = self.resolver.resolve_version(
+            raw, remote=self._remote(models=[self._remote_model("krea_model.safetensors")])
+        )
+        row = remote["models"][0]
+        self.assertEqual(row["state"], "installed")
+        self.assertIsNone(row["required_hash"])
+
+    def test_remote_none_is_byte_for_byte_unchanged(self):
+        # remote=None must reproduce the local-only report exactly, so every
+        # remote-unavailable path (Modal down, fetch failure) is unchanged.
+        self._seed_model()
+        version = self._version_with_model()
+
+        without = self.resolver.resolve_version(version)
+        explicit_none = self.resolver.resolve_version(version, remote=None)
+        self.assertEqual(without, explicit_none)
+        self.assertNotIn("remote_model", without["models"][0])
+        self.assertNotIn("remote_available", without["models"][0])
+
+    def test_malformed_remote_payload_degrades_to_local_truth(self):
+        self._seed_model()
+        version = self._version_with_model()
+
+        for junk in [{}, {"models": "not-a-list"}, {"models": [None, 7]}, "garbage", 42]:
+            remote = self.resolver.resolve_version(version, remote=junk)
+            self.assertEqual(remote["models"][0]["state"], "installed", junk)
+            self.assertNotIn("remote_model", remote["models"][0], junk)
+
+    # ── nonessential (no live reference) dependencies ────────────────────
+
+    def _version_with_bypassed_lora(self) -> dict:
+        # Models reachable only from a bypassed node are off the critical path.
+        # The stack is pre-seeded with them, as pre-fix captures recorded, and
+        # the graph keeps them with mode=4 so the resolver must classify them.
+        version = {
+            "workflow_version_id": "wv_lora",
+            "executable_prompt": {
+                "1": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": {"ckpt_name": "base.safetensors"},
+                },
+            },
+            "graph_json": {
+                "id": "g",
+                "nodes": [
+                    {
+                        "id": 1,
+                        "type": "CheckpointLoaderSimple",
+                        "mode": 0,
+                        "widgets_values": ["base.safetensors"],
+                    },
+                    {
+                        "id": 2,
+                        "type": "SeedVR2LoadVAEModel",
+                        "mode": 4,
+                        "widgets_values": ["ema_vae_fp16.safetensors"],
+                    },
+                    {
+                        "id": 3,
+                        "type": "LoraLoader",
+                        "mode": 2,
+                        "widgets_values": ["muted.safetensors"],
+                    },
+                ],
+            },
+            "dependency_metadata": {
+                "model_stack": {
+                    "checkpoint": ["base.safetensors"],
+                    "model": [
+                        "ema_vae_fp16.safetensors",
+                        "muted.safetensors",
+                    ],
+                },
+                "node_classes": [],
+            },
+        }
+        return version
+
+    def test_bypassed_or_muted_node_models_are_nonessential(self):
+        result = self.resolver.resolve_version(self._version_with_bypassed_lora())
+        rows = {m["filename"]: m for m in result["models"]}
+
+        self.assertTrue(rows["ema_vae_fp16.safetensors"]["nonessential"])
+        self.assertTrue(rows["muted.safetensors"]["nonessential"])
+        # The node ComfyUI will actually run keeps its model essential.
+        self.assertNotIn("nonessential", rows["base.safetensors"])
+
+    def test_nonessential_missing_does_not_block_readiness(self):
+        version = self._version_with_bypassed_lora()
+        result = self.resolver.resolve_version(version)
+
+        # All three are absent everywhere, but only the live node's model is
+        # counted: the two disabled ones are reported and never block.
+        missing = [m for m in result["models"] if m["state"] == "missing"]
+        self.assertEqual(len(missing), 3)
+        essential = [m for m in missing if not m.get("nonessential")]
+        self.assertEqual([m["filename"] for m in essential], ["base.safetensors"])
+        self.assertEqual(result["summary"]["missing"], 1)
+        self.assertEqual(result["summary"]["attention"], 1)
+        self.assertFalse(result["summary"]["ready"])
+
+        # Drop the live reference and the version is ready: the two disabled
+        # models were never what stood in the way.
+        version["dependency_metadata"]["model_stack"]["checkpoint"] = []
+        version["executable_prompt"] = {}
+        ready = self.resolver.resolve_version(version)
+        self.assertEqual(ready["summary"]["missing"], 0)
+        self.assertEqual(ready["summary"]["attention"], 0)
+        self.assertTrue(ready["summary"]["ready"])
+
+    def test_nonessential_models_emit_no_blocking_reason(self):
+        version = self._version_with_bypassed_lora()
+
+        reasons = self.resolver.reasons_for(version, remote={})
+
+        # Only the active node's model blocks; the disabled pair is silent.
+        self.assertTrue(reasons)
+        self.assertTrue(all("base.safetensors" in r for r in reasons))
+        self.assertFalse(any("ema_vae" in r or "muted.safetensors" in r for r in reasons))
+
+    def test_active_model_named_only_by_a_note_stays_a_dependency(self):
+        # A MarkdownNote that merely mentions a filename is prose, not a model
+        # reference: it must not create a dependency of its own.
+        version = {
+            "workflow_version_id": "wv_note",
+            "executable_prompt": {},
+            "graph_json": {
+                "id": "g",
+                "nodes": [
+                    {
+                        "id": 1,
+                        "type": "MarkdownNote",
+                        "mode": 0,
+                        "widgets_values": [
+                            "use the controlnet "
+                            "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors"
+                        ],
+                    }
+                ],
+            },
+            "dependency_metadata": {"model_stack": {}, "node_classes": []},
+        }
+        result = self.resolver.resolve_version(version)
+        names = [m["filename"] for m in result["models"]]
+        self.assertNotIn(
+            "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors", names
+        )
+
+    # ── user-declared overrides ──────────────────────────────────────────
+
+    def test_user_override_marks_a_live_model_nonessential(self):
+        # Detection cannot see this one: a live node names it. Only an explicit
+        # override makes it advisory, and it must win over detection.
+        version = self._version_with_bypassed_lora()
+        version["workflow_id"] = "wf_override"
+        live = "base.safetensors"
+        result = self.resolver.resolve_version(version, remote={})
+        row = [m for m in result["models"] if m["filename"] == live][0]
+        self.assertNotIn("nonessential", row)
+        self.assertFalse(result["summary"]["ready"])
+
+        self.resolver.overrides.set_keys("wf_override", {f"checkpoint|{live}"})
+        try:
+            marked = self.resolver.resolve_version(version, remote={})
+            row = [m for m in marked["models"] if m["filename"] == live][0]
+            self.assertTrue(row["nonessential"])
+            self.assertEqual(row["nonessential_source"], "user")
+            self.assertTrue(marked["summary"]["ready"])
+            # A deliberate override must also stop blocking the run gate.
+            self.assertEqual(self.resolver.reasons_for(version, remote={}), [])
+        finally:
+            self.resolver.overrides.set_keys("wf_override", set())
+
+    def test_override_is_scoped_to_its_workflow(self):
+        version = self._version_with_bypassed_lora()
+        version["workflow_id"] = "wf_a"
+        self.resolver.overrides.set_keys("wf_b", {"checkpoint|base.safetensors"})
+        try:
+            result = self.resolver.resolve_version(version, remote={})
+            self.assertFalse(result["summary"]["ready"])
+        finally:
+            self.resolver.overrides.set_keys("wf_b", set())
+
+    def test_clearing_the_last_override_removes_the_record(self):
+        self.resolver.overrides.set_keys("wf_c", {"checkpoint|base.safetensors"})
+        self.assertEqual(self.resolver.overrides.keys_for("wf_c"), {"checkpoint|base.safetensors"})
+        self.resolver.overrides.set_keys("wf_c", set())
+        self.assertEqual(self.resolver.overrides.keys_for("wf_c"), set())
+
+    def test_unreadable_override_store_degrades_to_no_overrides(self):
+        store = self.resolver.overrides
+        store.store.write_atomic([{"workflow_id": "wf_x", "nonessential": ["a|b"]}])
+        store.store.path.write_bytes(b"{ not json")
+        # Must not raise into resolution, and must not invent overrides.
+        self.assertEqual(store.keys_for("wf_x"), set())
+        version = self._version_with_bypassed_lora()
+        version["workflow_id"] = "wf_x"
+        self.assertIn("summary", self.resolver.resolve_version(version, remote={}))
+
+    def test_user_override_applies_to_a_model_that_has_a_library_record(self):
+        # Regression: the flag used to be stamped on only the "no library record
+        # at all" branch, so overriding a model the library already knew about —
+        # the common case — silently did nothing.
+        self._seed_model()  # krea_model.safetensors is a known library record
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"])
+        version_id = version["workflow_version_id"]
+        self._set_mapping(version_id)
+        raw = self.service.store.get_version(version_id) or {}
+        raw["workflow_id"] = "wf_recorded"
+        live = "krea_model.safetensors"
+        key = f"checkpoint|{live}"
+
+        before = self.resolver.resolve_version(raw, remote={})
+        row = [m for m in before["models"] if m["filename"] == live][0]
+        self.assertEqual(row["state"], "installed")
+        self.assertNotIn("nonessential", row)
+
+        self.resolver.overrides.set_keys("wf_recorded", {key})
+        try:
+            after = self.resolver.resolve_version(raw, remote={})
+            row = [m for m in after["models"] if m["filename"] == live][0]
+            self.assertTrue(row["nonessential"], "override must survive a library record")
+            self.assertEqual(row["nonessential_source"], "user")
+        finally:
+            self.resolver.overrides.set_keys("wf_recorded", set())
+
+    def test_override_reaches_every_resolution_branch(self):
+        # Each branch of resolve_model_refs (unknown / unreadable / installed /
+        # known-but-absent / unknown-record) must carry the flag.
+        self._seed_model()
+        version = self._version_with_model("branch_probe.safetensors")
+        version["workflow_id"] = "wf_branches"
+        self.resolver.overrides.set_keys("wf_branches", {"checkpoint|branch_probe.safetensors"})
+        try:
+            row = [
+                m for m in self.resolver.resolve_version(version, remote={})["models"]
+                if m["filename"] == "branch_probe.safetensors"
+            ][0]
+            self.assertTrue(row["nonessential"])
+            self.assertEqual(row["nonessential_source"], "user")
+        finally:
+            self.resolver.overrides.set_keys("wf_branches", set())
+
+    def test_unresolvable_classes_are_untouched_by_remote(self):
+        # A graph artifact can never be a pack, so a remote inventory must not
+        # promote it into an installed dependency or clear it from the skip list.
+        version = {
+            "workflow_version_id": "wv_artifact",
+            "executable_prompt": {},
+            "graph_json": {
+                "id": "g",
+                "nodes": [
+                    {"id": 1, "type": "DonutLatestPreview", "inputs": [], "outputs": []},
+                ],
+            },
+            "dependency_metadata": {"model_stack": {}, "node_classes": ["DonutLatestPreview"]},
+        }
+        remote = self.resolver.resolve_version(
+            version, remote=self._remote(custom_nodes=["DonutLatestPreview"])
+        )
+        self.assertEqual(remote["custom_nodes"], [])
+        self.assertEqual([u["name"] for u in remote["unresolvable"]], ["DonutLatestPreview"])
+
+    # ── version state and the report must agree ──────────────────────────
+
+    def test_reasons_read_the_shared_inventory_snapshot(self):
+        # The version card derives its state through reasons_for, not through
+        # resolve_version. If it re-derived local-only truth the card would
+        # say "Incomplete" directly above a report that says "Ready".
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"])
+        version_id = version["workflow_version_id"]
+        self._set_mapping(version_id)
+        raw = self.service.store.get_version(version_id) or {}
+
+        self.assertTrue(
+            any("missing model 'krea_model.safetensors'" in r for r in self.resolver.reasons_for(raw))
+        )
+        self.assertFalse(self.service.derive_version_state(version_id).runnable)
+
+        payload = self._remote(models=[self._remote_model("krea_model.safetensors")])
+        try:
+            remote_inventory._fetch = _static_fetch(payload)
+            asyncio.run(remote_inventory.get_inventory())
+
+            # No explicit `remote=` anywhere: the shared snapshot is the input.
+            self.assertEqual(self.resolver.reasons_for(raw), [])
+            state = self.service.derive_version_state(version_id)
+            self.assertTrue(state.runnable)
+            self.assertEqual(state.status, "ready")
+
+            # And the two surfaces now report the same thing.
+            report = self.resolver.resolve_version(raw)
+            self.assertEqual(report["summary"]["ready"], state.status == "ready")
+        finally:
+            remote_inventory._fetch = remote_inventory._default_fetch
+            remote_inventory.invalidate()
+
+    def test_reasons_can_be_forced_local_only(self):
+        # remote={} opts out of the shared snapshot, so an explicit local-only
+        # answer stays available for callers that want PC truth.
+        workflow = self._create_workflow()
+        version = self._create_version(workflow["workflow_id"])
+        version_id = version["workflow_version_id"]
+        self._set_mapping(version_id)
+        raw = self.service.store.get_version(version_id) or {}
+
+        payload = self._remote(models=[self._remote_model("krea_model.safetensors")])
+        try:
+            remote_inventory._fetch = _static_fetch(payload)
+            asyncio.run(remote_inventory.get_inventory())
+            self.assertEqual(self.resolver.reasons_for(raw), [])
+            self.assertTrue(
+                any(
+                    "missing model 'krea_model.safetensors'" in r
+                    for r in self.resolver.reasons_for(raw, remote={})
+                )
+            )
+        finally:
+            remote_inventory._fetch = remote_inventory._default_fetch
+            remote_inventory.invalidate()
+
+
+def _static_fetch(payload):
+    async def _fetch():
+        return payload
+
+    return _fetch
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from tests import _test_env  # noqa: E402,F401  (hide real ComfyUI from sys.path
 
 from dependency_resolver import DependencyResolver  # noqa: E402
 from model_library import MODEL_TYPES  # noqa: E402
+import remote_inventory  # noqa: E402
 
 
 # ── Minimal _server stub (self-contained copy of the house pattern) ──────
@@ -173,7 +174,20 @@ class ModelLibraryRoutesTestCase(unittest.TestCase):
         )
         self.mod = type("RoutesModule", (), {"_server": stub})
 
+        # The dependencies route reconciles against the Modal volume. Route
+        # tests must never reach a real Modal app, and the default is "no
+        # remote inventory" so the pre-existing local-only assertions below
+        # keep describing local-only behaviour.
+        self._saved_fetch = remote_inventory._fetch
+
+        async def _no_remote():
+            return None
+
+        remote_inventory._fetch = _no_remote
+
     def tearDown(self) -> None:
+        remote_inventory._fetch = self._saved_fetch
+        remote_inventory.invalidate()
         self._tmp.cleanup()
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -820,6 +834,173 @@ class ModelLibraryRoutesTestCase(unittest.TestCase):
         self.assertIn("NestedBetaNode", beta[0]["classes"])
         self.assertNotIn("NestedPanel", classes)
         self.assertNotIn("static_graph", self._stored_version(version_id))
+
+    # ── dependencies route reconciles against the Modal volume ───────────
+    #
+    # The endpoint answers "what does the app have", not "what does the PC
+    # have": it folds one cached CPU-only get_volume_status payload into the
+    # report. Without a payload it degrades to the local-only report.
+
+    def _deps(self, version_id: str) -> dict:
+        resp = self._call(
+            "GET",
+            "/comfymodal/studio/workflows/versions/{version_id}/dependencies",
+            match_info={"version_id": version_id},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        return self._body(resp)
+
+    def _serve_remote(self, payload) -> None:
+        async def _fetch():
+            return payload
+
+        remote_inventory._fetch = _fetch
+        remote_inventory.invalidate()
+
+    def test_dependencies_route_installs_a_volume_only_model(self):
+        _workflow, version = self._import_workflow()
+        version_id = version["workflow_version_id"]
+
+        # Nothing on the PC: the model is only on the Modal volume.
+        local_only = self._deps(version_id)
+        row = [m for m in local_only["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertEqual(row["state"], "missing")
+        self.assertNotIn("remote_model", row)
+        before = local_only["summary"]["attention"]
+
+        self._serve_remote(
+            {
+                "models": [
+                    {"folder": "checkpoints", "name": "krea_model.safetensors", "size": 2048}
+                ],
+                "custom_nodes": [],
+            }
+        )
+        remote = self._deps(version_id)
+        row = [m for m in remote["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertEqual(row["state"], "installed")
+        self.assertTrue(row["remote_available"])
+        self.assertEqual(row["remote_model"]["size"], 2048)
+        # The model stops counting against readiness. This fixture registers no
+        # fake ``nodes`` module, so ComfyUI's own loader classes resolve as
+        # missing custom nodes here; the model is what this route change owns.
+        self.assertEqual(remote["summary"]["attention"], before - 1)
+        self.assertEqual(remote["summary"]["installed"], local_only["summary"]["installed"] + 1)
+
+    def test_dependencies_route_survives_an_unreachable_modal(self):
+        _workflow, version = self._import_workflow()
+        version_id = version["workflow_version_id"]
+
+        async def _boom():
+            raise RuntimeError("modal unreachable")
+
+        remote_inventory._fetch = _boom
+        remote_inventory.invalidate()
+
+        body = self._deps(version_id)
+        self.assertEqual(body["status"], "ok")
+        row = [m for m in body["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertEqual(row["state"], "missing")
+        self.assertNotIn("remote_model", row)
+        self.assertFalse(body["summary"]["ready"])
+
+    def test_dependencies_route_serves_one_inventory_across_requests(self):
+        # Two report requests inside the TTL must cost one Modal round trip;
+        # the second is served from the shared snapshot.
+        _workflow, version = self._import_workflow()
+        version_id = version["workflow_version_id"]
+        calls: list[int] = []
+
+        async def _fetch():
+            calls.append(1)
+            return {"models": [], "custom_nodes": []}
+
+        remote_inventory._fetch = _fetch
+        remote_inventory.invalidate()
+
+        self._deps(version_id)
+        self._deps(version_id)
+        self.assertEqual(len(calls), 1)
+
+        remote_inventory.invalidate()
+        self._deps(version_id)
+        self.assertEqual(len(calls), 2)
+
+    # ── nonessential override route ──────────────────────────────────────
+
+    def test_nonessential_route_marks_and_restores(self):
+        workflow, version = self._import_workflow()
+        workflow_id = workflow["workflow_id"]
+        version_id = version["workflow_version_id"]
+
+        before = self._deps(version_id)
+        row = [m for m in before["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertNotIn("nonessential", row)
+        # The override key is the row's own key, so the test never has to guess
+        # the role bucket a capture happened to use.
+        key = row["key"]
+
+        resp = self._call(
+            "POST",
+            "/comfymodal/studio/workflows/{workflow_id}/dependencies/nonessential",
+            match_info={"workflow_id": workflow_id},
+            json_body={"keys": [key]},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        self.assertEqual(self._body(resp)["nonessential"], [key])
+
+        after = self._deps(version_id)
+        row = [m for m in after["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertTrue(row["nonessential"])
+        self.assertEqual(row["nonessential_source"], "user")
+
+        # Restoring sends an empty set, which clears the record entirely.
+        resp = self._call(
+            "POST",
+            "/comfymodal/studio/workflows/{workflow_id}/dependencies/nonessential",
+            match_info={"workflow_id": workflow_id},
+            json_body={"keys": []},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        restored = self._deps(version_id)
+        row = [m for m in restored["models"] if m["filename"] == "krea_model.safetensors"][0]
+        self.assertNotIn("nonessential", row)
+
+    def test_nonessential_route_rejects_bad_input(self):
+        workflow, _version = self._import_workflow()
+        workflow_id = workflow["workflow_id"]
+        path = "/comfymodal/studio/workflows/{workflow_id}/dependencies/nonessential"
+
+        resp = self._call(
+            "POST", path, match_info={"workflow_id": workflow_id}, json_body={"keys": "nope"}
+        )
+        self.assertEqual(resp.status, 400)
+
+        resp = self._call(
+            "POST", path, match_info={"workflow_id": "wf_ghost"}, json_body={"keys": []}
+        )
+        self.assertEqual(resp.status, 404)
+
+    def test_dependencies_route_ignores_remote_when_offline(self):
+        # A reachable-but-unreachable Modal must never be needed to mark a
+        # dependency unnecessary: the override is local truth.
+        workflow, version = self._import_workflow()
+        version_id = version["workflow_version_id"]
+
+        async def _boom():
+            raise RuntimeError("modal unreachable")
+
+        remote_inventory._fetch = _boom
+        remote_inventory.invalidate()
+
+        resp = self._call(
+            "POST",
+            "/comfymodal/studio/workflows/{workflow_id}/dependencies/nonessential",
+            match_info={"workflow_id": workflow["workflow_id"]},
+            json_body={"keys": ["model|krea_model.safetensors"]},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        self.assertEqual(self._deps(version_id)["status"], "ok")
 
 
 if __name__ == "__main__":

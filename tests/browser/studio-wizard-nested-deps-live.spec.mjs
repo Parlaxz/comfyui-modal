@@ -298,16 +298,7 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         ).toBe(false);
       }
 
-      // ── Capture the live remote-inventory read and intercept mutations ──
-      // Passive response capture: read the wizard's own GET without holding
-      // the route open (a retained route callback can outlive the test).
-      const capturedModels = [];
-      page.on("response", (resp) => {
-        let pathname = "";
-        try { pathname = new URL(resp.url()).pathname; } catch (e) { return; }
-        if (pathname !== "/comfymodal/models") return;
-        resp.json().then((j) => capturedModels.push(j)).catch(() => capturedModels.push(null));
-      });
+      // ── Intercept mutations; dependency availability is server-owned ──
       const seen = { gitUrl: [], reboot: 0, modelInstallPayloads: [], queueInstall: [] };
       await page.route("**/manager/version", (route) =>
         route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ version: "probe" }) })
@@ -374,17 +365,13 @@ test.describe("Studio wizard nested dependencies (live)", () => {
         timeout: 20000,
       });
 
-      // The wizard must have read the live remote inventory (read-only GET).
-      // Modal CPU cold start can take a while, so this is generously bounded.
-      await expect
-        .poll(() => capturedModels.length, { timeout: 180000 })
-        .toBeGreaterThanOrEqual(1);
-      const capturedEntry = flattenRemoteInventory(
-        capturedModels[capturedModels.length - 1]
-      ).find((e) => basenameOf(e.name) === basenameOf(NESTED_ONLY_MODEL));
-      expect(capturedEntry, "wizard did not capture the remote model entry").toBeTruthy();
-      expect(Number(capturedEntry.size) || 0).toBe(remoteSize);
-      evidence.live.wizard_captured_remote_size = Number(capturedEntry.size) || 0;
+      // The dependency response already carries the remote authority; the
+      // wizard must render that row without fetching the inventory itself.
+      expect(nestedModel.remote_available).toBe(remoteAvailable);
+      expect(Number(nestedModel.remote_model && nestedModel.remote_model.size) || 0).toBe(remoteSize);
+      evidence.live.wizard_captured_remote_size = Number(
+        nestedModel.remote_model && nestedModel.remote_model.size
+      ) || 0;
 
       // ── The nested row state follows remote size, not the placeholder ─
       const modelRows = panel.locator('[data-testid="dependency-model-row"]');

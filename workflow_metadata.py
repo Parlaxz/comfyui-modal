@@ -473,6 +473,23 @@ def _named_widget_values(node: dict) -> dict[str, object]:
     return out
 
 
+def _is_disabled_graph_node(node) -> bool:
+    """True for a graph node ComfyUI will not execute.
+
+    ``mode`` is ComfyUI's own per-node execution state: 0 = ALWAYS,
+    2 = NEVER (muted), 4 = BYPASS. A muted/bypassed node is not on the
+    critical path, so the models it names are not dependencies of the
+    workflow. A missing or unrecognised ``mode`` counts as enabled, because
+    only an explicit opt-out may relax readiness.
+    """
+    if not isinstance(node, dict):
+        return False
+    mode = node.get("mode")
+    if isinstance(mode, bool) or not isinstance(mode, int):
+        return False
+    return mode in (2, 4)
+
+
 def extract_ui_graph_model_refs(graph_json) -> list[dict[str, str]]:
     """Extract model refs from named widget metadata on a captured UI graph.
 
@@ -480,8 +497,9 @@ def extract_ui_graph_model_refs(graph_json) -> list[dict[str, str]]:
     and passed through :func:`extract_workflow_model_refs`, so standard loader
     mappings and the generic custom-loader model-token/extension guards both
     apply. Nodes nested in group/subgraph containers are included. Virtual
-    panels (empty inputs/outputs, no pack identity) are skipped so their
-    metadata can never surface as a model. Never raises.
+    panels (empty inputs/outputs, no pack identity) and nodes ComfyUI will not
+    execute (muted/bypassed) are skipped, so their metadata can never surface as
+    a model. Never raises.
     """
     if not isinstance(graph_json, dict):
         return []
@@ -492,7 +510,7 @@ def extract_ui_graph_model_refs(graph_json) -> list[dict[str, str]]:
         class_type = node.get("type")
         if not isinstance(class_type, str) or not class_type:
             continue
-        if _is_virtual_graph_node(node):
+        if _is_virtual_graph_node(node) or _is_disabled_graph_node(node):
             continue
         inputs = _named_widget_values(node)
         if not inputs:

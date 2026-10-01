@@ -4373,6 +4373,8 @@ if _server:
             })
         try:
             results = await batch_download_models(normalized_items, hf_token=_read_hf_token(), civitai_token=_read_civitai_token())
+            from remote_inventory import invalidate as _invalidate_remote_inventory
+            _invalidate_remote_inventory()
             placeholders, placeholder_errors = _create_placeholder_batch([
                 {"folder": item["save_path"], "filename": item["filename"]}
                 for item in normalized_items
@@ -4396,6 +4398,7 @@ if _server:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
     async def _background_download(download_id: str, url: str, filename: str, save_path: str):
+        download_completed = False
         try:
             _download_progress[download_id] = {"state": "starting", "pct": 0, "filename": filename, "save_path": save_path}
             async for update in download_model_stream(url=url, filename=filename, save_path=save_path, hf_token=_read_hf_token(), civitai_token=_read_civitai_token()):
@@ -4409,6 +4412,7 @@ if _server:
                         "save_path": save_path,
                     }
                 elif update["type"] == "complete":
+                    download_completed = True
                     placeholder = None
                     placeholder_error = None
                     try:
@@ -4428,6 +4432,9 @@ if _server:
                         "filename": filename,
                         "save_path": save_path,
                     }
+            if download_completed:
+                from remote_inventory import invalidate as _invalidate_remote_inventory
+                _invalidate_remote_inventory()
         except Exception as e:
             _download_progress[download_id] = {"state": "error", "error": str(e), "filename": filename, "save_path": save_path}
 
@@ -4739,6 +4746,9 @@ if _server:
                         workspace=workspace,
                     )
                     results.append({"folder": folder, "filename": filename, **result})
+                    if result.get("status") in ("ok", "skipped"):
+                        from remote_inventory import invalidate as _invalidate_remote_inventory
+                        _invalidate_remote_inventory()
                 except Exception as e:
                     results.append({"folder": folder, "filename": filename, "status": "error", "error": str(e)})
             successes = sum(1 for r in results if r.get("status") in ("ok", "skipped"))
@@ -5085,6 +5095,8 @@ if _server:
             result = await delete_model(folder=folder, filename=filename)
             local_placeholder = None
             if result.get("status") == "ok":
+                from remote_inventory import invalidate as _invalidate_remote_inventory
+                _invalidate_remote_inventory()
                 local_placeholder = _remove_local_placeholder_if_needed(folder, filename)
                 if local_placeholder:
                     result["local_placeholder"] = local_placeholder
@@ -5212,6 +5224,9 @@ if _server:
             except Exception as e:
                 errors.append({"name": f"{item['folder']}/{item['name']}", "error": str(e)})
 
+        if uploaded:
+            from remote_inventory import invalidate as _invalidate_remote_inventory
+            _invalidate_remote_inventory()
         result = {"status": "ok", "uploaded": uploaded, "total": len(to_upload)}
         if errors:
             result["errors"] = errors
@@ -5228,6 +5243,10 @@ if _server:
 
         try:
             result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
+            publication = result.get("publication") or {}
+            if result.get("status") == "ok" and publication.get("verified_publication"):
+                from remote_inventory import invalidate as _invalidate_remote_inventory
+                _invalidate_remote_inventory()
             return web.json_response(result, status=200 if result.get("status") == "ok" else 500)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)

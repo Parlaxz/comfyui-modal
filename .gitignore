@@ -44,6 +44,7 @@ playwright/.cache/
 .studio_workflow_presets.json
 .studio_model_library.json
 .studio_custom_nodes.json
+.studio_dependency_overrides.json
 .studio_workflow_compatibility.json
 .deploy_warmup_state.json
 .run_history/
