@@ -100,7 +100,22 @@ class CustomNodeDiscovery:
 
     @staticmethod
     def _git(path: Path, args: list[str]) -> str:
+        # ``git -C <path>`` searches parents when <path> has no .git.  A
+        # plugin nested in the ComfyUI checkout must never inherit ComfyUI's
+        # remote or commit, so establish the repository root before querying
+        # any metadata.  A .git file is valid for worktrees/submodules.
+        marker = path / ".git"
+        if not marker.exists():
+            return ""
         try:
+            root = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if root.returncode != 0 or Path((root.stdout or "").strip()).resolve() != path.resolve():
+                return ""
             proc = subprocess.run(
                 ["git", "-C", str(path), *args],
                 capture_output=True,
@@ -112,6 +127,25 @@ class CustomNodeDiscovery:
         except Exception:
             pass
         return ""
+
+    @classmethod
+    def _own_git_remote(cls, path: Path) -> str:
+        """Return one unambiguous own-root remote, or an empty value."""
+        urls: list[str] = []
+        for remote in cls._git(path, ["remote"]).splitlines():
+            remote = remote.strip()
+            if not remote:
+                continue
+            for mode in ([], ["--push"]):
+                for url in cls._git(
+                    path, ["remote", "get-url", *mode, "--all", remote]
+                ).splitlines():
+                    value = url.strip()
+                    if value and value not in urls:
+                        urls.append(value)
+        if len({url.casefold() for url in urls}) != 1:
+            return ""
+        return urls[0] if urls else ""
 
     @staticmethod
     def _import_nodes():
@@ -160,7 +194,7 @@ class CustomNodeDiscovery:
                     record = CustomNodeRecord(
                         name=name,
                         install_path=str(entry),
-                        repo_url=self._git(entry, ["remote", "get-url", "origin"]),
+                        repo_url=self._own_git_remote(entry),
                         installed_commit=self._git(entry, ["rev-parse", "HEAD"]),
                         updated_at=_now_iso(),
                     )

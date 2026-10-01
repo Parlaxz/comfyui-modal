@@ -20,6 +20,7 @@ Route summary (all under ``/comfymodal/studio``):
         GET   /comfymodal/studio/custom-nodes                   -- list registry
         POST  /comfymodal/studio/custom-nodes/refresh           -- rediscover + store
         POST  /comfymodal/studio/custom-nodes/install-request   -- approval record only
+        GET   /comfymodal/studio/custom-nodes/sync-status       -- read-only parity report
 
     Dependencies:
         GET   /comfymodal/studio/workflows/versions/{version_id}/dependencies
@@ -29,13 +30,24 @@ Route summary (all under ``/comfymodal/studio``):
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping, Sequence
 
 from aiohttp import web
 
 from custom_node_registry import CustomNodeDiscovery, CustomNodeRegistryStore
+from comfymodal_runtime.custom_node_identity import resolve_plugin_identity
+from comfymodal_runtime.custom_node_root import resolve_custom_nodes_root
+from comfymodal_runtime.publication_policy import (
+    CUSTOM_NODES_VOLUME_NAME,
+    canonical_publication_bytes,
+    compute_publication_generation,
+    iter_publication_files,
+)
 from dependency_resolver import DependencyResolver
 from model_library import (
     MODEL_TYPES,
@@ -46,6 +58,7 @@ from model_library import (
 from studio_domain.services import WorkflowDomainService
 from studio_store import StudioJsonStore, StudioStoreError
 from workflow_metadata import iter_graph_nodes
+from tools.v2_control.custom_nodes import ReceiptError, get_volume, read_receipt
 
 _log = logging.getLogger(__name__)
 
@@ -134,11 +147,249 @@ def _version_for_resolution(
     return resolved
 
 
+_SYNC_STATUS_KEYS = (
+    "status", "inventory_state", "payload_state", "local_only", "published_only",
+    "duplicates", "unknown_identity", "dependencies_changed", "dependencies_state",
+    "receipt_schema_supported", "local_generation", "published_generation",
+)
+
+
+def _sync_entry(name: str, identity: Any, source: str, confidence: str) -> dict[str, Any]:
+    return {
+        "name": str(name),
+        "identity": identity if isinstance(identity, str) and identity else None,
+        "identity_source": str(source),
+        "confidence": str(confidence),
+    }
+
+
+def _published_identity(item: Mapping[str, Any]) -> tuple[str | None, str, str]:
+    for key in ("identity", "repo_url", "repository_url", "canonical_identity"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            # Resolve the URL through the same canonical rules as local nodes.
+            from comfymodal_runtime.custom_node_identity import normalize_repository_url
+            normalized = normalize_repository_url(value)
+            if normalized:
+                return normalized, "receipt_identity", "high"
+    return None, "receipt_package_name", "weak"
+
+
+def _requirements_record(package: Path) -> tuple[bool, str | None]:
+    path = package / "requirements.txt"
+    try:
+        if not path.is_file():
+            return True, None
+        data = canonical_publication_bytes(path, path.read_bytes())
+    except OSError:
+        return False, None
+    return True, hashlib.sha256(data).hexdigest()
+
+
+def _receipt_requirement_digest(item: Mapping[str, Any]) -> tuple[bool, str | None]:
+    for key in ("requirements_sha256", "requirements_digest", "requirements_content_digest"):
+        value = item.get(key)
+        if isinstance(value, str):
+            return True, value
+    raw = item.get("requirements")
+    if isinstance(raw, str):
+        return True, hashlib.sha256(raw.replace("\r\n", "\n").replace("\r", "\n").encode()).hexdigest()
+    if isinstance(raw, Mapping):
+        for key in ("sha256", "digest", "content_digest"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                return True, value
+    if "requirements_present" in item and isinstance(item["requirements_present"], bool):
+        return True, None if not item["requirements_present"] else ""
+    return False, None
+
+
+def _local_inventory(
+    root: str | Path,
+    provenance_records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Path], dict[str, str]]:
+    """Build inventory from the canonical publication file iterator only."""
+    files = list(iter_publication_files(root))
+    package_names = sorted({path.relative_to(Path(root).resolve()).parts[0] for path in files})
+    package_paths = {name: Path(root).resolve() / name for name in package_names}
+    by_path: dict[str, Mapping[str, Any]] = {}
+    by_name: dict[str, Mapping[str, Any]] = {}
+    for record in provenance_records:
+        name = str(record.get("name") or "")
+        if name:
+            by_name[name] = record
+        install_path = record.get("install_path")
+        if isinstance(install_path, str) and install_path:
+            try:
+                by_path[str(Path(install_path).resolve())] = record
+            except OSError:
+                pass
+    folded = Counter(name.casefold() for name in package_names)
+    collisions = {name for name, count in folded.items() if count > 1}
+    entries: list[dict[str, Any]] = []
+    requirements: dict[str, str] = {}
+    for name in package_names:
+        package = package_paths[name]
+        record = by_path.get(str(package.resolve())) or by_name.get(name)
+        identity = resolve_plugin_identity(
+            package,
+            provenance=record,
+            basename_collisions=collisions,
+        )
+        entries.append(_sync_entry(
+            name, identity.identity, identity.identity_source, identity.confidence
+        ))
+        supported, digest = _requirements_record(package)
+        if supported and digest is not None:
+            requirements[name] = digest
+    return entries, package_paths, requirements
+
+
+def _sync_status_payload(
+    *,
+    root: str | Path,
+    receipt: Any | None,
+    provenance_records: Sequence[Mapping[str, Any]],
+    receipt_schema_supported: bool,
+) -> dict[str, Any]:
+    """Compute the read-only comparison without touching publication state."""
+    local, package_paths, local_requirements = _local_inventory(root, provenance_records)
+    local_generation = compute_publication_generation(root)
+    published_generation = getattr(receipt, "content_generation", None) if receipt else None
+    if not isinstance(published_generation, str) or not published_generation:
+        published_generation = None
+
+    published: list[dict[str, Any]] = []
+    published_raw: list[Mapping[str, Any]] = []
+    if receipt is not None:
+        raw_packages = getattr(receipt, "package_manifests", ())
+        if isinstance(raw_packages, (list, tuple)):
+            for raw in raw_packages:
+                if not isinstance(raw, Mapping):
+                    continue
+                name = str(raw.get("name") or "")
+                if not name:
+                    continue
+                identity, source, confidence = _published_identity(raw)
+                published.append(_sync_entry(name, identity, source, confidence))
+                published_raw.append(raw)
+    unknown_identity = sorted(
+        entry["name"] for entry in [*local, *published] if not entry["identity"]
+    )
+
+    local_known = all(
+        item["identity"] and item["confidence"] not in {"weak", "ambiguous"}
+        for item in local
+    )
+    published_known = bool(published) and all(item["identity"] for item in published)
+    identity_comparable = receipt_schema_supported and local_known and published_known
+
+    if identity_comparable:
+        local_counts = Counter(resolve_plugin_identity_key(item) for item in local)
+        published_counts = Counter(resolve_plugin_identity_key(item) for item in published)
+    else:
+        # A current receipt without identity metadata is still useful for a
+        # degraded name inventory, but never supports an identity verdict.
+        local_counts = Counter(item["name"] for item in local)
+        published_counts = Counter(item["name"] for item in published)
+
+    local_only = _counter_difference(local, local_counts - published_counts, identity_comparable)
+    published_only = _counter_difference(published, published_counts - local_counts, identity_comparable)
+    duplicates = _find_duplicates(local, published)
+    if not receipt_schema_supported or receipt is None:
+        inventory_state = "unknown"
+        local_only = []
+        published_only = []
+    elif duplicates:
+        inventory_state = "ambiguous"
+    elif not identity_comparable or unknown_identity:
+        inventory_state = "unknown"
+    elif local_only or published_only:
+        inventory_state = "differs"
+    else:
+        inventory_state = "match"
+
+    if local_generation and published_generation:
+        payload_state = "exact" if local_generation == published_generation else "differs"
+    else:
+        payload_state = "unknown"
+
+    dependencies_changed: list[str] = []
+    dependency_supported = bool(published_raw) and all(
+        _receipt_requirement_digest(item)[0] for item in published_raw
+    )
+    if dependency_supported:
+        for raw in published_raw:
+            name = str(raw.get("name") or "")
+            supported, expected = _receipt_requirement_digest(raw)
+            actual = local_requirements.get(name)
+            if supported and expected != actual:
+                dependencies_changed.append(name)
+        dependencies_state = "changed" if dependencies_changed else "same"
+    else:
+        dependencies_state = "unknown"
+
+    return {
+        "status": "ok",
+        "inventory_state": inventory_state,
+        "payload_state": payload_state,
+        "local_only": sorted(local_only, key=_entry_sort_key),
+        "published_only": sorted(published_only, key=_entry_sort_key),
+        "duplicates": duplicates,
+        "unknown_identity": unknown_identity,
+        "dependencies_changed": sorted(set(dependencies_changed), key=str.casefold),
+        "dependencies_state": dependencies_state,
+        "receipt_schema_supported": bool(receipt_schema_supported),
+        "local_generation": local_generation or None,
+        "published_generation": published_generation,
+    }
+
+
+def resolve_plugin_identity_key(entry: Mapping[str, Any]) -> str:
+    return str(entry.get("identity") or entry.get("name") or "").casefold()
+
+
+def _entry_sort_key(entry: Mapping[str, Any]) -> tuple[str, str]:
+    return (str(entry.get("name") or "").casefold(), str(entry.get("name") or ""))
+
+
+def _counter_difference(
+    entries: list[dict[str, Any]], difference: Counter[str], identity_mode: bool
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    remaining = Counter(difference)
+    for entry in sorted(entries, key=_entry_sort_key):
+        key = resolve_plugin_identity_key(entry) if identity_mode else entry["name"]
+        if remaining[key] > 0:
+            result.append(entry)
+            remaining[key] -= 1
+    return result
+
+
+def _find_duplicates(local: list[dict[str, Any]], published: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, set[str]] = defaultdict(set)
+    displays: dict[str, str] = {}
+    for entry in [*local, *published]:
+        identity = entry.get("identity")
+        if not identity:
+            continue
+        key = str(identity).casefold()
+        grouped[key].add(str(entry["name"]))
+        displays.setdefault(key, str(identity))
+    return [
+        {"identity": displays[key], "names": sorted(names, key=lambda value: (value.casefold(), value))}
+        for key, names in sorted(grouped.items()) if len(names) > 1
+    ]
+
+
 def register_model_library_routes(
     server: Any,
     node_dir: str | Path,
     comfyui_root: str | Path,
     resolver: DependencyResolver | None = None,
+    *,
+    custom_nodes_volume: Any | None = None,
+    custom_nodes_volume_factory: Callable[[str], Any] | None = None,
 ) -> None:
     """Register the Studio Model Library + dependency routes on *server*."""
     node_dir = str(node_dir)
@@ -331,6 +582,80 @@ def register_model_library_routes(
                 "note": _CUSTOM_NODE_INSTALL_NOTE,
             }
         )
+
+    @server.routes.get("/comfymodal/studio/custom-nodes/sync-status")
+    async def custom_nodes_sync_status(request: web.Request) -> web.Response:
+        """Compare the local publication candidate with the read-only receipt."""
+        try:
+            source_root = resolve_custom_nodes_root(node_dir)
+            try:
+                provenance = registry.list_records()
+            except Exception:
+                provenance = []
+            provenance = [item for item in provenance if isinstance(item, Mapping)]
+        except Exception:
+            return web.json_response({
+                "status": "ok",
+                "inventory_state": "unknown",
+                "payload_state": "unknown",
+                "local_only": [],
+                "published_only": [],
+                "duplicates": [],
+                "unknown_identity": [],
+                "dependencies_changed": [],
+                "dependencies_state": "unknown",
+                "receipt_schema_supported": False,
+                "local_generation": None,
+                "published_generation": None,
+            })
+
+        receipt = None
+        receipt_supported = False
+        try:
+            volume = custom_nodes_volume
+            if volume is None:
+                volume = await asyncio.to_thread(
+                    get_volume,
+                    CUSTOM_NODES_VOLUME_NAME,
+                    custom_nodes_volume_factory,
+                )
+            receipt = await asyncio.to_thread(
+                read_receipt,
+                volume,
+                volume_name=CUSTOM_NODES_VOLUME_NAME,
+            )
+            receipt_supported = True
+        except (ReceiptError, OSError, ValueError, TypeError):
+            # A missing, old, or corrupt receipt is not evidence of a remote
+            # difference.  Continue with local generation only.
+            receipt = None
+        except Exception:
+            _log.exception("Custom-node sync receipt read failed")
+
+        try:
+            result = _sync_status_payload(
+                root=source_root,
+                receipt=receipt,
+                provenance_records=provenance,
+                receipt_schema_supported=receipt_supported,
+            )
+        except Exception:
+            _log.exception("Custom-node sync status failed")
+            result = {
+                "status": "ok",
+                "inventory_state": "unknown",
+                "payload_state": "unknown",
+                "local_only": [],
+                "published_only": [],
+                "duplicates": [],
+                "unknown_identity": [],
+                "dependencies_changed": [],
+                "dependencies_state": "unknown",
+                "receipt_schema_supported": False,
+                "local_generation": None,
+                "published_generation": None,
+            }
+        return web.json_response(result)
 
     # ── Dependencies ────────────────────────────────────────────────────
 
