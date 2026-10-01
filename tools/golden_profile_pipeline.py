@@ -271,6 +271,11 @@ def analyze(session_dir: Path) -> int:
     )
     calls = ftr._build_calls(events)
     ftr._reconstruct_parents(calls)
+    # _build_calls produces independent rows, so the 1.26M raw event dicts are
+    # dead weight from here on. A raw event row is ~1 KB, so holding them for the
+    # rest of the run cost roughly a gigabyte of resident memory for nothing.
+    events = None
+    del events
     lap(f"normalized calls: {len(calls)}")
 
     config = ftr._parse_trace_config(session)

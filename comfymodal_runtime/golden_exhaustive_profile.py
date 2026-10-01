@@ -619,6 +619,7 @@ def build_exhaustive_calls(
     processes: Sequence[ProcessTrace],
     *,
     parent_calls: Sequence[Mapping[str, Any]] | None = None,
+    reuse_parent_rows: bool = False,
 ) -> list[dict[str, Any]]:
     """Return one normalized call row per captured Python invocation.
 
@@ -626,12 +627,21 @@ def build_exhaustive_calls(
     exhaustive view cannot disagree with ``calls.csv.gz``.  Each child process is
     normalized with the *same* normalizer, which is what makes the merged view
     comparable rather than a second dialect.
+
+    ``reuse_parent_rows`` mutates the supplied rows in place instead of copying
+    them.  A call row is ~2 KB of dict, so copying 1.26M of them costs about
+    2.5 GB of resident memory for a table the caller is about to discard.  Only
+    pass True when the caller genuinely does not need its own copy afterwards --
+    the rows are enriched with ``process_role``, ``span_ok`` and the span bounds.
     """
     report = _report_module()
     rows: list[dict[str, Any]] = []
     for process in processes:
         if process.role == "parent" and parent_calls is not None:
-            calls = [dict(call) for call in parent_calls]
+            if reuse_parent_rows:
+                calls = list(parent_calls)  # type: ignore[arg-type]
+            else:
+                calls = [dict(call) for call in parent_calls]  # type: ignore[assignment]
         else:
             events = report.parse_chrome_trace_events(process.data or {})
             calls = report._build_calls(events)  # noqa: SLF001 - shared normalizer
@@ -2541,7 +2551,12 @@ def analyze(
     ))
     calls = build_exhaustive_calls(
         processes,
-        parent_calls=list(parent_calls) if parent_calls is not None else None,
+        parent_calls=parent_calls,
+        # parent_calls is not read again after this point (see the only other
+        # reference above), so enrich the caller's rows instead of duplicating
+        # them. A call row is ~2 KB, so the copy cost ~2.5 GB on a 1.26M-event
+        # request and was a large share of analyze's resident memory.
+        reuse_parent_rows=parent_calls is not None,
     )
     _lap("build_exhaustive_calls calls=%d" % len(calls))
     children = _children_map(calls)
@@ -3835,7 +3850,29 @@ def _root_call_of(profile: Mapping[str, Any]) -> Mapping[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _calls_csv_rows(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _calls_csv_sort_key(call: Mapping[str, Any], base: float):
+    """Sort key for one call row, derived from the call instead of the row.
+
+    Sorting the calls (existing dicts) and then yielding rows keeps the whole
+    table out of memory: an 8M-call request previously materialised 8M row
+    dicts here and died with MemoryError before the CSV was written.
+    """
+    span = _span(call)
+    return (
+        str(call.get("process_role")),
+        _safe_int(call.get("pid")) or 0,
+        _us_to_ms(span[0] - base) if span else float("inf"),
+        _safe_int(call.get("event_index")) or 0,
+    )
+
+
+def _calls_csv_rows(profile: Mapping[str, Any]) -> Iterable[dict[str, Any]]:
+    """Yield one row per call, in the deterministic CSV order.
+
+    Streaming: the rows are never all resident at once, so peak memory is the
+    call table plus the parent index rather than the call table plus a second
+    full table of expanded rows.
+    """
     root = profile.get("root") or {}
     root_span = root.get("span")
     base = float(root_span[0]) if root_span else 0.0
@@ -3843,7 +3880,7 @@ def _calls_csv_rows(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
     by_index = {
         (call.get("pid"), call.get("event_index")): call for call in calls
     }
-    rows: list[dict[str, Any]] = []
+    calls.sort(key=lambda call: _calls_csv_sort_key(call, base))
     for call in calls:
         span = _span(call)
         parent_function = ""
@@ -3852,7 +3889,7 @@ def _calls_csv_rows(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
             parent = by_index.get((call.get("pid"), parent_index))
             if parent is not None:
                 parent_function = _qualified_name(parent.get("name"))
-        rows.append({
+        yield {
             "event_index": call.get("event_index"),
             "process_role": call.get("process_role"),
             "pid": call.get("pid"),
@@ -3876,21 +3913,16 @@ def _calls_csv_rows(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
             "child_overlap_ms": call.get("child_overlap_ms"),
             "exclusive_self_ms": call.get("exclusive_self_ms") if span else "",
             "complete": bool(call.get("complete")),
-        })
-    rows.sort(key=lambda r: (
-        str(r["process_role"]), _safe_int(r["pid"]) or 0,
-        _safe_float(r["start_offset_ms"]) if r["start_offset_ms"] != "" else float("inf"),
-        _safe_int(r["event_index"]) or 0,
-    ))
-    return rows
+        }
 
 
-def _write_gzip_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
+def _write_gzip_csv(path: Path, rows: Iterable[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
     """Write a deterministic gzipped CSV (mtime=0, no stored filename).
 
-    Streamed straight into the compressor. Buffering the whole table in a
-    StringIO first materialised a ~300 MB string to produce a 13 MB artifact,
-    and that buffer was a large part of write_artifacts' cost and peak RSS.
+    Streamed straight into the compressor, from an iterable of rows. Buffering
+    the whole table in a StringIO first materialised a ~300 MB string to
+    produce a 13 MB artifact, and that buffer was a large part of
+    write_artifacts' cost and peak RSS.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as raw_fh:
