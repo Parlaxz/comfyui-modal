@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.v2_control import environment as env_mod
+
 # Parent-ComfyUI root the plan builder needs: ``build_execution_plan`` lazily
 # imports ``execution`` (validation proof) and ``nodes`` (registry fingerprint)
 # from the parent ComfyUI tree, which is NOT on this harness's sys.path.  Add
@@ -627,8 +629,8 @@ GOLDEN_P1_SNAPSHOT_ROLE_COUNTERS = (
 
 
 def _load_workspace() -> dict[str, Any]:
-    frozen_id = os.environ.get("MODAL_WORKSPACE_ID", "").strip()
-    frozen_label = os.environ.get("MODAL_WORKSPACE_LABEL", "").strip()
+    frozen_id = os.environ.get(env_mod.V2CTL_WORKSPACE_ID_ENV, "").strip()
+    frozen_label = os.environ.get(env_mod.V2CTL_WORKSPACE_LABEL_ENV, "").strip()
     frozen_token_id = os.environ.get("MODAL_TOKEN_ID", "").strip()
     frozen_token_secret = os.environ.get("MODAL_TOKEN_SECRET", "").strip()
     if frozen_id and frozen_token_id and frozen_token_secret:

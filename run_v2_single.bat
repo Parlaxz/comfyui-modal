@@ -414,12 +414,12 @@ if not defined MODAL_TOKEN_SECRET (
     echo === ERROR: v2ctl frozen MODAL_TOKEN_SECRET missing; refusing remote operation ===
     exit /b 1
 )
-if not defined MODAL_WORKSPACE_ID (
-    echo === ERROR: v2ctl frozen MODAL_WORKSPACE_ID missing; refusing remote operation ===
+if not defined COMFYMODAL_V2CTL_WORKSPACE_ID (
+    echo === ERROR: v2ctl frozen COMFYMODAL_V2CTL_WORKSPACE_ID missing; refusing remote operation ===
     exit /b 1
 )
-if not defined MODAL_WORKSPACE_LABEL (
-    echo === ERROR: v2ctl frozen MODAL_WORKSPACE_LABEL missing; refusing remote operation ===
+if not defined COMFYMODAL_V2CTL_WORKSPACE_LABEL (
+    echo === ERROR: v2ctl frozen COMFYMODAL_V2CTL_WORKSPACE_LABEL missing; refusing remote operation ===
     exit /b 1
 )
 

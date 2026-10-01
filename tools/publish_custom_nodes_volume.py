@@ -41,6 +41,7 @@ from tools.v2_control.custom_nodes import (
     publish_or_skip,
 )
 from tools.v2_control.locking import DeployLock
+from tools.v2_control import environment as env_mod
 
 import modal_workspaces
 
@@ -69,9 +70,9 @@ def _resolve_custom_nodes_root() -> str:
 
 def _load_active_workspace() -> dict:
     """Return v2ctl's frozen destination, or resolve it for standalone use."""
-    if os.environ.get("COMFYMODAL_V2CTL_DESTINATION_FROZEN") == "1":
-        workspace_id = os.environ.get("MODAL_WORKSPACE_ID", "").strip()
-        label = os.environ.get("MODAL_WORKSPACE_LABEL", "").strip()
+    if os.environ.get(env_mod.V2CTL_DESTINATION_FROZEN_ENV) == "1":
+        workspace_id = os.environ.get(env_mod.V2CTL_WORKSPACE_ID_ENV, "").strip()
+        label = os.environ.get(env_mod.V2CTL_WORKSPACE_LABEL_ENV, "").strip()
         token_id = os.environ.get("MODAL_TOKEN_ID", "").strip()
         token_secret = os.environ.get("MODAL_TOKEN_SECRET", "").strip()
         if not all((workspace_id, label, token_id, token_secret)):
