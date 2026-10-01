@@ -1528,6 +1528,69 @@ def test_stage_coverage_excludes_the_stage_own_span():
     assert "measurement_unavailable" in diag["narrative"]
 
 
+def test_blocking_wait_is_separated_from_real_self_time():
+    """A frame that waits on another lane did not burn CPU.
+
+    `wall - child_union` charges the entire wait to self time, which reads as
+    "this function used 3.5 seconds of CPU" when the truth is "this thread was
+    blocked for 3.5 seconds while another lane did the work".
+    """
+    waiter = mkcall("source_open_read", 0.0, 3_569_485.0, pid=2, tid=2)
+    worker = mkcall("_read_golden_m2_clip", 0.0, 3_569_400.0, pid=2, tid=99)
+
+    wait = gep.blocking_wait_ms(waiter, [waiter, worker])
+
+    assert wait == pytest.approx(3569.4, rel=1e-3)
+    # Self time was the whole 3569.5 ms; after removing the wait there is none.
+    self_ms = 3569.485
+    assert max(0.0, self_ms - wait) == pytest.approx(0.085, abs=0.2)
+
+
+def test_blocking_wait_ignores_frames_that_merely_contain_the_caller():
+    # The root contains the waiting frame; it is not "work it waited for".
+    waiter = mkcall("source_open_read", 100.0, 200.0, pid=2, tid=2)
+    root = mkcall("golden_parallel_execute", 0.0, 10_000.0, pid=2, tid=2)
+    assert gep.blocking_wait_ms(waiter, [waiter, root]) == 0.0
+
+
+def test_blocking_wait_is_zero_without_other_lanes():
+    solo = mkcall("work", 0.0, 500.0, pid=2, tid=2)
+    assert gep.blocking_wait_ms(solo, [solo]) == 0.0
+
+
+def test_stage_window_separates_enclosing_nested_and_concurrent():
+    """The root measures a stage; it must not be counted as explaining it.
+
+    Single-lane union over a stage window is always the stage wall, because the
+    enclosing root swallows the measurement whole.
+    """
+    root = mkcall("golden_parallel_execute", 0.0, 10_000_000.0, pid=2, tid=2,
+                  cat=gep.GOLDEN_ROOT_CATEGORY)
+    stage = mkcall("golden_unet_load", 100_000.0, 9_000_000.0, pid=2, tid=2)
+    inner = mkcall("golden.unet.source_h2d_transport",
+                   500_000.0, 4_500_000.0, pid=2, tid=2)
+    other = mkcall("golden_clip_forward", 200_000.0, 5_200_000.0, pid=2, tid=80)
+
+    out = gep.partition_stage_window(stage, (100_000.0, 9_000_000.0),
+                                     [root, stage, inner, other], 2)
+
+    assert [c["name"] for c in out["enclosing"]] == ["golden_parallel_execute"]
+    assert [c["name"] for c in out["nested"]] == ["golden.unet.source_h2d_transport"]
+    assert [c["name"] for c in out["concurrent"]] == ["golden_clip_forward"]
+    assert out["nested_union_ms"] == pytest.approx(4000.0)
+    assert out["concurrent_union_ms"] == pytest.approx(5000.0)
+    # The enclosing root is never folded into the stage's own numbers.
+    assert out["nested_union_ms"] < 9000.0
+
+
+def test_stage_window_ignores_other_processes():
+    stage = mkcall("golden_unet_load", 0.0, 5_000.0, pid=2, tid=2)
+    foreign = mkcall("c0_worker_read", 100.0, 4_000.0, pid=48, tid=7)
+    out = gep.partition_stage_window(stage, (0.0, 5_000.0), [stage, foreign], 2)
+    assert out["concurrent"] == []
+    assert out["nested"] == []
+
+
 def test_manifest_sidecar_is_never_counted_as_a_process(tmp_path):
     raw = tmp_path / "s" / "raw"
     write_trace(raw, "viztracer.json.gz", full_stage_events())

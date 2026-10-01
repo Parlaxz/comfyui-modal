@@ -1568,6 +1568,8 @@ def aggregate_functions(
                 "call_count": 0,
                 "inclusive_ms": 0.0,
                 "exclusive_ms": 0.0,
+                "blocking_wait_ms": 0.0,
+                "self_after_blocking_ms": 0.0,
                 "max_call_ms": 0.0,
                 "complete_calls": 0,
                 "incomplete_calls": 0,
@@ -1586,11 +1588,17 @@ def aggregate_functions(
         exclusive = _safe_float(call.get("exclusive_self_ms"))
         if exclusive is not None:
             bucket["exclusive_ms"] += exclusive
+        bucket["blocking_wait_ms"] += _safe_float(call.get("blocking_wait_ms")) or 0.0
+        bucket["self_after_blocking_ms"] += (
+            _safe_float(call.get("self_after_blocking_ms")) or 0.0
+        )
     result = []
     for bucket in buckets.values():
         bucket["process_roles"] = sorted(bucket["process_roles"])
         bucket["inclusive_ms"] = round(bucket["inclusive_ms"], 3)
         bucket["exclusive_ms"] = round(bucket["exclusive_ms"], 3)
+        bucket["blocking_wait_ms"] = round(bucket["blocking_wait_ms"], 3)
+        bucket["self_after_blocking_ms"] = round(bucket["self_after_blocking_ms"], 3)
         bucket["max_call_ms"] = round(bucket["max_call_ms"], 3)
         bucket["pct_of_stage_wall"] = (
             round(bucket["inclusive_ms"] / wall_ms * 100.0, 3)
@@ -1737,6 +1745,119 @@ def _count_subtree(
             total += 1
             stack.append(child_key)
     return total
+
+
+def partition_stage_window(
+    stage_call: Mapping[str, Any],
+    stage_span: tuple[float, float],
+    calls: Sequence[Mapping[str, Any]],
+    pid: Any,
+) -> dict[str, Any]:
+    """Split every record in a stage window into enclosing / nested / concurrent.
+
+    A stage's wall is measured on one thread, but Golden's work inside it is not
+    confined to that thread: the overlap schedule runs a sibling stage body on a
+    private executor thread, and a blocking stage (``source_open_read``) sits on
+    one lane while the source pool does the work on another.  Attributing a stage
+    by its own thread alone therefore drops real, captured work -- 37,499 of
+    37,506 records in ``golden_clip_load``, and the whole 5258 ms of
+    ``golden_clip_forward`` overlapping ``golden_unet_load``.
+
+    Three disjoint groups, because they mean different things to a reader:
+
+    ``enclosing``
+        Frames that *contain* the whole stage window (the root). They measure the
+        stage, they do not explain it, and are excluded from coverage.
+    ``nested``
+        Records on the stage's own thread, strictly inside the window. This is
+        the stage's real body.
+    ``concurrent``
+        Records on other threads of the same process that overlap the window but
+        do not contain it. This is work the stage waited for, or ran in parallel.
+
+    Coverage is the union of ``nested`` and ``concurrent`` minus whatever
+    ``enclosing`` already accounts for, so a stage can never be reported as
+    explained by the root that measures it.
+    """
+    stage_pid = stage_call.get("pid")
+    own_tid = stage_call.get("tid")
+    start, end = stage_span
+    nested: list[Mapping[str, Any]] = []
+    concurrent: list[Mapping[str, Any]] = []
+    enclosing: list[Mapping[str, Any]] = []
+    for call in calls:
+        if not call.get("span_ok"):
+            continue
+        if pid is not None and call.get("pid") != pid:
+            continue
+        span = _span(call)
+        if span is None:
+            continue
+        c_start, c_end = span
+        if c_start <= start + 1e-6 and c_end >= end - 1e-6:
+            # Contains the stage window (or is it): measures, does not explain.
+            if (c_start, c_end) != (start, end):
+                enclosing.append(call)
+            continue
+        if c_end <= start + 1e-6 or c_start >= end - 1e-6:
+            continue
+        if call.get("tid") == own_tid:
+            nested.append(call)
+        else:
+            concurrent.append(call)
+
+    def union_ms(rows: Sequence[Mapping[str, Any]]) -> float:
+        iv = [(_safe_float(r.get("start_us")), _safe_float(r.get("end_us"))) for r in rows]
+        iv = [(a, b) for a, b in iv if a is not None and b is not None and b >= a]
+        return round(_us_to_ms(_union_length(iv) or 0.0) or 0.0, 3)
+
+    nested.sort(key=_call_sort_key)
+    concurrent.sort(key=_call_sort_key)
+    return {
+        "nested": nested,
+        "concurrent": concurrent,
+        "enclosing": enclosing,
+        "nested_union_ms": union_ms(nested),
+        "concurrent_union_ms": union_ms(concurrent),
+        "enclosing_count": len(enclosing),
+        "own_tid": own_tid,
+        "stage_pid": stage_pid,
+    }
+
+
+def blocking_wait_ms(
+    call: Mapping[str, Any],
+    calls: Sequence[Mapping[str, Any]],
+) -> float:
+    """Return how long *call*'s own lane was blocked on another lane's work.
+
+    A frame that blocks on a pipe, a volume read or a sibling task has no
+    same-thread children for the duration, so ``wall - child_union`` charges the
+    entire wait to its own self time.  That reads as "this function burned 3.5
+    seconds of CPU" when the truth is "this thread waited 3.5 seconds while
+    another thread did the work".  The two need to be separable, because only the
+    second is a real optimization target for the waiting frame.
+    """
+    span = _span(call)
+    if span is None:
+        return 0.0
+    own = (call.get("pid"), call.get("tid"))
+    iv: list[tuple[float, float]] = []
+    for other in calls:
+        if not other.get("span_ok"):
+            continue
+        if (other.get("pid"), other.get("tid")) == own:
+            continue
+        ospan = _span(other)
+        if ospan is None:
+            continue
+        # Only work that overlaps and does not merely contain the wait.
+        if ospan[1] <= span[0] + 1e-6 or ospan[0] >= span[1] - 1e-6:
+            continue
+        if ospan[0] <= span[0] + 1e-6 and ospan[1] >= span[1] - 1e-6:
+            continue
+        iv.append(ospan)
+    return round(_us_to_ms(_union_length(iv) or 0.0) or 0.0, 3)
 
 
 def stage_diagnosis(
@@ -2463,6 +2584,28 @@ def analyze(
         direct_children = children.get(
             (stage_call.get("pid"), stage_call.get("event_index")), ()
         )
+        window = partition_stage_window(
+            stage_call, stage_span, calls, stage_call.get("pid"),
+        )
+        nested = window["nested"]
+        concurrent = window["concurrent"]
+        # The stage's own body plus everything that ran alongside it on another
+        # lane. Enclosing frames are excluded: the root measures this stage, it
+        # does not explain it.
+        all_content = list(subtree) + [
+            c for c in concurrent if not any(c is n for n in subtree)
+        ]
+        content_functions = aggregate_functions(all_content, wall_ms=wall_ms)
+        # Coverage counts frames strictly INSIDE the stage window. The stage's
+        # own record spans the window by construction, so including it would
+        # report 100% attributed for every stage and hide exactly the residual a
+        # reader needs -- the same trap as counting the root as its own child.
+        inner_ids = {id(c) for c in nested} | {id(c) for c in concurrent}
+        content_union = _us_to_ms(_union_length([
+            (float(c["span_start_us"]), float(c["span_end_us"]))
+            for c in all_content
+            if c.get("span_ok") and id(c) in inner_ids
+        ])) or 0.0
         stage_records.append({
             "stage": stage,
             "call": stage_call,
@@ -2479,6 +2622,13 @@ def analyze(
             "subtree": subtree,
             "direct_children": list(direct_children),
             "functions": functions,
+            "nested_calls": nested,
+            "concurrent_calls": concurrent,
+            "enclosing_count": window["enclosing_count"],
+            "nested_union_ms": window["nested_union_ms"],
+            "concurrent_union_ms": window["concurrent_union_ms"],
+            "content_union_ms": round(min(content_union, wall_ms), 3),
+            "content_functions": content_functions,
             "repeated": repeated,
             "bubbles": bubbles,
             "descendant_union_ms": round(descendant_union_ms, 3),
@@ -2521,6 +2671,18 @@ def analyze(
         c_function_tracing=c_function_tracing,
         enclosing_frames=[c for c in root_owner_calls if c is not root],
     )
+
+    # Split every call's self time into real self time and time spent blocked on
+    # another lane. A frame that waits on a pipe, a volume read or a sibling
+    # task has no same-thread children for the duration, so plain
+    # `wall - child_union` charges the whole wait to its own self time and reads
+    # as CPU burn. Recorded per call so every table can show both.
+    for call in calls:
+        call["blocking_wait_ms"] = blocking_wait_ms(call, calls)
+        self_ms = _safe_float(call.get("exclusive_self_ms")) or 0.0
+        call["self_after_blocking_ms"] = round(
+            max(0.0, self_ms - float(call["blocking_wait_ms"])), 3,
+        )
 
     profile.update({
         "root": {
@@ -2956,6 +3118,46 @@ def _stage_gantt_lines(stage: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _stage_lane_lines(stage: Mapping[str, Any]) -> list[str]:
+    """Per-lane occupancy of a stage window, split nested vs concurrent.
+
+    Reported per lane rather than as one union: a single union over every lane
+    is always the stage wall, because the frame that measures the stage contains
+    the window and would swallow the measurement whole.
+    """
+    nested = list(stage.get("nested_calls") or [])
+    concurrent = list(stage.get("concurrent_calls") or [])
+    if not nested and not concurrent:
+        return ["  no other traced work inside this stage window."]
+    lanes: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for row, kind in [(c, "nested") for c in nested] + [
+        (c, "concurrent") for c in concurrent
+    ]:
+        key = (row.get("pid"), row.get("tid"))
+        bucket = lanes.setdefault(key, {"nested": [], "concurrent": []})
+        bucket[kind].append(row)
+    out = [
+        "  %-22s %-10s %8s %11s %11s" % (
+            "lane", "kind", "calls", "union ms", "self ms",
+        ),
+    ]
+    for key in sorted(lanes, key=lambda k: (str(k[0]), str(k[1]))):
+        for kind in ("nested", "concurrent"):
+            rows = lanes[key][kind]
+            if not rows:
+                continue
+            spans = [
+                (float(r["span_start_us"]), float(r["span_end_us"]))
+                for r in rows if r.get("span_ok")
+            ]
+            union = (_us_to_ms(_union_length(spans)) or 0.0) if spans else 0.0
+            self_ms = sum(float(r.get("exclusive_self_ms") or 0.0) for r in rows)
+            out.append("  pid=%-6s tid=%-9s %8d %11.1f %11.1f" % (
+                key[0], key[1], len(rows), union, self_ms,
+            ))
+    return out
+
+
 def _stage_function_table(stage: Mapping[str, Any]) -> list[str]:
     """Function cost table shown before each stage Gantt."""
     wall = _safe_float(stage.get("wall_ms"))
@@ -3059,6 +3261,41 @@ def _bubble_lines(stage: Mapping[str, Any]) -> list[str]:
     return out
 
 
+    lines.extend(["", "Lanes inside this stage window:", ""])
+    lines.extend(_stage_lane_lines(stage))
+
+    lines.extend(["", "Work running concurrently on other threads:", ""])
+    concurrent = list(stage.get("concurrent_calls") or [])
+    if not concurrent:
+        lines.append("  none: this stage's window contains no work on any other thread.")
+    else:
+        lines.extend(_table(
+            ["Function", "Lane", "Wall ms", "Self ms", "Calls"],
+            [
+            [
+                _qualified_name(c.get("name")),
+                f"tid:{c.get('tid')}",
+                    round(float(c.get("wall_ms") or 0.0), 1),
+                    round(float(c.get("exclusive_self_ms") or 0.0), 1),
+                    1,
+                ]
+                for c in sorted(
+                    concurrent,
+                    key=lambda c: -float(c.get("wall_ms") or 0.0),
+                )[:40]
+            ],
+        ))
+        lines.append("")
+        lines.append(
+            "  concurrent union: %.1f ms of work this stage waited for or ran "
+            "alongside" % float(stage.get("concurrent_union_ms") or 0.0)
+        )
+
+    lines.extend(["", "Exhaustive waterfall:", ""])
+    lines.extend(_code(_stage_gantt_lines(stage)))
+    return lines
+
+
 def _stage_section(stage: Mapping[str, Any]) -> list[str]:
     lines: list[str] = []
     span = stage.get("span")
@@ -3067,12 +3304,19 @@ def _stage_section(stage: Mapping[str, Any]) -> list[str]:
         f"start offset from root: {_fmt_ms(stage.get('start_offset_ms'))} ms",
         f"source: {(stage.get('call') or {}).get('source_file')}"
         f":{(stage.get('call') or {}).get('source_line')}",
-        f"traced calls under this stage: {len(stage.get('subtree') or [])}",
+        f"traced calls in this stage's own body: {len(stage.get('subtree') or [])}",
         f"records carrying this stage name: {stage.get('candidates_seen')}",
-        f"traced child union on owner lane: "
+        f"owner-lane child union: "
         f"{_fmt_ms(stage.get('descendant_union_ms'))} ms",
-        f"residual (self/native/untraced): "
-        f"{_fmt_ms(max(0.0, float(stage.get('wall_ms') or 0) - float(stage.get('descendant_union_ms') or 0)))} ms",
+        f"concurrent union (other threads in the window): "
+        f"{_fmt_ms(stage.get('concurrent_union_ms'))} ms",
+        f"total content attributed: "
+        f"{_fmt_ms(stage.get('content_union_ms'))} ms "
+        f"of {_fmt_ms(stage.get('wall_ms'))} ms wall "
+        f"({_fmt_pct(stage.get('content_union_ms'), stage.get('wall_ms'))}%)",
+        f"unattributed (GPU/C/native or a lane with no tracer): "
+        f"{_fmt_ms(max(0.0, float(stage.get('wall_ms') or 0) - float(stage.get('content_union_ms') or 0)))} ms",
+        f"enclosing frames excluded from the above: {stage.get('enclosing_count')}",
         "",
     ])
     lines.extend(_stage_function_table(stage))
