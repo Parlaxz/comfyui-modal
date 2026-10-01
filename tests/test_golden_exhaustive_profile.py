@@ -1296,6 +1296,79 @@ def test_roles_are_never_invented(tmp_path):
     assert bridge.process_role_for_entrypoint([]) == "other:unknown"
 
 
+# ---------------------------------------------------------------------------
+# Wall-clock coverage: what fraction of the root any Python frame explains
+# ---------------------------------------------------------------------------
+
+
+def _coverage_profile(root_wall_ms, inner_spans_us, *, root_span_us=None,
+                     c_tracing=False, torch=False):
+    """Minimal profile shape for :func:`gep._coverage_split`."""
+    root_span = root_span_us or (0.0, float(root_wall_ms) * 1000.0)
+    return {
+        "root": {"wall_ms": root_wall_ms, "span": root_span},
+        "root_spans_us": [list(root_span)] + [list(s) for s in inner_spans_us],
+        "c_function_tracing": c_tracing,
+        "torch_enabled": torch,
+    }
+
+
+def test_root_record_itself_never_counts_as_coverage():
+    # The root span covers the whole root by construction. Counting it would
+    # make coverage trivially 100% and hide the gap this metric exists to show.
+    split = gep._coverage_split(_coverage_profile(1000.0, [(0.0, 100000.0)]))
+    assert split["python_attributed_ms"] == pytest.approx(100.0)
+    assert split["python_attributed_pct"] == pytest.approx(10.0)
+    assert split["unattributed_ms"] == pytest.approx(900.0)
+
+
+def test_coverage_uses_the_union_so_nesting_is_not_double_counted():
+    # Three nested frames span 100 ms total, not 300 ms.
+    split = gep._coverage_split(_coverage_profile(
+        100.0, [(0.0, 100000.0), (0.0, 60000.0), (20000.0, 100000.0)],
+    ))
+    assert split["python_attributed_ms"] == pytest.approx(100.0)
+    assert split["unattributed_ms"] == pytest.approx(0.0)
+
+
+def test_coverage_never_exceeds_the_root_wall():
+    # A child frame that overruns the root must not inflate the split.
+    split = gep._coverage_split(_coverage_profile(
+        100.0, [(0.0, 500000.0)], root_span_us=(0.0, 100000.0),
+    ))
+    assert split["python_attributed_ms"] == pytest.approx(100.0)
+    assert split["unattributed_ms"] == pytest.approx(0.0)
+
+
+def test_trailing_tail_with_no_python_frame_is_reported_separately():
+    # Frames end at 1360 ms inside an 8922 ms root. The 7558 ms tail has no
+    # frame spanning it at all, which is a different fact from C-level time.
+    split = gep._coverage_split(_coverage_profile(
+        8921.899, [(0.0, 1360000.0)], root_span_us=(0.0, 8921899.0),
+    ))
+    assert split["python_attributed_ms"] == pytest.approx(1360.0)
+    assert split["trailing_unframed_ms"] == pytest.approx(7561.899, rel=1e-3)
+    lines = "\n".join(gep._coverage_lines({"coverage_split": split}))
+    assert "no Python frame spans it" in lines
+
+
+def test_coverage_names_the_disabled_tracers_that_explain_the_gap():
+    split = gep._coverage_split(_coverage_profile(100.0, [(0.0, 10000.0)]))
+    assert "C_FUNCTION_TRACING=DISABLED" in split["unattributed_basis"]
+    assert "TORCH_PROFILER=DISABLED" in split["unattributed_basis"]
+    enabled = gep._coverage_split(_coverage_profile(
+        100.0, [(0.0, 10000.0)], c_tracing=True, torch=True,
+    ))
+    assert enabled["unattributed_basis"] == []
+
+
+def test_coverage_of_an_empty_root_is_zero_not_an_error():
+    split = gep._coverage_split(_coverage_profile(0.0, []))
+    assert split["python_attributed_ms"] == 0.0
+    assert split["unattributed_ms"] == 0.0
+    assert split["python_attributed_pct"] is None
+
+
 def test_manifest_sidecar_is_never_counted_as_a_process(tmp_path):
     raw = tmp_path / "s" / "raw"
     write_trace(raw, "viztracer.json.gz", full_stage_events())

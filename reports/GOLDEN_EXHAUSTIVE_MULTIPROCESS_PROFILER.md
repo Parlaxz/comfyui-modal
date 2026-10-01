@@ -653,7 +653,38 @@ contract — an attached child trace is discovered as a second process
 `heavy_local` because `import comfymodal_runtime.modal_app` costs ~9.0 s, which
 must not contaminate FAST_UNIT verification.
 
-### 16.5 Open scope decision
+### 16.5 Wall-clock coverage (implemented)
+
+Section 2 now states where the root wall actually went, instead of letting
+exclusive-time arithmetic imply the root function did all of it. Coverage is
+the **union** of captured frames strictly *inside* the root — the root record
+itself spans the whole interval by construction, so including it would make
+coverage trivially 100% and hide the gap this metric exists to show.
+
+Measured across the captured runs:
+
+| trace_id | root wall (ms) | Python-attributed (ms) | pct | unframed tail (ms) |
+|---|---|---|---|---|
+| `14e07018…` (Testing 8) | 1806.0 | 1805.8 | 100.0% | 0.0 |
+| `36101dcd…` | 11323.8 | 1904.7 | 16.8% | 9418.9 |
+| `ed3f97e0…` | 10951.6 | 1504.7 | 13.7% | 9446.6 |
+| `9544340a…` | 13822.1 | 4592.6 | 33.2% | 9229.2 |
+| `63a62380…` | 10344.2 | 1789.6 | 17.3% | 8554.4 |
+| `c43636e3…` | 8921.9 | 1360.0 | 15.2% | 7558.0 |
+
+Two distinct facts are separated, because they have different owners:
+
+* time inside a captured Python frame whose C body is invisible (GPU kernels,
+  `cudaLaunchKernel`) — needs `C_FUNCTION_TRACING` or the torch profiler;
+* an **unframed tail** where no Python frame spans the interval at all — in
+  every Testing 9 run this is 7.5–9.4 s, i.e. the majority of the request.
+
+The Testing 8 run is 100% covered because its root was restore-only (1806 ms),
+the pre-fix behaviour. That contrast is the clearest single measurement in this
+report: the same instrumentation, with a root that spans the real request,
+shows that Python tracing explains only ~15–33% of Golden wall.
+
+### 16.6 Open scope decision
 
 How to account for GPU time is a deliberate choice, not a bug fix:
 

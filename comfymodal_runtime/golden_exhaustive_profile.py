@@ -871,7 +871,7 @@ def _containment_descendants(
 
 
 def _assign_containment_depths(
-    root: Mapping[str, Any],
+    root: dict[str, Any],
     members: Sequence[dict[str, Any]],
 ) -> dict[int, dict[str, Any]]:
     """Return the containment tree over *members* under *root*.
@@ -957,13 +957,14 @@ def resolve_descendants(
         walk(alias, 0)
 
     # Containment pass: everything the root measured, on the root's process.
-    contained = _containment_descendants(root, calls)
-    known = {call["event_index"] for call in collected.values()}
-    fresh = [call for call in contained if call["event_index"] not in known]
-    if fresh:
-        _assign_containment_depths(root, fresh)
-        for call in fresh:
-            collected[(call.get("pid"), call.get("event_index"))] = call
+    if isinstance(root, dict):
+        contained = _containment_descendants(root, calls)
+        known = {call["event_index"] for call in collected.values()}
+        fresh = [call for call in contained if call["event_index"] not in known]
+        if fresh:
+            _assign_containment_depths(root, fresh)
+            for call in fresh:
+                collected[(call.get("pid"), call.get("event_index"))] = call
 
     return sorted(collected.values(), key=_call_sort_key)
 
@@ -2526,7 +2527,20 @@ def analyze(
             root_functions, key=lambda f: (-int(f["call_count"]), str(f["qualified_function"]))
         )[:TOP_N],
         "repeated_setup": repeated_setup_functions(root_functions),
+        # Coverage needs absolute timestamps, not durations: the union of
+        # captured intervals only means something relative to the root's own
+        # start, and a trace can carry durations with a separate origin.
+        "root_spans_us": [
+            [float(c["span_start_us"]), float(c["span_end_us"])]
+            for c in root_subtree
+            if c.get("span_ok") and c.get("span_start_us") is not None
+            and c.get("span_end_us") is not None
+        ],
     })
+
+    # Must run after the root dict exists and before rendering, because the
+    # split is derived from the root wall and the captured intervals.
+    profile["coverage_split"] = _coverage_split(profile)
 
     incomplete_calls = profile["incomplete_calls"]
     profile["contract"] = evaluate_completeness(
@@ -2599,6 +2613,100 @@ def _health_lines(profile: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _coverage_split(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Split root wall into time a traced Python frame encloses, and the rest.
+
+    VizTracer records Python function calls.  Time inside a CUDA kernel or any
+    other C call is invisible to it unless C function tracing is on, so the
+    root wall is *not* the sum of captured intervals.
+
+    The attributed figure is the **union** of captured intervals rather than
+    their sum, because nested frames double-count: summing would report more
+    than the root wall and imply full coverage.  The union is bounded by the
+    root wall, and what it does not cover is a CUDA kernel or C call dispatched
+    from inside a traced frame -- for example an UNet forward whose Python
+    wrapper is captured for 200 ms while the GPU works for 5 s.
+
+    This states both numbers and names the reason for the remainder.  It makes
+    no claim about where the unattributed time went beyond "no Python frame
+    spans it".
+    """
+    root = profile.get("root") or {}
+    wall = float(root.get("wall_ms") or 0.0)
+    spans: list[tuple[float, float]] = [
+        (float(s[0]), float(s[1]))
+        for s in (profile.get("root_spans_us") or [])
+        if len(s) == 2
+    ]
+    spans = [(a, b) for a, b in spans if b >= a]
+
+    # The root record spans the whole root interval by construction, so leaving
+    # it in the union would make coverage trivially 100% and hide the very gap
+    # this reports.  Measure coverage from the frames *inside* the root.
+    root_span = root.get("span")
+    inner = (
+        [(a, b) for a, b in spans if (a, b) != (float(root_span[0]), float(root_span[1]))]
+        if root_span else list(spans)
+    )
+    union_us = _union_length(inner) if inner else 0.0
+    attributed = float(union_us or 0.0) / 1000.0
+    # Never claim more coverage than the root itself measured.
+    if wall > 0.0:
+        attributed = float(min(attributed, wall))
+    unattributed = float(max(0.0, wall - attributed))
+    reasons: list[str] = []
+    if not profile.get("c_function_tracing"):
+        reasons.append("C_FUNCTION_TRACING=DISABLED")
+    if not profile.get("torch_enabled"):
+        reasons.append("TORCH_PROFILER=DISABLED")
+    # A trailing run with no Python frame at all is a different fact from time
+    # inside a captured frame, and the distinction decides who should look next.
+    trailing_ms = 0.0
+    if inner and root_span:
+        trailing_ms = float(max(0.0, float(root_span[1]) - max(b for _a, b in inner))) / 1000.0
+    return {
+        "root_wall_ms": wall,
+        "python_attributed_ms": attributed,
+        "unattributed_ms": unattributed,
+        "python_attributed_pct": (100.0 * attributed / wall) if wall > 0 else None,
+        "unattributed_basis": reasons,
+        "trailing_unframed_ms": trailing_ms,
+    }
+
+
+def _coverage_lines(profile: Mapping[str, Any]) -> list[str]:
+    """Human-readable form of :func:`_coverage_split`."""
+    split = profile.get("coverage_split") or {}
+    wall = float(split.get("root_wall_ms") or 0.0)
+    attributed = float(split.get("python_attributed_ms") or 0.0)
+    unattributed = float(split.get("unattributed_ms") or 0.0)
+    pct = split.get("python_attributed_pct")
+    basis = list(split.get("unattributed_basis") or [])
+    lines = [
+        f"  total Golden wall          {wall:9.1f} ms",
+        f"  inside a traced Py call    {attributed:9.1f} ms"
+        + (f"  ({float(pct):.1f}%)" if pct is not None else ""),
+        f"  NOT Python-attributed      {unattributed:9.1f} ms",
+    ]
+    if unattributed > 0:
+        why = ", ".join(basis) if basis else "no tracing gap recorded"
+        lines.append(f"  unattributed because      {why}")
+        trailing = float(split.get("trailing_unframed_ms") or 0.0)
+        if trailing > 0:
+            # No Python frame spans this at all, so it is not merely a coarse
+            # C-level measurement: nothing at all was recorded here.
+            lines.append(
+                f"  of which unframed tail    {trailing:9.1f} ms"
+                "  (no Python frame spans it)"
+            )
+        lines.append(
+            "  -> that time runs in CUDA/C frames this tracer cannot see."
+            if "C_FUNCTION_TRACING=DISABLED" in basis
+            else "  -> unattributed time is not claimed as Python overhead."
+        )
+    return lines
+
+
 def _summary_lines(profile: Mapping[str, Any]) -> list[str]:
     """Section 2 -- the thirty-second answer."""
     root = profile.get("root") or {}
@@ -2608,8 +2716,10 @@ def _summary_lines(profile: Mapping[str, Any]) -> list[str]:
         f"({root.get('category')}, {root.get('process_role')})",
         f"Captured Python calls under the root: {root.get('call_count')}",
         "",
-        "Canonical stage walls:",
+        "Where the wall actually went:",
     ]
+    lines.extend(_coverage_lines(profile))
+    lines.extend(["", "Canonical stage walls:"])
     stages = [s for s in (profile.get("stages") or []) if s.get("wall_ms") is not None]
     if stages:
         width = max(len(str(s["stage"])) for s in stages)
