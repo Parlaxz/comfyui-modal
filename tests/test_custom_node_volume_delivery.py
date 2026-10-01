@@ -12,6 +12,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 IMPORT_PATH = "/root/comfy/ComfyUI/custom_nodes"
+# Combined mode stages the content-addressed source archive here before the
+# image extracts it into IMPORT_PATH (comfyapp.py `_prepare_custom_node_archive`).
+ARCHIVE_STAGE_DIR = "/root/comfy-build/"
 pytestmark = pytest.mark.fast_unit
 
 
@@ -99,7 +102,16 @@ def _load_comfyapp(delivery: str | None):
 
 
 def _custom_node_copy_calls(image):
-    return [
+    """Return the calls that ship custom-node source into the image.
+
+    ``image`` mode delivers the source either as a directory mount
+    (``add_local_dir``) or, in combined mode, as a single content-addressed
+    archive added with ``add_local_file`` and extracted into the import path.
+    Both satisfy the contract these tests care about: the source ends up inside
+    the image. Detect either so the tests assert behaviour rather than one
+    specific mechanism.
+    """
+    directory_calls = [
         call
         for call in image.calls
         if call[0] == "add_local_dir"
@@ -109,6 +121,22 @@ def _custom_node_copy_calls(image):
             or str(call[1][1]).startswith(IMPORT_PATH + "/")
         )
     ]
+    archive_calls = [
+        call
+        for call in image.calls
+        if call[0] == "add_local_file"
+        and len(call[1]) >= 2
+        and str(call[1][1]).startswith(ARCHIVE_STAGE_DIR)
+    ]
+    extract_calls = [
+        call
+        for call in image.calls
+        if call[0] == "run_commands"
+        and len(call[1]) >= 1
+        and "tar --extract" in str(call[1][0])
+        and IMPORT_PATH in str(call[1][0])
+    ]
+    return directory_calls + archive_calls + extract_calls
 
 
 def test_default_delivery_is_image_and_emits_custom_node_source_copy():
