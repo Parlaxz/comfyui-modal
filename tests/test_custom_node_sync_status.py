@@ -247,3 +247,31 @@ def test_sync_posts_return_pollable_status_and_preserve_refusal_outcomes(tmp_pat
     assert status_body["outcome"] == "destructive_publication_blocked"
     assert "refused" in status_body["message"].lower()
     assert calls == [("publish", [])]
+
+
+def test_sync_publish_lock_refusal_is_not_accepted(tmp_path, monkeypatch):
+    monkeypatch.setenv("COMFYMODAL_CUSTOM_NODE_DELIVERY", "volume")
+    root = tmp_path / "custom_nodes"
+    anchor = root / "comfyui-modal"
+    anchor.mkdir(parents=True)
+    server = _Server()
+    model_library_routes.register_model_library_routes(
+        server,
+        node_dir=anchor,
+        comfyui_root=tmp_path,
+        custom_node_sync_start=lambda operation, expected: {
+            "status": "refused",
+            "state": "refused",
+            "outcome": "lock_held",
+            "message": "Custom-node publication refused: deploy lock is held.",
+            "_http_status": 409,
+        },
+        custom_node_delivery_mode="volume",
+    )
+    response = __import__("asyncio").run(
+        _method_handler(server, "POST", "/comfymodal/studio/custom-nodes/sync")(_Request())
+    )
+    assert response.status == 409
+    body = json.loads(response.body)
+    assert body["status"] == "refused"
+    assert body["outcome"] == "lock_held"
