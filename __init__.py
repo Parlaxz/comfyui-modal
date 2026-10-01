@@ -3273,32 +3273,11 @@ async def _execute_job(item: tuple, item_id: int):
 
 
 def _build_custom_nodes_archive(cn_root: str) -> bytes:
-    import io
-    import tarfile
+    """Compatibility wrapper around the canonical publication archive builder."""
+    from tools.v2_control.custom_nodes import prepare_publication
 
-    def tar_filter(tarinfo):
-        if tarinfo.issym() or tarinfo.islnk():
-            return None
-        if _is_excluded_publication_path(tarinfo.name):
-            return None
-        return tarinfo
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        allowed = set(_iter_syncable_custom_node_dirs(cn_root))
-        for node_dir in (sorted(os.listdir(cn_root)) if os.path.isdir(cn_root) else []):
-            node_path = os.path.join(cn_root, node_dir)
-            if not os.path.isdir(node_path) or os.path.islink(node_path):
-                continue
-            reason = _custom_node_filter_reason(node_dir, node_path) or "production_custom_node"
-            print(
-                f"[comfyui-modal.custom_node_filter] action={'allow' if node_dir in allowed else 'deny'} "
-                f"name={node_dir} reason={reason}",
-                flush=True,
-            )
-        for node_dir in _iter_syncable_custom_node_dirs(cn_root):
-            tar.add(os.path.join(cn_root, node_dir), arcname=node_dir, filter=tar_filter)
-    return buf.getvalue()
+    _identity, archive, _files = prepare_publication(cn_root)
+    return archive
 
 
 async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> dict:

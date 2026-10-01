@@ -55,6 +55,8 @@ class SemanticFile:
     size: int
     sha256: str
     data: bytes
+    mode: int = 0o644
+    source_data: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -352,8 +354,17 @@ def collect_semantic_files(root: str | Path) -> tuple[SemanticFile, ...]:
     files: list[SemanticFile] = []
     for path in iter_publication_files(root_path):
         relative = path.relative_to(root_path).as_posix()
-        data = canonical_publication_bytes(relative, path.read_bytes())
-        files.append(SemanticFile(relative, len(data), hashlib.sha256(data).hexdigest(), data))
+        source_data = path.read_bytes()
+        data = canonical_publication_bytes(relative, source_data)
+        mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+        files.append(SemanticFile(
+            relative,
+            len(data),
+            hashlib.sha256(data).hexdigest(),
+            data,
+            mode=mode,
+            source_data=source_data,
+        ))
     return tuple(sorted(files, key=lambda item: item.path))
 
 
@@ -553,15 +564,42 @@ def build_archive(files: tuple[SemanticFile, ...]) -> bytes:
     output = io.BytesIO()
     with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
         with tarfile.open(fileobj=compressed, mode="w") as archive:
-            for item in files:
-                info = tarfile.TarInfo(item.path)
-                info.size = item.size
+            for item in sorted(files, key=lambda item: item.path):
+                normalized_path = item.path.replace("\\", "/")
+                parts = normalized_path.split("/")
+                if (
+                    not normalized_path
+                    or normalized_path.startswith("/")
+                    or normalized_path.startswith("//")
+                    or (len(normalized_path) >= 2 and normalized_path[1] == ":")
+                    or normalized_path != item.path
+                    or "\x00" in normalized_path
+                    or any(part in ("", ".", "..") for part in parts)
+                ):
+                    raise ValueError(f"unsafe archive member path: {item.path!r}")
+                info = tarfile.TarInfo(normalized_path)
+                payload = item.source_data if item.source_data is not None else item.data
+                info.size = len(payload)
                 info.mtime = 0
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
-                info.mode = 0o644
-                archive.addfile(info, io.BytesIO(item.data))
+                info.mode = stat.S_IMODE(item.mode)
+                archive.addfile(info, io.BytesIO(payload))
     return output.getvalue()
+
+
+def archive_content_digest(files: tuple[SemanticFile, ...]) -> str:
+    """Return a stable cache key for archive bytes without rebuilding them."""
+    digest = hashlib.sha256()
+    for item in sorted(files, key=lambda item: item.path):
+        payload = item.source_data if item.source_data is not None else item.data
+        digest.update(item.path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.S_IMODE(item.mode)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def prepare_publication(root: str | Path, *, identity_provider: Callable[..., Any] | None = None):
@@ -1057,6 +1095,7 @@ __all__ = [
     "RECEIPT_PATH", "GENERATION_RECORD_PATH",
     "CUSTOM_NODES_VOLUME_NAME", "CUSTOM_NODES_PUBLISHER_APP_NAME",
     "collect_semantic_files", "build_source_identity", "build_archive",
+    "archive_content_digest",
     "prepare_publication", "evaluate_receipt", "read_receipt", "read_receipt_async",
     "write_receipt", "write_receipt_async",
     "check_publication_safety", "publication_safety_delta",

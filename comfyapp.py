@@ -8465,6 +8465,35 @@ _FIRST_PARTY_SOURCE_FILE_COUNT, _FIRST_PARTY_SOURCE_BYTES = (
     _prepare_first_party_source_build_context()
 )
 
+
+def _prepare_custom_node_archive(source_root: str) -> tuple[str, str]:
+    """Return one cached archive built from the canonical publication inventory.
+
+    The inventory is collected once and feeds both the publication generation
+    and the archive.  The cache key includes raw bytes and modes, so an
+    executable-bit change cannot reuse an older archive with the same semantic
+    publication generation.
+    """
+    from tools.v2_control.custom_nodes import (
+        archive_content_digest,
+        build_archive,
+        build_source_identity,
+        collect_semantic_files,
+    )
+
+    files = collect_semantic_files(source_root)
+    identity = build_source_identity(source_root, semantic_files=files)
+    archive_key = archive_content_digest(files)
+    cache_root = Path(tempfile.gettempdir()) / "comfymodal-custom-node-archives"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    archive_path = cache_root / f"custom_nodes-{archive_key}.tar.gz"
+    if not archive_path.is_file():
+        archive_data = build_archive(files)
+        temporary = archive_path.with_name(f".{archive_path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(archive_data)
+        os.replace(temporary, archive_path)
+    return str(archive_path), identity.content_generation
+
 # Custom-node requirements are copied and installed one node at a time.  The
 # staged context is deliberately split here as well as in the shell commands:
 # a changed node must not invalidate an unchanged node's parent layer.
@@ -8994,6 +9023,8 @@ _image_base = _LATE_CONFIG_IMAGE
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
     _cn_copy_layer_count = 0
+    _custom_node_archive_path = None
+    _custom_node_archive_generation = None
     # Verified ComfyModal duplicate worktrees/typo copies must never be baked
     # into the image: ComfyUI would import them as extra custom nodes, inflating
     # snapshot startup (2,398 registered nodes in the baseline).  The canonical
@@ -9030,15 +9061,30 @@ if not _INSIDE_MODAL_CONTAINER:
             "/root/comfy/ComfyUI/custom_nodes -> /root/custom_nodes_vol"
         )
     elif CUSTOM_NODE_COPY_MODE == "combined":
-        _image_base = _image_base.add_local_dir(
-            _LOCAL_CUSTOM_NODES,
-            "/root/comfy/ComfyUI/custom_nodes",
+        _custom_node_archive_path, _custom_node_archive_generation = (
+            _prepare_custom_node_archive(_LOCAL_CUSTOM_NODES)
+        )
+        _custom_node_archive_name = os.path.basename(_custom_node_archive_path)
+        _custom_node_archive_destination = (
+            f"/root/comfy-build/{_custom_node_archive_name}"
+        )
+        _image_base = _image_base.add_local_file(
+            _custom_node_archive_path,
+            _custom_node_archive_destination,
             copy=True,
-            ignore=_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
+        ).run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "mkdir -p /root/comfy/ComfyUI/custom_nodes && "
+            f"tar --extract --gzip --no-same-owner --preserve-permissions "
+            f"--file {shlex.quote(_custom_node_archive_destination)} "
+            "--directory /root/comfy/ComfyUI/custom_nodes"
         )
         _cn_copy_layer_count = 1
-        print(f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} layers=1 "
-              f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes")
+        print(
+            f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} "
+            f"layers=1 archive={_custom_node_archive_name} "
+            f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes"
+        )
     else:
         for _node_name in _syncable_node_names:
             _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
@@ -9078,7 +9124,11 @@ if not _INSIDE_MODAL_CONTAINER:
 
     try:
         _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
-        _source_generation = custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        _source_generation = (
+            _custom_node_archive_generation
+            if _custom_node_archive_generation is not None
+            else custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        )
         _baked_manifest["production_custom_node_generation"] = _source_generation
         _maybe_write_baked_manifest(_BAKED_MANIFEST_TEMP, _baked_manifest)
         _baked_nodes = _baked_manifest.get("nodes", {})
