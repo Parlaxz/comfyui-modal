@@ -200,6 +200,39 @@ def stage_of(profile: dict, name: str) -> dict:
     raise AssertionError(f"stage {name} missing; have {[s['stage'] for s in profile['stages']]}")
 
 
+def mkcall(
+    name: str,
+    start_us: float,
+    end_us: float,
+    *,
+    pid: int = PARENT_PID,
+    tid: int = 100,
+    cat: str = "FEE",
+    depth: int = 0,
+    event_index: int = 0,
+) -> dict:
+    """A normalized call record shaped like the analyzer's own output."""
+    return {
+        "name": name,
+        "span_ok": True,
+        "pid": pid,
+        "tid": tid,
+        "task_id": "",
+        "cat": cat,
+        "category": cat,
+        "start_us": start_us,
+        "end_us": end_us,
+        "span_start_us": start_us,
+        "span_end_us": end_us,
+        "wall_ms": (end_us - start_us) / 1000.0,
+        "depth": depth,
+        "event_index": event_index,
+        "complete": True,
+        "source_file": None,
+        "source_line": None,
+    }
+
+
 def full_stage_events(
     *,
     root_dur_us: float = 10_000_000,
@@ -1367,6 +1400,132 @@ def test_coverage_of_an_empty_root_is_zero_not_an_error():
     assert split["python_attributed_ms"] == 0.0
     assert split["unattributed_ms"] == 0.0
     assert split["python_attributed_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# Stage spans must be emitted on the Golden *parallel* path
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTracer:
+    """Captures ``log_event`` enter/exit pairs like VizTracer's VizEvent."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def log_event(self, name):
+        tracer = self
+
+        class _Event:
+            def __enter__(self):
+                tracer.events.append(("enter", str(name)))
+
+            def __exit__(self, *exc):
+                tracer.events.append(("exit", str(name)))
+                return False
+
+        return _Event()
+
+
+def test_stage_span_is_emitted_on_the_parallel_path():
+    """The parallel executor never sets _GOLDEN_DEEP_TRACE_ACTIVE.
+
+    Gating the stage seam on that serial-only ContextVar made every canonical
+    stage a nullcontext in Golden Parallel, so the whole run produced no stage
+    timeline -- only incidental FEE records. The real question is whether a
+    request-bound tracer exists, which the binding answers directly.
+    """
+    from comfymodal_runtime import full_execution_trace as fet  # type: ignore
+    from comfymodal_runtime import golden_serial as gs  # type: ignore
+
+    # Precondition: this is the predicate that used to disable every stage.
+    assert gs._full_trace_active() is False, "parallel path must not set the serial flag"
+
+    tracer = _RecordingTracer()
+    with fet.bind_golden_tracer(tracer):
+        with gs._golden_trace_span("golden_sampling"):
+            pass
+
+    assert ("enter", "golden_sampling") in tracer.events
+    assert ("exit", "golden_sampling") in tracer.events
+
+
+def test_stage_span_is_inert_when_no_tracer_is_bound():
+    from comfymodal_runtime import golden_serial as gs  # type: ignore
+
+    # Full-trace off must not raise, and must not record anywhere.
+    with gs._golden_trace_span("golden_sampling"):
+        pass
+
+
+def test_phase_records_are_kept_on_the_parallel_path():
+    """_golden_trace_phase had the same gate, so it recorded nothing."""
+    from comfymodal_runtime import full_execution_trace as fet  # type: ignore
+    from comfymodal_runtime import golden_serial as gs  # type: ignore
+
+    records: list[dict] = []
+    tracer = _RecordingTracer()
+    with fet.bind_golden_tracer(tracer):
+        with gs._golden_trace_phase("golden.unet.header_config_preflight", records):
+            pass
+
+    assert [r["name"] for r in records] == ["golden.unet.header_config_preflight"]
+    assert ("enter", "golden.unet.header_config_preflight") in tracer.events
+
+
+def test_stage_on_another_thread_is_still_resolved():
+    """A canonical stage body on an overlap executor thread is a real stage.
+
+    Golden's overlap schedule runs clip_forward / unet_load / sampling / vae_load
+    through run_in_executor, so their thread id differs from the root's. Matching
+    candidates by thread discarded correctly-timed stages outright.
+    """
+    root = mkcall("golden_parallel_execute", 0.0, 10000.0, pid=2, tid=2, cat=gep.GOLDEN_ROOT_CATEGORY)
+    # Same process, different thread, entirely inside the root interval.
+    stage = mkcall("golden_clip_forward", 100.0, 9000.0, pid=2, tid=80)
+    resolved = gep.resolve_stage("golden_clip_forward", [root, stage], root)
+    assert resolved is not None
+    assert resolved["call"] is stage
+    assert resolved["cross_thread"] is True
+
+
+def test_stage_outside_the_root_interval_is_not_resolved():
+    # Containment, not just a name match, is what makes a candidate valid.
+    root = mkcall("golden_parallel_execute", 0.0, 1000.0, pid=2, tid=2, cat=gep.GOLDEN_ROOT_CATEGORY)
+    outside = mkcall("golden_clip_forward", 5000.0, 6000.0, pid=2, tid=80)
+    assert gep.resolve_stage("golden_clip_forward", [root, outside], root) is None
+
+
+def test_stage_in_a_different_process_is_not_resolved():
+    root = mkcall("golden_parallel_execute", 0.0, 10000.0, pid=2, tid=2, cat=gep.GOLDEN_ROOT_CATEGORY)
+    other_pid = mkcall("golden_clip_forward", 100.0, 9000.0, pid=48, tid=3)
+    assert gep.resolve_stage("golden_clip_forward", [root, other_pid], root) is None
+
+
+def test_stage_coverage_excludes_the_stage_own_span():
+    """A stage must never report itself as the explanation for its own wall.
+
+    Including the stage's own record made the child union equal the stage wall,
+    so a stage with no traced body at all reported 100% accounted and zero
+    residual -- the exact case a reader needs flagged.
+    """
+    diag = gep.stage_diagnosis(
+        stage="golden_sampling",
+        wall_ms=4609.163,
+        descendant_union_ms=0.0,          # nothing inside the stage was traced
+        functions=[{"qualified_function": "golden_sampling", "inclusive_ms": 4609.163,
+                    "exclusive_ms": 4609.163, "call_count": 1}],
+        bubbles={"bubbles": []},
+        repeated=[],
+        clock_alignment={"status": "PROVEN"},
+    )
+    # 100% residual: nothing inside the stage was traced.
+    assert diag["residual_pct"] == pytest.approx(100.0)
+    assert diag["residual_ms"] == pytest.approx(4609.163, rel=1e-3)
+    # The stage must not be named as its own dominant owner.
+    assert diag["dominant_wall_owner"] is None
+    assert diag["dominant_self_owner"] is None
+    assert "measurement_unavailable" in diag["narrative"]
 
 
 def test_manifest_sidecar_is_never_counted_as_a_process(tmp_path):

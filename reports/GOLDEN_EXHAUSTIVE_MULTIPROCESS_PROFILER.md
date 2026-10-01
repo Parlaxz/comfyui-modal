@@ -684,7 +684,81 @@ the pre-fix behaviour. That contrast is the clearest single measurement in this
 report: the same instrumentation, with a root that spans the real request,
 shows that Python tracing explains only ~15–33% of Golden wall.
 
-### 16.6 Open scope decision
+### 16.6 Stage spans were never emitted on the parallel path (fixed)
+
+`_golden_trace_span` was gated on `_full_trace_active()`, which reads
+`_GOLDEN_DEEP_TRACE_ACTIVE` — a ContextVar only `@_trace_golden_serial_root`
+sets, on the **serial** executor. `golden_parallel_execute` never sets it, so
+every one of the 11 canonical stages became a `nullcontext` and the parallel path
+produced no stage timeline at all.
+
+Same defect class as the root span, one level deeper. Fixed the same way: the
+seam now delegates to `full_execution_trace.golden_trace_span`, which resolves
+the request-bound tracer directly and no-ops when there is none.
+`_golden_trace_phase` carried the identical gate and was fixed alongside it.
+
+Before the fix, three stages "resolved" only incidentally — as `FEE` records for
+plain Python functions, with walls like 1.7 ms against a real 3915 ms. Anyone
+reading those as stage walls would have been reading function-entry durations
+under a stage label.
+
+### 16.7 Cross-thread stages were resolved away (fixed)
+
+With spans emitted, `resolve_stage` still discarded `golden_clip_forward` and
+`golden_vae_load`: it required `_same_context(call, root)`, i.e. the same
+thread. Golden's overlap schedule runs those stage bodies through
+`run_in_executor`, on a private thread — tid 80 and tid 81 against a root on
+tid 2. Correctly-timed stages were rejected purely on a thread-id mismatch.
+
+Candidates are now matched by process and containment within the root's own
+interval, which is the same rule the root's descendants are discovered by. A
+stage outside the root interval, or in another process, is still refused.
+
+### 16.8 A stage could explain itself (fixed)
+
+`descendant_union_ms` included the stage's own span, so the child union trivially
+equalled the stage wall. `golden_sampling` reported **100% accounted, 0.0 ms
+residual** while its own bubble analysis reported the same interval as a
+4609.2 ms bubble with no traced child. Both were true and both were wrong.
+
+Coverage is now measured from the frames *inside* the stage, and the stage's own
+record is excluded from the dominant-owner search. The same stage now reads
+correctly: 0.0% accounted, 4609.2 ms residual.
+
+### 16.9 Verified result
+
+Deploy `e3fd4951fcb198cd`, published `f3965855ce808f75`, source-probe
+`MATCH`/`PASS`. Run `run_20261001-023906_e292f59b`, trace
+`a4a4eaaf52fe456cbcd3583527068891`:
+
+```
+GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE = YES
+ROOT=golden_parallel_execute  ROOT_WALL_MS=16276.683  calls=37819
+CLOCK_ALIGNMENT=PROVEN   THREAD_COVERAGE=COMPLETE (3 lanes)   INCOMPLETE_CALLS=0
+```
+
+| stage | wall (ms) | bubble (ms) | classification |
+|---|---|---|---|
+| golden_unet_load | 5648.652 | 452.854 | OTHER_THREAD_ACTIVE |
+| golden_clip_forward | 5258.090 | 5258.090 | OTHER_THREAD_ACTIVE |
+| golden_sampling | 4790.641 | 4790.641 | UNKNOWN |
+| golden_clip_load | 3651.131 | 11.947 | |
+| golden_vae_decode | 1252.031 | 0.208 | |
+| golden_vae_load | 755.714 | 755.714 | OTHER_THREAD_ACTIVE |
+| golden_sampler_prepare | 643.733 | 0.641 | |
+| golden_output | 257.759 | 257.759 | UNKNOWN |
+| golden_request_setup | 2.103 | 2.103 | OTHER_THREAD_ACTIVE |
+| golden_restore | 0.356 | 0.058 | |
+| golden_sampler_tail | 0.042 | 0.042 | |
+
+The three largest stages are now visible and attributable:
+`golden.unet.source_h2d_transport` 4959.7 ms self,
+`golden.clip_load.source_open_read` 3569.5 ms self, and
+`SourceThreadProcess.wait_ready` 120 calls = 3047.8 ms of `select.select`
+polling across the 4-thread source pool. Report is ~171 KB with a waterfall per
+stage.
+
+### 16.10 Open scope decision
 
 How to account for GPU time is a deliberate choice, not a bug fix:
 

@@ -981,16 +981,39 @@ def resolve_stage(
 ) -> dict[str, Any] | None:
     """Return the record that bounds one canonical stage, or ``None``.
 
-    Selection is evidence-based and deterministic: among the records on the
-    root's own execution context that carry this stage's name, the one with the
-    largest measured wall wins.  A stage body and its Python-call record cover
-    the same interval, so taking the longest removes a double count instead of
-    hiding evidence.  ``candidates_seen`` keeps the discarded ones visible.
+    Selection is evidence-based and deterministic: among the records carrying
+    this stage's name that lie inside the root's own measured interval, the one
+    with the largest measured wall wins.  A stage body and its Python-call
+    record cover the same interval, so taking the longest removes a double count
+    instead of hiding evidence.  ``candidates_seen`` keeps the discarded ones
+    visible.
+
+    Candidate records are matched by **process and containment, not by thread**.
+    Golden's overlap schedule runs a canonical stage body on a private executor
+    thread (``run_in_executor``), so a same-tid requirement silently discarded
+    real, correctly-timed stages: ``golden_clip_forward`` and ``golden_vae_load``
+    were observed in the trace and then rejected purely because their thread id
+    differed from the root's.  Containment is the honest test -- the span
+    genuinely lies within the root's own interval on the same process, which is
+    the same rule the root's own descendants are discovered by.
     """
-    candidates = [
-        call for call in descendants
-        if _basename(call.get("name")) == stage and _same_context(call, owner)
-    ]
+    owner_span = _span(owner)
+    candidates: list[dict[str, Any]] = []
+    for call in descendants:
+        if _basename(call.get("name")) != stage:
+            continue
+        if not call.get("span_ok"):
+            continue
+        if owner.get("pid") is not None and call.get("pid") != owner.get("pid"):
+            continue
+        span = _span(call)
+        if span is None:
+            continue
+        if owner_span is not None and not (
+            span[0] >= owner_span[0] - 1e-6 and span[1] <= owner_span[1] + 1e-6
+        ):
+            continue
+        candidates.append(call)
     if not candidates:
         return None
 
@@ -1004,6 +1027,7 @@ def resolve_stage(
         "call": chosen,
         "candidates_seen": len(candidates),
         "candidate_names": sorted({str(c.get("name")) for c in candidates}),
+        "cross_thread": not _same_context(chosen, owner),
     }
 
 
@@ -1731,15 +1755,19 @@ def stage_diagnosis(
     cause that the evidence does not establish.
     """
     residual_ms = max(0.0, wall_ms - descendant_union_ms)
+    # The stage's own span measures the stage; it never explains it. Excluding it
+    # here stops a stage with no traced body from naming itself as the dominant
+    # owner of its own wall.
+    inner = [
+        f for f in functions
+        if _basename(f.get("qualified_function")) != stage
+        and _safe_float(f.get("inclusive_ms"))
+    ]
     dominant_wall = max(
-        (f for f in functions if _safe_float(f.get("inclusive_ms"))),
-        key=lambda f: float(f["inclusive_ms"]),
-        default=None,
+        inner, key=lambda f: float(f["inclusive_ms"]), default=None,
     )
     dominant_self = max(
-        (f for f in functions if _safe_float(f.get("exclusive_ms"))),
-        key=lambda f: float(f["exclusive_ms"]),
-        default=None,
+        inner, key=lambda f: float(f["exclusive_ms"]), default=None,
     )
     bubble_rows = bubbles.get("bubbles") or []
     largest_bubble = bubble_rows[0] if bubble_rows else None
@@ -2391,11 +2419,16 @@ def analyze(
             })
             continue
         subtree = subtree_of(stage_call, calls, children)
-        # Same-context containment matters: an unparented sibling overlapping
-        # the stage is real work inside the stage and must not become a bubble.
+        # Containment matters: an unparented sibling overlapping the stage is
+        # real work inside the stage and must not become a bubble. Matched on
+        # the stage's own context rather than the root's, because an overlap
+        # stage body runs on a different thread than the root.
+        stage_ctx = (stage_call.get("pid"), stage_call.get("tid"))
         owner_calls: list[Mapping[str, Any]] = []
         for candidate in calls:
-            if not _same_context(candidate, root) or not candidate.get("span_ok"):
+            if not candidate.get("span_ok"):
+                continue
+            if (candidate.get("pid"), candidate.get("tid")) != stage_ctx:
                 continue
             span = _span(candidate)
             if span is None:
@@ -2416,9 +2449,13 @@ def analyze(
             enclosing_frames=enclosing,
         )
         wall_ms = _us_to_ms(stage_span[1] - stage_span[0]) or 0.0
+        # Coverage is measured from the frames *inside* the stage. Including the
+        # stage's own record would make the union equal the stage wall and
+        # report 100% accounted with zero residual for a stage that contains no
+        # traced work at all -- which is exactly the case a reader needs to see.
         covered_ms = _us_to_ms(_union_length([
             (float(c["span_start_us"]), float(c["span_end_us"]))
-            for c in owner_calls
+            for c in enclosing
         ])) or 0.0
         descendant_union_ms = min(covered_ms, wall_ms)
         functions = aggregate_functions(subtree, wall_ms=wall_ms)
