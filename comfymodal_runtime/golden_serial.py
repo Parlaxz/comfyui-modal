@@ -1986,6 +1986,35 @@ def _golden_trace_span(name: str) -> ContextManager[Any]:
 
 
 @contextlib.contextmanager
+def golden_root_span(name: str) -> ContextManager[Any]:
+    """Record THE authoritative Golden root span, on Serial *and* Parallel.
+
+    Deliberately **not** gated on :func:`_full_trace_active`.  That predicate
+    reads ``_GOLDEN_DEEP_TRACE_ACTIVE``, a ContextVar only
+    :func:`_trace_golden_serial_root` sets, so in the Golden Parallel executor it
+    is always False and a root span gated on it silently records nothing.  The
+    real question is "is a request-bound tracer available?", which
+    ``full_execution_trace.golden_root_span`` already answers: it resolves the
+    binding and no-ops when there is none.  That keeps the full-trace-off path
+    inert without depending on a serial-only flag.
+
+    Emits the dedicated ``GOLDEN_ROOT`` Chrome category so the offline profiler
+    can identify the one authoritative root even though VizTracer 1.1.1 labels
+    explicit spans and Python-call records identically.
+    """
+    try:
+        trace_module = importlib.import_module("comfymodal_runtime.full_execution_trace")
+        span = getattr(trace_module, "golden_root_span", None)
+        if callable(span):
+            with span(name):
+                yield
+            return
+    except BaseException:
+        pass
+    yield
+
+
+@contextlib.contextmanager
 def _golden_trace_phase(
     span_name: str,
     records: list[dict[str, Any]],
@@ -2027,7 +2056,7 @@ def _trace_golden_serial_root(func: Callable) -> Callable:
         active = bool(getattr(request, "deep_trace", False))
         token = _GOLDEN_DEEP_TRACE_ACTIVE.set(active)
         try:
-            with _golden_trace_span("golden_serial_execute"):
+            with golden_root_span("golden_serial_execute"):
                 return await func(*args, **kwargs)
         finally:
             _GOLDEN_DEEP_TRACE_ACTIVE.reset(token)
@@ -9692,6 +9721,56 @@ def validate_attention_backend_diagnostics(
         )
 
 
+def _container_restore_facts() -> dict:
+    """Capture container-side facts that explain source-read throughput.
+
+    Model-load bandwidth on this lane spans roughly 1.5-7 GB/s between
+    otherwise identical runs, and the only known mechanism that would force a
+    cold model re-read is a failed memory-snapshot restore.  Neither the Modal
+    execution region nor the snapshot outcome is recoverable from the produced
+    artifacts, so record them at the restore boundary where the metadata is
+    already persisted.
+
+    Strictly observation-only: every lookup is individually guarded and any
+    unexpected condition degrades to ``None`` rather than raising, because
+    telemetry must never be able to fail a production request.
+    """
+
+    def _safe(fn):
+        try:
+            return fn()
+        except BaseException:
+            return None
+
+    facts: dict = {
+        # Whether this app asked Modal for a memory snapshot at all.  The
+        # resolver defaults to True, so a restore failure here means a cold
+        # container start and a full model re-read.
+        "memory_snapshot_enabled": _safe(
+            lambda: (
+                os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", "").strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+        ),
+        "memory_snapshot_env_raw": _safe(
+            lambda: os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT")
+        ),
+    }
+    # Modal does not expose the execution region as a stable documented env var,
+    # so probe the plausible spellings instead of assuming one.
+    for name in (
+        "MODAL_REGION",
+        "MODAL_DEFAULT_REGION",
+        "MODAL_ENVIRONMENT",
+        "MODAL_CONTAINER_ID",
+        "MODAL_TASK_ID",
+    ):
+        value = _safe(lambda n=name: os.environ.get(n))
+        if value:
+            facts[name.lower()] = value
+    return facts
+
+
 async def golden_restore(session: GoldenSession) -> dict:
     """Observe the adapter's already-completed REAL RESTORE handoff.
 
@@ -9767,6 +9846,7 @@ async def golden_restore(session: GoldenSession) -> dict:
             "request_id": session.request.request_id,
             "observation_only": True,
             "external_restore_interval": metadata,
+            "container_facts": _container_restore_facts(),
         }
         session.restore_baseline = baseline
         rec.end_stage(
@@ -9775,6 +9855,9 @@ async def golden_restore(session: GoldenSession) -> dict:
             observation_only=True,
             external_restore_interval=metadata,
             device=str(baseline["device"]),
+            # The caller discards the returned baseline, so the facts must be
+            # recorded on the stage itself to survive into the artifacts.
+            container_facts=baseline["container_facts"],
         )
         return baseline
     except BaseException as exc:
@@ -11267,12 +11350,12 @@ def _golden_model_transport_enabled() -> bool:
     return _golden_m2_clip_enabled() or selected in {"1", "true", "yes", "on", "m2", "persistent"}
 
 
-def _read_golden_m2_clip(path: str, *, transport: Any = None) -> dict[str, Any]:
+def _read_golden_m2_clip(path: str, *, transport: Any = None, role: str = "clip") -> dict[str, Any]:
     """Adapt the canonical M2 loader to Golden's transport contract."""
     from .golden_model_transport import get_golden_model_transport
 
     transport = transport or get_golden_model_transport()
-    loaded = transport.load_sync(path)
+    loaded = transport.load_sync(path, role=role)
     source = loaded.stats.get("source") or {}
     stats = dict(loaded.stats)
     stats.update({
@@ -13060,7 +13143,7 @@ async def golden_unet_load(
             shared_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
             session.model_transport = shared_transport
             shared_layout = shared_transport.inspect(unet_path)
-            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path))
+            shared_transport_task = asyncio.create_task(shared_transport.load(unet_path, role="unet"))
             await asyncio.sleep(0)
 
         with _golden_trace_span("golden.unet.header_config_preflight"):

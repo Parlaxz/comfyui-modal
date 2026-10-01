@@ -64,6 +64,12 @@ _DEFAULT_RESOURCE_INTERVAL_MS = 50
 # (where the legacy optional global seam remains available) from an explicitly
 # bound request whose missing tracer must fail closed.
 _GOLDEN_TRACER_UNBOUND = object()
+
+#: Chrome-trace category for the single authoritative Golden root span.  It must
+#: match ``GOLDEN_ROOT_CATEGORY`` in ``golden_exhaustive_profile``; the offline
+#: reporter reads this category to tell the authoritative root apart from the
+#: executor function's own (identically categorised) Python-call record.
+GOLDEN_ROOT_CATEGORY = "GOLDEN_ROOT"
 _GOLDEN_TRACER: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "comfymodal_golden_tracer",
     default=_GOLDEN_TRACER_UNBOUND,
@@ -280,6 +286,104 @@ def golden_trace_span(name: str):
                 event.__exit__(None, None, None)
             except BaseException:
                 pass
+
+
+@contextlib.contextmanager
+def golden_root_span(name: str):
+    """Record THE authoritative Golden root span for one executor.
+
+    Why this exists rather than another :func:`golden_trace_span`: in VizTracer
+    1.1.1 ``VizEvent.__exit__`` hardcodes ``cat="FEE"``, so an explicit span and
+    the automatic Python-call record of the same function are byte-for-byte
+    indistinguishable once serialized.  An offline reader therefore cannot tell
+    "the span the executor opened around its whole body" from "the call record of
+    the function itself", and a build that emits both ends up with two candidate
+    roots.
+
+    Writing the same Chrome ``X`` event under a dedicated category makes the
+    authoritative root unambiguous from the artifact alone.  It records no new
+    measurement: the timestamps come from the tracer's own clock, so this adds no
+    stopwatch and no per-function instrumentation.
+
+    Inert when no tracer is bound, and a tracing failure never affects Golden.
+    """
+    tracer = _resolve_bound_tracer()
+    start_us: float | None = None
+    if tracer is not None:
+        try:
+            getts = getattr(tracer, "getts", None)
+            add_raw = getattr(tracer, "add_raw", None)
+            if callable(getts) and callable(add_raw):
+                start_us = float(str(getts()))
+            else:
+                tracer = None
+        except BaseException:
+            tracer = None
+    if tracer is None:
+        yield
+        return
+    frame = _caller_frame()
+    try:
+        yield
+    finally:
+        try:
+            duration = float(tracer.getts()) - float(start_us or 0.0)
+            tracer.add_raw({
+                "ph": "X",
+                "name": f"{name} ({frame.f_code.co_filename}:{frame.f_lineno})",
+                "ts": start_us,
+                "dur": max(0.0, duration),
+                "cat": GOLDEN_ROOT_CATEGORY,
+            })
+        except BaseException:
+            pass
+
+
+#: Frames that belong to the span plumbing itself, not to the Golden executor.
+#: ``@contextlib.contextmanager`` inserts a ``wrapper`` frame per layer, and the
+#: serial seam adds its own ``golden_root_span`` frame, so a naive
+#: ``sys._getframe(1)`` would attribute the authoritative root to
+#: ``contextlib.py`` or to the seam instead of to the executor that opened it.
+_ROOT_SPAN_INTERNAL_FILES = ("contextlib.py", "full_execution_trace.py")
+_ROOT_SPAN_INTERNAL_FUNCTIONS = frozenset({
+    "golden_root_span", "wrapper", "helper",
+})
+
+
+def _caller_frame() -> Any:
+    """Return the nearest frame outside the span plumbing itself."""
+    try:
+        frame: Any = sys._getframe(1)
+    except Exception:  # pragma: no cover - no frame stack
+        return sys._getframe(0)
+    while frame is not None:
+        filename = str(getattr(frame.f_code, "co_filename", "") or "")
+        function = str(getattr(frame.f_code, "co_name", "") or "")
+        is_internal = (
+            function in _ROOT_SPAN_INTERNAL_FUNCTIONS
+            or any(filename.endswith(name) for name in _ROOT_SPAN_INTERNAL_FILES)
+        )
+        if not is_internal:
+            return frame
+        frame = frame.f_back
+    return sys._getframe(1)
+
+
+def _resolve_bound_tracer() -> Any:
+    """Return the request-bound tracer, or ``None``.
+
+    Never consults an unrelated global tracer once a binding exists, and never
+    imports VizTracer.
+    """
+    try:
+        tracer = _GOLDEN_TRACER.get()
+        if tracer is _GOLDEN_TRACER_UNBOUND:
+            tracer_module = sys.modules.get("viztracer")
+            get_tracer = getattr(tracer_module, "get_tracer", None)
+            tracer = get_tracer() if callable(get_tracer) else None
+        return tracer
+    except BaseException:
+        return None
 
 
 def _sanitize_cmdline(cmdline: str) -> str:
@@ -1354,6 +1458,15 @@ class FullExecutionTraceSession:
         return Path(base) / self.trace_id
 
     # ── Factory ──────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def get_instance(cls) -> Optional["FullExecutionTraceSession"]:
+        """Return the live traced session, or ``None`` when tracing is off.
+
+        A read-only accessor for process-boundary integrations that must ask
+        "is this request being traced?" without being able to create a session.
+        """
+        return cls._instance
 
     @classmethod
     def create_if_enabled(

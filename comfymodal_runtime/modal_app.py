@@ -4883,6 +4883,12 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"
         ),
+        # Reader isolation for the C0 source owner.  Without this the container
+        # always resolved "thread", which made the four-process arm silently
+        # unreachable no matter what the profile or --set selected.
+        "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND", "thread"
+        ),
         "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": os.environ.get(
             "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "preadv"
         ),
@@ -23093,7 +23099,13 @@ class ModalRuntimeEntrypoint:
         marker selects ``golden_parallel_execute`` at the final orchestration
         seam; no serial loader or sampler implementation is duplicated.
         """
+        outer_mark_lifetime = __import__(
+            "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
+        )._OuterLifetime
+        outer = outer_mark_lifetime()
+        outer.mark("remote_method_entry")
         if not isinstance(request, Mapping):
+            outer.mark("remote_method_return")
             yield {
                 "type": "error",
                 "request_id": "",
@@ -23103,7 +23115,25 @@ class ModalRuntimeEntrypoint:
         parallel_request = dict(request)
         parallel_request["golden_mode"] = "parallel"
         async for event in self._run_golden_stream_impl(parallel_request):
+            # pre-yield / post-yield-resume are the seam that decides whether a
+            # Modal-reported execution time includes caller-side suspension.
+            outer.mark("pre_yield", detail=str(event.get("type", "")))
             yield event
+            outer.mark("post_yield_resume")
+        outer.mark("remote_method_return")
+        outer.report()
+        # Container stdout is not captured into run artifacts, so the marks must
+        # be persisted into the Golden telemetry JSON, which v2ctl does collect.
+        _telemetry_path = getattr(self, "_golden_telemetry_path", None)
+        if _telemetry_path:
+            _inject = __import__(
+                "comfymodal_runtime.golden_parallel",
+                fromlist=["inject_outer_marks_into_telemetry"],
+            ).inject_outer_marks_into_telemetry
+            outer.marks.insert(
+                0, ("golden_call_telemetry_path", time.monotonic_ns(), 0, "")
+            )
+            _inject(_telemetry_path, outer.marks)
 
     async def run_golden_serial_stream(
         self,
@@ -23199,8 +23229,17 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_c0_source_threads_must_be_bool")
             if source_threads_requested != source_threads_deployed:
                 raise ValueError("golden_c0_source_threads_deployment_mismatch")
-            if source_threads_deployed and c0_mmap_lifecycle != "whole":
-                raise ValueError("golden_c0_source_threads_requires_whole_lifecycle")
+            if source_threads_deployed and c0_mmap_lifecycle not in {
+                "fresh", "whole",
+            }:
+                # The C0 source owner implements both exact-window (fresh) and
+                # one-whole-file-mapping (whole) lifecycles behind the same
+                # selector, so both are valid arms of the source architecture
+                # comparison.  Only lifecycles it does not implement are
+                # refused.  This gate used to hard-require "whole", which
+                # pinned the architecture to one lifecycle and made the
+                # fresh/whole comparison impossible.
+                raise ValueError("golden_c0_source_threads_unsupported_lifecycle")
             # The source-thread arm is restore/deploy-owned.  Never mutate the
             # process environment per request; a mismatch fails closed above.
             if not source_threads_deployed:
@@ -23263,6 +23302,10 @@ class ModalRuntimeEntrypoint:
                 raise ValueError("golden_request_id_unsanitizable")
             golden_dir = Path(RUNTIME_STATE_PATH, "golden")
             telemetry_path = golden_dir / f"{sanitized}.json"
+            # Published for the outer-lifetime instrumentation in the streaming
+            # wrapper, which flushes its marks into this file once the method
+            # has returned; stdout alone is not captured into run artifacts.
+            self._golden_telemetry_path = str(telemetry_path)
             if telemetry_path.resolve().parent != golden_dir.resolve():
                 raise ValueError("golden_telemetry_path_traversal_blocked")
             golden_dir.mkdir(parents=True, exist_ok=True)
@@ -23800,6 +23843,11 @@ class ModalRuntimeEntrypoint:
             }
             result_data["images"] = [image_entry]
             result_data["include_base64"] = True
+            # The PNG now lives in images[0].data.  Leaving the flat
+            # image_data key in place duplicated the full 3 MB payload, which
+            # base64-encodes to ~4 MB and is serialized onto the Modal wire
+            # between yield and method return.
+            result_data.pop("image_data", None)
         # The adapter result is the authoritative request-scoped Golden
         # identity surface.  Keep a named copy as well as the conventional
         # result identity key so host projection can consume either terminal
@@ -23869,6 +23917,12 @@ class ModalRuntimeEntrypoint:
             _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
         )
         if telemetry is not None:
+            # The result carries the byte-identical persisted telemetry document.
+            # That equality is a deliberate contract (asserted by
+            # test_p2_golden_snapshot_adapter), not incidental structure: the
+            # terminal result must be self-describing and independently
+            # verifiable without re-reading the volume.  Trimming the ~99 KB
+            # event stream here to save wire time would break it, so it stays.
             result_data["golden_telemetry"] = telemetry
             observed_attention = str(
                 telemetry.get("attention_backend_resolved", "missing")

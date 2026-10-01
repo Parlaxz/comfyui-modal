@@ -982,21 +982,22 @@ def _reconstruct_parents(calls: list[dict[str, Any]]) -> None:
                 stack.append(c)
 
         # Mark ambiguous parenthood: if a call has same start and duration as
-        # its parent, that's an ambiguous nesting (likely concurrent sibling)
+        # its parent, that's an ambiguous nesting (likely concurrent sibling).
+        # Index the group once: a per-call scan here is quadratic and a real
+        # Golden trace puts 100k+ calls in a single group.
+        by_event_index = {c["event_index"]: c for c in group}
         for c in group:
             pi = c.get("parent_event_index")
-            if pi is not None:
-                parent = None
-                for other in group:
-                    if other["event_index"] == pi:
-                        parent = other
-                        break
-                if parent is not None:
-                    if (abs(c["start_us"] - parent["start_us"]) < 0.001 and
-                            abs(c["duration_us"] - parent["duration_us"]) < 0.001):
-                        c["parent_event_index"] = None
-                        c["parent_name"] = ""
-                        c["depth"] = 0
+            if pi is None:
+                continue
+            parent = by_event_index.get(pi)
+            if parent is None:
+                continue
+            if (abs(c["start_us"] - parent["start_us"]) < 0.001 and
+                    abs(c["duration_us"] - parent["duration_us"]) < 0.001):
+                c["parent_event_index"] = None
+                c["parent_name"] = ""
+                c["depth"] = 0
 
 
 def _detect_stack_inconsistencies(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6088,6 +6089,87 @@ def _build_report_data(
 # ---------------------------------------------------------------------------
 
 
+def _maybe_generate_golden_exhaustive_profile(
+    session_dir: Path,
+    *,
+    parent_calls: Sequence[dict[str, Any]],
+    trace_config: Mapping[str, Any],
+    semantic_ops: Sequence[dict[str, Any]],
+    resource_result: Mapping[str, Any],
+    torch_enabled: bool,
+    stack_inconsistencies: int,
+) -> dict[str, Any]:
+    """Render the exhaustive Golden profiler when a Golden root was captured.
+
+    Runs only for a Golden request that the full-trace session actually traced,
+    and only when ``COMFYMODAL_GOLDEN_EXHAUSTIVE_PROFILE`` is set.  The selector
+    is a *report* selector: it cannot enable capture, so a request without a full
+    trace is unaffected either way.
+    """
+    try:
+        from . import process_trace_bridge as bridge  # type: ignore  # noqa: PLC0415
+        from . import golden_exhaustive_profile as exhaustive  # type: ignore  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - never break the existing report
+        return {"warnings": [f"golden_exhaustive_profile_unavailable: {exc}"]}
+
+    has_golden_root = any(
+        _basename(c.get("name")) in exhaustive.GOLDEN_ROOT_NAMES for c in parent_calls
+    )
+    if not has_golden_root:
+        return {}
+    if not bridge.exhaustive_profile_enabled():
+        return {}
+
+    warnings: list[str] = []
+    c_function_tracing = bool(
+        (trace_config.get("config") or {}).get("ignore_c_function")
+        if isinstance(trace_config.get("config"), Mapping) else False
+    )
+    try:
+        profile = exhaustive.analyze(
+            session_dir,
+            parent_calls=parent_calls,
+            trace_config=trace_config,
+            semantic_ops=semantic_ops,
+            cpu_evidence=dict(resource_result or {}),
+            stack_inconsistencies=stack_inconsistencies,
+            torch_enabled=bool(torch_enabled),
+            c_function_tracing=c_function_tracing,
+        )
+        written = exhaustive.write_artifacts(session_dir, profile)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail the report
+        warnings.append(f"golden_exhaustive_profile_failed: {type(exc).__name__}: {exc}"[:400])
+        return {"warnings": warnings}
+
+    if not profile.get("complete"):
+        warnings.append(
+            "golden_exhaustive_profile_incomplete: "
+            + "; ".join(profile.get("reasons") or [])[:600]
+        )
+    return {
+        "warnings": warnings,
+        "written": written,
+        "complete": bool(profile.get("complete")),
+        "report_path": written.get("report", ""),
+        "summary": {
+            "GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE": (
+                "YES" if profile.get("complete") else "NO"
+            ),
+            "reasons": profile.get("reasons"),
+            "root": profile.get("root"),
+            "clock_alignment": profile.get("clock_alignment"),
+            "process_coverage": (profile.get("process_manifest") or {}).get(
+                "process_coverage"
+            ),
+            "thread_coverage": profile.get("thread_coverage"),
+            "stages": [
+                {"stage": s.get("stage"), "wall_ms": s.get("wall_ms")}
+                for s in profile.get("stages") or []
+            ],
+        },
+    }
+
+
 def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     """Generate a full execution trace report from *session_dir*.
 
@@ -6218,6 +6300,23 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
 
     # ── Stack inconsistencies ──
     stack_issues = _detect_stack_inconsistencies(calls)
+
+    # ── Golden exhaustive execution profiler ──
+    # The existing full-trace session owns capture; this is the same owner
+    # rendering the microscope view alongside the >50 ms quick view.  It runs
+    # only when a Golden root is present and the selector is on, so an ordinary
+    # report of a non-Golden request pays nothing for it.
+    exhaustive_result = _maybe_generate_golden_exhaustive_profile(
+        session_dir,
+        parent_calls=calls,
+        trace_config=trace_config,
+        semantic_ops=semantic_ops,
+        resource_result=resource_result,
+        torch_enabled=bool(torch_events),
+        stack_inconsistencies=len(stack_issues),
+    )
+    if exhaustive_result:
+        warnings.extend(exhaustive_result.get("warnings", []))
 
     # ── Ensure derived directory ──
     derived_dir.mkdir(parents=True, exist_ok=True)
@@ -6555,6 +6654,15 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "golden_profile_reason": golden_profile["GOLDEN_PROFILE_REASON"],
         "golden_profile_torch": golden_profile["GOLDEN_PROFILE_TORCH"],
         "golden_profile_summary_path": str(golden_summary_path).replace("\\", "/"),
+        "golden_exhaustive_profile_complete": (
+            (exhaustive_result.get("summary") or {}).get(
+                "GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE"
+            )
+            if exhaustive_result else ""
+        ),
+        "golden_exhaustive_profile_report_path": (
+            exhaustive_result.get("report_path", "") if exhaustive_result else ""
+        ),
         "golden_profile_report_path": str(golden_report_path).replace("\\", "/"),
         "golden_profile_gantt_path": str(golden_gantt_path).replace("\\", "/"),
         "golden_stage_gantts_path": str(golden_stage_gantts_path).replace("\\", "/"),
