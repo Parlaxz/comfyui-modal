@@ -3914,10 +3914,10 @@ def _write_gzip_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: S
 
 def _write_json(path: Path, payload: Any, *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=indent, sort_keys=True, default=str),
-        encoding="utf-8",
-    )
+    # json.dump streams through iterencode instead of building one giant string
+    # via json.dumps first.
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=indent, sort_keys=True, default=str)
 
 
 def _jsonable(value: Any) -> Any:
@@ -3942,11 +3942,25 @@ def write_artifacts(session_dir: Path, profile: Mapping[str, Any]) -> dict[str, 
     derived.mkdir(parents=True, exist_ok=True)
 
     written: dict[str, str] = {}
+    # This phase is tens of seconds on a 1.2M-call request and used to emit
+    # nothing at all, so a slow artifact write looked identical to a hang.
+    _w0 = time.perf_counter()
+
+    def _wlap(label: str) -> None:
+        print(
+            "    [gep.write] %s elapsed_s=%.1f"
+            % (label, time.perf_counter() - _w0),
+            flush=True,
+        )
+
+    _wlap("enter")
     _write_gzip_csv(derived / CALLS_NAME, _calls_csv_rows(profile), EXHAUSTIVE_CALL_FIELDS)
     written["calls"] = f"derived/{CALLS_NAME}"
+    _wlap("calls_csv")
 
     _write_json(derived / MANIFEST_NAME, _jsonable(profile.get("process_manifest")))
     written["manifest"] = f"derived/{MANIFEST_NAME}"
+    _wlap("manifest")
 
     summary = {
         "schema_version": profile.get("schema_version"),
@@ -4012,20 +4026,25 @@ def write_artifacts(session_dir: Path, profile: Mapping[str, Any]) -> dict[str, 
     }
     _write_json(derived / SUMMARY_NAME, _jsonable(summary), indent=None)
     written["summary"] = f"derived/{SUMMARY_NAME}"
+    _wlap("summary")
 
     merged = write_merged_trace(session_dir, profile)
     if merged:
         written["merged_trace"] = merged
+    _wlap("merged_trace")
 
     # Render once to prove the report can be produced at all, then finalize the
     # contract with that evidence and render the authoritative text.  A report
     # that fails to render or write raises instead of leaving a "complete"
     # verdict behind with no artifact to back it.
     render_markdown(profile)
+    _wlap("render#1")
     _finalize_contract(profile)
     report = render_markdown(profile)
+    _wlap("render#2")
     (derived / REPORT_NAME).write_text(report, encoding="utf-8")
     written["report"] = f"derived/{REPORT_NAME}"
+    _wlap("done")
     return written
 
 
@@ -4108,20 +4127,16 @@ def write_merged_trace(session_dir: Path, profile: Mapping[str, Any]) -> str:
     }
     target = Path(session_dir) / "derived" / MERGED_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Streamed into the compressor: json.dumps built the whole ~400 MB document
-    # as one string before compressing it.
+    # json.dump streams through iterencode using the C encoder. Hand-rolling this
+    # with one json.dumps per event built 1.26M Python-level encoder calls and was
+    # slower than the single giant json.dumps it replaced, trading CPU for memory
+    # in the wrong direction.
+    payload = {"traceEvents": merged_events, "viztracer_metadata": metadata}
     with target.open("wb") as raw_fh:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw_fh, mtime=0) as gz:
             text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
             try:
-                text.write('{"traceEvents":[')
-                for i, e in enumerate(merged_events):
-                    if i:
-                        text.write(",")
-                    text.write(json.dumps(e, sort_keys=True, default=str))
-                text.write('],"viztracer_metadata":')
-                text.write(json.dumps(metadata, sort_keys=True, default=str))
-                text.write("}")
+                json.dump(payload, text, sort_keys=True, default=str)
                 text.flush()
             finally:
                 text.detach()
