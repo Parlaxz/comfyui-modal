@@ -303,6 +303,44 @@ if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
     )
     CUSTOM_NODE_DELIVERY = "image"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
+
+
+def _ensure_custom_nodes_compat_symlink() -> None:
+    """Expose the volume at the legacy path without mounting it twice."""
+    if CUSTOM_NODE_DELIVERY != "volume":
+        return
+
+    target = CUSTOM_NODES_IMPORT_PATH
+    link = CUSTOM_NODES_PATH
+    try:
+        if not os.path.isdir(target):
+            raise RuntimeError(
+                f"mounted custom-node Volume path is missing or not a directory: {target}"
+            )
+        if os.path.lexists(link):
+            if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target):
+                return
+            raise RuntimeError(
+                f"legacy custom-node path already exists and is not the compatibility "
+                f"symlink: {link}"
+            )
+        os.symlink(target, link, target_is_directory=True)
+        if os.path.realpath(link) != os.path.realpath(target):
+            raise RuntimeError(
+                f"compatibility symlink does not resolve to mounted custom-node path: "
+                f"{link} -> {target}"
+            )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            detail = str(exc)
+        else:
+            detail = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(
+            "custom-node Volume compatibility symlink setup failed; refusing to "
+            f"start with an unresolved {CUSTOM_NODES_PATH}: {detail}"
+        ) from exc
+
+
 _RESTORE_CLIP_PROBE_SOURCE_ENV = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
 _RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH = os.path.join(
     "text_encoders", "qwen_3_4b.safetensors"
@@ -11116,6 +11154,7 @@ class ModalRuntimeEntrypoint:
 
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
+        _ensure_custom_nodes_compat_symlink()
         _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
         _v2_startup_stage(
             "container_python_import",
@@ -12741,6 +12780,7 @@ class ModalRuntimeEntrypoint:
 
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        _ensure_custom_nodes_compat_symlink()
         # Deep profiling is request-only.  Restore deliberately creates no
         # FullExecutionTraceSession, resource sampler, VizTracer, or torch
         # profiler; a deep request starts those lazily at its own boundary.
@@ -24417,13 +24457,14 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     _gpu_arg: str | list[str] = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
     _volumes: dict[str, Any] = {
         spec.models_path: resources["models_volume"],
-        spec.custom_nodes_path: resources["custom_nodes_volume"],
-        spec.runtime_state_path: resources["runtime_state_volume"],
     }
     if CUSTOM_NODE_DELIVERY == "volume":
-        # Keep the legacy control-record mount while exposing the same Volume
-        # directly at ComfyUI's discovery root; no startup copy is required.
+        # Mount the shared Volume only at ComfyUI's discovery root.  The
+        # legacy CUSTOM_NODES_PATH is linked to this path at container start.
         _volumes[CUSTOM_NODES_IMPORT_PATH] = resources["custom_nodes_volume"]
+    else:
+        _volumes[spec.custom_nodes_path] = resources["custom_nodes_volume"]
+    _volumes[spec.runtime_state_path] = resources["runtime_state_volume"]
     # Add profile volume mount when full-trace is enabled
     if _V2_FULL_TRACE_ENABLED:
         _pv = resources.get("profile_volume")
