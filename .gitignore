@@ -9,6 +9,7 @@ __pycache__/
 .deploy_log
 .custom_node_requirements/
 .baked_custom_node_deps/
+.comfymodal_first_party_sources/
 *benchmark*/
 optimization_logs/
 latest_benchmark_workflow.json

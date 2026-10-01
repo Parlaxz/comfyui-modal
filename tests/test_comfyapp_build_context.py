@@ -293,55 +293,56 @@ class ComfyAppBuildContextTests(unittest.TestCase):
         self.assertNotIn("presets", cpu_sources)
         self.assertNotIn("run_history", cpu_sources)
 
-    def test_gpu_source_function_uses_copy_true(self):
-        """_add_gpu_python_sources must call add_local_python_source with copy=True."""
+    def test_runtime_source_helpers_use_one_snapshot_mount(self):
+        """The staged tree preserves bytes while keeping copy=True snapshot semantics."""
         module = load_module()
-        import ast
-        source = module._COMFYAPP_SOURCE if hasattr(module, "_COMFYAPP_SOURCE") else ""
-        if not source:
-            with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
-                source = f.read()
-        # Find _add_gpu_python_sources function body
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_add_gpu_python_sources":
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        func = child.func
-                        if isinstance(func, ast.Attribute) and func.attr == "add_local_python_source":
-                            # Check copy=True keyword exists
-                            for kw in child.keywords:
-                                if kw.arg == "copy":
-                                    self.assertTrue(
-                                        isinstance(kw.value, ast.Constant) and kw.value.value is True,
-                                        "_add_gpu_python_sources must call add_local_python_source with copy=True"
-                                    )
-                            break  # only check first call
-                break
+        staging = Path(module._FIRST_PARTY_SOURCE_STAGING_DIR)
+        source_files = module._first_party_source_file_map()
+        required = set(module._CANONICAL_GPU_SOURCE_MODULES)
+        required.update(module._CPU_COMFYMODAL_PYTHON_SOURCES)
+        required.add("optimizations")
 
-    def test_cpu_source_function_uses_copy_true(self):
-        """_add_cpu_python_sources must call add_local_python_source with copy=True."""
+        # Check the meaning of the consolidated context, not the deleted API
+        # shape: every source formerly mounted independently is staged verbatim.
+        for module_name in required:
+            relative = f"{module_name}.py"
+            self.assertIn(relative, source_files)
+            self.assertEqual(
+                (staging / relative).read_bytes(),
+                source_files[relative].read_bytes(),
+            )
+        self.assertIn("comfyapp.py", source_files)
+        self.assertTrue((staging / "comfymodal_runtime" / "__init__.py").is_file())
+
+        for helper in (
+            module._add_gpu_python_sources,
+            module._add_cpu_python_sources,
+            module._add_comfymodal_local_python_sources,
+        ):
+            image = MagicMock()
+            image.add_local_dir.return_value = image
+            helper(image)
+            # add_local_dir(copy=True) is the build-time snapshot guarantee;
+            # the single call avoids a descendant image per source module.
+            image.add_local_dir.assert_called_once_with(
+                module._FIRST_PARTY_SOURCE_STAGING_DIR,
+                "/root",
+                copy=True,
+            )
+
+    def test_cpu_source_helper_uses_snapshot_mount(self):
+        """The CPU/download path uses the same byte-stable source snapshot."""
         module = load_module()
-        import ast
-        source = module._COMFYAPP_SOURCE if hasattr(module, "_COMFYAPP_SOURCE") else ""
-        if not source:
-            with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
-                source = f.read()
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_add_cpu_python_sources":
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        func = child.func
-                        if isinstance(func, ast.Attribute) and func.attr == "add_local_python_source":
-                            for kw in child.keywords:
-                                if kw.arg == "copy":
-                                    self.assertTrue(
-                                        isinstance(kw.value, ast.Constant) and kw.value.value is True,
-                                        "_add_cpu_python_sources must call add_local_python_source with copy=True"
-                                    )
-                            break
-                break
+        image = MagicMock()
+        image.add_local_dir.return_value = image
+        module._add_cpu_python_sources(image)
+        # Keep the CPU contract explicit: it must not regress to per-module
+        # mounts just because its source set is smaller than the GPU set.
+        image.add_local_dir.assert_called_once_with(
+            module._FIRST_PARTY_SOURCE_STAGING_DIR,
+            "/root",
+            copy=True,
+        )
 
     def test_app_uses_include_source_false(self):
         """modal.App must be called with include_source=False."""
@@ -589,9 +590,7 @@ class ComfyAppBuildContextTests(unittest.TestCase):
     # to be present in every image, especially the CPU download image.
 
     def test_download_image_includes_comfymodal_runtime(self):
-        """download_image must chain add_local_python_source('comfymodal_runtime')
-        because comfyapp.py imports comfymodal_runtime at module level and
-        App(include_source=False) means explicit inclusion is required."""
+        """download_image's consolidated mount must contain comfymodal_runtime."""
         import ast
         with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
             source = f.read()
@@ -602,26 +601,8 @@ class ComfyAppBuildContextTests(unittest.TestCase):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "download_image":
-                        # Walk all calls in the value for add_local_python_source
-                        for child in ast.walk(node.value):
-                            if (isinstance(child, ast.Call)
-                                    and isinstance(child.func, ast.Attribute)
-                                    and child.func.attr == "add_local_python_source"):
-                                args = child.args
-                                if (args
-                                        and isinstance(args[0], ast.Constant)
-                                        and args[0].value == "comfymodal_runtime"):
-                                    # Verify copy=True keyword
-                                    copy_ok = any(
-                                        kw.arg == "copy"
-                                        and isinstance(kw.value, ast.Constant)
-                                        and kw.value.value is True
-                                        for kw in child.keywords
-                                    )
-                                    self.assertTrue(copy_ok,
-                                        "comfymodal_runtime must be added with copy=True")
-                                    found = True
-                        # Also verify _add_cpu_python_sources is used
+                        # The helper owns the one copy=True snapshot mount;
+                        # assert the staged content rather than a removed API call.
                         sources_ref = any(
                             isinstance(c, ast.Call)
                             and isinstance(c.func, ast.Name)
@@ -630,10 +611,29 @@ class ComfyAppBuildContextTests(unittest.TestCase):
                         )
                         self.assertTrue(sources_ref,
                             "download_image must use _add_cpu_python_sources")
+                        self.assertFalse(
+                            any(
+                                isinstance(c, ast.Call)
+                                and isinstance(c.func, ast.Attribute)
+                                and c.func.attr == "add_local_python_source"
+                                for c in ast.walk(node.value)
+                            ),
+                            "download_image must use the consolidated source mount",
+                        )
+                        found = True
                         break
 
         self.assertTrue(found,
-            "download_image must include comfymodal_runtime via add_local_python_source")
+            "download_image must use the consolidated first-party source mount")
+
+        module = load_module()
+        staging = Path(module._FIRST_PARTY_SOURCE_STAGING_DIR)
+        runtime_source = Path(module._COMFYUI_MODAL_DIR) / "comfymodal_runtime"
+        for relative in ("__init__.py", "modal_app.py", "runtime_executor.py"):
+            self.assertEqual(
+                (staging / "comfymodal_runtime" / relative).read_bytes(),
+                (runtime_source / relative).read_bytes(),
+            )
 
     # ── Requirement 6: cachedit_dependency_lock.txt in build context ──
 

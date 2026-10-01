@@ -33,7 +33,7 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     "output", "test-results", "playwright-report", "playwright/.cache",
     ".playwright-mcp", ".experiments", ".run_history", "benchmark_runs",
     "benchmark_logs", "optimization_logs", ".comfymodal_experiments",
-    ".custom_node_requirements", ".baked_custom_node_deps", ".presets",
+    ".custom_node_requirements", ".baked_custom_node_deps", ".comfymodal_first_party_sources", ".presets",
     ".preset_blobs", ".v2ctl", ".comfymodal_control", "tests", "test", "examples", "benchmarks",
     "benchmark", "traces", "logs", "scripts", ".github", "MagicMock",
     "reference", "docs",

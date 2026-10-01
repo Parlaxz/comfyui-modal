@@ -7871,7 +7871,18 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"  11. apply late runtime env vars")
     print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
     print(f"  13. generate/add baked dependency manifest")
-    print(f"  14. add helper Python sources")
+    print(
+        f"  14. golden GPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  15. publisher first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  16. download CPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
     print(f"[comfyapp] ===========================================")
 
     _save_last_context_manifest(current)
@@ -8235,6 +8246,109 @@ _V2_RUNTIME_ENV = build_v2_late_config(
     runtime_revision=_V2_RUNTIME_REVISION,
 )
 
+
+_GPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "optimizations",
+    "worker_control",
+)
+
+_CPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "worker_control",
+)
+
+_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
+    _GPU_COMFYMODAL_PYTHON_SOURCES + (
+        "canonical_execution", "modal_client", "run_prompt_options",
+        "warmup_profile", "workflow_metadata", "model_manifest",
+    )
+))
+
+_FIRST_PARTY_SOURCE_STAGING_DIR = os.path.join(
+    _COMFYUI_MODAL_DIR, ".comfymodal_first_party_sources"
+)
+
+
+def _first_party_source_file_map() -> dict[str, Path]:
+    """Return the exact source tree mounted into each runtime image."""
+    source_root = Path(_COMFYUI_MODAL_DIR)
+    files: dict[str, Path] = {"comfyapp.py": Path(__file__)}
+    module_names = tuple(dict.fromkeys(
+        _CANONICAL_GPU_SOURCE_MODULES
+        + _CPU_COMFYMODAL_PYTHON_SOURCES
+        + ("optimizations",)
+    ))
+    for module_name in module_names:
+        source = source_root / f"{module_name}.py"
+        if not source.is_file():
+            raise FileNotFoundError(f"first-party image source is missing: {source}")
+        files[f"{module_name}.py"] = source
+
+    runtime_root = source_root / "comfymodal_runtime"
+    if not runtime_root.is_dir():
+        raise FileNotFoundError(f"first-party image package is missing: {runtime_root}")
+    for source in sorted(runtime_root.rglob("*.py")):
+        if "__pycache__" not in source.parts:
+            files[source.relative_to(source_root).as_posix()] = source
+    return files
+
+
+def _prepare_first_party_source_build_context() -> tuple[int, int]:
+    """Synchronize the small source mount without rewriting unchanged bytes."""
+    staging_root = Path(_FIRST_PARTY_SOURCE_STAGING_DIR)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    desired = _first_party_source_file_map()
+
+    for existing in sorted(staging_root.rglob("*"), reverse=True):
+        if not existing.is_file():
+            continue
+        relative = existing.relative_to(staging_root).as_posix()
+        if relative not in desired:
+            existing.unlink()
+
+    total_bytes = 0
+    for relative, source in sorted(desired.items()):
+        destination = staging_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_bytes = source.read_bytes()
+        total_bytes += len(source_bytes)
+        try:
+            unchanged = destination.read_bytes() == source_bytes
+        except FileNotFoundError:
+            unchanged = False
+        if not unchanged:
+            destination.write_bytes(source_bytes)
+            os.chmod(destination, 0o644)
+
+    for directory in sorted(
+        (path for path in staging_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return len(desired), total_bytes
+
+
+_FIRST_PARTY_SOURCE_FILE_COUNT, _FIRST_PARTY_SOURCE_BYTES = (
+    _prepare_first_party_source_build_context()
+)
+
 # Combined requirements layer: one COPY + one pip loop (single cache unit).
 # When no requirements.txt changes, the layer is cached (~5s deploy).
 # Changed requirements cause all pip installs to re-run within this layer.
@@ -8556,29 +8670,6 @@ if not _INSIDE_MODAL_CONTAINER:
         copy=True,
     )
 
-_GPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "optimizations",
-    "worker_control",
-)
-
-_CPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "worker_control",
-)
-
 _COMFYAPP_SOURCE = Path(__file__).read_text(encoding="utf-8-sig")
 _COMFYMODAL_INCLUDE_SOURCE = False
 _GPU_SOURCE_BYTES = sum(
@@ -8589,35 +8680,28 @@ _GPU_SOURCE_BYTES = sum(
 _APP_SOURCE_BYTES = os.path.getsize(__file__)
 
 def _add_gpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _CANONICAL_GPU_SOURCE_MODULES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_cpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_comfymodal_local_python_sources(img):
-    """Legacy wrapper: includes all CPU sources + optimizations + comfymodal_runtime."""
-    img = _add_cpu_python_sources(img)
-    img = img.add_local_python_source("optimizations", copy=True)
-    img = img.add_local_python_source("comfymodal_runtime", copy=True)
-    return img
-
-
-_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
-    _GPU_COMFYMODAL_PYTHON_SOURCES + (
-        "canonical_execution", "modal_client", "run_prompt_options",
-        "warmup_profile", "workflow_metadata", "model_manifest",
+    """Mount the consolidated first-party source tree for lightweight images."""
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
     )
-))
 
 
 @dataclass(frozen=True)
@@ -8765,9 +8849,7 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
     # ``_image_base`` is now the post-custom-node-source boundary.  Start the
     # final source additions there so the canonical plan does not accidentally
     # drop the published custom-node tree.
-    source = _add_gpu_python_sources(_image_base).add_local_python_source(
-        "comfymodal_runtime", copy=True,
-    )
+    source = _add_gpu_python_sources(_image_base)
     if not _INSIDE_MODAL_CONTAINER:
         source = source.add_local_file(
             _CANONICAL_PLAN_METADATA_HOST_PATH,
@@ -8821,7 +8903,7 @@ else:
 download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-).add_local_python_source("comfymodal_runtime", copy=True)
+)
 
 app = modal.App(APP_NAME, image=image, include_source=False)
 _E16_READ_ONLY_VOLUME_LOOKUP = os.environ.get(
