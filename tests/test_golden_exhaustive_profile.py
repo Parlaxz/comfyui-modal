@@ -1601,3 +1601,78 @@ def test_manifest_sidecar_is_never_counted_as_a_process(tmp_path):
     )
     processes = gep.discover_process_traces(tmp_path / "s")
     assert sorted(p.pid for p in processes) == [2, 9]
+
+
+# -- post-request exit gate -----------------------------------------------
+# The traced run reached ~1.2M VizTracer entries (the include_files whitelist
+# was replaced by an exclude_files blacklist, because a rejected call poisons
+# every descendant in VizTracer).  Serializing that overruns the production 15s
+# post-request bound and used to os._exit(71) a run whose telemetry, output and
+# trace were all already durable.
+
+
+def test_exit_gate_defaults_to_production_budget(monkeypatch):
+    from comfymodal_runtime import golden_parallel as gp
+
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_EXIT_GATE_S", raising=False)
+    monkeypatch.delenv("COMFYMODAL_V2_FULL_TRACE", raising=False)
+    assert gp._resolve_post_request_exit_gate_s() == gp.POST_REQUEST_EXIT_GATE_S
+
+
+def test_exit_gate_widens_under_full_trace(monkeypatch):
+    from comfymodal_runtime import golden_parallel as gp
+
+    monkeypatch.delenv("COMFYMODAL_GOLDEN_EXIT_GATE_S", raising=False)
+    monkeypatch.setenv("COMFYMODAL_V2_FULL_TRACE", "1")
+    assert gp._resolve_post_request_exit_gate_s() == gp.POST_REQUEST_EXIT_GATE_TRACED_S
+    assert gp.POST_REQUEST_EXIT_GATE_TRACED_S > gp.POST_REQUEST_EXIT_GATE_S
+
+
+def test_exit_gate_env_override_wins(monkeypatch):
+    from comfymodal_runtime import golden_parallel as gp
+
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_EXIT_GATE_S", "42.5")
+    monkeypatch.setenv("COMFYMODAL_V2_FULL_TRACE", "1")
+    assert gp._resolve_post_request_exit_gate_s() == 42.5
+
+
+def test_exit_gate_env_override_ignores_garbage(monkeypatch):
+    from comfymodal_runtime import golden_parallel as gp
+
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_EXIT_GATE_S", "not-a-number")
+    monkeypatch.setenv("COMFYMODAL_V2_FULL_TRACE", "1")
+    assert gp._resolve_post_request_exit_gate_s() == gp.POST_REQUEST_EXIT_GATE_TRACED_S
+
+
+def test_exit_gate_clamps_absurd_override(monkeypatch):
+    from comfymodal_runtime import golden_parallel as gp
+
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_EXIT_GATE_S", "0")
+    assert gp._resolve_post_request_exit_gate_s() == 1.0
+
+
+def test_request_tracing_uses_blacklist_not_include_files():
+    """The whitelist poisoned whole subtrees; the blacklist does not.
+
+    A rejected call increments VizTracer's thread-local ignore_stack_depth and
+    every descendant is skipped without re-testing its own filename, so
+    excluding asyncio/threading/concurrent.futures hid every project frame
+    beneath them.  Dropping include_files entirely was tried and is not viable:
+    tracing torch internals explodes the event count and the request stops
+    completing, so the blacklist must stay.
+    """
+    src = Path(
+        __file__
+).resolve().parents[1] / "comfymodal_runtime" / "full_execution_trace.py"
+    text = src.read_text(encoding="utf-8")
+    start = text.index("def _start_request_tracing")
+    body = text[start:text.index("\n    def ", start + 10)]
+    assert '"include_files"' not in body
+    assert '"exclude_files"' in body
+    # The blacklist must keep the scheduler roots traceable: asyncio, threading
+    # and concurrent.futures live under the interpreter prefix, not site-packages.
+    from comfymodal_runtime import full_execution_trace as fet
+
+    excluded = fet._resolve_trace_include_paths()["excluded"]
+    for scheduler_frame in ("asyncio", "threading", "concurrent"):
+        assert not any(scheduler_frame in e for e in excluded)

@@ -15296,7 +15296,18 @@ def _stage_pair_metrics(
 
 
 async def _run_overlap_stage_offloaded(call: Callable[[], Any]) -> Any:
-    """Run a blocking canonical async stage on a private worker event loop."""
+    """Run a blocking canonical async stage on a private worker event loop.
+
+    The body runs on an asyncio executor thread that already existed before
+    ``enable_thread_tracing()``, so without an explicit handoff it records
+    nothing.  That is the whole reason every parallelized canonical stage
+    collapsed to a single leaf span: ``clip_forward``/``unet_load`` and
+    ``sampling``/``vae_load`` are the two overlap pairs, and both are dispatched
+    through here, while the serial stages on the request task thread stayed deep.
+    The handoff installs this request's profile hook from inside the worker;
+    ``sys.setprofile`` only ever affects the calling thread, so it cannot be
+    applied from out here.
+    """
     loop = asyncio.get_running_loop()
     inner: dict[str, Any] = {}
     cancel_requested = threading.Event()
@@ -15319,7 +15330,14 @@ async def _run_overlap_stage_offloaded(call: Callable[[], Any]) -> Any:
             asyncio.set_event_loop(None)
             worker_loop.close()
 
-    future = loop.run_in_executor(None, contextvars.copy_context().run, run)
+    try:
+        from .full_execution_trace import thread_traced
+        dispatched = thread_traced(run)
+    except BaseException:
+        dispatched = run
+    future = loop.run_in_executor(
+        None, contextvars.copy_context().run, dispatched,
+    )
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:

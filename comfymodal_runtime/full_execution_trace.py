@@ -277,13 +277,34 @@ def thread_traced(fn: Callable[..., Any]) -> Callable[..., Any]:
     def _run(*args: Any, **kwargs: Any) -> Any:
         try:
             tracer = _GOLDEN_TRACER.get()
+            if tracer is _GOLDEN_TRACER_UNBOUND:
+                _viz = sys.modules.get("viztracer")
+                _get = getattr(_viz, "get_tracer", None)
+                tracer = _get() if callable(_get) else None
             thread_hook = getattr(tracer, "threadtracefunc", None)
             if callable(thread_hook):
                 sys.setprofile(thread_hook)
-        except BaseException:
+                # On Python 3.12+ VizTracer registers threads through
+                # threading.settrace_all_threads instead of a bare setprofile,
+                # so ask the tracer to register this thread too. On 3.11 it
+                # simply re-sets the same profile function, which is harmless.
+                reg = getattr(tracer, "enable_thread_tracing", None)
+                if callable(reg):
+                    reg()
+        except BaseException:  # noqa: BLE001 - tracing must never break the load
             pass
         return fn(*args, **kwargs)
 
+    # ``functools.wraps`` exposes __wrapped__, so ``inspect.signature`` follows
+    # it to the real callable. Anything that introspects this object rather than
+    # calling it -- GoldenModelTransport dispatches on the signature and rejects
+    # the keyword arguments it sees -- must keep seeing the original, so the
+    # wrapper's own signature is pinned rather than (*args, **kwargs).
+    try:
+        import inspect as _inspect
+        _run.__signature__ = _inspect.signature(fn)  # type: ignore[attr-defined]
+    except (TypeError, ValueError, ImportError):
+        pass
     return _run
 
 
@@ -1299,6 +1320,65 @@ def _inspect_asyncio_task(task: asyncio.Task) -> dict[str, Any]:
 # Include-path resolution for trace_config.json
 # ═══════════════════════════════════════════════════════════════════════════════════
 
+def _comfyui_root_candidates(here: Path | None) -> list[Path]:
+    """Return plausible ComfyUI checkout roots, most specific first.
+
+    Covers both layouts this runtime ships in: a source checkout where the
+    package sits at ``<ComfyUI>/custom_nodes/comfyui-modal/comfymodal_runtime``,
+    and the deployed layout where the package is mounted at
+    ``/root/comfymodal_runtime``. Derivation from the module path alone misses
+    the second case entirely.
+    """
+    out: list[Path] = []
+    if here is not None:
+        try:
+            node = here
+            for _ in range(4):
+                node = node.parent
+                if node.name == "comfyui-modal" and node.parent.name == "custom_nodes":
+                    out.append(node.parent.parent)
+                if node.name == "ComfyUI":
+                    out.append(node)
+        except Exception:
+            pass
+    out.extend([
+        Path("/root/ComfyUI"),
+        Path("/ComfyUI"),
+        Path("/opt/ComfyUI"),
+        Path("/workspace/ComfyUI"),
+        Path("/app/ComfyUI"),
+    ])
+    # Anything that imports cleanly is authoritative.
+    try:
+        import folder_paths  # type: ignore
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            out.append(Path(str(base)))
+        main = getattr(folder_paths, "get_folder_paths", None)
+        if callable(main):
+            for name in ("custom_nodes", "comfy"):
+                try:
+                    p = main(name)
+                except Exception:
+                    continue
+                if p:
+                    base_p = Path(str(p))
+                    out.append(base_p if base_p.name != "comfy" else base_p.parent)
+    except Exception:
+        pass
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in out:
+        try:
+            k = str(p)
+        except Exception:
+            continue
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
+
+
 def _resolve_trace_include_paths() -> dict[str, Any]:
     """Resolve VizTracer include file paths from known project layout.
 
@@ -1354,13 +1434,38 @@ def _resolve_trace_include_paths() -> dict[str, Any]:
         search_roots.append(here)                    # comfymodal_runtime/
         custom_node_root = here.parent               # comfyui-modal/
         search_roots.append(custom_node_root)
-        comfyui_root = custom_node_root.parent.parent  # ComfyUI/ (if it exists)
-        if comfyui_root.name == "ComfyUI":
-            search_roots.append(comfyui_root)
-            # Also comfy/ subdirectory
-            search_roots.append(comfyui_root / "comfy")
     except Exception:
-        pass
+        here = None
+
+    # Locate the ComfyUI checkout. The obvious two-levels-up guess only holds
+    # for a source checkout; the deployed layout puts this package at
+    # /root/comfymodal_runtime, so `comfyui_root.name == "ComfyUI"` was never
+    # true and ComfyUI was never searched at all. Every `comfy/*.py` and
+    # custom-node pattern below silently landed in `missing`, which is why the
+    # compute stages -- whose bodies are ComfyUI and RES4LYF code -- recorded no
+    # frames however well they were traced.
+    comfyui_root: Path | None = None
+    for candidate in _comfyui_root_candidates(here):
+        try:
+            if (candidate / "comfy").is_dir():
+                comfyui_root = candidate
+                break
+        except Exception:
+            continue
+    if comfyui_root is not None:
+        search_roots.append(comfyui_root)
+        search_roots.append(comfyui_root / "comfy")
+        # Custom nodes hold the sampler, CFG and CacheDiT implementations that
+        # golden_sampling executes; without them that stage is a bare leaf.
+        custom_nodes_dir = comfyui_root / "custom_nodes"
+        if custom_nodes_dir.is_dir():
+            search_roots.append(custom_nodes_dir)
+            try:
+                for entry in sorted(custom_nodes_dir.iterdir()):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        search_roots.append(entry)
+            except Exception:
+                pass
 
     # Custom node search roots (from known installed paths)
     try:
@@ -1369,6 +1474,51 @@ def _resolve_trace_include_paths() -> dict[str, Any]:
             search_roots.append(Path(sp))
     except Exception:
         pass
+
+    # Locate the ComfyUI checkout by content, not by path shape.
+    #
+    # The layout assumption above (``<custom_node_root>/../../ComfyUI``) only
+    # holds when this package is installed under ComfyUI/custom_nodes/. In the
+    # container it lives at /root/comfymodal_runtime, so custom_node_root is
+    # /root, the guessed parent is "/", its name is not "ComfyUI", and the real
+    # checkout is never searched. Every requested ComfyUI path then resolved to
+    # `missing`, and since a non-empty include list is used, those frames were
+    # silently filtered out of the trace.
+    #
+    # That is precisely why golden_clip_load was deep (its body is
+    # comfymodal_runtime, always included) while every stage that hands off to
+    # ComfyUI or a custom node -- clip_forward, unet_load, vae_load, sampling --
+    # collapsed to a leaf despite the tracer recording the calls. Probe for a
+    # directory that actually contains the ComfyUI package instead of assuming.
+    def _looks_like_comfyui(root: Path) -> bool:
+        try:
+            return (root / "comfy" / "sd.py").exists() and (
+                root / "folder_paths.py"
+            ).exists()
+        except OSError:
+            return False
+
+    probe_roots: list[Path] = []
+    for base in list(search_roots):
+        for suffix in ("", "ComfyUI", "custom_nodes/ComfyUI", ".."):
+            try:
+                probe_roots.append((base / suffix).resolve())
+            except OSError:
+                continue
+    for candidate in probe_roots:
+        try:
+            if candidate.name == "ComfyUI" or _looks_like_comfyui(candidate):
+                if candidate not in search_roots:
+                    search_roots.append(candidate)
+                comfy_pkg = candidate / "comfy"
+                if comfy_pkg.is_dir() and comfy_pkg not in search_roots:
+                    search_roots.append(comfy_pkg)
+                custom_nodes = candidate / "custom_nodes"
+                if custom_nodes.is_dir() and custom_nodes not in search_roots:
+                    # Sampler/model packs live here (RES4LYF, ComfyUI-CacheDiT).
+                    search_roots.append(custom_nodes)
+        except OSError:
+            continue
 
     searched_dirs = set()
     for root in search_roots:
@@ -1939,11 +2089,27 @@ class FullExecutionTraceSession:
                 "register_global": True,
                 "log_async": True,
                 "pid_suffix": False,
+                "ignore_c_function": True,
+                "ignore_frozen": True,
+                "min_duration": 0,
             }
-            if inc["resolved"]:
-                kwargs["include_files"] = inc["resolved"]
-            else:
-                kwargs["exclude_files"] = inc["excluded"]
+            # Use a BLACKLIST, never the include_files whitelist.
+            #
+            # VizTracer applies these at capture time, and a rejected call
+            # increments a thread-local ignore_stack_depth that suppresses every
+            # descendant WITHOUT re-checking its own filename (snaptrace.c skips
+            # on `ignore_stack_depth > 0` before the prefix test). A whitelist
+            # that omits asyncio/threading/concurrent.futures therefore hides
+            # every project function reached beneath them -- which is why only
+            # the work before the first await was ever deep.
+            #
+            # Excluding torch and the site-packages bulk instead keeps the
+            # scheduler frames traceable, so no ancestry is poisoned and call
+            # trees survive coroutine resumes and executor workers. Dropping
+            # include_files entirely was tried and is not viable: it traces torch
+            # internals too, the event volume explodes, and the request stops
+            # completing inside golden_sampling.
+            kwargs["exclude_files"] = inc["excluded"]
             try:
                 self._viztracer = _VT(**kwargs)
             except TypeError:
