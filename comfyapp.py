@@ -9619,6 +9619,9 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
     cpu=2,
     memory=4096,
     timeout=1800,
+    # The shared Volume has one publication authority.  Keep this function
+    # single-writer even when callers come from different hosts/routes.
+    max_containers=1,
     volumes={CUSTOM_NODES_PATH: custom_nodes_vol},
 )
 def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
@@ -9627,12 +9630,15 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     import io
     import os
     import shutil
+    import tempfile
 
-    staging_dir = os.path.join(CUSTOM_NODES_PATH, ".staging")
-
-    # Clean any leftover staging dir (safe regardless of type)
-    _safe_remove_path(staging_dir)
-    os.makedirs(staging_dir)
+    # Stage on the container's ephemeral filesystem, not under the published
+    # tree.  The name is unique per invocation, so a bypassed platform gate
+    # cannot make one invocation delete or extract into another's staging.
+    staging_dir = tempfile.mkdtemp(
+        prefix="comfyui-custom-nodes-",
+        dir="/tmp",
+    )
 
     # Extract to staging with path traversal and symlink protection.
     # NOTE: old content is NOT removed until the new archive has been
@@ -9653,28 +9659,27 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         raise
 
     # GÃ¶Ã‡GÃ¶Ã‡ Old content removal (only after new archive is in staging) GÃ¶Ã‡GÃ¶Ã‡
-    _staging_name = os.path.basename(staging_dir)
-    for item in os.listdir(CUSTOM_NODES_PATH):
-        if item == _staging_name:
-            continue
-        if item == ".comfymodal_control":
-            continue
-        item_path = os.path.join(CUSTOM_NODES_PATH, item)
-        if os.path.islink(item_path):
-            os.unlink(item_path)
-        elif os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-        else:
-            os.remove(item_path)
+    try:
+        for item in os.listdir(CUSTOM_NODES_PATH):
+            if item == ".comfymodal_control":
+                continue
+            item_path = os.path.join(CUSTOM_NODES_PATH, item)
+            if os.path.islink(item_path):
+                os.unlink(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
 
-    # Move extracted items from staging to volume root
-    for item in os.listdir(staging_dir):
-        src = os.path.join(staging_dir, item)
-        dst = os.path.join(CUSTOM_NODES_PATH, item)
-        shutil.move(src, dst)
-
-    # Clean up staging
-    _safe_remove_path(staging_dir)
+        # Move extracted items from staging to volume root.  Cleanup is in a
+        # finally block so partial moves and all later failure paths cannot
+        # leave an invocation's staging directory behind.
+        for item in os.listdir(staging_dir):
+            src = os.path.join(staging_dir, item)
+            dst = os.path.join(CUSTOM_NODES_PATH, item)
+            shutil.move(src, dst)
+    finally:
+        _safe_remove_path(staging_dir)
 
     # P3 (corrected): Write the generation record BEFORE committing,
     # so the custom-node contents AND the generation record are part

@@ -37,6 +37,8 @@ from comfymodal_runtime.publication_policy import (
     CUSTOM_NODES_VOLUME_NAME as _CUSTOM_NODES_VOLUME_NAME,
 )
 from tools.v2_control.custom_nodes import publish_or_skip
+from tools.v2_control.errors import LockHeldError, LockStaleError
+from tools.v2_control.locking import DeployLock
 
 _local_exact_prefill = env_flag("COMFYMODAL_EXACT_CLIP_PREFILL", default=True)
 print(f"[exact_prefill.local] enabled={int(_local_exact_prefill)} source=env")
@@ -3325,6 +3327,40 @@ async def _sync_custom_nodes_and_maybe_deploy(cn_root: str, workspace: dict) -> 
     return result
 
 
+def _acquire_studio_publication_lock() -> DeployLock:
+    """Acquire the repo deploy lock without waiting on another publisher.
+
+    The lock file is shared with v2ctl on this checkout.  A proven stale lock
+    is recovered automatically only under the existing bounded policy (dead
+    same-host pid or foreign host older than six hours); a fresh lock is
+    reported to the route instead of being silently replaced.
+    """
+    lock = DeployLock(Path(_NODE_DIR) / ".v2ctl" / "deploy.lock")
+    kwargs = {
+        "owner": "studio-custom-node-publication",
+        "target": _CUSTOM_NODES_VOLUME_NAME,
+        "profile": "studio_custom_nodes",
+    }
+    try:
+        lock.acquire(**kwargs, auto_recover=True)
+    except LockStaleError:
+        # DeployLock deliberately requires explicit force for stale locks.
+        # Studio can recover one only after re-checking the evidence, so a
+        # crashed publisher cannot wedge this route forever.
+        status = lock.status()
+        if status is None or not lock.is_stale(status):
+            raise LockHeldError(
+                "Studio custom-node publication lock changed while checking staleness; "
+                "refusing to replace it"
+            )
+        print(
+            "[custom_nodes.publish] recovering proven stale deploy lock for Studio "
+            f"owner={status.get('owner')} pid={status.get('pid')} host={status.get('host')}"
+        )
+        lock.acquire(**kwargs, force=True)
+    return lock
+
+
 async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
     """Publish custom nodes through the receipt/full-content control plane.
 
@@ -5227,7 +5263,20 @@ if _server:
             return web.json_response({"status": "error", "message": "No active workspace configured"}, status=400)
 
         try:
-            result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
+            publication_lock = _acquire_studio_publication_lock()
+        except (LockHeldError, LockStaleError) as exc:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "message": f"Custom node publication refused: deploy lock is held or stale: {exc}",
+                },
+                status=409,
+            )
+        try:
+            try:
+                result = await _sync_custom_nodes_and_maybe_deploy(cn_root, workspace)
+            finally:
+                publication_lock.release()
             return web.json_response(result, status=200 if result.get("status") == "ok" else 500)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=500)
