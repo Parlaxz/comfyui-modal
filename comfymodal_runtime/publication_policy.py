@@ -184,7 +184,14 @@ COMFYMODAL_LOCAL_CUSTOM_NODES_ENV = "COMFYMODAL_LOCAL_CUSTOM_NODES"
 
 # The custom-node source is a shared resource.  Keep its Volume and the one
 # app allowed to mutate it independent of whichever Golden app consumes it.
-CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+# Honor the same override the runtime already respects (``modal_app.py`` reads
+# COMFYMODAL_CUSTOM_NODES_VOLUME).  Without this, pointing the runtime at an
+# alternate Volume while the publisher kept writing the default one produced a
+# silent split: the reader and the writer disagreed about the content identity.
+# Unset in production, so the default name is unchanged.
+CUSTOM_NODES_VOLUME_NAME = os.environ.get(
+    "COMFYMODAL_CUSTOM_NODES_VOLUME", "comfyui-custom-nodes"
+)
 CUSTOM_NODES_PUBLISHER_APP_NAME = "comfyui-custom-nodes-publisher"
 
 
