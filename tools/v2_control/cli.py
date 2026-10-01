@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -2462,12 +2463,183 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         return 1
 
 
+GOLDEN_PROFILE_DEPLOY_FLAGS = (
+    ("COMFYMODAL_V2_FULL_TRACE", "1"),
+    ("COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER", "1"),
+    ("COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN", "1"),
+)
+GOLDEN_PROFILE_RUN_FLAGS = (
+    ("COMFYMODAL_V2_GOLDEN_DEEP_TRACE", "1"),
+)
+_GOLDEN_COMMAND_HELP = {
+    "doctor": "check local Golden readiness",
+    "deploy": "deploy the Golden app without running a request",
+    "run": "run exactly one Golden request",
+    "publisher-bootstrap": "prepare custom-node publication",
+    "publish-custom-nodes": "publish custom nodes to the app",
+    "profile": "profile one Golden run end to end and print the decision report",
+}
+
+_GOLDEN_COMMAND_DESCRIPTION = {
+    "profile": (
+        "profile one Golden run end to end and print the decision report\n"
+        "\n"
+        "Deploys with tracing enabled, verifies the deployment actually landed,\n"
+        "runs a single request, then downloads the trace bundle, analyzes it and\n"
+        "writes the stage decision documents. This is the whole profiling loop in\n"
+        "one command.\n"
+        "\n"
+        "  python tools/v2ctl.py golden profile --app <experimental-app>\n"
+        "\n"
+        "Tracing flags are added automatically (do not pass them yourself):\n"
+        "  COMFYMODAL_V2_FULL_TRACE=1\n"
+        "  COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1\n"
+        "  COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1\n"
+        "  COMFYMODAL_V2_GOLDEN_DEEP_TRACE=1  (run only)\n"
+        "\n"
+        "Aborts if source-probe does not report RESULT=PASS, so a stale deployment\n"
+        "is never profiled.\n"
+        "\n"
+        "Options:\n"
+        "  --min-ms FLOAT     call-tree expansion floor in ms (default 1.0)\n"
+        "  --skip-analyze     reuse existing derived artifacts, only re-render\n"
+        "  --workspace-id ID  Modal workspace id override for the bundle fetch\n"
+        "\n"
+        "Final output:\n"
+        "  artifacts/golden_exhaustive_runs/<trace_id>/<trace_id>/session/derived/\n"
+        "      golden_stage_report.md\n"
+        "  containing the critical path, a whole-request function rollup, and a\n"
+        "  recursive call tree per stage.\n"
+        "\n"
+        "For an already-downloaded bundle, use the pipeline directly:\n"
+        "  python tools/golden_profile_pipeline.py latest\n"
+        "  python tools/golden_profile_pipeline.py report <trace_id>"
+    ),
+}
+
+_TRACE_ID_RE = re.compile(r"trace_id=([0-9a-f]{32})")
+
+
+def _run_v2ctl(repo_root: Path, argv: list[str], capture: bool) -> tuple[int, str]:
+    """Invoke this same CLI as a subprocess, streaming (and optionally capturing) it.
+
+    Going through the documented ``v2ctl`` entry point rather than calling the
+    internal handlers directly keeps one contract instead of two, so a change to
+    deploy/run argument handling cannot silently diverge from the public CLI.
+    """
+    cmd = [sys.executable, str(repo_root / "tools" / "v2ctl.py")] + argv
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        capture_output=capture,
+        text=True,
+    )
+    return proc.returncode, (proc.stdout or "") if capture else ""
+
+
+def cmd_golden_profile(args, repo_root: Path) -> int:
+    """Deploy with tracing, run one Golden request, then profile the result.
+
+    Automates the whole loop: deploy -> source-probe -> run -> resolve the trace
+    id -> fetch and verify the bundle -> analyze -> render. Ends by printing the
+    path to the stage decision report.
+    """
+    if getattr(args, "dry_run", False):
+        print(
+            "[v2ctl.golden_profile] dry-run: would deploy with "
+            f"{', '.join(k for k, _ in GOLDEN_PROFILE_DEPLOY_FLAGS)}, "
+            f"source-probe, run with "
+            f"{', '.join(k for k, _ in GOLDEN_PROFILE_RUN_FLAGS)}, then fetch, "
+            "analyze and render.",
+            flush=True,
+        )
+        return 0
+    app = getattr(args, "app", None)
+    if not app:
+        print(
+            "ERROR: golden profile requires --app <experimental-app>",
+            file=sys.stderr,
+        )
+        return 2
+
+    profile = getattr(args, "profile", None) or GOLDEN_P1_PROFILE
+    min_ms = float(getattr(args, "min_ms", 1.0) or 1.0)
+
+    # Preserve any --set the caller supplied, then add ours.
+    extra: list[str] = []
+    for item in getattr(args, "set", None) or []:
+        extra += ["--set", str(item)]
+
+    def base() -> list[str]:
+        return ["--profile", profile, "--app", app] + extra
+
+    for flag, value in GOLDEN_PROFILE_DEPLOY_FLAGS:
+        if flag not in {s.split("=", 1)[0] for s in extra}:
+            extra += ["--set", f"{flag}={value}"]
+    if not any(s.startswith("COMFYMODAL_V2_GOLDEN_DEEP_TRACE=") for s in extra):
+        for flag, value in GOLDEN_PROFILE_RUN_FLAGS:
+            extra += ["--set", f"{flag}={value}"]
+
+    print("[v2ctl.golden_profile] step 1/5 deploy", flush=True)
+    rc, _ = _run_v2ctl(repo_root, base() + ["golden", "deploy"], capture=False)
+    if rc != 0:
+        print(f"ERROR: deploy failed rc={rc}", file=sys.stderr)
+        return rc
+
+    print("[v2ctl.golden_profile] step 2/5 source-probe", flush=True)
+    rc, probe = _run_v2ctl(repo_root, base() + ["source-probe"], capture=True)
+    sys.stdout.write(probe)
+    sys.stdout.flush()
+    if rc != 0 or "RESULT=PASS" not in probe:
+        print(
+            "ERROR: source-probe did not report RESULT=PASS; refusing to run so a "
+            "stale deployment cannot be profiled",
+            file=sys.stderr,
+        )
+        return rc or 1
+
+    print("[v2ctl.golden_profile] step 3/5 run", flush=True)
+    rc, run_out = _run_v2ctl(repo_root, base() + ["golden", "run"], capture=True)
+    sys.stdout.write(run_out)
+    sys.stdout.flush()
+    if rc != 0:
+        print(f"ERROR: golden run failed rc={rc}", file=sys.stderr)
+        return rc
+
+    matches = _TRACE_ID_RE.findall(run_out)
+    if not matches:
+        print(
+            "ERROR: no trace_id found in the run output; cannot locate the bundle",
+            file=sys.stderr,
+        )
+        return 1
+    trace_id = matches[-1]
+    print(f"[v2ctl.golden_profile] trace_id={trace_id}", flush=True)
+
+    print("[v2ctl.golden_profile] step 4/5 fetch + analyze", flush=True)
+    sys.path.insert(0, str(repo_root / "tools"))
+    import golden_profile_pipeline as pipeline
+
+    argv = ["report", trace_id, "--min-ms", str(min_ms)]
+    if getattr(args, "workspace_id", None):
+        argv += ["--workspace-id", args.workspace_id]
+    if getattr(args, "skip_analyze", False):
+        argv.append("--skip-analyze")
+    rc = pipeline.main(argv)
+    if rc != 0:
+        print(f"ERROR: profiling pipeline failed rc={rc}", file=sys.stderr)
+        return rc
+
+    print("[v2ctl.golden_profile] step 5/5 done", flush=True)
+    return 0
+
+
 def cmd_golden(args, repo_root: Path) -> int:
     """Dispatch the public Golden namespace to the canonical handlers."""
-    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
+    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"}:
         print(
             "ERROR: public Golden commands are doctor, status, deploy, run, "
-            "publisher-bootstrap, and publish-custom-nodes",
+            "publisher-bootstrap, publish-custom-nodes, and profile",
             file=sys.stderr,
         )
         return 2
@@ -2487,7 +2659,7 @@ def cmd_golden(args, repo_root: Path) -> int:
     identity_error = _reject_golden_identity_args(args, public=True)
     if identity_error is not None:
         return identity_error
-    public_run = args.golden_command in {"deploy", "run"}
+    public_run = args.golden_command in {"deploy", "run", "profile"}
     dry_run = bool(getattr(args, "dry_run", False))
     if public_run and not dry_run:
         if not getattr(args, "app", None):
@@ -2507,6 +2679,8 @@ def cmd_golden(args, repo_root: Path) -> int:
         args.run_count = 1
     if args.golden_command == "status":
         return cmd_golden_status(args, repo_root)
+    if args.golden_command == "profile":
+        return cmd_golden_profile(args, repo_root)
     handlers = {
         "doctor": cmd_doctor,
         "deploy": cmd_deploy,
@@ -4457,9 +4631,14 @@ def build_parser() -> argparse.ArgumentParser:
     gsub.add_parser("status", help="show local Golden readiness without backend calls").set_defaults(
         func=cmd_golden
     )
-    for name in ("doctor", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"):
-        child = gsub.add_parser(name)
-        if name in {"deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
+    for name in ("doctor", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"):
+        child = gsub.add_parser(
+            name,
+            help=_GOLDEN_COMMAND_HELP.get(name),
+            description=_GOLDEN_COMMAND_DESCRIPTION.get(name),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        if name in {"deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"}:
             # Visible on ``golden <command> --help`` while the existing
             # pre-parser continues to support root-option hoisting.
             # SUPPRESS is important: _hoist_global_options may already have
@@ -4467,6 +4646,24 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
             child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                                help="resolve and print, invoke nothing")
+            if name == "profile":
+                child.add_argument(
+                    "--min-ms",
+                    type=float,
+                    default=argparse.SUPPRESS,
+                    help="call-tree expansion floor in ms (default 1.0)",
+                )
+                child.add_argument(
+                    "--skip-analyze",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="reuse existing derived artifacts and only re-render",
+                )
+                child.add_argument(
+                    "--workspace-id",
+                    default=argparse.SUPPRESS,
+                    help="Modal workspace id override for bundle fetch",
+                )
             if name == "run":
                 child.add_argument(
                     "--acknowledge-volume-drift",
