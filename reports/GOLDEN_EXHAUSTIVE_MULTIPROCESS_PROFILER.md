@@ -556,9 +556,114 @@ What that proves that local tests cannot: that the process registry is written
 by the running container, that roles resolve from live evidence, and that
 TRACE_BEGIN/TRACE_END reaches a persistent worker that was already alive.
 
-**Blocking prerequisite:** the working tree currently carries uncommitted
-in-progress changes in `golden_source_threads.py` (~2,041 lines) and
-`modal_app.py` that were not written for this task. Deploying publishes that
-work to the shared custom-nodes Volume and runs it on a paid GPU, so the tree
-must be cleaned (or that lane's owner must approve) before the capture is
-responsible. That decision is not mine to make.
+**Blocking prerequisite (now resolved):** `golden_source_threads.py`,
+`modal_app.py` and `golden_p1_parallel_c0_p7_h100.toml` were restored to their
+`production-007` (`9de63e61`) content, which this branch was missing. The
+superseded in-progress versions are preserved at
+`C:\Users\parla\AppData\Local\Temp\gep_run\prod007_backup` and can be restored
+with `temp/gep_run/align_prod007.py`.
+
+---
+
+## 16. Live capture: five profiled runs on Testing 9
+
+Deployed `golden_p1_parallel_c0_p7_h100` on Testing 9 (`ws_ee7221847f7d`) with
+`COMFYMODAL_V2_FULL_TRACE=1`, `COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1`,
+`COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1` (deploy) and
+`COMFYMODAL_V2_GOLDEN_DEEP_TRACE=1` (run). All five runs were valid, counted and
+`ELIGIBLE`.
+
+| # | trace_id | root wall (ms) | calls under root |
+|---|---|---|---|
+| 1 | `36101dcdb3a34212b9b7964de18f484c` | 11323.793 | 37742 |
+| 2 | `ed3f97e0536545148b9e7138758c0a56` | 10951.551 | 37762 |
+| 3 | `9544340a937d4c50a87e614acb77f3d8` | 13822.123 | 37847 |
+| 4 | `63a6238005b44360a3a37c0369da0676` | 10344.248 | 37765 |
+| 5 | `c43636e33f834163ae05ab57ac8f355e` | 8921.899 | 37763 |
+
+Every run: `ROOT_COMPLETE=YES`, `CLOCK_ALIGNMENT=PROVEN`, `THREAD_COVERAGE=COMPLETE`
+(2 lanes), `INCOMPLETE_CALLS=0`, `PROCESS_COVERAGE=UNKNOWN`,
+`TRACED_PROCESSES=1`, and `GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE=NO` with the exact
+missing stages listed.
+
+### 16.1 Root descendant discovery needed time containment
+
+The first pass over these bundles returned `calls=1`. The authoritative root is
+opened around an `await`, so the stages it measures run on a different thread or
+asyncio task, where stack nesting cannot see them: every record looked like an
+unrelated top-level call.
+
+`resolve_descendants` now combines two relations — stack nesting within one
+execution context, and time containment inside the root's own wall interval on
+the root's own process. That lifted `calls` from 1 to ~37.7k and resolved three
+stages. This is the general case for any span that delimits an `await`, not a
+Golden-specific workaround.
+
+### 16.2 There is no C0 child process in this profile
+
+`PROCESS_COVERAGE=UNKNOWN` / `TRACED_PROCESSES=1` was **not** a bundling defect.
+The bundle contains no `raw/trace_child_viztracer.json`, and `_attach_child_viztracer_trace`
+(the helper that copies the child's self-written trace into the bundle, ported
+from the `golden-best-003-docs` worktree) correctly wrote nothing because it
+reported `enabled=False`.
+
+`golden_telemetry` says why:
+
+```json
+{"architecture": "source_owner", "source_worker_kind": "thread",
+ "workers_configured": 4, "workers_ready": 4,
+ "reader_identities": [{"name": "c0-source-0", "thread_id": 64}, ...]}
+```
+
+with `COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND="thread"`. The C0 work runs as
+four **threads inside the parent container**. `golden_io_process_v2.py`'s
+module-scope `_start_child_viztracer()` is therefore never executed as a child
+entrypoint, `/tmp/comfymodal_c0_child_viztracer.json` is never created, and
+`COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1` is a **no-op in this profile**. The
+child-VizTracer design assumes the separate-process architecture; this profile
+does not use it.
+
+### 16.3 The apparent "untraced window" is GPU time, not a gap
+
+Run 5's lane table:
+
+```
+parent/tid:2:MainProcess    |################################|  busy 8933.5 ms
+parent/tid:5105280:Task-61  |#######                         |  busy 1366.3 ms
+```
+
+The parent is traced across the whole 8922 ms root; `Task-61` simply stops at
+1366 ms. The window that looks unexplained is UNet / sampler / VAE executing in
+CUDA and C frames, which VizTracer's Python-function tracing structurally cannot
+record. There is no early `tracer.stop()`: both call sites
+(`full_execution_trace.py` `stop_tracing` and `close_for_exit`) are teardown
+paths.
+
+So `PROFILE_COMPLETE=NO` is the profiler **correctly refusing** to claim
+coverage it does not have. Closing that gap requires torch/CUDA tracing, not a
+second VizTracer.
+
+### 16.4 Child trace attachment (kept for the process architecture)
+
+`_attach_child_viztracer_trace` plus its call before `_build_full_trace_bundle`
+is correct and inert for `worker_kind=thread`. It is required for the
+separate-process architecture and is guarded by tests that prove the real
+contract — an attached child trace is discovered as a second process
+(`tests/test_v2_child_trace_attachment.py`). Those tests are marked
+`heavy_local` because `import comfymodal_runtime.modal_app` costs ~9.0 s, which
+must not contaminate FAST_UNIT verification.
+
+### 16.5 Open scope decision
+
+How to account for GPU time is a deliberate choice, not a bug fix:
+
+1. **Attribute it** by enabling the torch profiler (`trace_config.json` exposes
+   `torch_enabled`; the bundle currently carries an empty 37-byte
+   `raw/torch_trace.json.gz`). This closes the gap with real numbers but adds
+   overhead and failure modes to a Golden run.
+2. **Report it as a bounded attributed residual** — "8922 ms total, 1366 ms
+   Python-attributed, remainder GPU/CUDA". Near-zero cost and already honest.
+3. **Name the C0 source threads as first-class lanes** — 4 real threads the
+   report cannot currently attribute.
+
+Recommendation: (2) now, (1) as a follow-up.
