@@ -1090,6 +1090,11 @@ export async function triggerRebuildDependencies(apiBase) {
   return apiFetch(apiBase, "/custom-nodes/sync/rebuild-dependencies", { method: "POST" });
 }
 
+export async function getCustomNodeSyncOperationStatus(apiBase, syncId) {
+  if (!syncId) return null;
+  return apiFetch(apiBase, `/custom-nodes/sync/status/${encodeURIComponent(syncId)}`);
+}
+
 export async function getDeployLog(apiBase) {
   return apiFetch(apiBase, "/deploy/log");
 }

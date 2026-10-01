@@ -17,7 +17,7 @@ from collections import namedtuple
 from collections.abc import Mapping
 from pathlib import Path
 import traceback as _traceback
-from typing import Any
+from typing import Any, Sequence
 import importlib
 
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1002,6 +1002,8 @@ _deploy_status = {"state": "idle", "message": ""}
 _last_successful_model_stack: dict = {}
 _latest_benchmark_workflow: dict = {}
 _download_progress: dict = {}
+_studio_custom_node_sync_status: dict[str, dict[str, Any]] = {}
+_studio_custom_node_sync_status_lock = threading.Lock()
 
 _RESULT_ROUTE = os.environ.get("COMFYMODAL_RESULT_ROUTE", "legacy").strip().lower()
 if _RESULT_ROUTE not in ("legacy", "direct"):
@@ -3425,6 +3427,191 @@ async def _publish_custom_nodes_or_skip(cn_root: str, workspace: dict) -> dict:
                 "verified_publication": False,
             },
         }
+
+
+def _studio_custom_node_delivery_mode() -> str:
+    mode = os.environ.get("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+    return mode if mode in {"image", "volume"} else "image"
+
+
+def _studio_sync_status(sync_id: str) -> dict[str, Any] | None:
+    with _studio_custom_node_sync_status_lock:
+        status = _studio_custom_node_sync_status.get(sync_id)
+        return dict(status) if status is not None else None
+
+
+def _set_studio_sync_status(sync_id: str, **updates: Any) -> None:
+    with _studio_custom_node_sync_status_lock:
+        current = _studio_custom_node_sync_status.setdefault(sync_id, {"sync_id": sync_id})
+        current.update(updates)
+
+
+def _run_studio_custom_node_sync(
+    sync_id: str,
+    operation: str,
+    cn_root: str,
+    workspace: dict,
+    publication_lock: DeployLock | None,
+    expected_dependencies: list[str],
+) -> None:
+    _set_studio_sync_status(sync_id, state="running", status="running")
+    try:
+        if operation == "publish":
+            result = asyncio.run(_publish_custom_nodes_or_skip(cn_root, workspace))
+            publication = result.get("publication", {}) if isinstance(result, dict) else {}
+            reason = publication.get("reason")
+            if reason == "destructive_custom_node_publication_blocked":
+                _set_studio_sync_status(
+                    sync_id,
+                    state="blocked",
+                    status="blocked",
+                    outcome="destructive_publication_blocked",
+                    message="Publication refused: it would remove previously-published custom-node content.",
+                    result=result,
+                )
+            elif isinstance(result, dict) and result.get("status") == "ok":
+                _set_studio_sync_status(
+                    sync_id,
+                    state="completed",
+                    status="completed",
+                    outcome="published",
+                    message=result.get("message", "Custom nodes published."),
+                    result=result,
+                )
+            else:
+                _set_studio_sync_status(
+                    sync_id,
+                    state="error",
+                    status="error",
+                    outcome="publication_failed",
+                    message=(result or {}).get("message", "Custom-node publication failed."),
+                    result=result,
+                )
+            return
+
+        # Deliberate dependency rebuilds use the existing deploy worker.  Do
+        # not duplicate Modal invocation or make the fast publication path
+        # implicitly rebuild an image.
+        fingerprint = _build_custom_node_fingerprint(cn_root)
+        deploy = _start_background_deploy(
+            workspace=workspace,
+            custom_nodes_fingerprint=fingerprint,
+            reason="studio_custom_node_dependency_rebuild",
+        )
+        if not deploy.get("started"):
+            _set_studio_sync_status(
+                sync_id,
+                state="refused",
+                status="refused",
+                outcome="deploy_already_running",
+                message="Dependency rebuild refused: a deploy is already running.",
+            )
+            return
+        while _deploy_status.get("state") in {"deploying", "starting"}:
+            time.sleep(0.25)
+        deploy_status = dict(_deploy_status)
+        if deploy_status.get("state") == "error":
+            _set_studio_sync_status(
+                sync_id,
+                state="error",
+                status="error",
+                outcome="dependency_rebuild_failed",
+                message=deploy_status.get("message", "Dependency rebuild failed."),
+                deploy=deploy_status,
+            )
+        else:
+            _set_studio_sync_status(
+                sync_id,
+                state="completed",
+                status="completed",
+                outcome="dependency_rebuilt",
+                message="Dependency rebuild deploy completed.",
+                deploy=deploy_status,
+            )
+    except Exception as exc:
+        _log.exception("Studio custom-node sync failed")
+        _set_studio_sync_status(
+            sync_id,
+            state="error",
+            status="error",
+            outcome="operation_failed",
+            message=str(exc),
+        )
+    finally:
+        _set_studio_sync_status(sync_id, dependencies_changed=list(expected_dependencies))
+        if publication_lock is not None:
+            try:
+                publication_lock.release()
+            except Exception:
+                _log.exception("Studio custom-node publication lock release failed")
+
+
+def _start_studio_custom_node_sync(operation: str, expected_dependencies: Sequence[str]) -> dict[str, Any]:
+    sync_id = str(uuid.uuid4())
+    dependencies = [str(item) for item in expected_dependencies]
+    base = {
+        "sync_id": sync_id,
+        "operation": operation,
+        "delivery_mode": _studio_custom_node_delivery_mode(),
+        "state": "queued",
+        "status": "started",
+        "dependencies_changed": dependencies,
+        "poll_url": f"/comfymodal/studio/custom-nodes/sync/status/{sync_id}",
+    }
+    if base["delivery_mode"] == "image":
+        base.update({
+            "state": "completed",
+            "status": "completed",
+            "outcome": "not_applicable",
+            "message": (
+                "Custom nodes ship with the deploy image; nothing needs pushing."
+                if operation == "publish"
+                else "Custom nodes ship with the deploy image; dependency rebuild is part of deploy."
+            ),
+        })
+        _set_studio_sync_status(sync_id, **base)
+        return base
+    workspace = _active_workspace()
+    cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
+    if workspace is None:
+        base.update({
+            "state": "refused", "status": "refused", "outcome": "no_workspace",
+            "message": "Custom-node operation refused: no active workspace configured.",
+            "_http_status": 400,
+        })
+        _set_studio_sync_status(
+            sync_id, **{key: value for key, value in base.items() if key != "_http_status"}
+        )
+        return base
+    publication_lock = None
+    if operation == "publish":
+        try:
+            publication_lock = _acquire_studio_publication_lock()
+        except (LockHeldError, LockStaleError) as exc:
+            base.update({
+                "state": "refused", "status": "refused", "outcome": "lock_held",
+                "message": f"Custom-node publication refused: deploy lock is held: {exc}",
+                "_http_status": 409,
+            })
+            _set_studio_sync_status(
+                sync_id, **{key: value for key, value in base.items() if key != "_http_status"}
+            )
+            return base
+    _set_studio_sync_status(sync_id, **base)
+    thread = threading.Thread(
+        target=_run_studio_custom_node_sync,
+        kwargs={
+            "sync_id": sync_id,
+            "operation": operation,
+            "cn_root": cn_root,
+            "workspace": workspace,
+            "publication_lock": publication_lock,
+            "expected_dependencies": dependencies,
+        },
+        daemon=True,
+    )
+    thread.start()
+    return base
 
 
 def _manifest_entry_from_install(url: str, folder: str, filename: str) -> dict:
@@ -6962,7 +7149,13 @@ if _server:
     register_workflow_routes(_server, _NODE_DIR, resolver=_dependency_resolver)
     from model_library_routes import register_model_library_routes
     register_model_library_routes(
-        _server, _NODE_DIR, _COMFYUI_ROOT, resolver=_dependency_resolver
+        _server,
+        _NODE_DIR,
+        _COMFYUI_ROOT,
+        resolver=_dependency_resolver,
+        custom_node_sync_start=_start_studio_custom_node_sync,
+        custom_node_sync_status=_studio_sync_status,
+        custom_node_delivery_mode=_studio_custom_node_delivery_mode,
     )
 
     # — Studio Backends (legacy compatibility / import-only) —

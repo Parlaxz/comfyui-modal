@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { customNodeSyncMessages } from "../web/studio-backend-deployment.js";
 import {
   getCustomNodeSyncStatus,
+  getCustomNodeSyncOperationStatus,
   triggerPushPlugins,
   triggerRebuildDependencies,
 } from "../web/studio-backend-api.js";
@@ -77,6 +78,19 @@ assert.deepEqual(
 );
 console.log("PASS: payload unknown, counts, and identity note contracts");
 
+assert.deepEqual(
+  customNodeSyncMessages({
+    ...clean,
+    delivery_mode: "image",
+    inventory_state: "differs",
+    payload_state: "differs",
+    dependencies_state: "changed",
+    local_only: [{ name: "node-a" }],
+  }).map((message) => message.id),
+  ["image-mode"],
+  "image delivery never renders Volume drift",
+);
+
 const previousFetch = globalThis.fetch;
 const calls = [];
 globalThis.fetch = async (url, options) => {
@@ -87,6 +101,7 @@ try {
   await getCustomNodeSyncStatus("/comfymodal");
   await triggerPushPlugins("/comfymodal");
   await triggerRebuildDependencies("/comfymodal");
+  await getCustomNodeSyncOperationStatus("/comfymodal", "sync-1");
 } finally {
   globalThis.fetch = previousFetch;
 }
@@ -94,5 +109,6 @@ assert.deepEqual(calls, [
   { url: "/comfymodal/custom-nodes/sync-status", method: "GET" },
   { url: "/comfymodal/custom-nodes/sync", method: "POST" },
   { url: "/comfymodal/custom-nodes/sync/rebuild-dependencies", method: "POST" },
+  { url: "/comfymodal/custom-nodes/sync/status/sync-1", method: "GET" },
 ]);
 console.log("PASS: custom-node sync API helper routes");

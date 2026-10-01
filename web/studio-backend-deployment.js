@@ -17,6 +17,7 @@ import {
   getDeployStatus,
   triggerDeploy,
   getCustomNodeSyncStatus,
+  getCustomNodeSyncOperationStatus,
   triggerPushPlugins,
   triggerRebuildDependencies,
   getDeployLog,
@@ -32,9 +33,12 @@ const REDEPLOY_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const RESTART_POLL_TIMEOUT_MS = 600 * 1000;
 
 export function customNodeSyncMessages(data) {
-  const validInventoryStates = ["match", "differs", "ambiguous", "unknown"];
-  const validPayloadStates = ["exact", "differs", "unknown"];
-  const validDependencyStates = ["changed", "same", "unknown"];
+  if (data && data.delivery_mode === "image") {
+    return [{ id: "image-mode", kind: "neutral", label: "N/A", text: "Custom nodes ship with the deploy image — nothing needs pushing or rebuilding." }];
+  }
+  const validInventoryStates = ["match", "differs", "ambiguous", "unknown", "not_applicable"];
+  const validPayloadStates = ["exact", "differs", "unknown", "not_applicable"];
+  const validDependencyStates = ["changed", "same", "unknown", "not_applicable"];
   if (!data || typeof data !== "object"
     || data.status === "error"
     || validInventoryStates.indexOf(data.inventory_state) === -1
@@ -93,6 +97,11 @@ export function customNodeSyncMessages(data) {
     }
   }
 
+  if (data.inventory_state === "not_applicable" || data.payload_state === "not_applicable"
+    || data.dependencies_state === "not_applicable") {
+    return [{ id: "not-applicable", kind: "neutral", label: "N/A", text: "Custom-node sync is not applicable in this delivery mode." }];
+  }
+
   if (data.dependencies_state === "changed" || dependenciesChanged.length) {
     const count = dependenciesChanged.length;
     messages.push({
@@ -140,7 +149,9 @@ export function renderDeploymentSection(container, apiBase, bus) {
     redeployBusy: false,
     pushBusy: false,
     rebuildBusy: false,
+    syncPollTimer: null,
     customNodeSync: null,
+    customNodeDeliveryMode: null,
     customNodeSyncLoaded: false,
   };
 
@@ -276,8 +287,15 @@ export function renderDeploymentSection(container, apiBase, bus) {
     deployBtn.disabled = busy;
     restartBtn.disabled = busy;
     const syncBusy = state.pushBusy || state.rebuildBusy;
-    pushPluginsBtn.disabled = syncBusy;
-    rebuildDependenciesBtn.disabled = syncBusy;
+    const imageMode = state.customNodeSyncLoaded && state.customNodeDeliveryMode === "image";
+    pushPluginsBtn.disabled = syncBusy || imageMode;
+    rebuildDependenciesBtn.disabled = syncBusy || imageMode;
+    pushPluginsBtn.title = imageMode
+      ? "Custom nodes ship with the deploy image; pushing is not applicable"
+      : "Quickly publish the installed custom nodes without rebuilding dependencies";
+    rebuildDependenciesBtn.title = imageMode
+      ? "Custom-node dependencies are rebuilt as part of the deploy image"
+      : "Rebuild custom-node dependencies; this takes considerably longer than pushing plugins";
     pushPluginsBtn.textContent = state.pushBusy ? "Pushing plugins…" : "Push plugins (FAST)";
     rebuildDependenciesBtn.textContent = state.rebuildBusy ? "Rebuilding dependencies…" : "Rebuild dependencies (SLOW)";
     deployBtn.textContent = state.deploying ? "Deploying\u2026" : "Deploy";
@@ -295,7 +313,9 @@ export function renderDeploymentSection(container, apiBase, bus) {
     let data = null;
     try { data = await getCustomNodeSyncStatus(apiBase); } catch { data = null; }
     state.customNodeSync = data && data.status === "ok" ? data : null;
+    state.customNodeDeliveryMode = state.customNodeSync && state.customNodeSync.delivery_mode;
     state.customNodeSyncLoaded = true;
+    syncButtons();
     renderCustomNodeSync();
     return state.customNodeSync;
   }
@@ -365,6 +385,22 @@ export function renderDeploymentSection(container, apiBase, bus) {
     return !!(resp && typeof resp === "object" && !resp._httpStatus && resp.status !== "error");
   }
 
+  async function pollCustomNodeOperation(syncId, isPush) {
+    const timeout = isPush ? 10 * 60 * 1000 : 30 * 60 * 1000;
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      await new Promise((resolve) => { state.syncPollTimer = setTimeout(resolve, STATUS_POLL_MS); });
+      state.syncPollTimer = null;
+      const operation = await getCustomNodeSyncOperationStatus(apiBase, syncId);
+      if (!operation) continue;
+      if (["completed", "error", "blocked", "refused"].includes(operation.state)
+        || ["completed", "error", "blocked", "refused"].includes(operation.status)) {
+        return operation;
+      }
+    }
+    return { state: "error", status: "error", message: "Custom-node operation timed out." };
+  }
+
   async function onCustomNodeSyncClicked(action) {
     const isPush = action === "push";
     const button = isPush ? pushPluginsBtn : rebuildDependenciesBtn;
@@ -376,23 +412,30 @@ export function renderDeploymentSection(container, apiBase, bus) {
     let resp = null;
     try {
       resp = await (isPush ? triggerPushPlugins(apiBase) : triggerRebuildDependencies(apiBase));
-      if (customNodeActionSucceeded(resp)) {
+      if (resp && resp.outcome === "not_applicable") {
+        appendBoundedResult(resp.message || "Custom nodes ship with the deploy image; nothing needs pushing or rebuilding.", "#aaa");
+      } else if (resp && resp.status === "started" && resp.sync_id) {
+        appendBoundedResult(
+          isPush ? "Push plugins started (FAST); polling publication status…" : "Dependency rebuild started (SLOW); polling deploy status…",
+          "#7ed321",
+        );
+        const operation = await pollCustomNodeOperation(resp.sync_id, isPush);
+        if (operation.outcome === "destructive_publication_blocked") {
+          appendBoundedResult("Push plugins refused: publication would remove previously-published content.", "#e05050");
+        } else if (operation.state === "completed") {
+          appendBoundedResult(operation.message || (isPush ? "Plugins published." : "Dependency rebuild completed."), "#7ed321");
+        } else {
+          appendBoundedResult(operation.message || (isPush ? "Push plugins failed." : "Dependency rebuild failed."), "#e05050");
+        }
+      } else if (resp && (resp.outcome === "destructive_publication_blocked" || resp.outcome === "lock_held")) {
+        appendBoundedResult(resp.message || "Push plugins refused by the publication safety policy.", "#e05050");
+      } else if (customNodeActionSucceeded(resp)) {
         appendBoundedResult(isPush ? "Push plugins request accepted." : "Dependency rebuild request accepted.", "#7ed321");
       } else {
-        appendBoundedResult(
-          isPush
-            ? "Push plugins is not available yet — the sync endpoint is not ready."
-            : "Rebuild dependencies is not available yet — the sync endpoint is not ready.",
-          "#e05050"
-        );
+        appendBoundedResult((resp && (resp.message || resp.error)) || "Custom-node operation failed.", "#e05050");
       }
     } catch {
-      appendBoundedResult(
-        isPush
-          ? "Push plugins is not available yet — the sync endpoint is not ready."
-          : "Rebuild dependencies is not available yet — the sync endpoint is not ready.",
-        "#e05050"
-      );
+      appendBoundedResult("Custom-node operation request failed.", "#e05050");
     } finally {
       await readCustomNodeSyncStatus();
       if (isPush) state.pushBusy = false;

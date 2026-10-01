@@ -21,6 +21,9 @@ Route summary (all under ``/comfymodal/studio``):
         POST  /comfymodal/studio/custom-nodes/refresh           -- rediscover + store
         POST  /comfymodal/studio/custom-nodes/install-request   -- approval record only
         GET   /comfymodal/studio/custom-nodes/sync-status       -- read-only parity report
+        POST  /comfymodal/studio/custom-nodes/sync              -- background publication
+        POST  /comfymodal/studio/custom-nodes/sync/rebuild-dependencies
+        GET   /comfymodal/studio/custom-nodes/sync/status/{id} -- operation status
 
     Dependencies:
         GET   /comfymodal/studio/workflows/versions/{version_id}/dependencies
@@ -32,7 +35,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -390,6 +395,9 @@ def register_model_library_routes(
     *,
     custom_nodes_volume: Any | None = None,
     custom_nodes_volume_factory: Callable[[str], Any] | None = None,
+    custom_node_sync_start: Callable[[str, Sequence[str]], Mapping[str, Any]] | None = None,
+    custom_node_sync_status: Callable[[str], Mapping[str, Any] | None] | None = None,
+    custom_node_delivery_mode: Callable[[], str] | str | None = None,
 ) -> None:
     """Register the Studio Model Library + dependency routes on *server*."""
     node_dir = str(node_dir)
@@ -402,6 +410,30 @@ def register_model_library_routes(
     discovery = CustomNodeDiscovery(node_dir)
     compat_store = StudioJsonStore(Path(node_dir) / ".studio_workflow_compatibility.json")
     workflow_service = WorkflowDomainService(node_dir)
+
+    def _delivery_mode() -> str:
+        value = custom_node_delivery_mode() if callable(custom_node_delivery_mode) else custom_node_delivery_mode
+        if value is None:
+            value = os.environ.get("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image")
+        value = str(value).strip().lower()
+        return value if value in {"image", "volume"} else "image"
+
+    def _not_applicable_sync_status() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "delivery_mode": "image",
+            "inventory_state": "not_applicable",
+            "payload_state": "not_applicable",
+            "local_only": [],
+            "published_only": [],
+            "duplicates": [],
+            "unknown_identity": [],
+            "dependencies_changed": [],
+            "dependencies_state": "not_applicable",
+            "receipt_schema_supported": False,
+            "local_generation": None,
+            "published_generation": None,
+        }
 
     # Cached core-class count from the most recent custom-node discovery.
     _core_count = 0
@@ -586,6 +618,10 @@ def register_model_library_routes(
     @server.routes.get("/comfymodal/studio/custom-nodes/sync-status")
     async def custom_nodes_sync_status(request: web.Request) -> web.Response:
         """Compare the local publication candidate with the read-only receipt."""
+        if _delivery_mode() == "image":
+            # The Volume is not the runtime authority in image delivery mode.
+            # Do not turn its contents into a permanent false drift warning.
+            return web.json_response(_not_applicable_sync_status())
         try:
             source_root = resolve_custom_nodes_root(node_dir)
             try:
@@ -596,6 +632,7 @@ def register_model_library_routes(
         except Exception:
             return web.json_response({
                 "status": "ok",
+                "delivery_mode": "volume",
                 "inventory_state": "unknown",
                 "payload_state": "unknown",
                 "local_only": [],
@@ -643,6 +680,7 @@ def register_model_library_routes(
             _log.exception("Custom-node sync status failed")
             result = {
                 "status": "ok",
+                "delivery_mode": "volume",
                 "inventory_state": "unknown",
                 "payload_state": "unknown",
                 "local_only": [],
@@ -655,7 +693,71 @@ def register_model_library_routes(
                 "local_generation": None,
                 "published_generation": None,
             }
+        result["delivery_mode"] = "volume"
         return web.json_response(result)
+
+    @server.routes.post("/comfymodal/studio/custom-nodes/sync")
+    async def custom_nodes_sync(request: web.Request) -> web.Response:
+        if _delivery_mode() == "image":
+            if custom_node_sync_start is not None:
+                result = dict(custom_node_sync_start("publish", ()))
+                result.pop("_http_status", None)
+                return web.json_response(result)
+            result = _not_applicable_sync_status()
+            result.update({
+                "status": "completed",
+                "operation": "publish",
+                "state": "completed",
+                "outcome": "not_applicable",
+                "message": "Custom nodes ship with the deploy image; nothing needs pushing.",
+            })
+            return web.json_response(result)
+        if custom_node_sync_start is None:
+            return _json_error(501, "Custom-node sync is not configured")
+        result = dict(custom_node_sync_start("publish", ()))
+        http_status = int(result.pop("_http_status", 202 if result.get("status") == "started" else 200))
+        return web.json_response(result, status=http_status)
+
+    @server.routes.post("/comfymodal/studio/custom-nodes/sync/rebuild-dependencies")
+    async def custom_nodes_rebuild_dependencies(request: web.Request) -> web.Response:
+        if _delivery_mode() == "image":
+            if custom_node_sync_start is not None:
+                result = dict(custom_node_sync_start("rebuild_dependencies", ()))
+                result.pop("_http_status", None)
+                return web.json_response(result)
+            result = _not_applicable_sync_status()
+            result.update({
+                "status": "completed",
+                "operation": "rebuild_dependencies",
+                "state": "completed",
+                "outcome": "not_applicable",
+                "message": "Custom nodes ship with the deploy image; dependency rebuild is part of deploy.",
+            })
+            return web.json_response(result)
+        if custom_node_sync_start is None:
+            return _json_error(501, "Custom-node dependency rebuild is not configured")
+        status_response = await custom_nodes_sync_status(request)
+        try:
+            status_payload = json.loads(status_response.body)
+        except Exception:
+            status_payload = {}
+        expected = status_payload.get("dependencies_changed", [])
+        if not isinstance(expected, list):
+            expected = []
+        result = dict(custom_node_sync_start("rebuild_dependencies", [str(item) for item in expected]))
+        result.setdefault("dependencies_changed", [str(item) for item in expected])
+        http_status = int(result.pop("_http_status", 202 if result.get("status") == "started" else 200))
+        return web.json_response(result, status=http_status)
+
+    @server.routes.get("/comfymodal/studio/custom-nodes/sync/status/{sync_id}")
+    async def custom_nodes_sync_operation_status(request: web.Request) -> web.Response:
+        sync_id = request.match_info.get("sync_id", "")
+        if custom_node_sync_status is None:
+            return _json_error(501, "Custom-node sync status is not configured")
+        result = custom_node_sync_status(sync_id)
+        if result is None:
+            return web.json_response({"status": "not_found", "sync_id": sync_id}, status=404)
+        return web.json_response(dict(result))
 
     # ── Dependencies ────────────────────────────────────────────────────
 
