@@ -451,6 +451,28 @@ When breaking a stage into parts:
 
 For CUDA profiling, prefer events/stream-aware measurement that does not add synchronization inside every inner operation. Realize measurements at an already-required safe boundary where possible.
 
+## Locate cost before optimizing it
+
+A wall-clock breakdown is the entry point, not the conclusion. Before changing
+anything:
+
+- Establish the **critical path**, not the biggest stage. Overlapping stages sum
+  to more than the request wall, so time inside an overlapped stage can be fully
+  absorbed by a longer sibling and yield nothing.
+- Prefer **totals over means**. A function called 318 times at 22 ms is 7 seconds,
+  not 22 ms.
+- Separate **inclusive from self** time. Inclusive wall contains callees, so
+  totals are not additive down a tree; a large inclusive total with near-zero
+  self is a wrapper, not a target.
+- Treat blocking waits (`select`, `EpollSelector`, queue reads) as waiting, not
+  CPU burn.
+- A Python-only profiler cannot see GPU kernel time. A GPU-bound stage reads as
+  waiting; do not conclude there is nothing to fix.
+- An observed breakdown is a hypothesis. Confirm with an A/B run.
+
+`comfymodal-golden-ops` owns the concrete profiling procedure and the decision
+report format.
+
 ## Optimize the real endpoint
 
 Microbenchmarks are useful capability evidence, not automatically production wins.

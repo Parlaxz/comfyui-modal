@@ -273,6 +273,93 @@ For a new change:
 
 For three valid observations report raw values plus mean, median, min, max, range, sample SD, and CV. Do not report a meaningful p90 from `n=3`.
 
+## Profiling a Golden run
+
+When the question is **where the time went**, not whether the run passed, use the
+profiling path. It deploys with tracing, runs one request, then downloads and
+analyzes the trace.
+
+```text
+python tools/v2ctl.py golden profile --app <experimental-app>
+```
+
+That single command does the whole loop: deploy with tracing flags, verify the
+deployment actually landed via source-probe, run one request, resolve the trace
+id, download and SHA-verify the bundle, analyze it, and write the decision
+documents. It prints the final report path when done.
+
+- It performs a **real deploy and a real run**. That costs GPU time. Use
+  `--dry-run` first if you only want to see the plan.
+- It **aborts if source-probe does not report `RESULT=PASS`**, so a stale
+  deployment is never profiled.
+- Tracing flags are added automatically; do not pass them yourself:
+  `COMFYMODAL_V2_FULL_TRACE=1`, `COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1`,
+  `COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1`, and `COMFYMODAL_V2_GOLDEN_DEEP_TRACE=1`
+  on the run.
+
+Options: `--min-ms FLOAT` (call-tree expansion floor, default 1.0),
+`--skip-analyze` (reuse existing artifacts, only re-render),
+`--workspace-id ID`.
+
+### Re-analysing an existing trace without spending GPU time
+
+The bundle fetch, analysis and rendering are usable standalone. This costs
+nothing beyond a download:
+
+```text
+python tools/golden_profile_pipeline.py latest                  # recent trace ids + bundle sha
+python tools/golden_profile_pipeline.py fetch <trace_id>        # download, SHA-verify, extract
+python tools/golden_profile_pipeline.py analyze <session_dir>   # parse + analyze + artifacts
+python tools/golden_profile_pipeline.py render <session_dir>    # decision documents only
+python tools/golden_profile_pipeline.py report <trace_id>       # fetch + analyze + render
+python tools/golden_profile_pipeline.py report <trace_id> --skip-analyze   # render only
+```
+
+### Reading the output
+
+Final artifact:
+
+```text
+artifacts/golden_exhaustive_runs/<trace_id>/<trace_id>/session/derived/golden_stage_report.md
+```
+
+The session directory is **doubly nested**; glob for `session` rather than
+assuming the path.
+
+Read the report in this order:
+
+1. **Critical path and stage overlap** — read this first. Sum of stage walls
+   exceeds the timeline union because stages overlap, so stage size alone
+   misranks targets. The `on critical path` column is the uncontended
+   fraction: time during a stage when no other stage was running. A stage at
+   0% is fully hidden behind a longer sibling, and optimising it moves root
+   wall by nothing.
+2. **Function rollup** — whole-request totals per function: call count, mean,
+   max, total inclusive, total self. Use totals, not means. Inclusive wall
+   contains its callees, so totals are not additive down a tree; `total self` is
+   the non-overlapping part and separates real work from wrappers.
+3. **Per-stage call trees** — recursive, expanded at the `--min-ms` floor.
+   Depth is uncapped on purpose; the wall floor bounds it.
+
+### Limits worth stating before you trust it
+
+- The profiler traces **Python frames only** (`ignore_c_function=True`). GPU
+  kernel time is invisible, so a GPU-bound stage reads as waiting.
+- Large "exclusive self time" in a thread worker or `select`/`EpollSelector`
+  is **blocking wait**, not CPU burn.
+- The report is **observational**. It localises cost; it does not prove a
+  change helps. Confirm every optimisation with an A/B run.
+- `GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE = NO` is fail-closed; read the listed
+  reasons before trusting coverage.
+
+### Gotcha
+
+The bundle SHA-256 is **not** in the v2ctl run manifest —
+`provenance.artifact_sha256` is always `None`. It exists only in
+`artifact.json` next to the bundle on the profile volume, and the pipeline reads
+it from there and refuses to extract on mismatch. Do not go looking for it in
+the run manifest.
+
 ## Operational failures
 
 Before calling something a blocker, distinguish:
