@@ -29,6 +29,7 @@ Design rules that make the output trustworthy:
 
 from __future__ import annotations
 
+import codecs
 import csv
 import gzip
 import io
@@ -92,6 +93,13 @@ REPORT_NAME = "golden_exhaustive_profile.md"
 CALLS_NAME = "golden_exhaustive_calls.csv.gz"
 MANIFEST_NAME = "golden_process_manifest.json"
 SUMMARY_NAME = "golden_exhaustive_summary.json"
+
+#: Per-stage function aggregates are unbounded: a 347k-call stage can hold tens
+#: of thousands of distinct qualified names, and eleven of them serialized to a
+#: 381 MB "summary" that cost ~120s to write. The complete per-call detail
+#: already lives in the calls CSV and the ranked view in the report, so the
+#: summary keeps only the head of each ranking and records the truncation.
+SUMMARY_FUNCTIONS_PER_STAGE = 200
 MERGED_NAME = "viztracer_merged.json.gz"
 
 #: Fixed-width renderer geometry.  ASCII is authoritative; no Mermaid.
@@ -3878,20 +3886,37 @@ def _calls_csv_rows(profile: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _write_gzip_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
-    """Write a deterministic gzipped CSV (mtime=0, no stored filename)."""
+    """Write a deterministic gzipped CSV (mtime=0, no stored filename).
+
+    Streamed straight into the compressor. Buffering the whole table in a
+    StringIO first materialised a ~300 MB string to produce a 13 MB artifact,
+    and that buffer was a large part of write_artifacts' cost and peak RSS.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=list(fieldnames), extrasaction="ignore")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
-    path.write_bytes(gzip.compress(buffer.getvalue().encode("utf-8-sig"), mtime=0))
+    with path.open("wb") as raw_fh:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_fh, mtime=0) as gz:
+            gz.write(codecs.BOM_UTF8)
+            text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+            try:
+                writer = csv.DictWriter(
+                    text, fieldnames=list(fieldnames), extrasaction="ignore",
+                )
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({
+                        k: ("" if row.get(k) is None else row.get(k))
+                        for k in fieldnames
+                    })
+                text.flush()
+            finally:
+                text.detach()
 
 
-def _write_json(path: Path, payload: Any) -> None:
+def _write_json(path: Path, payload: Any, *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8",
+        json.dumps(payload, indent=indent, sort_keys=True, default=str),
+        encoding="utf-8",
     )
 
 
@@ -3953,7 +3978,14 @@ def write_artifacts(session_dir: Path, profile: Mapping[str, Any]) -> dict[str, 
                 "complete": stage.get("complete"),
                 "candidates_seen": stage.get("candidates_seen"),
                 "descendant_union_ms": stage.get("descendant_union_ms"),
-                "functions": stage.get("functions"),
+                "functions": (
+                    (stage.get("functions") or [])[:SUMMARY_FUNCTIONS_PER_STAGE]
+                ),
+                "functions_total": len(stage.get("functions") or []),
+                "functions_truncated": (
+                    len(stage.get("functions") or [])
+                    > SUMMARY_FUNCTIONS_PER_STAGE
+                ),
                 "repeated": stage.get("repeated"),
                 "bubbles": stage.get("bubbles"),
                 "diagnosis": stage.get("diagnosis"),
@@ -3978,7 +4010,7 @@ def write_artifacts(session_dir: Path, profile: Mapping[str, Any]) -> dict[str, 
         "processes": profile.get("processes"),
         "visual_threshold_ms": profile.get("visual_threshold_ms"),
     }
-    _write_json(derived / SUMMARY_NAME, _jsonable(summary))
+    _write_json(derived / SUMMARY_NAME, _jsonable(summary), indent=None)
     written["summary"] = f"derived/{SUMMARY_NAME}"
 
     merged = write_merged_trace(session_dir, profile)
@@ -4050,21 +4082,47 @@ def write_merged_trace(session_dir: Path, profile: Mapping[str, Any]) -> str:
             # Disambiguate pids so two processes never collapse into one lane.
             tagged["pid"] = f"{role}#{pid}" if pid is not None else role
             merged_events.append(tagged)
-    merged_events.sort(key=lambda e: (
-        str(e.get("pid") or ""),
-        _safe_float(e.get("ts")) if _safe_float(e.get("ts")) is not None else float("inf"),
-    ))
-    payload = {
-        "traceEvents": merged_events,
-        "viztracer_metadata": {
-            "version": "merged-by-comfymodal-golden-exhaustive-profiler",
-            "overflow": any(bool(p.get("truncated")) for p in profile.get("processes") or []),
-            "clock_alignment": profile.get("clock_alignment"),
-        },
+    # Decorate-sort-undecorate. The old key called _safe_float twice per
+    # comparison, so sorting 1.26M events evaluated it ~50M times.
+    decorated = sorted(
+        (
+            (
+                str(e.get("pid") or ""),
+                (
+                    _safe_float(e.get("ts"))
+                    if _safe_float(e.get("ts")) is not None
+                    else float("inf")
+                ),
+                i,
+                e,
+            )
+            for i, e in enumerate(merged_events)
+        ),
+        key=lambda item: (item[0], item[1], item[2]),
+    )
+    merged_events = [item[3] for item in decorated]
+    metadata = {
+        "version": "merged-by-comfymodal-golden-exhaustive-profiler",
+        "overflow": any(bool(p.get("truncated")) for p in profile.get("processes") or []),
+        "clock_alignment": profile.get("clock_alignment"),
     }
     target = Path(session_dir) / "derived" / MERGED_NAME
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(gzip.compress(
-        json.dumps(payload, sort_keys=True, default=str).encode("utf-8"), mtime=0,
-    ))
+    # Streamed into the compressor: json.dumps built the whole ~400 MB document
+    # as one string before compressing it.
+    with target.open("wb") as raw_fh:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_fh, mtime=0) as gz:
+            text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+            try:
+                text.write('{"traceEvents":[')
+                for i, e in enumerate(merged_events):
+                    if i:
+                        text.write(",")
+                    text.write(json.dumps(e, sort_keys=True, default=str))
+                text.write('],"viztracer_metadata":')
+                text.write(json.dumps(metadata, sort_keys=True, default=str))
+                text.write("}")
+                text.flush()
+            finally:
+                text.detach()
     return f"derived/{MERGED_NAME}"
