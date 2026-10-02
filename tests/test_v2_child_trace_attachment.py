@@ -201,3 +201,27 @@ def test_bundle_includes_the_attached_child_trace(monkeypatch, tmp_path, modal_a
     assert "raw/trace_child_viztracer.json" in paths
     assert "raw/trace_child_viztracer_manifest.json" in paths
     assert tar_bytes
+
+
+def test_unknown_state_writes_a_manifest(monkeypatch, tmp_path, modal_app):
+    """An unreadable artifact state must not look like a proven disable.
+
+    This path used to return before both the manifest write and the log line, so
+    a bundle with no manifest was ambiguous: flag off, or state never learned.
+    """
+    def _boom():
+        raise RuntimeError("child bootstrap exploded")
+
+    import comfymodal_runtime.golden_io_process_v2 as gio  # type: ignore
+
+    monkeypatch.setattr(gio, "child_viztracer_artifact", _boom)
+    session_dir = tmp_path / "s"
+    (session_dir / "raw").mkdir(parents=True)
+
+    result = modal_app._attach_child_viztracer_trace(_FakeSession(session_dir))
+    manifest = session_dir / "raw" / "trace_child_viztracer_manifest.json"
+    assert manifest.exists()
+    assert result["state_unknown"] is True
+    assert result["error"] == "RuntimeError"
+    recorded = json.loads(manifest.read_text(encoding="utf-8"))
+    assert recorded["state_unknown"] is True

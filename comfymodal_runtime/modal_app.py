@@ -3068,6 +3068,37 @@ def _capture_host_diagnostics() -> dict[str, Any] | None:
 # ── Full-trace packaging helpers (inert when disabled) ────────────────
 
 
+def _persist_child_viztracer_manifest(session: Any, result: dict[str, Any]) -> str:
+    """Write the child-trace manifest and log the outcome. Returns "" on success.
+
+    A write failure used to be swallowed entirely, which made a vanished manifest
+    impossible to diagnose: a bundle with no manifest looked exactly like a run
+    where the flag was off. Only the error reporting changed; the manifest is
+    still written on the same paths as before.
+    """
+    error_name = ""
+    try:
+        (session.base_dir / "raw" / "trace_child_viztracer_manifest.json").write_text(
+            json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        error_name = type(exc).__name__
+    print(
+        f"[v2.full_trace] stage=child_viztracer "
+        f"status={result.get('status')} "
+        f"enabled={bool(result.get('enabled'))} "
+        f"trace_present={bool(result.get('trace_present'))} "
+        f"child_ran={result.get('child_ran')} "
+        f"state_unknown={bool(result.get('state_unknown'))} "
+        f"error={result.get('error') or 'none'} "
+        f"manifest_write_error={error_name or 'none'} "
+        f"trace_id={getattr(session, 'trace_id', '')}",
+        flush=True,
+    )
+    return error_name
+
+
 def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
     """Copy the C0 child trace into the session ``raw/`` dir before bundling.
 
@@ -3094,13 +3125,27 @@ def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
     try:
         from .golden_io_process_v2 import child_viztracer_artifact
         artifact = child_viztracer_artifact()
-    except Exception:
+    except Exception as _artifact_exc:
+        # We could not determine whether the child tracer was on. That is not the
+        # same as proven-off, so record it: previously this returned before both
+        # the manifest write and the log line, leaving a bundle with no manifest
+        # that was indistinguishable from a run which never asked for a child
+        # trace. A clean disable still writes nothing.
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = type(_artifact_exc).__name__
+        _persist_child_viztracer_manifest(session, result)
         return result
     if not isinstance(artifact, dict):
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = "artifact_not_a_dict"
+        _persist_child_viztracer_manifest(session, result)
         return result
     result["enabled"] = bool(artifact.get("enabled"))
     result["source_path"] = str(artifact.get("path") or "")
     if not result["enabled"]:
+        # Proven off: no manifest, by contract.
         return result
     reason = str(artifact.get("status") or "unknown")
     result["reason"] = reason
@@ -3136,30 +3181,10 @@ def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
             })
     else:
         result["status"] = "missing_child_trace"
-    # The manifest is written even on failure so a missing child trace is
-    # visible in the bundle instead of being indistinguishable from a child
-    # that was never asked to trace.
-    #
-    # A write failure used to be swallowed entirely, which made a vanished
-    # manifest impossible to diagnose: a bundle with no manifest looked exactly
-    # like a run where the flag was off. The record is still written on the same
-    # paths as before; only the error is now reported.
-    _manifest_error = ""
-    try:
-        (session.base_dir / "raw" / "trace_child_viztracer_manifest.json").write_text(
-            json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception as _manifest_exc:
-        _manifest_error = type(_manifest_exc).__name__
-    print(
-        f"[v2.full_trace] stage=child_viztracer "
-        f"status={result.get('status')} "
-        f"trace_present={bool(result.get('trace_present'))} "
-        f"manifest_write_error={_manifest_error or 'none'} "
-        f"trace_id={getattr(session, 'trace_id', '')}",
-        flush=True,
-    )
+# The manifest is written even on failure so a missing child trace is
+    # visible in the bundle instead of being indistinguishable from a child that
+    # was never asked to trace.
+    _persist_child_viztracer_manifest(session, result)
     return result
 
 
