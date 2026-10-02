@@ -9,7 +9,11 @@ __pycache__/
 .deploy_log
 .custom_node_requirements/
 .baked_custom_node_deps/
+# Generated benchmark output. This broad pattern also matches source paths whose
+# directory name contains "benchmark", so re-include the one skill directory
+# rather than anchoring the rule and losing nested output coverage.
 *benchmark*/
+!.opencode/skills/benchmark-modal/
 optimization_logs/
 latest_benchmark_workflow.json
 
@@ -44,6 +48,7 @@ playwright/.cache/
 .studio_workflow_presets.json
 .studio_model_library.json
 .studio_custom_nodes.json
+.studio_dependency_overrides.json
 .studio_workflow_compatibility.json
 .deploy_warmup_state.json
 .run_history/

@@ -43,6 +43,7 @@ from model_library import (
     ModelLibraryService,
     ModelNotFoundError,
 )
+import remote_inventory
 from studio_domain.services import WorkflowDomainService
 from studio_store import StudioJsonStore, StudioStoreError
 from workflow_metadata import iter_graph_nodes
@@ -341,8 +342,13 @@ def register_model_library_routes(
             version = workflow_service.store.get_version(version_id)
             if version is None:
                 return _json_error(404, f"workflow version {version_id!r} not found")
+            try:
+                inventory = await remote_inventory.get_inventory()
+            except Exception:  # pragma: no cover - defensive route guard
+                inventory = None
             result = resolver.resolve_version(
-                _version_for_resolution(version, workflow_service)
+                _version_for_resolution(version, workflow_service),
+                remote=inventory,
             )
             return web.json_response(
                 {
@@ -357,6 +363,45 @@ def register_model_library_routes(
         except Exception as exc:  # noqa: BLE001
             _log.exception("Version dependencies failed")
             return _json_error(500, "Internal error")
+
+    @server.routes.post(
+        "/comfymodal/studio/workflows/{workflow_id}/dependencies/nonessential"
+    )
+    async def workflow_dependency_nonessential(request: web.Request) -> web.Response:
+        """Mark dependencies as unnecessary (or restore them) for a workflow.
+
+        Detection covers a model no active node references; this is the escape
+        hatch for a live node the user does not want to satisfy. Replacing the
+        whole set keeps the operation idempotent, so a stale client can never
+        clear someone else's override. Keyed by workflow, not version, so a
+        recapture does not lose the decision.
+        """
+        workflow_id = request.match_info.get("workflow_id", "")
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _json_error(400, "Invalid JSON body")
+        if not isinstance(body, dict):
+            return _json_error(400, "Invalid JSON body")
+        keys = body.get("keys")
+        if keys is None:
+            keys = []
+        if not isinstance(keys, (list, tuple)):
+            return _json_error(400, "'keys' must be a list of '<role>|<file>' strings")
+        try:
+            workflow = workflow_service.get_workflow(workflow_id)
+        except Exception:  # noqa: BLE001
+            workflow = None
+        if not workflow:
+            return _json_error(404, f"workflow {workflow_id!r} not found")
+        try:
+            stored = resolver.overrides.set_keys(workflow_id, set(keys))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Nonessential override failed")
+            return _json_error(500, str(exc))
+        return web.json_response(
+            {"status": "ok", "workflow_id": workflow_id, "nonessential": stored}
+        )
 
     @server.routes.get("/comfymodal/studio/workflows/versions/{version_id}/compatibility")
     async def version_compatibility(request: web.Request) -> web.Response:

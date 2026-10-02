@@ -35,6 +35,7 @@ import {
   installSingleModel,
   modelDownloadStatus,
   managerInstallNode,
+  setWorkflowNonessential,
   managerQueueInstall,
   managerQueueStart,
 } from "./studio-backend-api.js";
@@ -1198,143 +1199,49 @@ export async function performManagerInstall(plan) {
   }
 }
 
-// ── Remote Modal model-volume availability overlay ──────────────────────
-//
-// The remote model volume (GET /comfymodal/models -> list_models_cpu) is the
-// availability authority. Local zero-byte files are intentional placeholders:
-// a dependency row is "remote available" only when its remote entry's size is
-// greater than zero, regardless of the local placeholder's size. Availability
-// is derived only from basename + role/folder alias; wrong_version stays a
-// compatibility signal. Nothing here downloads or installs — the overlay is a
-// display projection of the report.
-
-// Mirror of the backend's WORKFLOW_ROLE_FOLDERS aliases (dependency_resolver).
-const _REMOTE_ROLE_FOLDER_ALIASES = {
-  checkpoint: ["checkpoints"],
-  unet: ["unet", "diffusion_models"],
-  clip: ["clip", "text_encoders"],
-  vae: ["vae"],
-  lora: ["loras"],
-  controlnet: ["controlnet"],
-};
-
-/** Lowercased basename of a path-like model reference. */
-function _remoteNameKey(name) {
-  const value = String(name || "").replace(/\\/g, "/");
-  const base = value.slice(value.lastIndexOf("/") + 1);
-  return base.toLowerCase();
-}
-
-/** Folders that satisfy a dependency role, aliases included. */
-function _remoteFolderAliases(role) {
-  return _REMOTE_ROLE_FOLDER_ALIASES[String(role || "").trim().toLowerCase()] || [];
-}
+// ── Dependency row detail helpers ───────────────────────────────────────
 
 /**
- * Index a normalized /comfymodal/models inventory by lowercased basename.
- * @param {Array} inventory - entries from listRemoteModels()
- * @returns {Map<string, Array<object>>}
+ * Mark a dependency row nonessential (or required again) and re-render.
+ *
+ * The override set is per workflow and replaced wholesale, so the request
+ * carries the full set rather than a delta: a stale client can then never
+ * silently drop a decision it did not know about. Explicit click only.
  */
-export function buildRemoteModelIndex(inventory) {
-  const index = new Map();
-  (Array.isArray(inventory) ? inventory : []).forEach((entry) => {
-    if (!entry || typeof entry !== "object") return;
-    const key = _remoteNameKey(entry.name);
-    if (!key) return;
-    const list = index.get(key);
-    if (list) list.push(entry);
-    else index.set(key, [entry]);
+async function _setNonessential(model, nonessential, ctx) {
+  const base = ctx && ctx.apiBase;
+  const workflowId = ctx && ctx.workflowId;
+  if (!base || !workflowId) return;
+  const key = model.key || model.filename || "";
+  const current = new Set(Array.isArray(ctx.nonessentialKeys) ? ctx.nonessentialKeys : []);
+  if (nonessential) current.add(key);
+  else current.delete(key);
+  const row = (typeof document !== "undefined")
+    ? document.querySelector('[data-testid="dependency-model-row"][data-model-key="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]')
+    : null;
+  // Show the outcome in the row itself. A failure that only lands in a
+  // detached node (or nowhere) is indistinguishable from the button doing
+  // nothing, which is exactly the bug this replaced.
+  const note = el("div", {
+    class: "comfymodal-studio-dependency-request-note",
+    "data-testid": "dependency-model-error",
+    style: "display:block;font-size:10px;color:#f87171;",
   });
-  return index;
-}
-
-/**
- * Resolve a dependency model row to its remote volume entry, or null.
- * Exact folder wins, then the role's alias folders (unet/diffusion_models,
- * clip/text_encoders), then the first basename match.
- */
-export function matchRemoteModel(model, remoteIndex) {
-  if (!model || !remoteIndex || typeof remoteIndex.get !== "function") return null;
-  const entries = remoteIndex.get(_remoteNameKey(model.filename));
-  if (!entries || !entries.length) return null;
-  const byFolder = (target) => entries.find(
-    (e) => String(e.folder || "").trim().toLowerCase() === target
-  );
-  const folder = String(model.folder || "").trim().toLowerCase();
-  if (folder) {
-    const exact = byFolder(folder);
-    if (exact) return exact;
+  const showError = (message) => {
+    if (!row) return;
+    row.appendChild(note);
+    note.textContent = message;
+  };
+  try {
+    const res = await setWorkflowNonessential(base, workflowId, [...current]);
+    if (typeof ctx.onNonessentialChanged === "function") {
+      ctx.onNonessentialChanged(res && res.nonessential ? res.nonessential : [...current]);
+    } else if (typeof ctx.onDepsRefresh === "function") {
+      await ctx.onDepsRefresh();
+    }
+  } catch (err) {
+    showError((err && err.message) || "Could not update dependency");
   }
-  for (const alias of _remoteFolderAliases(model.role)) {
-    const hit = byFolder(alias);
-    if (hit) return hit;
-  }
-  return entries[0];
-}
-
-/**
- * Copy a report model row with its remote availability projected on top.
- * A remote size > 0 upgrades a missing/unknown row to Installed; a remote
- * size of 0 stays missing. The local placeholder/path is preserved as
- * secondary detail only. Returns the original row when no remote entry
- * matches. Never mutates the input.
- */
-export function overlayDependencyModel(model, remoteIndex) {
-  if (!model || typeof model !== "object") return model;
-  const remote = matchRemoteModel(model, remoteIndex);
-  if (!remote) return model;
-  const size = Number(remote.size);
-  const available = Number.isFinite(size) && size > 0;
-  const merged = Object.assign({}, model, {
-    remote_model: {
-      name: remote.name || model.filename || "",
-      folder: remote.folder || "",
-      size: Number.isFinite(size) ? size : 0,
-    },
-    remote_available: available,
-  });
-  // The report carries no local placement; the remote entry's annotation does.
-  if (model.local_placeholder && typeof model.local_placeholder === "object") {
-    merged.local_placeholder = model.local_placeholder;
-  } else if (remote.local_placeholder && typeof remote.local_placeholder === "object") {
-    merged.local_placeholder = remote.local_placeholder;
-  }
-  if (available && (merged.state === "missing" || merged.state === "unknown")) {
-    merged.state = "installed";
-    merged.installed = true;
-  }
-  return merged;
-}
-
-/**
- * Project a full dependency report through to the remote overlay, recomputing
- * the displayed summary (and therefore the "Download all" count) from the
- * overlay state. Returns a shallow copy; the input report is never mutated.
- * A null/absent index is a no-op so a failed remote read keeps local truth.
- */
-export function overlayDependencyModels(deps, remoteIndex) {
-  if (!deps || typeof deps !== "object" || !remoteIndex) return deps;
-  const nodes = Array.isArray(deps.custom_nodes) ? deps.custom_nodes : [];
-  const models = (Array.isArray(deps.models) ? deps.models : [])
-    .map((m) => overlayDependencyModel(m, remoteIndex));
-  const countModels = (state) => models.filter((m) => m && m.state === state).length;
-  const countNodes = (state) => nodes.filter((n) => n && n.state === state).length;
-  const installed = countModels("installed") + countNodes("installed");
-  const missing = countModels("missing") + countNodes("missing");
-  const wrong_version = countModels("wrong_version") + countNodes("wrong_revision");
-  const unknown = countModels("unknown");
-  const attention = missing + wrong_version + unknown;
-  return Object.assign({}, deps, {
-    models,
-    summary: {
-      installed,
-      missing,
-      wrong_version,
-      unknown,
-      attention,
-      ready: attention === 0,
-    },
-  });
 }
 
 /** Human-readable byte size for the remote-availability detail line. */
@@ -1500,12 +1407,53 @@ function renderDependencyModelRow(m, ctx) {
   });
   row.appendChild(_badge(m.role || "model", "role"));
   row.appendChild(el("span", { class: "comfymodal-studio-dependency-name", text: m.filename || "", title: m.filename || "" }));
-  // The state badge is the single source of truth for install state; the
-  // in-flight transition updates this same node in place (no "Not installed"
-  // detail duplicate).
+  // No live node references a nonessential model, so its state is advisory:
+  // report it as Optional and drop the install affordances, which would
+  // otherwise invite downloading a file nothing will load. The row stays
+  // visible so the model is never silently forgotten.
+  const nonessential = m.nonessential === true;
+  if (nonessential) row.setAttribute("data-nonessential", "true");
   const stateBadge = _stateBadgeFor(m.state);
   stateBadge.setAttribute("data-testid", "dependency-model-state");
+  if (nonessential) {
+    _applyBadge(stateBadge, "Optional", "optional");
+    stateBadge.setAttribute("data-state", m.state || "unknown");
+    row.appendChild(stateBadge);
+    row.appendChild(el("span", {
+      class: "comfymodal-studio-dependency-detail",
+      "data-testid": "dependency-model-nonessential",
+      text: m.nonessential_source === "user"
+        ? "marked unnecessary"
+        : "not used by any active node",
+    }));
+    // A detected row is still the user's to confirm or overrule, so both
+    // directions are offered: restore an auto-detected one, or un-mark a
+    // deliberate override.
+    const restore = el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "dependency-model-restore",
+      "data-model-key": m.key || m.filename || "",
+      text: m.nonessential_source === "user" ? "Mark required" : "Dismiss",
+      style: "font-size:10px;padding:2px 8px;width:auto;",
+      onclick: () => _setNonessential(m, false, ctx),
+    });
+    row.appendChild(restore);
+    return row;
+  }
   row.appendChild(stateBadge);
+  if (ctx && ctx.apiBase && ctx.workflowId) {
+    row.appendChild(el("button", {
+      class: "comfymodal-secondary-btn",
+      type: "button",
+      "data-testid": "dependency-model-nonessential-toggle",
+      "data-model-key": m.key || m.filename || "",
+      text: "Not needed",
+      title: "Mark as unnecessary: it will not block this workflow.",
+      style: "font-size:10px;padding:2px 8px;width:auto;",
+      onclick: () => _setNonessential(m, true, ctx),
+    }));
+  }
   if (m.state === "installed") {
     row.appendChild(el("span", { class: "comfymodal-studio-dependency-detail", text: m.local_path || m.folder || "" }));
     // Remote availability is secondary information: a nonempty remote volume

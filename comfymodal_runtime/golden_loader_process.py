@@ -455,6 +455,55 @@ def _child_main(conn: Any, presnapshot: bool = False) -> None:
                     "nonce": msg.get("nonce"),
                     **_child_status(state, conn),
                 })
+            elif op == "trace_begin":
+                # Generic process-boundary trace control (TRACE_BEGIN).  This
+                # worker can already be alive when the traced request starts, so
+                # inheritance cannot reach it; the parent drives it through the
+                # existing control protocol instead.  No stopwatch is added to
+                # any load path, and an untraced request never sends this op.
+                try:
+                    from .process_trace_bridge import (  # type: ignore  # noqa: PLC0415
+                        get_child_trace_controller,
+                    )
+
+                    controller = get_child_trace_controller(role="loader_worker")
+                    result = controller.trace_begin(
+                        trace_id=str(msg.get("trace_id") or ""),
+                        request_id=str(msg.get("request_id") or ""),
+                        role=str(msg.get("role") or "loader_worker"),
+                        raw_dir=str(msg.get("raw_dir") or "") or None,
+                        include_paths=msg.get("include_paths") or [],
+                        entries=int(msg.get("entries") or 0) or 8_000_000,
+                    )
+                except BaseException as exc:  # noqa: BLE001 - reported to parent
+                    result = {
+                        "status": "unavailable",
+                        "error": f"{type(exc).__name__}: {exc}"[:240],
+                    }
+                conn.send({
+                    "op": "trace_begun",
+                    "result": result,
+                    **_child_status(state, conn),
+                })
+            elif op == "trace_end":
+                try:
+                    from .process_trace_bridge import (  # type: ignore  # noqa: PLC0415
+                        get_child_trace_controller,
+                    )
+
+                    result = get_child_trace_controller().trace_end(
+                        trace_id=str(msg.get("trace_id") or "") or None,
+                    )
+                except BaseException as exc:  # noqa: BLE001 - reported to parent
+                    result = {
+                        "status": "unavailable",
+                        "error": f"{type(exc).__name__}: {exc}"[:240],
+                    }
+                conn.send({
+                    "op": "trace_ended",
+                    "result": result,
+                    **_child_status(state, conn),
+                })
             elif op == "init":
                 try:
                     _initialize_session(state, msg)
@@ -854,6 +903,63 @@ class GoldenLoaderProcess:
             transports.append(item)
         reply["transports"] = transports
         return reply
+
+    def begin_trace(self, *, timeout_s: float = REPLY_TIMEOUT_S) -> dict:
+        """TRACE_BEGIN: make this already-alive worker trace the request.
+
+        A pre-snapshot worker exists before the traced request starts, so it can
+        only be captured through the control protocol, never by inheritance.
+        Inert when no full-trace session is active.  Returns the child's evidence
+        rather than raising: tracing must never break the load path.
+        """
+        return self._trace_control("trace_begin", timeout_s=timeout_s)
+
+    def end_trace(self, *, timeout_s: float = REPLY_TIMEOUT_S) -> dict:
+        """TRACE_END: stop tracing and return the child's raw-trace evidence."""
+        return self._trace_control("trace_end", timeout_s=timeout_s)
+
+    def _trace_control(self, op: str, *, timeout_s: float) -> dict:
+        try:
+            from . import process_trace_bridge as bridge  # type: ignore  # noqa: PLC0415
+            from .full_execution_trace import (  # type: ignore  # noqa: PLC0415
+                FullExecutionTraceSession,
+            )
+
+            session = FullExecutionTraceSession.get_instance()
+            if session is None:
+                return {"status": "untraced"}
+            message: dict = {"op": op}
+            if op == "trace_begin":
+                bridge_env = bridge.session_trace_env(
+                    session, role="loader_worker", base_env={},
+                )
+                message.update({
+                    "trace_id": bridge_env.get(bridge.ENV_TRACE_ID, ""),
+                    "request_id": bridge_env.get(bridge.ENV_REQUEST_ID, ""),
+                    "role": "loader_worker",
+                    "raw_dir": bridge_env.get(bridge.ENV_RAW_DIR, ""),
+                    "include_paths": [],
+                    "entries": bridge_env.get(bridge.ENV_ENTRIES, ""),
+                })
+                bridge.register_session_process(
+                    session, role="loader_worker", pid=self.pid,
+                    kind="persistent", lifetime="container",
+                )
+            conn = self._conn
+            if conn is None:
+                return {"status": "no_connection"}
+            conn.send(message)
+            reply = conn.recv()
+            if not isinstance(reply, dict):
+                return {"status": "bad_reply"}
+            bridge.mark_session_process_traced(
+                session, role="loader_worker", pid=self.pid,
+                status=str((reply.get("result") or {}).get("status") or "sent"),
+                detail=reply.get("result") if isinstance(reply.get("result"), dict) else None,
+            )
+            return dict(reply)
+        except Exception as exc:  # noqa: BLE001 - tracing is diagnostic only
+            return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"[:240]}
 
     def stop(self, *, timeout_s: float = STOP_TIMEOUT_S) -> dict:
         """Stop the worker (releases child-side CUDA storage)."""

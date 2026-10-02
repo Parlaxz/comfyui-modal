@@ -1967,14 +1967,22 @@ def _full_trace_active() -> bool:
 
 
 def _golden_trace_span(name: str) -> ContextManager[Any]:
-    """Resolve the optional full-trace span seam without importing eagerly.
+    """Record one Golden stage span on the request-bound VizTracer.
 
-    The Modal adapter binds the request's session-owned VizTracer around the
-    actual Golden await; this helper deliberately remains a thin forwarding
-    layer so the root and stage ``VizEvent`` wrappers use that binding.
+    Deliberately **not** gated on :func:`_full_trace_active`, for the same
+    reason :func:`golden_root_span` is not: that predicate reads
+    ``_GOLDEN_DEEP_TRACE_ACTIVE``, a ContextVar only
+    :func:`_trace_golden_serial_root` sets, so in the Golden Parallel executor it
+    is always False.  Gating here meant every canonical stage span silently
+    became a ``nullcontext`` and the parallel path produced no stage timeline at
+    all -- only incidental ``FEE`` records for whichever stage functions
+    happened to be plain Python calls.
+
+    ``full_execution_trace.golden_trace_span`` answers the real question, "is a
+    request-bound tracer available?", by resolving the binding directly and
+    no-oping when there is none.  That keeps the full-trace-off path inert
+    without depending on a serial-only flag.
     """
-    if not _full_trace_active():
-        return contextlib.nullcontext()
     try:
         trace_module = importlib.import_module("comfymodal_runtime.full_execution_trace")
         span = getattr(trace_module, "golden_trace_span", None)
@@ -1986,16 +1994,49 @@ def _golden_trace_span(name: str) -> ContextManager[Any]:
 
 
 @contextlib.contextmanager
+def golden_root_span(name: str) -> ContextManager[Any]:
+    """Record THE authoritative Golden root span, on Serial *and* Parallel.
+
+    Deliberately **not** gated on :func:`_full_trace_active`.  That predicate
+    reads ``_GOLDEN_DEEP_TRACE_ACTIVE``, a ContextVar only
+    :func:`_trace_golden_serial_root` sets, so in the Golden Parallel executor it
+    is always False and a root span gated on it silently records nothing.  The
+    real question is "is a request-bound tracer available?", which
+    ``full_execution_trace.golden_root_span`` already answers: it resolves the
+    binding and no-ops when there is none.  That keeps the full-trace-off path
+    inert without depending on a serial-only flag.
+
+    Emits the dedicated ``GOLDEN_ROOT`` Chrome category so the offline profiler
+    can identify the one authoritative root even though VizTracer 1.1.1 labels
+    explicit spans and Python-call records identically.
+    """
+    try:
+        trace_module = importlib.import_module("comfymodal_runtime.full_execution_trace")
+        span = getattr(trace_module, "golden_root_span", None)
+        if callable(span):
+            with span(name):
+                yield
+            return
+    except BaseException:
+        pass
+    yield
+
+
+@contextlib.contextmanager
 def _golden_trace_phase(
     span_name: str,
     records: list[dict[str, Any]],
     *,
     phase: Optional[str] = None,
 ):
-    """Time one stable Golden operation only while FULL-TRACE is enabled."""
-    if not _full_trace_active():
-        yield
-        return
+    """Time one stable Golden operation while FULL-TRACE is enabled.
+
+    Not gated on :func:`_full_trace_active` for the same reason
+    :func:`_golden_trace_span` is not: that ContextVar is only set on the serial
+    executor, so gating here silently produced no phase records in Golden
+    Parallel.  The span itself no-ops when no tracer is bound, so the
+    full-trace-off path stays inert.
+    """
     start_ns = time.monotonic_ns()
     try:
         with _golden_trace_span(span_name):
@@ -2027,7 +2068,7 @@ def _trace_golden_serial_root(func: Callable) -> Callable:
         active = bool(getattr(request, "deep_trace", False))
         token = _GOLDEN_DEEP_TRACE_ACTIVE.set(active)
         try:
-            with _golden_trace_span("golden_serial_execute"):
+            with golden_root_span("golden_serial_execute"):
                 return await func(*args, **kwargs)
         finally:
             _GOLDEN_DEEP_TRACE_ACTIVE.reset(token)
@@ -15255,7 +15296,18 @@ def _stage_pair_metrics(
 
 
 async def _run_overlap_stage_offloaded(call: Callable[[], Any]) -> Any:
-    """Run a blocking canonical async stage on a private worker event loop."""
+    """Run a blocking canonical async stage on a private worker event loop.
+
+    The body runs on an asyncio executor thread that already existed before
+    ``enable_thread_tracing()``, so without an explicit handoff it records
+    nothing.  That is the whole reason every parallelized canonical stage
+    collapsed to a single leaf span: ``clip_forward``/``unet_load`` and
+    ``sampling``/``vae_load`` are the two overlap pairs, and both are dispatched
+    through here, while the serial stages on the request task thread stayed deep.
+    The handoff installs this request's profile hook from inside the worker;
+    ``sys.setprofile`` only ever affects the calling thread, so it cannot be
+    applied from out here.
+    """
     loop = asyncio.get_running_loop()
     inner: dict[str, Any] = {}
     cancel_requested = threading.Event()
@@ -15278,7 +15330,14 @@ async def _run_overlap_stage_offloaded(call: Callable[[], Any]) -> Any:
             asyncio.set_event_loop(None)
             worker_loop.close()
 
-    future = loop.run_in_executor(None, contextvars.copy_context().run, run)
+    try:
+        from .full_execution_trace import thread_traced
+        dispatched = thread_traced(run)
+    except BaseException:
+        dispatched = run
+    future = loop.run_in_executor(
+        None, contextvars.copy_context().run, dispatched,
+    )
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:

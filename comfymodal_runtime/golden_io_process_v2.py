@@ -1959,9 +1959,18 @@ def resolve_c0_source_volume_metadata(volume_name: Optional[str] = None) -> dict
 def child_viztracer_artifact() -> dict:
     """Return the child trace path and terminal status for parent finalization.
 
-    When the flag is OFF this is an explicit ``disabled`` record.  When ON the
-    child writes its terminal status beside the trace file; a missing status
-    file is reported as ``missing`` rather than assumed complete.  Never raises.
+    Three outcomes are distinguished, because collapsing them makes a failed
+    capture indistinguishable from never asking:
+
+    * ``disabled`` -- the flag is off; no child trace was ever expected.
+    * ``child_absent`` -- the flag is on but no C0 child ran, so there is
+      nothing to trace. Not an error.
+    * ``missing_child_trace`` -- the flag is on, a child ran, and it produced no
+      trace. This is a real capture failure and must be loud.
+
+    A parent that ran a child doing seconds of measurable work and recorded no
+    trace used to look identical to a run that never requested child tracing.
+    Never raises.
     """
     enabled = child_viztracer_enabled()
     path = child_viztracer_output_path()
@@ -1981,14 +1990,65 @@ def child_viztracer_artifact() -> dict:
     except Exception:
         pass
     artifact["trace_present"] = bool(os.path.isfile(path))
+
+    # Did a C0 child actually run? The telemetry carries its pid once it has
+    # registered, which is the only evidence that distinguishes "nothing to
+    # trace" from "traced nothing".
+    child_pid = 0
+    child_ran = False
     try:
         runtime = get_arena_runtime()
         ready = getattr(runtime, "child_viztracer", None) if runtime is not None else None
         if isinstance(ready, dict):
             artifact["ready_status"] = str(ready.get("status") or "")
+        pid = 0
+        if isinstance(ready, dict):
+            pid = int(ready.get("pid") or 0)
+        if not pid:
+            pid = _registered_child_pid()
+        child_pid = pid
+        child_ran = pid > 0
     except Exception:
-        pass
+        child_ran = False
+    artifact["child_pid"] = child_pid
+    artifact["child_ran"] = bool(child_ran)
+
+    if not artifact["trace_present"]:
+        artifact["status"] = (
+            "missing_child_trace" if child_ran else "child_absent"
+        )
+        artifact["capture_failed"] = bool(child_ran)
     return artifact
+
+
+def _registered_child_pid() -> int:
+    """Best-effort C0 child pid from the arena runtime, 0 when unknown.
+
+    Used to decide whether a missing child trace is a real capture failure or
+    simply that no child was spawned. Never raises.
+    """
+    try:
+        runtime = get_arena_runtime()
+    except Exception:
+        return 0
+    for attr in ("child_pid", "source_child_pid", "io_child_pid"):
+        value = getattr(runtime, attr, None)
+        try:
+            pid = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            return pid
+    reader = getattr(runtime, "reader_identities", None)
+    if isinstance(reader, dict):
+        for value in reader.values():
+            try:
+                pid = int((value or {}).get("process_id") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if pid > 0:
+                return pid
+    return 0
 
 
 def _read_runtime_text(path: str, limit: int = 240) -> Optional[str]:
@@ -4578,6 +4638,35 @@ class SharedArenaRing:
         if self.child_viztracer_enabled:
             self.child_viztracer_path = child_viztracer_output_path()
             child_env["COMFYMODAL_C0_CHILD_VIZTRACER_PATH"] = self.child_viztracer_path
+        # Generic process-boundary trace control.  This is the one integration
+        # point the exhaustive profiler needs at a process boundary: it exports
+        # the active session's trace identity so the child records its own trace,
+        # and it registers the child so the offline manifest knows this process
+        # was expected.  Inert when no full-trace session is active, so an
+        # untraced request's child environment is unchanged.
+        try:
+            from .process_trace_bridge import (  # type: ignore  # noqa: PLC0415
+                register_session_process,
+                session_trace_env,
+            )
+
+            from .full_execution_trace import (  # type: ignore  # noqa: PLC0415
+                FullExecutionTraceSession,
+            )
+
+            _trace_session = FullExecutionTraceSession.get_instance()
+            register_session_process(
+                _trace_session,
+                role="c0_io_process",
+                pid=getattr(self, "child_pid", None),
+                kind="persistent" if self.preadv_sickness_diag else "spawn",
+                lifetime="container" if self.preadv_sickness_diag else "request",
+            )
+            child_env = session_trace_env(
+                _trace_session, role="c0_io_process", base_env=child_env,
+            )
+        except Exception:
+            pass
         # Diagnostic clustered preadv-sickness: hand the child the pre-registered
         # control manifest plus launch-time hashes and a per-invocation id.  The
         # manifest holds offsets only; no model bytes are read or changed.

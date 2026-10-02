@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -2462,12 +2463,337 @@ def cmd_golden_status(args, repo_root: Path) -> int:
         return 1
 
 
+GOLDEN_PROFILE_DEPLOY_FLAGS = (
+    ("COMFYMODAL_V2_FULL_TRACE", "1"),
+    ("COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER", "1"),
+    ("COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN", "1"),
+)
+GOLDEN_PROFILE_RUN_FLAGS = (
+    ("COMFYMODAL_V2_GOLDEN_DEEP_TRACE", "1"),
+)
+_GOLDEN_COMMAND_HELP = {
+    "doctor": "check local Golden readiness",
+    "deploy": "deploy the Golden app without running a request",
+    "run": "run exactly one Golden request",
+    "publisher-bootstrap": "prepare custom-node publication",
+    "publish-custom-nodes": "publish custom nodes to the app",
+    "profile": "profile one Golden run end to end and print the decision report",
+}
+
+_GOLDEN_COMMAND_DESCRIPTION = {
+    "profile": (
+        "profile one Golden run end to end and print the decision report\n"
+        "\n"
+        "Runs a single request, identifies the trace that request produced,\n"
+        "downloads and SHA-verifies its bundle, analyzes it, and writes the stage\n"
+        "decision documents. Prints the report path when done.\n"
+        "\n"
+        "As one command (deploys first):\n"
+        "  python tools/v2ctl.py --profile <profile> golden profile\n"
+        "\n"
+        "As two commands (deploy once, profile repeatedly):\n"
+        "  python tools/v2ctl.py --profile <profile> golden deploy\n"
+        "  python tools/v2ctl.py --profile <profile> golden profile --skip-deploy\n"
+        "\n"
+        "The app is resolved from the profile's target.app, so --app is only\n"
+        "needed to override it. --profile defaults to the canonical Golden\n"
+        "profile.\n"
+        "\n"
+        "Tracing flags are added automatically; do not pass them yourself:\n"
+        "  COMFYMODAL_V2_FULL_TRACE=1\n"
+        "  COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER=1\n"
+        "  COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1\n"
+        "  COMFYMODAL_V2_GOLDEN_DEEP_TRACE=1  (run only)\n"
+        "\n"
+        "Aborts if source-probe does not report RESULT=PASS, so a stale deployment\n"
+        "is never profiled. Identifies the trace by what the run creates on the\n"
+        "profile volume, not by scraping the container log.\n"
+        "\n"
+        "Options:\n"
+        "  --skip-deploy       reuse the current deployment (must already carry\n"
+        "                       the tracing flags)\n"
+        "  --trace-id ID       analyze this existing trace instead of a new run\n"
+        "  --min-ms FLOAT      call-tree expansion floor in ms (default 1.0)\n"
+        "  --skip-analyze      reuse existing derived artifacts, only re-render\n"
+        "  --workspace-id ID   Modal workspace id override for the bundle fetch\n"
+        "  --dry-run           print the plan, invoke nothing\n"
+        "\n"
+        "Final output:\n"
+        "  artifacts/golden_exhaustive_runs/<trace_id>/<trace_id>/session/derived/\n"
+        "      golden_stage_report.md\n"
+        "  containing the critical path, a whole-request function rollup, and a\n"
+        "  recursive call tree per stage.\n"
+        "\n"
+        "This performs a real deploy and a real run, and the analysis is\n"
+        "memory-hungry on very large traces. To work on an existing bundle with no\n"
+        "GPU spend:\n"
+        "  python tools/golden_profile_pipeline.py latest\n"
+        "  python tools/golden_profile_pipeline.py report <trace_id> --skip-analyze"
+    ),
+}
+
+_TRACE_ID_RE = re.compile(r"trace_id=([0-9a-f]{32})")
+
+
+def _run_v2ctl(repo_root: Path, argv: list[str], capture: bool) -> tuple[int, str]:
+    """Invoke this same CLI as a subprocess, streaming (and optionally capturing) it.
+
+    Going through the documented ``v2ctl`` entry point rather than calling the
+    internal handlers directly keeps one contract instead of two, so a change to
+    deploy/run argument handling cannot silently diverge from the public CLI.
+    """
+    cmd = [sys.executable, str(repo_root / "tools" / "v2ctl.py")] + argv
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        capture_output=capture,
+        text=True,
+    )
+    return proc.returncode, (proc.stdout or "") if capture else ""
+
+
+def _profile_app_name(repo_root: Path, profile_name: str) -> str:
+    """Return ``target.app`` for *profile_name*, following ``extends``.
+
+    ``--app`` is otherwise required, and a caller that does not know the app has
+    to guess -- which is how a profiling run ended up pointed at a different
+    profile contract than the one it meant to measure.
+    """
+    import tomllib
+
+    profiles_dir = repo_root / "config" / "v2" / "profiles"
+    seen: set[str] = set()
+    cursor: str | None = profile_name
+    while cursor and cursor not in seen:
+        seen.add(cursor)
+        path = profiles_dir / f"{cursor}.toml"
+        try:
+            with path.open("rb") as handle:
+                raw = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            return ""
+        target = raw.get("target")
+        if isinstance(target, dict):
+            app = target.get("app") or target.get("app_name")
+            if isinstance(app, str) and app:
+                return app
+        parent = raw.get("extends")
+        cursor = parent if isinstance(parent, str) and parent else None
+    return ""
+
+
+def _volume_trace_ids(repo_root: Path, profile_name: str) -> set[str] | None:
+    """Current trace ids on the profile volume, or None if unreachable.
+
+    Used to diff before and after a run so the trace id is identified by what the
+    run *created* rather than by scraping the container log, which is not reliably
+    present in captured stdout.
+    """
+    try:
+        sys.path.insert(0, str(repo_root / "tools"))
+        import golden_profile_pipeline as pipeline
+
+        workspace_id = pipeline.resolve_workspace_id(None)
+        volume_name = pipeline.resolve_profile_volume(None)
+        if not workspace_id:
+            return None
+        volume = pipeline.open_volume(workspace_id, volume_name)
+        return {
+            record["trace_id"]
+            for record in pipeline.list_traces(volume, days=2)
+        }
+    except BaseException:
+        return None
+
+
+def cmd_golden_profile(args, repo_root: Path) -> int:
+    """Run one Golden request and profile it end to end.
+
+    One command: run, identify the trace this run produced, fetch and verify the
+    bundle, analyze it, write the decision documents, print the report path.
+
+    Deploy is skipped by default when ``--skip-deploy`` is given, so the loop can
+    be driven as two commands -- one deploy, then repeated profiling runs -- or as
+    a single command that deploys first.
+    """
+    profile = getattr(args, "profile", None) or GOLDEN_P1_PROFILE
+    app = getattr(args, "app", None) or _profile_app_name(repo_root, profile)
+    min_ms = float(getattr(args, "min_ms", 1.0) or 1.0)
+    skip_deploy = bool(getattr(args, "skip_deploy", False))
+    explicit_trace = getattr(args, "trace_id", None)
+
+    deploy_flags = ", ".join(k for k, _ in GOLDEN_PROFILE_DEPLOY_FLAGS)
+    run_flags = ", ".join(k for k, _ in GOLDEN_PROFILE_RUN_FLAGS)
+
+    if getattr(args, "dry_run", False):
+        steps = "source-probe, run, fetch, analyze, render"
+        if not skip_deploy:
+            steps = "deploy, " + steps
+        print(
+            f"[v2ctl.golden_profile] dry-run\n"
+            f"  profile = {profile}\n"
+            f"  app     = {app or '(unresolved: pass --app)'}\n"
+            f"  steps   = {steps}\n"
+            f"  deploy flags = {deploy_flags}\n"
+            f"  run flags    = {run_flags}",
+            flush=True,
+        )
+        return 0
+
+    if not app:
+        print(
+            f"ERROR: could not resolve target.app for profile {profile!r} in "
+            "config/v2/profiles. Pass --app explicitly.",
+            file=sys.stderr,
+        )
+        return 2
+
+    extra: list[str] = []
+    for item in getattr(args, "set", None) or []:
+        extra += ["--set", str(item)]
+    already = {s.split("=", 1)[0] for s in extra if "=" in s}
+
+    def base() -> list[str]:
+        return ["--profile", profile, "--app", app] + extra
+
+    step = 0
+
+    def advance(label: str) -> None:
+        nonlocal step
+        step += 1
+        print(f"[v2ctl.golden_profile] step {step} {label}", flush=True)
+
+    if not skip_deploy:
+        for flag, value in GOLDEN_PROFILE_DEPLOY_FLAGS:
+            if flag not in already:
+                extra += ["--set", f"{flag}={value}"]
+        advance("deploy (with tracing)")
+        rc, _ = _run_v2ctl(repo_root, base() + ["golden", "deploy"], capture=False)
+        if rc != 0:
+            print(f"ERROR: deploy failed rc={rc}", file=sys.stderr)
+            return rc
+    else:
+        print(
+            "[v2ctl.golden_profile] skipping deploy; the existing deployment "
+            "must already carry the tracing flags",
+            flush=True,
+        )
+
+    advance("source-probe")
+    rc, probe = _run_v2ctl(repo_root, base() + ["source-probe"], capture=True)
+    sys.stdout.write(probe)
+    sys.stdout.flush()
+    if rc != 0 or "RESULT=PASS" not in probe:
+        print(
+            "ERROR: source-probe did not report RESULT=PASS. The deployment is "
+            "stale or mismatched, so a run now would not measure this source.",
+            file=sys.stderr,
+        )
+        return rc or 1
+
+    # Identify the trace by what the run creates, not by scraping its log.
+    before = _volume_trace_ids(repo_root, profile)
+    if before is None:
+        print(
+            "[v2ctl.golden_profile] note: cannot list the profile volume, falling "
+            "back to log scraping for the trace id",
+            flush=True,
+        )
+
+    for flag, value in GOLDEN_PROFILE_RUN_FLAGS:
+        if flag not in already:
+            extra += ["--set", f"{flag}={value}"]
+
+    advance("run (traced)")
+    rc, run_out = _run_v2ctl(repo_root, base() + ["golden", "run"], capture=True)
+    sys.stdout.write(run_out)
+    sys.stdout.flush()
+    if rc != 0:
+        print(f"ERROR: golden run failed rc={rc}", file=sys.stderr)
+        return rc
+
+    trace_id = explicit_trace
+    if not trace_id and before is not None:
+        after = _volume_trace_ids(repo_root, profile) or set()
+        created = sorted(after - before)
+        if len(created) == 1:
+            trace_id = created[0]
+        elif created:
+            print(
+                f"[v2ctl.golden_profile] {len(created)} traces appeared during the "
+                f"run; using the last: {created[-1]}",
+                file=sys.stderr,
+            )
+            trace_id = created[-1]
+    if not trace_id:
+        matches = _TRACE_ID_RE.findall(run_out)
+        trace_id = matches[-1] if matches else None
+
+    if not trace_id:
+        print(
+            "ERROR: could not identify the trace id for this run.\n"
+            "  The run manifest does not record it and the container log did not "
+            "surface it. Recover it manually with:\n"
+            "    python tools/golden_profile_pipeline.py latest\n"
+            "  then re-run with --trace-id <id> (or --skip-analyze to re-render "
+            "an existing bundle).",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"[v2ctl.golden_profile] trace_id={trace_id}", flush=True)
+
+    advance("fetch, analyze and render")
+    sys.path.insert(0, str(repo_root / "tools"))
+    import golden_profile_pipeline as pipeline
+
+    argv = ["report", trace_id, "--min-ms", str(min_ms)]
+    if getattr(args, "workspace_id", None):
+        argv += ["--workspace-id", args.workspace_id]
+    if getattr(args, "skip_analyze", False):
+        argv.append("--skip-analyze")
+    rc = pipeline.main(argv)
+    if rc != 0:
+        print(f"ERROR: profiling pipeline failed rc={rc}", file=sys.stderr)
+        return rc
+
+    advance("done")
+    return 0
+
+def cmd_golden_deploy(args, repo_root: Path) -> int:
+    """``golden deploy``, optionally with the profiler's tracing flags.
+
+    ``--for-profiling`` exists so the two-command loop does not depend on the
+    caller reproducing three environment flags from documentation. Without it,
+    ``golden deploy`` followed by ``golden profile --skip-deploy`` produces a
+    perfectly clean run with no trace at all, because the tracing flags are only
+    otherwise applied by ``golden profile`` when it deploys itself.
+    """
+    if getattr(args, "for_profiling", False):
+        extra = []
+        for item in getattr(args, "set", None) or []:
+            extra += ["--set", str(item)]
+        already = {s.split("=", 1)[0] for s in extra if "=" in s}
+        for flag, value in GOLDEN_PROFILE_DEPLOY_FLAGS:
+            if flag not in already:
+                extra += ["--set", f"{flag}={value}"]
+        if extra != list(getattr(args, "set", None) or []):
+            args.set = [
+                s for pair in zip(extra[::2], extra[1::2]) for s in pair
+            ]
+            print(
+                "[v2ctl.golden.deploy] --for-profiling: tracing flags added: "
+                + ", ".join(f"{k}={v}" for k, v in GOLDEN_PROFILE_DEPLOY_FLAGS),
+                flush=True,
+            )
+    return cmd_deploy(args, repo_root)
+
+
 def cmd_golden(args, repo_root: Path) -> int:
     """Dispatch the public Golden namespace to the canonical handlers."""
-    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
+    if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"}:
         print(
             "ERROR: public Golden commands are doctor, status, deploy, run, "
-            "publisher-bootstrap, and publish-custom-nodes",
+            "publisher-bootstrap, publish-custom-nodes, and profile",
             file=sys.stderr,
         )
         return 2
@@ -2487,8 +2813,15 @@ def cmd_golden(args, repo_root: Path) -> int:
     identity_error = _reject_golden_identity_args(args, public=True)
     if identity_error is not None:
         return identity_error
-    public_run = args.golden_command in {"deploy", "run"}
+    public_run = args.golden_command in {"deploy", "run", "profile"}
     dry_run = bool(getattr(args, "dry_run", False))
+    if public_run and not dry_run and not getattr(args, "app", None):
+        # The profile declares its own target.app. Resolve it here rather than
+        # forcing the caller to know the experimental app name, which otherwise
+        # leads to a guessed app and a profile contract that was never intended.
+        resolved_app = _profile_app_name(repo_root, requested_profile)
+        if resolved_app:
+            args.app = resolved_app
     if public_run and not dry_run:
         if not getattr(args, "app", None):
             print(
@@ -2507,6 +2840,10 @@ def cmd_golden(args, repo_root: Path) -> int:
         args.run_count = 1
     if args.golden_command == "status":
         return cmd_golden_status(args, repo_root)
+    if args.golden_command == "profile":
+        return cmd_golden_profile(args, repo_root)
+    if args.golden_command == "deploy":
+        return cmd_golden_deploy(args, repo_root)
     handlers = {
         "doctor": cmd_doctor,
         "deploy": cmd_deploy,
@@ -4457,9 +4794,14 @@ def build_parser() -> argparse.ArgumentParser:
     gsub.add_parser("status", help="show local Golden readiness without backend calls").set_defaults(
         func=cmd_golden
     )
-    for name in ("doctor", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes"):
-        child = gsub.add_parser(name)
-        if name in {"deploy", "run", "publisher-bootstrap", "publish-custom-nodes"}:
+    for name in ("doctor", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"):
+        child = gsub.add_parser(
+            name,
+            help=_GOLDEN_COMMAND_HELP.get(name),
+            description=_GOLDEN_COMMAND_DESCRIPTION.get(name),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        if name in {"deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"}:
             # Visible on ``golden <command> --help`` while the existing
             # pre-parser continues to support root-option hoisting.
             # SUPPRESS is important: _hoist_global_options may already have
@@ -4467,6 +4809,47 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
             child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                                help="resolve and print, invoke nothing")
+            if name == "deploy":
+                child.add_argument(
+                    "--for-profiling",
+                    dest="for_profiling",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="add the full-trace tracing flags, so a later "
+                    "`golden profile --skip-deploy` produces a trace",
+                )
+            if name == "profile":
+                child.add_argument(
+                    "--min-ms",
+                    type=float,
+                    default=argparse.SUPPRESS,
+                    help="call-tree expansion floor in ms (default 1.0)",
+                )
+                child.add_argument(
+                    "--skip-deploy",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="do not deploy; reuse the current deployment (it must "
+                    "already carry the tracing flags)",
+                )
+                child.add_argument(
+                    "--trace-id",
+                    dest="trace_id",
+                    default=argparse.SUPPRESS,
+                    help="analyse this existing trace id instead of the one "
+                    "produced by the run",
+                )
+                child.add_argument(
+                    "--skip-analyze",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="reuse existing derived artifacts and only re-render",
+                )
+                child.add_argument(
+                    "--workspace-id",
+                    default=argparse.SUPPRESS,
+                    help="Modal workspace id override for bundle fetch",
+                )
             if name == "run":
                 child.add_argument(
                     "--acknowledge-volume-drift",

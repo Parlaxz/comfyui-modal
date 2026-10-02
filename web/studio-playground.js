@@ -1510,29 +1510,34 @@ function _workflowSelectEl(state, actions, context) {
 }
 
 function _workflowVersionSelectEl(state, actions, context) {
+  // A workflow has one version, so this is a read-only label rather than a
+  // chooser. It keeps the field's place in the layout and its testid, so the
+  // surrounding run form is unchanged; only the ability to switch is gone.
   const store = state && state.playground && state.playground._workflowRun;
-  const select = el("select", {
+  if (!store || !store.workflowId) {
+    return el("span", {
+      class: "comfymodal-input comfymodal-studio-select",
+      "data-testid": "workflow-version-selector",
+      text: "No workflow selected",
+    });
+  }
+  const versions = store.versions || [];
+  const current = versions.find(
+    (v) => String(v.workflow_version_id) === String(store.workflowVersionId)
+  ) || versions[versions.length - 1];
+  if (!current) {
+    return el("span", {
+      class: "comfymodal-input comfymodal-studio-select",
+      "data-testid": "workflow-version-selector",
+      text: "No version",
+    });
+  }
+  return el("span", {
     class: "comfymodal-input comfymodal-studio-select",
     "data-testid": "workflow-version-selector",
+    "data-version-id": String(current.workflow_version_id),
+    text: _workflowVersionOptionLabel(current),
   });
-  if (!store || !store.workflowId) {
-    select.appendChild(el("option", { value: "", text: "No workflow selected", disabled: true, selected: true }));
-    select.disabled = true;
-    return select;
-  }
-  const placeholder = el("option", { value: "", text: "Select a version\u2026", disabled: true });
-  if (!store.workflowVersionId) placeholder.selected = true;
-  select.appendChild(placeholder);
-  (store.versions || []).forEach((v) => {
-    const opt = el("option", { value: String(v.workflow_version_id), text: _workflowVersionOptionLabel(v) });
-    if (store.workflowVersionId && String(store.workflowVersionId) === String(v.workflow_version_id)) opt.selected = true;
-    select.appendChild(opt);
-  });
-  select.disabled = !store.workflowId || (store.versions || []).length === 0;
-  select.addEventListener("change", () => {
-    _handleVersionChange(state, context, actions, select.value);
-  });
-  return select;
 }
 
 function _workflowPresetSelectEl(state, actions, context) {
@@ -1997,9 +2002,16 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     return;
   }
   if (saved.workflowVersionId) {
-    const verExists = (store.versions || []).some((v) => String(v.workflow_version_id) === String(saved.workflowVersionId));
-    if (!verExists) {
-      // Keep the workflow selected; never silently substitute a version.
+    // A workflow has one version, so a restored id is a hint, not a choice.
+    // Snap to whatever the workflow's latest is now rather than failing when
+    // the saved version is gone: the run context is version-agnostic to the
+    // user, who has no way to pick a different one any more.
+    const wanted = String(saved.workflowVersionId);
+    const versions = store.versions || [];
+    const target =
+      versions.find((v) => String(v.workflow_version_id) === wanted)
+      || versions[versions.length - 1];
+    if (!target) {
       store.statusLine = "Requested version no longer available";
       store.setVersionId("");
       store.setPresetId("");
@@ -2009,7 +2021,7 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
       store.setReasons(["Requested version no longer available"]);
       return;
     }
-    const verRes = await wf.selectVersion(apiBase, store, saved.workflowVersionId);
+    const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
     if (!verRes.ok) {
       store.statusLine = verRes.error || "Requested version no longer available";
       return;
@@ -2053,26 +2065,6 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
     });
   }
   // Shelf: a new Workflow loads its own durably autosaved field values.
-  _rerenderWorkflowSection(state, context, actions, { applySaved: true });
-}
-
-async function _handleVersionChange(state, context, actions, versionId) {
-  const store = state && state.playground && state.playground._workflowRun;
-  const wf = state && state.playground && state.playground._workflowRunModule;
-  if (!store || !wf || !versionId) return;
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  store.handoffError = null;
-  const result = await wf.selectVersion(apiBase, store, versionId);
-  if (result && result.ok) {
-    wf.saveWorkflowSelection({
-      workflowId: store.workflowId,
-      workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
-      workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
-    });
-  }
-  // Shelf: a new Version loads its own durably autosaved field values.
   _rerenderWorkflowSection(state, context, actions, { applySaved: true });
 }
 

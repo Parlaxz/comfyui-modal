@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Optional
 
 import torch
@@ -17,6 +17,7 @@ from .golden_serial import (
     _GOLDEN_QD_ARM_CONTEXT,
     _persist_final_telemetry,
     _golden_trace_span,
+    golden_root_span,
     _resolve_clip_unet_schedule,
     _resolve_sampling_vae_schedule,
     golden_clip_forward_unet_window,
@@ -57,6 +58,28 @@ GOLDEN_REQUEST_WALL_GATE_S = 40.0
 # hang can never destroy a good result -- only cap how long the container holds
 # the GPU while failing to return.
 POST_REQUEST_EXIT_GATE_S = 15.0
+# The post-request bound has to absorb VizTracer's final serialization, which
+# runs after the request is armed and scales with entry count.  Removing the
+# include_files whitelist (see full_execution_trace._start_request_tracing)
+# raised a Golden request from ~40k entries to ~1.2M, and serializing that
+# legitimately overruns the production 15s bound -- the gate then os._exit(71)s
+# a run whose telemetry, output and trace are all already durable.  Give the
+# traced path a larger default and let the env var win for explicit tuning.
+POST_REQUEST_EXIT_GATE_TRACED_S = 120.0
+
+
+def _resolve_post_request_exit_gate_s() -> float:
+    raw = str(os.environ.get("COMFYMODAL_GOLDEN_EXIT_GATE_S", "")).strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    if str(os.environ.get("COMFYMODAL_V2_FULL_TRACE", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return POST_REQUEST_EXIT_GATE_TRACED_S
+    return POST_REQUEST_EXIT_GATE_S
 PROGRESS_HEARTBEAT_ENV = "COMFYMODAL_GOLDEN_PROGRESS_HEARTBEAT"
 
 _PROGRESS_STATE: dict[str, Any] = {"t0_ns": 0, "last_stage": "none"}
@@ -128,14 +151,18 @@ def _cancel_request_wall_gate() -> None:
             pass
 
 
-def _install_post_request_exit_bound(gate_s: float = POST_REQUEST_EXIT_GATE_S) -> None:
+def _install_post_request_exit_bound(gate_s: float | None = None) -> None:
     """Bound the Modal adapter's post-request return.
 
     Golden completed and its telemetry is already durable on the volume before
     this is armed, so an exit hang can no longer destroy a good result -- but an
     unbounded exit still holds the H100 until the platform timeout.  This fires
     only if the container has not returned, and says so explicitly.
+
+    ``gate_s`` defaults to None and is resolved at arm time, not import time, so
+    the traced run picks up its own larger budget.
     """
+    gate_s = _resolve_post_request_exit_gate_s() if gate_s is None else gate_s
 
     def _fire() -> None:
         print(
@@ -265,6 +292,9 @@ async def golden_parallel_execute(
     result: GoldenFinalResult | None = None
     loader_worker: Any = None
     loader_process_active = False
+    # Bound before the try so the finally always has a root to close, even if
+    # entering the span itself is what failed.
+    golden_root: Any = nullcontext()
     try:
         # Experimental loader-process modes (both disabled by default):
         # - request-time worker (COMFYMODAL_GOLDEN_LOADER_PROCESS): one
@@ -296,8 +326,14 @@ async def golden_parallel_execute(
         _PROGRESS_STATE["last_stage"] = "execute_enter"
         _install_request_wall_gate()
         _hb("execute_enter")
-        with _golden_trace_span("golden_parallel_execute"):
-            await golden_restore(session)
+        # THE authoritative Golden Parallel root.  It opens before any request
+        # work and closes in the ``finally`` below, after teardown and after the
+        # loader worker has released its child-side storage, so every canonical
+        # stage and teardown are inside it.  It must be the only Golden root:
+        # two competing roots make the exhaustive profiler fail closed.
+        golden_root = golden_root_span("golden_parallel_execute")
+        golden_root.__enter__()
+        await golden_restore(session)
         _hb("restore_done")
         if _io_process_active:
             # Diagnostic probe BEFORE the first CLIP/model read: report exactly
@@ -457,6 +493,9 @@ async def golden_parallel_execute(
                 )
             loader_worker = None
         _GOLDEN_QD_ARM_CONTEXT.reset(transport_arm_token)
+        # Close the authoritative Golden root last: teardown and loader-worker
+        # release are request-side work, telemetry persistence is not.
+        golden_root.__exit__(None, None, None)
 
     try:
         _hb("telemetry_persist_begin")

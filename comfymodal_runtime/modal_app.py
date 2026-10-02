@@ -3068,6 +3068,126 @@ def _capture_host_diagnostics() -> dict[str, Any] | None:
 # ── Full-trace packaging helpers (inert when disabled) ────────────────
 
 
+def _persist_child_viztracer_manifest(session: Any, result: dict[str, Any]) -> str:
+    """Write the child-trace manifest and log the outcome. Returns "" on success.
+
+    A write failure used to be swallowed entirely, which made a vanished manifest
+    impossible to diagnose: a bundle with no manifest looked exactly like a run
+    where the flag was off. Only the error reporting changed; the manifest is
+    still written on the same paths as before.
+    """
+    error_name = ""
+    try:
+        (session.base_dir / "raw" / "trace_child_viztracer_manifest.json").write_text(
+            json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        error_name = type(exc).__name__
+    print(
+        f"[v2.full_trace] stage=child_viztracer "
+        f"status={result.get('status')} "
+        f"enabled={bool(result.get('enabled'))} "
+        f"trace_present={bool(result.get('trace_present'))} "
+        f"child_ran={result.get('child_ran')} "
+        f"state_unknown={bool(result.get('state_unknown'))} "
+        f"error={result.get('error') or 'none'} "
+        f"manifest_write_error={error_name or 'none'} "
+        f"trace_id={getattr(session, 'trace_id', '')}",
+        flush=True,
+    )
+    return error_name
+
+
+def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
+    """Copy the C0 child trace into the session ``raw/`` dir before bundling.
+
+    The C0 child process traces itself to a deterministic path when
+    ``COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER`` is ON, but the child cannot add
+    itself to the parent's bundle.  Without this copy the bundle ships
+    parent-only, and the whole request reads as a single traced process even
+    though the child recorded thousands of intervals.
+
+    Uses the deterministic child output path only, never a newest-file
+    heuristic.  When the flag is ON but the artifact is missing or failed, an
+    explicit ``missing_child_trace`` status is preserved so the run is never
+    counted as complete parent+child capture.  Never raises.
+    """
+    result: dict[str, Any] = {
+        "enabled": False,
+        "status": "disabled",
+        "source_path": "",
+        "raw_path": None,
+        "trace_present": False,
+        "sha256": "",
+        "size_bytes": 0,
+    }
+    try:
+        from .golden_io_process_v2 import child_viztracer_artifact
+        artifact = child_viztracer_artifact()
+    except Exception as _artifact_exc:
+        # We could not determine whether the child tracer was on. That is not the
+        # same as proven-off, so record it: previously this returned before both
+        # the manifest write and the log line, leaving a bundle with no manifest
+        # that was indistinguishable from a run which never asked for a child
+        # trace. A clean disable still writes nothing.
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = type(_artifact_exc).__name__
+        _persist_child_viztracer_manifest(session, result)
+        return result
+    if not isinstance(artifact, dict):
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = "artifact_not_a_dict"
+        _persist_child_viztracer_manifest(session, result)
+        return result
+    result["enabled"] = bool(artifact.get("enabled"))
+    result["source_path"] = str(artifact.get("path") or "")
+    if not result["enabled"]:
+        # Proven off: no manifest, by contract.
+        return result
+    reason = str(artifact.get("status") or "unknown")
+    result["reason"] = reason
+    source = result["source_path"]
+    trace_ok = (
+        bool(artifact.get("trace_present"))
+        and bool(source)
+        and os.path.isfile(source)
+    )
+    if reason == "saved" and trace_ok:
+        try:
+            with open(source, "rb") as handle:
+                payload = handle.read()
+            digest = hashlib.sha256(payload).hexdigest()
+            raw_rel = "raw/trace_child_viztracer.json"
+            (session.base_dir / raw_rel).write_bytes(payload)
+            result.update({
+                "status": "captured",
+                "raw_path": raw_rel,
+                "trace_present": True,
+                "sha256": digest,
+                "size_bytes": len(payload),
+                "viztracer_version": str(artifact.get("viztracer_version") or ""),
+                "tracer_entries": int(artifact.get("tracer_entries") or 0),
+                "max_stack_depth": int(artifact.get("max_stack_depth") or 0),
+                "child_pid": int(artifact.get("pid") or 0),
+            })
+        except Exception as exc:
+            result.update({
+                "status": "missing_child_trace",
+                "trace_present": False,
+                "error": type(exc).__name__,
+            })
+    else:
+        result["status"] = "missing_child_trace"
+# The manifest is written even on failure so a missing child trace is
+    # visible in the bundle instead of being indistinguishable from a child that
+    # was never asked to trace.
+    _persist_child_viztracer_manifest(session, result)
+    return result
+
+
 def _build_full_trace_bundle(session: Any) -> tuple[str, str, bytes, str, list[dict[str, Any]]] | None:
     """Build the deterministic tar.gz bundle from an active trace session.
 
@@ -3304,6 +3424,9 @@ def _finalize_full_trace(
                 flush=True,
             )
         # ── 7. Package raw bundle (not traced) ──
+        # The C0 child traced itself to its own /tmp path; copy it into raw/
+        # first so the bundle is parent+child rather than parent-only.
+        _child_trace_result = _attach_child_viztracer_trace(session)
         _bundle_started = time.perf_counter()
         _bundle = _build_full_trace_bundle(session)
         _stage_timings_ms["bundle_ms"] = round(

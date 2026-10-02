@@ -250,6 +250,24 @@ owner = "e31"
 description = "Persist compute-ready FP32 CLIP weights; cast once at module import. Also allowlisted for request override; lifecycle per design doc (design §7 example)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "golden-profiler"
+description = "Process-boundary VizTracer for the Golden C0 child process. Default OFF; when ON the child records its own function-level trace plus a metadata sidecar (trace_id, request_id, pid, parent_pid, role, clock origin, entry count/capacity, truncation) so the exhaustive profiler can merge it. Diagnostic only."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_EXHAUSTIVE_PROFILE"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "none"
+owner = "golden-profiler"
+description = "Report-rendering selector for the Golden exhaustive execution profiler. Read only by the offline reporter over already-captured artifacts; it cannot enable capture, so it is never deploy-baked and never changes container execution."
+
+[[flag]]
 name = "COMFYMODAL_V2_E31_FORENSICS"
 type = "bool"
 default = "0"

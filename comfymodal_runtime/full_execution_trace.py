@@ -64,6 +64,12 @@ _DEFAULT_RESOURCE_INTERVAL_MS = 50
 # (where the legacy optional global seam remains available) from an explicitly
 # bound request whose missing tracer must fail closed.
 _GOLDEN_TRACER_UNBOUND = object()
+
+#: Chrome-trace category for the single authoritative Golden root span.  It must
+#: match ``GOLDEN_ROOT_CATEGORY`` in ``golden_exhaustive_profile``; the offline
+#: reporter reads this category to tell the authoritative root apart from the
+#: executor function's own (identically categorised) Python-call record.
+GOLDEN_ROOT_CATEGORY = "GOLDEN_ROOT"
 _GOLDEN_TRACER: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "comfymodal_golden_tracer",
     default=_GOLDEN_TRACER_UNBOUND,
@@ -245,6 +251,63 @@ def bind_golden_tracer(tracer: Any):
         _GOLDEN_TRACER.reset(token)
 
 
+def thread_traced(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap *fn* so the thread running it installs this request's profile hook.
+
+    ``VizTracer.enable_thread_tracing()`` only reaches threads created *after* it
+    is called.  Golden's asyncio default executor already exists by the time a
+    request runs, so ``asyncio.to_thread`` reuses worker threads that never
+    receive the hook and produce no events at all.
+
+    That is measurable, and it is not a code difference: on trace
+    ``a4a4eaaf52fe456cbcd3583527068891`` golden_unet_load reports
+    ``source_read_count = 184`` against golden_clip_load's 120, i.e. it drove
+    *more* of the C0 source pool, yet recorded zero frames.  The asymmetry is
+    the dispatch path -- clip loads via ``load_sync`` on the request task thread,
+    while unet dispatches ``load`` -> ``asyncio.to_thread(_load_sync)`` onto the
+    stale executor thread.  Everything under that call is plain Python
+    (``wait_ready``, ``_read_message``, ``select.select``) and should be traced.
+
+    ``sys.setprofile`` only ever affects the calling thread, so the hook has to be
+    installed from inside the worker.  The tracer is resolved at call time, not
+    captured, so the binding stays authoritative and an unbound tracer makes this
+    a plain passthrough.  Tracing failures never escape into the load.
+    """
+    @functools.wraps(fn)
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        try:
+            tracer = _GOLDEN_TRACER.get()
+            if tracer is _GOLDEN_TRACER_UNBOUND:
+                _viz = sys.modules.get("viztracer")
+                _get = getattr(_viz, "get_tracer", None)
+                tracer = _get() if callable(_get) else None
+            thread_hook = getattr(tracer, "threadtracefunc", None)
+            if callable(thread_hook):
+                sys.setprofile(thread_hook)
+                # On Python 3.12+ VizTracer registers threads through
+                # threading.settrace_all_threads instead of a bare setprofile,
+                # so ask the tracer to register this thread too. On 3.11 it
+                # simply re-sets the same profile function, which is harmless.
+                reg = getattr(tracer, "enable_thread_tracing", None)
+                if callable(reg):
+                    reg()
+        except BaseException:  # noqa: BLE001 - tracing must never break the load
+            pass
+        return fn(*args, **kwargs)
+
+    # ``functools.wraps`` exposes __wrapped__, so ``inspect.signature`` follows
+    # it to the real callable. Anything that introspects this object rather than
+    # calling it -- GoldenModelTransport dispatches on the signature and rejects
+    # the keyword arguments it sees -- must keep seeing the original, so the
+    # wrapper's own signature is pinned rather than (*args, **kwargs).
+    try:
+        import inspect as _inspect
+        _run.__signature__ = _inspect.signature(fn)  # type: ignore[attr-defined]
+    except (TypeError, ValueError, ImportError):
+        pass
+    return _run
+
+
 @contextlib.contextmanager
 def golden_trace_span(name: str):
     """Record a Golden duration event on the request-bound VizTracer.
@@ -280,6 +343,104 @@ def golden_trace_span(name: str):
                 event.__exit__(None, None, None)
             except BaseException:
                 pass
+
+
+@contextlib.contextmanager
+def golden_root_span(name: str):
+    """Record THE authoritative Golden root span for one executor.
+
+    Why this exists rather than another :func:`golden_trace_span`: in VizTracer
+    1.1.1 ``VizEvent.__exit__`` hardcodes ``cat="FEE"``, so an explicit span and
+    the automatic Python-call record of the same function are byte-for-byte
+    indistinguishable once serialized.  An offline reader therefore cannot tell
+    "the span the executor opened around its whole body" from "the call record of
+    the function itself", and a build that emits both ends up with two candidate
+    roots.
+
+    Writing the same Chrome ``X`` event under a dedicated category makes the
+    authoritative root unambiguous from the artifact alone.  It records no new
+    measurement: the timestamps come from the tracer's own clock, so this adds no
+    stopwatch and no per-function instrumentation.
+
+    Inert when no tracer is bound, and a tracing failure never affects Golden.
+    """
+    tracer = _resolve_bound_tracer()
+    start_us: float | None = None
+    if tracer is not None:
+        try:
+            getts = getattr(tracer, "getts", None)
+            add_raw = getattr(tracer, "add_raw", None)
+            if callable(getts) and callable(add_raw):
+                start_us = float(str(getts()))
+            else:
+                tracer = None
+        except BaseException:
+            tracer = None
+    if tracer is None:
+        yield
+        return
+    frame = _caller_frame()
+    try:
+        yield
+    finally:
+        try:
+            duration = float(tracer.getts()) - float(start_us or 0.0)
+            tracer.add_raw({
+                "ph": "X",
+                "name": f"{name} ({frame.f_code.co_filename}:{frame.f_lineno})",
+                "ts": start_us,
+                "dur": max(0.0, duration),
+                "cat": GOLDEN_ROOT_CATEGORY,
+            })
+        except BaseException:
+            pass
+
+
+#: Frames that belong to the span plumbing itself, not to the Golden executor.
+#: ``@contextlib.contextmanager`` inserts a ``wrapper`` frame per layer, and the
+#: serial seam adds its own ``golden_root_span`` frame, so a naive
+#: ``sys._getframe(1)`` would attribute the authoritative root to
+#: ``contextlib.py`` or to the seam instead of to the executor that opened it.
+_ROOT_SPAN_INTERNAL_FILES = ("contextlib.py", "full_execution_trace.py")
+_ROOT_SPAN_INTERNAL_FUNCTIONS = frozenset({
+    "golden_root_span", "wrapper", "helper",
+})
+
+
+def _caller_frame() -> Any:
+    """Return the nearest frame outside the span plumbing itself."""
+    try:
+        frame: Any = sys._getframe(1)
+    except Exception:  # pragma: no cover - no frame stack
+        return sys._getframe(0)
+    while frame is not None:
+        filename = str(getattr(frame.f_code, "co_filename", "") or "")
+        function = str(getattr(frame.f_code, "co_name", "") or "")
+        is_internal = (
+            function in _ROOT_SPAN_INTERNAL_FUNCTIONS
+            or any(filename.endswith(name) for name in _ROOT_SPAN_INTERNAL_FILES)
+        )
+        if not is_internal:
+            return frame
+        frame = frame.f_back
+    return sys._getframe(1)
+
+
+def _resolve_bound_tracer() -> Any:
+    """Return the request-bound tracer, or ``None``.
+
+    Never consults an unrelated global tracer once a binding exists, and never
+    imports VizTracer.
+    """
+    try:
+        tracer = _GOLDEN_TRACER.get()
+        if tracer is _GOLDEN_TRACER_UNBOUND:
+            tracer_module = sys.modules.get("viztracer")
+            get_tracer = getattr(tracer_module, "get_tracer", None)
+            tracer = get_tracer() if callable(get_tracer) else None
+        return tracer
+    except BaseException:
+        return None
 
 
 def _sanitize_cmdline(cmdline: str) -> str:
@@ -1159,6 +1320,84 @@ def _inspect_asyncio_task(task: asyncio.Task) -> dict[str, Any]:
 # Include-path resolution for trace_config.json
 # ═══════════════════════════════════════════════════════════════════════════════════
 
+def _comfyui_root_candidates(here: Path | None) -> list[Path]:
+    """Return plausible ComfyUI checkout roots, most specific first.
+
+    Covers both layouts this runtime ships in: a source checkout where the
+    package sits at ``<ComfyUI>/custom_nodes/comfyui-modal/comfymodal_runtime``,
+    and the deployed layout where the package is mounted at
+    ``/root/comfymodal_runtime``. Derivation from the module path alone misses
+    the second case entirely.
+    """
+    out: list[Path] = []
+    if here is not None:
+        try:
+            node = here
+            for _ in range(4):
+                node = node.parent
+                if node.name == "comfyui-modal" and node.parent.name == "custom_nodes":
+                    out.append(node.parent.parent)
+                if node.name == "ComfyUI":
+                    out.append(node)
+        except Exception:
+            pass
+    out.extend([
+        Path("/root/ComfyUI"),
+        Path("/ComfyUI"),
+        Path("/opt/ComfyUI"),
+        Path("/workspace/ComfyUI"),
+        Path("/app/ComfyUI"),
+    ])
+    # Anything that imports cleanly is authoritative.
+    try:
+        import folder_paths  # type: ignore
+        base = getattr(folder_paths, "base_path", None)
+        if base:
+            out.append(Path(str(base)))
+        main = getattr(folder_paths, "get_folder_paths", None)
+        if callable(main):
+            for name in ("custom_nodes", "comfy"):
+                try:
+                    p = main(name)
+                except Exception:
+                    continue
+                if p:
+                    base_p = Path(str(p))
+                    out.append(base_p if base_p.name != "comfy" else base_p.parent)
+    except Exception:
+        pass
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in out:
+        try:
+            k = str(p)
+        except Exception:
+            continue
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
+
+
+#: VizTracer ``min_duration`` floor, in milliseconds.  Tracing every Python call
+#: in a Golden request produced ~1.25M events, which is a ~400 MB JSON trace and
+#: dominates the analysis loop.  A 10us floor drops the sub-frame bookkeeping
+#: noise while preserving every call a human would read in a call tree.
+#: Override with COMFYMODAL_V2_TRACE_MIN_DURATION_MS (0 disables the filter).
+TRACE_MIN_DURATION_MS_DEFAULT = 0.01
+
+
+def _trace_min_duration_ms() -> float:
+    raw = str(os.environ.get("COMFYMODAL_V2_TRACE_MIN_DURATION_MS", "")).strip()
+    if not raw:
+        return TRACE_MIN_DURATION_MS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return TRACE_MIN_DURATION_MS_DEFAULT
+    return value if value >= 0 else TRACE_MIN_DURATION_MS_DEFAULT
+
+
 def _resolve_trace_include_paths() -> dict[str, Any]:
     """Resolve VizTracer include file paths from known project layout.
 
@@ -1214,13 +1453,38 @@ def _resolve_trace_include_paths() -> dict[str, Any]:
         search_roots.append(here)                    # comfymodal_runtime/
         custom_node_root = here.parent               # comfyui-modal/
         search_roots.append(custom_node_root)
-        comfyui_root = custom_node_root.parent.parent  # ComfyUI/ (if it exists)
-        if comfyui_root.name == "ComfyUI":
-            search_roots.append(comfyui_root)
-            # Also comfy/ subdirectory
-            search_roots.append(comfyui_root / "comfy")
     except Exception:
-        pass
+        here = None
+
+    # Locate the ComfyUI checkout. The obvious two-levels-up guess only holds
+    # for a source checkout; the deployed layout puts this package at
+    # /root/comfymodal_runtime, so `comfyui_root.name == "ComfyUI"` was never
+    # true and ComfyUI was never searched at all. Every `comfy/*.py` and
+    # custom-node pattern below silently landed in `missing`, which is why the
+    # compute stages -- whose bodies are ComfyUI and RES4LYF code -- recorded no
+    # frames however well they were traced.
+    comfyui_root: Path | None = None
+    for candidate in _comfyui_root_candidates(here):
+        try:
+            if (candidate / "comfy").is_dir():
+                comfyui_root = candidate
+                break
+        except Exception:
+            continue
+    if comfyui_root is not None:
+        search_roots.append(comfyui_root)
+        search_roots.append(comfyui_root / "comfy")
+        # Custom nodes hold the sampler, CFG and CacheDiT implementations that
+        # golden_sampling executes; without them that stage is a bare leaf.
+        custom_nodes_dir = comfyui_root / "custom_nodes"
+        if custom_nodes_dir.is_dir():
+            search_roots.append(custom_nodes_dir)
+            try:
+                for entry in sorted(custom_nodes_dir.iterdir()):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        search_roots.append(entry)
+            except Exception:
+                pass
 
     # Custom node search roots (from known installed paths)
     try:
@@ -1229,6 +1493,51 @@ def _resolve_trace_include_paths() -> dict[str, Any]:
             search_roots.append(Path(sp))
     except Exception:
         pass
+
+    # Locate the ComfyUI checkout by content, not by path shape.
+    #
+    # The layout assumption above (``<custom_node_root>/../../ComfyUI``) only
+    # holds when this package is installed under ComfyUI/custom_nodes/. In the
+    # container it lives at /root/comfymodal_runtime, so custom_node_root is
+    # /root, the guessed parent is "/", its name is not "ComfyUI", and the real
+    # checkout is never searched. Every requested ComfyUI path then resolved to
+    # `missing`, and since a non-empty include list is used, those frames were
+    # silently filtered out of the trace.
+    #
+    # That is precisely why golden_clip_load was deep (its body is
+    # comfymodal_runtime, always included) while every stage that hands off to
+    # ComfyUI or a custom node -- clip_forward, unet_load, vae_load, sampling --
+    # collapsed to a leaf despite the tracer recording the calls. Probe for a
+    # directory that actually contains the ComfyUI package instead of assuming.
+    def _looks_like_comfyui(root: Path) -> bool:
+        try:
+            return (root / "comfy" / "sd.py").exists() and (
+                root / "folder_paths.py"
+            ).exists()
+        except OSError:
+            return False
+
+    probe_roots: list[Path] = []
+    for base in list(search_roots):
+        for suffix in ("", "ComfyUI", "custom_nodes/ComfyUI", ".."):
+            try:
+                probe_roots.append((base / suffix).resolve())
+            except OSError:
+                continue
+    for candidate in probe_roots:
+        try:
+            if candidate.name == "ComfyUI" or _looks_like_comfyui(candidate):
+                if candidate not in search_roots:
+                    search_roots.append(candidate)
+                comfy_pkg = candidate / "comfy"
+                if comfy_pkg.is_dir() and comfy_pkg not in search_roots:
+                    search_roots.append(comfy_pkg)
+                custom_nodes = candidate / "custom_nodes"
+                if custom_nodes.is_dir() and custom_nodes not in search_roots:
+                    # Sampler/model packs live here (RES4LYF, ComfyUI-CacheDiT).
+                    search_roots.append(custom_nodes)
+        except OSError:
+            continue
 
     searched_dirs = set()
     for root in search_roots:
@@ -1354,6 +1663,15 @@ class FullExecutionTraceSession:
         return Path(base) / self.trace_id
 
     # ── Factory ──────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def get_instance(cls) -> Optional["FullExecutionTraceSession"]:
+        """Return the live traced session, or ``None`` when tracing is off.
+
+        A read-only accessor for process-boundary integrations that must ask
+        "is this request being traced?" without being able to create a session.
+        """
+        return cls._instance
 
     @classmethod
     def create_if_enabled(
@@ -1681,14 +1999,16 @@ class FullExecutionTraceSession:
                 file_info=True,
                 register_global=True,
                 trace_self=False,
-                min_duration=0,
+                min_duration=_trace_min_duration_ms(),
                 minimize_memory=True,
                 output_file=str(self._base_dir / "raw" / "viztracer.json"),
             )
-            if inc["resolved"]:
-                viz_kwargs["include_files"] = inc["resolved"]
-            else:
-                viz_kwargs["exclude_files"] = inc["excluded"]
+            # Blacklist, never the include_files whitelist -- same reasoning as the
+            # request tracer below. A rejected call increments VizTracer's
+            # thread-local ignore_stack_depth and suppresses every descendant
+            # without re-testing its own filename, so a whitelist that omits
+            # asyncio/threading/concurrent.futures hides whole subtrees.
+            viz_kwargs["exclude_files"] = inc["excluded"]
 
             # Attempt creation with full kwargs; fall back on keyword rejection
             try:
@@ -1698,9 +2018,11 @@ class FullExecutionTraceSession:
                 minimal_kwargs: dict[str, Any] = dict(
                     tracer_entries=entries,
                     max_stack_depth=stack,
+                    # Keep the blacklist on the fallback path too. Falling back
+                    # to the include_files whitelist here would silently
+                    # reinstate the subtree-poisoning this replaced.
+                    exclude_files=inc["excluded"],
                 )
-                if inc["resolved"]:
-                    minimal_kwargs["include_files"] = inc["resolved"]
                 self._viztracer = _VT(**minimal_kwargs)
 
             self._viztracer.start()
@@ -1790,11 +2112,27 @@ class FullExecutionTraceSession:
                 "register_global": True,
                 "log_async": True,
                 "pid_suffix": False,
+                "ignore_c_function": True,
+                "ignore_frozen": True,
+                "min_duration": _trace_min_duration_ms(),
             }
-            if inc["resolved"]:
-                kwargs["include_files"] = inc["resolved"]
-            else:
-                kwargs["exclude_files"] = inc["excluded"]
+            # Use a BLACKLIST, never the include_files whitelist.
+            #
+            # VizTracer applies these at capture time, and a rejected call
+            # increments a thread-local ignore_stack_depth that suppresses every
+            # descendant WITHOUT re-checking its own filename (snaptrace.c skips
+            # on `ignore_stack_depth > 0` before the prefix test). A whitelist
+            # that omits asyncio/threading/concurrent.futures therefore hides
+            # every project function reached beneath them -- which is why only
+            # the work before the first await was ever deep.
+            #
+            # Excluding torch and the site-packages bulk instead keeps the
+            # scheduler frames traceable, so no ancestry is poisoned and call
+            # trees survive coroutine resumes and executor workers. Dropping
+            # include_files entirely was tried and is not viable: it traces torch
+            # internals too, the event volume explodes, and the request stops
+            # completing inside golden_sampling.
+            kwargs["exclude_files"] = inc["excluded"]
             try:
                 self._viztracer = _VT(**kwargs)
             except TypeError:

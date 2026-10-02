@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import atexit
 import collections
 import ctypes
@@ -984,7 +985,18 @@ class GoldenModelTransport:
         return layout
 
     async def load(self, path: str, *, role: str = "model") -> LoadedSafetensors:
-        return await asyncio.to_thread(self._load_sync, path, role=role)
+        # The transport body, including the C0 source-thread fan-out, runs on
+        # an asyncio executor worker whose thread predates
+        # enable_thread_tracing(), so without this handoff it records nothing.
+        # Measured on trace a4a4eaaf52fe456cbcd3583527068891: this path drives
+        # 184 source reads (clip_load's 120) and produced zero frames. Imported
+        # lazily so this module stays importable without the trace runtime.
+        try:
+            from .full_execution_trace import thread_traced
+            target = thread_traced(functools.partial(self._load_sync, role=role))
+        except BaseException:
+            return await asyncio.to_thread(self._load_sync, path, role=role)
+        return await asyncio.to_thread(target, path)
 
     def load_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         return self._load_sync(path, role=role)
