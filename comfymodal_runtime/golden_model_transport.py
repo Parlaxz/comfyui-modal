@@ -301,72 +301,6 @@ def _destination_reserve_capacities(free_bytes: int, total_bytes: int) -> tuple[
     return (3 * unit, 2 * unit, unit)
 
 
-def _metadata_cache():
-    """Return the shared metadata cache, or ``None`` if it is unavailable.
-
-    The cache is strictly an accelerator: when its module cannot be imported,
-    every caller falls through to the original parser, so Golden keeps working
-    exactly as before.
-    """
-    try:
-        from . import golden_metadata_cache
-
-        return golden_metadata_cache.cache()
-    except BaseException:
-        return None
-
-
-_METADATA_CACHE_PUBLISH_LOCK = threading.Lock()
-_METADATA_CACHE_PUBLISH_THREAD: Any = None
-_METADATA_CACHE_PUBLISH_WAKEUP: Any = None
-
-
-def _schedule_metadata_cache_publish(metadata_cache: Any) -> None:
-    """Persist learned metadata off the request critical path.
-
-    A miss is recorded immediately in memory; the one cache file is rewritten
-    by a single coalescing daemon thread so request wall never pays for the
-    write. Publication failure is counted, never raised.
-    """
-    global _METADATA_CACHE_PUBLISH_THREAD, _METADATA_CACHE_PUBLISH_WAKEUP
-    try:
-        with _METADATA_CACHE_PUBLISH_LOCK:
-            if _METADATA_CACHE_PUBLISH_WAKEUP is None:
-                _METADATA_CACHE_PUBLISH_WAKEUP = threading.Event()
-            wakeup = _METADATA_CACHE_PUBLISH_WAKEUP
-            if _METADATA_CACHE_PUBLISH_THREAD is None or not _METADATA_CACHE_PUBLISH_THREAD.is_alive():
-                thread = threading.Thread(
-                    target=_metadata_cache_publish_loop,
-                    args=(metadata_cache, wakeup),
-                    name="golden-metadata-cache-publish",
-                    daemon=True,
-                )
-                _METADATA_CACHE_PUBLISH_THREAD = thread
-                thread.start()
-        wakeup.set()
-    except BaseException:
-        pass
-
-
-def _metadata_cache_publish_loop(metadata_cache: Any, wakeup: Any) -> None:
-    while True:
-        try:
-            wakeup.wait()
-        except BaseException:
-            return
-        wakeup.clear()
-        # Coalesce a burst of misses into one write.
-        try:
-            wakeup.wait(0.05)
-        except BaseException:
-            return
-        wakeup.clear()
-        try:
-            metadata_cache.publish()
-        except BaseException:
-            pass
-
-
 def _parse_layout(path: str, identity: tuple[int, int, int, int]) -> SafetensorsLayout:
     size = os.path.getsize(path)
     with open(path, "rb") as handle:
@@ -1043,24 +977,7 @@ class GoldenModelTransport:
         if cached is not None and cached.identity == identity:
             self._layout_cache.move_to_end(normalized)
             return cached
-
-        # Persistent single-file cache. A hit needs only the stat identity
-        # already computed above, so it performs no Volume data read at all;
-        # a miss falls through to the original parser unchanged.
-        metadata_cache = _metadata_cache()
-        if metadata_cache is not None:
-            restored = metadata_cache.get(normalized, identity)
-            if restored is not None:
-                self._layout_cache[normalized] = restored
-                self._layout_cache.move_to_end(normalized)
-                while len(self._layout_cache) > LAYOUT_CACHE_LIMIT:
-                    self._layout_cache.popitem(last=False)
-                return restored
-
         layout = _parse_layout(normalized, identity)
-        if metadata_cache is not None:
-            metadata_cache.put(layout)
-            _schedule_metadata_cache_publish(metadata_cache)
         self._layout_cache[normalized] = layout
         self._layout_cache.move_to_end(normalized)
         while len(self._layout_cache) > LAYOUT_CACHE_LIMIT:
