@@ -1699,3 +1699,52 @@ def test_no_tracer_configures_include_files():
         or re.search(r'\binclude_files\s*=', line)
     ]
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# 13. incomplete-call counting
+# ---------------------------------------------------------------------------
+# Stopping a tracer always leaves the frames that were on the stack at that
+# moment unclosed -- including the teardown frames themselves. Those rows carry
+# no entry timestamp, so they measured nothing and must not fail the contract.
+# A row that recorded a start but never closed is a genuinely dangling call and
+# must still fail closed (covered by
+# test_incomplete_call_inside_root_fails_closed).
+
+
+def test_incomplete_call_counting_separates_unmeasured_tail():
+    from comfymodal_runtime.golden_exhaustive_profile import count_incomplete_calls
+
+    calls = [
+        # Opened at shutdown, nothing recorded: not corrupting.
+        {"complete": False, "start_us": None, "end_us": None, "name": "stop_tracing"},
+        {"complete": False, "start_us": None, "end_us": None, "name": "wait"},
+        # Dangling: a start was recorded but the frame never closed. Corrupting.
+        {"complete": False, "start_us": 100.0, "end_us": None, "name": "dangling"},
+        # Closed properly: not incomplete at all.
+        {"complete": True, "start_us": 1.0, "end_us": 2.0, "name": "ok"},
+    ]
+    total, measured = count_incomplete_calls(calls)
+    assert total == 3
+    assert measured == 1
+
+
+def test_incomplete_call_counting_on_empty_input():
+    from comfymodal_runtime.golden_exhaustive_profile import count_incomplete_calls
+
+    assert count_incomplete_calls([]) == (0, 0)
+
+
+def test_shutdown_tail_alone_does_not_fail_the_contract(tmp_path):
+    """A trace whose only incomplete calls are the shutdown tail is complete."""
+    events = full_stage_events()
+    # Frames still on the stack when the tracer stopped: entered, never
+    # returned, and never given a timestamp.
+    for name in ("stop_tracing (fet.py:1)", "wait (threading.py:1)"):
+        events.append({"ph": "B", "name": name, "ts": None,
+                       "pid": PARENT_PID, "tid": 100, "cat": "FEE"})
+    session = build_session(tmp_path, parent_events=events)
+    profile = analyze(session)
+    assert profile["incomplete_calls"] >= 1
+    assert profile["incomplete_measured_calls"] == 0
+    assert "no_root_corrupting_incomplete_calls" not in " ".join(profile["reasons"])
