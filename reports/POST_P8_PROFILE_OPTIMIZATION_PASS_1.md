@@ -1,4 +1,4 @@
-﻿# Post-Production-008 Profile Optimization Pass 1
+# Post-Production-008 Profile Optimization Pass 1
 
 (ASCII-only on purpose: an earlier PowerShell UTF-8 round-trip double-encoded this
 file, so all typographic characters have been removed to make that impossible again.)
@@ -975,3 +975,116 @@ of my changes. **New regressions: 0.**
 5. **Establish a placement-controlled comparison** before any total-request claim. Every
    storage-bound stage in this pass swung 5x between placements, which currently makes
    root-wall comparisons across deployments meaningless.
+
+---
+
+## 20. Counted acceptance cohort: 10 unprofiled runs, all optimizations on
+
+Run after the five phases, on the correct Production-008 profile with the profiler
+**OFF**, so these are ordinary performance observations and not diagnostic timings.
+
+| item | value |
+|---|---|
+| profile | `golden_p1_parallel_c0_p8_h100` (H100!, CPU 12) |
+| entrypoint | `run_golden_parallel_stream`, `golden_mode=parallel` |
+| attention backend | `comfy_kitchen` |
+| expected output SHA | `3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577` |
+| source | `opt/p8-profile-cleanup-1` @ `9c27b4e216dee9cb3f30ddbfb43920c7e3fa176c` |
+| deploy fingerprint | `6a4f7331b5d5b71a1f53fed13d5ebba585968bb946d524682dbc67658f19428d` |
+| source-probe | `RESULT=PASS source_identity=MATCH` (`git_head=9c27b4e216de`) |
+| gate | `verdict=ACCEPT`, manifest `gate_20261002-162940_a5d8af69.json` |
+| confirm | `confirm_20261002-163516_a5d8af69.json`, `reasons=[]`, `verdict=ACCEPT` |
+| optimizations in this build | Phase 1 + Phase 2 + Phase 4 (Phase 3 reverted, Phase 5 no-op) |
+
+### Profiler confirmed OFF for this profile
+
+Resolved before deploying, none of these were overridden:
+
+| flag | value | source |
+|---|---|---|
+| `COMFYMODAL_V2_FULL_TRACE` | 0 | profile |
+| `COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS` | 0 | profile |
+| `COMFYMODAL_V2_E27_FORENSICS` | 0 | profile |
+| `COMFYMODAL_GOLDEN_C0_WINDOW_TRACE` | 0 | profile |
+| `COMFYMODAL_SAMPLING_DEEP_PROFILE` | off | profile |
+| `COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER` | 0 | default |
+| `COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN` | 1 | profile |
+
+`COMFYMODAL_GOLDEN_DEEP_TRACE` was never passed (it is added only by `golden profile`).
+
+### Validity: 10/10 on every structural requirement
+
+| requirement | result |
+|---|---|
+| `output_sha_match == True` | **10 / 10** |
+| `valid == True` | **10 / 10** |
+| `restore_count == 1` | **10 / 10** |
+| `request_count == 1` | **10 / 10** |
+| `post_restore_nonce` present | **10 / 10** |
+| distinct `restored_instance_id` (true-cold) | **10 / 10** |
+| fallback reported | **0 / 10** |
+| true CLIP-forward / UNET-load overlap | **10 / 10** |
+| snapshot-capture guard | `idle`, `post_capture_guard_pending=false` on all 10 |
+
+No request was discarded: no capture occurred, so no one-request guard was armed.
+Runs were strictly serial. All 10 bind one deployment fingerprint, so this is a
+homogeneous single-deployment cohort.
+
+### Stage walls (ms), n=10
+
+| stage | min | p50 | p90 | max | mean | sd | CV% |
+|---|---|---|---|---|---|---|---|
+| `golden_restore` | 0.2 | 0.2 | 0.4 | 0.7 | 0.3 | 0.2 | 53.2 |
+| `golden_request_setup` | 1.5 | 2.0 | 3.4 | 50.0 | 7.1 | 15.1 | 214.0 |
+| `golden_clip_load` | 1756.8 | 3192.4 | 4192.3 | 4904.1 | 3160.0 | 1111.2 | 35.2 |
+| `golden_clip_forward` | 2449.6 | 2970.8 | 4888.0 | 4999.4 | 3444.9 | 1011.3 | 29.4 |
+| `golden_unet_load` | 2455.5 | 4289.0 | 6029.3 | 7126.4 | 4588.8 | 1383.0 | 30.1 |
+| **`golden_sampler_prepare`** | **25.6** | **30.8** | **32.4** | **43.9** | **31.1** | **5.0** | **16.0** |
+| `golden_sampling` | 3670.3 | 3925.1 | 4161.5 | 4653.0 | 3992.0 | 269.4 | 6.7 |
+| `golden_vae_load` | 361.0 | 517.2 | 895.7 | 1020.4 | 601.8 | 230.9 | 38.4 |
+| `golden_sampler_tail` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 14.9 |
+| `golden_vae_decode` | 478.7 | 558.7 | 620.9 | 831.5 | 580.1 | 97.9 | 16.9 |
+| `golden_output` | 212.5 | 242.6 | 249.9 | 267.9 | 238.2 | 17.5 | 7.3 |
+| `golden_teardown` | 0.4 | 1.0 | 1.5 | 1.5 | 1.0 | 0.3 | 32.4 |
+| `external_restore_total` | 643.2 | 909.8 | 1207.2 | 1460.4 | 949.4 | 242.0 | 25.5 |
+| `overlap_wall_hidden` | 2450.3 | 2971.6 | 4889.1 | 5000.1 | 3438.1 | 1019.2 | 29.6 |
+| `serial_equivalent_sum` | 4992.9 | 7015.7 | 10969.9 | 11031.4 | 8036.7 | 2234.8 | 27.8 |
+| **TOTAL wall (overlap-aware)** | **7575.8** | **9799.2** | **11928.1** | **12614.4** | **10047.7** | **1645.4** | **16.4** |
+
+With n=10 a p90 is meaningful, unlike the single-request profiler runs.
+
+### What this cohort does and does not prove
+
+**Proves.** All three approved optimizations hold on the real, unprofiled, Production-008
+path: 10/10 exact output SHA, 10/10 true-cold single restore, zero fallbacks, and
+`golden_sampler_prepare` now sits at **p50 30.8 ms / max 43.9 ms** with CV 16% - it no
+longer has a heavy tail. The CLIP/UNET overlap is intact on every run, hiding a mean of
+3438 ms of wall. Total overlap-aware wall is 10047.7 ms mean with CV 16.4%, far tighter
+than the 14449-19378 ms spread seen across the profiled runs earlier in this pass.
+
+**Does not prove.** There is **no like-for-like 10-run unprofiled baseline cohort** for
+`production-008` in this repository, so this is **not** a before/after delta:
+
+- the only baseline number available is trace `c5fe7cf3`, a **single profiled** run with
+  VizTracer ON, which is a different execution condition and a different sample size;
+- the profiled runs in this pass ranged 14449-19378 ms root wall against this cohort's
+  7576-12614 ms, and that gap is at least partly profiler overhead.
+
+So `sampler_prepare` moving from a 623.1 ms profiled baseline to a 30.8 ms unprofiled p50
+is consistent with the ~575 ms of `inspect.stack` work the optimization removes, but it is
+**not** a controlled delta and must not be quoted as one. Establishing one needs a 10-run
+unprofiled cohort on `production-008` itself.
+
+**Anomaly worth watching.** `golden_request_setup` has CV 214% (p50 2.0 ms, max 50.0 ms).
+One run spent 50 ms in a stage that normally costs 2 ms. That is a single outlier, not a
+regression - Phase 1/2/4 do not touch request setup - but it is the kind of thing a
+20-run cohort would confirm or dismiss.
+
+### Corrected count
+
+`confirm --runs 10` writes `confirm_runs: 10` but its manifest carries only the last run
+record. The full cohort is the 10 per-run cohorts under
+`artifacts/phase_p1_parallel_golden_v1/cohort_2026-10-02_16-29-50_*` through
+`cohort_2026-10-02_16-34-55_21e69a`, plus one gate cohort at
+`cohort_2026-10-02_16-28-50_0ecd78`. Note that `attempt_*.json` also matches the
+`attempt_0_events.json` sidecar, so a naive count reports 22 attempts; there are 10.
