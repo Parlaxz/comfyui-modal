@@ -362,12 +362,7 @@ def _metadata_cache_publish_loop(metadata_cache: Any, wakeup: Any) -> None:
             return
         wakeup.clear()
         try:
-            if metadata_cache.publish():
-                # A Modal Volume write is invisible to the next container until
-                # it is committed, so the file would never be reused without this.
-                from .golden_metadata_cache import volume_commit
-
-                volume_commit()
+            metadata_cache.publish()
         except BaseException:
             pass
 

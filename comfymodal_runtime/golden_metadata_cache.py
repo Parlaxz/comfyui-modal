@@ -71,46 +71,6 @@ def cache_path() -> str:
     return os.path.join(cache_dir(), CACHE_BASENAME)
 
 
-def _runtime_config_volume():
-    """The runtime-state Volume handle, or ``None`` outside the runtime."""
-    try:
-        import comfyapp
-
-        return getattr(comfyapp, "runtime_config_vol", None)
-    except BaseException:
-        return None
-
-
-def volume_reload() -> bool:
-    """Make a previously committed cache file visible to this container.
-
-    A Modal Volume write is only durable and only visible to a later container
-    after ``commit()``; without this reload a container can read its own
-    uncommitted write but not one written by an earlier container.
-    """
-    volume = _runtime_config_volume()
-    if volume is None:
-        return False
-    try:
-        volume.reload()
-        return True
-    except BaseException:
-        return False
-
-
-def volume_commit() -> bool:
-    """Publish the one cache file so a later container can reuse it."""
-    volume = _runtime_config_volume()
-    if volume is None:
-        return False
-    try:
-        volume.commit()
-        return True
-    except BaseException:
-        cache().publish_failures += 1
-        return False
-
-
 # ── normalized (de)serialization ──────────────────────────────────────────
 
 
