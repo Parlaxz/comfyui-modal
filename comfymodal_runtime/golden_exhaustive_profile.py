@@ -4069,11 +4069,22 @@ def write_artifacts(session_dir: Path, profile: Mapping[str, Any]) -> dict[str, 
     # contract with that evidence and render the authoritative text.  A report
     # that fails to render or write raises instead of leaving a "complete"
     # verdict behind with no artifact to back it.
-    render_markdown(profile)
-    _wlap("render#1")
+    # Settle the contract before rendering, so the report states the verdict it
+    # is actually shipped with and is rendered once.
+    #
+    # This used to render twice: once as a smoke test, then again after
+    # _finalize_contract settled the two render-dependent checks. On a 1M-call
+    # request each pass cost ~26s and the first pass's output was discarded --
+    # 43% of write_artifacts spent proving the report renders.
+    #
+    # The smoke test's actual guarantee was "never leave a complete verdict
+    # without an artifact behind it", and that still holds: the summary is
+    # written *above*, before finalization, so if rendering or writing raises,
+    # what reached disk still carries the pre-finalize NO verdict. A false YES
+    # cannot outlive a failure here.
     _finalize_contract(profile)
     report = render_markdown(profile)
-    _wlap("render#2")
+    _wlap("render")
     (derived / REPORT_NAME).write_text(report, encoding="utf-8")
     written["report"] = f"derived/{REPORT_NAME}"
     _wlap("done")
