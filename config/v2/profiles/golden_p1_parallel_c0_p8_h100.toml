@@ -1,0 +1,51 @@
+# v2ctl profile: Production 8 Golden Parallel on H100 with the C0 source owner.
+#
+# COUNTED PERFORMANCE profile for the Production-008 consolidation.  Additive
+# only: this file adds nothing to the Production-007 lineage and mutates no
+# P7 profile.  It extends the same counted base as P7
+# (golden_p1_parallel_c0_source_h100), so every Production-007 runtime
+# invariant is inherited unchanged rather than restated here:
+#
+#   H100! / CPU=12 / memory 24576 MB      (base [resources])
+#   whole mmap lifecycle                   COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE=whole
+#   thread source owner                    COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND=thread
+#   mmap_fresh engine identity             COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE=mmap_fresh
+#   qd4_64 source/transport geometry       COMFYMODAL_GOLDEN_{IO_PROCESS_V2,C0}_*_GEOMETRY=qd4_64
+#   persistent reader FDs                  COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS=1
+#   MINIMAL_GPU_TEARDOWN=1                 COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1
+#   forced-miss conditioning               [workload] conditioning_cache=forced_miss
+#   fresh-run requirement                  [workload] fresh_required=true
+#   correctness SHA (unchanged from P7)    3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#
+# PROFILER DEFAULT-OFF is inherited and is not overridden here.  The base sets
+# COMFYMODAL_V2_FULL_TRACE=0, E27_FORENSICS=0, C0_WINDOW_TRACE=0,
+# GOLDEN_STAGE_DIAGNOSTICS=0, SAMPLING_DEEP_PROFILE=off and
+# IO_PROCESS_V2_MMAP_COPY_DIAG=0.  Production-008 acceptance measures production
+# behaviour, not profiler overhead, so full VizTracer, exhaustive profiling, the
+# Torch profiler and the C0 child VizTracer all stay off for all 10 attempts.
+# The profiler machinery integrated from profiler-001-feature is present in the
+# tree and inert on this profile.
+#
+# What Production-008 adds over Production-007 is not runtime behaviour but
+# capability that is off on this profile:
+#   - profiler-001-feature Golden tracing/reporting seams (inert, see above)
+#   - deploy custom-node archive delivery, Volume publication safety,
+#     single-publisher locking, Studio sync status and the push-plugins /
+#     dependency-rebuild actions (deployment path, not the Golden hot path)
+#
+# Deliberately NOT enabled: WILLNEED / prewarm, Volume V2, any alternative
+# source geometry.  No M1B/M1C copy probe, diagnostic profile or arena global
+# is present in this lineage: commit 3e720a4b, which would add one, was
+# classified diagnostic-only and excluded from the consolidation.
+#
+# The only difference from P7 is the target app, so Production-008 is deployed
+# and accepted without mutating the production-007 anchor.
+schema_version = 1
+name = "golden_p1_parallel_c0_p8_h100"
+extends = "golden_p1_parallel_c0_p7_h100"
+owner = "production-008"
+
+[target]
+app = "batch-c0-p8-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
