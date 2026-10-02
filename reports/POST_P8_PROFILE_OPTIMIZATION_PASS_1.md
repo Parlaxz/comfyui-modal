@@ -1030,26 +1030,79 @@ No request was discarded: no capture occurred, so no one-request guard was armed
 Runs were strictly serial. All 10 bind one deployment fingerprint, so this is a
 homogeneous single-deployment cohort.
 
-### Stage walls (ms), n=10
+### Stage walls (ms), n=10 -- CORRECTED
+
+The first version of this table was wrong in two ways and has been replaced. See
+section 20.1 for the errata.
 
 | stage | min | p50 | p90 | max | mean | sd | CV% |
 |---|---|---|---|---|---|---|---|
-| `golden_restore` | 0.2 | 0.2 | 0.4 | 0.7 | 0.3 | 0.2 | 53.2 |
+| `restore` (`external_restore_total`) | 643.2 | 909.8 | 1207.2 | 1460.4 | 949.4 | 242.0 | 25.5 |
 | `golden_request_setup` | 1.5 | 2.0 | 3.4 | 50.0 | 7.1 | 15.1 | 214.0 |
 | `golden_clip_load` | 1756.8 | 3192.4 | 4192.3 | 4904.1 | 3160.0 | 1111.2 | 35.2 |
-| `golden_clip_forward` | 2449.6 | 2970.8 | 4888.0 | 4999.4 | 3444.9 | 1011.3 | 29.4 |
 | `golden_unet_load` | 2455.5 | 4289.0 | 6029.3 | 7126.4 | 4588.8 | 1383.0 | 30.1 |
+| `golden_clip_forward` | 2449.6 | 2970.8 | 4888.0 | 4999.4 | 3444.9 | 1011.3 | 29.4 |
 | **`golden_sampler_prepare`** | **25.6** | **30.8** | **32.4** | **43.9** | **31.1** | **5.0** | **16.0** |
-| `golden_sampling` | 3670.3 | 3925.1 | 4161.5 | 4653.0 | 3992.0 | 269.4 | 6.7 |
 | `golden_vae_load` | 361.0 | 517.2 | 895.7 | 1020.4 | 601.8 | 230.9 | 38.4 |
+| `golden_sampling` | 3670.3 | 3925.1 | 4161.5 | 4653.0 | 3992.0 | 269.4 | 6.7 |
 | `golden_sampler_tail` | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 14.9 |
 | `golden_vae_decode` | 478.7 | 558.7 | 620.9 | 831.5 | 580.1 | 97.9 | 16.9 |
 | `golden_output` | 212.5 | 242.6 | 249.9 | 267.9 | 238.2 | 17.5 | 7.3 |
 | `golden_teardown` | 0.4 | 1.0 | 1.5 | 1.5 | 1.0 | 0.3 | 32.4 |
-| `external_restore_total` | 643.2 | 909.8 | 1207.2 | 1460.4 | 949.4 | 242.0 | 25.5 |
-| `overlap_wall_hidden` | 2450.3 | 2971.6 | 4889.1 | 5000.1 | 3438.1 | 1019.2 | 29.6 |
-| `serial_equivalent_sum` | 4992.9 | 7015.7 | 10969.9 | 11031.4 | 8036.7 | 2234.8 | 27.8 |
-| **TOTAL wall (overlap-aware)** | **7575.8** | **9799.2** | **11928.1** | **12614.4** | **10047.7** | **1645.4** | **16.4** |
+| sum of all stage walls | 11788 | 15590 | 20648 | 21244 | 16645 | 3522 | 21.2 |
+| overlap 1: `clip_forward \|\| unet_load` | 2450.3 | 2971.6 | 4889.1 | 5000.1 | 3438.1 | 1019.2 | 29.6 |
+| overlap 2: `sampling \|\| vae_load` | 361.0 | 517.2 | 895.7 | 1020.4 | 601.8 | 230.9 | 38.4 |
+| sum minus both overlaps | 8950 | 12032 | 15738 | 16279 | 12606 | 2520 | 20.0 |
+| **E2E (restore + sum - overlaps)** | **9906** | **12841** | **16965** | **17084** | **13574** | **2646** | **19.5** |
+
+Reconciliation closes to within **20.1 ms** on every run: `E2E = restore + sum - ov1 - ov2`.
+
+`golden_restore` as a *stage* reads ~0 ms because it is flagged
+`details.observation_only: true`; the real restore is measured in
+`external_restore.restore_total_ms` and lies **outside** the stage envelope.
+
+### 20.1 Errata on the first version of this table
+
+Two extraction errors, both mine, both fixed above:
+
+1. **The original "TOTAL wall (overlap-aware)" omitted `golden_clip_load` entirely.** The
+   formula summed `request_setup + sampler_prepare + vae_load + sampling + sampler_tail +
+   vae_decode + output + teardown` and then added `max(clip_forward, unet_load)`.
+   `golden_clip_load` appeared in neither term, so a ~3.2 s serial stage was silently
+   dropped. The reported p50 of 9799 ms was roughly 3.0 s too low.
+2. **The original E2E was the stage envelope, which excludes the restore.** `golden_restore`
+   is an `observation_only` marker whose span is ~0 ms; the actual restore
+   (643-1460 ms) sits before the first real stage. The corrected E2E adds it back.
+
+Both errors understated the wall. The corrected E2E is **p50 12841 ms**, not 9799 ms.
+
+A third, smaller point: **`clip_unet_overlap` telemetry documents only one overlap.** The
+cohort actually contains **two**: the documented
+`golden_clip_forward || golden_unet_load` pair, and an undocumented
+`golden_sampling || golden_vae_load` pair worth a mean of 602 ms. Anyone reconstructing
+the critical path from the overlap telemetry alone would miss the second and overstate
+the serial tail by ~600 ms.
+
+### 20.2 Why `golden_clip_load` p50 really is ~3.2 s
+
+It is not overlapped, and it is not a measurement artifact:
+
+- **It cannot overlap.** `golden_clip_forward` requires the CLIP weights, so
+  `clip_load` is a hard predecessor. The parallel arm overlaps `clip_forward` with
+  `unet_load` *after* the load.
+- **It is 98.7% source read.** `clip_load_timing.phases` for the p50 run:
+  `source_open_read` 2659.1 ms of a 2694.0 ms stage, then `skeleton_patcher_construction`
+  0.7, `skeleton_bind_assign` 11.1, `owner_publish_handoff` 0.0, `storage_adoption` 16.4,
+  `compute_ready_proof` 2.4.
+- **The read moves a fixed 8.04 GB in 120 reads**, so the wall is set entirely by
+  placement bandwidth: **1.65-4.66 GB/s, p50 2.61 GB/s, CV 38%.** That 2.8x spread across
+  placements is what produces the CV 35% on the stage.
+
+So the median is real, and the cause is storage throughput rather than anything the
+optimizations touched. `golden_unet_load` moves 12.31 GB in 184 reads with no
+`source_open_read` phase recorded, so its GB/s is not separately derivable from this
+telemetry; `12.31 GB / 4289 ms p50` works out to about 2.87 GB/s if the whole stage is
+attributed to the read.
 
 With n=10 a p90 is meaningful, unlike the single-request profiler runs.
 
