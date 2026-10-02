@@ -3139,17 +3139,24 @@ def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
     # The manifest is written even on failure so a missing child trace is
     # visible in the bundle instead of being indistinguishable from a child
     # that was never asked to trace.
+    #
+    # A write failure used to be swallowed entirely, which made a vanished
+    # manifest impossible to diagnose: a bundle with no manifest looked exactly
+    # like a run where the flag was off. The record is still written on the same
+    # paths as before; only the error is now reported.
+    _manifest_error = ""
     try:
         (session.base_dir / "raw" / "trace_child_viztracer_manifest.json").write_text(
             json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+    except Exception as _manifest_exc:
+        _manifest_error = type(_manifest_exc).__name__
     print(
         f"[v2.full_trace] stage=child_viztracer "
         f"status={result.get('status')} "
         f"trace_present={bool(result.get('trace_present'))} "
+        f"manifest_write_error={_manifest_error or 'none'} "
         f"trace_id={getattr(session, 'trace_id', '')}",
         flush=True,
     )
