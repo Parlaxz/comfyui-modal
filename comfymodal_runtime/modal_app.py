@@ -12803,9 +12803,11 @@ class ModalRuntimeEntrypoint:
         # data read at all. Strictly an accelerator: a missing, corrupt or
         # stale cache leaves every caller on the original parser.
         try:
-            from .golden_metadata_cache import cache as _metadata_cache
+            from .golden_metadata_cache import cache as _metadata_cache, volume_reload as _volume_reload
 
+            _volume_reload()
             telemetry["metadata_cache"] = _metadata_cache().hydrate()
+            telemetry["metadata_cache"]["volume_reloaded"] = True
         except Exception as exc:
             telemetry["metadata_cache"] = {"error": type(exc).__name__}
         if isinstance(_preserved_snapshot_proof, Mapping):
