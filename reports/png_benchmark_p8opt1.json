@@ -1,0 +1,230 @@
+{
+ "real_1280x720": [
+  {
+   "encoder": "Pillow CL1 (PRODUCTION CONTROL)",
+   "median_ms": 18.05,
+   "p90_ms": 18.27,
+   "bytes": 1436895,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL0",
+   "median_ms": 17.31,
+   "p90_ms": 18.3,
+   "bytes": 5532984,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL3",
+   "median_ms": 22.43,
+   "p90_ms": 22.9,
+   "bytes": 1013047,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libpng CL1",
+   "median_ms": 16.17,
+   "p90_ms": 16.4,
+   "bytes": 1433338,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL1",
+   "median_ms": 43.04,
+   "p90_ms": 44.05,
+   "bytes": 1076748,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL3",
+   "median_ms": 53.13,
+   "p90_ms": 55.5,
+   "bytes": 1050174,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level0",
+   "median_ms": 54.23,
+   "p90_ms": 55.25,
+   "bytes": 990833,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level1",
+   "median_ms": 132.21,
+   "p90_ms": 136.07,
+   "bytes": 944089,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 libdeflater1",
+   "median_ms": 52.08,
+   "p90_ms": 57.54,
+   "bytes": 1016422,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 zlib1",
+   "error": "AttributeError: type object 'builtins.Deflaters' has no attribute 'zlib'"
+  },
+  {
+   "encoder": "OpenCV CL1",
+   "median_ms": 26.7,
+   "p90_ms": 27.17,
+   "bytes": 1075960,
+   "exact_pixels": false
+  }
+ ],
+ "synthetic_2048x2048": [
+  {
+   "encoder": "Pillow CL1 (PRODUCTION CONTROL)",
+   "median_ms": 196.0,
+   "p90_ms": 196.0,
+   "bytes": 12673080,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL0",
+   "median_ms": 110.49,
+   "p90_ms": 110.49,
+   "bytes": 12589062,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL3",
+   "median_ms": 253.93,
+   "p90_ms": 253.93,
+   "bytes": 8151875,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libpng CL1",
+   "median_ms": 166.95,
+   "p90_ms": 166.95,
+   "bytes": 12689316,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL1",
+   "median_ms": 333.94,
+   "p90_ms": 333.94,
+   "bytes": 8785887,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL3",
+   "median_ms": 336.16,
+   "p90_ms": 336.16,
+   "bytes": 8782536,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level0",
+   "median_ms": 301.42,
+   "p90_ms": 301.42,
+   "bytes": 7991932,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level1",
+   "median_ms": 491.59,
+   "p90_ms": 491.59,
+   "bytes": 7954202,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 libdeflater1",
+   "median_ms": 313.07,
+   "p90_ms": 313.07,
+   "bytes": 8139290,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 zlib1",
+   "error": "AttributeError: type object 'builtins.Deflaters' has no attribute 'zlib'"
+  },
+  {
+   "encoder": "OpenCV CL1",
+   "median_ms": 269.25,
+   "p90_ms": 269.25,
+   "bytes": 8786196,
+   "exact_pixels": false
+  }
+ ],
+ "synthetic_1024x1024": [
+  {
+   "encoder": "Pillow CL1 (PRODUCTION CONTROL)",
+   "median_ms": 49.19,
+   "p90_ms": 49.19,
+   "bytes": 3169549,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL0",
+   "median_ms": 27.65,
+   "p90_ms": 27.65,
+   "bytes": 3147861,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "Pillow CL3",
+   "median_ms": 67.43,
+   "p90_ms": 67.43,
+   "bytes": 2039777,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libpng CL1",
+   "median_ms": 48.08,
+   "p90_ms": 48.08,
+   "bytes": 3173605,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL1",
+   "median_ms": 80.73,
+   "p90_ms": 80.73,
+   "bytes": 2199065,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "imagecodecs libspng CL3",
+   "median_ms": 86.18,
+   "p90_ms": 86.18,
+   "bytes": 2198106,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level0",
+   "median_ms": 79.42,
+   "p90_ms": 79.42,
+   "bytes": 1999433,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level1",
+   "median_ms": 126.84,
+   "p90_ms": 126.84,
+   "bytes": 1989157,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 libdeflater1",
+   "median_ms": 81.39,
+   "p90_ms": 81.39,
+   "bytes": 2035883,
+   "exact_pixels": true
+  },
+  {
+   "encoder": "pyoxipng level2 zlib1",
+   "error": "AttributeError: type object 'builtins.Deflaters' has no attribute 'zlib'"
+  },
+  {
+   "encoder": "OpenCV CL1",
+   "median_ms": 66.49,
+   "p90_ms": 66.49,
+   "bytes": 2199039,
+   "exact_pixels": false
+  }
+ ]
+}
