@@ -2217,11 +2217,19 @@ def _clip_te_normalize_sd_keys(sd: dict) -> str:
 def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str]:
     try:
         from comfymodal_runtime import clip_qd_reader
-        parsed = clip_qd_reader.parse_safetensors_header(str(path))
-        if parsed.get("status") != "ok":
-            return None, f"header:{parsed.get('reason')}"
+
+        # Prefer the already-parsed layout when the metadata cache holds it, so
+        # the header is not re-read and re-parsed a second time for the same
+        # file.  Absent or stale cache falls through to the original parser.
+        header = _cached_safetensors_header(path)
+        if header is None:
+            parsed = clip_qd_reader.parse_safetensors_header(str(path))
+            if parsed.get("status") != "ok":
+                return None, f"header:{parsed.get('reason')}"
+            header = parsed.get("header") or {}
+
         state: dict[str, Any] = {}
-        for key, info in (parsed.get("header") or {}).items():
+        for key, info in header.items():
             if key == "__metadata__" or not isinstance(info, dict):
                 continue
             dtype = clip_qd_reader._TORCH_DTYPE.get(str(info.get("dtype") or ""))
@@ -2235,6 +2243,26 @@ def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str]:
         return (state, "ok") if reason == "ok" else (None, reason)
     except Exception as exc:
         return None, f"meta_header:{type(exc).__name__}"
+
+
+def _cached_safetensors_header(path: str) -> Optional[dict]:
+    """Return the cached safetensors header for *path*, or ``None``.
+
+    The identity is re-stat'ed here rather than trusted from memory, so a file
+    replaced or rewritten since the cache was hydrated is never served from it.
+    """
+    try:
+        from comfymodal_runtime import golden_metadata_cache, golden_model_transport
+
+        normalized = os.path.abspath(str(path))
+        identity = golden_model_transport._file_identity(normalized)
+        layout = golden_metadata_cache.cache().get(normalized, identity)
+        if layout is None:
+            return None
+        header = getattr(layout, "header", None)
+        return header if isinstance(header, dict) and header else None
+    except BaseException:
+        return None
 
 
 class _ClipSkeletonOverlap:

@@ -12798,6 +12798,16 @@ class ModalRuntimeEntrypoint:
         telemetry: dict[str, Any] = {
             "minimal_restore_start": time.monotonic_ns(),
         }
+        # ── Parsed model-metadata cache ─────────────────────────────────
+        # One file, hydrated here so a request that hits it performs no Volume
+        # data read at all. Strictly an accelerator: a missing, corrupt or
+        # stale cache leaves every caller on the original parser.
+        try:
+            from .golden_metadata_cache import cache as _metadata_cache
+
+            telemetry["metadata_cache"] = _metadata_cache().hydrate()
+        except Exception as exc:
+            telemetry["metadata_cache"] = {"error": type(exc).__name__}
         if isinstance(_preserved_snapshot_proof, Mapping):
             telemetry["golden_snapshot_content_proof"] = dict(_preserved_snapshot_proof)
 
