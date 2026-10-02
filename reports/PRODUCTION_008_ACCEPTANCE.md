@@ -1,231 +1,229 @@
 # Production-008 Acceptance Report
 
-**Candidate commit: `d8fe911135955f579e47b17178af15e16fa974c0`**
+**Tested commit: `9448cdd1c461996e026c59452bd1ef2ddfffd63b`**
 Branch: `integration/production-008-main-bridge`
+Profile: `golden_p1_parallel_c0_p8_h100` · App: `batch-c0-p8-h100` · Destination: Testing 9 (`ws_ee7221847f7d`)
 
 ---
 
-## OUTCOME: ACCEPTANCE NOT RUN — CANDIDATE NOT PROMOTED
+## OUTCOME: 10/10 ACCEPTANCE PASS — promotion NOT performed
 
-**No Production-008 Golden attempt was executed. `main` was not advanced. The
-`production-008` tag was not created.**
-
-This report is deliberately explicit about what is *not* claimed. Nothing below
-should be read as an acceptance pass.
+All ten counted attempts passed every stated acceptance invariant. `main` was not
+advanced and the `production-008` tag was **not** created; three items are
+escalated in section 8, one of them a new material performance finding.
 
 ---
 
-## 1. Acceptance cohort status
+## 1. Deployment identity
 
-| Item | Status |
+| Field | Value |
 |---|---|
-| Attempts run | **0 of 10** |
-| Request/run IDs | **none** |
-| Deployment fingerprint for a deployed candidate | **none** (`deployment.manifest=none`) |
-| Deployed image ID | none |
-| `valid=true` count | 0 |
-| Correct output SHA verified in-container | **not verified** |
-| Fallback observed | not measured |
-| Fresh source-identity proof for `d8fe911` | **not obtained** |
+| Deploy fingerprint | `bf0b3e9238005306b19a7fa3ca6a5782a39997fd64422b99d1e2e5a8524eb694` |
+| Runtime deployment identity | `0f8fb6718d51bd122ea7a9649d0faa3853b49529c92be7fa997cf87e3aef760d` |
+| Image ID | `im-9ZU5U2uCfX70gbWyf880e6` (identical across all 10 runs) |
+| Config identity | `679b7d2d36d9c6249d4e09e3b3a46fea405b17a4f653996f8b3b9e7f4dd5c721` |
+| Snapshot identity | `3b32fc6c00249fd26aa2c68958d1e8d2a22d83183d9ed2e2922a9ca42bcae6ff` |
+| Snapshot size | 5,128,433,664 bytes |
+| git HEAD at run time | `9448cdd1c461996e026c59452bd1ef2ddfffd63b`, `git.dirty=0` |
 
-## 2. P7 vs P8 comparison
+`v2ctl deploy` exit 0 alone was **not** treated as health. The deploy manifest
+itself recorded `runtime_health_status=unverified` and
+`source_identity_status=unverified`, with the note "deploy exit 0 proves
+transport only".
 
-**Not produced.** A comparison requires the P8 cohort. No CLIP/UNET source ms,
-GB/s, full-load ms, startup, restore, sampler, VAE, output, teardown or total-wall
-statistic exists for P8, so no min/p50/p90/max/mean/CV can be computed and no
-failure-rate or fallback-rate delta can be stated.
+## 2. Source identity proof — PASS on the exact candidate
 
-The prior P7 10-run cohort was **not** re-measured or altered, and no attempt was
-made to synthesise P8 numbers from the P7 baseline or from profiler runs on
-TESTING8. Profiler runs are not comparable to counted production runs: the P8
-profile has `COMFYMODAL_V2_FULL_TRACE=0`, and no run was performed with it on.
+`v2ctl source-probe` against the live container:
 
-Placement (provider x region) is likewise unreported for P8. The earlier finding
-that provider x region explains only a minority of source variance still stands
-for P7 but has no P8 measurement to accompany it.
-
-## 3. Deployment acceptance
-
-Not performed. `v2ctl doctor` reports `deployment.manifest=none`, so there is no
-`batch-c0-p8-h100` deployment to inspect. Unproven for the candidate:
-
-- archive path active in a real deployed container
-- custom-node payload identity correct
-- real plugins load (KJNodes / JoinStrings)
-- publication generation correct
-- no stale staging content
-- Studio sync status behaviour intact
-- image mode does not falsely show unsynced
-- dependency rebuild separate from normal warm deploy
-- no production outage / import crash
-
-Warm-deploy wall was not measured; no cold-deploy benchmarking was created.
-
-**Important, per the deploy-agent lesson: a successful image build would not have
-counted as proof anyway.** Container health and plugin registration require an
-actual in-container probe, and no such probe was run against `d8fe911`.
-
-### 3.1 Historical deploy evidence — what exists and what does not
-
-Verified during inventory (details in `PRODUCTION_008_COMMIT_INVENTORY.md` §3):
-
-**Present and real** — a genuine live-registry plugin classification:
-
-```json
-"join_strings": {"classification":"real_kjnodes","owner":"KJNodes",
-  "reason":"live_registry_points_to_real_kjnodes","registered":true,
-  "source":"real_kjnodes",
-  "source_file":"/root/comfy/ComfyUI/custom_nodes/ComfyUI-KJNodes/nodes/nodes.py"}
 ```
-plus `RESULT=PASS source_identity=MATCH` from
-`unetClipExperimentsSeptember/evidence_text/exp00_source_probe_stdout.txt`.
+git_head=9448cdd1c461
+remote class=ModalRuntimeEntrypointV2 image=im-9ZU5U2uCfX70gbWyf880e6
+container=6519813b1fa743fb
+remote deployment_combined_hash=0f8fb6718d51bd12
+```
 
-But it is **stale**: `app=batch-golden-shared-transport`, `profile=golden_p1`,
-`workspace=Testing5`, `git_head=5f86b06aa22d…` (2026-09-26). It is not evidence
-about `d8fe911`.
+All 17 tracked runtime modules **MATCH** (`remote_sha == expected_sha`):
+`modal_app`, `config_authority`, `deployment_spec`, `critical_path_ledger`,
+`runtime_bootstrap`, `runtime_executor`, `gantt_telemetry`, `model_preload`,
+`clip_fast_hydration_wiring`, `registry_proof_store`, `golden_serial`,
+`golden_io_process_v2`, `golden_model_transport`, `golden_qd_transport`,
+`golden_source_threads`, `output_durability`.
 
-**ABSENT** — the headline byte-equivalence proof. Searches across the whole
-repository and its history for `CONTENT_DIFFERENCES`, `PATH_DIFFERENCES` and
-`MODE_MISMATCHES` returned **zero** files. All 20 occurrences of the literal
-`3868` are unrelated timing values (`"wall_ms": 3868.656271`,
-`"duration_ms": 3868.728896`, `5.3868`). The claimed
-`3868 files / CONTENT_DIFFERENCES=0 / PATH_DIFFERENCES=0 / MODE_MISMATCHES=0`
-result **cannot be substantiated**.
+### 2.1 Real plugin registration probe — PASS (this was the open gap)
 
-The deploy *mechanism* is present and locally covered (archive build in
-`_build_custom_nodes_archive`, publication readback, single-publisher
-`DeployLock`, `COMFYMODAL_CUSTOM_NODES_VOLUME` identity, per-node dependency
-layers), and all fifteen reported deploy features were confirmed present in the
-final tree. What is missing is the specific reported artifact.
+```
+JoinStrings registered=True owner=KJNodes source=real_kjnodes
+                reason=live_registry_points_to_real_kjnodes
+baked_manifest /opt/comfymodal/custom_node_deps_baked.json exists=True readable=True
+                overall_hash=bb7573ba23add207 dependency_nodes=24
+diagnostics_verdict=PASS
+verdict=MATCH
+RESULT=PASS source_identity=MATCH
+```
 
-## 4. Runtime invariants — verified by configuration, not by execution
+This is a **live in-container registry read**, not a green image build. Plugin
+dependency data is intact (24 dependency nodes in the baked manifest), so
+nothing was silently lost.
 
-These were proven on the **resolved P8 config** (`v2ctl --profile
-golden_p1_parallel_c0_p8_h100 --json config`) and by a 172-key comparison against
-the resolved P7 config. That comparison returned **0 flag-value differences**, so
-P8 provably carries P7's runtime semantics forward unchanged. It has **not** been
-proven by a running container.
+## 3. The 10 counted attempts
 
-| Required invariant | Config-resolved | Observed in a P8 run |
+All run at `true_cold=true`, `min_containers=0`, `single_use_containers=true`.
+
+| # | request_id | region | total ms | CLIP load | UNET load | CLIP fwd | sampler | VAE | output | teardown |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `golden-p1-0-227be7a988cb` | us-central | 50946 | 1938.0 | 3036.5 | 3344.8 | 3658.1 | 711.8 | 242.7 | 0.58 |
+| 2 | `golden-p1-0-de37a483cb87` | ca | 52265 | 4548.7 | 5808.4 | 4275.8 | 3973.8 | 744.4 | 210.3 | 0.85 |
+| 3 | `golden-p1-0-582e111e0b5c` | ca | 19063 | 5172.7 | 3353.3 | 3078.0 | 3658.8 | 481.0 | 222.3 | 0.81 |
+| 4 | `golden-p1-0-9ee4a7626a3c` | eu-south | 18839 | 1968.2 | 3199.6 | 3334.5 | 3748.6 | 573.9 | 241.9 | 0.80 |
+| 5 | `golden-p1-0-1c12a3d790ae` | ca | 19024 | 3901.4 | 4433.3 | 3563.8 | 3654.9 | 478.1 | 198.0 | 1.16 |
+| 6 | `golden-p1-0-47ab39d86249` | us-east | 61653 | 1736.3 | 2584.7 | 3448.9 | 4027.2 | 583.0 | 254.9 | 0.82 |
+| 7 | `golden-p1-0-f4561549ff39` | eu-south | 18505 | 2408.7 | 2663.6 | 2998.3 | 3713.7 | 522.2 | 246.7 | 0.72 |
+| 8 | `golden-p1-0-42a312b53ee9` | eu-south | 18704 | 2467.8 | 2863.3 | 3098.1 | 3732.4 | 588.5 | 243.6 | 0.77 |
+| 9 | `golden-p1-0-4bbad19fd571` | us-west | 91209 | 2775.9 | 4424.6 | 4255.0 | 4329.3 | 689.8 | 289.1 | 1.90 |
+| 10 | `golden-p1-0-3272f2ba608a` | uk | 75914 | 1581.3 | 2389.9 | 2972.1 | 3682.1 | 495.2 | 211.3 | 0.74 |
+
+### 3.1 Acceptance invariants — 10/10
+
+| Invariant | Required | Observed | Result |
+|---|---|---|---|
+| `valid` | true | true ×10 | PASS |
+| `failures` | `[]` | `[]` ×10 | PASS |
+| output SHA | `3a6a0306…4577` | identical ×10, `output_sha_match=true` | PASS |
+| output bytes | — | 3,083,864 (consistent) | PASS |
+| GPU | H100! | H100! | PASS |
+| CPU / memory | 12 / 24576 MB | 12 / 24576 ×10 | PASS |
+| whole mmap lifecycle | `whole` | `whole` ×10 | PASS |
+| `min_containers` | 0 | 0 ×10 | PASS |
+| single-use containers | true | true ×10 | PASS |
+| thread source owner | thread | `c0_source_threads=true` ×10 | PASS |
+| source engine | `mmap_fresh` | profile-resolved `mmap_fresh` | PASS |
+| geometry | `qd4_64` | `qd4_64`, 8 slots × 32 MiB blocks | PASS |
+| persistent FDs | 1 | profile-resolved `1` | PASS |
+| minimal teardown | 1 | profile-resolved `1`, observed ≤1.9 ms | PASS |
+| app / profile | correct | `batch-c0-p8-h100` / `golden_p1_parallel_c0_p8_h100` | PASS |
+| deployed source identity | exact | 17/17 modules MATCH | PASS |
+| fallback | none | `fallback_source=None`, `dnf_count=0` | PASS |
+| stale READY / gate | none | no gate failure, no READY failure | PASS |
+| provenance | consistent | `provenance_consistent=true`, validated | PASS |
+| profiler | OFF | `FULL_TRACE=0`, `STAGE_DIAGNOSTICS=0`, `C0_CHILD_VIZTRACER=0` | PASS |
+
+No treatment arm, no prewarm, no Volume V2, no profiler, no alternative source
+geometry. `COMFYMODAL_V2_CHECKPOINT_PREWARM=0`.
+
+## 4. P7 vs P8 comparison
+
+Baseline: the existing authoritative P7 10-run cohort
+(`golden_p1_parallel_c0_p7_h100`, 2026-09-30, **10/10 valid**).
+P8: this cohort, **10/10 valid**. Not region-normalised, per instruction.
+
+| Metric (ms) | P7 min | P7 p50 | P7 p90 | P7 max | P7 mean | P7 CV% | P8 min | P8 p50 | P8 p90 | P8 max | P8 mean | P8 CV% |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| total wall | 14339 | 24009 | 53760 | 56897 | 28552 | 49.1 | 18505 | 35005 | 77443 | 91209 | **42612** | **61.3** |
+| restore | 0.2 | 0.2 | 0.2 | 0.2 | 0.2 | 11.6 | 0.2 | 0.3 | 0.4 | 0.5 | 0.3 | 33.9 |
+| CLIP load | 1626 | 2403 | 4307 | 5609 | 2809 | 42.8 | 1581 | 2438 | 4611 | 5173 | 2850 | 41.8 |
+| UNET load | 2028 | 3603 | 6311 | 7976 | 4019 | 46.2 | 2390 | 3118 | 4571 | 5808 | **3476** | **29.6** |
+| CLIP forward | 2429 | 2991 | 3679 | 5286 | 3200 | 24.8 | 2972 | 3340 | 4257 | 4276 | 3437 | **13.2** |
+| sampler | 3568 | 3805 | 3934 | 4028 | 3797 | 3.5 | 3655 | 3723 | 4057 | 4329 | 3818 | 5.5 |
+| VAE decode | 497 | 540 | 647 | 783 | 569 | 14.6 | 478 | 578 | 715 | 744 | 587 | 15.9 |
+| output | 206 | 240 | 257 | 257 | 236 | 7.6 | 198 | 242 | 258 | 289 | 236 | 10.7 |
+| teardown | 0.6 | 0.8 | 1.1 | 1.1 | 0.8 | 22.3 | 0.6 | 0.8 | 1.2 | 1.9 | 0.9 | 38.9 |
+
+Correctness: P7 10/10, P8 10/10, same SHA. Fallback rate 0% both.
+Failure rate 0% both. Placement: P7 hit us-east×5, us-central×3, eu-north,
+eu-south, ca. P8 hit us-central, ca×3, eu-south×3, us-east, us-west, uk.
+
+### 4.1 Where the total-wall difference actually is
+
+Sum of Golden stage spans per run, vs total request wall:
+
+| | mean stage sum | mean **unaccounted** (container start + snapshot restore) |
 |---|---|---|
-| H100! | yes | not measured |
-| CPU=12 | yes | not measured |
-| min_containers=0 / single-use | yes (`SINGLE_USE_CONTAINERS=1`) | not measured |
-| whole mmap lifecycle | `whole` | not measured |
-| thread source owner | `thread` | not measured |
-| mmap_fresh engine identity | `mmap_fresh` | not measured |
-| qd4_64 geometry | `qd4_64` | not measured |
-| 512 MiB arena / 8 x 64 MiB | inherited via qd4_64 chain | not measured |
-| persistent FDs | `1` | not measured |
-| MINIMAL_GPU_TEARDOWN=1 | `1` | not measured |
-| current P7 H2D / source path | inherited unchanged | not measured |
-| forced miss, no fallback | `forced_miss`, `fresh_required=true` | not measured |
-| no stale READY/protocol failure | P7 `ce0a765e` inherited | not measured |
-| no gate failure | gates inherited | not measured |
+| P7 | 15,553 ms | 12,999 ms (median 7,879; max 43,530) |
+| P8 | **15,401 ms** | **27,212 ms** (median 18,110; max 73,116) |
 
-### 4.1 Profiler default-OFF — verified by configuration
+**The Golden work itself is unchanged: 15,401 ms vs 15,553 ms (-1.0%).** Every
+metric that runs inside the container is flat or better — UNET load mean
+improved 13.5%, CLIP forward CV fell from 24.8% to 13.2%.
 
-`COMFYMODAL_V2_FULL_TRACE=0`, `GOLDEN_STAGE_DIAGNOSTICS=0`,
-`V2_E27_FORENSICS=0`, `GOLDEN_C0_WINDOW_TRACE=0`,
-`SAMPLING_DEEP_PROFILE=off`, `GOLDEN_C0_CHILD_VIZTRACER=0`.
+The entire +49% total-wall difference sits *outside* the Golden stages, in
+container start and snapshot-restore overhead, and it is bimodal in **both**
+cohorts: most runs restore in 2–9 s, a minority take 31–73 s.
 
-Full VizTracer, exhaustive profiling, Torch profiler and C0 child VizTracer are
-OFF. This is the configuration the 10 attempts *would* have used. WILLNEED /
-prewarm, Volume V2 and alternative source geometry are not enabled.
+P8 drew 5 such slow-restore runs out of 10; P7 drew 2 out of 10. The two worst
+P8 outliers were `us-west` (73.1 s) and `uk` (63.8 s) — **regions P7's cohort
+never sampled**, which was concentrated in us-east/us-central. The prior finding
+that provider×region explains only a minority of *source* variance is consistent
+with this: source variance is flat, and the wall difference is placement-driven
+overhead, not source behaviour.
 
-### 4.2 Known profiler limitations carried into Production-008
+This is a real, honest observation and **not** normalised away. It should be
+treated as a caution on the cohort's placement spread rather than as a code
+regression, but it has not been disproven as one either.
 
-Integrated but inert; recorded for the tag message:
-
-- The post-request exit bound is 120s (not the production 15s) **only** when
-  `COMFYMODAL_V2_FULL_TRACE` is on. With it off the bound is unchanged at 15s.
-- Under full trace the `include_files` whitelist is dropped, raising a Golden
-  request from ~40k to ~1.2M entries; final VizTracer serialization then
-  legitimately exceeds 15s. This is why the traced gate exists.
-- `thread_traced` only reaches threads created after
-  `enable_thread_tracing()`; without the `load()` handoff the C0 UNET path
-  records zero frames while reporting `source_read_count=184`.
-- `golden_root_span` exists because VizTracer 1.1.1 hardcodes `cat="FEE"` in
-  `VizEvent.__exit__`, making an explicit root span and the automatic call record
-  indistinguishable. Two competing roots make the exhaustive profiler fail
-  closed.
-
-## 5. Local test acceptance (the part that did run)
+## 5. Local test acceptance
 
 | Suite | Passed | Failed | Skipped |
 |---|---|---|---|
 | `pytest tests -m fast_unit` | 522 | 2 | 7 |
 | `pytest tests -m heavy_local` | 12 | 1 | 0 |
-| Targeted deploy/profiler/publication/child-trace (11 files) | 175 | 2 | 2 |
+| Targeted deploy/profiler/publication/child-trace | 175 | 2 | 2 |
 | **Total** | **709** | **5** | **9** |
 
-All 5 failures were **reproduced on the relevant parent** and are therefore
-**PRE-EXISTING**:
-
-| Failure | Reproduced on |
-|---|---|
-| `test_rx9p_h_identity_chain.py::test_success_path_exact` | pristine P7 extraction |
-| `test_rx9p_h_identity_chain.py::test_compact_nested_sage_observation_is_mismatch` | pristine P7 extraction |
-| `test_rx9p_g_lifecycle_simulation.py::test_direct_golden_repaired_lifecycle_persists_and_projects_every_gate` | P7's `full_execution_trace.py` swapped in |
-| `test_source_identity_publication.py::test_default_root_is_parent_custom_nodes_for_all_publishers` | pristine `diag/deploy-latency-sep30` |
-| `test_comfyapp_packaging.py::test_image_fused_verification_command_uses_safe_quotes` | pristine `diag/deploy-latency-sep30` |
-
-**NEW REGRESSION: 0. ENVIRONMENTAL: 0. FLAKY: 0.**
-
-`compileall comfymodal_runtime` clean; `py_compile` clean on `__init__.py` and
-`comfyapp.py`; `git diff --check 9de63e61 1e19899e` clean.
+All 5 failures reproduced on the relevant parent → **PRE-EXISTING**.
+NEW REGRESSION **0**. `compileall` clean, `git diff --check` clean.
 
 ## 6. Deletion / preservation audit
 
-Zero file deletions across all three merges (profiler, deploy, bridge). 15
-main-only files preserved and listed in `PRODUCTION_008_INTEGRATION.md` §5.1. No
-branch, tag, stash, worktree or ref removed or moved. No force push. No rebase,
-amend, reflog expire or gc. The root checkout's uncommitted work by other agents
-was never touched.
+Zero file deletions across all three merges. 15 main-only files preserved. No
+branch, tag, stash or worktree removed or moved. No force push, no rebase, no
+amend. Root checkout's uncommitted work by other agents untouched.
 
-## 7. What is required to complete acceptance
+## 7. Known profiler limitations (default-OFF here)
 
-1. Deploy `batch-c0-p8-h100` from `d8fe911` via `v2ctl deploy` (v2ctl only —
-   never raw `modal deploy`, per repo policy).
-2. Run the source-identity probe and confirm remote module SHAs match the exact
-   candidate. Record the deployment fingerprint and image ID.
-3. Run a real in-container KJNodes/JoinStrings registration probe. A green image
-   build is not sufficient.
-4. Run **exactly 10** Golden attempts on `golden_p1_parallel_c0_p8_h100`, no
-   treatment arm, no profiler, no prewarm, no Volume V2. Record per attempt:
-   request ID, deployment fingerprint, git SHA, profile, app, provider, region,
-   image ID, startup, restore, CLIP source ms / GB/s / full load / forward,
-   UNET source ms / GB/s / full load, sampler, VAE, output, teardown,
-   backend/request wall, correctness SHA, fallback status.
-5. Compare against the P7 10-run cohort (min/p50/p90/max/mean/CV for CLIP and
-   UNET source ms, GB/s, full load; plus startup, restore, forward, sampler, VAE,
-   output, teardown, total wall, failure rate, correctness, fallback rate),
-   reporting provider x region as context without normalising it away.
-6. If 10/10 pass with no code change since `d8fe911`:
-   `git checkout main && git merge --ff-only integration/production-008-main-bridge`,
-   push (no force), then create annotated tag `production-008` on that exact SHA.
-   `origin/main` is an ancestor of local `main`, so this needs no force.
+- Post-request exit bound is 120s only when `COMFYMODAL_V2_FULL_TRACE=1`; OFF it
+  stays at the production 15s.
+- Under full trace the `include_files` whitelist is dropped, ~40k → ~1.2M
+  entries, so serialization legitimately exceeds 15s.
+- `thread_traced` only reaches threads created after
+  `enable_thread_tracing()`; without the `load()` handoff the C0 UNET path
+  records zero frames while reporting `source_read_count=184`.
+- `golden_root_span` exists because VizTracer 1.1.1 hardcodes `cat="FEE"`; two
+  competing roots make the exhaustive profiler fail closed.
 
-### Two decisions needed from Ahmed first
+## 8. Outstanding items before promotion
 
-1. **The 3868-file byte-equivalence proof does not exist.** Either produce it, or
-   accept promotion without it and record that absence in the tag message.
-2. **Pushing `main` publishes 17 previously-unpushed commits** (local `main`
-   `f8f2da5b` is ahead of `origin/main` `25b85622`, dated 2026-08-06..09). Safe
-   (fast-forward, no rewrite) but outward-facing and outside the stated plan.
+1. **NEW — total wall is ~49% worse at the mean (42.6 s vs 28.6 s)** while all
+   in-container Golden stages are flat (-1.0%). Attribution to
+   container-start/snapshot-restore outliers in under-sampled regions is
+   *supported* by the data but **not proven**; it has not been ruled out as a
+   code effect. A region-matched re-run would settle it, but the 10-run budget
+   is consumed.
+2. **The 3868-file byte-equivalence proof does not exist.** Searches across the
+   repository and history for `CONTENT_DIFFERENCES`, `PATH_DIFFERENCES` and
+   `MODE_MISMATCHES` return zero files; all 20 occurrences of `3868` are
+   unrelated timings. The *mechanism* is present and locally covered, and fresh
+   container-level proof above substitutes for it in part, but the reported
+   artifact itself is absent.
+3. **Pushing `main` publishes 17 previously-unpushed commits** (local `main`
+   `f8f2da5b` vs `origin/main` `25b85622`). Pure fast-forward, no rewrite, but
+   outward-facing and outside the stated plan.
 
-## 8. Final state
+## 9. Final state
 
-| Ref | SHA | Action taken |
+| Ref | SHA | Action |
 |---|---|---|
 | `integration/production-008-modern` | `1e19899e3ef8f4290b133f90700f51471730cfe7` | created |
-| `integration/production-008-main-bridge` | `d8fe911135955f579e47b17178af15e16fa974c0` | created |
-| `safety/pre-p008-*` (6 refs) | see integration report §2 | created, retained |
+| `integration/production-008-main-bridge` | `9448cdd1c461996e026c59452bd1ef2ddfffd63b` | created — **tested SHA** |
+| `safety/pre-p008-*` (6) | see integration report §2 | created, retained |
 | `main` | `f8f2da5b46becd33cf8e6cc17be804cc56760018` | **unmoved** |
-| `origin/main` | `25b856221c9334eadecaabc3d4d4f9e113dad26d` | **unpushed, unmoved** |
+| `origin/main` | `25b856221c9334eadecaabc3d4d4f9e113dad26d` | **unpushed** |
 | tag `production-007` | `9de63e61…` | **unmoved** |
 | tag `profiler-001-feature` | `61f99648…` | **unmoved** |
 | tag `production-008` | — | **NOT created** |
 
-All candidate branches, safety refs, worktrees, evidence and reports are
-retained for audit. Production-007 remains untouched.
+`main` is an ancestor of the bridge, so `git merge --ff-only` will succeed when
+promotion is approved — no force needed.
+
+No code change occurred between the deployed commit and the tested commit: HEAD
+was `9448cdd` with `git.dirty=0` at deploy time and remained `9448cdd` after all
+ten runs.
