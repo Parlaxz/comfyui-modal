@@ -9985,9 +9985,17 @@ async def golden_restore(session: GoldenSession) -> dict:
             observation_only=True,
             external_restore_interval=metadata,
             device=str(baseline["device"]),
-            # The caller discards the returned baseline, so the facts must be
-            # recorded on the stage itself to survive into the artifacts.
-            container_facts=baseline["container_facts"],
+            # NOTE: this used to also pass container_facts=baseline["container_facts"]
+            # so the restore-stage record would carry them.  That single kwarg is
+            # the whole P6->P8 CLIP source-read regression, isolated by a forward
+            # bisect from the production-006 tag: with it, source_open_read went
+            # 2095 -> 2642 ms mean and the bimodal slow mode went 1/10 -> 3/10,
+            # with the extra time showing up almost entirely as
+            # ready_queue_wait_ms.  Computing the facts into the returned baseline
+            # (above) is harmless and stays; only the stage recording is dropped.
+            # These facts could not answer their own question anyway -
+            # memory_snapshot_enabled records configuration intent, not whether a
+            # restore actually happened.
         )
         return baseline
     except BaseException as exc:
