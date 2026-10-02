@@ -224,40 +224,6 @@ class _OuterLifetime:
         )
 
 
-def inject_outer_marks_into_telemetry(telemetry_path: str, marks: list) -> bool:
-    """Persist outer-method lifetime marks into the Golden telemetry JSON.
-
-    Container stdout is not captured into run artifacts, so marks printed to the
-    log are unreadable after the fact.  The telemetry JSON *is* collected into
-    ``attempt_0.json``, which makes it the authoritative channel for measuring
-    the outer lifecycle against the inner Golden wall.
-    """
-    if not marks:
-        return False
-    try:
-        with open(telemetry_path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except Exception:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    ordered = [
-        {"mark": name, "t_ns": t_ns, "elapsed_ms": round(elapsed / 1e6, 3), "detail": detail}
-        for name, t_ns, elapsed, detail in marks
-    ]
-    payload["outer_lifetime"] = {
-        "marks": ordered,
-        "outer_wall_ms": round((ordered[-1]["elapsed_ms"] - ordered[0]["elapsed_ms"]), 3)
-        if len(ordered) > 1 else 0.0,
-    }
-    try:
-        with open(telemetry_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-    except Exception:
-        return False
-    return True
-
-
 async def golden_parallel_execute(
     request: GoldenRequest,
     *,

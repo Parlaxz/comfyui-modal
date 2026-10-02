@@ -23367,18 +23367,17 @@ class ModalRuntimeEntrypoint:
             outer.mark("post_yield_resume")
         outer.mark("remote_method_return")
         outer.report()
-        # Container stdout is not captured into run artifacts, so the marks must
-        # be persisted into the Golden telemetry JSON, which v2ctl does collect.
-        _telemetry_path = getattr(self, "_golden_telemetry_path", None)
-        if _telemetry_path:
-            _inject = __import__(
-                "comfymodal_runtime.golden_parallel",
-                fromlist=["inject_outer_marks_into_telemetry"],
-            ).inject_outer_marks_into_telemetry
-            outer.marks.insert(
-                0, ("golden_call_telemetry_path", time.monotonic_ns(), 0, "")
-            )
-            _inject(_telemetry_path, outer.marks)
+        # NOTE: a post-yield rewrite of the Golden telemetry JSON used to live
+        # here.  It re-read and re-wrote the whole document on the mounted
+        # volume after the terminal result was already yielded, but before this
+        # async generator returned - so Modal kept the invocation open and billed
+        # that read-modify-write into the reported wall time on every run
+        # (~+1.4 s, consistently).  It was also ineffective: v2ctl collects
+        # golden_telemetry from the yielded result, so an update written to the
+        # file after that yield cannot reach the artifact, and it truncated the
+        # recorder's atomically-replaced document without flush/fsync.  The same
+        # marks are already recorded through session.recorder.event(
+        # "golden_outer_marks") before telemetry persist, so nothing is lost.
 
     async def run_golden_serial_stream(
         self,
