@@ -12292,6 +12292,25 @@ class ModalRuntimeEntrypoint:
             except Exception:
                 pass
 
+        # ── Triton environment-key warm ─────────────────────────────────
+        # triton.runtime.cache.triton_key hashes the installed Triton software
+        # environment (every compiler/backend/language module plus the compiled
+        # libtriton). That is deployment state, not request state, and it cost
+        # 613.8 ms of self time on the request's first Triton compile. Warm it
+        # through Triton's own implementation; advisory and non-fatal.
+        if _golden_serial_active:
+            try:
+                from .golden_serial import warm_triton_key
+
+                _triton_warm = warm_triton_key()
+                _restore_timing["snapshot_triton_key_warm"] = {
+                    "warmed": bool(_triton_warm.get("warmed")),
+                    "key_length": len(str(_triton_warm.get("key") or "")),
+                    "reason": _triton_warm.get("reason"),
+                }
+            except Exception:
+                pass
+
         # ── Snapshot quiescence proof (fail closed) ───────────────────────
         # Golden must prove quiescence before capture, but this proof must be
         # read-only: stopping a cache worker or flushing it here changes the

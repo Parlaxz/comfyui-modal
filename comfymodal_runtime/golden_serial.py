@@ -986,6 +986,35 @@ def golden_input_types(class_def: Any) -> dict:
     return class_def.INPUT_TYPES()
 
 
+def warm_triton_key() -> dict[str, Any]:
+    """Populate Triton's own environment-key cache before the snapshot.
+
+    ``triton.runtime.cache.triton_key`` is ``@functools.lru_cache``-decorated and
+    hashes the installed Triton software environment: every module under
+    ``triton/compiler``, ``triton/backends`` and ``triton/language`` plus the
+    compiled ``libtriton`` backend. In the production-008 exhaustive profile that
+    was 613.8 ms of self time inside the request's first Triton compile
+    (``get_cache_key`` 645.6 ms), paid on every request.
+
+    This is software/deployment state, not request state, so it belongs before
+    the snapshot. The exact request-time function object is called: there is no
+    fake value and no patched constant, so the key still changes when Triton
+    changes, through Triton's own process/deployment lifecycle. No GPU-specific
+    compiled-kernel artifact is produced here.
+
+    Purely advisory: Triton being absent or failing must never affect a request.
+    """
+    record: dict[str, Any] = {"warmed": False}
+    try:
+        from triton.runtime.cache import triton_key
+
+        record["key"] = triton_key()
+        record["warmed"] = True
+    except Exception as exc:
+        record["reason"] = type(exc).__name__
+    return record
+
+
 def _require_attention_backend_invocation(backend: str, state: Mapping[str, Any]) -> None:
     """Fail closed when a non-baseline override was never observed in use."""
     if backend != "pytorch" and int(state.get("calls", 0)) == 0:
