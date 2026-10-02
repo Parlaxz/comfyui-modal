@@ -2759,6 +2759,35 @@ def cmd_golden_profile(args, repo_root: Path) -> int:
     advance("done")
     return 0
 
+def cmd_golden_deploy(args, repo_root: Path) -> int:
+    """``golden deploy``, optionally with the profiler's tracing flags.
+
+    ``--for-profiling`` exists so the two-command loop does not depend on the
+    caller reproducing three environment flags from documentation. Without it,
+    ``golden deploy`` followed by ``golden profile --skip-deploy`` produces a
+    perfectly clean run with no trace at all, because the tracing flags are only
+    otherwise applied by ``golden profile`` when it deploys itself.
+    """
+    if getattr(args, "for_profiling", False):
+        extra = []
+        for item in getattr(args, "set", None) or []:
+            extra += ["--set", str(item)]
+        already = {s.split("=", 1)[0] for s in extra if "=" in s}
+        for flag, value in GOLDEN_PROFILE_DEPLOY_FLAGS:
+            if flag not in already:
+                extra += ["--set", f"{flag}={value}"]
+        if extra != list(getattr(args, "set", None) or []):
+            args.set = [
+                s for pair in zip(extra[::2], extra[1::2]) for s in pair
+            ]
+            print(
+                "[v2ctl.golden.deploy] --for-profiling: tracing flags added: "
+                + ", ".join(f"{k}={v}" for k, v in GOLDEN_PROFILE_DEPLOY_FLAGS),
+                flush=True,
+            )
+    return cmd_deploy(args, repo_root)
+
+
 def cmd_golden(args, repo_root: Path) -> int:
     """Dispatch the public Golden namespace to the canonical handlers."""
     if args.golden_command not in {"doctor", "status", "deploy", "run", "publisher-bootstrap", "publish-custom-nodes", "profile"}:
@@ -2813,6 +2842,8 @@ def cmd_golden(args, repo_root: Path) -> int:
         return cmd_golden_status(args, repo_root)
     if args.golden_command == "profile":
         return cmd_golden_profile(args, repo_root)
+    if args.golden_command == "deploy":
+        return cmd_golden_deploy(args, repo_root)
     handlers = {
         "doctor": cmd_doctor,
         "deploy": cmd_deploy,
@@ -4778,6 +4809,15 @@ def build_parser() -> argparse.ArgumentParser:
             child.add_argument("--app", default=argparse.SUPPRESS, help="experimental Modal app name")
             child.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                                help="resolve and print, invoke nothing")
+            if name == "deploy":
+                child.add_argument(
+                    "--for-profiling",
+                    dest="for_profiling",
+                    action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="add the full-trace tracing flags, so a later "
+                    "`golden profile --skip-deploy` produces a trace",
+                )
             if name == "profile":
                 child.add_argument(
                     "--min-ms",
