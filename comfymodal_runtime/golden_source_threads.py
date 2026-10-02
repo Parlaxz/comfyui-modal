@@ -987,26 +987,37 @@ class SourceThreadProcess:
         self.telemetry["plan_range_count"] = len(planned)
         return dict(ack)
 
+    def _raise_if_failed(self, header: Sequence[int]) -> None:
+        """Fail closed on the shared failure counter. Caller holds the lock.
+
+        Reading the header is the only reason the health check needs the lock
+        at all, so every caller that already reads the header for another
+        reason checks the counter here instead of taking the lock again.
+        """
+        if header[10]:
+            detail = _read_error(self.control.buf)
+            raise SourceProtocolError(f"source_thread_failed:{detail or 'unknown'}")
+
     def _poll_child(self) -> None:
         """Fast child liveness for the blocking wait: ``poll()`` only.
 
-        Takes no shared lock.  Process liveness is the only thing a healthy
+        Takes no shared lock. Process liveness is the only thing a healthy
         blocking wait needs, and the shared failure counter is only
         *additional* information.
 
-        It is not the sole failure channel.  Every site that raises the counter
+        It is not the sole failure channel. Every site that raises the counter
         (``fail_control`` in the reader loops and in the supervisor's terminal
         block) is paired with an ``emit``-ed ``fatal`` message, after which the
         supervisor returns non-zero, so the parent observes the failure either
-        as a ``fatal`` operation on the pipe or as EOF.  The counter exists to
+        as a ``fatal`` operation on the pipe or as EOF. The counter exists to
         carry the error *detail* for the case where the message is lost, which
-        is why it is read where the detail matters and not on every iteration.
+        is why it is inspected whenever the header is read under the lock.
 
-        Calling the authoritative check on every iteration was redundant with
-        work already done under that lock -- doorbell-loss recovery, timeout
-        recovery and READY token resolution all read the header -- and could
-        stall the parent behind the very lock the source workers need in order
-        to claim slots and publish READY.
+        Calling the authoritative check on every wait iteration was redundant
+        with work already done under that lock -- READY token resolution,
+        doorbell-loss recovery and timeout recovery all read the header -- and
+        could stall the parent behind the very lock the source workers need in
+        order to claim slots and publish READY.
         """
         self.telemetry["health_poll_count"] = int(self.telemetry.get("health_poll_count", 0)) + 1
         if self._proc is not None and self._proc.poll() is not None:
@@ -1020,9 +1031,7 @@ class SourceThreadProcess:
         )
         with self._lock:
             header = _read_header(self.control.buf)
-        if header[10]:
-            detail = _read_error(self.control.buf)
-            raise SourceProtocolError(f"source_thread_failed:{detail or 'unknown'}")
+        self._raise_if_failed(header)
 
     def _resolve_ready_block(self, message: Mapping[str, Any]) -> ReadyRecord | None:
         """Turn one READY_BLOCK announcement into a verified exact token."""
@@ -1030,6 +1039,7 @@ class SourceThreadProcess:
         generation = int(message["generation"])
         with self._lock:
             header = _read_header(self.control.buf)
+            self._raise_if_failed(header)
             state, slot_generation, range_index, source, destination, length, ready_ns, producer_id = _slot(
                 self.control.buf, slot_index
             )
@@ -1091,6 +1101,7 @@ class SourceThreadProcess:
         """
         with self._lock:
             header = _read_header(self.control.buf)
+            self._raise_if_failed(header)
             plan_generation = int(header[5])
             if self._planned_generation != plan_generation:
                 return None
@@ -1118,11 +1129,6 @@ class SourceThreadProcess:
         """
         if self._pending_ready:
             return self._pending_ready.pop(0)
-        # One authoritative inspection before blocking, so a failure that has
-        # already happened is reported with its detail instead of as a wait
-        # timeout.  Inside the loop only liveness is polled; every path that
-        # acts on shared state already holds the lock for its own reasons.
-        self._check_child()
         deadline = time.monotonic() + timeout_s
         while True:
             self._poll_child()

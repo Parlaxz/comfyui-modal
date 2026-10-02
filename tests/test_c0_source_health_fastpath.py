@@ -112,11 +112,12 @@ def test_authoritative_check_still_takes_the_lock_exactly_once():
 
 
 def test_healthy_wait_ready_does_not_lock_between_iterations():
-    """wait_ready takes the lock once up front, then only via recovery.
+    """wait_ready's only lock acquisition is the READY token resolution.
 
     Three TELEMETRY messages force three loop iterations before the READY, so
-    this discriminates: the old code acquired the health-check lock on every
-    iteration (4 acquisitions here), the fast path takes 2 in total.
+    this discriminates: the pre-fix code acquired the health-check lock on
+    every iteration (4 acquisitions here); the fast path takes exactly 1, for
+    the READY token resolution that has to read the header anyway.
     """
     buf = _buffer()
     lock = _CountingLock()
@@ -141,8 +142,8 @@ def test_healthy_wait_ready_does_not_lock_between_iterations():
 
     assert record is not None
     assert len(messages) == 0  # all three telemetry messages were consumed
-    # Entry check + READY token resolution.  Not one acquisition per iteration.
-    assert lock.entered == before + 2
+    # Exactly one acquisition: the READY token resolution.  None per iteration.
+    assert lock.entered == before + 1
 
 
 # â”€â”€ child process exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -197,15 +198,41 @@ def test_shared_header_error_with_live_child_is_still_reported():
         manager._check_child()
 
 
-def test_wait_ready_entry_check_reports_a_failure_that_already_happened():
-    """A pre-existing failure is reported with detail, not as a timeout."""
+def test_shared_failure_is_reported_from_the_path_that_reads_the_header():
+    """Fail-closed detail survives without a dedicated lock acquisition.
+
+    ``header[10]`` is inspected wherever the header is already read under the
+    lock, so a failure raised before any doorbell arrives is still reported
+    with its error detail rather than as a wait timeout.
+    """
     buf = _buffer()
+    values = list(source._read_header(buf))
+    values[5] = 7
+    source._write_header_all(buf, values)
+    _publish_ready(buf)
+    _set_failure(buf, "late_failure")
+
     manager = _manager(buf, _CountingLock())
     manager._proc = _FakeProc(exit_code=None)  # type: ignore[assignment]
-    _set_failure(buf, "late_failure")
+    manager._read_message = lambda _t: {"op": "READY_BLOCK", "slot_index": 0, "generation": 7}  # type: ignore[method-assign]
 
     with pytest.raises(source.SourceProtocolError, match="source_thread_failed:late_failure"):
         manager.wait_ready(timeout_s=1.0)
+
+
+def test_shared_failure_is_reported_by_the_timeout_recovery_path():
+    buf = _buffer()
+    values = list(source._read_header(buf))
+    values[5] = 7
+    source._write_header_all(buf, values)
+    _set_failure(buf, "timeout_failure")
+
+    manager = _manager(buf, _CountingLock())
+    manager._proc = _FakeProc(exit_code=None)  # type: ignore[assignment]
+    manager._read_message = lambda _t: None  # type: ignore[method-assign]
+
+    with pytest.raises(source.SourceProtocolError, match="source_thread_failed:timeout_failure"):
+        manager.wait_ready(timeout_s=0.01)
 
 
 def test_timeout_path_performs_the_authoritative_check():
