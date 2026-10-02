@@ -329,7 +329,9 @@ def analyze(session_dir: Path) -> int:
     threads = profile.get("thread_coverage") or {}
     print(
         "THREAD_COVERAGE =", threads.get("status"),
-        "| lanes =", threads.get("lanes_traced") or threads.get("lanes"),
+        "| lanes =", threads.get("lanes_with_traced_calls"),
+        "/", threads.get("threads_total"),
+        "|", threads.get("reason"),
     )
     print("INCOMPLETE_CALLS =", profile.get("incomplete_calls"))
     print()

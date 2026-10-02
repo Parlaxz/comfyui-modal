@@ -2674,8 +2674,8 @@ def cmd_golden_profile(args, repo_root: Path) -> int:
             return rc
     else:
         print(
-            "[v2ctl.golden_profile] step 1 source-probe (skipping deploy; the "
-            "deployment must already carry the tracing flags)",
+            "[v2ctl.golden_profile] skipping deploy; the existing deployment "
+            "must already carry the tracing flags",
             flush=True,
         )
 
@@ -2786,6 +2786,13 @@ def cmd_golden(args, repo_root: Path) -> int:
         return identity_error
     public_run = args.golden_command in {"deploy", "run", "profile"}
     dry_run = bool(getattr(args, "dry_run", False))
+    if public_run and not dry_run and not getattr(args, "app", None):
+        # The profile declares its own target.app. Resolve it here rather than
+        # forcing the caller to know the experimental app name, which otherwise
+        # leads to a guessed app and a profile contract that was never intended.
+        resolved_app = _profile_app_name(repo_root, requested_profile)
+        if resolved_app:
+            args.app = resolved_app
     if public_run and not dry_run:
         if not getattr(args, "app", None):
             print(
