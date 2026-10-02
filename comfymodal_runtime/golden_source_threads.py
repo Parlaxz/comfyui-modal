@@ -987,9 +987,37 @@ class SourceThreadProcess:
         self.telemetry["plan_range_count"] = len(planned)
         return dict(ack)
 
+    def _poll_child(self) -> None:
+        """Fast child liveness for the blocking wait: ``poll()`` only.
+
+        Takes no shared lock.  Process liveness is the only thing a healthy
+        blocking wait needs, and the shared failure counter is only
+        *additional* information.
+
+        It is not the sole failure channel.  Every site that raises the counter
+        (``fail_control`` in the reader loops and in the supervisor's terminal
+        block) is paired with an ``emit``-ed ``fatal`` message, after which the
+        supervisor returns non-zero, so the parent observes the failure either
+        as a ``fatal`` operation on the pipe or as EOF.  The counter exists to
+        carry the error *detail* for the case where the message is lost, which
+        is why it is read where the detail matters and not on every iteration.
+
+        Calling the authoritative check on every iteration was redundant with
+        work already done under that lock -- doorbell-loss recovery, timeout
+        recovery and READY token resolution all read the header -- and could
+        stall the parent behind the very lock the source workers need in order
+        to claim slots and publish READY.
+        """
+        self.telemetry["health_poll_count"] = int(self.telemetry.get("health_poll_count", 0)) + 1
+        if self._proc is not None and self._proc.poll() is not None:
+            raise SourceProtocolError("source_process_exited")
+
     def _check_child(self) -> None:
         if self._proc is not None and self._proc.poll() is not None:
             raise SourceProtocolError("source_process_exited")
+        self.telemetry["health_authoritative_count"] = (
+            int(self.telemetry.get("health_authoritative_count", 0)) + 1
+        )
         with self._lock:
             header = _read_header(self.control.buf)
         if header[10]:
@@ -1090,9 +1118,14 @@ class SourceThreadProcess:
         """
         if self._pending_ready:
             return self._pending_ready.pop(0)
+        # One authoritative inspection before blocking, so a failure that has
+        # already happened is reported with its detail instead of as a wait
+        # timeout.  Inside the loop only liveness is polled; every path that
+        # acts on shared state already holds the lock for its own reasons.
+        self._check_child()
         deadline = time.monotonic() + timeout_s
         while True:
-            self._check_child()
+            self._poll_child()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 # The wait budget is spent, but the shared control block is the
@@ -1100,6 +1133,7 @@ class SourceThreadProcess:
                 # announcement was dropped or coalesced would otherwise be left
                 # owned by nobody in READY, so make one last authoritative
                 # attempt before reporting the wait as unsatisfied.
+                self._check_child()
                 return self._recover_ready_from_table()
             message = self._read_message(min(remaining, 0.25))
             if message is None:
