@@ -39,7 +39,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from .environment import EnvironmentBuilder
+from .environment import (
+    EnvironmentBuilder,
+    V2CTL_WORKSPACE_ID_ENV,
+    V2CTL_WORKSPACE_LABEL_ENV,
+)
 from .errors import BackendError, ProvenanceError
 from .provenance import read_provenance_sibling
 
@@ -585,10 +589,11 @@ class BackendRunner:
             if workspace_label is None and isinstance(frozen, Mapping):
                 workspace_label = frozen.get("workspace_label") or frozen.get("label")
             if workspace_id and workspace_label:
-                # The canonical BAT consumes these non-secret assertions; the
-                # Modal CLI itself does not use them as a selector.
-                child_env["MODAL_WORKSPACE_ID"] = str(workspace_id)
-                child_env["MODAL_WORKSPACE_LABEL"] = str(workspace_label)
+                # These repo-owned variables are provenance assertions for the
+                # canonical BAT, not Modal CLI selectors. Modal CLI workspace
+                # selection comes from MODAL_TOKEN_ID/MODAL_TOKEN_SECRET.
+                child_env[V2CTL_WORKSPACE_ID_ENV] = str(workspace_id)
+                child_env[V2CTL_WORKSPACE_LABEL_ENV] = str(workspace_label)
             environment = getattr(frozen, "environment", None)
             if environment is None and isinstance(frozen, Mapping):
                 environment = frozen.get("environment")

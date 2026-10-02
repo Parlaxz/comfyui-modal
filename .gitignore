@@ -12,6 +12,7 @@ __pycache__/
 # Generated benchmark output. This broad pattern also matches source paths whose
 # directory name contains "benchmark", so re-include the one skill directory
 # rather than anchoring the rule and losing nested output coverage.
+.comfymodal_first_party_sources/
 *benchmark*/
 !.opencode/skills/benchmark-modal/
 optimization_logs/

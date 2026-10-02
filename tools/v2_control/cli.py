@@ -1085,8 +1085,8 @@ def _apply_workspace_binding_to_env(env: dict[str, str], binding: WorkspaceBindi
             env.pop(name, None)
     env.update(binding.credentials)
     env[env_mod.V2CTL_DESTINATION_FROZEN_ENV] = "1"
-    env["MODAL_WORKSPACE_ID"] = binding.workspace_id
-    env["MODAL_WORKSPACE_LABEL"] = binding.label
+    env[env_mod.V2CTL_WORKSPACE_ID_ENV] = binding.workspace_id
+    env[env_mod.V2CTL_WORKSPACE_LABEL_ENV] = binding.label
     if binding.environment != DEFAULT_MODAL_ENVIRONMENT:
         env["MODAL_ENVIRONMENT"] = binding.environment
 
@@ -1099,8 +1099,8 @@ def _apply_workspace_binding_to_process(binding: WorkspaceBinding) -> None:
     os.environ.pop("COMFYMODAL_ENVIRONMENT", None)
     os.environ.pop("COMFYMODAL_V2_ENVIRONMENT", None)
     os.environ.update(binding.credentials)
-    os.environ["MODAL_WORKSPACE_ID"] = binding.workspace_id
-    os.environ["MODAL_WORKSPACE_LABEL"] = binding.label
+    os.environ[env_mod.V2CTL_WORKSPACE_ID_ENV] = binding.workspace_id
+    os.environ[env_mod.V2CTL_WORKSPACE_LABEL_ENV] = binding.label
     if binding.environment == DEFAULT_MODAL_ENVIRONMENT:
         os.environ.pop("MODAL_ENVIRONMENT", None)
         os.environ.pop("COMFYMODAL_ENVIRONMENT", None)

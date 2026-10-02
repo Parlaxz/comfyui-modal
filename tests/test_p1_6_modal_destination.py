@@ -194,16 +194,16 @@ def test_adversarial_testing3_environment_is_irrelevant(monkeypatch):
     assert "MODAL_ENVIRONMENT" not in captured
     assert "MODAL_CLIENT_ID" not in captured
     assert "MODAL_AUTH" not in captured
-    assert captured["MODAL_WORKSPACE_ID"] == "ws-six"
-    assert captured["MODAL_WORKSPACE_LABEL"] == "Testing 6"
+    assert captured["COMFYMODAL_V2CTL_WORKSPACE_ID"] == "ws-six"
+    assert captured["COMFYMODAL_V2CTL_WORKSPACE_LABEL"] == "Testing 6"
 
 
 def test_canonical_publisher_consumes_frozen_destination(monkeypatch):
     from tools import publish_custom_nodes_volume as publisher
 
     monkeypatch.setenv("COMFYMODAL_V2CTL_DESTINATION_FROZEN", "1")
-    monkeypatch.setenv("MODAL_WORKSPACE_ID", "ws-six")
-    monkeypatch.setenv("MODAL_WORKSPACE_LABEL", "Testing 6")
+    monkeypatch.setenv("COMFYMODAL_V2CTL_WORKSPACE_ID", "ws-six")
+    monkeypatch.setenv("COMFYMODAL_V2CTL_WORKSPACE_LABEL", "Testing 6")
     monkeypatch.setenv("MODAL_TOKEN_ID", "ak-six")
     monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-six")
     monkeypatch.setenv("MODAL_ENVIRONMENT", "(default)")
@@ -212,6 +212,34 @@ def test_canonical_publisher_consumes_frozen_destination(monkeypatch):
     assert destination["id"] == "ws-six"
     assert destination["label"] == "Testing 6"
     assert destination["token_id"] == "ak-six"
+
+
+def test_workspace_identity_is_not_exported_as_modal_cli_selector():
+    repo_root = Path(__file__).resolve().parents[1]
+    producer_sources = tuple(
+        (repo_root / path).read_text(encoding="utf-8")
+        for path in ("tools/v2_control/cli.py", "tools/v2_control/backend.py")
+    )
+    combined = "\n".join(producer_sources)
+
+    assert "MODAL_WORKSPACE_ID" not in combined
+    assert "MODAL_WORKSPACE_LABEL" not in combined
+    assert "MODAL_TOKEN_ID" in combined
+    assert "MODAL_TOKEN_SECRET" in combined
+    assert "MODAL_ENVIRONMENT" in combined
+
+
+def test_canonical_publisher_requires_new_workspace_assertions(monkeypatch):
+    from tools import publish_custom_nodes_volume as publisher
+
+    monkeypatch.setenv("COMFYMODAL_V2CTL_DESTINATION_FROZEN", "1")
+    monkeypatch.delenv("COMFYMODAL_V2CTL_WORKSPACE_ID", raising=False)
+    monkeypatch.delenv("COMFYMODAL_V2CTL_WORKSPACE_LABEL", raising=False)
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-six")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-six")
+
+    with pytest.raises(RuntimeError, match="frozen v2ctl destination is incomplete"):
+        publisher._load_active_workspace()
 
 
 def test_strict_receipt_without_destination_fails_closed(tmp_path):

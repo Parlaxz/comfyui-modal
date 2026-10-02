@@ -748,20 +748,20 @@ if not defined MODAL_TOKEN_SECRET (
     echo === ERROR: frozen MODAL_TOKEN_SECRET missing; refusing remote operation ===
     exit /b 1
 )
-if not defined MODAL_WORKSPACE_ID (
-    echo === ERROR: frozen MODAL_WORKSPACE_ID missing; refusing remote operation ===
+if not defined COMFYMODAL_V2CTL_WORKSPACE_ID (
+    echo === ERROR: frozen COMFYMODAL_V2CTL_WORKSPACE_ID missing; refusing remote operation ===
     exit /b 1
 )
-if not defined MODAL_WORKSPACE_LABEL (
-    echo === ERROR: frozen MODAL_WORKSPACE_LABEL missing; refusing remote operation ===
+if not defined COMFYMODAL_V2CTL_WORKSPACE_LABEL (
+    echo === ERROR: frozen COMFYMODAL_V2CTL_WORKSPACE_LABEL missing; refusing remote operation ===
     exit /b 1
 )
-echo === Frozen destination: !MODAL_WORKSPACE_LABEL! (!MODAL_WORKSPACE_ID!) ===
+echo === Frozen destination: !COMFYMODAL_V2CTL_WORKSPACE_LABEL! (!COMFYMODAL_V2CTL_WORKSPACE_ID!) ===
 
 REM -- Frozen destination guard -------------------------------------
 REM v2ctl verified the configured workspace and label against the
 REM shared registry; this BAT consumes that immutable selection only.
-if not defined MODAL_WORKSPACE_LABEL (
+if not defined COMFYMODAL_V2CTL_WORKSPACE_LABEL (
     echo === ERROR: frozen workspace label missing; refusing to deploy ===
     exit /b 1
 )

@@ -32,14 +32,14 @@ set "IDX=0"
 for /f "usebackq delims=" %%a in (`python -c "import json,sys;d=json.load(open('.modal_workspaces.json'));aid=d.get('active_workspace_id');ws=next((w for w in d.get('workspaces',[]) if w.get('id')==aid),None);tid=ws and ws.get('token_id') or '';ts=ws and ws.get('token_secret') or '';label=ws and ws.get('label','') or '';sys.exit(1) if not(aid and ws and tid and ts) else None;print(tid);print(ts);print(label)"`) do (
     if !IDX! equ 0 set "MODAL_TOKEN_ID=%%a"
     if !IDX! equ 1 set "MODAL_TOKEN_SECRET=%%a"
-    if !IDX! equ 2 set "MODAL_WORKSPACE_LABEL=%%a"
+    if !IDX! equ 2 set "COMFYMODAL_V2CTL_WORKSPACE_LABEL=%%a"
     set /a IDX+=1
 )
 if !IDX! lss 3 (
     echo === ERROR: Could not load active workspace credentials from .modal_workspaces.json ===
     exit /b 1
 )
-echo === Active workspace: !MODAL_WORKSPACE_LABEL! ===
+echo === Active workspace: !COMFYMODAL_V2CTL_WORKSPACE_LABEL! ===
 
 :: Derive warmup profile from benchmark workflow
 echo === Extracting warmup profile ===

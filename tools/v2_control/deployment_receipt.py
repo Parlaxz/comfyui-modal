@@ -370,7 +370,6 @@ def latest_deployment_receipt(
     if not directory.is_dir():
         return None
     matches: list[tuple[Path, DeploymentReceipt]] = []
-    all_receipts: list[tuple[Path, DeploymentReceipt]] = []
     for path in sorted(directory.glob(f"{RECEIPT_PREFIX}*.json"), reverse=True):
         # Older receipts from another app may predate the immutable digest
         # field.  When the caller has already identified the profile/target,
@@ -409,7 +408,6 @@ def latest_deployment_receipt(
             # Never silently fall back from a corrupt authority to an older
             # deployment.  Callers can report the concrete path.
             raise
-        all_receipts.append((path, receipt))
         if profile is not None and receipt.profile != profile:
             continue
         if target is not None and any(receipt.target.get(k) != str(v) for k, v in target.items()):
@@ -417,8 +415,10 @@ def latest_deployment_receipt(
         matches.append((path, receipt))
     if not matches:
         return None
+    # Only receipts that survived the requested profile/destination filters can
+    # make this lookup ambiguous; unrelated apps are not competing authorities.
     by_app_version: dict[tuple[str, int], list[tuple[Path, DeploymentReceipt]]] = {}
-    for item in all_receipts:
+    for item in matches:
         key = (item[1].target.get("app", ""), item[1].deployment_version)
         by_app_version.setdefault(key, []).append(item)
     for (app, version), items in by_app_version.items():

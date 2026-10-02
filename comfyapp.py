@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -431,6 +432,10 @@ CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined"
 if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_COPY_MODE={CUSTOM_NODE_COPY_MODE!r}, falling back to 'combined'")
     CUSTOM_NODE_COPY_MODE = "combined"
+CUSTOM_NODE_DELIVERY = os.getenv("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_DELIVERY={CUSTOM_NODE_DELIVERY!r}, falling back to 'image'")
+    CUSTOM_NODE_DELIVERY = "image"
 
 # Generic collector for custom-node import/entrypoint failures during startup.
 # Populated by the logging.warning patch in _start_in_process_backend.
@@ -3796,6 +3801,92 @@ def _safe_listdir(path: str) -> list[str]:
     return sorted(os.listdir(path))
 
 
+def decide_custom_node_volume_gate(
+    *,
+    volume_entries: list[str] | None,
+    importable_node_count: int | None,
+    generation_record: dict | None,
+    expected_generation: str,
+) -> dict:
+    """Decide whether a Volume-backed custom-node tree may be imported.
+
+    This is deliberately pure so the startup contract can be tested without a
+    Modal container.  The caller supplies the directory and record reads; any
+    missing or unreadable input is represented by ``None`` and fails closed.
+    """
+    reasons: list[str] = []
+    if volume_entries is None:
+        reasons.append("volume_directory_missing_or_unreadable")
+    elif not volume_entries:
+        reasons.append("volume_directory_empty")
+    if not isinstance(importable_node_count, int) or importable_node_count < 1:
+        reasons.append("no_importable_custom_node_init_py")
+
+    actual_generation = ""
+    if not isinstance(generation_record, dict):
+        reasons.append("generation_record_missing_or_unreadable")
+    else:
+        actual_generation = str(generation_record.get("content_generation", "") or "").strip()
+        if not actual_generation:
+            reasons.append("generation_record_missing_or_unreadable")
+    expected_generation = str(expected_generation or "").strip()
+    if not expected_generation:
+        reasons.append("deployment_expected_generation_missing")
+    elif actual_generation and actual_generation != expected_generation:
+        reasons.append("generation_mismatch")
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "volume_entries": len(volume_entries) if volume_entries is not None else None,
+        "importable_node_count": importable_node_count,
+        "actual_generation": actual_generation,
+        "expected_generation": expected_generation,
+    }
+
+
+def verify_custom_node_volume_gate(
+    volume_root: str,
+    generation_record_path: str,
+    expected_generation: str,
+) -> dict:
+    """Read the mounted Volume inputs and return the fail-closed gate result."""
+    try:
+        volume_entries = sorted(os.listdir(volume_root)) if os.path.isdir(volume_root) else None
+    except OSError:
+        volume_entries = None
+    importable_node_count = 0
+    if volume_entries is not None:
+        for name in volume_entries:
+            node_root = os.path.join(volume_root, name)
+            if os.path.isdir(node_root) and os.path.isfile(os.path.join(node_root, "__init__.py")):
+                importable_node_count += 1
+    try:
+        with open(generation_record_path, "r", encoding="utf-8") as record_file:
+            generation_record = json.load(record_file)
+    except (OSError, TypeError, ValueError):
+        generation_record = None
+    if isinstance(generation_record, dict):
+        content_generation = generation_record.get("content_generation")
+        if (
+            generation_record.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION
+            or not isinstance(content_generation, str)
+            or not content_generation.strip()
+            or content_generation != content_generation.strip()
+            or (
+                "generation" in generation_record
+                and generation_record["generation"] != content_generation
+            )
+        ):
+            generation_record = None
+    return decide_custom_node_volume_gate(
+        volume_entries=volume_entries,
+        importable_node_count=importable_node_count,
+        generation_record=generation_record,
+        expected_generation=expected_generation,
+    )
+
+
 # Shared hash-input policy.  Keep this compatibility alias because diagnostics
 # and older callers expose the name, but do not maintain a second filter here.
 _CUSTOM_NODE_GENERATED_DIRS = _publication_policy.EXCLUDED_DIR_NAMES
@@ -3928,6 +4019,23 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
             req_file = os.path.join(path, "requirements.txt")
             req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
             state.append((name, stat.st_mtime_ns, req_mtime_ns))
+
+    if os.path.realpath(volume_root) == os.path.realpath(comfy_custom_nodes_root):
+        # Volume delivery exposes the Volume itself at ComfyUI's discovery
+        # root.  Do not turn its real package directories into self-links.
+        result = {
+            "created": [],
+            "removed": [],
+            "kept": sorted(volume_dirs),
+            "blocked": [],
+        }
+        if include_state:
+            result["state"] = tuple(state)
+        print(
+            "[comfyapp] sync_custom_nodes_into_comfy: direct Volume root; "
+            f"nodes={len(volume_dirs)}"
+        )
+        return result
 
     removed = []
     created = []
@@ -7430,7 +7538,7 @@ _V2_DEPENDENCY_CACHE_IDENTITY_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     _V2_DEPENDENCY_CACHE_IDENTITY_FILENAME,
 )
-_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-loop-v2"
+_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-per-node-v3"
 _V2_DEPENDENCY_BASE_INPUTS = {
     "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
     "python": "3.11",
@@ -7846,9 +7954,14 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
 
     # Task 8: Verify actual build order
     _node_names = _iter_syncable_custom_node_dirs(source_root)
+    print(f"[comfyapp] custom_node_delivery={CUSTOM_NODE_DELIVERY}")
     print(f"[comfyapp] custom_node_copy_mode={CUSTOM_NODE_COPY_MODE}")
     print(f"[comfyapp] syncable_custom_nodes={len(_node_names)}")
-    _combined_layers = 1 if CUSTOM_NODE_COPY_MODE == "combined" else len(_node_names)
+    _combined_layers = (
+        0 if CUSTOM_NODE_DELIVERY == "volume"
+        else 1 if CUSTOM_NODE_COPY_MODE == "combined"
+        else len(_node_names)
+    )
     print(f"[comfyapp] source_copy_layers={_combined_layers}")
     print(f"[comfyapp] local_custom_node_root={source_root}")
     combined_excluded_ok = (
@@ -7869,9 +7982,23 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"  9. install/verify comfy-kitchen==0.2.31")
     print(f"  10. install/verify fastsafetensors and SageAttention")
     print(f"  11. apply late runtime env vars")
-    print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print("  12. mount publisher custom-node Volume at ComfyUI import path")
+    else:
+        print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
     print(f"  13. generate/add baked dependency manifest")
-    print(f"  14. add helper Python sources")
+    print(
+        f"  14. golden GPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  15. publisher first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  16. download CPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
     print(f"[comfyapp] ===========================================")
 
     _save_last_context_manifest(current)
@@ -8235,50 +8362,523 @@ _V2_RUNTIME_ENV = build_v2_late_config(
     runtime_revision=_V2_RUNTIME_REVISION,
 )
 
-# Combined requirements layer: one COPY + one pip loop (single cache unit).
-# When no requirements.txt changes, the layer is cached (~5s deploy).
-# Changed requirements cause all pip installs to re-run within this layer.
+
+_GPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "optimizations",
+    "worker_control",
+)
+
+_CPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "worker_control",
+)
+
+_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
+    _GPU_COMFYMODAL_PYTHON_SOURCES + (
+        "canonical_execution", "modal_client", "run_prompt_options",
+        "warmup_profile", "workflow_metadata", "model_manifest",
+    )
+))
+
+_FIRST_PARTY_SOURCE_STAGING_DIR = os.path.join(
+    _COMFYUI_MODAL_DIR, ".comfymodal_first_party_sources"
+)
+
+
+def _first_party_source_file_map() -> dict[str, Path]:
+    """Return the exact source tree mounted into each runtime image."""
+    source_root = Path(_COMFYUI_MODAL_DIR)
+    files: dict[str, Path] = {"comfyapp.py": Path(__file__)}
+    module_names = tuple(dict.fromkeys(
+        _CANONICAL_GPU_SOURCE_MODULES
+        + _CPU_COMFYMODAL_PYTHON_SOURCES
+        + ("optimizations",)
+    ))
+    for module_name in module_names:
+        source = source_root / f"{module_name}.py"
+        if not source.is_file():
+            raise FileNotFoundError(f"first-party image source is missing: {source}")
+        files[f"{module_name}.py"] = source
+
+    runtime_root = source_root / "comfymodal_runtime"
+    if not runtime_root.is_dir():
+        raise FileNotFoundError(f"first-party image package is missing: {runtime_root}")
+    for source in sorted(runtime_root.rglob("*.py")):
+        if "__pycache__" not in source.parts:
+            files[source.relative_to(source_root).as_posix()] = source
+    return files
+
+
+def _prepare_first_party_source_build_context() -> tuple[int, int]:
+    """Synchronize the small source mount without rewriting unchanged bytes."""
+    staging_root = Path(_FIRST_PARTY_SOURCE_STAGING_DIR)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    desired = _first_party_source_file_map()
+
+    for existing in sorted(staging_root.rglob("*"), reverse=True):
+        if not existing.is_file():
+            continue
+        relative = existing.relative_to(staging_root).as_posix()
+        if relative not in desired:
+            existing.unlink()
+
+    total_bytes = 0
+    for relative, source in sorted(desired.items()):
+        destination = staging_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_bytes = source.read_bytes()
+        total_bytes += len(source_bytes)
+        try:
+            unchanged = destination.read_bytes() == source_bytes
+        except FileNotFoundError:
+            unchanged = False
+        if not unchanged:
+            destination.write_bytes(source_bytes)
+            os.chmod(destination, 0o644)
+
+    for directory in sorted(
+        (path for path in staging_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return len(desired), total_bytes
+
+
+_FIRST_PARTY_SOURCE_FILE_COUNT, _FIRST_PARTY_SOURCE_BYTES = (
+    _prepare_first_party_source_build_context()
+)
+
+
+def _prepare_custom_node_archive(source_root: str) -> tuple[str, str]:
+    """Return one cached archive built from the canonical publication inventory.
+
+    The inventory is collected once and feeds both the publication generation
+    and the archive.  The cache key includes raw bytes and modes, so an
+    executable-bit change cannot reuse an older archive with the same semantic
+    publication generation.
+    """
+    from tools.v2_control.custom_nodes import (
+        archive_content_digest,
+        build_archive,
+        build_source_identity,
+        collect_semantic_files,
+    )
+
+    files = collect_semantic_files(source_root)
+    identity = build_source_identity(source_root, semantic_files=files)
+    archive_key = archive_content_digest(files)
+    cache_root = Path(tempfile.gettempdir()) / "comfymodal-custom-node-archives"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    archive_path = cache_root / f"custom_nodes-{archive_key}.tar.gz"
+    if not archive_path.is_file():
+        archive_data = build_archive(files)
+        temporary = archive_path.with_name(f".{archive_path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(archive_data)
+        os.replace(temporary, archive_path)
+    return str(archive_path), identity.content_generation
+
+# Custom-node requirements are copied and installed one node at a time.  The
+# staged context is deliberately split here as well as in the shell commands:
+# a changed node must not invalidate an unchanged node's parent layer.
+def _staged_custom_node_requirement_names(requirements_root: str) -> tuple[str, ...]:
+    """Return deterministic staged node names that have requirements.txt."""
+    return tuple(
+        node_name
+        for node_name in _iter_syncable_custom_node_dirs(requirements_root)
+        if os.path.isfile(
+            os.path.join(requirements_root, node_name, "requirements.txt")
+        )
+    )
+
+
+def _custom_node_requirement_context_hash(context_dir: str) -> str:
+    """Hash only the canonical staged dependency context for one node."""
+    return stable_hash(_build_requirements_context_manifest(context_dir))
+
+
+def _custom_node_install_command(node_name: str, context_hash: str) -> str:
+    """Build a deterministic, fail-closed install command for one node."""
+    # The destination is an image path and the node name is the stable
+    # published directory name; no host path is embedded in this command.
+    node_path = shlex.quote(node_name)
+    return (
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        f'_req_root="/root/comfy-build/custom_node_requirements"; '
+        f'echo "CUSTOM_NODE_PREREQ_INSTALL node={node_name} '
+        f'context_sha256={context_hash}"; '
+        f'cd "$_req_root"/{node_path} && '
+        'python -m pip install --disable-pip-version-check --no-input '
+        '-r requirements.txt -c "$_lock" --quiet 2>&1 || '
+        '{ echo "CUSTOM_NODE_PREREQ_FAILED"; exit 1; }'
+    )
+
+
+_CUSTOM_NODE_PREREQ_CHECK_PROGRAM = r"""
+_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*([^,\s]+)(?:\s*,\s*(.*))?$")
+_VERSION_RE = re.compile(
+    r"^[vV]?(\d+(?:\.\d+)*)(?:(a|alpha|b|beta|rc|c|pre|preview)(\d*))?"
+    r"(?:\.post(\d+))?(?:\.dev(\d+))?(?:\+([0-9A-Za-z.-]+))?$"
+)
+_MARKER_RE = re.compile(
+    r"^(sys_platform|platform_system|python_version|python_full_version|"
+    r"implementation_name)\s*(==|!=|in|not in)\s*(['\"])(.*?)\3$"
+)
+
+
+def _version_key(value):
+    match = _VERSION_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    release = tuple(int(part) for part in match.group(1).split("."))
+    release = release + (0,) * (4 - len(release))
+    stage_name, stage_number = match.group(2), int(match.group(3) or 0)
+    if stage_name is None:
+        stage = 3
+    elif stage_name in ("a", "alpha"):
+        stage = 0
+    elif stage_name in ("b", "beta"):
+        stage = 1
+    elif stage_name in ("rc", "c", "pre", "preview"):
+        stage = 2
+    else:
+        stage = 3
+    post = int(match.group(4) or 0)
+    dev = int(match.group(5) or 0)
+    return release, stage, stage_number, post, dev
+
+
+def _split_specifiers(specifiers):
+    if not specifiers:
+        return []
+    parts = []
+    remainder = specifiers
+    while remainder:
+        match = _SPEC_RE.match(remainder)
+        if not match:
+            return None
+        parts.append((match.group(1), match.group(2)))
+        remainder = match.group(3) or ""
+    return parts
+
+
+def _satisfies(installed, specifiers):
+    parts = _split_specifiers(specifiers)
+    if parts is None:
+        return None
+    if not parts:
+        return bool(installed)
+    installed_key = _version_key(installed)
+    if installed_key is None:
+        return None
+    for operator, expected in parts:
+        if operator == "===":
+            satisfied = installed == expected
+        else:
+            wildcard = expected.endswith(".*")
+            expected_base = expected[:-2] if wildcard else expected
+            expected_key = _version_key(expected_base)
+            if expected_key is None:
+                return None
+            if operator in ("==", "!=") and wildcard:
+                prefix = expected_base.split(".")
+                actual_prefix = installed.lstrip("vV").split(".")[: len(prefix)]
+                satisfied = actual_prefix == prefix
+                if operator == "!=":
+                    satisfied = not satisfied
+            elif operator == "==":
+                satisfied = installed_key == expected_key
+            elif operator == "!=":
+                satisfied = installed_key != expected_key
+            elif operator == ">=":
+                satisfied = installed_key >= expected_key
+            elif operator == "<=":
+                satisfied = installed_key <= expected_key
+            elif operator == ">":
+                satisfied = installed_key > expected_key
+            elif operator == "<":
+                satisfied = installed_key < expected_key
+            elif operator == "~=":
+                expected_parts = tuple(int(part) for part in expected_base.split("."))
+                upper_parts = list(expected_parts)
+                upper_index = max(0, len(upper_parts) - 2)
+                upper_parts[upper_index] += 1
+                upper_parts = upper_parts[: upper_index + 1]
+                upper_key = _version_key(".".join(str(part) for part in upper_parts))
+                satisfied = installed_key >= expected_key and installed_key < upper_key
+            else:
+                return None
+        if not satisfied:
+            return False
+    return True
+
+
+def _marker_applies(marker):
+    if not marker:
+        return True
+    if " and " in marker or " or " in marker:
+        return None
+    match = _MARKER_RE.fullmatch(marker.strip())
+    if not match:
+        return None
+    key, operator, _, expected = match.groups()
+    values = {
+        "sys_platform": sys.platform,
+        "platform_system": __import__("platform").system(),
+        "python_version": ".".join(str(part) for part in sys.version_info[:2]),
+        "python_full_version": ".".join(str(part) for part in sys.version_info[:3]),
+        "implementation_name": __import__("platform").python_implementation().lower(),
+    }
+    actual = values[key]
+    if operator == "==":
+        return actual == expected
+    if operator == "!=":
+        return actual != expected
+    if operator == "in":
+        return actual in expected
+    if operator == "not in":
+        return actual not in expected
+    return None
+
+
+def _parse_requirement(raw):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return "skip", None, None
+    line = line.split(" #", 1)[0].strip()
+    if not line:
+        return "skip", None, None
+    if line.startswith("-e ") or line.startswith("--editable"):
+        return "unchecked", line, "editable"
+    if line.startswith("-"):
+        return "skip", None, None
+    if line.startswith(("git+", "hg+", "svn+", "bzr+", "http://", "https://", "file:")):
+        return "unchecked", line, "vcs_or_url"
+    if line.startswith(("./", "../", "/", "~/")) or " @ " in line:
+        return "unchecked", line, "path_or_direct_url"
+    requirement, _, marker = line.partition(";")
+    match = _NAME_RE.match(requirement.strip())
+    if not match:
+        return "unchecked", line, "unparseable"
+    name = match.group(0)
+    remainder = requirement.strip()[match.end() :].strip()
+    if remainder.startswith("["):
+        end = remainder.find("]")
+        if end < 0:
+            return "unchecked", line, "unparseable"
+        remainder = remainder[end + 1 :].strip()
+    if remainder and remainder[0] not in "<>!=~":
+        return "unchecked", line, "unparseable"
+    applies = _marker_applies(marker.strip())
+    if applies is None:
+        return "unchecked", line, "unsupported_marker"
+    if not applies:
+        return "conditional_skip", None, None
+    return "check", (name, remainder, line), None
+
+
+def check_requirement_lines(lines, version_lookup):
+    checked = []
+    unsatisfied = []
+    unchecked = []
+    for raw in lines:
+        status, parsed, reason = _parse_requirement(raw)
+        if status in ("skip", "conditional_skip"):
+            continue
+        if status == "unchecked":
+            unchecked.append({
+                "req": parsed,
+                "reason": reason,
+                "fatal": reason not in ("editable", "vcs_or_url", "path_or_direct_url"),
+            })
+            continue
+        name, specifiers, requirement = parsed
+        try:
+            installed = version_lookup(name)
+        except Exception as exc:
+            if exc.__class__.__name__ == "PackageNotFoundError":
+                installed = None
+            else:
+                unchecked.append({"req": requirement, "reason": "metadata_error", "fatal": True})
+                continue
+        if installed is None:
+            unsatisfied.append({"req": requirement, "installed": None})
+            continue
+        satisfied = _satisfies(installed, specifiers)
+        if satisfied is None:
+            unchecked.append({"req": requirement, "reason": "unsupported_specifier", "fatal": True})
+        elif satisfied:
+            checked.append({"req": requirement, "installed": installed})
+        else:
+            unsatisfied.append({"req": requirement, "installed": installed})
+    return {
+        "checked": sorted(checked, key=lambda item: item["req"]),
+        "unsatisfied": sorted(unsatisfied, key=lambda item: item["req"]),
+        "unchecked": sorted(unchecked, key=lambda item: item["req"]),
+    }
+
+
+def verify_nodes(node_requirements, version_lookup):
+    return [
+        (node, check_requirement_lines(node_requirements[node], version_lookup))
+        for node in sorted(node_requirements)
+    ]
+
+
+def render_results(results):
+    output = []
+    for node, result in results:
+        for item in result["unsatisfied"]:
+            installed = item["installed"] or "missing"
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNSATISFIED node={node} req={item['req']} installed={installed}"
+            )
+        for item in result["unchecked"]:
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNCHECKED node={node} req={item['req']} "
+                f"reason={item['reason']} fatal={int(item['fatal'])}"
+            )
+        marker = "CUSTOM_NODE_PREREQ_PASSED"
+        if result["unsatisfied"] or any(item["fatal"] for item in result["unchecked"]):
+            marker = "CUSTOM_NODE_PREREQ_FAILED"
+        output.append(
+            f"{marker} node={node} checked={len(result['checked'])} "
+            f"unchecked={len(result['unchecked'])} unsatisfied={len(result['unsatisfied'])}"
+        )
+    checked = sum(len(result["checked"]) for _, result in results)
+    unchecked = sum(len(result["unchecked"]) for _, result in results)
+    unsatisfied = sum(len(result["unsatisfied"]) for _, result in results)
+    output.append(
+        f"CUSTOM_NODE_PREREQ_SUMMARY nodes={len(results)} checked={checked} "
+        f"unchecked={unchecked} unsatisfied={unsatisfied}"
+    )
+    return "\n".join(output)
+
+
+def results_ok(results):
+    return not any(
+        result["unsatisfied"]
+        or any(item["fatal"] for item in result["unchecked"])
+        for _, result in results
+    )
+""".strip()
+
+
+def _custom_node_verification_command(node_names: tuple[str, ...]) -> str:
+    """Build the uncached final-environment requirement verification layer."""
+    # This preserves the false-positive guarantee: every checkable requirement
+    # is compared with the installed distribution's version, so no requirement
+    # is left unsatisfied in the final environment.  Re-resolving the graph
+    # would only repeat work for installed candidates (already checked here) or
+    # require a network install, which this layer does not permit.  A cached
+    # install layer can only be absent or wrong-version, and this catches both.
+    command = 'python3 << "PYEOF"\n'
+    if not node_names:
+        return command + 'print("CUSTOM_NODE_PREREQ_VERIFY no_requirements")\nPYEOF\n'
+    command += (
+        'import importlib.metadata as metadata\n'
+        'import os\n'
+        'import re\n'
+        'import sys\n'
+        f'ROOT = {json.dumps("/root/comfy-build/custom_node_requirements")}\n'
+        f'NODES = {json.dumps(sorted(node_names))}\n'
+        + _CUSTOM_NODE_PREREQ_CHECK_PROGRAM
+        + '\n'
+        'results = verify_nodes(\n'
+        '    {node: open(os.path.join(ROOT, node, "requirements.txt"), encoding="utf-8").read().splitlines() for node in NODES},\n'
+        '    metadata.version,\n'
+        ')\n'
+        'print(render_results(results))\n'
+        'if not results_ok(results):\n'
+        '    raise SystemExit(1)\n'
+        'PYEOF\n'
+    )
+    return command
+
+
+def _add_custom_node_requirement_layers(
+    image: Any, requirements_root: str
+) -> tuple[Any, tuple[str, ...]]:
+    """Add one cached install layer per staged node."""
+    node_names = _staged_custom_node_requirement_names(requirements_root)
+    for node_name in node_names:
+        context_dir = os.path.join(requirements_root, node_name)
+        image = image.add_local_dir(
+            context_dir,
+            f"/root/comfy-build/custom_node_requirements/{node_name}",
+            copy=True,
+        ).run_commands(
+            _custom_node_install_command(
+                node_name,
+                _custom_node_requirement_context_hash(context_dir),
+            )
+        )
+
+    return image, node_names
+
+
+def _add_custom_node_verification_layer(
+    image: Any, node_names: tuple[str, ...]
+) -> Any:
+    """Add the forced check after all dependency/image layers are complete."""
+    # This is deliberately the final image layer.  It checks the assembled
+    # environment even when an earlier per-node install layer was cached,
+    # without forcing any expensive descendant layer to rebuild.
+    return image.run_commands(
+        _custom_node_verification_command(node_names),
+        force_build=True,
+    )
+
+
 # Only runs during local deploy. Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _image_base = _image_base.add_local_file(
         _CACHEDIT_LOCK_SRC,
         _CACHEDIT_LOCK_DST,
         copy=True,
-    ).add_local_dir(
-        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
-        "/root/comfy-build/custom_node_requirements",
-        copy=True,
-    ).run_commands(
+    )
+    _image_base = _image_base.run_commands(
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CUSTOM_NODE_PREREQ_INSTALL_START"; '
+        'echo "CUSTOM_NODE_PREREQ_CONTEXT_READY"'
+    )
+    _image_base, _V2_CUSTOM_NODE_REQUIREMENT_NAMES = _add_custom_node_requirement_layers(
+        _image_base,
+        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    )
+
+    # CacheDiT final family reinstall (after all custom-node reqs).
+    _image_base = _image_base.run_commands(
         '__ts_ms() { python3 -c "import time; print(int(time.time()*1000))"; }; '
-        '_lock="' + _CACHEDIT_LOCK_DST + '"; '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_START ts_ms=$(__ts_ms)"; '
-        '_total_req=0; _total_installed=0; _total_skipped=0; '
-        '_pip_node() { local d="$1"; '
-        '  local name; name=$(basename "$d"); '
-        '  [ -f "$d/requirements.txt" ] || { _total_skipped=$((_total_skipped+1)); return 0; }; '
-        '  _total_req=$((_total_req+1)); '
-        '  local t0; t0=$(__ts_ms); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-         '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet 2>&1 || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
-        '  local t1; t1=$(__ts_ms); '
-        '  local dur; dur=$((t1 - t0)); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
-        '  _total_installed=$((_total_installed+1)); '
-        '}; '
-        'for d in /root/comfy-build/custom_node_requirements/*/; do '
-        '  _pip_node "$d" || exit 1; '
-        'done; '
-        '_end_ts=$(__ts_ms); '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
-        # CacheDiT final family reinstall (after all custom-node reqs)
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_START ts_ms=$(__ts_ms)"; '
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
-         'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet 2>&1 || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
-        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
-        # CacheDiT image-build import gate
-        # Override compiler cache envs to /tmp paths — the image env sets
-        # TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache,
-        # so imports during the gate would create content under the future
-        # volume mount point and cause "cannot mount volume on non-empty path".
+        'python -m pip install --disable-pip-version-check --no-input --no-deps '
+        '-r "$_lock" --quiet 2>&1 || '
+        '{ echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
+        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"'
+    )
+
+    # CacheDiT image-build import gate.  Override compiler cache envs to /tmp
+    # paths so the gate cannot populate the future volume mount point.
+    _image_base = _image_base.run_commands(
         'export TORCHINDUCTOR_CACHE_DIR=/tmp/build_gate_inductor_cache; '
         'export TRITON_CACHE_DIR=/tmp/build_gate_triton_cache; '
         'python3 << "PYEOF"\n'
@@ -8418,11 +9018,13 @@ _STABLE_DEPENDENCY_IMAGE = _ACCELERATOR_NATIVE_IMAGE
 _LATE_CONFIG_IMAGE = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
 _image_base = _LATE_CONFIG_IMAGE
 
-# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
+# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source delivery (image or Volume) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
     _cn_copy_layer_count = 0
+    _custom_node_archive_path = None
+    _custom_node_archive_generation = None
     # Verified ComfyModal duplicate worktrees/typo copies must never be baked
     # into the image: ComfyUI would import them as extra custom nodes, inflating
     # snapshot startup (2,398 registered nodes in the baseline).  The canonical
@@ -8441,16 +9043,48 @@ if not _INSIDE_MODAL_CONTAINER:
             f"[comfyapp] custom_node_filter: excluding ComfyModal duplicate dirs "
             f"from image ({len(_duplicate_node_names)}): {_duplicate_node_names}"
         )
-    if CUSTOM_NODE_COPY_MODE == "combined":
-        _image_base = _image_base.add_local_dir(
-            _LOCAL_CUSTOM_NODES,
-            "/root/comfy/ComfyUI/custom_nodes",
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print(
+            "[comfyapp] custom_node_delivery=volume; skipping custom-node source "
+            "add_local_dir (publisher Volume is the runtime source)"
+        )
+        # Modal cannot mount a Volume over the non-empty ComfyUI discovery
+        # directory.  Mount the Volume at the empty compatibility path and
+        # make ComfyUI resolve its normal import path to that mount in the
+        # built image; runtime code only verifies this link.
+        _image_base = _image_base.run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "ln -s /root/custom_nodes_vol /root/comfy/ComfyUI/custom_nodes"
+        )
+        print(
+            "[comfyapp] custom_node_delivery=volume; baked import-path symlink "
+            "/root/comfy/ComfyUI/custom_nodes -> /root/custom_nodes_vol"
+        )
+    elif CUSTOM_NODE_COPY_MODE == "combined":
+        _custom_node_archive_path, _custom_node_archive_generation = (
+            _prepare_custom_node_archive(_LOCAL_CUSTOM_NODES)
+        )
+        _custom_node_archive_name = os.path.basename(_custom_node_archive_path)
+        _custom_node_archive_destination = (
+            f"/root/comfy-build/{_custom_node_archive_name}"
+        )
+        _image_base = _image_base.add_local_file(
+            _custom_node_archive_path,
+            _custom_node_archive_destination,
             copy=True,
-            ignore=_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
+        ).run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "mkdir -p /root/comfy/ComfyUI/custom_nodes && "
+            f"tar --extract --gzip --no-same-owner --preserve-permissions "
+            f"--file {shlex.quote(_custom_node_archive_destination)} "
+            "--directory /root/comfy/ComfyUI/custom_nodes"
         )
         _cn_copy_layer_count = 1
-        print(f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} layers=1 "
-              f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes")
+        print(
+            f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} "
+            f"layers=1 archive={_custom_node_archive_name} "
+            f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes"
+        )
     else:
         for _node_name in _syncable_node_names:
             _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
@@ -8490,7 +9124,11 @@ if not _INSIDE_MODAL_CONTAINER:
 
     try:
         _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
-        _source_generation = custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        _source_generation = (
+            _custom_node_archive_generation
+            if _custom_node_archive_generation is not None
+            else custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        )
         _baked_manifest["production_custom_node_generation"] = _source_generation
         _maybe_write_baked_manifest(_BAKED_MANIFEST_TEMP, _baked_manifest)
         _baked_nodes = _baked_manifest.get("nodes", {})
@@ -8556,29 +9194,6 @@ if not _INSIDE_MODAL_CONTAINER:
         copy=True,
     )
 
-_GPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "optimizations",
-    "worker_control",
-)
-
-_CPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "worker_control",
-)
-
 _COMFYAPP_SOURCE = Path(__file__).read_text(encoding="utf-8-sig")
 _COMFYMODAL_INCLUDE_SOURCE = False
 _GPU_SOURCE_BYTES = sum(
@@ -8589,35 +9204,28 @@ _GPU_SOURCE_BYTES = sum(
 _APP_SOURCE_BYTES = os.path.getsize(__file__)
 
 def _add_gpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _CANONICAL_GPU_SOURCE_MODULES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_cpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_comfymodal_local_python_sources(img):
-    """Legacy wrapper: includes all CPU sources + optimizations + comfymodal_runtime."""
-    img = _add_cpu_python_sources(img)
-    img = img.add_local_python_source("optimizations", copy=True)
-    img = img.add_local_python_source("comfymodal_runtime", copy=True)
-    return img
-
-
-_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
-    _GPU_COMFYMODAL_PYTHON_SOURCES + (
-        "canonical_execution", "modal_client", "run_prompt_options",
-        "warmup_profile", "workflow_metadata", "model_manifest",
+    """Mount the consolidated first-party source tree for lightweight images."""
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
     )
-))
 
 
 @dataclass(frozen=True)
@@ -8765,9 +9373,7 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
     # ``_image_base`` is now the post-custom-node-source boundary.  Start the
     # final source additions there so the canonical plan does not accidentally
     # drop the published custom-node tree.
-    source = _add_gpu_python_sources(_image_base).add_local_python_source(
-        "comfymodal_runtime", copy=True,
-    )
+    source = _add_gpu_python_sources(_image_base)
     if not _INSIDE_MODAL_CONTAINER:
         source = source.add_local_file(
             _CANONICAL_PLAN_METADATA_HOST_PATH,
@@ -8776,6 +9382,13 @@ def build_canonical_image_plan() -> CanonicalImagePlan:
         ).env({
             _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
         })
+        # Build-time only.  This layer needs the per-node requirement names bound
+        # above, which exist solely on the local deploy path.  Inside a Modal
+        # container the image is already built, so referencing the name here
+        # raised NameError and broke container startup.
+        source = _add_custom_node_verification_layer(
+            source, _V2_CUSTOM_NODE_REQUIREMENT_NAMES
+        )
     return CanonicalImagePlan(
         foundation=_FOUNDATION_IMAGE,
         third_party_dependency_environment=_THIRD_PARTY_DEPENDENCY_IMAGE,
@@ -8821,7 +9434,7 @@ else:
 download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-).add_local_python_source("comfymodal_runtime", copy=True)
+)
 
 app = modal.App(APP_NAME, image=image, include_source=False)
 _E16_READ_ONLY_VOLUME_LOOKUP = os.environ.get(
@@ -9056,6 +9669,9 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
     cpu=2,
     memory=4096,
     timeout=1800,
+    # The shared Volume has one publication authority.  Keep this function
+    # single-writer even when callers come from different hosts/routes.
+    max_containers=1,
     volumes={CUSTOM_NODES_PATH: custom_nodes_vol},
 )
 def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
@@ -9064,12 +9680,15 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     import io
     import os
     import shutil
+    import tempfile
 
-    staging_dir = os.path.join(CUSTOM_NODES_PATH, ".staging")
-
-    # Clean any leftover staging dir (safe regardless of type)
-    _safe_remove_path(staging_dir)
-    os.makedirs(staging_dir)
+    # Stage on the container's ephemeral filesystem, not under the published
+    # tree.  The name is unique per invocation, so a bypassed platform gate
+    # cannot make one invocation delete or extract into another's staging.
+    staging_dir = tempfile.mkdtemp(
+        prefix="comfyui-custom-nodes-",
+        dir="/tmp",
+    )
 
     # Extract to staging with path traversal and symlink protection.
     # NOTE: old content is NOT removed until the new archive has been
@@ -9090,28 +9709,27 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         raise
 
     # GÃ¶Ã‡GÃ¶Ã‡ Old content removal (only after new archive is in staging) GÃ¶Ã‡GÃ¶Ã‡
-    _staging_name = os.path.basename(staging_dir)
-    for item in os.listdir(CUSTOM_NODES_PATH):
-        if item == _staging_name:
-            continue
-        if item == ".comfymodal_control":
-            continue
-        item_path = os.path.join(CUSTOM_NODES_PATH, item)
-        if os.path.islink(item_path):
-            os.unlink(item_path)
-        elif os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-        else:
-            os.remove(item_path)
+    try:
+        for item in os.listdir(CUSTOM_NODES_PATH):
+            if item == ".comfymodal_control":
+                continue
+            item_path = os.path.join(CUSTOM_NODES_PATH, item)
+            if os.path.islink(item_path):
+                os.unlink(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
 
-    # Move extracted items from staging to volume root
-    for item in os.listdir(staging_dir):
-        src = os.path.join(staging_dir, item)
-        dst = os.path.join(CUSTOM_NODES_PATH, item)
-        shutil.move(src, dst)
-
-    # Clean up staging
-    _safe_remove_path(staging_dir)
+        # Move extracted items from staging to volume root.  Cleanup is in a
+        # finally block so partial moves and all later failure paths cannot
+        # leave an invocation's staging directory behind.
+        for item in os.listdir(staging_dir):
+            src = os.path.join(staging_dir, item)
+            dst = os.path.join(CUSTOM_NODES_PATH, item)
+            shutil.move(src, dst)
+    finally:
+        _safe_remove_path(staging_dir)
 
     # P3 (corrected): Write the generation record BEFORE committing,
     # so the custom-node contents AND the generation record are part

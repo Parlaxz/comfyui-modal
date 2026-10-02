@@ -1067,6 +1067,23 @@ export async function triggerDeploy(apiBase) {
   return apiFetch(apiBase, "/deploy", { method: "POST" });
 }
 
+export async function getCustomNodeSyncStatus(apiBase) {
+  return apiFetch(apiBase, "/custom-nodes/sync-status");
+}
+
+export async function triggerPushPlugins(apiBase) {
+  return apiFetch(apiBase, "/custom-nodes/sync", { method: "POST" });
+}
+
+export async function triggerRebuildDependencies(apiBase) {
+  return apiFetch(apiBase, "/custom-nodes/sync/rebuild-dependencies", { method: "POST" });
+}
+
+export async function getCustomNodeSyncOperationStatus(apiBase, syncId) {
+  if (!syncId) return null;
+  return apiFetch(apiBase, `/custom-nodes/sync/status/${encodeURIComponent(syncId)}`);
+}
+
 export async function getDeployLog(apiBase) {
   return apiFetch(apiBase, "/deploy/log");
 }

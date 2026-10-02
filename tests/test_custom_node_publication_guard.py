@@ -10,6 +10,7 @@ the stale shared ``.deployed_state.json`` is never consulted.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,11 +22,13 @@ import pytest
 pytestmark = pytest.mark.fast_unit
 
 from tools.v2_control.custom_nodes import (
+    CANDIDATE_READBACK_SAMPLE_SIZE,
     GENERATION_RECORD_PATH,
     PublicationReceipt,
     RECEIPT_PATH,
     build_source_identity,
     check_publication_safety,
+    collect_semantic_files,
     prepare_publication,
     publish_or_skip,
 )
@@ -35,8 +38,10 @@ class FakeVolume:
     def __init__(self, name="test-volume"):
         self.name = name
         self.files: dict[str, bytes] = {}
+        self.read_calls: list[str] = []
 
     def read_file(self, path):
+        self.read_calls.append(path)
         if path not in self.files:
             raise FileNotFoundError(path)
         return iter((self.files[path],))
@@ -83,6 +88,11 @@ def _publishing_fake(volume: FakeVolume, root: Path, calls: list):
     async def publisher(_archive: bytes):
         calls.append(True)
         candidate = build_source_identity(root)
+        for path in list(volume.files):
+            if not path.startswith(".comfymodal_control/"):
+                del volume.files[path]
+        for item in collect_semantic_files(root):
+            volume.files[item.path] = item.data
         volume.files[GENERATION_RECORD_PATH] = json.dumps({
             "schema_version": 2,
             "content_generation": candidate.content_generation,
@@ -90,6 +100,11 @@ def _publishing_fake(volume: FakeVolume, root: Path, calls: list):
         return {"status": "ok", "content_generation": candidate.content_generation}
 
     return publisher
+
+
+def _materialize_candidate(volume: FakeVolume, root: Path) -> None:
+    for item in collect_semantic_files(root):
+        volume.files[item.path] = item.data
 
 
 def _run(root, volume, publisher, **kwargs):
@@ -269,6 +284,65 @@ def test_override_allowed_and_recorded_in_receipt(tmp_path):
     assert check_publication_safety(
         prev_receipt, decision.identity, allow_destructive=True
     )["allowed"] is True
+
+
+def test_override_with_stale_excluded_package_is_incomplete(tmp_path):
+    _write(tmp_path, "ext-stale", {"stale.py": b"old"})
+    previous, _archive, _files = prepare_publication(tmp_path)
+    volume = FakeVolume()
+    _seed(volume, previous)
+    shutil.rmtree(tmp_path / "ext-stale")
+    _write(tmp_path, "ext-stale", {"notes.md": b"excluded by policy"})
+    _write(tmp_path, "ext-current", {"current.py": b"new"})
+
+    async def publisher(_archive: bytes):
+        candidate = build_source_identity(tmp_path)
+        _materialize_candidate(volume, tmp_path)
+        volume.files[GENERATION_RECORD_PATH] = json.dumps({
+            "schema_version": 2,
+            "content_generation": candidate.content_generation,
+        }).encode()
+        return {"status": "ok", "content_generation": candidate.content_generation}
+
+    # Simulate the defective publisher: an excluded package is left behind.
+    volume.files["ext-stale/stale.py"] = b"old"
+    decision = _run(
+        tmp_path, volume, publisher, allow_destructive=True,
+    )
+    assert decision.action == "publish"
+    assert decision.reason == "publication_incomplete"
+    assert "ext-stale/stale.py" in decision.result["remote_content_mismatch"]
+
+
+def test_bounded_candidate_readback_detects_sampled_corruption(tmp_path):
+    files = {f"{index:03d}.py": b"x" for index in range(CANDIDATE_READBACK_SAMPLE_SIZE + 12)}
+    _write(tmp_path, "ext-a", files)
+    volume = FakeVolume()
+    calls: list = []
+
+    async def publisher(_archive: bytes):
+        candidate = build_source_identity(tmp_path)
+        _materialize_candidate(volume, tmp_path)
+        sampled = sorted(
+            (item.path for item in collect_semantic_files(tmp_path)),
+            key=lambda path: (hashlib.sha256(path.encode("utf-8")).digest(), path),
+        )[:CANDIDATE_READBACK_SAMPLE_SIZE]
+        # Corrupt the lexically last sampled path so the bounded sweep reaches
+        # the mismatch only after reading the full sample.
+        volume.files[max(sampled)] = b"z"
+        volume.files[GENERATION_RECORD_PATH] = json.dumps({
+            "schema_version": 2,
+            "content_generation": candidate.content_generation,
+        }).encode()
+        calls.append(True)
+        return {"status": "ok", "content_generation": candidate.content_generation}
+
+    decision = _run(tmp_path, volume, publisher)
+    assert decision.reason == "publication_incomplete"
+    assert "candidate remote content differs" in decision.result["remote_content_mismatch"]
+    candidate_reads = [path for path in volume.read_calls if path.startswith("ext-a/")]
+    assert len(candidate_reads) == CANDIDATE_READBACK_SAMPLE_SIZE
+    assert calls == [True]
 
 
 # (9) blocked publication performs zero remote mutation.

@@ -149,6 +149,37 @@ def test_receipt_tamper_and_same_version_ambiguity_fail_closed(tmp_path):
         })
 
 
+def test_unrelated_same_version_receipt_does_not_block_target_selection(tmp_path):
+    config = _config()
+    requested = _receipt(config, version=3)
+    requested_path = write_deployment_receipt(tmp_path, requested)
+    unrelated = DeploymentReceipt(**{
+        **_receipt(config, version=3).__dict__,
+        "target": {
+            "app": "unrelated-app",
+            "class": config.target.class_name,
+            "method": config.target.method,
+        },
+        "modal_app": "unrelated-app",
+        "deploy_fingerprint": "c" * 64,
+    })
+    write_deployment_receipt(tmp_path, unrelated)
+
+    result = latest_deployment_receipt(
+        tmp_path,
+        profile=config.profile_name,
+        target={
+            "app": config.target.app,
+            "class": config.target.class_name,
+            "method": config.target.method,
+        },
+    )
+    assert result is not None
+    selected_path, selected = result
+    assert selected_path == requested_path
+    assert selected.target["app"] == config.target.app
+
+
 def test_source_probe_evidence_is_required_and_receipt_bound(tmp_path):
     config = _config()
     receipt = _receipt(config)

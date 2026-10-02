@@ -33,11 +33,79 @@ EXCLUDED_DIR_NAMES: frozenset[str] = frozenset({
     "output", "test-results", "playwright-report", "playwright/.cache",
     ".playwright-mcp", ".experiments", ".run_history", "benchmark_runs",
     "benchmark_logs", "optimization_logs", ".comfymodal_experiments",
-    ".custom_node_requirements", ".baked_custom_node_deps", ".presets",
+    ".custom_node_requirements", ".baked_custom_node_deps", ".comfymodal_first_party_sources", ".presets",
     ".preset_blobs", ".v2ctl", ".comfymodal_control", "tests", "test", "examples", "benchmarks",
     "benchmark", "traces", "logs", "scripts", ".github", "MagicMock",
     "reference", "docs",
+    # Host-side experiment evidence.  These two directories alone accounted for
+    # ~1.66 GB (68.7%) of the published custom-node payload while contributing
+    # no runtime code: tracked references exist only in local benchmark/report
+    # tooling, never inside the container.  Shipping them forced Modal to walk,
+    # hash, and issue a per-file existence RPC for 1,569 files on every deploy.
+    # They stay tracked in git; this only prunes them from the published tree.
+    "golden_history", "unetClipExperimentsSeptember",
 })
+
+# Named subset of EXCLUDED_DIR_NAMES holding host-side experiment evidence.
+# Kept separate so tests can pin the deploy-latency contract against exactly
+# these names instead of the whole conservative exclusion set.
+#
+# Every name here was verified to be (a) present only inside the first-party
+# ``comfyui-modal`` node, and (b) unreferenced by comfyapp.py, comfymodal_runtime,
+# studio_domain, or web.  ``EXCLUDED_DIR_NAMES`` matches at every depth inside
+# every node, so a generic name here would be a cross-node hazard: ``tools`` and
+# ``web`` were both rejected for exactly that reason (comfyui-easy-use ships a
+# runtime ``tools/combine_autocomplete.py``; eight third-party nodes ship ``web/``).
+# An explicit list keeps the blast radius provable instead of probable.
+EVIDENCE_ONLY_DIR_NAMES: frozenset[str] = frozenset({
+    "golden_history", "unetClipExperimentsSeptember",
+    # Per-experiment run output.  All are host-side artifacts of campaigns that
+    # have already been concluded; none is read by the container.
+    "abc_lifecycle", "abc_t5", "aff_runs", "allocator64_qd8", "allocator64_runs",
+    "allocator64_smoke", "allocator_runs", "allocator_smoke", "cpufrac_runs",
+    "cross_source_runs", "du_runs", "engine_pinned_runs", "engine_runs",
+    "exp1_control", "exp1_control_frozen", "exp2_2x64", "exp2_4x32",
+    "exp3_m0", "exp3_m1", "exp3_m2", "exp4_odirect", "flight_recorder_runs",
+    "fva_runs", "hedge_altfile", "hedge_dispatch_fix", "hedge_dispatch_fix2",
+    "hedge_proc_125", "hedge_proc_runs", "hedge_proc_verify", "hedge_runs",
+    "hedge_runs2", "hedge_shift1", "hedge_trace_runs",
+    "imbalance_hedged_runs", "imbalance_runs", "launch_spacing_boundary_runs",
+    "launch_spacing_confirm_runs", "launch_spacing_runs", "m2_phase1_runs",
+    "m2_phase1b_runs", "m2_phase2_runs", "m2_phase3_runs", "m2_runs",
+    "mapshare_runs", "matrix2_runs", "matrix_runs", "opt2_runs", "opt3_runs",
+    "opt4_runs", "opt_runs", "pace_runs", "phase0_probe", "phase1_runs",
+    "phase2_runs", "phase2b_runs", "phase3_verify", "pm2_interleaved",
+    "primer_mech_runs", "primer_scope_runs", "primer_size_runs",
+    "progression_runs", "qd4_distribution", "qd_compare_runs", "qd_sweep_runs",
+    "rtx_128", "rtx_best", "rtx_m2", "sanity_nopop", "sanity_pat", "sanity_pop",
+    "sentinel_runs", "size_sweep", "source_conc_runs", "source_fullfile_runs",
+    "source_geom_runs", "source_race_runs", "source_roll_runs", "ss_smoke",
+    "startup_arm_runs", "step1_fio", "step2_touch", "step2b_touch",
+    "step3_m0m2", "step5_zerocopy", "sticky_runs", "sticky_smoke",
+    "task1_layout", "task2_profile", "task3_m0", "task5_pacing", "task5_report",
+    "timing_runs", "witness_runs", "worker_model_runs", "worker_model_runs_pinned",
+    "worker_model_runs_provider", "worker_model_runs_unpinned",
+    "working_source_harness_runs",
+    # Point-in-time remote measurement captures.
+    "RA7B_REMOTE_STEP1_EVIDENCE_20260831T000000Z",
+    "RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z_REPLACEMENT2",
+    "RV2B_REMOTE_MEASUREMENT_RAW_EVIDENCE_20260830T000000Z_REPLACEMENT3",
+    # Scratch/metadata dirs holding no runtime code.
+    ".scratch", ".unlazy", "_tools", "diag1",
+})
+
+# These are first-party benchmark harness nodes, not runtime custom nodes.
+# This filter is deliberately applied only to the top-level node selection
+# below; adding these names to EXCLUDED_DIR_NAMES would prune same-named
+# runtime directories inside unrelated third-party nodes.
+FIRST_PARTY_BENCHMARK_NODE_NAMES: frozenset[str] = frozenset({
+    "modal-single-volume-parallelism",
+    "modal-volume-read-ceiling",
+})
+
+# The evidence names are the ones added for deploy latency; they are part of
+# the exclusion contract too, so keep one authoritative set.
+EXCLUDED_DIR_NAMES = EXCLUDED_DIR_NAMES | EVIDENCE_ONLY_DIR_NAMES
 
 # Compatibility spelling used by existing callers/tests.
 EXCLUDED_DIRS = EXCLUDED_DIR_NAMES
@@ -66,6 +134,7 @@ EXCLUDED_FILENAMES: frozenset[str] = frozenset({
 
 EXCLUDED_EXTENSIONS: frozenset[str] = frozenset({
     ".pyc", ".pyo", ".md", ".tmp", ".ref", ".log", ".trace", ".jsonl",
+    ".bat", ".pid",
     ".whl", ".patch", ".diff", ".gz", ".zip", ".tar", ".bundle",
 })
 
@@ -115,7 +184,14 @@ COMFYMODAL_LOCAL_CUSTOM_NODES_ENV = "COMFYMODAL_LOCAL_CUSTOM_NODES"
 
 # The custom-node source is a shared resource.  Keep its Volume and the one
 # app allowed to mutate it independent of whichever Golden app consumes it.
-CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+# Honor the same override the runtime already respects (``modal_app.py`` reads
+# COMFYMODAL_CUSTOM_NODES_VOLUME).  Without this, pointing the runtime at an
+# alternate Volume while the publisher kept writing the default one produced a
+# silent split: the reader and the writer disagreed about the content identity.
+# Unset in production, so the default name is unchanged.
+CUSTOM_NODES_VOLUME_NAME = os.environ.get(
+    "COMFYMODAL_CUSTOM_NODES_VOLUME", "comfyui-custom-nodes"
+)
 CUSTOM_NODES_PUBLISHER_APP_NAME = "comfyui-custom-nodes-publisher"
 
 
@@ -207,9 +283,13 @@ def iter_syncable_custom_node_dirs(root: str | Path) -> list[str]:
     root_path = os.fspath(root)
     if not os.path.isdir(root_path):
         return []
+    first_party_benchmark_names = {
+        name.casefold() for name in FIRST_PARTY_BENCHMARK_NODE_NAMES
+    }
     return sorted(
         name for name in os.listdir(root_path)
-        if custom_node_filter_reason(name, os.path.join(root_path, name)) is None
+        if name.casefold() not in first_party_benchmark_names
+        and custom_node_filter_reason(name, os.path.join(root_path, name)) is None
     )
 
 

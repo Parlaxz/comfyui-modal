@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import re
 import sys
 import tempfile
 import types
@@ -51,7 +52,76 @@ def load_module():
         sys.modules.pop(module_name, None)
 
 
+class _RecordingImage:
+    """Small image double that preserves the order of build operations."""
+
+    def __init__(self):
+        self.calls = []
+
+    def add_local_dir(self, *args, **kwargs):
+        self.calls.append(("add_local_dir", args, kwargs))
+        return self
+
+    def run_commands(self, *args, **kwargs):
+        self.calls.append(("run_commands", args, kwargs))
+        return self
+
+
 class ComfyAppBuildContextTests(unittest.TestCase):
+    @staticmethod
+    def _requirement_checker(module):
+        namespace = {"re": re, "sys": sys}
+        exec(module._CUSTOM_NODE_PREREQ_CHECK_PROGRAM, namespace)
+        return namespace
+
+    def test_requirement_satisfaction_check_is_fail_closed_and_local(self):
+        module = load_module()
+        checker = self._requirement_checker(module)
+
+        def installed(name):
+            return {"present": "2.4.1", "old": "1.0"}.get(name)
+
+        result = checker["check_requirement_lines"](
+            ["", "# comment", "--index-url https://example.invalid", "present>=2"],
+            installed,
+        )
+        self.assertEqual(len(result["checked"]), 1)
+        self.assertEqual(result["unsatisfied"], [])
+        self.assertEqual(result["unchecked"], [])
+
+        missing = checker["check_requirement_lines"](["missing>=1"], installed)
+        self.assertEqual(missing["unsatisfied"][0]["installed"], None)
+
+        too_old = checker["check_requirement_lines"](["old>=2"], installed)
+        self.assertEqual(too_old["unsatisfied"][0]["installed"], "1.0")
+
+        unchecked = checker["check_requirement_lines"](
+            ["git+https://example.invalid/project.git", "not a requirement"],
+            installed,
+        )
+        self.assertEqual(len(unchecked["unchecked"]), 2)
+        self.assertEqual(unchecked["unsatisfied"], [])
+        self.assertFalse(checker["results_ok"]([("node", unchecked)]))
+
+    def test_requirement_check_output_is_sorted_and_deterministic(self):
+        module = load_module()
+        checker = self._requirement_checker(module)
+        versions = {"zeta": "1.0", "alpha": "2.0"}
+        results = checker["verify_nodes"](
+            {"z-node": ["zeta"], "a-node": ["alpha", "missing"]},
+            versions.get,
+        )
+        output = checker["render_results"](results)
+        self.assertEqual(
+            output.splitlines(),
+            [
+                "CUSTOM_NODE_PREREQ_UNSATISFIED node=a-node req=missing installed=missing",
+                "CUSTOM_NODE_PREREQ_FAILED node=a-node checked=1 unchecked=0 unsatisfied=1",
+                "CUSTOM_NODE_PREREQ_PASSED node=z-node checked=1 unchecked=0 unsatisfied=0",
+                "CUSTOM_NODE_PREREQ_SUMMARY nodes=2 checked=2 unchecked=0 unsatisfied=1",
+            ],
+        )
+
     def test_build_context_diagnostics_are_opt_in(self):
         """The recursive build diagnostic must not run during normal import."""
         tree = ast.parse(COMFYAPP_PATH.read_text(encoding="utf-8-sig"))
@@ -293,55 +363,56 @@ class ComfyAppBuildContextTests(unittest.TestCase):
         self.assertNotIn("presets", cpu_sources)
         self.assertNotIn("run_history", cpu_sources)
 
-    def test_gpu_source_function_uses_copy_true(self):
-        """_add_gpu_python_sources must call add_local_python_source with copy=True."""
+    def test_runtime_source_helpers_use_one_snapshot_mount(self):
+        """The staged tree preserves bytes while keeping copy=True snapshot semantics."""
         module = load_module()
-        import ast
-        source = module._COMFYAPP_SOURCE if hasattr(module, "_COMFYAPP_SOURCE") else ""
-        if not source:
-            with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
-                source = f.read()
-        # Find _add_gpu_python_sources function body
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_add_gpu_python_sources":
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        func = child.func
-                        if isinstance(func, ast.Attribute) and func.attr == "add_local_python_source":
-                            # Check copy=True keyword exists
-                            for kw in child.keywords:
-                                if kw.arg == "copy":
-                                    self.assertTrue(
-                                        isinstance(kw.value, ast.Constant) and kw.value.value is True,
-                                        "_add_gpu_python_sources must call add_local_python_source with copy=True"
-                                    )
-                            break  # only check first call
-                break
+        staging = Path(module._FIRST_PARTY_SOURCE_STAGING_DIR)
+        source_files = module._first_party_source_file_map()
+        required = set(module._CANONICAL_GPU_SOURCE_MODULES)
+        required.update(module._CPU_COMFYMODAL_PYTHON_SOURCES)
+        required.add("optimizations")
 
-    def test_cpu_source_function_uses_copy_true(self):
-        """_add_cpu_python_sources must call add_local_python_source with copy=True."""
+        # Check the meaning of the consolidated context, not the deleted API
+        # shape: every source formerly mounted independently is staged verbatim.
+        for module_name in required:
+            relative = f"{module_name}.py"
+            self.assertIn(relative, source_files)
+            self.assertEqual(
+                (staging / relative).read_bytes(),
+                source_files[relative].read_bytes(),
+            )
+        self.assertIn("comfyapp.py", source_files)
+        self.assertTrue((staging / "comfymodal_runtime" / "__init__.py").is_file())
+
+        for helper in (
+            module._add_gpu_python_sources,
+            module._add_cpu_python_sources,
+            module._add_comfymodal_local_python_sources,
+        ):
+            image = MagicMock()
+            image.add_local_dir.return_value = image
+            helper(image)
+            # add_local_dir(copy=True) is the build-time snapshot guarantee;
+            # the single call avoids a descendant image per source module.
+            image.add_local_dir.assert_called_once_with(
+                module._FIRST_PARTY_SOURCE_STAGING_DIR,
+                "/root",
+                copy=True,
+            )
+
+    def test_cpu_source_helper_uses_snapshot_mount(self):
+        """The CPU/download path uses the same byte-stable source snapshot."""
         module = load_module()
-        import ast
-        source = module._COMFYAPP_SOURCE if hasattr(module, "_COMFYAPP_SOURCE") else ""
-        if not source:
-            with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
-                source = f.read()
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "_add_cpu_python_sources":
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Call):
-                        func = child.func
-                        if isinstance(func, ast.Attribute) and func.attr == "add_local_python_source":
-                            for kw in child.keywords:
-                                if kw.arg == "copy":
-                                    self.assertTrue(
-                                        isinstance(kw.value, ast.Constant) and kw.value.value is True,
-                                        "_add_cpu_python_sources must call add_local_python_source with copy=True"
-                                    )
-                            break
-                break
+        image = MagicMock()
+        image.add_local_dir.return_value = image
+        module._add_cpu_python_sources(image)
+        # Keep the CPU contract explicit: it must not regress to per-module
+        # mounts just because its source set is smaller than the GPU set.
+        image.add_local_dir.assert_called_once_with(
+            module._FIRST_PARTY_SOURCE_STAGING_DIR,
+            "/root",
+            copy=True,
+        )
 
     def test_app_uses_include_source_false(self):
         """modal.App must be called with include_source=False."""
@@ -509,58 +580,138 @@ class ComfyAppBuildContextTests(unittest.TestCase):
             "modal_app.py change must NOT alter custom-node dependency hash"
         )
 
-    # ── Requirement 3: Pip failures stop build ───────────────────────
-    # The shell script must exit on pip failure.
+    # ── Requirement 3: Per-node pip failures stop build ───────────────
 
-    def test_pip_failure_stops_build(self):
-        """The pip-install shell function must propagate failures
-        via '|| return 1' and the 'for' loop must exit on failure.
-        Tests command semantics (operators, exit codes), not just
-        substring presence."""
-        with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
-            source = f.read()
+    def test_per_node_install_command_fails_closed(self):
+        """A node install command must fail closed on pip errors."""
+        module = load_module()
+        command = module._custom_node_install_command("node-a", "hash")
+        self.assertIn("python -m pip install --disable-pip-version-check", command)
+        self.assertIn("-r requirements.txt -c \"$_lock\" --quiet", command)
+        self.assertIn("CUSTOM_NODE_PREREQ_FAILED", command)
+        self.assertIn("exit 1", command)
 
-        # Find the run_commands string that contains _pip_node
-        # by extracting the contiguous shell script between CUSTOM_NODE_PREREQ
-        # markers (since the AST contains complex string concatenation).
-        start_marker = "CUSTOM_NODE_PREREQ_INSTALL_START"
-        # Use the CacheDiT gate start as the end bound so we cover both the
-        # pip loop and the CacheDiT lock family ensure command.
-        end_marker = "CACHEDIT_LOCK_FAMILY_ENSURE_END"
-        start_idx = source.find(start_marker)
-        end_idx = source.find(end_marker)
-        self.assertGreater(start_idx, 0,
-                           "Must find custom-node pip-install start marker")
-        self.assertGreater(end_idx, start_idx,
-                           "Must find CacheDiT lock family ensure end marker")
+    @staticmethod
+    def _plan_for(module, root):
+        image = _RecordingImage()
+        image, names = module._add_custom_node_requirement_layers(image, str(root))
+        module._add_custom_node_verification_layer(image, names)
+        commands = [
+            call[1][0]
+            for call in image.calls
+            if call[0] == "run_commands"
+        ]
+        return image, names, commands
 
-        # Extract a generous window around the script
-        search_window = source[start_idx:end_idx + len(end_marker)]
+    def test_each_staged_requirement_node_gets_its_own_install_layer(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, content in (("z-node", "zlib\n"), ("a-node", "attrs\n")):
+                node = root / name
+                node.mkdir()
+                (node / "requirements.txt").write_text(content, encoding="utf-8")
+            (root / "no-req").mkdir()
+            image, names, commands = self._plan_for(module, root)
 
-        # Check that _pip_node has || return 1 on pip command
-        self.assertIn("|| { echo", search_window,
-                      "pip command must have fail-fast guard")
-        self.assertIn("return 1", search_window,
-                      "_pip_node must return 1 on failure")
-        self.assertIn("2>&1", search_window,
-                      "pip stderr must be captured in the build log")
-        # Check that the for loop checks exit code
-        self.assertIn('_pip_node "$d" || exit 1', search_window,
-                      "for loop must exit on _pip_node failure")
-        # Check CacheDiT lock family ensure also fails fast
-        self.assertIn("CACHEDIT_LOCK_FAMILY_FAILED", search_window,
-                      "CacheDiT lock family ensure must have failure guard")
-        # Check that error-swallowing patterns are absent
-        self.assertNotIn("|| true", search_window,
-                         "pip commands must not swallow errors with || true")
-        self.assertNotIn("|| :", search_window,
-                         "pip commands must not swallow errors with || :")
-        # The for loop must NOT be wrapped in set ±e (individual
-        # 'exit 1' handles failure propagation unconditionally)
-        self.assertNotIn("set +e", search_window,
-                         "for loop must not disable error handling")
-        self.assertNotIn("set -e", search_window,
-                         "for loop must not enable error handling")
+        self.assertEqual(names, ("a-node", "z-node"))
+        install_commands = [cmd for cmd in commands if "CUSTOM_NODE_PREREQ_INSTALL" in cmd]
+        self.assertEqual(len(install_commands), len(names))
+        self.assertEqual(
+            len([call for call in image.calls if call[0] == "add_local_dir"]),
+            len(names),
+        )
+
+    def test_verification_is_forced_and_after_all_install_layers(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("node-a", "node-b"):
+                node = root / name
+                node.mkdir()
+                (node / "requirements.txt").write_text("wheel\n", encoding="utf-8")
+            image, names, commands = self._plan_for(module, root)
+
+        verify_index = next(i for i, cmd in enumerate(commands) if "CUSTOM_NODE_PREREQ_SUMMARY" in cmd)
+        self.assertEqual(verify_index, len(names))
+        verify_call = image.calls[verify_index * 2]
+        self.assertEqual(verify_call[0], "run_commands")
+        self.assertTrue(verify_call[2].get("force_build"))
+        self.assertIn('"node-a"', commands[verify_index])
+        self.assertIn('"node-b"', commands[verify_index])
+        self.assertNotIn("pip install", commands[verify_index])
+        self.assertNotIn("--dry-run", commands[verify_index])
+        self.assertIn("CUSTOM_NODE_PREREQ_UNSATISFIED", commands[verify_index])
+
+    def test_forced_verification_is_after_cachedit_gate_in_canonical_build(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        gate_end = source.index('print("CACHEDIT_LOCK_GATE cleanup complete")')
+        verification_call = source.rfind("_add_custom_node_verification_layer(")
+        self.assertGreater(
+            verification_call,
+            gate_end,
+            "forced verification must not sit upstream of the CacheDiT gate",
+        )
+        self.assertGreater(
+            source.index("return CanonicalImagePlan(", verification_call),
+            verification_call,
+        )
+
+    def test_per_node_commands_are_deterministic_across_host_paths(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            for root in (Path(tmp_a), Path(tmp_b)):
+                for name, content in (("node-a", "numpy==1\n"), ("node-b", "torch\n")):
+                    node = root / name
+                    node.mkdir()
+                    (node / "requirements.txt").write_text(content, encoding="utf-8")
+            _, _, commands_a = self._plan_for(module, Path(tmp_a))
+            _, _, commands_b = self._plan_for(module, Path(tmp_b))
+        self.assertEqual(commands_a, commands_b)
+
+    def test_one_requirement_change_only_changes_that_node_command(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, content in (("node-a", "numpy==1\n"), ("node-b", "torch\n")):
+                node = root / name
+                node.mkdir()
+                (node / "requirements.txt").write_text(content, encoding="utf-8")
+            _, names_a, commands_a = self._plan_for(module, root)
+            (root / "node-a" / "requirements.txt").write_text("numpy==2\n", encoding="utf-8")
+            _, names_b, commands_b = self._plan_for(module, root)
+        install_a = dict(zip(names_a, commands_a[:len(names_a)]))
+        install_b = dict(zip(names_b, commands_b[:len(names_b)]))
+        self.assertNotEqual(install_a["node-a"], install_b["node-a"])
+        self.assertEqual(install_a["node-b"], install_b["node-b"])
+
+    def test_cachedit_gate_and_dependency_diagnostics_are_preserved(self):
+        source = COMFYAPP_PATH.read_text(encoding="utf-8-sig")
+        for pin in (
+            '"cache-dit": "1.2.3"', '"transformers": "4.55.2"',
+            '"diffusers": "0.36.0"', '"huggingface-hub": "0.34.4"',
+            '"accelerate": "1.10.1"', '"safetensors": "0.5.3"',
+            '"tokenizers": "0.21.4"',
+        ):
+            self.assertIn(pin, source)
+        for key in (
+            "dependency_key", "base_key", "requirements_key", "cachedit_lock_key",
+            "installer_key", "runtime_revision", "runtime_revision_part_of_dependency_key=0",
+            "decision", "reason",
+        ):
+            self.assertIn(key, source)
+        self.assertIn(
+            '_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-per-node-v3"',
+            source,
+        )
+        self.assertLess(
+            source.index("CUSTOM_NODE_PREREQ_UNSATISFIED"),
+            source.index("CACHEDIT_LOCK_FAMILY_ENSURE_START"),
+        )
+        self.assertLess(
+            source.index("CACHEDIT_LOCK_FAMILY_ENSURE_START"),
+            source.index("CACHEDIT_LOCK_GATE"),
+        )
 
     # ── Requirement 4: No PyTorch 2.12 force-reinstall ───────────────
 
@@ -589,9 +740,7 @@ class ComfyAppBuildContextTests(unittest.TestCase):
     # to be present in every image, especially the CPU download image.
 
     def test_download_image_includes_comfymodal_runtime(self):
-        """download_image must chain add_local_python_source('comfymodal_runtime')
-        because comfyapp.py imports comfymodal_runtime at module level and
-        App(include_source=False) means explicit inclusion is required."""
+        """download_image's consolidated mount must contain comfymodal_runtime."""
         import ast
         with open(str(COMFYAPP_PATH), encoding="utf-8-sig") as f:
             source = f.read()
@@ -602,26 +751,8 @@ class ComfyAppBuildContextTests(unittest.TestCase):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "download_image":
-                        # Walk all calls in the value for add_local_python_source
-                        for child in ast.walk(node.value):
-                            if (isinstance(child, ast.Call)
-                                    and isinstance(child.func, ast.Attribute)
-                                    and child.func.attr == "add_local_python_source"):
-                                args = child.args
-                                if (args
-                                        and isinstance(args[0], ast.Constant)
-                                        and args[0].value == "comfymodal_runtime"):
-                                    # Verify copy=True keyword
-                                    copy_ok = any(
-                                        kw.arg == "copy"
-                                        and isinstance(kw.value, ast.Constant)
-                                        and kw.value.value is True
-                                        for kw in child.keywords
-                                    )
-                                    self.assertTrue(copy_ok,
-                                        "comfymodal_runtime must be added with copy=True")
-                                    found = True
-                        # Also verify _add_cpu_python_sources is used
+                        # The helper owns the one copy=True snapshot mount;
+                        # assert the staged content rather than a removed API call.
                         sources_ref = any(
                             isinstance(c, ast.Call)
                             and isinstance(c.func, ast.Name)
@@ -630,10 +761,29 @@ class ComfyAppBuildContextTests(unittest.TestCase):
                         )
                         self.assertTrue(sources_ref,
                             "download_image must use _add_cpu_python_sources")
+                        self.assertFalse(
+                            any(
+                                isinstance(c, ast.Call)
+                                and isinstance(c.func, ast.Attribute)
+                                and c.func.attr == "add_local_python_source"
+                                for c in ast.walk(node.value)
+                            ),
+                            "download_image must use the consolidated source mount",
+                        )
+                        found = True
                         break
 
         self.assertTrue(found,
-            "download_image must include comfymodal_runtime via add_local_python_source")
+            "download_image must use the consolidated first-party source mount")
+
+        module = load_module()
+        staging = Path(module._FIRST_PARTY_SOURCE_STAGING_DIR)
+        runtime_source = Path(module._COMFYUI_MODAL_DIR) / "comfymodal_runtime"
+        for relative in ("__init__.py", "modal_app.py", "runtime_executor.py"):
+            self.assertEqual(
+                (staging / "comfymodal_runtime" / relative).read_bytes(),
+                (runtime_source / relative).read_bytes(),
+            )
 
     # ── Requirement 6: cachedit_dependency_lock.txt in build context ──
 
