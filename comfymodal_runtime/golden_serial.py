@@ -905,6 +905,87 @@ def normalize_attention_backend(value: Any) -> str:
 _MISSING = object()
 
 
+# ΓöÇΓöÇ Snapshot-captured INPUT_TYPES schemas ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# A few third-party INPUT_TYPES() implementations call ``inspect.stack()`` only
+# to detect whether the caller is upstream ComfyUI's ``get_input_info()``
+# validation path, so they can substitute an "accepts anything" container.
+# The schema they build is otherwise constant, but the caller detection is not
+# free: in the production-008 exhaustive profile Impact Pack's GeneralSwitch
+# spent 574.9 ms across 5 request-time calls, essentially all of it inside
+# ``inspect.stack()`` -> getframeinfo -> findsource/getmodule.
+#
+# Golden never needs that bypass: it resolves links itself and consumes the
+# normal schema.  So the normal schema is captured once, before the snapshot is
+# taken, and served from snapshot-resident memory afterwards.
+#
+# Only classes listed here are served from the cache, and only after their
+# schema was actually captured.  Everything else keeps calling the real
+# implementation, so no arbitrary custom-node INPUT_TYPES is memoized.  The
+# third-party package is never modified and non-Golden ``get_input_info()``
+# behavior is untouched: the cache is consulted solely through
+# ``golden_input_types()``.
+_SNAPSHOT_INPUT_TYPES_SCHEMAS: dict[str, dict] = {}
+
+
+def _input_types_snapshot_key(class_def: Any) -> str | None:
+    """Identity of a class whose normal INPUT_TYPES schema may be captured.
+
+    Discovery is structural rather than a hardcoded dotted path so a relocated
+    Impact Pack install is still recognised, and so an unrelated custom node
+    that merely reuses the name ``GeneralSwitch`` is not captured.
+    """
+    module = getattr(class_def, "__module__", "") or ""
+    qualname = getattr(class_def, "__qualname__", "") or ""
+    if qualname != "GeneralSwitch" or not module.endswith("impact.util_nodes"):
+        return None
+    return f"{module}.{qualname}"
+
+
+def capture_golden_input_types_schemas() -> dict[str, Any]:
+    """Capture normal INPUT_TYPES schemas before the snapshot is serialized.
+
+    Runs in the normal Golden context, so ``inspect.stack()``-based caller
+    detection does not fire and the captured schema is the real one.  Failures
+    are non-fatal: a class that cannot be captured simply stays uncached.
+    """
+    captured: dict[str, Any] = {}
+    try:
+        import nodes as _nodes
+    except Exception:
+        return captured
+    mappings = getattr(_nodes, "NODE_CLASS_MAPPINGS", None)
+    if not isinstance(mappings, dict):
+        return captured
+    for class_def in list(mappings.values()):
+        key = _input_types_snapshot_key(class_def)
+        if key is None or key in _SNAPSHOT_INPUT_TYPES_SCHEMAS:
+            continue
+        try:
+            schema = class_def.INPUT_TYPES()
+        except Exception:
+            continue
+        if isinstance(schema, dict):
+            _SNAPSHOT_INPUT_TYPES_SCHEMAS[key] = schema
+            captured[key] = schema
+    return captured
+
+
+def golden_input_types(class_def: Any) -> dict:
+    """The single entry point Golden uses to read a node's INPUT_TYPES.
+
+    Returns the snapshot-captured normal schema when one exists, otherwise the
+    class's own implementation. Correctness never depends on the cache: an
+    absent, incomplete, or incompatible capture falls through to the original
+    call and produces exactly the same schema.
+    """
+    key = _input_types_snapshot_key(class_def)
+    if key is not None:
+        schema = _SNAPSHOT_INPUT_TYPES_SCHEMAS.get(key)
+        if isinstance(schema, dict):
+            return schema
+    return class_def.INPUT_TYPES()
+
+
 def _require_attention_backend_invocation(backend: str, state: Mapping[str, Any]) -> None:
     """Fail closed when a non-baseline override was never observed in use."""
     if backend != "pytorch" and int(state.get("calls", 0)) == 0:
@@ -8591,7 +8672,7 @@ class GoldenSerialRunner:
 
     def _get_input_data(self, unique_id: str, class_def: Any) -> tuple[dict, dict]:
         inputs = self.prompt[unique_id]["inputs"]
-        valid_inputs = class_def.INPUT_TYPES()
+        valid_inputs = golden_input_types(class_def)
         is_v3 = self._is_v3_class(class_def)
         if is_v3:
             from comfy_api.latest import _io
@@ -8637,7 +8718,7 @@ class GoldenSerialRunner:
         from comfy_api.latest import _io
 
         _, hidden, v3_data = _io.get_finalized_class_inputs(
-            class_def.INPUT_TYPES(), self.prompt[unique_id]["inputs"]
+            golden_input_types(class_def), self.prompt[unique_id]["inputs"]
         )
         hidden_inputs = {}
         if hidden is not None:
@@ -9016,10 +9097,15 @@ class GoldenSerialRunner:
             raise RuntimeError(f"node_not_found:{node_id}")
         inputs = self.prompt[node_id]["inputs"]
         class_def = self._classes()[self.prompt[node_id]["class_type"]]
+        # One schema per node, not one per linked input: INPUT_TYPES() is a
+        # schema builder and upstream ComfyUI also resolves it once per node.
+        valid_inputs = None
         for name, value in inputs.items():
             if not _is_link(value):
                 continue
-            _, input_info = self._input_info(class_def, name, class_def.INPUT_TYPES())
+            if valid_inputs is None:
+                valid_inputs = golden_input_types(class_def)
+            _, input_info = self._input_info(class_def, name, valid_inputs)
             if (input_info or {}).get("lazy", False):
                 continue  # pulled on demand by check_lazy_status
             await self._ensure(value[0], _depth + 1)
@@ -9041,10 +9127,13 @@ class GoldenSerialRunner:
 
         inputs = self.prompt[target_id]["inputs"]
         class_def = self._classes()[self.prompt[target_id]["class_type"]]
+        valid_inputs = None
         for name, value in inputs.items():
             if not _is_link(value):
                 continue
-            _, input_info = self._input_info(class_def, name, class_def.INPUT_TYPES())
+            if valid_inputs is None:
+                valid_inputs = golden_input_types(class_def)
+            _, input_info = self._input_info(class_def, name, valid_inputs)
             if (input_info or {}).get("lazy", False):
                 continue
             await self._ensure(value[0])

@@ -12275,6 +12275,23 @@ class ModalRuntimeEntrypoint:
                 if _io_process_record:
                     _restore_timing["golden_io_process"] = _io_process_record
 
+        # ── Snapshot-captured INPUT_TYPES schemas ───────────────────────
+        # Some third-party INPUT_TYPES() implementations run inspect.stack()
+        # only to detect upstream ComfyUI's get_input_info() validation path.
+        # Golden does not want that bypass, so capture the normal schema here --
+        # before capture, in the normal Golden context -- and let the request
+        # path serve it from snapshot-resident memory.  Advisory and
+        # non-fatal: an uncaptured class keeps calling its own implementation.
+        if _golden_serial_active:
+            try:
+                from .golden_serial import capture_golden_input_types_schemas
+
+                _restore_timing["snapshot_input_types_schemas"] = sorted(
+                    capture_golden_input_types_schemas()
+                )
+            except Exception:
+                pass
+
         # ── Snapshot quiescence proof (fail closed) ───────────────────────
         # Golden must prove quiescence before capture, but this proof must be
         # read-only: stopping a cache worker or flushing it here changes the

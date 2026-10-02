@@ -87,11 +87,16 @@ def warm_classes_input_types(prompt: dict[str, Any]) -> tuple[int, float]:
         _class_types = []
     _count = 0
     _t0 = time.perf_counter()
+    # Routed through the same helper the runner uses, so a class whose schema
+    # was captured before the snapshot is served from memory here too instead
+    # of paying its caller-detection cost again at request time.
+    from comfymodal_runtime.golden_serial import golden_input_types
+
     for _ct in _class_types:
         try:
             _class_def = nodes.NODE_CLASS_MAPPINGS.get(_ct)
             if _class_def is not None:
-                _class_def.INPUT_TYPES()
+                golden_input_types(_class_def)
                 _count += 1
         except Exception:
             # Advisory only: an un-mappable or raising class leaves the topo
