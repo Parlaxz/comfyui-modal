@@ -2227,36 +2227,6 @@ def _code(lines: Sequence[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def count_incomplete_calls(
-    calls: Sequence[Mapping[str, Any]],
-) -> tuple[int, int]:
-    """Return ``(total_incomplete, unmeasured_incomplete)``.
-
-    VizTracer emits a ``call`` event on entry and only writes the matching return
-    if the frame returns.  Stopping the tracer therefore always leaves a tail of
-    frames mid-flight -- the teardown frames themselves (``stop_tracing``,
-    ``_finalize_full_trace``) plus whatever threads were parked in ``select`` or
-    ``wait``.  Those rows carry no ``start_us``/``end_us``/``wall_ms`` at all.
-
-    Counting them as corrupting made ``no_root_corrupting_incomplete_calls``
-    unsatisfiable for every possible trace, so the check could never pass and
-    said nothing.  The discriminator is whether the row carries an entry
-    timestamp at all -- not whether it has a *closed* span.  A frame that opened
-    with no recorded start measured nothing and cannot corrupt a measurement,
-    whereas a row that recorded a start but never closed is a genuinely dangling
-    call and must still fail closed.
-    """
-    total = 0
-    measured = 0
-    for call in calls:
-        if call.get("complete", True):
-            continue
-        total += 1
-        if call.get("start_us") is not None or call.get("end_us") is not None:
-            measured += 1
-    return total, measured
-
-
 def evaluate_completeness(
     *,
     root_selection: Mapping[str, Any],
@@ -2312,9 +2282,7 @@ def evaluate_completeness(
     check(
         "no_root_corrupting_incomplete_calls",
         int(incomplete_calls) == 0,
-        f"incomplete_calls_with_measurements={incomplete_calls} "
-        "(unmeasured frames still open at tracer shutdown are excluded; they "
-        "carry no timing and cannot corrupt a measurement)",
+        f"incomplete_calls={incomplete_calls}",
     )
     expected = manifest.get("expected_processes")
     traced = manifest.get("traced_processes")
@@ -2985,8 +2953,6 @@ def analyze(
     profile["coverage_split"] = _coverage_split(profile)
 
     incomplete_calls = profile["incomplete_calls"]
-    _incomplete_total, incomplete_measured = count_incomplete_calls(calls)
-    profile["incomplete_measured_calls"] = incomplete_measured
     profile["contract"] = evaluate_completeness(
         root_selection=root_selection,
         root=root,
@@ -2997,7 +2963,7 @@ def analyze(
         manifest=manifest,
         clock_alignment=clock_alignment,
         thread_coverage=thread_coverage,
-        incomplete_calls=incomplete_measured,
+        incomplete_calls=incomplete_calls,
         stack_inconsistencies=stack_inconsistencies,
         raw_trace_nonempty=profile["raw_trace_nonempty"],
         report_written=False,
