@@ -432,6 +432,54 @@ class TestHandleFullTraceArtifact(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(call_count, 0)
 
+    # ── Canonical nested result.data form ───────────────────────────────
+
+    async def test_nested_ready_artifact_invokes_downloader_once(self):
+        """The canonical result.data descriptor downloads exactly once."""
+        result = {"data": {"full_trace_artifact": dict(READY_FULL_TRACE)}}
+        call_args: list[dict[str, Any]] = []
+
+        async def tracking_downloader(**kw: Any) -> dict[str, Any]:
+            call_args.append(kw)
+            return _fake_downloader_success(**kw)
+
+        meta = await _handle_full_trace_artifact(
+            result, self.output_dir, self.workspace, self.transport,
+            _test_trace_downloader=tracking_downloader,
+        )
+
+        self.assertEqual(len(call_args), 1)
+        self.assertEqual(meta["trace_id"], READY_FULL_TRACE["trace_id"])
+        self.assertTrue((self.output_dir / "full_trace_download.json").is_file())
+
+    async def test_nested_error_artifact_raises_without_downloader(self):
+        """A nested error descriptor raises and never invokes the downloader."""
+        result = {"data": {"full_trace_artifact": dict(ERROR_FULL_TRACE)}}
+        downloader = mock.AsyncMock()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await _handle_full_trace_artifact(
+                result, self.output_dir, self.workspace, self.transport,
+                _test_trace_downloader=downloader,
+            )
+
+        self.assertIn("trace_collection_failed", str(ctx.exception))
+        downloader.assert_not_awaited()
+
+    async def test_nested_absent_artifact_is_noop(self):
+        """A result.data object without a descriptor is absent/no-op."""
+        result = {"data": {"other": "value"}}
+        downloader = mock.AsyncMock()
+
+        meta = await _handle_full_trace_artifact(
+            result, self.output_dir, self.workspace, self.transport,
+            _test_trace_downloader=downloader,
+        )
+
+        self.assertIsNone(meta)
+        downloader.assert_not_awaited()
+        self.assertFalse((self.output_dir / "full_trace_download.json").exists())
+
 
 # ============================================================================
 # _run_one — handoff error persistence to disk
@@ -686,7 +734,7 @@ class TestDeployV2FullTraceOnlyBatchFile(unittest.TestCase):
             'set "COMFYMODAL_V2_GPU=rtx-pro-6000"',
             'set "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=1"',
             'set "COMFYMODAL_V2_FULL_TRACE=1"',
-            'set "COMFYMODAL_V2_FULL_TRACE_TORCH=1"',
+            'set "COMFYMODAL_V2_FULL_TRACE_TORCH=0"',
             'set "COMFYMODAL_V2_FULL_TRACE_ENTRIES=8000000"',
             'set "COMFYMODAL_V2_FULL_TRACE_RESOURCE_INTERVAL_MS=50"',
             'set "COMFYMODAL_V2_PROFILE_VOLUME=comfymodal-v2-profiles"',

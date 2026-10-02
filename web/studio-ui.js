@@ -1,8 +1,8 @@
 // Modal Studio — Shared UI Helpers
 //
-// Element builder, status badges, keyboard registry, zoomable image preview,
-// image preview overlay, download button, and legacy empty state renderer
-// shared across Backend page modules.
+// Element builder, status badges (shared chip base), keyboard registry,
+// zoomable image preview, image preview overlay, download button, and the
+// generic empty-state primitive shared across Backend page modules.
 
 // ── Layer-aware Keyboard Registry ─────────────────────────────────────────
 //
@@ -273,18 +273,36 @@ export function el(tag, props = {}, children = []) {
 }
 
 // ── Status badge helper ──────────────────────────────────────────────────
+//
+// Phase I3: badges adopt the shared `.cm-chip` base + `data-tone` system
+// while PRESERVING the legacy feature classes (`comfymodal-studio-status-badge`
+// plus its kind modifier) that callers/CSS still rely on.  Tone mapping is
+// truthful to the existing vocabulary: ok/warn/error pass through; every
+// other kind (including "neutral") lands on the neutral tone.
+
+const _STATUS_TONE_KINDS = ["ok", "warn", "error"];
 
 export function statusBadge(text, kind) {
-  const cls = kind === "ok" ? "comfymodal-studio-status-badge ok"
-    : kind === "warn" ? "comfymodal-studio-status-badge warn"
-    : kind === "error" ? "comfymodal-studio-status-badge error"
-    : "comfymodal-studio-status-badge neutral";
-  return el("span", { class: cls, text: text });
+  const legacy = _STATUS_TONE_KINDS.indexOf(kind) !== -1 ? kind : "neutral";
+  const tone = legacy;
+  return el("span", {
+    class: "comfymodal-studio-status-badge " + legacy + " cm-chip",
+    "data-tone": tone,
+    text: text,
+  });
 }
 
-// ── Legacy empty state renderer ──────────────────────────────────────────
-// Kept for backward compatibility with tests that reference it from the
-// backend module.
+// ── Image viewer (generic foundation) ─────────────────────────────────────
+//
+// Phase I5 re-measurement: these two helpers have NO current production
+// caller — the only import lives in studio-playground.js and is never
+// invoked (orphaned by the H13/H18 deletions). The former doc claim that
+// they were "used by both experiment cell detail and history preview" was
+// stale and has been removed. They are retained as generic single-image
+// viewing capability for that existing import; the Phase I5 A/B compare
+// deliberately does NOT host inside them (their single-image pan/zoom
+// transform architecture does not model two pixel-aligned clipped layers)
+// and reuses only el() + registerLayerHandler instead.
 
 /**
  * Create a zoomable image element with pointer-based pan, pointer-centered
@@ -662,8 +680,9 @@ export function createZoomableImageEl(imageUrl, alt, opts) {
 
 /**
  * Create a shared image preview overlay with zoomable image and
- * configurable info sections. Used by both experiment cell detail
- * and history preview to provide a consistent viewing experience.
+ * configurable info sections. Generic single-image viewing foundation
+ * (currently without a production caller — see the region note above);
+ * the Phase I5 A/B compare uses its own aligned two-image stage instead.
  *
  * Toolbar (close / save / download + zoom controls) renders BELOW the
  * image. Save comes before fullscreen in the row order.
@@ -936,12 +955,49 @@ function _buildDownloadButton(opts) {
   return dlBtn;
 }
 
-export function renderEmptyState(listContent, detailPanel, context, state) {
-  while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-  const emptyCard = el("div", { class: "comfymodal-studio-card" }, [
-    el("p", { text: "No backends configured via legacy discovery.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
-    el("p", { text: "Use the Snapshots or Backend Presets tabs above.", style: "font-size:12px;color:#555;margin:0 0 8px;" }),
-  ]);
-  while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
-  listContent.appendChild(emptyCard);
+// ── Generic empty-state primitive ────────────────────────────────────────
+//
+// Phase I3 shared primitive.  The previous renderer here was an ad-hoc
+// backend-specific card with baked-in legacy copy ("No backends configured
+// via legacy discovery.") and a destructive 4-argument signature that
+// cleared two caller-owned containers.  It had zero runtime callers (only a
+// never-invoked re-export wrapper in studio-backend.js), so it is replaced
+// by this generic, copy-free primitive.
+//
+// DELIBERATELY STAGED: page empty states (workflows/models/history/backend/
+// playground) migrate onto this helper in I4/I6/I7/I8.  Having no production
+// caller immediately after I3 is by design — this is planned downstream
+// consumption, not accidental dead code.
+//
+// Contract:
+//   renderEmptyState({ title, detail = "", action = null, testid } = {})
+//   - root: class "cm-empty-state", optional data-testid
+//   - title/detail rendered only when non-blank strings are supplied
+//     (all user-facing copy comes from callers — none is baked in)
+//   - action: an existing HTMLElement/Node appended WITHOUT cloning into
+//     a "cm-empty-state-action" wrapper
+//   - NO heading level is assigned (the page owner owns document hierarchy)
+//   - NO role="alert" / aria-live: an empty state is normal application
+//     state, not an automatic announcement
+
+export function renderEmptyState(options = {}) {
+  const opts = options && typeof options === "object" ? options : {};
+  const root = el("div", { class: "cm-empty-state" });
+  if (typeof opts.testid === "string" && opts.testid !== "") {
+    root.setAttribute("data-testid", opts.testid);
+  }
+  const title = typeof opts.title === "string" ? opts.title.trim() : "";
+  if (title !== "") {
+    root.appendChild(el("div", { class: "cm-empty-state-title", text: title }));
+  }
+  const detail = typeof opts.detail === "string" ? opts.detail : "";
+  if (detail.trim() !== "") {
+    root.appendChild(el("div", { class: "cm-empty-state-detail", text: detail }));
+  }
+  if (opts.action && typeof opts.action.appendChild === "function") {
+    const actionWrap = el("div", { class: "cm-empty-state-action" });
+    actionWrap.appendChild(opts.action);
+    root.appendChild(actionWrap);
+  }
+  return root;
 }

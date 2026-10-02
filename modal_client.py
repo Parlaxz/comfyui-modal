@@ -23,6 +23,9 @@ from gpu_catalog import (
 # there is one source of truth.
 from production_workflow import _canonical_workflow_hash, COMPILER_SCHEMA_VERSION, HASH_SCHEMA_VERSION, PRODUCTION_PLAN_SCHEMA_VERSION
 from comfymodal_runtime.env import env_flag
+from comfymodal_runtime.publication_policy import (
+    CUSTOM_NODES_PUBLISHER_APP_NAME,
+)
 from comfymodal_runtime.v2_waterfall import (
     attach_waterfall,
     graph_result_from_event,
@@ -36,9 +39,11 @@ def _attach_waterfall_for_graph(result, *, run_label):
     Only graph workflow result / timing payloads are finalized; non-graph
     payloads (checkpoint summaries, asset reads, health, canary, restore-only,
     NUMA, rehoming probes) never receive fabricated graph stages.
+    Host-side fallback attach: the remote container already prints the
+    waterfall render, so this suppresses the duplicate host render.
     """
     if is_graph_result(result):
-        attach_waterfall(result, run_label=run_label)
+        attach_waterfall(result, run_label=run_label, print_render=False)
 
 
 def _short_hash(h: str) -> str:
@@ -152,7 +157,7 @@ _run_prompt_semaphore = asyncio.Semaphore(1)
 # (workspace["id"], gpu_value, region, cloud) for Cls instances.
 _workspace_resolver: Callable[[], dict | None] | None = None
 _workspace_clients: dict[str, object] = {}
-_workspace_function_handles: dict[tuple[str, str, str | None], object] = {}
+_workspace_function_handles: dict[tuple[str, str, str | None, str], object] = {}
 _workspace_cls_instances: dict[tuple[str, str, str, str], object] = {}
 _current_gpu = DEFAULT_GPU
 _handle_cache_hits = 0
@@ -208,24 +213,33 @@ def _workspace_client(workspace: dict):
     return client
 
 
-def _workspace_function(name: str, workspace: dict, environment_name: str | None = None):
+def _workspace_function(
+    name: str,
+    workspace: dict,
+    environment_name: str | None = None,
+    app_name: str | None = None,
+):
     """Return (and cache) a ``modal.Function`` handle scoped to *workspace*.
 
     When *environment_name* is ``None`` (the default) the active environment
     is resolved via ``_resolve_v1_environment()``, which checks
     ``COMFYMODAL_ENVIRONMENT`` then ``MODAL_ENVIRONMENT``.
-    The environment is part of the cache key so different environments
-    produce distinct handles.
+    The environment and app are part of the cache key so different
+    environments/apps produce distinct handles.  ``app_name`` is optional so
+    existing callers continue to use the module's default app.
     """
     global _handle_cache_hits, _handle_cache_misses
     if environment_name is None:
         environment_name = _resolve_v1_environment()
-    key = (workspace["id"], name, environment_name)
+    selected_app = APP_NAME if app_name is None else str(app_name).strip()
+    if not selected_app:
+        raise ValueError("Modal app name must not be empty")
+    key = (workspace["id"], name, environment_name, selected_app)
     handle = _workspace_function_handles.get(key)
     if handle is None:
         _handle_cache_misses += 1
         handle = modal.Function.from_name(
-            APP_NAME, name,
+            selected_app, name,
             client=_workspace_client(workspace),
             environment_name=environment_name,
         )
@@ -554,6 +568,22 @@ async def run_prompt_stream(
                     _attach_waterfall_for_graph(
                         _rdata, run_label="modal_client run_prompt_stream",
                     )
+            if isinstance(msg, dict) and msg.get("type") == "persistence":
+                # Variant A: record the remote's definitive persistence
+                # outcome (deferred commit) so the asset route / history can
+                # distinguish pending, ok, and failed states after the caller
+                # already received the result.
+                try:
+                    from comfymodal_runtime.modal_transport import record_persistence_status
+                    _persist_key = str(
+                        (trace or {}).get("prompt_id")
+                        or (trace or {}).get("request_id")
+                        or ""
+                    )
+                    if _persist_key:
+                        record_persistence_status(_persist_key, msg)
+                except Exception:
+                    pass
             yield msg
     except TimeoutError:
         raise TimeoutError(
@@ -698,6 +728,21 @@ async def download_model(
     )
 
 
+_DOWNLOAD_STREAM_EXHAUSTED = object()
+
+
+def _next_download_item(gen):
+    """Pull the next stream item in the worker thread, exhaustion as a value.
+
+    ``asyncio``/``concurrent.futures`` Futures cannot carry ``StopIteration``
+    as a result exception: doing so raises ``TypeError: StopIteration interacts
+    badly with generators``.  ``next(gen, sentinel)`` converts a normal
+    generator's ``StopIteration`` into an ordinary return value inside the
+    thread, so the executor Future only ever sees a value or a real error.
+    """
+    return next(gen, _DOWNLOAD_STREAM_EXHAUSTED)
+
+
 async def download_model_stream(
     url: str,
     filename: str,
@@ -717,11 +762,10 @@ async def download_model_stream(
         lambda: _workspace_function("download_model_stream", selected).remote_gen(**kwargs),
     )
     while True:
-        try:
-            item = await loop.run_in_executor(None, next, gen)
-            yield item
-        except StopIteration:
+        item = await loop.run_in_executor(None, _next_download_item, gen)
+        if item is _DOWNLOAD_STREAM_EXHAUSTED:
             break
+        yield item
 
 
 @_modal_error_handler
@@ -755,10 +799,39 @@ async def delete_model(folder: str, filename: str, workspace: dict | None = None
 
 
 @_modal_error_handler
-async def sync_custom_nodes(archive_data: bytes, workspace: dict | None = None) -> dict:
+async def sync_custom_nodes(
+    archive_data: bytes,
+    workspace: dict | None = None,
+    app_name: str | None = CUSTOM_NODES_PUBLISHER_APP_NAME,
+    publisher_app_name: str | None = None,
+) -> dict:
+    """Publish custom-node content through the shared authority.
+
+    ``app_name`` is retained for callers of the old client API.  New callers
+    use the explicit publisher spelling, and the default is always the stable
+    shared publisher rather than a consumer-derived app.
+    """
     selected = _resolve_workspace(workspace)
+    # The old ``app_name`` parameter is retained for source compatibility, but
+    # it is not an ownership selector.  A consumer must not be able to route a
+    # write to a different publisher app.
+    _ = app_name, publisher_app_name
+    app_name = CUSTOM_NODES_PUBLISHER_APP_NAME
+    environment_name = str(selected.get("environment") or "(default)")
+    if environment_name == "(default)":
+        environment_name = None
+    if app_name is None:
+        operation = lambda: _workspace_function(
+            "sync_custom_nodes_to_volume", selected,
+            environment_name=environment_name,
+        ).remote(archive_data)
+    else:
+        operation = lambda: _workspace_function(
+            "sync_custom_nodes_to_volume", selected, app_name=app_name,
+            environment_name=environment_name,
+        ).remote(archive_data)
     return await asyncio.to_thread(
-        lambda: _workspace_function("sync_custom_nodes_to_volume", selected).remote(archive_data),
+        operation,
     )
 
 

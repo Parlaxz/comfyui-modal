@@ -1,0 +1,292 @@
+{
+  "attempt_id": "conc-smoke-h100",
+  "batches": [
+    {
+      "aggregate_decimal_gbps": 1.4175685212755742,
+      "aggregate_gib_per_s": 1.3202135649282245,
+      "all_full_length": true,
+      "bytes_returned": [
+        134217728
+      ],
+      "dispatch_skew_ms": 0.0,
+      "lengths": [
+        134217728
+      ],
+      "max_ms": 94.669641,
+      "mean_ms": 94.669641,
+      "median_ms": 94.669641,
+      "min_ms": 94.669641,
+      "n": 1,
+      "offsets": [
+        0
+      ],
+      "preadv_ms": [
+        94.669641
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "useful_bytes": 134217728,
+      "wave_makespan_ms": 94.681651,
+      "wave_release_ns": 5185648082
+    },
+    {
+      "aggregate_decimal_gbps": 3.1629286608829554,
+      "aggregate_gib_per_s": 2.945706863778602,
+      "all_full_length": true,
+      "bytes_returned": [
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 0.141237,
+      "lengths": [
+        134217728,
+        134217728
+      ],
+      "max_ms": 84.859456,
+      "mean_ms": 65.6977845,
+      "median_ms": 65.6977845,
+      "min_ms": 46.536113,
+      "n": 2,
+      "offsets": [
+        0,
+        134217728
+      ],
+      "preadv_ms": [
+        46.536113,
+        84.859456
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "useful_bytes": 268435456,
+      "wave_makespan_ms": 84.869273,
+      "wave_release_ns": 5282077025
+    },
+    {
+      "aggregate_decimal_gbps": 2.5164688325479836,
+      "aggregate_gib_per_s": 2.3436442320681956,
+      "all_full_length": true,
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 165.369091,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 213.272525,
+      "mean_ms": 129.27935025,
+      "median_ms": 128.158662,
+      "min_ms": 47.527552,
+      "n": 4,
+      "offsets": [
+        0,
+        134217728,
+        268435456,
+        402653184
+      ],
+      "preadv_ms": [
+        165.322723,
+        47.527552,
+        213.272525,
+        90.994601
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "useful_bytes": 536870912,
+      "wave_makespan_ms": 213.342961,
+      "wave_release_ns": 5370000427
+    },
+    {
+      "aggregate_decimal_gbps": 3.230148262362091,
+      "aggregate_gib_per_s": 3.008309996092777,
+      "all_full_length": true,
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 0.524613,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 332.050269,
+      "mean_ms": 277.571126375,
+      "median_ms": 331.5875125,
+      "min_ms": 44.919715,
+      "n": 8,
+      "offsets": [
+        0,
+        134217728,
+        268435456,
+        402653184,
+        536870912,
+        671088640,
+        805306368,
+        939524096
+      ],
+      "preadv_ms": [
+        44.919715,
+        185.579085,
+        332.050269,
+        331.597563,
+        331.656952,
+        331.844854,
+        331.343111,
+        331.577462
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "useful_bytes": 1073741824,
+      "wave_makespan_ms": 332.412551,
+      "wave_release_ns": 5586547674
+    },
+    {
+      "aggregate_decimal_gbps": 3.210656517292741,
+      "aggregate_gib_per_s": 2.990156893891041,
+      "all_full_length": true,
+      "bytes_returned": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "dispatch_skew_ms": 592.967395,
+      "lengths": [
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728,
+        134217728
+      ],
+      "max_ms": 668.55934,
+      "mean_ms": 565.62603425,
+      "median_ms": 667.9000570000001,
+      "min_ms": 74.664925,
+      "n": 16,
+      "offsets": [
+        0,
+        134217728,
+        268435456,
+        402653184,
+        536870912,
+        671088640,
+        805306368,
+        939524096,
+        1073741824,
+        1207959552,
+        1342177280,
+        1476395008,
+        1610612736,
+        1744830464,
+        1879048192,
+        2013265920
+      ],
+      "preadv_ms": [
+        667.688824,
+        272.353341,
+        668.55934,
+        668.264158,
+        668.310086,
+        667.687396,
+        668.109432,
+        668.538172,
+        592.846373,
+        668.297108,
+        667.864592,
+        667.129009,
+        667.935522,
+        74.664925,
+        668.557679,
+        93.210591
+      ],
+      "ranges_distinct_and_non_overlapping": true,
+      "useful_bytes": 2147483648,
+      "wave_makespan_ms": 668.861224,
+      "wave_release_ns": 5923263025
+    }
+  ],
+  "config": {
+    "file_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+    "max_n": 16,
+    "offset_start": 0,
+    "read_bytes": 134217728,
+    "widths": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ]
+  },
+  "container_session_id": "ta-01M33XT2G0B14FKJ1BBS7AHWSR",
+  "env": {
+    "platform": "Linux",
+    "preadv_available": true,
+    "syscall_impl": "os.preadv"
+  },
+  "file_identity": {
+    "path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+    "size": 8044982048,
+    "st_dev": 31,
+    "st_ino": 4,
+    "st_mtime_ns": 1781316088009883330
+  },
+  "hostname": "modal",
+  "identity": {
+    "container_session_id": "ta-01M33XT2G0B14FKJ1BBS7AHWSR",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "hostname": "modal",
+    "image_id": "im-XDbvlnU6U9MAQioa9eAonq",
+    "observed_gpu": "NVIDIA H100 80GB HBM3",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "asia-south2",
+    "requested_gpu": "h100!"
+  },
+  "image_id": "im-XDbvlnU6U9MAQioa9eAonq",
+  "kind": "source_concurrency_probe",
+  "model_name": "qwen_3_4b.safetensors",
+  "observed_gpu": "NVIDIA H100 80GB HBM3",
+  "provider": "CLOUD_PROVIDER_GCP",
+  "region": "asia-south2",
+  "requested_gpu": "h100!",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "schema_version": 1,
+  "status": "ok"
+}

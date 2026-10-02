@@ -31,6 +31,10 @@ from typing import Any, TextIO
 MEASUREMENT_UNAVAILABLE = "measurement_unavailable"
 VERSION = "v2-full-trace/1"
 
+# sampling_deep_profile is already bounded by its producers.  Keep the report
+# reader defensive as it may also consume hand-copied Golden telemetry.
+_SAMPLING_DEEP_PROFILE_MAX_BYTES = 2 * 1024 * 1024
+
 # Semantic operation type constants (must match requirement 6 exactly)
 SEMANTIC_TYPES = {
     "volume_reload:models",
@@ -215,6 +219,15 @@ def _write_json(path: Path, data: Any, *, sort_keys: bool = True) -> None:
         pass
 
 
+def _write_text_exact(path: Path, text: str) -> None:
+    """Persist UTF-8 text without platform newline translation."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(str(text).replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
+    except Exception:
+        pass
+
+
 def _micros(ts: float) -> int:
     """Convert seconds to microseconds."""
     return int(round(ts * 1_000_000))
@@ -280,6 +293,11 @@ def parse_chrome_trace_events(data: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for ev in raw:
         if not isinstance(ev, dict):
+            continue
+        # This is a persisted diagnostic artifact, not a timed Python span.
+        # Keep it out of calls before parent reconstruction and Golden profile
+        # accounting; the structured copy is read from session/Golden evidence.
+        if str(ev.get("name", "")) == "sampling_deep_profile":
             continue
         ph = ev.get("ph", "")
         if ph not in ("X", "B", "E", "i", "I"):
@@ -418,11 +436,160 @@ def _parse_milestones(session_dir: Path) -> list[dict[str, Any]]:
 
 
 def _parse_session_events(session_dir: Path) -> list[dict[str, Any]]:
-    """Parse session_events.jsonl."""
+    """Parse and normalize ``session_events.jsonl`` records.
+
+    ``RuntimeTrace`` writes records as ``{"event": ..., "data": ...}``,
+    while older fixtures stored the data fields at the top level.  Keep the
+    latter shape working, but flatten the current shape and pair operation
+    records by their opaque operation id before consumers see them.
+    """
     path = session_dir / "raw" / "session_events.jsonl"
     if not path.exists():
         return []
-    return _jsonl_load(path)
+    text = _safe_read_text(path)
+    records = _parse_jsonl_lines(text)
+    # Keep a marker for a malformed deep-profile line so unavailable evidence
+    # is not mistaken for a clean run with no diagnostic event.
+    for line in text.splitlines():
+        if "sampling_deep_profile" in line:
+            try:
+                json.loads(line)
+            except Exception:
+                records.append({"event_type": "sampling_deep_profile", "_malformed": True})
+    return _pair_session_events(records)
+
+
+def _session_timestamp_ms(record: Mapping[str, Any]) -> float | None:
+    """Convert a session record's wall-clock timestamp to milliseconds."""
+    for key in ("timestamp_ms", "start_ms", "time_ms", "wall_unix_ms"):
+        value = _safe_float(record.get(key), None)
+        if value is not None:
+            return value
+    timestamp = _safe_float(record.get("timestamp"), None)
+    return timestamp * 1000.0 if timestamp is not None else None
+
+
+def _normalize_session_event(record: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one current or legacy session-event record.
+
+    Missing timestamps and identifiers remain absent/``None``.  In
+    particular, a missing wall timestamp is not represented as epoch zero.
+    """
+    if not isinstance(record.get("data"), dict) or "event" not in record:
+        return dict(record)
+
+    event_type = str(record.get("event", ""))
+    data = dict(record["data"])
+    normalized = dict(data)
+    normalized["event"] = event_type
+    normalized["event_type"] = event_type
+    for key in ("timestamp", "timestamp_iso", "monotonic_ns"):
+        if key in record:
+            normalized[key] = record[key]
+
+    timestamp_ms = _session_timestamp_ms(record)
+    if timestamp_ms is not None:
+        normalized.setdefault("timestamp_ms", timestamp_ms)
+        normalized.setdefault("time_ms", timestamp_ms)
+
+    # The runtime calls this field native_thread_id and uses asyncio_task_id;
+    # report consumers use the shorter context names used by VizTracer calls.
+    if "tid" not in normalized and "native_thread_id" in normalized:
+        normalized["tid"] = normalized["native_thread_id"]
+    if "task_id" not in normalized and "asyncio_task_id" in normalized:
+        normalized["task_id"] = str(normalized["asyncio_task_id"])
+    if "metadata" in normalized and "args" not in normalized and isinstance(normalized["metadata"], dict):
+        normalized["args"] = normalized["metadata"]
+    return normalized
+
+
+def _pair_session_events(records: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten session events and pair operation starts/ends by operation id."""
+    normalized = [_normalize_session_event(record) for record in records]
+    pending: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    replacements: dict[int, dict[str, Any]] = {}
+    consumed_end_indexes: set[int] = set()
+
+    for index, record in enumerate(normalized):
+        event_type = str(record.get("event_type", record.get("event", "")))
+        operation_id = record.get("operation_id")
+        if not operation_id:
+            continue
+        operation_id = str(operation_id)
+        if event_type == "operation_start":
+            pending[operation_id].append((index, record))
+            continue
+        if event_type != "operation_end":
+            continue
+
+        starts = pending.get(operation_id, [])
+        if not starts:
+            # Retain an unmatched end as incomplete evidence.
+            continue
+        start_index, start = starts.pop(0)
+        consumed_end_indexes.add(index)
+        paired = dict(start)
+        paired["event"] = "operation"
+        paired["event_type"] = "operation"
+        paired["operation_id"] = operation_id
+        paired["operation_end"] = dict(record)
+
+        # End metadata is authoritative for completion/status, but does not
+        # replace the start timestamp or start-side operation identity.
+        for key in ("operation_type", "semantic_key_hash", "request_id", "restore_session_id",
+                    "pid", "tid", "task_id"):
+            if paired.get(key) in (None, "") and record.get(key) not in (None, ""):
+                paired[key] = record[key]
+        if isinstance(start.get("metadata"), dict) or isinstance(record.get("metadata"), dict):
+            metadata = dict(start.get("metadata") or {})
+            metadata.update(record.get("metadata") or {})
+            paired["metadata"] = metadata
+            paired.setdefault("args", metadata)
+        paired["status"] = record.get("status") or start.get("status", "started")
+        paired["end_monotonic_ns"] = record.get("end_monotonic_ns")
+        paired["end_timestamp_ms"] = _session_timestamp_ms(record)
+
+        start_ms = _session_timestamp_ms(start)
+        end_ms = _session_timestamp_ms(record)
+        if end_ms is None:
+            end_ms = _safe_float(record.get("end_ms"), None)
+        duration_ms = _safe_float(record.get("wall_ms"), None)
+        if duration_ms is None and start_ms is not None and end_ms is not None:
+            duration_ms = end_ms - start_ms
+        paired["wall_ms"] = duration_ms
+        paired["start_ms"] = start_ms
+        paired["timestamp_ms"] = start_ms
+        paired["time_ms"] = start_ms
+        paired["duration_ms"] = duration_ms
+        paired["end_ms"] = end_ms if end_ms is not None else (
+            start_ms + duration_ms if start_ms is not None and duration_ms is not None else None
+        )
+        paired["complete"] = (
+            start_ms is not None
+            and paired["end_ms"] is not None
+            and duration_ms is not None
+        )
+        replacements[start_index] = paired
+
+    result: list[dict[str, Any]] = []
+    for index, record in enumerate(normalized):
+        if index in consumed_end_indexes:
+            continue
+        if str(record.get("event_type", record.get("event", ""))) == "operation_end":
+            # An end without its matching start is retained, but its end
+            # timestamp must never be mistaken for a fabricated start.
+            record = dict(record)
+            end_timestamp_ms = _session_timestamp_ms(record)
+            if end_timestamp_ms is None:
+                end_timestamp_ms = _safe_float(record.get("end_ms"), None)
+            record["start_ms"] = None
+            record["timestamp_ms"] = None
+            record["time_ms"] = None
+            record["duration_ms"] = None
+            record["end_ms"] = end_timestamp_ms
+            record["complete"] = False
+        result.append(replacements.get(index, record))
+    return result
 
 
 def _parse_wrapper_snapshots(session_dir: Path) -> list[dict[str, Any]]:
@@ -461,14 +628,93 @@ def _parse_trace_config(session_dir: Path) -> dict[str, Any]:
 
 
 def _parse_runtime_result_summary(session_dir: Path) -> dict[str, Any]:
-    """Parse runtime_result_summary.json."""
+    """Parse the scalar summary and merge its raw invocation-owned telemetry.
+
+    Full-trace finalization intentionally strips nested values from
+    ``runtime_result_summary.json``.  Golden telemetry therefore has a
+    separate raw artifact, whose contents are authoritative for report-time
+    sampling/E27 projection.
+    """
     path = session_dir / "raw" / "runtime_result_summary.json"
-    if not path.exists():
-        return {}
-    data = _json_load(path)
-    if isinstance(data, dict):
-        return data
-    return {}
+    data: dict[str, Any] = {}
+    if path.is_file():
+        loaded = _json_load(path)
+        if isinstance(loaded, dict):
+            data = loaded
+
+    def telemetry_document(value: Any, depth: int = 0) -> Mapping[str, Any] | None:
+        """Find a Golden telemetry document without flattening its payload."""
+        if depth > 6:
+            return None
+        if isinstance(value, (list, tuple)):
+            for child in value[:64]:
+                found = telemetry_document(child, depth + 1)
+                if found is not None:
+                    return found
+            return None
+        if not isinstance(value, Mapping):
+            return None
+        nested = value.get("golden_telemetry")
+        if isinstance(nested, Mapping):
+            return nested
+        # golden_telemetry.json is normally the document itself.  Cohort
+        # envelopes may instead put it under result/data/payload.
+        for key in ("result", "data", "payload", "attempt", "runtime_result"):
+            found = telemetry_document(value.get(key), depth + 1)
+            if found is not None:
+                return found
+        if value.get("schema") == "golden_p1_telemetry_v1" or any(
+            key in value for key in ("events", "stages", "node_timing_records")
+        ):
+            return value
+        return None
+
+    def merge_documents(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge copied telemetry documents while retaining all event lists."""
+        merged = dict(left)
+        for key, value in right.items():
+            previous = merged.get(key)
+            if isinstance(previous, list) and isinstance(value, list):
+                merged[key] = [*previous, *value]
+            elif isinstance(previous, Mapping) and isinstance(value, Mapping):
+                merged[key] = merge_documents(previous, value)
+            elif key not in merged or previous is None:
+                merged[key] = value
+        return merged
+
+    telemetry_documents: list[Mapping[str, Any]] = []
+    summary_telemetry = telemetry_document(data.get("golden_telemetry"))
+    if summary_telemetry is not None:
+        telemetry_documents.append(summary_telemetry)
+    telemetry_path = session_dir / "raw" / "golden_telemetry.json"
+    if telemetry_path.is_file():
+        telemetry = telemetry_document(_json_load(telemetry_path))
+        if telemetry is not None:
+            telemetry_documents.append(telemetry)
+
+    # Golden runs persist their complete runtime result in the invocation-owned
+    # cohort envelope rather than in the generic full-trace raw layout.  Keep
+    # this fallback local to report generation; it does not alter instrumentation
+    # or synthesize trace events.  Do this even when the scalar summary exists:
+    # the sanitized summary is deliberately not the authority for rich evidence.
+    for attempt_path in sorted(session_dir.glob("attempt_*.json")):
+        if (
+            not attempt_path.is_file()
+            or attempt_path.name.endswith("_events.json")
+            or attempt_path.name.endswith(".json.v2ctl-provenance.json")
+        ):
+            continue
+        attempt = _json_load(attempt_path)
+        telemetry = telemetry_document(attempt)
+        if telemetry is not None:
+            telemetry_documents.append(telemetry)
+
+    if telemetry_documents:
+        telemetry = telemetry_documents[0]
+        for document in telemetry_documents[1:]:
+            telemetry = merge_documents(telemetry, document)
+        data["golden_telemetry"] = telemetry
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -736,21 +982,22 @@ def _reconstruct_parents(calls: list[dict[str, Any]]) -> None:
                 stack.append(c)
 
         # Mark ambiguous parenthood: if a call has same start and duration as
-        # its parent, that's an ambiguous nesting (likely concurrent sibling)
+        # its parent, that's an ambiguous nesting (likely concurrent sibling).
+        # Index the group once: a per-call scan here is quadratic and a real
+        # Golden trace puts 100k+ calls in a single group.
+        by_event_index = {c["event_index"]: c for c in group}
         for c in group:
             pi = c.get("parent_event_index")
-            if pi is not None:
-                parent = None
-                for other in group:
-                    if other["event_index"] == pi:
-                        parent = other
-                        break
-                if parent is not None:
-                    if (abs(c["start_us"] - parent["start_us"]) < 0.001 and
-                            abs(c["duration_us"] - parent["duration_us"]) < 0.001):
-                        c["parent_event_index"] = None
-                        c["parent_name"] = ""
-                        c["depth"] = 0
+            if pi is None:
+                continue
+            parent = by_event_index.get(pi)
+            if parent is None:
+                continue
+            if (abs(c["start_us"] - parent["start_us"]) < 0.001 and
+                    abs(c["duration_us"] - parent["duration_us"]) < 0.001):
+                c["parent_event_index"] = None
+                c["parent_name"] = ""
+                c["depth"] = 0
 
 
 def _detect_stack_inconsistencies(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -759,29 +1006,35 @@ def _detect_stack_inconsistencies(calls: list[dict[str, Any]]) -> list[dict[str,
     Returns a list of issue dicts with event_index and description.
     """
     issues: list[dict[str, Any]] = []
+    # Index event_index once.  This used to rescan every call for every call --
+    # O(n^2), which on a 1.26M-event Golden request is ~1.6e12 comparisons and
+    # dominated the entire analysis by hours.  First match wins, as before.
+    by_index: dict[Any, dict[str, Any]] = {}
+    for other in calls:
+        ei = other.get("event_index")
+        if ei is not None and ei not in by_index:
+            by_index[ei] = other
     for c in calls:
         pi = c.get("parent_event_index")
-        if pi is not None:
-            found = False
-            for other in calls:
-                if other["event_index"] == pi:
-                    found = True
-                    if (other.get("end_us") is not None
-                            and c.get("start_us") is not None
-                            and other["end_us"] < c["start_us"]):
-                        issues.append({
-                            "event_index": c["event_index"],
-                            "description": (
-                                f"Child {c['name']} starts at {c['start_us']}us "
-                                f"after parent {other['name']} ends at {other['end_us']}us"
-                            ),
-                        })
-                    break
-            if not found:
-                issues.append({
-                    "event_index": c["event_index"],
-                    "description": f"Parent index {pi} not found for {c['name']}",
-                })
+        if pi is None:
+            continue
+        other = by_index.get(pi)
+        if other is None:
+            issues.append({
+                "event_index": c["event_index"],
+                "description": f"Parent index {pi} not found for {c['name']}",
+            })
+            continue
+        if (other.get("end_us") is not None
+                and c.get("start_us") is not None
+                and other["end_us"] < c["start_us"]):
+            issues.append({
+                "event_index": c["event_index"],
+                "description": (
+                    f"Child {c['name']} starts at {c['start_us']}us "
+                    f"after parent {other['name']} ends at {other['end_us']}us"
+                ),
+            })
     return issues
 
 
@@ -949,9 +1202,14 @@ def _build_critical_timeline(
             "evidence_source": evidence,
         })
 
-    # Add semantic operations from session events
+    # Add semantic operations from session events.  Paired RuntimeTrace
+    # records have operation_type; lifecycle records (mark/state transition)
+    # are emitted separately below so they are not misclassified as semantic
+    # operations.
     for ev in sessions:
         op_type = str(ev.get("operation_type", ev.get("event_type", "")))
+        if not ev.get("operation_type"):
+            continue
         start_ms_raw = next((ev[k] for k in ("start_ms", "timestamp_ms", "time_ms") if k in ev), None)
         duration_raw = ev.get("duration_ms") if "duration_ms" in ev else None
         start_ms = _safe_float(start_ms_raw, None)
@@ -960,8 +1218,8 @@ def _build_critical_timeline(
             continue
         if dur_ms is None:
             dur_ms = 0.0
-        pid = _safe_int(ev.get("pid", 0))
-        tid = _safe_int(ev.get("tid", 0))
+        pid = _safe_int(ev.get("pid"), None)
+        tid = _safe_int(ev.get("tid"), None)
         task_id = str(ev.get("task_id", ""))
         phase = str(ev.get("phase", ""))
         timeline.append({
@@ -975,6 +1233,48 @@ def _build_critical_timeline(
             "task_id": task_id,
             "parent": "",
             "lifecycle_phase": phase,
+            "evidence_source": "session_events",
+        })
+
+    # Current RuntimeTrace lifecycle evidence is also wrapped in
+    # session_events.jsonl.  Keep it as point evidence without inventing a
+    # duration or a missing timestamp.
+    for ev in sessions:
+        if ev.get("operation_type"):
+            continue
+        event_type = str(ev.get("event_type", ev.get("event", "")))
+        if event_type not in {"mark", "state_transition", "request_claimed", "identity_updated"}:
+            continue
+        start_ms = _safe_float(
+            next((ev[k] for k in ("timestamp_ms", "time_ms") if k in ev), None),
+            None,
+        )
+        if start_ms is None:
+            continue
+        name = str(ev.get("name", ""))
+        if not name and event_type == "state_transition":
+            name = str(ev.get("to", event_type))
+        if not name:
+            name = event_type
+        pid = _safe_int(ev.get("pid"), None)
+        tid = _safe_int(ev.get("tid"), None)
+        timeline.append({
+            "start_ms": round(start_ms, 3),
+            "end_ms": round(start_ms, 3),
+            "duration_ms": 0.0,
+            "owner_type": "milestone" if event_type == "mark" else "lifecycle",
+            "owner_name": name,
+            "pid": pid,
+            "tid": tid,
+            "task_id": str(ev.get("task_id", "")),
+            "parent": "",
+            "lifecycle_phase": str(
+                ev.get(
+                    "phase",
+                    (ev.get("metadata", {}).get("phase", event_type)
+                     if isinstance(ev.get("metadata"), dict) else event_type),
+                )
+            ),
             "evidence_source": "session_events",
         })
 
@@ -1155,6 +1455,9 @@ def _compute_semantic_key_hash(event: dict[str, Any]) -> str:
     Uses canonical JSON encoding of the event's key, semantic_key, or identity
     args if present.  Falls back to name + operation_type if no explicit key.
     """
+    explicit_hash = event.get("semantic_key_hash")
+    if isinstance(explicit_hash, str) and explicit_hash:
+        return explicit_hash
     args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
     for key_field in ("key", "semantic_key", "identity"):
         val = args.get(key_field)
@@ -1175,8 +1478,8 @@ def _extract_request_session_ids(
 ) -> tuple[str, str]:
     """Extract request_id and restore_session_id from event args or config."""
     args = event.get("args", {}) if isinstance(event.get("args"), dict) else {}
-    req = str(args.get("request_id", trace_config.get("request_id", "")))
-    sess = str(args.get("restore_session_id", trace_config.get("restore_session_id", "")))
+    req = str(event.get("request_id", args.get("request_id", trace_config.get("request_id", ""))))
+    sess = str(event.get("restore_session_id", args.get("restore_session_id", trace_config.get("restore_session_id", ""))))
     return req, sess
 
 
@@ -1207,13 +1510,22 @@ def _build_semantic_ops(
                 "pid": c.get("pid"),
                 "tid": c.get("tid"),
                 "task_id": c.get("task_id", ""),
+                "complete": bool(c.get("complete", True)),
             })
     for ev in sessions:
         op_type = str(ev.get("operation_type", ""))
         if op_type:
-            start_ms = _safe_float(ev.get("start_ms", 0.0), 0.0)
-            dur_ms = _safe_float(ev.get("duration_ms", 0.0), 0.0)
-            start_us = start_ms * 1000.0
+            start_ms = _safe_float(
+                next((ev[k] for k in ("start_ms", "timestamp_ms", "time_ms") if k in ev), None),
+                None,
+            )
+            dur_ms = _safe_float(ev.get("duration_ms"), None)
+            if start_ms is None:
+                start_us = None
+                end_us = None
+            else:
+                start_us = start_ms * 1000.0
+                end_us = start_us + dur_ms * 1000.0 if dur_ms is not None else None
             req, sess = _extract_request_session_ids(ev, trace_config)
             sk_hash = _compute_semantic_key_hash(ev)
             ops.append({
@@ -1224,11 +1536,15 @@ def _build_semantic_ops(
                 "source": "session_event",
                 "name": str(ev.get("name", "")),
                 "start_us": start_us,
-                "end_us": start_us + dur_ms * 1000.0,
-                "duration_us": dur_ms * 1000.0,
-                "pid": _safe_int(ev.get("pid", 0)),
-                "tid": _safe_int(ev.get("tid", 0)),
+                "end_us": end_us,
+                "duration_us": dur_ms * 1000.0 if dur_ms is not None else None,
+                "pid": _safe_int(ev.get("pid"), None),
+                "tid": _safe_int(ev.get("tid"), None),
                 "task_id": str(ev.get("task_id", "")),
+                # Legacy semantic fixtures predate the paired-operation
+                # completeness marker; their valid measured interval remains
+                # complete unless the parser explicitly marked it otherwise.
+                "complete": bool(ev.get("complete", True)),
             })
     return ops
 
@@ -2254,8 +2570,8 @@ def _build_async_tasks(
         task_id = str(ev.get("task_id", ""))
         if not task_id:
             return
+        ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms")), None)
         if task_id not in tasks:
-            ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms", 0.0)), 0.0)
             tasks[task_id] = {
                 "task_id": task_id,
                 "task_name": str(ev.get("task_name", ev.get("name", ""))),
@@ -2263,7 +2579,7 @@ def _build_async_tasks(
                 "cancelled": False,
                 "coroutine_qualname": str(ev.get("coroutine_name", ev.get("coroutine_qualname", ""))),
                 "top_stack_file": str(ev.get("stack_file", "")),
-                "top_stack_line": _safe_int(ev.get("stack_line", 0)),
+                "top_stack_line": _safe_int(ev.get("stack_line"), None),
                 "top_stack_function": str(ev.get("stack_function", "")),
                 "first_seen_ms": ts,
                 "last_seen_ms": ts,
@@ -2271,14 +2587,20 @@ def _build_async_tasks(
                 "source": event_source,
             }
         entry = tasks[task_id]
-        ts = _safe_float(ev.get("timestamp_ms", ev.get("wall_unix_ms", 0.0)), 0.0)
-        entry["last_seen_ms"] = max(entry["last_seen_ms"], ts)
+        if ts is not None:
+            entry["last_seen_ms"] = (
+                ts if entry["last_seen_ms"] is None
+                else max(entry["last_seen_ms"], ts)
+            )
         if ev.get("done"):
             entry["done"] = True
         if ev.get("cancelled"):
             entry["cancelled"] = True
-        if ev.get("milestone_start"):
-            entry["first_seen_ms"] = min(entry["first_seen_ms"], ts)
+        if ev.get("milestone_start") and ts is not None:
+            entry["first_seen_ms"] = (
+                ts if entry["first_seen_ms"] is None
+                else min(entry["first_seen_ms"], ts)
+            )
 
         # Check boundary crossing
         for bname in LIFECYCLE_BOUNDARIES:
@@ -2304,11 +2626,1636 @@ def _build_async_tasks(
             "top_stack_file": info["top_stack_file"],
             "top_stack_line": info["top_stack_line"],
             "top_stack_function": info["top_stack_function"],
-            "first_seen_ms": round(info["first_seen_ms"], 3),
-            "last_seen_ms": round(info["last_seen_ms"], 3),
+            "first_seen_ms": (
+                round(info["first_seen_ms"], 3)
+                if info["first_seen_ms"] is not None else MEASUREMENT_UNAVAILABLE
+            ),
+            "last_seen_ms": (
+                round(info["last_seen_ms"], 3)
+                if info["last_seen_ms"] is not None else MEASUREMENT_UNAVAILABLE
+            ),
             "boundaries_crossed": ";".join(info["boundaries_crossed"]),
         })
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Sampling deep-profile evidence
+# ---------------------------------------------------------------------------
+
+
+def _normalize_clip_module_records(runtime_result: dict[str, Any]) -> dict[str, Any]:
+    """Promote CLIP module spans to the report's renderer-facing result tree.
+
+    Golden telemetry keeps this payload with its owning interval, under
+    ``details.clip_forward_decomposition``.  That is a good producer shape,
+    but it is easy for envelope serializers to hide from consumers that start
+    at ``runtime_result``.  Normalize only explicit module boundaries; a
+    duration without both endpoints remains non-temporal evidence.
+    """
+    decompositions: list[Mapping[str, Any]] = []
+    producer_present = False
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal producer_present
+        if depth > 10 or not isinstance(value, (Mapping, list, tuple)):
+            return
+        if isinstance(value, Mapping):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            decomposition = value.get("clip_forward_decomposition")
+            if isinstance(decomposition, Mapping):
+                producer_present = True
+                decompositions.append(decomposition)
+            # The recorder persists the envelope as
+            # ``clip_forward_timing.decomposition``.  The standalone
+            # ``clip_forward_decomposition`` event is only a second copy when
+            # diagnostics are enabled, so accept both producer handoffs
+            # without treating an absent optional producer as an ingest error.
+            timing = value.get("clip_forward_timing")
+            if isinstance(timing, Mapping):
+                nested = timing.get("decomposition")
+                if isinstance(nested, Mapping):
+                    producer_present = True
+                    decompositions.append(nested)
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child, depth + 1)
+        else:
+            for child in value[:256]:
+                visit(child, depth + 1)
+
+    visit(runtime_result)
+    normalized: list[dict[str, Any]] = []
+    seen_records: set[str] = set()
+    invalid_count = 0
+    for decomposition in decompositions:
+        raw_records = decomposition.get("module_records")
+        if not isinstance(raw_records, list):
+            invalid_count += 1
+            continue
+        for record in raw_records[:256]:
+            if not isinstance(record, Mapping):
+                invalid_count += 1
+                continue
+            start = _sampling_number(
+                record.get("start_monotonic_ns", record.get("start_ns"))
+            )
+            end = _sampling_number(
+                record.get("end_monotonic_ns", record.get("end_ns"))
+            )
+            if start is None or end is None or end <= start:
+                invalid_count += 1
+                continue
+            # The explicit endpoints are the temporal authority.  Preserve a
+            # producer duration only as a diagnostic comparison; never let a
+            # stale summary duration change the plotted wall.
+            duration_ns = end - start
+            recorded_duration_ns = _sampling_number(record.get("duration_ns"))
+            name = str(
+                record.get("module_path")
+                or record.get("qualified_name")
+                or record.get("module_name")
+                or record.get("name")
+                or "module"
+            )
+            module_name = str(record.get("module_name") or record.get("name") or name)
+            clock = str(
+                record.get("clock")
+                or record.get("clock_domain")
+                or decomposition.get("clock")
+                or "perf_counter_ns"
+            )
+            item = {
+                "name": name,
+                "module_path": name,
+                "module_name": module_name,
+                "qualified_name": str(record.get("qualified_name") or name),
+                "start_ns": start,
+                "end_ns": end,
+                "start_monotonic_ns": start,
+                "end_monotonic_ns": end,
+                "duration_ns": duration_ns,
+                "duration_ms": round(duration_ns / 1_000_000.0, 3),
+                "wall_ms": round(duration_ns / 1_000_000.0, 3),
+                "clock": clock,
+                "clock_domain": clock,
+                "boundary_kind": record.get("boundary_kind", "host_observed_inclusive"),
+            }
+            if recorded_duration_ns is not None and recorded_duration_ns != duration_ns:
+                item["recorded_duration_ns"] = recorded_duration_ns
+            try:
+                identity = json.dumps(
+                    (item["qualified_name"], item["start_ns"], item["end_ns"]),
+                    separators=(",", ":"),
+                )
+            except Exception:
+                identity = ""
+            if identity and identity in seen_records:
+                continue
+            if identity:
+                seen_records.add(identity)
+            normalized.append(item)
+
+    if not producer_present:
+        status = "producer_absent"
+    elif invalid_count:
+        status = "ingest_failure"
+    else:
+        status = "available"
+    promoted = runtime_result.get("clip_forward_decomposition")
+    promoted = dict(promoted) if isinstance(promoted, Mapping) else {}
+    promoted["module_records"] = normalized
+    promoted["module_records_status"] = status
+    promoted["module_records_producer_present"] = producer_present
+    promoted["module_records_ingest_error_count"] = invalid_count
+    runtime_result["clip_forward_decomposition"] = promoted
+    # Keep the status easy to inspect without requiring consumers to know the
+    # producer's nesting, while retaining the full normalized record list in
+    # the decomposition object above.
+    runtime_result["clip_module_records_status"] = status
+    runtime_result["clip_module_records_producer_present"] = producer_present
+    return promoted
+
+
+def _normalize_node_timing_records(runtime_result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Promote explicit Golden runner node windows into report data."""
+    raw_records: list[Mapping[str, Any]] = []
+    producer_present = False
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal producer_present
+        if depth > 10 or not isinstance(value, (Mapping, list, tuple)):
+            return
+        if isinstance(value, Mapping):
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            records = value.get("node_timing_records")
+            if isinstance(records, list):
+                producer_present = True
+                raw_records.extend(item for item in records if isinstance(item, Mapping))
+            for child in value.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    visit(child, depth + 1)
+        else:
+            for child in value[:256]:
+                visit(child, depth + 1)
+
+    visit(runtime_result)
+    normalized: list[dict[str, Any]] = []
+    seen_records: set[str] = set()
+    invalid_count = 0
+    for record in raw_records[:512]:
+        start = _sampling_number(record.get("start_monotonic_ns", record.get("start_ns")))
+        end = _sampling_number(record.get("end_monotonic_ns", record.get("end_ns")))
+        # A persisted node record may already carry the report-axis endpoints.
+        # Prefer those explicit endpoints when the monotonic copy is absent;
+        # never derive an endpoint from duration alone.
+        axis_start = _sampling_number(record.get("start_ms"))
+        axis_end = _sampling_number(record.get("end_ms"))
+        if start is None or end is None or end <= start:
+            if axis_start is None or axis_end is None or axis_end <= axis_start:
+                invalid_count += 1
+                continue
+            start = axis_start * 1_000_000.0
+            end = axis_end * 1_000_000.0
+        class_type = str(record.get("class_type") or record.get("node_class") or record.get("name") or "node")
+        node_id = str(record.get("node_id") or record.get("id") or "")
+        clock = str(
+            record.get("clock")
+            or record.get("clock_domain")
+            or ("host_monotonic" if axis_start is not None else "host_monotonic")
+        )
+        item = {
+            "node_id": node_id,
+            "class_type": class_type,
+            "name": class_type,
+            "start_ns": start,
+            "end_ns": end,
+            "start_monotonic_ns": start,
+            "end_monotonic_ns": end,
+            "duration_ns": end - start,
+            "duration_ms": round((end - start) / 1_000_000.0, 3),
+            "wall_ms": round((end - start) / 1_000_000.0, 3),
+            "clock": clock,
+            "clock_domain": clock,
+            "pass_outcome": record.get("pass_outcome", "UNKNOWN"),
+        }
+        if axis_start is not None and axis_end is not None:
+            item["start_ms"] = axis_start
+            item["end_ms"] = axis_end
+        else:
+            item["start_ms"] = round(start / 1_000_000.0, 3)
+            item["end_ms"] = round(end / 1_000_000.0, 3)
+        identity = json.dumps(
+            (node_id, class_type, item["start_ns"], item["end_ns"]),
+            separators=(",", ":"),
+        )
+        if identity in seen_records:
+            continue
+        seen_records.add(identity)
+        normalized.append(item)
+
+    runtime_result["node_timing_records"] = normalized
+    runtime_result["node_timing_records_status"] = (
+        "producer_absent" if not producer_present else (
+            "ingest_failure" if invalid_count else "available"
+        )
+    )
+    runtime_result["node_timing_records_producer_present"] = producer_present
+    runtime_result["node_timing_records_ingest_error_count"] = invalid_count
+    return normalized
+
+
+def _sampling_profile_name(record: Mapping[str, Any]) -> bool:
+    """Return whether *record* names the persisted deep-profile event."""
+    for key in ("event_type", "event", "name"):
+        value = record.get(key)
+        if value:
+            return str(value) == "sampling_deep_profile"
+    return False
+
+
+def _sampling_profile_payload(record: Mapping[str, Any]) -> Any:
+    """Extract an artifact from RuntimeTrace or GoldenTelemetry event shapes."""
+    pending: list[Mapping[str, Any]] = [record]
+    seen: set[int] = set()
+    wrapper_keys = (
+        "data", "fields", "metadata", "args", "payload", "artifact",
+        "sampling_deep_profile", "sampling_profile", "decomposition", "result",
+        "value",
+    )
+    while pending and len(seen) < 64:
+        container = pending.pop(0)
+        if id(container) in seen:
+            continue
+        seen.add(id(container))
+        if all(key in container for key in ("schema_version", "level", "status")):
+            return container
+        if any(key in container for key in ("schema_version", "level", "status", "steps", "evals")):
+            # Prefer a nested, richer artifact when this is only an event
+            # envelope, but retain this mapping as a valid final fallback.
+            fallback = container
+        else:
+            fallback = None
+        for key in wrapper_keys:
+            value = container.get(key)
+            if isinstance(value, Mapping):
+                pending.append(value)
+            elif isinstance(value, str):
+                parsed = _json_loads(value)
+                if isinstance(parsed, Mapping):
+                    pending.append(parsed)
+        if fallback is not None and not pending:
+            return fallback
+    return None
+
+
+def _sampling_profile_event_records(
+    sessions: Sequence[dict[str, Any]], runtime_result: Mapping[str, Any],
+) -> list[tuple[Any, str]]:
+    """Collect session-event and Golden telemetry copies without touching calls."""
+    candidates: list[tuple[Any, str]] = []
+    for event in sessions:
+        if _sampling_profile_name(event):
+            candidates.append((_sampling_profile_payload(event), "session_events"))
+
+    # GoldenTelemetryRecorder.to_json_dict() is normally carried by the runtime
+    # result summary.  Walk only that telemetry/event domain; deep-profile data
+    # is evidence, never an input to VizTracer accounting.
+    telemetry = runtime_result.get("golden_telemetry") if isinstance(runtime_result, Mapping) else None
+    if telemetry is None and isinstance(runtime_result, Mapping):
+        telemetry = runtime_result.get("telemetry")
+
+    def visit(value: Any, path: str, depth: int = 0) -> None:
+        if depth > 8 or not isinstance(value, (Mapping, list, tuple)):
+            return
+        if isinstance(value, Mapping):
+            if _sampling_profile_name(value):
+                candidates.append((_sampling_profile_payload(value), f"golden_telemetry:{path}"))
+                return
+            for key, child in value.items():
+                if key in {
+                    "events", "golden_telemetry", "telemetry", "stages", "details",
+                    "fields", "data", "metadata", "payload", "artifact",
+                    "decomposition", "sampling_profile", "sampling_diagnostics", "result",
+                }:
+                    visit(child, f"{path}.{key}", depth + 1)
+        else:
+            for index, child in enumerate(value[:256]):
+                visit(child, f"{path}[{index}]", depth + 1)
+
+    if telemetry is not None:
+        visit(telemetry, "golden_telemetry")
+    return candidates
+
+
+def _sampling_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    return _safe_float(value, None)
+
+
+def _sampling_interval_bounds(value: Mapping[str, Any]) -> tuple[float | None, float | None]:
+    """Read explicit nanosecond endpoints after JSON envelope nesting."""
+    containers: list[Mapping[str, Any]] = [value]
+    for key in ("interval", "timing", "temporal"):
+        child = value.get(key)
+        if isinstance(child, Mapping):
+            containers.append(child)
+    start: float | None = None
+    end: float | None = None
+    for container in containers:
+        if start is None:
+            for key in ("start_monotonic_ns", "start_ns"):
+                start = _sampling_number(container.get(key))
+                if start is not None:
+                    break
+        if end is None:
+            for key in ("end_monotonic_ns", "end_ns"):
+                end = _sampling_number(container.get(key))
+                if end is not None:
+                    break
+    return start, end
+
+
+def _sampling_window_endpoint(payload: Mapping[str, Any], side: str) -> float | None:
+    names = (
+        f"sampling_window_{side}_monotonic_ns",
+        f"sampling_window_{side}_ns",
+    )
+    for name in names:
+        value = _sampling_number(payload.get(name))
+        if value is not None:
+            return value
+    window = payload.get("sampling_window")
+    if isinstance(window, Mapping):
+        for name in (f"{side}_monotonic_ns", f"{side}_ns"):
+            value = _sampling_number(window.get(name))
+            if value is not None:
+                return value
+    return None
+
+
+def _sampling_metric(payload: Mapping[str, Any], *names: str) -> tuple[float | None, str]:
+    """Read a metric from established payload locations, without zero filling."""
+    locations: list[tuple[str, Mapping[str, Any]]] = [("payload", payload)]
+    for parent_name in ("reconciliation", "sampler_invocation", "summary"):
+        parent = payload.get(parent_name)
+        if isinstance(parent, Mapping):
+            locations.append((parent_name, parent))
+    for name in names:
+        for location, container in locations:
+            if name in container:
+                return _sampling_number(container.get(name)), f"{location}.{name}"
+    return None, ""
+
+
+def _sampling_steps(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    reconciliation = payload.get("reconciliation")
+    for container in (reconciliation, payload):
+        if isinstance(container, Mapping):
+            value = container.get("steps_ms")
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, Mapping)]
+    return []
+
+
+def _build_sampling_step_breakdown(profiles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    summary_names = (
+        ("FIRST_PASS_WALL_MS", "first_pass_wall_ms"),
+        ("SUBSEQUENT_STEPS_WALL_MS", "subsequent_steps_wall_ms"),
+        ("TOTAL_STEP_UNION_MS", "total_step_union_ms"),
+        ("SAMPLER_PARENT_WALL_MS", "sampler_parent_wall_ms"),
+        ("UNACCOUNTED_MS", "unaccounted_ms"),
+    )
+    for profile_index, record in enumerate(profiles):
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        recon = payload.get("reconciliation") if isinstance(payload.get("reconciliation"), Mapping) else {}
+        setup, setup_source = _sampling_metric(payload, "setup_ms", "setup_to_first_eval_ms")
+        finalization, final_source = _sampling_metric(payload, "teardown_ms", "finalization_ms")
+        if setup is not None:
+            rows.append({"profile_index": profile_index, "kind": "setup", "label": "setup", "wall_ms": round(setup, 3), "source": setup_source})
+        steps = _sampling_steps(payload)
+        numeric_totals: list[float] = []
+        for step in steps:
+            row = {"profile_index": profile_index, "kind": "step", "label": f"step {step.get('step', len(numeric_totals))}", "source": "reconciliation.steps_ms"}
+            for key in ("step", "pre_model_ms", "eval0_ms", "gap_ms", "eval1_ms", "post_model_ms", "total_ms", "residual_ms"):
+                if key in step:
+                    row[key] = step.get(key)
+            total = _sampling_number(step.get("total_ms"))
+            if total is not None:
+                numeric_totals.append(total)
+                row["wall_ms"] = round(total, 3)
+            else:
+                row["wall_ms"] = MEASUREMENT_UNAVAILABLE
+            rows.append(row)
+        if finalization is not None:
+            final_row: dict[str, Any] = {
+                "profile_index": profile_index,
+                "kind": "finalization",
+                "label": "finalization",
+                "wall_ms": round(finalization, 3),
+                "source": final_source,
+            }
+            final_eval = recon.get("teardown_final_eval_ms")
+            if final_eval is not None:
+                final_row["teardown_final_eval_ms"] = final_eval
+            rows.append(final_row)
+
+        # These labels are emitted even when unavailable.  In particular, row
+        # zero is not treated as a first pass unless the producer recorded that
+        # semantic explicitly.
+        for display_name, raw_name in summary_names:
+            value, source = _sampling_metric(payload, display_name, raw_name)
+            if value is None and not source and display_name == "SAMPLER_PARENT_WALL_MS":
+                value, source = _sampling_metric(payload, "authoritative_sampling_window_ms", "sampling_total_ms")
+            if value is None and not source and display_name == "UNACCOUNTED_MS":
+                value, source = _sampling_metric(payload, "sampling_residual_ms", "post_loop_residual_ms")
+            rows.append({
+                "profile_index": profile_index,
+                "kind": "summary",
+                "label": display_name,
+                "wall_ms": round(value, 3) if value is not None else MEASUREMENT_UNAVAILABLE,
+                "source": source or MEASUREMENT_UNAVAILABLE,
+            })
+    return rows
+
+
+def _build_sampling_model_breakdown(profiles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for profile_index, record in enumerate(profiles):
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        evals = payload.get("evals")
+        per_eval = evals.get("per_eval") if isinstance(evals, Mapping) else []
+        if isinstance(per_eval, list):
+            for item in per_eval:
+                if not isinstance(item, Mapping):
+                    continue
+                base = {
+                    "profile_index": profile_index,
+                    "scope": "eval",
+                    "eval_index": item.get("index", MEASUREMENT_UNAVAILABLE),
+                    "step": item.get("step", MEASUREMENT_UNAVAILABLE),
+                    "row": item.get("row", MEASUREMENT_UNAVAILABLE),
+                    "timing_domain": "host_monotonic",
+                    "host_monotonic_ms": item.get("ms", MEASUREMENT_UNAVAILABLE),
+                    "cuda_device_ms": item.get("forward_gpu_ms", MEASUREMENT_UNAVAILABLE),
+                }
+                rows.append(base)
+                categories = item.get("categories_ms")
+                if isinstance(categories, Mapping):
+                    for category, value in sorted(categories.items(), key=lambda pair: str(pair[0])):
+                        rows.append({**base, "scope": "eval_category", "category": str(category), "host_monotonic_ms": value, "cuda_device_ms": MEASUREMENT_UNAVAILABLE})
+                blocks = item.get("blocks")
+                if isinstance(blocks, Mapping):
+                    blocks = [{"block": key, **(value if isinstance(value, Mapping) else {"total_ms": value})} for key, value in blocks.items()]
+                if isinstance(blocks, list):
+                    for block in blocks:
+                        if isinstance(block, Mapping):
+                            rows.append({**base, "scope": "eval_block", "block": block.get("block", MEASUREMENT_UNAVAILABLE), "host_monotonic_ms": block.get("total_ms", MEASUREMENT_UNAVAILABLE), "cuda_device_ms": MEASUREMENT_UNAVAILABLE, "attention_ms": block.get("attention_ms", MEASUREMENT_UNAVAILABLE), "mlp_ms": block.get("mlp_ms", MEASUREMENT_UNAVAILABLE), "norm_ms": block.get("norm_ms", MEASUREMENT_UNAVAILABLE)})
+
+        categories = payload.get("categories_ms")
+        if isinstance(categories, Mapping):
+            for category, value in sorted(categories.items(), key=lambda pair: str(pair[0])):
+                rows.append({"profile_index": profile_index, "scope": "aggregate_category", "category": str(category), "timing_domain": "host_monotonic", "host_monotonic_ms": value, "cuda_device_ms": MEASUREMENT_UNAVAILABLE})
+        blocks = payload.get("blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, Mapping):
+                    rows.append({"profile_index": profile_index, "scope": "aggregate_block", "block": block.get("block", MEASUREMENT_UNAVAILABLE), "timing_domain": "host_monotonic", "host_monotonic_ms": block.get("total_ms", MEASUREMENT_UNAVAILABLE), "cuda_device_ms": MEASUREMENT_UNAVAILABLE, "attention_ms": block.get("attention_ms", MEASUREMENT_UNAVAILABLE), "mlp_ms": block.get("mlp_ms", MEASUREMENT_UNAVAILABLE), "norm_ms": block.get("norm_ms", MEASUREMENT_UNAVAILABLE)})
+        cuda = payload.get("cuda_timings_ms")
+        if isinstance(cuda, Mapping):
+            for name, value in sorted(cuda.items(), key=lambda pair: str(pair[0])):
+                rows.append({"profile_index": profile_index, "scope": "cuda_device", "category": str(name), "timing_domain": "cuda_device_elapsed", "host_monotonic_ms": MEASUREMENT_UNAVAILABLE, "cuda_device_ms": value})
+    return rows
+
+
+def _build_human_sampling_model_breakdown(
+    deep: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Collapse deep model evidence into readable, non-authoritative rows."""
+    raw = deep.get("model_breakdown", [])
+    raw = raw if isinstance(raw, list) else []
+    has_eval_rows = any(
+        isinstance(row, Mapping) and str(row.get("scope", "")).startswith("eval")
+        for row in raw
+    )
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    non_additive = False
+    for row in raw:
+        if not isinstance(row, Mapping):
+            continue
+        scope = str(row.get("scope", "evidence"))
+        if has_eval_rows and scope.startswith("aggregate"):
+            continue
+        domain = str(row.get("timing_domain", "host_monotonic"))
+        if domain != "host_monotonic" or scope != "eval":
+            non_additive = True
+        phase = "evaluation"
+        if scope == "eval_category":
+            phase = str(row.get("category", "category"))
+        elif scope == "eval_block":
+            phase = "model_blocks"
+        elif scope in {"aggregate_category", "aggregate_block", "cuda_device"}:
+            phase = str(row.get("category", row.get("block", "aggregate")))
+        key = (
+            row.get("profile_index"), row.get("step", MEASUREMENT_UNAVAILABLE),
+            row.get("eval_index", MEASUREMENT_UNAVAILABLE), phase, domain,
+        )
+        item = groups.setdefault(key, {
+            "profile_index": row.get("profile_index", MEASUREMENT_UNAVAILABLE),
+            "step": row.get("step", MEASUREMENT_UNAVAILABLE),
+            "eval_index": row.get("eval_index", MEASUREMENT_UNAVAILABLE),
+            "row": row.get("row", MEASUREMENT_UNAVAILABLE),
+            "phase": phase,
+            "timing_domain": domain,
+            "count": 0,
+            "host_values": [],
+            "cuda_values": [],
+        })
+        item["count"] += 1
+        host = _sampling_number(row.get("host_monotonic_ms"))
+        cuda = _sampling_number(row.get("cuda_device_ms"))
+        if host is not None:
+            item["host_values"].append(host)
+        if cuda is not None:
+            item["cuda_values"].append(cuda)
+
+    result: list[dict[str, Any]] = []
+    for item in groups.values():
+        hosts = item.pop("host_values")
+        cuda = item.pop("cuda_values")
+        item["host_monotonic_ms"] = round(sum(hosts), 3) if hosts else MEASUREMENT_UNAVAILABLE
+        item["host_min_ms"] = round(min(hosts), 3) if hosts else MEASUREMENT_UNAVAILABLE
+        item["host_max_ms"] = round(max(hosts), 3) if hosts else MEASUREMENT_UNAVAILABLE
+        item["cuda_device_ms"] = round(sum(cuda), 3) if cuda else MEASUREMENT_UNAVAILABLE
+        item["sample_count"] = item.pop("count")
+        result.append(item)
+    result.sort(key=lambda row: (
+        str(row.get("profile_index")), str(row.get("step")),
+        str(row.get("eval_index")), str(row.get("phase")),
+    ))
+    return result, non_additive
+
+
+def _sampling_temporal_rows(
+    deep: Mapping[str, Any],
+    trace_config: Mapping[str, Any],
+    sampling_node: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return aligned per-evaluation intervals only.
+
+    A resource-sampler cadence is not a duration measurement and is never
+    used as a cap here.  Rows are drawable only when the producer recorded
+    explicit monotonic start/end timestamps *and* an explicit mapping from
+    that monotonic clock to the Golden sampling/VizTracer axis.
+    """
+    records = deep.get("records", [])
+    records = records if isinstance(records, list) else []
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        alignment = _sampling_clock_alignment(payload, sampling_node)
+        if alignment is None:
+            continue
+        evals = payload.get("evals")
+        per_eval = evals.get("per_eval") if isinstance(evals, Mapping) else []
+        if not isinstance(per_eval, list):
+            continue
+        for item in per_eval:
+            if not isinstance(item, Mapping):
+                continue
+            # A skipped evaluation may still have a wrapper lifecycle span,
+            # but it has no compute interval.  Do not turn that wrapper wall
+            # into a plotted evaluation row or imply work that did not run.
+            if str(item.get("compute_or_skip", "")).strip().lower() == "skip":
+                continue
+            start, end = _sampling_interval_bounds(item)
+            if start is None or end is None or end <= start:
+                continue
+            start_ms = alignment["to_golden_ms"](start)
+            end_ms = alignment["to_golden_ms"](end)
+            if start_ms is None or end_ms is None or end_ms <= start_ms:
+                continue
+            node_start = _sampling_number(sampling_node.get("start_ms")) if sampling_node else None
+            node_end = _sampling_number(sampling_node.get("end_ms")) if sampling_node else None
+            if node_start is not None and node_end is not None and (
+                end_ms < node_start or start_ms > node_end
+            ):
+                continue
+            rows.append({
+                "label": (
+                    f"eval step={item.get('step', MEASUREMENT_UNAVAILABLE)} "
+                    f"row={item.get('row', MEASUREMENT_UNAVAILABLE)}"
+                    + (
+                        f" [{item.get('compute_or_skip')}]"
+                        if item.get("compute_or_skip") else ""
+                    )
+                ),
+                "start_ms": round(start_ms, 3),
+                "end_ms": round(end_ms, 3),
+                "interval_ms": round((end - start) / 1_000_000.0, 3),
+                "source": "sampling_deep_profile.host_monotonic.aligned",
+            })
+        # ``timeline_steps`` is the bounded, authoritative step sequence from
+        # sampling_deep_profile.  It is intentionally projected separately
+        # from aggregate reconciliation rows and uses the same explicit clock
+        # alignment as per-evaluation evidence.
+        timeline_steps = payload.get("timeline_steps", [])
+        if isinstance(timeline_steps, list):
+            for item in timeline_steps:
+                if not isinstance(item, Mapping):
+                    continue
+                start, end = _sampling_interval_bounds(item)
+                if start is None or end is None or end <= start:
+                    continue
+                start_ms = alignment["to_golden_ms"](start)
+                end_ms = alignment["to_golden_ms"](end)
+                if start_ms is None or end_ms is None or end_ms <= start_ms:
+                    continue
+                rows.append({
+                    "label": f"step {item.get('step_index', item.get('step', MEASUREMENT_UNAVAILABLE))}",
+                    "start_ms": round(start_ms, 3),
+                    "end_ms": round(end_ms, 3),
+                    "interval_ms": round((end - start) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.timeline_steps.aligned",
+                })
+        # Setup and finalization are drawable only when the producer persisted
+        # both sampling-window endpoints and an evaluation endpoint.  These are
+        # local-window complements, never inferred from the report wall.
+        window_start = _sampling_window_endpoint(payload, "start")
+        window_end = _sampling_window_endpoint(payload, "end")
+        eval_intervals = []
+        for item in per_eval:
+            if not isinstance(item, Mapping):
+                continue
+            start, end = _sampling_interval_bounds(item)
+            if start is not None and end is not None and end > start:
+                eval_intervals.append((start, end))
+        if window_start is not None and eval_intervals:
+            first_start = min(start for start, _end in eval_intervals)
+            if first_start > window_start:
+                rows.append({
+                    "label": "setup",
+                    "start_ms": round(alignment["to_golden_ms"](window_start), 3),
+                    "end_ms": round(alignment["to_golden_ms"](first_start), 3),
+                    "interval_ms": round((first_start - window_start) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.sampling_window.aligned",
+                })
+        if window_end is not None and eval_intervals:
+            last_end = max(end for _start, end in eval_intervals)
+            if window_end > last_end:
+                rows.append({
+                    "label": "finalization",
+                    "start_ms": round(alignment["to_golden_ms"](last_end), 3),
+                    "end_ms": round(alignment["to_golden_ms"](window_end), 3),
+                    "interval_ms": round((window_end - last_end) / 1_000_000.0, 3),
+                    "source": "sampling_deep_profile.sampling_window.aligned",
+                })
+    rows.sort(key=lambda row: (row["start_ms"], row["end_ms"], row["label"]))
+    return rows
+
+
+def _sampling_clock_alignment(
+    payload: Mapping[str, Any],
+    sampling_node: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate an explicit monotonic-to-Golden clock-origin declaration."""
+    clocks = payload.get("clocks")
+    clocks = clocks if isinstance(clocks, Mapping) else {}
+    authoritative = payload.get("authoritative_wall")
+    authoritative = authoritative if isinstance(authoritative, Mapping) else {}
+    declaration = payload.get("alignment")
+    declaration = declaration if isinstance(declaration, Mapping) else {}
+    if not declaration:
+        declaration = payload.get("clock_alignment")
+        declaration = declaration if isinstance(declaration, Mapping) else {}
+
+    clock = str(declaration.get("clock", clocks.get("host", ""))).strip().lower()
+    source = str(
+        declaration.get("source", declaration.get("reference", authoritative.get("source", "")))
+    ).strip().lower()
+    boundary = str(declaration.get("boundary", authoritative.get("boundary", ""))).strip().lower()
+    if clock != "monotonic_ns" or source not in {"golden_sampling", "golden_sampling_node"}:
+        return None
+    if boundary and boundary not in {"sampling_start_to_sampling_end", "golden_sampling"}:
+        return None
+
+    # The origin must be explicit.  A same-clock assertion alone cannot map
+    # absolute monotonic_ns values onto VizTracer's microsecond axis.
+    mono_origin = _sampling_number(
+        declaration.get(
+            "monotonic_origin_ns",
+            declaration.get(
+                "origin_monotonic_ns",
+                declaration.get("golden_sampling_start_monotonic_ns"),
+            ),
+        )
+    )
+    golden_origin_ms = _sampling_number(
+        declaration.get(
+            "golden_origin_ms",
+            declaration.get(
+                "origin_ms",
+                declaration.get("golden_sampling_start_ms"),
+            ),
+        )
+    )
+    # A producer may declare the node's monotonic endpoints directly.  This
+    # is equivalent evidence and avoids requiring a second origin object.
+    if sampling_node is not None:
+        if mono_origin is None:
+            mono_origin = _sampling_number(sampling_node.get("start_monotonic_ns"))
+        if golden_origin_ms is None:
+            # ``golden_sampling`` is an explicit VizTracer stage boundary.
+            # Its start_ms is the report axis origin; pairing it with the
+            # payload's declared monotonic origin is clock mapping evidence,
+            # not duration or wall-time inference.
+            golden_origin_ms = _sampling_number(sampling_node.get("start_ms"))
+    if mono_origin is None or golden_origin_ms is None:
+        return None
+
+    def to_golden_ms(value: float) -> float:
+        return golden_origin_ms + (value - mono_origin) / 1_000_000.0
+
+    return {"clock": clock, "source": source, "to_golden_ms": to_golden_ms}
+
+
+def _build_sampling_deep_evidence(
+    sessions: Sequence[dict[str, Any]], runtime_result: Mapping[str, Any], warnings: list[str],
+) -> dict[str, Any]:
+    candidates = _sampling_profile_event_records(sessions, runtime_result)
+    profiles: list[dict[str, Any]] = []
+    by_payload: dict[str, int] = {}
+    duplicate_count = 0
+    for payload, source in candidates:
+        if not isinstance(payload, Mapping):
+            warnings.append("sampling_deep_profile_invalid: payload is not an object")
+            profiles.append({"status": "invalid", "source": source, "payload": None, "error": "payload_not_object"})
+            continue
+        try:
+            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        except Exception as exc:
+            warnings.append(f"sampling_deep_profile_invalid: serialization failed ({type(exc).__name__})")
+            profiles.append({"status": "invalid", "source": source, "payload": None, "error": "serialization_failed"})
+            continue
+        if len(encoded) > _SAMPLING_DEEP_PROFILE_MAX_BYTES:
+            warnings.append(f"sampling_deep_profile_oversized: {len(encoded)} bytes")
+            profiles.append({"status": "oversized", "source": source, "payload": None, "error": f"payload_bytes={len(encoded)}"})
+            continue
+        if not any(key in payload for key in ("schema_version", "level", "status", "steps", "evals")):
+            warnings.append("sampling_deep_profile_invalid: unrecognized artifact shape")
+            profiles.append({"status": "invalid", "source": source, "payload": None, "error": "unrecognized_shape"})
+            continue
+        key = hashlib.sha256(encoded).hexdigest()
+        existing = by_payload.get(key)
+        if existing is not None:
+            duplicate_count += 1
+            sources = profiles[existing].setdefault("sources", [])
+            sources.append(source)
+            continue
+        status = str(payload.get("status", "unknown"))
+        profiles.append({"status": status, "source": source, "sources": [source], "payload": json.loads(encoded.decode("utf-8")), "payload_sha256": key})
+        by_payload[key] = len(profiles) - 1
+        if status != "ok":
+            warnings.append(f"sampling_deep_profile_non_ok: {status}")
+
+    valid_payload_profiles = [profile for profile in profiles if isinstance(profile.get("payload"), Mapping)]
+    if not candidates:
+        overall = "unavailable"
+    elif not valid_payload_profiles:
+        recorded_statuses = {str(profile.get("status", "")) for profile in profiles}
+        overall = "oversized" if recorded_statuses == {"oversized"} else "invalid"
+    elif any(profile.get("status") == "ok" for profile in valid_payload_profiles):
+        overall = "available"
+    else:
+        overall = "non_ok"
+    return {
+        "status": overall,
+        "record_count": len(profiles),
+        "duplicate_count": duplicate_count,
+        "records": profiles,
+        "step_breakdown": _build_sampling_step_breakdown(profiles),
+        "model_breakdown": _build_sampling_model_breakdown(profiles),
+        "warnings": [warning for warning in warnings if warning.startswith("sampling_deep_profile_")],
+        "hierarchy_included": False,
+    }
+
+
+def _sampling_has_additive_reconciliation(deep: Mapping[str, Any]) -> bool:
+    """Return true only for an explicit, numerically checkable decomposition."""
+    records = deep.get("records", [])
+    if not isinstance(records, list):
+        return False
+    for record in records:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if not isinstance(payload, Mapping):
+            continue
+        recon = payload.get("reconciliation")
+        if not isinstance(recon, Mapping) or recon.get("residual_status") != "ok":
+            continue
+        total = _sampling_number(recon.get("sampling_total_ms"))
+        accounted = _sampling_number(recon.get("accounted_ms"))
+        residual = _sampling_number(recon.get("sampling_residual_ms"))
+        if total is None or accounted is None or residual is None:
+            continue
+        if abs(total - accounted - residual) <= 0.01:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Report-time E27 source/H2D projection
+# ---------------------------------------------------------------------------
+
+_SOURCE_H2D_UNAVAILABLE = MEASUREMENT_UNAVAILABLE
+_SOURCE_H2D_FIELDS = (
+    "SOURCE_TOTAL_WALL_MS",
+    "SOURCE_SYSCALL_UNION_BUSY_MS",
+    "read_count",
+    "read_bytes",
+    "max_inflight",
+    "source_read_count",
+    "source_read_bytes",
+    "max_actual_source_inflight",
+    "qd_occupancy_ms",
+    "time_weighted_mean_qd",
+    "QD_OCCUPANCY_MS",
+    "TIME_WEIGHTED_MEAN_QD",
+    "H2D_TOTAL_WALL_MS",
+    "h2d_submitted_bytes",
+    "h2d_completed_bytes",
+    "H2D_SUBMITTED_BYTES",
+    "H2D_COMPLETED_BYTES",
+    "h2d_reconciliation_complete",
+    "reconciliation_state",
+    "SOURCE_H2D_OVERLAP_MS",
+    "SOURCE_TO_GPU_READY_MS",
+    "POST_SOURCE_H2D_TAIL_MS",
+    "starvation_gaps",
+    "STARVATION_GAPS",
+    "quiescence",
+    "quiescence_checkpoints",
+    "fence",
+    "QUIESCENCE_EVIDENCE",
+    "FENCE_EVIDENCE",
+    "producer_count",
+    "observed_producer_count",
+    "producer_ids",
+    "qd_peak",
+    "h2d_submission_count",
+    "h2d_completion_count",
+)
+
+_SOURCE_H2D_PROOF_FIELDS = (
+    "e27_source_mechanism_evaluation",
+    "E27_SOURCE_MECHANISM_PROVEN",
+    "e27_source_mechanism_failed_predicates",
+    "e27_source_mechanism_line",
+    "e27_source_mechanism_status",
+)
+
+_SOURCE_H2D_STAGE_ROLES = {
+    "golden_clip_load": "clip",
+    "golden_unet_load": "unet",
+    "golden_vae_load": "vae",
+}
+_SOURCE_H2D_ROLES = tuple(_SOURCE_H2D_STAGE_ROLES.values())
+_SOURCE_H2D_ROLE_STAGES = {
+    role: stage for stage, role in _SOURCE_H2D_STAGE_ROLES.items()
+}
+
+
+def _source_h2d_stages_from_value(value: Any) -> set[str]:
+    """Extract only the canonical Golden load stages from a context value."""
+    if not isinstance(value, str):
+        return set()
+    token = value.strip().lower().replace(".", "_").replace("-", "_").replace(" ", "_")
+    return {stage for stage in _SOURCE_H2D_STAGE_ROLES if stage in token}
+
+
+def _source_h2d_roles_from_value(value: Any) -> set[str]:
+    """Extract transport roles without guessing from measurements."""
+    if not isinstance(value, str) or not value.strip():
+        return {"__invalid__"}
+    token = value.strip().lower().replace(".", "_").replace("-", "_").replace(" ", "_")
+    roles = {role for role in _SOURCE_H2D_ROLES if token == role or role in token.split("_")}
+    return roles or {"__invalid__"}
+
+
+def _source_h2d_identity(
+    stage_context: str,
+    record: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Resolve stage/role identity from the record and its traversal context."""
+    containers = _source_h2d_record_containers(record)
+    stage_values: list[Any] = [stage_context]
+    role_values: list[Any] = []
+    for container in containers:
+        for key in ("name", "stage", "stage_name", "event", "event_type", "traversal", "context", "path"):
+            if key in container:
+                stage_values.append(container[key])
+        if "role" in container:
+            role_values.append(container["role"])
+    stages: set[str] = set()
+    for value in stage_values:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                stages.update(_source_h2d_stages_from_value(item))
+        else:
+            stages.update(_source_h2d_stages_from_value(value))
+    for container in containers:
+        for key in ("stage", "stage_name"):
+            value = container.get(key)
+            if value is not None and isinstance(value, str) and value.strip() and not _source_h2d_stages_from_value(value):
+                stages.add("__invalid__")
+    roles: set[str] = set()
+    for value in role_values:
+        roles.update(_source_h2d_roles_from_value(value))
+    return stages, roles
+
+
+def _source_h2d_unavailable(*, status: str = "unavailable", reason: str = "") -> dict[str, Any]:
+    """Return a stable projection shape without manufacturing measurements."""
+    result: dict[str, Any] = {
+        "schema_version": "source-h2d-transport/1",
+        "status": status,
+        "availability": status,
+        "reason": reason or "persisted E27 source/H2D evidence is unavailable",
+        "stage": _SOURCE_H2D_UNAVAILABLE,
+        "role": _SOURCE_H2D_UNAVAILABLE,
+        "reconciliation": {
+            "state": "unavailable",
+            "complete": _SOURCE_H2D_UNAVAILABLE,
+            "reason": "persisted H2D reconciliation evidence is unavailable",
+            "submitted_bytes": _SOURCE_H2D_UNAVAILABLE,
+            "completed_bytes": _SOURCE_H2D_UNAVAILABLE,
+        },
+        "h2d_reconciliation_complete": _SOURCE_H2D_UNAVAILABLE,
+        "reconciliation_state": "unavailable",
+        "timing_semantics": {
+            "clock": "source/H2D monotonic intervals as persisted by E27",
+            "overlap_is_union": True,
+            "non_additive": True,
+            "stage_wall_used": False,
+            "waits_or_fences_inferred": False,
+        },
+        "evidence_source": _SOURCE_H2D_UNAVAILABLE,
+        "stages": [],
+        "stage_count": 0,
+        "timestamp_lanes": [],
+        "timestamp_axis": {
+            "clock": _SOURCE_H2D_UNAVAILABLE,
+            "start_ns": _SOURCE_H2D_UNAVAILABLE,
+            "end_ns": _SOURCE_H2D_UNAVAILABLE,
+        },
+    }
+    result.update({field: _SOURCE_H2D_UNAVAILABLE for field in _SOURCE_H2D_FIELDS})
+    result.update({field: _SOURCE_H2D_UNAVAILABLE for field in _SOURCE_H2D_PROOF_FIELDS})
+    return result
+
+
+def _source_h2d_number(value: Any) -> int | float | str:
+    """Keep persisted scalar values, marking malformed values unavailable."""
+    if isinstance(value, bool):
+        return _SOURCE_H2D_UNAVAILABLE
+    if isinstance(value, (int, float)):
+        numeric = _safe_float(value, None)
+        return value if numeric is not None and numeric >= 0 else _SOURCE_H2D_UNAVAILABLE
+    return _SOURCE_H2D_UNAVAILABLE
+
+
+def _source_h2d_first(container: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in container and container[key] is not None:
+            return container[key]
+    return None
+
+
+_SOURCE_H2D_NESTED_KEYS = (
+    "actual_source",
+    "actual_source_telemetry",
+    "dispatcher",
+    "dispatcher_telemetry",
+    "dispatcher_control",
+    "transport_telemetry",
+)
+
+
+def _source_h2d_record_containers(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return the bounded record/actual/dispatcher evidence containers."""
+    containers: list[Mapping[str, Any]] = []
+    pending: list[tuple[Mapping[str, Any], int]] = [(record, 0)]
+    seen: set[int] = set()
+    while pending:
+        value, depth = pending.pop(0)
+        if depth > 4 or id(value) in seen:
+            continue
+        seen.add(id(value))
+        containers.append(value)
+        for key in _SOURCE_H2D_NESTED_KEYS:
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                pending.append((child, depth + 1))
+    return containers
+
+
+def _source_h2d_actual_source(
+    record: Mapping[str, Any], containers: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Select the physical-source payload without interpreting its evidence."""
+    for container in containers:
+        for key in ("actual_source", "actual_source_telemetry"):
+            actual = container.get(key)
+            if isinstance(actual, Mapping):
+                return actual
+    # Dispatcher payloads from older envelopes sometimes contain the actual
+    # fields directly rather than under an actual_source key.
+    for container in containers[1:]:
+        if any(key in container for key in (
+            "actual_source_events", "source_reads", "h2d_events", "SOURCE_TOTAL_WALL_MS",
+        )):
+            return container
+    return record
+
+
+def _source_h2d_e27_fields(
+    containers: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Normalize persisted E27 evaluator fields without recomputing proof."""
+    evaluator: Mapping[str, Any] | None = None
+    for container in containers:
+        candidate = container.get("e27_source_mechanism_evaluation")
+        if isinstance(candidate, Mapping):
+            evaluator = candidate
+            break
+
+    def first_value(*keys: str) -> Any:
+        for container in containers:
+            value = _source_h2d_first(container, *keys)
+            if value is not None:
+                return value
+        if isinstance(evaluator, Mapping):
+            return _source_h2d_first(evaluator, *keys)
+        return None
+
+    proof_value = first_value("E27_SOURCE_MECHANISM_PROVEN")
+    if proof_value is None and isinstance(evaluator, Mapping):
+        proof_value = evaluator.get("proven")
+    if proof_value is True or str(proof_value).upper() in {"YES", "TRUE"}:
+        proof = "YES"
+        status = "proven"
+    elif proof_value is False or str(proof_value).upper() in {"NO", "FALSE"}:
+        proof = "NO"
+        status = "failed"
+    else:
+        proof = _SOURCE_H2D_UNAVAILABLE
+        status = _SOURCE_H2D_UNAVAILABLE
+
+    failed = first_value("e27_source_mechanism_failed_predicates")
+    if failed is None and isinstance(evaluator, Mapping):
+        failed = evaluator.get("failed_predicates")
+    if isinstance(failed, list):
+        failed = [str(item) for item in failed]
+    else:
+        failed = _SOURCE_H2D_UNAVAILABLE
+
+    line = first_value("e27_source_mechanism_line")
+    if line is None and isinstance(evaluator, Mapping):
+        line = _source_h2d_first(evaluator, "emitted_line", "line")
+    if not isinstance(line, str):
+        line = _SOURCE_H2D_UNAVAILABLE
+
+    return {
+        "e27_source_mechanism_evaluation": (
+            dict(evaluator) if evaluator is not None else _SOURCE_H2D_UNAVAILABLE
+        ),
+        "E27_SOURCE_MECHANISM_PROVEN": proof,
+        "e27_source_mechanism_failed_predicates": failed,
+        "e27_source_mechanism_line": line,
+        "e27_source_mechanism_status": status,
+    }
+
+
+def _source_h2d_candidates(
+    runtime_result: Mapping[str, Any],
+    sessions: Sequence[dict[str, Any]] = (),
+    raw_evidence: Mapping[str, Any] | None = None,
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """Find persisted Golden transport records, preserving their stage name."""
+    roots: list[tuple[str, Any]] = []
+    if isinstance(runtime_result, Mapping):
+        for key in ("golden_telemetry", "telemetry"):
+            if isinstance(runtime_result.get(key), Mapping):
+                roots.append((key, runtime_result[key]))
+        if any(key in runtime_result for key in ("actual_source", "actual_source_telemetry", "transport_stats", "stages")):
+            roots.append(("runtime_result", runtime_result))
+
+    candidates: list[tuple[str, Mapping[str, Any]]] = []
+    seen: set[int] = set()
+    # Copies of one record under the same traversal stage are duplicates.  The
+    # same payload under different stage contexts is not: suppressing it would
+    # make an ambiguous projection look like the first record was authoritative.
+    seen_content: set[tuple[str, str]] = set()
+
+    def add(stage: str, value: Any) -> None:
+        if not isinstance(value, Mapping) or id(value) in seen:
+            return
+        content = value.get("actual_source")
+        if not isinstance(content, Mapping):
+            content = value.get("actual_source_telemetry")
+        if not isinstance(content, Mapping):
+            for key in _SOURCE_H2D_NESTED_KEYS:
+                nested = value.get(key)
+                if not isinstance(nested, Mapping):
+                    continue
+                content = nested.get(
+                    "actual_source", nested.get("actual_source_telemetry", nested)
+                )
+                break
+        if not isinstance(content, Mapping):
+            content = value
+        try:
+            content_key = hashlib.sha256(
+                json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            content_key = ""
+        context_stages = _source_h2d_stages_from_value(stage)
+        context_key = "|".join(sorted(context_stages)) if context_stages else str(stage).strip().lower()
+        content_identity = (content_key, context_key)
+        if content_key and content_identity in seen_content:
+            return
+        seen.add(id(value))
+        if content_key:
+            seen_content.add(content_identity)
+        candidates.append((stage or "golden_transport", value))
+
+    def visit(value: Any, stage: str, depth: int = 0) -> None:
+        if depth > 10 or not isinstance(value, Mapping):
+            return
+        named_stage = value.get("name")
+        # Keep a useful parent traversal context when a transport wrapper has a
+        # generic name such as ``transport_stats``.
+        current_stage = (
+            str(named_stage)
+            if named_stage and _source_h2d_stages_from_value(named_stage)
+            else stage
+        )
+        for key in ("transport_stats", "transport_telemetry"):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                add(current_stage, child)
+            elif isinstance(child, list):
+                for item in child[:32]:
+                    add(current_stage, item)
+        for key in ("transport", "vae_load_decomposition"):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                if key == "transport":
+                    add(current_stage, child)
+                else:
+                    add(current_stage, child.get("transport"))
+        if any(key in value for key in ("actual_source", "actual_source_telemetry")):
+            add(current_stage, value)
+        for key in (
+            "stages", "details", "events", "data", "result", "dispatcher",
+            "dispatcher_telemetry", "dispatcher_control", "transport_telemetry",
+            "actual_source", "actual_source_telemetry", "report", "payload",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, current_stage, depth + 1)
+            elif isinstance(child, list):
+                for item in child[:64]:
+                    visit(item, current_stage, depth + 1)
+
+    for stage, root in roots:
+        visit(root, stage)
+    # A few Golden event copies are persisted in session_events rather than the
+    # result summary.  They are still report-time evidence, not trace spans.
+    for event in sessions:
+        if not isinstance(event, Mapping):
+            continue
+        name = str(event.get("name", event.get("event_type", event.get("event", ""))))
+        if name in {"vae_load_decomposition", "transport_stats", "golden_transport"}:
+            visit(event, name)
+    if isinstance(raw_evidence, Mapping):
+        visit(raw_evidence, "golden_e27_source")
+    return candidates
+
+
+def _load_persisted_e27_raw(session_dir: Path | None) -> Mapping[str, Any] | None:
+    """Read the bounded raw E27 artifact when the Golden copy is present."""
+    if session_dir is None:
+        return None
+    path = session_dir / "raw" / "e27_source_mechanism.json"
+    value = _json_load(path) if path.is_file() else None
+    return value if isinstance(value, Mapping) else None
+
+
+def _project_source_h2d_record(stage: str, record: Mapping[str, Any]) -> dict[str, Any]:
+    containers = _source_h2d_record_containers(record)
+    actual = _source_h2d_actual_source(record, containers)
+    e27_fields = _source_h2d_e27_fields(containers)
+
+    source_reads_value = actual.get("source_reads")
+    source_reads: Mapping[str, Any] = source_reads_value if isinstance(source_reads_value, Mapping) else {}
+    producer_report_value = actual.get("producer_report")
+    producer_report: Mapping[str, Any] = producer_report_value if isinstance(producer_report_value, Mapping) else {}
+    read_count = _source_h2d_first(actual, "source_read_count", "read_count")
+    if read_count is None:
+        read_count = _source_h2d_first(source_reads, "read_count", "copy_count")
+    read_bytes = _source_h2d_first(actual, "source_bytes", "source_read_bytes", "read_bytes", "bytes_read")
+    if read_bytes is None:
+        read_bytes = source_reads.get("bytes")
+    if read_count is None and producer_report:
+        read_count = sum(
+            int(row.get("read_count", 0))
+            for row in producer_report.values()
+            if isinstance(row, Mapping) and str(row.get("read_count", "")).isdigit()
+        )
+    if read_bytes is None and producer_report:
+        read_bytes = sum(
+            int(row.get("bytes", 0))
+            for row in producer_report.values()
+            if isinstance(row, Mapping) and str(row.get("bytes", "")).isdigit()
+        )
+
+    qd = actual.get("qd_occupancy_ms")
+    if not isinstance(qd, Mapping):
+        qd = actual.get("milliseconds_at_qd")
+    if not isinstance(qd, Mapping):
+        qd = record.get("producer_qd_occupancy")
+    qd = dict(qd) if isinstance(qd, Mapping) else _SOURCE_H2D_UNAVAILABLE
+    topology = actual.get("topology")
+    topology = topology if isinstance(topology, Mapping) else {}
+    def raw_value(*keys: str) -> Any:
+        value = _source_h2d_first(actual, *keys)
+        if value is None:
+            value = _source_h2d_first(record, *keys)
+        return value if value is not None else _SOURCE_H2D_UNAVAILABLE
+
+    submitted = _source_h2d_first(actual, "h2d_submitted_bytes", "submitted_bytes")
+    completed = _source_h2d_first(actual, "h2d_completed_bytes", "completed_bytes")
+    if submitted is None:
+        submitted = record.get("h2d_submitted_bytes")
+    if completed is None:
+        completed = record.get("h2d_completed_bytes")
+    reconciliation_flag = actual.get("h2d_reconciliation_complete")
+    if reconciliation_flag is None:
+        reconciliation_flag = record.get("h2d_reconciliation_complete")
+    reconciliation_details = actual.get("h2d_reconciliation")
+    if not isinstance(reconciliation_details, Mapping):
+        reconciliation_details = record.get("h2d_reconciliation")
+    if reconciliation_flag is None and isinstance(reconciliation_details, Mapping):
+        reconciliation_flag = _source_h2d_first(reconciliation_details, "complete", "ok")
+    expected_h2d = _source_h2d_first(actual, "expected_h2d_bytes")
+    if expected_h2d is None:
+        topology_inputs = actual.get("topology_inputs")
+        if isinstance(topology_inputs, Mapping):
+            expected_h2d = topology_inputs.get("expected_h2d_bytes")
+    if expected_h2d is None and isinstance(reconciliation_details, Mapping):
+        expected_h2d = _source_h2d_first(reconciliation_details, "planned_bytes", "expected_bytes")
+    if submitted is not None and completed is not None and submitted != completed:
+        reconciliation_valid = False
+    elif submitted is not None and expected_h2d is not None and submitted != expected_h2d:
+        reconciliation_valid = False
+    elif isinstance(reconciliation_flag, bool):
+        reconciliation_valid = reconciliation_flag
+    else:
+        reconciliation_valid = None
+    if reconciliation_valid is False:
+        reconciliation_state = "invalid"
+    elif reconciliation_valid is True:
+        reconciliation_state = "valid"
+    else:
+        reconciliation_state = "unavailable"
+
+    max_inflight = _source_h2d_first(actual, "max_actual_source_inflight", "max_inflight")
+    if max_inflight is None:
+        max_inflight = _source_h2d_first(record, "max_inflight")
+    quiescence = _source_h2d_first(actual, "quiescence_evidence", "quiescence")
+    if quiescence is None:
+        quiescence = _source_h2d_first(actual, "quiescence_checkpoints")
+    if quiescence is None:
+        quiescence = _source_h2d_first(
+            record, "quiescence_evidence", "quiescence", "qd_quiescence", "waits_quiescence"
+        )
+    fence = _source_h2d_first(actual, "source_fence_evidence", "source_fence_valid", "fence_evidence")
+    if fence is None:
+        fence = _source_h2d_first(record, "source_fence_evidence", "source_fence_valid", "fence_evidence")
+    starvation = actual.get("starvation_gaps")
+    if starvation is None:
+        starvation = record.get("starvation_gaps")
+    if not isinstance(starvation, list):
+        starvation = _SOURCE_H2D_UNAVAILABLE
+
+    def metric(*keys: str) -> Any:
+        value = _source_h2d_first(actual, *keys)
+        if value is None:
+            value = _source_h2d_first(record, *keys)
+        return _source_h2d_number(value)
+
+    # H2D interval projections are valid only after the persisted event set has
+    # reconciled.  Do not expose a partial interval as a complete transport.
+    h2d_timing = reconciliation_state == "valid"
+    projected = _source_h2d_unavailable(
+        status="reconciliation_invalid" if reconciliation_state == "invalid" else "available",
+        reason=(
+            "persisted H2D submitted/completed bytes do not reconcile"
+            if reconciliation_state == "invalid"
+            else "persisted E27 source/H2D evidence"
+        ),
+    )
+    projected.update({
+        "status": projected["status"],
+        "availability": projected["status"],
+        "stage": stage,
+        "role": _source_h2d_first(record, "role") or _source_h2d_first(actual, "role") or _SOURCE_H2D_UNAVAILABLE,
+        "evidence_source": "golden_telemetry",
+        **e27_fields,
+        # The human renderer's established compatibility field is the active
+        # arm.  Fall back only to the explicit proof status when an arm was not
+        # persisted; never infer an arm from transport measurements.
+        "mechanism": (
+            raw_value("mechanism", "arm", "execution_arm")
+            if raw_value("mechanism", "arm", "execution_arm") != _SOURCE_H2D_UNAVAILABLE
+            else e27_fields["e27_source_mechanism_status"]
+        ),
+        "SOURCE_TOTAL_WALL_MS": metric("SOURCE_TOTAL_WALL_MS"),
+        "SOURCE_SYSCALL_UNION_BUSY_MS": metric("SOURCE_SYSCALL_UNION_BUSY_MS"),
+        "read_count": _source_h2d_number(read_count),
+        "read_bytes": _source_h2d_number(read_bytes),
+        "source_read_count": _source_h2d_number(read_count),
+        "source_read_bytes": _source_h2d_number(read_bytes),
+        "max_inflight": _source_h2d_number(max_inflight),
+        "max_actual_source_inflight": _source_h2d_number(max_inflight),
+        "qd_occupancy_ms": qd,
+        "time_weighted_mean_qd": metric("time_weighted_mean_qd"),
+        "QD_OCCUPANCY_MS": qd,
+        "TIME_WEIGHTED_MEAN_QD": metric("time_weighted_mean_qd"),
+        "h2d_submitted_bytes": _source_h2d_number(submitted),
+        "h2d_completed_bytes": _source_h2d_number(completed),
+        "H2D_SUBMITTED_BYTES": _source_h2d_number(submitted),
+        "H2D_COMPLETED_BYTES": _source_h2d_number(completed),
+        "h2d_reconciliation_complete": reconciliation_valid if reconciliation_valid is not None else _SOURCE_H2D_UNAVAILABLE,
+        "reconciliation_state": reconciliation_state,
+        "starvation_gaps": starvation,
+        "quiescence": quiescence if quiescence is not None else _SOURCE_H2D_UNAVAILABLE,
+        "quiescence_checkpoints": actual.get("quiescence_checkpoints", record.get("quiescence_checkpoints", _SOURCE_H2D_UNAVAILABLE)),
+        "fence": fence if fence is not None else _SOURCE_H2D_UNAVAILABLE,
+        "fallback": raw_value("fallback", "fallback_counts"),
+        "poison": raw_value("poison", "poison_counts"),
+        "region_coverage": topology.get("coverage_exact", _SOURCE_H2D_UNAVAILABLE),
+        "region_gaps": topology.get("gaps", _SOURCE_H2D_UNAVAILABLE),
+        "region_overlaps": topology.get("overlaps", _SOURCE_H2D_UNAVAILABLE),
+        "region_duplicates": topology.get("unexpected_duplicates", _SOURCE_H2D_UNAVAILABLE),
+        "reconciliation": {
+            "state": reconciliation_state,
+            "complete": reconciliation_valid if reconciliation_valid is not None else _SOURCE_H2D_UNAVAILABLE,
+            "reason": "ok" if reconciliation_state == "valid" else (
+                "submitted/completed bytes mismatch" if reconciliation_state == "invalid" else "persisted reconciliation flag unavailable"
+            ),
+            "submitted_bytes": _source_h2d_number(submitted),
+            "completed_bytes": _source_h2d_number(completed),
+        },
+    })
+    projected["h2d_reconciliation"] = projected["reconciliation"]
+    projected["STARVATION_GAPS"] = projected["starvation_gaps"]
+    projected["QUIESCENCE_EVIDENCE"] = projected["quiescence"]
+    projected["FENCE_EVIDENCE"] = projected["fence"]
+    lanes: list[dict[str, Any]] = []
+    source_events = actual.get("actual_source_events", actual.get("source_events", []))
+    if isinstance(source_events, list):
+        for index, event in enumerate(source_events):
+            if not isinstance(event, Mapping):
+                continue
+            start = _safe_int(event.get("syscall_enter_monotonic_ns", event.get("start_ns")), None)
+            end = _safe_int(event.get("syscall_exit_monotonic_ns", event.get("end_ns")), None)
+            if start is not None and end is not None and end >= start:
+                lanes.append({
+                    "lane": "source",
+                    "label": f"producer={event.get('producer_id', index)}",
+                    "start_ns": start,
+                    "end_ns": end,
+                    "duration_ms": round((end - start) / 1_000_000.0, 3),
+                })
+    h2d_events = actual.get("h2d_events", [])
+    if isinstance(h2d_events, list):
+        for index, event in enumerate(h2d_events):
+            if not isinstance(event, Mapping):
+                continue
+            start = _safe_int(event.get("submit_ns", event.get("start_ns")), None)
+            end = _safe_int(event.get("complete_ns", event.get("end_ns")), None)
+            if start is not None and end is not None and end >= start:
+                lanes.append({
+                    "lane": "h2d",
+                    "label": f"token={event.get('token', index)}",
+                    "start_ns": start,
+                    "end_ns": end,
+                    "duration_ms": round((end - start) / 1_000_000.0, 3),
+                })
+    if lanes:
+        projected["timestamp_axis"] = {
+            "clock": "monotonic_ns",
+            "start_ns": min(row["start_ns"] for row in lanes),
+            "end_ns": max(row["end_ns"] for row in lanes),
+            "source": "explicit *_monotonic_ns / submit_ns / complete_ns fields",
+        }
+    projected["timestamp_lanes"] = sorted(
+        lanes, key=lambda item: (item["start_ns"], item["end_ns"], item["lane"], item["label"])
+    )
+    # Readable aggregate counters are derived only from persisted event rows or
+    # explicit producer fields.  Missing values stay unavailable.
+    producer_ids = sorted({
+        str(event.get("producer_id")) for event in source_events
+        if isinstance(event, Mapping) and event.get("producer_id") is not None
+    }) if isinstance(source_events, list) else []
+    projected["producer_count"] = _source_h2d_number(
+        _source_h2d_first(actual, "producer_count")
+        if _source_h2d_first(actual, "producer_count") is not None
+        else (len(producer_ids) if producer_ids else None)
+    )
+    projected["observed_producer_count"] = len(producer_ids) if producer_ids else _SOURCE_H2D_UNAVAILABLE
+    projected["producer_ids"] = producer_ids or _SOURCE_H2D_UNAVAILABLE
+    projected["qd_peak"] = projected["max_actual_source_inflight"]
+    projected["h2d_submission_count"] = (
+        len(h2d_events) if isinstance(h2d_events, list) and h2d_events
+        else _SOURCE_H2D_UNAVAILABLE
+    )
+    projected["h2d_completion_count"] = (
+        sum(isinstance(row, Mapping) and row.get("complete_ns") is not None for row in h2d_events)
+        if isinstance(h2d_events, list) and h2d_events else _SOURCE_H2D_UNAVAILABLE
+    )
+    for key in ("H2D_TOTAL_WALL_MS", "SOURCE_H2D_OVERLAP_MS", "SOURCE_TO_GPU_READY_MS", "POST_SOURCE_H2D_TAIL_MS"):
+        projected[key] = metric(key) if h2d_timing else _SOURCE_H2D_UNAVAILABLE
+    if projected["SOURCE_TOTAL_WALL_MS"] == _SOURCE_H2D_UNAVAILABLE:
+        projected["status"] = "timestamps_unavailable" if reconciliation_state != "invalid" else "reconciliation_invalid"
+        projected["availability"] = projected["status"]
+        projected["reason"] = "persisted source interval timestamps are unavailable"
+    return projected
+
+
+def build_source_h2d_transport_projection(
+    runtime_result: Mapping[str, Any] | None,
+    *,
+    sessions: Sequence[dict[str, Any]] = (),
+    session_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Project persisted E27 evidence without adding runtime instrumentation."""
+    candidates = _source_h2d_candidates(
+        runtime_result or {},
+        sessions,
+        _load_persisted_e27_raw(session_dir),
+    )
+    if not candidates:
+        unavailable = _source_h2d_unavailable()
+        unavailable["by_stage"] = {
+            stage: _source_h2d_unavailable(
+                reason=f"no persisted E27 transport record for {stage}"
+            )
+            for stage in _SOURCE_H2D_STAGE_ROLES
+        }
+        unavailable["by_role"] = {
+            role: _source_h2d_unavailable(
+                reason=f"no persisted E27 transport record for role {role}"
+            )
+            for role in _SOURCE_H2D_ROLES
+        }
+        return unavailable
+    projections = [_project_source_h2d_record(stage, record) for stage, record in candidates]
+
+    # Resolve identity independently from the measurements.  A projection is
+    # usable only when one record has one canonical stage and its matching role;
+    # there is deliberately no positional fallback here.
+    identities: list[dict[str, Any]] = []
+    for (stage_context, record), projection in zip(candidates, projections):
+        stages, roles = _source_h2d_identity(stage_context, record)
+        reason = ""
+        if len(stages) > 1:
+            reason = "ambiguous persisted E27 stage identity"
+        elif len(roles) > 1:
+            reason = "ambiguous persisted E27 role identity"
+        elif not stages and len(roles) == 1 and next(iter(roles)) in _SOURCE_H2D_ROLE_STAGES:
+            stages = {_SOURCE_H2D_ROLE_STAGES[next(iter(roles))]}
+        elif not roles and len(stages) == 1:
+            resolved_stage = next(iter(stages))
+            if resolved_stage in _SOURCE_H2D_STAGE_ROLES:
+                roles = {_SOURCE_H2D_STAGE_ROLES[resolved_stage]}
+        if not stages or not roles:
+            reason = reason or "persisted E27 stage/role identity is unavailable"
+        elif len(stages) == 1 and len(roles) == 1:
+            resolved_stage = next(iter(stages))
+            resolved_role = next(iter(roles))
+            if (
+                resolved_stage not in _SOURCE_H2D_STAGE_ROLES
+                or resolved_role not in _SOURCE_H2D_ROLES
+                or _SOURCE_H2D_STAGE_ROLES[resolved_stage] != resolved_role
+            ):
+                reason = "persisted E27 stage and role disagree"
+        identities.append({
+            "stage": next(iter(stages)) if len(stages) == 1 else None,
+            "role": next(iter(roles)) if len(roles) == 1 else None,
+            "projection": projection,
+            "reason": reason,
+        })
+
+    def get_transport_for_stage(
+        stage: str,
+        role: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return the unique stage/role projection, or ``(None, reason)``."""
+        expected_stage = stage if stage in _SOURCE_H2D_STAGE_ROLES else None
+        expected_role = role if role in _SOURCE_H2D_ROLES else None
+        if expected_stage is None or expected_role is None:
+            return None, "requested E27 stage or role is not canonical"
+        related = [
+            identity for identity in identities
+            if identity["stage"] == expected_stage or identity["role"] == expected_role
+        ]
+        reasons = sorted({str(identity["reason"]) for identity in related if identity["reason"]})
+        matches = [
+            identity for identity in related
+            if identity["stage"] == expected_stage and identity["role"] == expected_role
+        ]
+        if len(matches) == 1 and len(related) == 1 and not reasons:
+            projection = dict(matches[0]["projection"])
+            projection["stage"] = expected_stage
+            projection["role"] = expected_role
+            return projection, ""
+        if reasons:
+            return None, reasons[0]
+        if len(matches) > 1 or len(related) > 1:
+            return None, f"ambiguous persisted E27 transport records for {expected_stage}/{expected_role}"
+        return None, reasons[0] if reasons else f"no unique persisted E27 record for {expected_stage}/{expected_role}"
+
+    def unavailable_mapping(stage: str, role: str, reason: str) -> dict[str, Any]:
+        result = _source_h2d_unavailable(status="unavailable", reason=reason)
+        result["stage"] = stage
+        result["role"] = role
+        return result
+
+    by_stage: dict[str, dict[str, Any]] = {}
+    by_role: dict[str, dict[str, Any]] = {}
+    for stage, role in _SOURCE_H2D_STAGE_ROLES.items():
+        match, reason = get_transport_for_stage(stage, role)
+        value = match if match is not None else unavailable_mapping(stage, role, reason)
+        by_stage[stage] = value
+        by_role[role] = dict(value)
+
+    # Keep every raw-derived projection auditable while exposing a direct
+    # projection only when the complete candidate set has one unique identity.
+    usable = [identity for identity in identities if not identity["reason"]]
+    if len(usable) == 1 and len(identities) == 1:
+        selected = dict(usable[0]["projection"])
+        selected["stage"] = usable[0]["stage"]
+        selected["role"] = usable[0]["role"]
+    else:
+        reason = (
+            identities[0]["reason"]
+            if len(identities) == 1 and identities[0]["reason"]
+            else "ambiguous persisted E27 stage/role identities; use by_stage/by_role"
+        )
+        selected = _source_h2d_unavailable(
+            reason=reason
+        )
+        # Multiple canonical load records make aggregate transport timing
+        # intentionally unavailable, but scalar proof remains safe to expose
+        # when every candidate agrees.  Do not select one stage's evaluator
+        # mapping as the aggregate evidence unless it is byte-for-byte shared.
+        for key in (
+            "e27_source_mechanism_evaluation",
+            "E27_SOURCE_MECHANISM_PROVEN",
+            "e27_source_mechanism_failed_predicates",
+            "e27_source_mechanism_line",
+            "e27_source_mechanism_status",
+            "mechanism",
+        ):
+            values = [projection.get(key) for projection in projections]
+            if (
+                values
+                and all(value != _SOURCE_H2D_UNAVAILABLE for value in values)
+                and all(value == values[0] for value in values[1:])
+            ):
+                selected[key] = values[0]
+    selected["stages"] = projections
+    selected["stage_count"] = len(projections)
+    selected["by_stage"] = by_stage
+    selected["by_role"] = by_role
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -2325,6 +4272,1139 @@ _BOUNDARY_DISPLAY_NAMES = {
     "sampling_start": "sampling start",
     "trace_stop": "trace stop",
 }
+
+# Golden profiling deliberately lives in this report pipeline rather than in a
+# second parser.  These names mirror golden_serial.STAGE_ORDER, but are kept
+# local so that offline report generation remains stdlib-only.
+_GOLDEN_ROOT_NAME = "golden_serial_execute"
+_GOLDEN_ROOT_NAMES = ("golden_serial_execute", "golden_parallel_execute")
+_GOLDEN_STAGE_NAMES = (
+    "golden_restore",
+    "golden_request_setup",
+    "golden_clip_load",
+    "golden_clip_forward",
+    "golden_unet_load",
+    "golden_sampler_prepare",
+    "golden_vae_load",
+    "golden_sampling",
+    "golden_sampler_tail",
+    "golden_vae_decode",
+    "golden_output",
+    "golden_durable_commit",
+)
+_GOLDEN_PROFILE_THRESHOLD_MS = 50.0
+_GOLDEN_PROFILE_RESIDUAL_MS = 25.0
+_GOLDEN_PROFILE_RESIDUAL_PERCENT = 2.0
+
+
+def _basename(name: Any) -> str:
+    """Return the final component of a qualified trace name."""
+    # VizTracer's ``VizEvent`` appends its source location to explicit spans:
+    # ``name (file.py:line)``.  Keep that provenance in the raw call record,
+    # but normalize only the semantic lookup name.
+    value = str(name or "")
+    if " (" in value:
+        value = value.split(" (", 1)[0]
+    return value.rsplit(".", 1)[-1]
+
+
+def _golden_named_calls(
+    calls: Sequence[dict[str, Any]], name: str,
+) -> list[dict[str, Any]]:
+    """Select one truthful spelling of a Golden span from raw calls.
+
+    Explicit ``VizEvent`` spans are authoritative when present.  VizTracer's
+    Python call hook may also record the same function on a resumed async
+    context; preferring the explicit event avoids turning one real boundary
+    into an ambiguity while retaining the hook-only compatibility path.
+    """
+    candidates = [call for call in calls if _basename(call.get("name")) == name]
+    explicit = [call for call in candidates if call.get("category") == "FEE"]
+    return explicit or candidates
+
+
+def _golden_span(start_us: Any, end_us: Any) -> tuple[float, float] | None:
+    """Return a valid interval, without manufacturing missing timestamps."""
+    start = _safe_float(start_us, None)
+    end = _safe_float(end_us, None)
+    if start is None or end is None or end < start:
+        return None
+    return start, end
+
+
+def _golden_same_context(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Return whether two trace records share the complete execution context."""
+    if left.get("pid") is None or right.get("pid") is None:
+        return False
+    if left.get("tid") is None or right.get("tid") is None:
+        return False
+    return (
+        left.get("pid") == right.get("pid")
+        and left.get("tid") == right.get("tid")
+        and str(left.get("task_id", "") or "") == str(right.get("task_id", "") or "")
+    )
+
+
+def _golden_union_ms(calls: Sequence[dict[str, Any]]) -> float:
+    intervals = [
+        (float(c["start_us"]), float(c["end_us"]))
+        for c in calls
+        if _golden_span(c.get("start_us"), c.get("end_us")) is not None
+    ]
+    return _ms(_total_interval_length(intervals))
+
+
+def _golden_required_stages(
+    trace_config: Mapping[str, Any],
+    calls: Sequence[dict[str, Any]],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Resolve explicitly applicable canonical stages.
+
+    A generic trace containing a function named ``golden_serial_execute`` is
+    not assumed to have exercised every stage.  Producers can make the
+    contract explicit with any of the established config spellings.  If a
+    canonical stage is present, the trace is also treated as a canonical-stage
+    claim and all non-durability stages are required.
+    """
+    configured: Any = None
+    for key in (
+        "required_canonical_stages",
+        "golden_required_stages",
+        "canonical_stages_required",
+    ):
+        if key in trace_config:
+            configured = trace_config[key]
+            break
+    if isinstance(configured, (list, tuple)):
+        requested = {_basename(v) for v in configured if str(v)}
+        return [name for name in _GOLDEN_STAGE_NAMES if name in requested]
+    if trace_config.get("golden_profile_require_canonical_stages") is True:
+        strict = str(
+            trace_config.get("output_durability_mode", trace_config.get("output_durability", ""))
+        ).lower() == "strict"
+        return [n for n in _GOLDEN_STAGE_NAMES if strict or n != "golden_durable_commit"]
+
+    evidence_calls = (
+        [c for c in calls if context is None or _golden_same_context(c, context)]
+    )
+    observed = {_basename(c.get("name")) for c in evidence_calls}
+    if observed.intersection(_GOLDEN_STAGE_NAMES):
+        strict = str(
+            trace_config.get("output_durability_mode", trace_config.get("output_durability", ""))
+        ).lower() == "strict"
+        return [n for n in _GOLDEN_STAGE_NAMES if strict or n != "golden_durable_commit"]
+    return []
+
+
+def _golden_node(
+    item: dict[str, Any],
+    *,
+    root_start_us: float,
+    children: Sequence[dict[str, Any]],
+    kind: str,
+    parent: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one auditable Golden profile span from an existing interval."""
+    start = float(item["start_us"])
+    end = float(item["end_us"])
+    wall_ms = _ms(max(0.0, end - start))
+    measured_children = [
+        child for child in children
+        if _golden_span(child.get("start_us"), child.get("end_us")) is not None
+    ]
+    child_sum_ms = sum(
+        _ms(max(0.0, float(child["end_us"]) - float(child["start_us"])))
+        for child in measured_children
+    )
+    child_union_ms = _golden_union_ms(measured_children)
+    child_overlap_ms = child_sum_ms - child_union_ms
+    residual_ms = wall_ms - child_union_ms
+    coverage_pct = (child_union_ms / wall_ms * 100.0) if wall_ms > 0 else None
+    subthreshold = [
+        child for child in measured_children
+        if _ms(max(0.0, float(child["end_us"]) - float(child["start_us"]))) <= _GOLDEN_PROFILE_THRESHOLD_MS
+    ]
+    displayed_children = [child for child in measured_children if child not in subthreshold]
+    subthreshold_union_ms = _golden_union_ms(subthreshold)
+    residual_pct = (residual_ms / wall_ms * 100.0) if wall_ms > 0 else None
+    if not measured_children:
+        residual_reason = "NO_TRACED_CHILDREN"
+    elif displayed_children:
+        residual_reason = "DISPLAYED_CHILDREN_GT50MS"
+    else:
+        residual_reason = "ONLY_SUBTHRESHOLD_CHILDREN"
+    source = item.get("source_file") or (
+        "session_events" if kind == "semantic" and item.get("source") == "session_event"
+        else ("trace_call" if kind == "semantic" else "viztracer")
+    )
+    task_id = str(item.get("task_id", "") or "")
+    pid = item.get("pid")
+    tid = item.get("tid")
+    thread_task = f"{pid}:{tid}" if pid is not None or tid is not None else ""
+    if task_id:
+        thread_task = f"{thread_task}/task:{task_id}" if thread_task else f"task:{task_id}"
+    name = (
+        str(item.get("operation_type"))
+        if kind == "semantic"
+        else _basename(item.get("name", ""))
+    )
+    complete = bool(item.get("complete", True)) and _golden_span(start, end) is not None
+    needs_decomposition = (
+        residual_ms > _GOLDEN_PROFILE_RESIDUAL_MS
+        or (wall_ms > 0 and residual_ms / wall_ms * 100.0 > _GOLDEN_PROFILE_RESIDUAL_PERCENT)
+    )
+    return {
+        "kind": kind,
+        "name": name,
+        "source": source,
+        "source_file": item.get("source_file") or source,
+        "source_line": item.get("source_line"),
+        "event_index": item.get("event_index"),
+        "parent_event_index": item.get("parent_event_index"),
+        "parent_name": item.get("parent_name", "") if parent else "",
+        "start_offset_ms": round(_ms(start - root_start_us), 3),
+        "start_offset": round(_ms(start - root_start_us), 3),
+        "start_offset_us": round(start - root_start_us, 3),
+        "start_ms": round(_ms(start), 3),
+        "end_ms": round(_ms(end), 3),
+        "wall_ms": round(wall_ms, 3),
+        "direct_child_count": len(measured_children),
+        "direct_child_sum_ms": round(child_sum_ms, 3),
+        "direct_child_union_ms": round(child_union_ms, 3),
+        "direct_child_overlap_ms": round(child_overlap_ms, 3),
+        "child_overlap_ms": round(child_overlap_ms, 3),
+        "direct_children_sum_ms": round(child_sum_ms, 3),
+        "direct_children_union_ms": round(child_union_ms, 3),
+        "overlap_ms": round(child_overlap_ms, 3),
+        "exclusive_residual_ms": round(residual_ms, 3),
+        "residual_ms": round(residual_ms, 3),
+        "residual_pct": round(residual_pct, 3) if residual_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "coverage_pct": round(coverage_pct, 3) if coverage_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "coverage": round(coverage_pct, 3) if coverage_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "coverage_ms": round(child_union_ms, 3),
+        "subthreshold_child_count": len(subthreshold),
+        "subthreshold_children_union_ms": round(subthreshold_union_ms, 3),
+        "subthreshold_child_union_ms": round(subthreshold_union_ms, 3),
+        "display_children_gt50ms": len(displayed_children),
+        "traced_children": len(measured_children),
+        "true_self_or_untraced_residual_ms": round(residual_ms, 3),
+        "residual_reason": residual_reason,
+        "pid": pid,
+        "tid": tid,
+        "task_id": task_id,
+        "depth": item.get("depth", 0),
+        "thread_task": thread_task,
+        "complete": complete,
+        "completeness": "complete" if complete else "incomplete",
+        "needs_decomposition": needs_decomposition,
+        "flag": "NEEDS_DECOMPOSITION" if needs_decomposition else "",
+        # Upper-case aliases are the names used by the standalone and Modal
+        # log projections.  Keep the established lower-case fields above for
+        # JSON consumers that already read the Golden profile schema.
+        "WALL_MS": round(wall_ms, 3),
+        "DIRECT_CHILD_COUNT": len(measured_children),
+        "DIRECT_CHILD_SUM_MS": round(child_sum_ms, 3),
+        "DIRECT_CHILD_UNION_MS": round(child_union_ms, 3),
+        "DIRECT_CHILD_OVERLAP_MS": round(child_overlap_ms, 3),
+        "SUBTHRESHOLD_CHILD_COUNT": len(subthreshold),
+        "SUBTHRESHOLD_CHILD_UNION_MS": round(subthreshold_union_ms, 3),
+        "DISPLAY_CHILDREN_GT50MS": len(displayed_children),
+        "TRACED_CHILDREN": len(measured_children),
+        "RESIDUAL_MS": round(residual_ms, 3),
+        "RESIDUAL_PCT": round(residual_pct, 3) if residual_pct is not None else MEASUREMENT_UNAVAILABLE,
+        "TRUE_SELF_OR_UNTRACED_RESIDUAL_MS": round(residual_ms, 3),
+        "RESIDUAL_REASON": residual_reason,
+        "children": [],
+    }
+
+
+def _golden_refresh_display_summary(node: dict[str, Any]) -> None:
+    """Align visibility fields with the tree after short wrappers are promoted."""
+    for child in node.get("children", []):
+        _golden_refresh_display_summary(child)
+
+    displayed_count = len(node.get("children", []))
+    residual_reason = (
+        "NO_TRACED_CHILDREN"
+        if node.get("traced_children", 0) == 0
+        else (
+            "DISPLAYED_CHILDREN_GT50MS"
+            if displayed_count
+            else "ONLY_SUBTHRESHOLD_CHILDREN"
+        )
+    )
+    node["display_children_gt50ms"] = displayed_count
+    node["DISPLAY_CHILDREN_GT50MS"] = displayed_count
+    node["residual_reason"] = residual_reason
+    node["RESIDUAL_REASON"] = residual_reason
+
+
+def _golden_semantic_span(op: dict[str, Any]) -> dict[str, Any] | None:
+    span = _golden_span(op.get("start_us"), op.get("end_us"))
+    if span is None:
+        return None
+    start, end = span
+    return {
+        "operation_type": op.get("operation_type", ""),
+        "name": op.get("operation_type", op.get("name", "")),
+        "source": op.get("source", "semantic"),
+        "source_file": op.get("source", "semantic"),
+        "source_line": None,
+        "start_us": start,
+        "end_us": end,
+        "duration_us": end - start,
+        "pid": op.get("pid"),
+        "tid": op.get("tid"),
+        "task_id": op.get("task_id", ""),
+        "complete": True,
+    }
+
+
+def _build_golden_profile(
+    calls: list[dict[str, Any]],
+    semantic_ops: list[dict[str, Any]],
+    torch_events: list[dict[str, Any]],
+    trace_config: Mapping[str, Any],
+    *,
+    trace_truncated: bool,
+    raw_trace_nonempty: bool,
+) -> dict[str, Any]:
+    """Analyze one and only one claimed Golden root call."""
+    roots = [
+        call for root_name in _GOLDEN_ROOT_NAMES
+        for call in _golden_named_calls(calls, root_name)
+    ]
+    root_name = _basename(roots[0].get("name")) if len(roots) == 1 else _GOLDEN_ROOT_NAME
+    configured_torch_enabled = trace_config.get("torch_enabled")
+    if isinstance(configured_torch_enabled, bool):
+        # An explicit setting is authoritative, including false.  A trace
+        # artifact can exist as an empty/placeholder file without profiling
+        # having been enabled.
+        torch_enabled = configured_torch_enabled
+    else:
+        # Offline sessions from before torch_enabled was recorded use parsed
+        # events (or the configured trace path) as the compatibility signal.
+        torch_enabled = bool(torch_events) or bool(trace_config.get("torch_trace_path"))
+    torch_disabled = not torch_enabled
+    torch_state = "DISABLED" if torch_disabled else "ENABLED"
+    reason = "complete"
+    complete = True
+    root: dict[str, Any] | None = None
+    if len(roots) == 0:
+        complete, reason = False, f"missing {root_name} root call"
+    elif len(roots) != 1:
+        complete, reason = False, f"ambiguous Golden root call: found {len(roots)}"
+    else:
+        root = roots[0]
+        if not bool(root.get("complete")) or _golden_span(root.get("start_us"), root.get("end_us")) is None:
+            complete, reason = False, f"incomplete {root_name} root call"
+        elif not raw_trace_nonempty:
+            complete, reason = False, "raw VizTracer trace is empty"
+        elif trace_truncated:
+            complete, reason = False, "VizTracer trace is truncated"
+        elif not torch_disabled and not torch_events:
+            complete, reason = False, "Torch analysis failed: enabled trace is empty or invalid"
+
+    if root is not None and complete:
+        root_start = float(root["start_us"])
+        root_end = float(root["end_us"])
+        descendants = [
+            c for c in calls
+            if c is not root
+            and c.get("start_us") is not None
+            and c.get("end_us") is not None
+            and root_start <= float(c["start_us"])
+            and float(c["end_us"]) <= root_end
+        ]
+        incomplete_inside = [
+            c for c in calls
+            if c is not root and not c.get("complete", True)
+            and (
+                (c.get("start_us") is not None and root_start <= float(c["start_us"]) <= root_end)
+                or (c.get("end_us") is not None and root_start <= float(c["end_us"]) <= root_end)
+            )
+        ]
+        if incomplete_inside:
+            bad = sorted(incomplete_inside, key=lambda c: (c.get("event_index", 0), c.get("name", "")))[0]
+            complete = False
+            reason = f"incomplete root-corrupting call: {bad.get('name', '')}"
+
+        ambiguous = [
+            c for c in descendants
+            if c.get("parent_event_index") is None
+            and c.get("pid") == root.get("pid")
+            and c.get("tid") == root.get("tid")
+            and abs(float(c["start_us"]) - root_start) < 0.001
+            and abs(float(c["end_us"]) - root_end) < 0.001
+        ]
+        if complete and ambiguous:
+            complete = False
+            reason = f"ambiguous parenthood for call: {ambiguous[0].get('name', '')}"
+
+        root_context_calls = [c for c in calls if _golden_same_context(c, root)]
+        required = _golden_required_stages(
+            trace_config,
+            root_context_calls,
+            context=root,
+        )
+        observed_stages = {
+            _basename(c.get("name")) for c in descendants
+            if _golden_same_context(c, root)
+            and _basename(c.get("name")) in _GOLDEN_STAGE_NAMES
+        }
+        missing = [stage for stage in required if stage not in observed_stages]
+        if complete and missing:
+            complete = False
+            reason = f"missing required canonical stage: {missing[0]}"
+
+        parented_root_children = [
+            c for c in descendants
+            if c.get("parent_event_index") == root.get("event_index")
+            and _golden_same_context(c, root)
+        ]
+        # Interval containment is useful accounting evidence even when the
+        # existing reconstruction intentionally leaves an overlapping sibling
+        # unparented.  Keep that call's parent blank; this is not async
+        # ownership inference.  Cross-thread calls are excluded because their
+        # relationship to this root is not established by the trace.
+        ambiguous_root_children = [
+            c for c in descendants
+            if c.get("parent_event_index") is None
+            and _golden_same_context(c, root)
+            and c not in parented_root_children
+        ]
+        unparented_contained = [
+            c for c in descendants
+            if c.get("parent_event_index") is None and c not in parented_root_children
+            and c.get("pid") == root.get("pid")
+            and c.get("tid") == root.get("tid")
+            and c.get("task_id", "") == root.get("task_id", "")
+        ]
+        root_children = parented_root_children + ambiguous_root_children
+        root_intervals = [
+            (float(c["start_us"]), float(c["end_us"]))
+            for c in root_children
+            if _golden_span(c.get("start_us"), c.get("end_us")) is not None
+        ]
+        root_union_ms = _ms(_total_interval_length(root_intervals))
+        if complete and (root_end - root_start) < 0 or root_union_ms > _ms(root_end - root_start) + 0.001:
+            complete = False
+            reason = "invalid accounting: direct child union exceeds root wall"
+
+        root_node = _golden_node(root, root_start_us=root_start, children=root_children, kind="python")
+
+        calls_by_event_index = {
+            c["event_index"]: c
+            for c in calls
+            if isinstance(c.get("event_index"), int)
+        }
+        children_by_parent: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for child in descendants:
+            parent_index = child.get("parent_event_index")
+            parent = calls_by_event_index.get(parent_index) if isinstance(parent_index, int) else None
+            if parent is not None and _golden_same_context(child, parent):
+                children_by_parent[parent_index].append(child)
+
+        def build_children(parent: dict[str, Any], parent_node: dict[str, Any]) -> None:
+            direct = sorted(
+                children_by_parent.get(parent.get("event_index"), [])
+                + (unparented_contained if parent is root else []),
+                key=lambda c: (float(c.get("start_us", 0)), float(c.get("end_us", 0)), str(c.get("name", "")), int(c.get("event_index", 0))),
+            )
+            def visit(child: dict[str, Any]) -> None:
+                duration_ms = _ms(float(child["end_us"]) - float(child["start_us"]))
+                if duration_ms <= _GOLDEN_PROFILE_THRESHOLD_MS:
+                    # The threshold suppresses only the row, not its traced
+                    # descendants.  Continue through hidden spans so a large
+                    # operation is never lost merely because its wrapper is
+                    # short.  It is still accounted by its actual parent via
+                    # the direct-child interval union above.
+                    hidden_children = sorted(
+                        children_by_parent.get(child.get("event_index"), []),
+                        key=lambda c: (
+                            float(c.get("start_us", 0)),
+                            float(c.get("end_us", 0)),
+                            str(c.get("name", "")),
+                            int(c.get("event_index", 0)),
+                        ),
+                    )
+                    for hidden_child in hidden_children:
+                        visit(hidden_child)
+                    return
+                child_node = _golden_node(
+                    child,
+                    root_start_us=root_start,
+                    children=children_by_parent.get(child.get("event_index"), []),
+                    kind="python",
+                    parent=parent,
+                )
+                build_children(child, child_node)
+                parent_node["children"].append(child_node)
+
+            for child in direct:
+                visit(child)
+
+        build_children(root, root_node)
+        _golden_refresh_display_summary(root_node)
+        semantic_nodes: list[dict[str, Any]] = []
+        for op in semantic_ops:
+            span = _golden_semantic_span(op)
+            if span is None:
+                continue
+            if not (root_start <= span["start_us"] and span["end_us"] <= root_end):
+                continue
+            if _ms(span["end_us"] - span["start_us"]) <= _GOLDEN_PROFILE_THRESHOLD_MS:
+                continue
+            semantic_nodes.append(
+                _golden_node(span, root_start_us=root_start, children=[], kind="semantic")
+            )
+        semantic_nodes.sort(key=lambda n: (n["start_offset_ms"], n["end_ms"], n["name"], n.get("source", "")))
+        canonical_spans = []
+        for stage in _GOLDEN_STAGE_NAMES:
+            for candidate in _golden_named_calls(descendants, stage):
+                if not _golden_same_context(candidate, root):
+                    continue
+                canonical_node = _golden_node(
+                    candidate,
+                    root_start_us=root_start,
+                    children=children_by_parent.get(candidate.get("event_index"), []),
+                    kind="python",
+                )
+                build_children(candidate, canonical_node)
+                _golden_refresh_display_summary(canonical_node)
+                canonical_spans.append(canonical_node)
+        canonical_spans.sort(key=lambda n: (n["start_offset_ms"], n["end_ms"], n["name"], n.get("event_index", 0)))
+        return {
+            "GOLDEN_PROFILE_COMPLETE": "YES" if complete else "NO",
+            "GOLDEN_PROFILE_REASON": reason,
+            "GOLDEN_PROFILE_TORCH": torch_state,
+            "root": root_node,
+            "nodes": root_node["children"] + semantic_nodes,
+            "semantic_spans": semantic_nodes,
+            "canonical_spans": canonical_spans,
+            "required_canonical_stages": required,
+            "observed_canonical_stages": sorted(observed_stages),
+            "torch_cpu_ops": _build_torch_cpu_ops(torch_events),
+            "torch_cuda_ops": _build_torch_cuda_ops(torch_events),
+            "trace_truncated": trace_truncated,
+            "raw_trace_nonempty": raw_trace_nonempty,
+        }
+
+    return {
+        "GOLDEN_PROFILE_COMPLETE": "NO",
+        "GOLDEN_PROFILE_REASON": reason,
+        "GOLDEN_PROFILE_TORCH": torch_state,
+        "root": None,
+        "nodes": [],
+        "semantic_spans": [],
+        "canonical_spans": [],
+        "required_canonical_stages": [],
+        "observed_canonical_stages": [],
+        "torch_cpu_ops": _build_torch_cpu_ops(torch_events),
+        "torch_cuda_ops": _build_torch_cuda_ops(torch_events),
+        "trace_truncated": trace_truncated,
+        "raw_trace_nonempty": raw_trace_nonempty,
+    }
+
+
+def _golden_profile_json(profile: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable, JSON-facing Golden profile shape."""
+    root = profile.get("root") or {}
+    root_summary = {
+        key: root.get(key, MEASUREMENT_UNAVAILABLE)
+        for key in (
+            "kind", "name", "source", "start_offset_ms", "start_offset", "wall_ms", "direct_child_sum_ms",
+            "direct_child_union_ms", "direct_child_overlap_ms", "child_overlap_ms", "direct_children_sum_ms",
+            "direct_children_union_ms", "overlap_ms", "exclusive_residual_ms",
+            "residual_ms", "residual_pct", "coverage_pct", "coverage", "subthreshold_children_union_ms",
+            "direct_child_count", "subthreshold_child_count", "subthreshold_child_union_ms",
+            "display_children_gt50ms", "traced_children", "true_self_or_untraced_residual_ms",
+            "residual_reason", "classification", "decomposition_classification",
+            "DECOMPOSITION_CLASSIFICATION",
+            "thread_task", "completeness", "needs_decomposition", "flag",
+            "WALL_MS", "DIRECT_CHILD_COUNT", "DIRECT_CHILD_SUM_MS", "DIRECT_CHILD_UNION_MS",
+            "DIRECT_CHILD_OVERLAP_MS", "SUBTHRESHOLD_CHILD_COUNT", "SUBTHRESHOLD_CHILD_UNION_MS",
+            "DISPLAY_CHILDREN_GT50MS", "TRACED_CHILDREN", "RESIDUAL_MS", "RESIDUAL_PCT",
+            "TRUE_SELF_OR_UNTRACED_RESIDUAL_MS", "RESIDUAL_REASON",
+        )
+    }
+    if root:
+        root_summary["children"] = root.get("children", [])
+    complete = profile["GOLDEN_PROFILE_COMPLETE"] == "YES"
+    root_wall = root.get("wall_ms") if root else MEASUREMENT_UNAVAILABLE
+    needs_decomposition = bool(root.get("needs_decomposition")) if root else False
+
+    def count_nodes(node_list: Sequence[dict[str, Any]]) -> int:
+        return sum(1 + count_nodes(node.get("children", [])) for node in node_list)
+
+    span_count = count_nodes(profile.get("nodes", []))
+    return {
+        "schema_version": "golden-profile/1",
+        "GOLDEN_PROFILE_COMPLETE": profile["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON": profile["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH": profile["GOLDEN_PROFILE_TORCH"],
+        "complete": complete,
+        "reason": profile["GOLDEN_PROFILE_REASON"],
+        "torch": profile["GOLDEN_PROFILE_TORCH"],
+        "GOLDEN_PROFILE_ROOT_NAME": root.get("name") if root else MEASUREMENT_UNAVAILABLE,
+        "GOLDEN_PROFILE_ROOT_WALL_MS": root_wall,
+        "GOLDEN_PROFILE_SPAN_COUNT": span_count,
+        "GOLDEN_PROFILE_NEEDS_DECOMPOSITION": needs_decomposition,
+        "root": root_summary if root else None,
+        "nodes": profile.get("nodes", []),
+        "semantic_spans": profile.get("semantic_spans", []),
+        "canonical_spans": profile.get("canonical_spans", []),
+        "required_canonical_stages": profile.get("required_canonical_stages", []),
+        "observed_canonical_stages": profile.get("observed_canonical_stages", []),
+        "completeness": {
+            "complete": complete,
+            "reason": profile["GOLDEN_PROFILE_REASON"],
+            "trace_truncated": profile.get("trace_truncated", False),
+            "raw_trace_nonempty": profile.get("raw_trace_nonempty", False),
+        },
+        "VIZTRACER_CHILD_COVERAGE": profile.get("VIZTRACER_CHILD_COVERAGE", MEASUREMENT_UNAVAILABLE),
+        "VIZTRACER_CHILD_COVERAGE_STATUS": profile.get(
+            "VIZTRACER_CHILD_COVERAGE_STATUS", "unavailable"
+        ),
+        "CROSS_EVIDENCE_DECOMPOSITION": profile.get("CROSS_EVIDENCE_DECOMPOSITION", "NONE"),
+        "sampling_temporal_rows": profile.get("sampling_temporal_rows", []),
+        "unresolved_over_50ms": profile.get("unresolved_over_50ms", []),
+        "sampling_reconciled": profile.get("sampling_reconciled", False),
+        "sampling_decomposition_status": profile.get(
+            "sampling_decomposition_status", "unavailable"
+        ),
+        "transport_reconciled": profile.get("transport_reconciled", False),
+        "stage_evidence": profile.get("stage_evidence", {}),
+    }
+
+
+def _golden_bar(start_ms: float, end_ms: float, root_start_ms: float, root_end_ms: float) -> str:
+    """Render a deterministic 100-column inclusive timeline bar."""
+    width = 100
+    span = root_end_ms - root_start_ms
+    if span <= 0:
+        return "█" + (" " * (width - 1))
+    lo = max(0, min(width - 1, int(((start_ms - root_start_ms) / span) * width)))
+    hi = max(lo + 1, min(width, int(((end_ms - root_start_ms) / span) * width + 0.999999)))
+    return " " * lo + "█" * (hi - lo) + " " * (width - hi)
+
+
+def _golden_profile_gantt(profile: dict[str, Any]) -> str:
+    """Build the primary timestamped Golden Gantt."""
+    lines = [
+        "GOLDEN_PROFILE_COMPLETE=" + profile["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON=" + profile["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH=" + profile["GOLDEN_PROFILE_TORCH"],
+        "VIZTRACER_CHILD_COVERAGE=" + str(profile.get("VIZTRACER_CHILD_COVERAGE", MEASUREMENT_UNAVAILABLE)),
+        "VIZTRACER_CHILD_COVERAGE_STATUS=" + str(profile.get("VIZTRACER_CHILD_COVERAGE_STATUS", "unavailable")),
+        "CROSS_EVIDENCE_DECOMPOSITION=" + str(profile.get("CROSS_EVIDENCE_DECOMPOSITION", "NONE")),
+        "# Golden profile Gantt",
+        "TIMELINE_COLUMNS=100",
+    ]
+    root = profile.get("root")
+    if root:
+        root_start = float(root["start_ms"])
+        root_end = float(root["end_ms"])
+        rows: list[tuple[int, float, float, str, str]] = [(0, root_start, root_end, root["name"], "root")]
+        selected: dict[tuple[Any, ...], tuple[int, float, float, str, str]] = {}
+        def select_node(node: dict[str, Any], level: int, *, preserve_existing: bool = False) -> None:
+            key = (node.get("kind"), node.get("event_index"), node.get("name"), node.get("start_ms"))
+            if not preserve_existing or key not in selected:
+                selected[key] = (level, float(node["start_ms"]), float(node["end_ms"]), node["name"], node.get("kind", ""))
+            for child in node.get("children", []):
+                select_node(child, level + 1)
+
+        for node in profile.get("nodes", []):
+            select_node(node, 1)
+        for node in profile.get("canonical_spans", []):
+            select_node(node, max(1, int(node.get("depth", 1) or 1)), preserve_existing=True)
+        rows.extend(selected.values())
+        rows.sort(key=lambda row: (0 if row[4] == "root" else 1, row[0], row[1], row[2], row[3]))
+        for level, start_ms, end_ms, name, kind in rows:
+            label = ("  " * level) + name
+            lines.append(f"{label} |{_golden_bar(start_ms, end_ms, root_start, root_end)}|")
+            if name == "golden_sampling":
+                for row in profile.get("sampling_temporal_rows", []):
+                    start = _safe_float(row.get("start_ms"), None)
+                    end = _safe_float(row.get("end_ms"), None)
+                    if start is None or end is None:
+                        continue
+                    lines.append(
+                        f"{('  ' * (level + 1))}{row.get('label', 'sampling evaluation')} |"
+                        f"{_golden_bar(start, end, root_start, root_end)}|"
+                    )
+    else:
+        lines.append("(no Golden root interval; timeline unavailable)")
+
+    lines.extend([
+        "",
+        "TORCH_LANES=SEPARATE_CLOCK_DOMAIN_NOT_PLOTTED",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _sampling_breakdown_text(deep: Mapping[str, Any]) -> str:
+    rows = deep.get("step_breakdown", [])
+    rows = rows if isinstance(rows, list) else []
+    human_rows, non_additive = _build_human_sampling_model_breakdown(deep)
+    lines = [
+        "SAMPLING SUMMARY",
+        f"STATUS={deep.get('status', 'unavailable')}",
+        f"RECORDS={deep.get('record_count', 0)} DUPLICATES_SUPPRESSED={deep.get('duplicate_count', 0)}",
+        "FIRST_PASS_SEMANTICS=EXPLICIT_ONLY",
+        f"TEMPORAL_ALIGNMENT={deep.get('temporal_alignment', 'unavailable')}",
+        f"TEMPORAL_ALIGNMENT_REASON={deep.get('temporal_alignment_reason', 'no alignment evidence')}",
+        "STEP | WALL_MS | SOURCE",
+    ]
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        lines.append(
+            f"{row.get('label', 'step')} | {row.get('wall_ms', MEASUREMENT_UNAVAILABLE)} | "
+            f"{row.get('source', MEASUREMENT_UNAVAILABLE)}"
+        )
+    if not rows:
+        lines.append(f"(unavailable) | {MEASUREMENT_UNAVAILABLE} | no persisted sampling breakdown")
+    lines.extend([
+        "",
+        "DEEP SAMPLING BREAKDOWN",
+        "MODEL_EVIDENCE=AGGREGATED_BY_STEP_EVALUATION_AND_PHASE",
+        "TIMING_DOMAINS=HOST_MONOTONIC_AND_CUDA_DEVICE_ELAPSED_ARE_SEPARATE",
+        "NON-ADDITIVE MODEL EVIDENCE=" + ("YES" if non_additive else "NO"),
+        "STEP | EVAL | PHASE | COUNT | HOST_MONOTONIC_MS | CUDA_DEVICE_ELAPSED_MS | RANGE_MS",
+    ])
+    for row in human_rows:
+        lines.append(
+            f"{row.get('step', MEASUREMENT_UNAVAILABLE)} | "
+            f"{row.get('eval_index', MEASUREMENT_UNAVAILABLE)} | "
+            f"{row.get('phase', MEASUREMENT_UNAVAILABLE)} | {row.get('sample_count', 0)} | "
+            f"{row.get('host_monotonic_ms', MEASUREMENT_UNAVAILABLE)} | "
+            f"{row.get('cuda_device_ms', MEASUREMENT_UNAVAILABLE)} | "
+            f"{row.get('host_min_ms', MEASUREMENT_UNAVAILABLE)}..{row.get('host_max_ms', MEASUREMENT_UNAVAILABLE)}"
+        )
+    if non_additive:
+        lines.append("WARNING=MODEL TIMINGS MUST NOT BE SUMMED ACROSS PHASES OR CLOCK DOMAINS")
+    if not human_rows:
+        lines.append("(unavailable) | (unavailable) | (unavailable) | 0 | measurement_unavailable | measurement_unavailable | measurement_unavailable")
+    return "\n".join(lines) + "\n"
+
+
+def _transport_breakdown_text(transport: Mapping[str, Any]) -> str:
+    lines = [
+        "E27 TRANSPORT BREAKDOWN",
+        f"STATUS={transport.get('status', MEASUREMENT_UNAVAILABLE)}",
+        f"STAGE={transport.get('stage', MEASUREMENT_UNAVAILABLE)} ROLE={transport.get('role', MEASUREMENT_UNAVAILABLE)}",
+        f"REASON={transport.get('reason', MEASUREMENT_UNAVAILABLE)}",
+        "SUMMARY",
+    ]
+    for label, key in (
+        ("SOURCE_TOTAL_WALL_MS", "SOURCE_TOTAL_WALL_MS"),
+        ("SOURCE_SYSCALL_UNION_BUSY_MS", "SOURCE_SYSCALL_UNION_BUSY_MS"),
+        ("SOURCE_READ_COUNT", "source_read_count"),
+        ("SOURCE_READ_BYTES", "source_read_bytes"),
+        ("OBSERVED_PRODUCER_COUNT", "observed_producer_count"),
+        ("PRODUCERS", "producer_ids"),
+        ("MAX_ACTUAL_SOURCE_INFLIGHT", "max_actual_source_inflight"),
+        ("QD_PEAK", "qd_peak"),
+        ("QD_MEAN", "time_weighted_mean_qd"),
+        ("H2D_TOTAL_WALL_MS", "H2D_TOTAL_WALL_MS"),
+        ("H2D_SUBMISSIONS", "h2d_submission_count"),
+        ("H2D_COMPLETIONS", "h2d_completion_count"),
+        ("H2D_SUBMITTED_BYTES", "h2d_submitted_bytes"),
+        ("H2D_COMPLETED_BYTES", "h2d_completed_bytes"),
+        ("SOURCE_H2D_OVERLAP_MS", "SOURCE_H2D_OVERLAP_MS"),
+        ("POST_SOURCE_H2D_TAIL_MS", "POST_SOURCE_H2D_TAIL_MS"),
+        ("FALLBACK", "fallback"),
+        ("POISON", "poison"),
+        ("REGION_COVERAGE", "region_coverage"),
+        ("REGION_GAPS", "region_gaps"),
+        ("REGION_OVERLAPS", "region_overlaps"),
+        ("REGION_DUPLICATES", "region_duplicates"),
+        ("RECONCILIATION_STATE", "reconciliation_state"),
+    ):
+        lines.append(f"{label}={transport.get(key, MEASUREMENT_UNAVAILABLE)}")
+    lines.extend(["QD OCCUPANCY HISTOGRAM", "QD | OCCUPANCY_MS"])
+    occupancy = transport.get("qd_occupancy_ms")
+    if isinstance(occupancy, Mapping):
+        for qd, value in sorted(occupancy.items(), key=lambda pair: str(pair[0])):
+            lines.append(f"{qd} | {value}")
+    else:
+        lines.append(f"(unavailable) | {MEASUREMENT_UNAVAILABLE}")
+    # Per-read/per-copy timestamps are machine evidence only.  Keeping them in
+    # the JSON projection permits independent reconstruction without flooding
+    # the human report with one line per transport event.
+    lines.extend(["", "TIMESTAMP_LANES=JSON_ONLY"])
+    axis = transport.get("timestamp_axis")
+    if isinstance(axis, Mapping):
+        axis_start = _sampling_number(axis.get("start_ns"))
+        axis_end = _sampling_number(axis.get("end_ns"))
+        if axis_start is not None and axis_end is not None:
+            lines.append(
+                f"TIMESTAMP_AXIS_CLOCK={axis.get('clock', MEASUREMENT_UNAVAILABLE)} "
+                f"START_NS={axis_start} END_NS={axis_end}"
+            )
+    semantics = transport.get("timing_semantics")
+    if isinstance(semantics, Mapping) and semantics.get("non_additive"):
+        lines.append("WARNING=TRANSPORT OVERLAP IS A UNION; WALLS AND LANES ARE NOT ADDITIVE")
+    return "\n".join(lines) + "\n"
+
+
+def _augment_golden_profile(
+    profile: dict[str, Any],
+    deep: Mapping[str, Any],
+    transport: Mapping[str, Any],
+    trace_config: Mapping[str, Any],
+) -> None:
+    root = profile.get("root")
+    sampling_node: Mapping[str, Any] | None = None
+    roots_to_search: list[Mapping[str, Any]] = []
+    if isinstance(root, Mapping):
+        roots_to_search.append(root)
+    # Canonical spans can be valid stage evidence even when parent
+    # reconstruction did not attach the stage to the visible root tree.
+    for candidate in profile.get("canonical_spans", []):
+        if isinstance(candidate, Mapping):
+            roots_to_search.append(candidate)
+    for search_root in roots_to_search:
+        if sampling_node is not None:
+            break
+        stack = [search_root]
+        while stack:
+            node = stack.pop()
+            if node.get("name") == "golden_sampling":
+                sampling_node = node
+                break
+            children = node.get("children")
+            if isinstance(children, list):
+                stack.extend(child for child in children if isinstance(child, Mapping))
+    profile["sampling_temporal_rows"] = _sampling_temporal_rows(
+        deep, trace_config, sampling_node,
+    )
+    deep["temporal_alignment"] = (
+        "aligned" if profile["sampling_temporal_rows"]
+        else ("unaligned" if deep.get("status") != "unavailable" else "unavailable")
+    )
+    deep["temporal_alignment_reason"] = (
+        "explicit per-evaluation monotonic intervals mapped to Golden sampling"
+        if profile["sampling_temporal_rows"]
+        else "clock origin/alignment evidence unavailable; temporal rows not plotted"
+    )
+    root_coverage = _sampling_number(root.get("coverage_pct")) if isinstance(root, Mapping) else None
+    profile["VIZTRACER_CHILD_COVERAGE"] = (
+        round(root_coverage, 3) if root_coverage is not None
+        else MEASUREMENT_UNAVAILABLE
+    )
+    profile["VIZTRACER_CHILD_COVERAGE_STATUS"] = (
+        "complete" if profile.get("GOLDEN_PROFILE_COMPLETE") == "YES"
+        else ("partial" if root is not None else "unavailable")
+    )
+    sampling_temporal_aligned = bool(profile["sampling_temporal_rows"])
+    sampling_additive = _sampling_has_additive_reconciliation(deep)
+    sampling_explained = sampling_temporal_aligned or sampling_additive
+    # A deep profile can be a valid decomposition even when its monotonic
+    # clock cannot be mapped onto VizTracer.  Keep that evidence distinct from
+    # ``sampling_explained``: the former suppresses a false whole-parent
+    # unresolved row, while the latter controls whether it may be plotted on
+    # the parent timeline.
+    sampling_decomposed = deep.get("status") in {"available", "ok"}
+    if sampling_decomposed:
+        sampling_decomposed = False
+        for record in deep.get("records", []) if isinstance(deep.get("records"), list) else []:
+            payload = record.get("payload") if isinstance(record, Mapping) else None
+            if isinstance(payload, Mapping) and (
+                isinstance(payload.get("evals"), Mapping)
+                or isinstance(payload.get("timeline_steps"), list)
+                or isinstance(payload.get("reconciliation"), Mapping)
+            ):
+                sampling_decomposed = True
+                break
+    lanes = transport.get("timestamp_lanes") if isinstance(transport, Mapping) else None
+    lane_types = {
+        str(row.get("lane")) for row in lanes
+        if isinstance(row, Mapping)
+    } if isinstance(lanes, list) else set()
+    transport_explained = (
+        transport.get("reconciliation_state") == "valid"
+        and {"source", "h2d"}.issubset(lane_types)
+        and _sampling_number(transport.get("SOURCE_TOTAL_WALL_MS")) is not None
+        and _sampling_number(transport.get("H2D_TOTAL_WALL_MS")) is not None
+    )
+    if sampling_explained and transport_explained:
+        decomposition = "ALIGNED_SAMPLING_AND_TRANSPORT"
+    elif sampling_explained:
+        decomposition = "ALIGNED_SAMPLING"
+    elif transport_explained:
+        decomposition = "ALIGNED_TRANSPORT"
+    elif deep.get("status") != "unavailable" or transport.get("status") != "unavailable":
+        decomposition = "UNALIGNED"
+    else:
+        decomposition = "NONE"
+    profile["CROSS_EVIDENCE_DECOMPOSITION"] = decomposition
+    profile["sampling_decomposition_status"] = (
+        "aligned" if sampling_explained else (
+            "unaligned" if deep.get("status") != "unavailable" else "unavailable"
+        )
+    )
+    sampling_residuals: list[float] = []
+    for record in deep.get("records", []) if isinstance(deep.get("records"), list) else []:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        reconciliation = payload.get("reconciliation") if isinstance(payload, Mapping) else None
+        if isinstance(reconciliation, Mapping):
+            residual = _sampling_number(reconciliation.get("sampling_residual_ms"))
+            if residual is not None and residual > _GOLDEN_PROFILE_THRESHOLD_MS:
+                sampling_residuals.append(residual)
+    sampling_residual = max(sampling_residuals, default=None)
+    transport_residual = None
+    if isinstance(transport, Mapping):
+        for key in ("transport_residual_ms", "residual_ms", "unaccounted_ms"):
+            transport_residual = _sampling_number(transport.get(key))
+            if transport_residual is not None:
+                break
+
+    transport_stages: set[str] = set()
+    by_stage = transport.get("by_stage") if isinstance(transport, Mapping) else None
+    if isinstance(by_stage, Mapping):
+        for stage_name, stage_data in by_stage.items():
+            if not isinstance(stage_data, Mapping):
+                continue
+            lanes = stage_data.get("timestamp_lanes")
+            lane_types = {
+                str(row.get("lane")) for row in lanes if isinstance(row, Mapping)
+            } if isinstance(lanes, list) else set()
+            if (
+                stage_data.get("status") == "available"
+                and (
+                    stage_data.get("reconciliation_state") == "valid"
+                    or {"source", "h2d"}.issubset(lane_types)
+                )
+            ):
+                transport_stages.add(str(stage_name))
+    transport_decomposed = transport_explained or bool(transport_stages)
+
+    candidates: list[Mapping[str, Any]] = []
+    if isinstance(root, Mapping):
+        candidates.extend(_flatten_golden_nodes(root))
+    candidates.extend(
+        span for span in profile.get("canonical_spans", [])
+        if isinstance(span, Mapping) and span not in candidates
+    )
+    unresolved: list[dict[str, Any]] = []
+    for node in candidates:
+        wall = _sampling_number(node.get("wall_ms"))
+        residual = _sampling_number(node.get("residual_ms", node.get("exclusive_residual_ms")))
+        name = str(node.get("name", ""))
+        lower_name = name.lower().replace("-", "_").replace("/", "_")
+        sampling_cross = name == "golden_sampling" and sampling_decomposed
+        transport_cross = (
+            (name in transport_stages)
+            or (transport_decomposed
+            and (
+                "source_h2d_transport" in lower_name
+                or lower_name in {"source_h2d", "source_h2d_transport"}
+                or any(token in lower_name for token in ("transport", "source", "h2d"))
+            ))
+        )
+        viz_children = int(node.get("traced_children", 0) or 0)
+        displayed_children = int(node.get("display_children_gt50ms", 0) or 0)
+        if sampling_cross or transport_cross:
+            classification = (
+                "PARTIALLY_DECOMPOSED" if viz_children else "CROSS_EVIDENCE_DECOMPOSED"
+            )
+        elif displayed_children:
+            classification = "VIZTRACER_DECOMPOSED"
+        elif viz_children:
+            classification = "PARTIALLY_DECOMPOSED"
+        else:
+            classification = "OPAQUE"
+        # Keep the classification on the normalized candidate as well as on
+        # any unresolved row.  NO_TRACED_CHILDREN remains a VizTracer fact; it
+        # must not erase an independent cross-evidence classification.
+        if isinstance(node, dict):
+            node["classification"] = classification
+            node["decomposition_classification"] = classification
+            node["DECOMPOSITION_CLASSIFICATION"] = classification
+        if wall is None or wall <= _GOLDEN_PROFILE_THRESHOLD_MS:
+            continue
+        if residual is None or residual <= _GOLDEN_PROFILE_THRESHOLD_MS:
+            continue
+        if sampling_cross or transport_cross:
+            continue
+        unresolved.append({
+            "name": name,
+            "wall_ms": wall,
+            "residual_ms": residual,
+            "coverage": "VizTracer coverage",
+            "evidence_source": "viztracer",
+            "clock_domain": "host_monotonic",
+            "reason": str(node.get("residual_reason", "untraced or self time")),
+            "classification": classification,
+        })
+    # A cross-evidence parent is never itself an unresolved row.  If its own
+    # producer reconciliation leaves a material residual, expose that residual
+    # explicitly instead of relabeling the whole parent as opaque.
+    if sampling_decomposed and sampling_residual is not None:
+        unresolved.append({
+            "name": "sampling residual",
+            "wall_ms": sampling_residual,
+            "residual_ms": sampling_residual,
+            "coverage": "cross-evidence",
+            "evidence_source": "sampling_deep_profile",
+            "clock_domain": "monotonic_ns",
+            "reason": "explicit sampling reconciliation residual",
+            "classification": "PARTIALLY_DECOMPOSED",
+        })
+    if transport_decomposed and transport_residual is not None and transport_residual > _GOLDEN_PROFILE_THRESHOLD_MS:
+        unresolved.append({
+            "name": "transport residual",
+            "wall_ms": transport_residual,
+            "residual_ms": transport_residual,
+            "coverage": "cross-evidence",
+            "evidence_source": "E27 persisted transport",
+            "clock_domain": "monotonic_ns",
+            "reason": "explicit source/H2D reconciliation residual",
+            "classification": "PARTIALLY_DECOMPOSED",
+        })
+    # Cross-evidence is intentionally not folded into VizTracer residuals.  If
+    # persisted sampling/E27 data exists but cannot be aligned/reconciled, make
+    # that limitation explicit; aligned regions are omitted from unresolved.
+    if deep.get("status") not in {"unavailable", ""} and not sampling_decomposed:
+        unresolved.append({
+            "name": "sampling_window",
+            "wall_ms": _sampling_number(deep.get("authoritative_sampling_window_ms")),
+            "residual_ms": _sampling_number(deep.get("reconciliation", {}).get("sampling_residual_ms"))
+            if isinstance(deep.get("reconciliation"), Mapping) else None,
+            "coverage": "cross-evidence",
+            "evidence_source": "sampling_deep_profile",
+            "clock_domain": "monotonic_ns",
+            "reason": str(deep.get("temporal_alignment_reason", "sampling clock alignment unavailable")),
+            "classification": "OPAQUE",
+        })
+    if transport.get("status") not in {"unavailable", ""} and not transport_explained:
+        unresolved.append({
+            "name": "source/H2D transport",
+            "wall_ms": _sampling_number(transport.get("SOURCE_TOTAL_WALL_MS")),
+            "residual_ms": None,
+            "coverage": "cross-evidence",
+            "evidence_source": "E27 persisted transport",
+            "clock_domain": "monotonic_ns",
+            "reason": str(transport.get("reason", "E27 reconciliation or timestamp coverage unavailable")),
+            "classification": "OPAQUE",
+        })
+    profile["unresolved_over_50ms"] = unresolved
+    profile["sampling_reconciled"] = sampling_explained
+    profile["transport_reconciled"] = transport_explained
+    profile["stage_evidence"] = {
+        stage: {
+            "source": "VizTracer parent clock",
+            "clock_domain": "host_monotonic",
+            "transport_role": role,
+            "transport_clock": "monotonic_ns separate local mini-Gantt"
+            if role in {"clip", "unet", "vae"} else MEASUREMENT_UNAVAILABLE,
+        }
+        for stage, role in {
+            "golden_clip_load": "clip",
+            "golden_clip_forward": "clip",
+            "golden_unet_load": "unet",
+            "golden_sampler_prepare": "sampler",
+            "golden_vae_load": "vae",
+            "golden_sampling": "sampling_window",
+            "golden_vae_decode": "vae_decode",
+        }.items()
+    }
+
+
+def _flatten_golden_nodes(root: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    result: list[Mapping[str, Any]] = []
+    stack: list[Mapping[str, Any]] = [root]
+    while stack:
+        node = stack.pop()
+        result.append(node)
+        children = node.get("children")
+        if isinstance(children, list):
+            stack.extend(child for child in children if isinstance(child, Mapping))
+    return result
+
+
+def _generate_golden_profile_report(profile: dict[str, Any]) -> str:
+    """Generate the standalone Golden profile report."""
+    data = _golden_profile_json(profile)
+    lines = [
+        "GOLDEN_PROFILE_COMPLETE=" + data["GOLDEN_PROFILE_COMPLETE"],
+        "GOLDEN_PROFILE_REASON=" + data["GOLDEN_PROFILE_REASON"],
+        "GOLDEN_PROFILE_TORCH=" + data["GOLDEN_PROFILE_TORCH"],
+        "GOLDEN_PROFILE_ROOT_NAME=" + str(data["GOLDEN_PROFILE_ROOT_NAME"]),
+        "GOLDEN_PROFILE_ROOT_WALL_MS=" + str(data["GOLDEN_PROFILE_ROOT_WALL_MS"]),
+        "GOLDEN_PROFILE_SPAN_COUNT=" + str(data["GOLDEN_PROFILE_SPAN_COUNT"]),
+        "GOLDEN_PROFILE_NEEDS_DECOMPOSITION=" + str(data["GOLDEN_PROFILE_NEEDS_DECOMPOSITION"]),
+        "NEEDS_DECOMPOSITION="
+        + ("YES" if data["GOLDEN_PROFILE_NEEDS_DECOMPOSITION"] else "NO"),
+        "VIZTRACER_CHILD_COVERAGE=" + str(data.get("VIZTRACER_CHILD_COVERAGE", MEASUREMENT_UNAVAILABLE)),
+        "VIZTRACER_CHILD_COVERAGE_STATUS=" + str(data.get("VIZTRACER_CHILD_COVERAGE_STATUS", "unavailable")),
+        "CROSS_EVIDENCE_DECOMPOSITION=" + str(data.get("CROSS_EVIDENCE_DECOMPOSITION", "NONE")),
+        "# Golden execution profile",
+        "",
+        "## Summary",
+        f"- Root: {data['root']['name'] if data['root'] else MEASUREMENT_UNAVAILABLE}",
+        f"- Required canonical stages: {', '.join(data['required_canonical_stages']) or '(none claimed)' }",
+        f"- Observed canonical stages: {', '.join(data['observed_canonical_stages']) or '(none)' }",
+        "",
+        "## Spans over 50.000 ms",
+        "",
+        "| Name | Kind | Source | Start offset (ms) | WALL_MS | DIRECT_CHILD_COUNT | DIRECT_CHILD_SUM_MS | DIRECT_CHILD_UNION_MS | DIRECT_CHILD_OVERLAP_MS | SUBTHRESHOLD_CHILD_COUNT | SUBTHRESHOLD_CHILD_UNION_MS | DISPLAY_CHILDREN_GT50MS | TRACED_CHILDREN | RESIDUAL_MS | RESIDUAL_PCT | TRUE_SELF_OR_UNTRACED_RESIDUAL_MS | RESIDUAL_REASON | Thread/task | Completeness | Flag |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|",
+    ]
+    def add_node(node: dict[str, Any], level: int = 0) -> None:
+        indent = "  " * level
+        lines.append(
+            f"| {indent}{node['name']} | {node['kind']} | {node['source']} | {node['start_offset_ms']} "
+            f"| {node['WALL_MS']} | {node['DIRECT_CHILD_COUNT']} | {node['DIRECT_CHILD_SUM_MS']} "
+            f"| {node['DIRECT_CHILD_UNION_MS']} | {node['DIRECT_CHILD_OVERLAP_MS']} "
+            f"| {node['SUBTHRESHOLD_CHILD_COUNT']} | {node['SUBTHRESHOLD_CHILD_UNION_MS']} "
+            f"| {node['DISPLAY_CHILDREN_GT50MS']} | {node['TRACED_CHILDREN']} | {node['RESIDUAL_MS']} "
+            f"| {node['RESIDUAL_PCT']} | {node['TRUE_SELF_OR_UNTRACED_RESIDUAL_MS']} "
+            f"| {node['RESIDUAL_REASON']} | {node['thread_task']} | {node['completeness']} "
+            f"| {node['flag']} NEEDS_DECOMPOSITION={'YES' if node['needs_decomposition'] else 'NO'} |"
+        )
+        for child in node.get("children", []):
+            add_node(child, level + 1)
+    if data["root"]:
+        add_node(data["root"])
+        for node in data["semantic_spans"]:
+            add_node(node, 1)
+    else:
+        unavailable = " | ".join(["measurement_unavailable"] * 15)
+        lines.append(f"| (none) | (none) | (none) | {unavailable} | incomplete | measurement_unavailable |")
+    lines.extend([
+        "",
+        "Residual is not causal. DIRECT_CHILD_OVERLAP_MS=DIRECT_CHILD_SUM_MS-DIRECT_CHILD_UNION_MS; "
+        "RESIDUAL_MS=parent WALL_MS-DIRECT_CHILD_UNION_MS. Children at or below 50 ms "
+        "remain in accounting but are not rendered as rows. TRACED_CHILDREN=0 and "
+        "RESIDUAL_REASON=NO_TRACED_CHILDREN "
+        "means no measured direct children; RESIDUAL_REASON=ONLY_SUBTHRESHOLD_CHILDREN "
+        "means DISPLAY_CHILDREN_GT50MS=0; RESIDUAL_REASON=DISPLAYED_CHILDREN_GT50MS "
+        "means larger descendants are rendered recursively.",
+        "",
+        "## Torch analysis",
+        "",
+        "Torch CPU/CUDA clock alignment is unproven; the Gantt keeps those lanes in a separate table.",
+        "",
+        "## UNRESOLVED >50ms AREAS",
+    ])
+    unresolved = data.get("unresolved_over_50ms", [])
+    if unresolved:
+        for area in unresolved:
+            lines.append(
+                f"- {area.get('name', '')}: {area.get('coverage', 'remaining')} "
+                f"wall_ms={area.get('wall_ms')} residual_ms={area.get('residual_ms')} "
+                f"clock={area.get('clock_domain', MEASUREMENT_UNAVAILABLE)} "
+                f"classification={area.get('classification', 'OPAQUE')} "
+                f"reason={area.get('reason', 'not established')}"
+            )
+    else:
+        lines.append("None; separately explained sampling and transport evidence is excluded.")
+    return "\n".join(lines) + "\n"
 
 
 def _generate_report_md(
@@ -2350,6 +5430,9 @@ def _generate_report_md(
     derived_files: dict[str, Any],
     overlaps: list[dict[str, Any]],
     milestones: list[dict[str, Any]],
+    golden_profile: dict[str, Any] | None = None,
+    sampling_deep_evidence: dict[str, Any] | None = None,
+    source_h2d_transport: dict[str, Any] | None = None,
 ) -> str:
     """Generate the full markdown report."""
     lines: list[str] = []
@@ -2389,6 +5472,126 @@ def _generate_report_md(
         _w("### Warnings")
         for w in warnings:
             _w(f"- {w}")
+    _w("")
+
+    # ── Golden serial profile ──
+    if golden_profile is not None:
+        _w("## Golden serial profile")
+        _w("")
+        _w(f"- **GOLDEN_PROFILE_COMPLETE**: {golden_profile.get('GOLDEN_PROFILE_COMPLETE', 'NO')}")
+        _w(f"- **GOLDEN_PROFILE_REASON**: {golden_profile.get('GOLDEN_PROFILE_REASON', '')}")
+        _w(f"- **GOLDEN_PROFILE_TORCH**: {golden_profile.get('GOLDEN_PROFILE_TORCH', 'DISABLED')}")
+        _w(f"- Profile spans over 50 ms: {len(golden_profile.get('nodes', []))}")
+        _w(f"- **VIZTRACER_CHILD_COVERAGE**: {golden_profile.get('VIZTRACER_CHILD_COVERAGE', MEASUREMENT_UNAVAILABLE)}")
+        _w(f"- **VIZTRACER_CHILD_COVERAGE_STATUS**: {golden_profile.get('VIZTRACER_CHILD_COVERAGE_STATUS', 'unavailable')}")
+        _w(f"- **CROSS_EVIDENCE_DECOMPOSITION**: {golden_profile.get('CROSS_EVIDENCE_DECOMPOSITION', 'NONE')}")
+        _w("")
+        _w("## Golden Gantt")
+        _w("")
+        _w("```text")
+        lines.extend(_golden_profile_gantt(golden_profile).rstrip("\n").splitlines())
+        _w("```")
+        _w("")
+        unresolved = golden_profile.get("unresolved_over_50ms", [])
+        _w("## UNRESOLVED >50ms AREAS")
+        _w("")
+        if unresolved:
+            _w("Areas below are residuals not separately explained by sampling or transport evidence.")
+            for area in unresolved:
+                _w(
+                    f"- {area.get('name', '')}: wall_ms={area.get('wall_ms')} "
+                    f"residual_ms={area.get('residual_ms')} "
+                    f"classification={area.get('classification', 'OPAQUE')} "
+                    f"reason={area.get('reason', 'not established')}"
+                )
+        else:
+            _w("None; sampling and transport are separate evidence domains when available.")
+        _w("")
+
+    # E27 source/H2D evidence is a report-time projection of persisted Golden
+    # telemetry.  It is deliberately not a VizTracer child or a Gantt lane:
+    # overlap is a union/non-additive diagnostic, not a decomposition sum.
+    transport = source_h2d_transport or _source_h2d_unavailable()
+    _w("## SOURCE/H2D TRANSPORT")
+    _w("")
+    _w(f"- **status**: {transport.get('status', _SOURCE_H2D_UNAVAILABLE)}")
+    _w(f"- **stage**: {transport.get('stage', _SOURCE_H2D_UNAVAILABLE)}")
+    _w(f"- **role**: {transport.get('role', _SOURCE_H2D_UNAVAILABLE)}")
+    _w(f"- **reason**: {transport.get('reason', _SOURCE_H2D_UNAVAILABLE)}")
+    _w("")
+    _w("| Metric | Value |")
+    _w("|---|---:|")
+    for field in _SOURCE_H2D_FIELDS:
+        value = transport.get(field, _SOURCE_H2D_UNAVAILABLE)
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        _w(f"| {field} | {value} |")
+    reconciliation = transport.get("reconciliation", {})
+    _w(f"| reconciliation_state | {reconciliation.get('state', 'unavailable') if isinstance(reconciliation, Mapping) else 'unavailable'} |")
+    _w("")
+    _w("Timing semantics: SOURCE_H2D_OVERLAP_MS is an interval union and is non-additive with source/H2D walls. No waits, fences, or timestamps are inferred from a Golden stage wall; unavailable and reconciliation-invalid states remain explicit.")
+    _w("")
+
+    # Sampling deep evidence is intentionally a separate domain.  In
+    # particular, none of these rows are calls, Golden nodes, child counts, or
+    # Gantt spans: host and device clocks are not silently merged.
+    deep = sampling_deep_evidence or {"status": "unavailable", "step_breakdown": [], "model_breakdown": []}
+    _w("## SAMPLING SUMMARY")
+    _w("")
+    _w("```text")
+    lines.extend(_sampling_breakdown_text(deep).rstrip("\n").splitlines())
+    _w("```")
+    _w("")
+    _w("## STEP BREAKDOWN")
+    _w("")
+    _w(f"- **sampling_deep_profile**: {deep.get('status', 'unavailable')}")
+    _w(f"- **records**: {deep.get('record_count', 0)}; duplicate copies suppressed: {deep.get('duplicate_count', 0)}")
+    step_rows = deep.get("step_breakdown", [])
+    if step_rows:
+        _w("")
+        _w("| Profile | Kind | Step/metric | Wall (host monotonic ms) | Source |")
+        _w("|---:|---|---|---:|---|")
+        for row in step_rows[:300]:
+            label = row.get("label", "")
+            wall = row.get("wall_ms", MEASUREMENT_UNAVAILABLE)
+            _w(f"| {row.get('profile_index', '')} | {row.get('kind', '')} | {label} | {wall} | {row.get('source', '')} |")
+    else:
+        _w("No step breakdown available.")
+    _w("")
+
+    _w("## DEEP MODEL BREAKDOWN")
+    _w("")
+    _w("CUDA/device elapsed and host monotonic timings are shown in separate columns; rows are evidence only and are not trace hierarchy spans.")
+    model_rows = deep.get("human_model_breakdown")
+    if not isinstance(model_rows, list):
+        model_rows, model_non_additive = _build_human_sampling_model_breakdown(deep)
+    else:
+        model_non_additive = bool(deep.get("model_non_additive"))
+    if model_rows:
+        if model_non_additive:
+            _w("**NON-ADDITIVE MODEL EVIDENCE**: do not sum rows across model phases or host/device clock domains.")
+        _w("")
+        _w("| Profile | Step | Eval | Phase | Count | Host monotonic ms | CUDA/device elapsed ms | Range ms |")
+        _w("|---:|---:|---:|---|---:|---:|---:|---|")
+        for row in model_rows[:500]:
+            _w(
+                f"| {row.get('profile_index', '')} | {row.get('step', '')} | {row.get('eval_index', '')} "
+                f"| {row.get('phase', '')} | {row.get('sample_count', '')} "
+                f"| {row.get('host_monotonic_ms', MEASUREMENT_UNAVAILABLE)} | {row.get('cuda_device_ms', MEASUREMENT_UNAVAILABLE)} "
+                f"| {row.get('host_min_ms', MEASUREMENT_UNAVAILABLE)}..{row.get('host_max_ms', MEASUREMENT_UNAVAILABLE)} |"
+            )
+    else:
+        _w("No deep model breakdown available.")
+    _w("")
+    _w("## DEEP SAMPLING BREAKDOWN")
+    _w("")
+    _w("See the persisted `golden_sampling_breakdown.txt`; model rows are aggregated by step/evaluation and phase.")
+    _w("")
+    _w("## E27 TRANSPORT BREAKDOWN")
+    _w("")
+    _w("```text")
+    lines.extend(_transport_breakdown_text(transport).rstrip("\n").splitlines())
+    _w("```")
     _w("")
 
     # ── Runtime configuration ──
@@ -2706,9 +5909,12 @@ def _build_manifest(raw_dir: Path, derived_dir: Path) -> list[dict[str, Any]]:
                     "sha256": _sha256_file(fpath),
                 })
 
-    # Derived files (exclude manifest.json from its own inventory)
+    # Derived files (exclude manifest.json from its own inventory).  Golden
+    # stage Gantts live under derived/gantts/, so the inventory must recurse;
+    # otherwise the manifest would claim a complete report while omitting the
+    # seven per-stage artifacts.
     if derived_dir.exists():
-        for fpath in sorted(derived_dir.iterdir()):
+        for fpath in sorted(derived_dir.rglob("*")):
             if fpath.is_file() and fpath.name != "manifest.json":
                 entries.append({
                     "path": str(fpath.relative_to(derived_dir.parent)).replace("\\", "/"),
@@ -2718,6 +5924,32 @@ def _build_manifest(raw_dir: Path, derived_dir: Path) -> list[dict[str, Any]]:
                 })
 
     return entries
+
+
+def _combine_profiler_artifacts(report: str, derived_dir: Path) -> str:
+    """Embed the four canonical profiler artifacts in the human report."""
+    parts = [report.rstrip("\n"), "", "## Persisted profiler artifacts", ""]
+    for name in (
+        "golden_profile_report.md",
+        "golden_profile_gantt.txt",
+        "golden_stage_gantts.txt",
+        "golden_sampling_breakdown.txt",
+        "e27_transport_breakdown.txt",
+    ):
+        path = derived_dir / name
+        parts.extend([f"### {name}", "", "```text"])
+        if path.is_file():
+            parts.extend(path.read_text(encoding="utf-8").rstrip("\n").splitlines())
+        else:
+            parts.append(MEASUREMENT_UNAVAILABLE)
+        parts.extend(["```", ""])
+    stage_dir = derived_dir / "gantts"
+    if stage_dir.is_dir():
+        for path in sorted(stage_dir.glob("golden_*.txt")):
+            parts.extend([f"### gantts/{path.name}", "", "```text"])
+            parts.extend(path.read_text(encoding="utf-8").rstrip("\n").splitlines())
+            parts.extend(["```", ""])
+    return "\n".join(parts).rstrip("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -2752,8 +5984,13 @@ def _build_report_data(
     async_tasks: list[dict[str, Any]],
     # Derived files info
     derived_files: dict[str, Any],
+    golden_profile: dict[str, Any] | None = None,
+    sampling_deep_evidence: dict[str, Any] | None = None,
+    source_h2d_transport: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the structured report_data.json."""
+    _normalize_clip_module_records(runtime_result)
+    _normalize_node_timing_records(runtime_result)
     data: dict[str, Any] = {
         "schema_version": VERSION,
         "status": status,
@@ -2797,7 +6034,54 @@ def _build_report_data(
         "session_events": sessions,
         "trace_config": trace_config,
         "runtime_result": runtime_result,
+        "clip_module_records_status": runtime_result.get(
+            "clip_module_records_status", "producer_absent"
+        ),
+        "clip_module_records_producer_present": runtime_result.get(
+            "clip_module_records_producer_present", False
+        ),
+        "derived_files": derived_files.get("files", []),
+        "golden_profile": _golden_profile_json(golden_profile) if golden_profile is not None else None,
+        "golden_profile_complete": (
+            golden_profile.get("GOLDEN_PROFILE_COMPLETE") if golden_profile is not None else "NO"
+        ),
+        "golden_profile_reason": (
+            golden_profile.get("GOLDEN_PROFILE_REASON") if golden_profile is not None else "not_generated"
+        ),
+        "golden_profile_torch": (
+            golden_profile.get("GOLDEN_PROFILE_TORCH") if golden_profile is not None else "DISABLED"
+        ),
+        # Kept outside calls/timeline/Golden profile by contract.  This is a
+        # structured projection of persisted diagnostic evidence, not inferred
+        # trace work.
+        "sampling_deep_profile": sampling_deep_evidence or {
+            "status": "unavailable",
+            "record_count": 0,
+            "duplicate_count": 0,
+            "records": [],
+            "step_breakdown": [],
+            "model_breakdown": [],
+            "warnings": [],
+            "hierarchy_included": False,
+        },
+        "source_h2d_transport": source_h2d_transport or _source_h2d_unavailable(),
     }
+    deep = data["sampling_deep_profile"]
+    human_model, model_non_additive = _build_human_sampling_model_breakdown(deep)
+    data["sampling_deep_profile"]["human_model_breakdown"] = human_model
+    data["sampling_deep_profile"]["model_non_additive"] = model_non_additive
+    data["VIZTRACER_CHILD_COVERAGE"] = (
+        golden_profile.get("VIZTRACER_CHILD_COVERAGE", "NO")
+        if golden_profile is not None else "NO"
+    )
+    data["CROSS_EVIDENCE_DECOMPOSITION"] = (
+        golden_profile.get("CROSS_EVIDENCE_DECOMPOSITION", "NONE")
+        if golden_profile is not None else "NONE"
+    )
+    data["unresolved_over_50ms"] = (
+        golden_profile.get("unresolved_over_50ms", [])
+        if golden_profile is not None else []
+    )
 
     # Add resource samples if available
     if isinstance(resource_result, dict) and resource_result.get("samples"):
@@ -2809,6 +6093,87 @@ def _build_report_data(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+
+def _maybe_generate_golden_exhaustive_profile(
+    session_dir: Path,
+    *,
+    parent_calls: Sequence[dict[str, Any]],
+    trace_config: Mapping[str, Any],
+    semantic_ops: Sequence[dict[str, Any]],
+    resource_result: Mapping[str, Any],
+    torch_enabled: bool,
+    stack_inconsistencies: int,
+) -> dict[str, Any]:
+    """Render the exhaustive Golden profiler when a Golden root was captured.
+
+    Runs only for a Golden request that the full-trace session actually traced,
+    and only when ``COMFYMODAL_GOLDEN_EXHAUSTIVE_PROFILE`` is set.  The selector
+    is a *report* selector: it cannot enable capture, so a request without a full
+    trace is unaffected either way.
+    """
+    try:
+        from . import process_trace_bridge as bridge  # type: ignore  # noqa: PLC0415
+        from . import golden_exhaustive_profile as exhaustive  # type: ignore  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - never break the existing report
+        return {"warnings": [f"golden_exhaustive_profile_unavailable: {exc}"]}
+
+    has_golden_root = any(
+        _basename(c.get("name")) in exhaustive.GOLDEN_ROOT_NAMES for c in parent_calls
+    )
+    if not has_golden_root:
+        return {}
+    if not bridge.exhaustive_profile_enabled():
+        return {}
+
+    warnings: list[str] = []
+    c_function_tracing = bool(
+        (trace_config.get("config") or {}).get("ignore_c_function")
+        if isinstance(trace_config.get("config"), Mapping) else False
+    )
+    try:
+        profile = exhaustive.analyze(
+            session_dir,
+            parent_calls=parent_calls,
+            trace_config=trace_config,
+            semantic_ops=semantic_ops,
+            cpu_evidence=dict(resource_result or {}),
+            stack_inconsistencies=stack_inconsistencies,
+            torch_enabled=bool(torch_enabled),
+            c_function_tracing=c_function_tracing,
+        )
+        written = exhaustive.write_artifacts(session_dir, profile)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not fail the report
+        warnings.append(f"golden_exhaustive_profile_failed: {type(exc).__name__}: {exc}"[:400])
+        return {"warnings": warnings}
+
+    if not profile.get("complete"):
+        warnings.append(
+            "golden_exhaustive_profile_incomplete: "
+            + "; ".join(profile.get("reasons") or [])[:600]
+        )
+    return {
+        "warnings": warnings,
+        "written": written,
+        "complete": bool(profile.get("complete")),
+        "report_path": written.get("report", ""),
+        "summary": {
+            "GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE": (
+                "YES" if profile.get("complete") else "NO"
+            ),
+            "reasons": profile.get("reasons"),
+            "root": profile.get("root"),
+            "clock_alignment": profile.get("clock_alignment"),
+            "process_coverage": (profile.get("process_manifest") or {}).get(
+                "process_coverage"
+            ),
+            "thread_coverage": profile.get("thread_coverage"),
+            "stages": [
+                {"stage": s.get("stage"), "wall_ms": s.get("wall_ms")}
+                for s in profile.get("stages") or []
+            ],
+        },
+    }
 
 
 def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
@@ -2866,6 +6231,15 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     trace_config = _parse_trace_config(session_dir)
     runtime_result = _parse_runtime_result_summary(session_dir)
 
+    # Parse this diagnostic domain independently of VizTracer calls.  In
+    # particular, do not append its intervals to timeline or semantic ops.
+    sampling_deep_evidence = _build_sampling_deep_evidence(
+        sessions, runtime_result, warnings,
+    )
+    source_h2d_transport = build_source_h2d_transport_projection(
+        runtime_result, sessions=sessions, session_dir=session_dir,
+    )
+
     # ── Build calls with parent-child relationships ──
     calls = _build_calls(trace_events)
 
@@ -2914,11 +6288,41 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     torch_cpu_ops = _build_torch_cpu_ops(torch_events)
     torch_cuda_ops = _build_torch_cuda_ops(torch_events)
 
+    # ── Golden serial profile (reuses all normalized/derived evidence above) ──
+    golden_profile = _build_golden_profile(
+        calls,
+        semantic_ops,
+        torch_events,
+        trace_config,
+        trace_truncated=truncated,
+        raw_trace_nonempty=bool(trace_events),
+    )
+    _augment_golden_profile(
+        golden_profile, sampling_deep_evidence, source_h2d_transport, trace_config,
+    )
+
     # ── Async tasks ──
     async_tasks = _build_async_tasks(milestones, sessions)
 
     # ── Stack inconsistencies ──
     stack_issues = _detect_stack_inconsistencies(calls)
+
+    # ── Golden exhaustive execution profiler ──
+    # The existing full-trace session owns capture; this is the same owner
+    # rendering the microscope view alongside the >50 ms quick view.  It runs
+    # only when a Golden root is present and the selector is on, so an ordinary
+    # report of a non-Golden request pays nothing for it.
+    exhaustive_result = _maybe_generate_golden_exhaustive_profile(
+        session_dir,
+        parent_calls=calls,
+        trace_config=trace_config,
+        semantic_ops=semantic_ops,
+        resource_result=resource_result,
+        torch_enabled=bool(torch_events),
+        stack_inconsistencies=len(stack_issues),
+    )
+    if exhaustive_result:
+        warnings.extend(exhaustive_result.get("warnings", []))
 
     # ── Ensure derived directory ──
     derived_dir.mkdir(parents=True, exist_ok=True)
@@ -3040,46 +6444,16 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "operation", "expected", "observed", "classification",
     ])
 
-    # ── Generate report.md ──
+    # Build one normalized machine-facing report first.  The human renderer is
+    # then the sole owner of console/stage/Gantt presentation; Modal reads the
+    # persisted console verbatim and never reconstructs it independently.
     derived_files_info = {
         "trace_entry_count": entry_count,
         "trace_entry_capacity": entry_capacity,
         "trace_truncated": truncated,
         "files": _build_manifest(raw_dir, derived_dir),
     }
-    # Note: manifest is rebuilt at the end after all files exist; this is a placeholder.
-
-    report_md = _generate_report_md(
-        status=status,
-        warnings=warnings,
-        calls=calls,
-        timeline=timeline,
-        func_summary=func_summary,
-        duplicates=duplicates,
-        semantic_duplicates=semantic_duplicates,
-        survivors=survivors,
-        wrapper_chains=wrapper_chains,
-        wrapper_changes=wrapper_changes,
-        expected_vs_observed=expected_vs_observed,
-        torch_cpu_ops=torch_cpu_ops,
-        torch_cuda_ops=torch_cuda_ops,
-        resource_result=resource_result,
-        process_timeline=process_timeline,
-        thread_timeline=thread_timeline,
-        resource_owners=resource_owners,
-        trace_config=trace_config,
-        runtime_result=runtime_result,
-        derived_files=derived_files_info,
-        overlaps=overlaps,
-        milestones=milestones,
-    )
-
-    report_path = derived_dir / "report.md"
-    report_path.write_text(report_md, encoding="utf-8")
-
-    # ── Generate report_data.json ──
-    report_data_path = derived_dir / "report_data.json"
-    _write_json(report_data_path, _build_report_data(
+    structured_report = _build_report_data(
         status=status,
         warnings=warnings,
         calls=calls,
@@ -3105,7 +6479,155 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         stack_issues=stack_issues,
         async_tasks=async_tasks,
         derived_files=derived_files_info,
-    ))
+        golden_profile=golden_profile,
+        sampling_deep_evidence=sampling_deep_evidence,
+        source_h2d_transport=source_h2d_transport,
+    )
+    from . import golden_human_report
+
+    structured_report["human_artifacts"] = {
+        "console": "derived/golden_profiler_console.txt",
+        "summary": "derived/golden_profile_summary.json",
+        "report": "derived/golden_profile_report.md",
+        "overall_gantt": "derived/golden_profile_gantt.txt",
+        "stage_gantts": "derived/golden_stage_gantts.txt",
+        "sampling": "derived/golden_sampling_breakdown.txt",
+        "transport": "derived/e27_transport_breakdown.txt",
+        "stage_directory": "derived/gantts/",
+    }
+
+    golden_summary_path = derived_dir / "golden_profile_summary.json"
+    golden_report_path = derived_dir / "golden_profile_report.md"
+    golden_gantt_path = derived_dir / "golden_profile_gantt.txt"
+    golden_stage_gantts_path = derived_dir / "golden_stage_gantts.txt"
+    golden_console_path = derived_dir / "golden_profiler_console.txt"
+    golden_sampling_path = derived_dir / "golden_sampling_breakdown.txt"
+    e27_transport_path = derived_dir / "e27_transport_breakdown.txt"
+    _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+    MODAL_HUMAN_REPORT = ""
+    sampling_artifact = ""
+    transport_artifact = ""
+    try:
+        MODAL_HUMAN_REPORT = golden_human_report.render_full_console(structured_report)
+        stage_gantts = golden_human_report.render_stage_gantts(structured_report)
+        overall_gantt = golden_human_report.render_overall_timeline(structured_report)
+        _write_text_exact(golden_console_path, MODAL_HUMAN_REPORT)
+        persisted_console = golden_console_path.read_text(encoding="utf-8")
+        normalize_newlines = lambda value: value.replace("\r\n", "\n").replace("\r", "\n")
+        if normalize_newlines(MODAL_HUMAN_REPORT) != normalize_newlines(persisted_console):
+            raise RuntimeError("MODAL_HUMAN_REPORT does not match persisted console")
+        _write_text_exact(golden_stage_gantts_path, stage_gantts)
+        _write_text_exact(golden_gantt_path, overall_gantt + "\n" + stage_gantts)
+        # The compact console uses dominant sampling rows.  The artifact and
+        # report retain the complete bounded deep-profile breakdown.
+        sampling_artifact = (
+            golden_human_report.render_sampling_stage(structured_report)
+            + "\n\n"
+            + _sampling_breakdown_text(sampling_deep_evidence)
+        )
+        transport_artifact = (
+            golden_human_report.render_transport_mini_gantt(source_h2d_transport)
+            + "\n\n"
+            + _transport_breakdown_text(source_h2d_transport)
+        )
+        _write_text_exact(golden_sampling_path, sampling_artifact)
+        _write_text_exact(e27_transport_path, transport_artifact)
+        gantt_dir = derived_dir / "gantts"
+        stage_file_specs = (
+            ("golden_clip_load", "CLIP LOAD", "clip"),
+            ("golden_clip_forward", "CLIP FORWARD", "clip"),
+            ("golden_unet_load", "UNET LOAD", "unet"),
+            ("golden_sampler_prepare", "SAMPLER PREPARE", "sampler"),
+            ("golden_vae_load", "VAE LOAD", "vae"),
+            ("golden_sampling", "SAMPLING", "sampling"),
+            ("golden_vae_decode", "VAE DECODE", "vae_decode"),
+        )
+        for stage_name, title, role in stage_file_specs:
+            _write_text_exact(
+                gantt_dir / f"{stage_name}.txt",
+                golden_human_report.render_stage_artifact(
+                    structured_report, title, stage_name, role=role,
+                ) + "\n",
+            )
+        _write_text_exact(
+            golden_report_path,
+            _generate_golden_profile_report(golden_profile).rstrip("\n")
+            + "\n\n## Detailed Golden stage Gantts\n\n"
+            + stage_gantts.rstrip("\n")
+            + "\n\n## Detailed sampling evidence\n\n"
+            + sampling_artifact.rstrip("\n")
+            + "\n\n## Detailed E27 transport evidence\n\n"
+            + transport_artifact.rstrip("\n")
+            + "\n",
+        )
+    except Exception as exc:
+        golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
+        golden_profile["GOLDEN_PROFILE_REASON"] = f"derived generation failed: {exc.__class__.__name__}"
+        _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+    if not all(path.is_file() for path in (
+        golden_summary_path, golden_report_path, golden_gantt_path,
+        golden_stage_gantts_path, golden_console_path, golden_sampling_path,
+        e27_transport_path,
+    )):
+        golden_profile["GOLDEN_PROFILE_COMPLETE"] = "NO"
+        golden_profile["GOLDEN_PROFILE_REASON"] = "derived generation failed: missing Golden artifact"
+        _write_json(golden_summary_path, _golden_profile_json(golden_profile))
+
+    # Refresh the inventory after the complete Golden family exists.  The
+    # structured report remains the same object used for rendering, while its
+    # machine inventory now includes nested derived/gantts files as well.
+    derived_files_info["files"] = _build_manifest(raw_dir, derived_dir)
+    structured_report["derived_files"] = derived_files_info["files"]
+
+    # Stage artifacts are created after the first console render.  Refresh the
+    # persisted console against the now-complete inventory so offline consumers
+    # get the same projection as render_full_console(report_data).
+    try:
+        MODAL_HUMAN_REPORT = golden_human_report.render_full_console(structured_report)
+        _write_text_exact(golden_console_path, MODAL_HUMAN_REPORT)
+    except Exception:
+        # Keep the fail-closed behavior used by the first render: mixed-clock
+        # unresolved evidence must not be projected onto the host timeline.
+        pass
+
+    # ── Generate report.md ──
+    # Note: manifest is rebuilt at the end after all files exist; this is a placeholder.
+
+    report_md = _generate_report_md(
+        status=status,
+        warnings=warnings,
+        calls=calls,
+        timeline=timeline,
+        func_summary=func_summary,
+        duplicates=duplicates,
+        semantic_duplicates=semantic_duplicates,
+        survivors=survivors,
+        wrapper_chains=wrapper_chains,
+        wrapper_changes=wrapper_changes,
+        expected_vs_observed=expected_vs_observed,
+        torch_cpu_ops=torch_cpu_ops,
+        torch_cuda_ops=torch_cuda_ops,
+        resource_result=resource_result,
+        process_timeline=process_timeline,
+        thread_timeline=thread_timeline,
+        resource_owners=resource_owners,
+        trace_config=trace_config,
+        runtime_result=runtime_result,
+        derived_files=derived_files_info,
+        overlaps=overlaps,
+        milestones=milestones,
+        golden_profile=golden_profile,
+        sampling_deep_evidence=sampling_deep_evidence,
+        source_h2d_transport=source_h2d_transport,
+    )
+    report_md = _combine_profiler_artifacts(report_md, derived_dir)
+
+    report_path = derived_dir / "report.md"
+    _write_text_exact(report_path, report_md)
+
+    # ── Generate report_data.json ──
+    report_data_path = derived_dir / "report_data.json"
+    _write_json(report_data_path, structured_report)
 
     # ── Generate manifest.json (built AFTER all derived files exist, including report_data.json) ──
     manifest_path = derived_dir / "manifest.json"
@@ -3121,7 +6643,7 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
     # ── Collect derived file listing (as list[str] of POSIX relative paths) ──
     derived_files_list: list[str] = sorted(
         str(p.relative_to(session_dir)).replace("\\", "/")
-        for p in derived_dir.iterdir()
+        for p in derived_dir.rglob("*")
         if p.is_file()
     )
 
@@ -3134,6 +6656,27 @@ def generate_full_trace_report(session_dir: Path) -> dict[str, Any]:
         "trace_entry_count": entry_count,
         "trace_entry_capacity": entry_capacity,
         "trace_truncated": truncated,
+        "golden_profile_complete": golden_profile["GOLDEN_PROFILE_COMPLETE"],
+        "golden_profile_reason": golden_profile["GOLDEN_PROFILE_REASON"],
+        "golden_profile_torch": golden_profile["GOLDEN_PROFILE_TORCH"],
+        "golden_profile_summary_path": str(golden_summary_path).replace("\\", "/"),
+        "golden_exhaustive_profile_complete": (
+            (exhaustive_result.get("summary") or {}).get(
+                "GOLDEN_EXHAUSTIVE_PROFILE_COMPLETE"
+            )
+            if exhaustive_result else ""
+        ),
+        "golden_exhaustive_profile_report_path": (
+            exhaustive_result.get("report_path", "") if exhaustive_result else ""
+        ),
+        "golden_profile_report_path": str(golden_report_path).replace("\\", "/"),
+        "golden_profile_gantt_path": str(golden_gantt_path).replace("\\", "/"),
+        "golden_stage_gantts_path": str(golden_stage_gantts_path).replace("\\", "/"),
+        "golden_profiler_console_path": str(golden_console_path).replace("\\", "/"),
+        "MODAL_HUMAN_REPORT": MODAL_HUMAN_REPORT,
+        "golden_sampling_breakdown_path": str(golden_sampling_path).replace("\\", "/"),
+        "e27_transport_breakdown_path": str(e27_transport_path).replace("\\", "/"),
+        "source_h2d_transport": source_h2d_transport,
     }
 
 

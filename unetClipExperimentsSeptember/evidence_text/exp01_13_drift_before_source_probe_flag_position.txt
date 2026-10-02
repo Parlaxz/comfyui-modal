@@ -1,0 +1,110 @@
+=== DRIFT DETECTION BEFORE SOURCE-PROBE FLAG-POSITION RETRY ===
+--- git status --short ---
+ M .opencode/skills/comfymodal-golden-ops/SKILL.md
+ M tools/v2_control/cli.py
+?? EXPERIMENT_EVIDENCE_golden_p1_0308695d024e41d5_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0474d478ce3245d6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_133afac7c9004337_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_25606a90ca244cf9_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_2e4d4cdeffde4b3a_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3916d2e167e94868_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3a982925da824d2d_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_48f7057bc7e3487b_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_54844b3521364f78_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_5fbe85f45830404f_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74364aa898644799_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74920442013c440c_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_7bf4f53dfd404c89_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8020d1eccaeb40e2_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8088a8ce0adc44d0_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b062782af4884be6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b55885b5864a47e1_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_ce6827c491ae47be_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f2787dfec45943ae_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f8514ab2fa8f49ea_2026-09-03.md
+?? RX9P_G_FAILED_SMOKE_REPAIR_AUDIT_2026-09-01.md
+?? RX9P_M_PROFILER_E27_AND_LOGGING_REPAIR_2026-09-02.md
+?? unetClipExperimentsSeptember/
+--- git diff --stat ---
+git : warning: in the working copy of '.opencode/skills/comfymodal-golden-ops/SKILL.md', LF will be replaced by CRLF 
+the next time Git touches it
+At line:1 char:188
++ ... hort; Write-Output '--- git diff --stat ---'; git diff --stat; Write- ...
++                                                   ~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tools/v2_control/cli.py', LF will be replaced by CRLF the next time Git touches it
+ .opencode/skills/comfymodal-golden-ops/SKILL.md | 11 +++++++++++
+ tools/v2_control/cli.py                         | 20 +++++++++++++++++++-
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+--- git diff --name-only ---
+git : warning: in the working copy of '.opencode/skills/comfymodal-golden-ops/SKILL.md', LF will be replaced by CRLF 
+the next time Git touches it
+At line:1 char:250
++ ... e-Output '--- git diff --name-only ---'; git diff --name-only; Write- ...
++                                              ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'tools/v2_control/cli.py', LF will be replaced by CRLF the next time Git touches it
+.opencode/skills/comfymodal-golden-ops/SKILL.md
+tools/v2_control/cli.py
+--- untracked inventory ---
+EXPERIMENT_EVIDENCE_golden_p1_0308695d024e41d5_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_0474d478ce3245d6_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_133afac7c9004337_2026-09-02.md
+EXPERIMENT_EVIDENCE_golden_p1_25606a90ca244cf9_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_2e4d4cdeffde4b3a_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_3916d2e167e94868_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_3a982925da824d2d_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_48f7057bc7e3487b_2026-09-02.md
+EXPERIMENT_EVIDENCE_golden_p1_54844b3521364f78_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_5fbe85f45830404f_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_74364aa898644799_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_74920442013c440c_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_7bf4f53dfd404c89_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_8020d1eccaeb40e2_2026-09-02.md
+EXPERIMENT_EVIDENCE_golden_p1_8088a8ce0adc44d0_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_b062782af4884be6_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_b55885b5864a47e1_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_ce6827c491ae47be_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_f2787dfec45943ae_2026-09-03.md
+EXPERIMENT_EVIDENCE_golden_p1_f8514ab2fa8f49ea_2026-09-03.md
+RX9P_G_FAILED_SMOKE_REPAIR_AUDIT_2026-09-01.md
+RX9P_M_PROFILER_E27_AND_LOGGING_REPAIR_2026-09-02.md
+unetClipExperimentsSeptember/00_current_bundle_baseline.md
+unetClipExperimentsSeptember/01_transport_core_cleanup.md
+unetClipExperimentsSeptember/EXPERIMENT_PROTOCOL.md
+unetClipExperimentsSeptember/build_experiment_report.py
+unetClipExperimentsSeptember/evidence_text/exp00_deploy_stdout.txt
+unetClipExperimentsSeptember/evidence_text/exp00_dirty_diff_stat.txt
+unetClipExperimentsSeptember/evidence_text/exp00_doctor_post_deploy.txt
+unetClipExperimentsSeptember/evidence_text/exp00_doctor_preflight.txt
+unetClipExperimentsSeptember/evidence_text/exp00_git_freeze_and_drift.txt
+unetClipExperimentsSeptember/evidence_text/exp00_run1_stdout.txt
+unetClipExperimentsSeptember/evidence_text/exp00_run2_blocked_stdout.txt
+unetClipExperimentsSeptember/evidence_text/exp00_source_probe_stdout.txt
+unetClipExperimentsSeptember/evidence_text/exp00_status_preflight.txt
+unetClipExperimentsSeptember/evidence_text/exp01_00_pre_status_drift.txt
+unetClipExperimentsSeptember/evidence_text/exp01_01_pre_deploy_status.txt
+unetClipExperimentsSeptember/evidence_text/exp01_02_pre_doctor_drift.txt
+unetClipExperimentsSeptember/evidence_text/exp01_03_pre_deploy_doctor.txt
+unetClipExperimentsSeptember/evidence_text/exp01_04_pre_deploy_drift.txt
+unetClipExperimentsSeptember/evidence_text/exp01_05_deploy_console.txt
+unetClipExperimentsSeptember/evidence_text/exp01_05_deploy_console_utf8.txt
+unetClipExperimentsSeptember/evidence_text/exp01_06_pre_source_probe_drift.txt
+unetClipExperimentsSeptember/evidence_text/exp01_07_source_probe.txt
+unetClipExperimentsSeptember/evidence_text/exp01_07_source_probe_utf8.txt
+unetClipExperimentsSeptember/evidence_text/exp01_08_final_drift_after_stop.txt
+unetClipExperimentsSeptember/evidence_text/exp01_09_drift_before_source_probe_no_flag.txt
+unetClipExperimentsSeptember/evidence_text/exp01_10_source_probe_no_flag.txt
+unetClipExperimentsSeptember/evidence_text/exp01_11_drift_before_source_probe_flag.txt
+unetClipExperimentsSeptember/evidence_text/exp01_12_source_probe_flag.txt
+unetClipExperimentsSeptember/evidence_text/exp01_13_drift_before_source_probe_flag_position.txt
+unetClipExperimentsSeptember/evidence_text/exp01_deployment_manifest.json
+unetClipExperimentsSeptember/evidence_text/exp01_deployment_receipt.json
+unetClipExperimentsSeptember/exp00_manifest.json
+unetClipExperimentsSeptember/exp01_manifest.json

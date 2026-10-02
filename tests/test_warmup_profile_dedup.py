@@ -8,7 +8,7 @@ Covers:
   5. Repeated unchanged: cached token returned, no UUID, no setter.
   6. Workspace/app identity change clears cache; changed identity publishes.
   7. Failed setter does not advance cache (retry publishes).
-  8. LocalRemoteInvoker can await the preparer (fast unchanged path).
+   8. Callers can await the preparer (fast unchanged path).
 
 These tests never call the real Modal setter.
 """
@@ -529,12 +529,13 @@ class WarmupProfileDedupResultFieldsTests(unittest.TestCase):
         self.assertGreater(len(r2.get("active_profile_token", "")), 0,
                            "Token must be set on successful retry")
 
-    # ── 8. LocalRemoteInvoker compatibility ───────────────────────────
+    # ── 8. Caller compatibility (H19: former V1 invoker caller deleted;
+    #       the fast-await contract is pinned against the shared helper) ──
 
     def test_no_fire_and_forget_needed(self):
-        """LocalRemoteInvoker can continue awaiting the preparer — the
-        helper returns quickly on unchanged (no remote call) and the
-        caller does NOT need a separate fire-and-forget path."""
+        """Callers can simply await the preparer — the helper returns
+        quickly on unchanged (no remote call) and the caller does NOT need
+        a separate fire-and-forget path."""
         # The preparer always returns a result dict; on prompt-only unchanged
         # the await is fast because no network call occurs.
         setter = _make_async_setter()
@@ -1017,8 +1018,18 @@ class TestProfileCheckerMatchedBreakdown(unittest.TestCase):
     def setUp(self):
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # checker/setter path runs (the inherit no-op gate would skip the
+        # checker, printing profile_checker_matched=False).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
 
@@ -1059,3 +1070,20 @@ class TestProfileCheckerMatchedBreakdown(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

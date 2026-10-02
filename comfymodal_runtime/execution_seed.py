@@ -456,8 +456,29 @@ def build_snapshot_execution_seed(
 
 SEED_SOURCE_PUBLISHER_PLAN = "publisher_plan"
 SEED_SOURCE_STARTUP_MINIMAL = "startup_minimal"
+# Request-derived seed source: built on the CONTAINER side from the request's
+# own plan payload (no remote restore-plan publication).  Never used to fake
+# ``publisher_plan`` — restore-time and request-time hydration emit it only
+# when the seed was genuinely derived from the invocation's workflow.
+SEED_SOURCE_INVOCATION_PLAN = "invocation_plan"
 SEED_PAYLOAD_FILENAME = "snapshot_seed.json"
 SEED_PAYLOAD_SCHEMA_VERSION = 2
+
+# Opt-in env flag for the legacy remote restore-plan publication path.  The
+# default (unset / "0") skips the remote ``publish_restore_plan`` RPC entirely;
+# the container then derives its seed from the invocation plan and restore-time
+# volume reads are skipped so a stale ``snapshot_seed.json`` can never claim
+# ``source=publisher_plan``.  Setting the flag to a truthy value restores the
+# legacy publisher path for diagnostics.
+PUBLISH_RESTORE_PLAN_ENV = "COMFYMODAL_V2_PUBLISH_RESTORE_PLAN"
+
+
+def publish_restore_plan_enabled() -> bool:
+    """True only when the opt-in ``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN`` flag
+    is truthy.  Default (unset / "0") disables remote restore publication."""
+    return os.environ.get(PUBLISH_RESTORE_PLAN_ENV, "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def build_snapshot_seed_payload(
@@ -488,6 +509,43 @@ def build_snapshot_seed_payload(
     return {
         "schema_version": SEED_PAYLOAD_SCHEMA_VERSION,
         "seed_source": SEED_SOURCE_PUBLISHER_PLAN,
+        "topology_available": True,
+        "built_at": time.time(),
+        "workflow_hash": seed.workflow_hash,
+        "seed": seed.to_dict(),
+    }
+
+
+def build_invocation_seed_payload(
+    workflow: Mapping[str, Any],
+    *,
+    output_node_ids: Sequence[str] = (),
+    workflow_hash: str = "",
+    source_workflow_hash: str = "",
+    custom_node_generation: str = "",
+    deployment_combined_hash: str = "",
+) -> dict[str, Any] | None:
+    """Build a schema-v2 seed payload from the REQUEST's own workflow.
+
+    Mirrors ``build_snapshot_seed_payload`` except the ``seed_source`` is
+    ``invocation_plan`` (never ``publisher_plan``): the seed was derived on
+    the container side from the invocation plan, not published remotely.
+    Returns ``None`` when the workflow is empty — callers fall back honestly
+    to ``minimal_snapshot_seed_payload``.
+    """
+    if not workflow:
+        return None
+    seed = build_snapshot_execution_seed(
+        workflow,
+        output_node_ids=output_node_ids,
+        workflow_hash=workflow_hash,
+        source_workflow_hash=source_workflow_hash,
+        custom_node_generation=custom_node_generation,
+        deployment_combined_hash=deployment_combined_hash,
+    )
+    return {
+        "schema_version": SEED_PAYLOAD_SCHEMA_VERSION,
+        "seed_source": SEED_SOURCE_INVOCATION_PLAN,
         "topology_available": True,
         "built_at": time.time(),
         "workflow_hash": seed.workflow_hash,
@@ -548,7 +606,11 @@ def snapshot_seed_payload_from_dict(value: Mapping[str, Any] | None) -> dict[str
     if int(seed.schema_version) != SEED_PAYLOAD_SCHEMA_VERSION:
         return None
     seed_source = str(payload.get("seed_source", ""))
-    if seed_source not in (SEED_SOURCE_PUBLISHER_PLAN, SEED_SOURCE_STARTUP_MINIMAL):
+    if seed_source not in (
+        SEED_SOURCE_PUBLISHER_PLAN,
+        SEED_SOURCE_STARTUP_MINIMAL,
+        SEED_SOURCE_INVOCATION_PLAN,
+    ):
         return None
     return {
         "schema_version": SEED_PAYLOAD_SCHEMA_VERSION,

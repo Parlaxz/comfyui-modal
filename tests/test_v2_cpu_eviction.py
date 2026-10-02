@@ -319,6 +319,22 @@ class RuntimeEnvPropagationTests(unittest.TestCase):
         os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = "1"
         self.assertEqual(_runtime_env()["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"], "1")
 
+    def test_snapshot_exclude_unet_default_off(self):
+        """SNAPSHOT_EXCLUDE_UNET is present and defaults to '0' when absent."""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                _runtime_env()["COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET"], "0"
+            )
+
+    def test_snapshot_exclude_unet_passthrough_when_set(self):
+        """SNAPSHOT_EXCLUDE_UNET propagates the host value into the container env."""
+        with patch.dict(os.environ, {
+            "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": "1",
+        }, clear=False):
+            self.assertEqual(
+                _runtime_env()["COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET"], "1"
+            )
+
     def test_release_gpu_production_default_enabled(self):
         with patch.dict(os.environ, {"COMFYMODAL_V2_ENV_PROFILE": "production"}, clear=True):
             self.assertEqual(_runtime_env()["COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"], "1")

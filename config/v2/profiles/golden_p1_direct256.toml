@@ -1,0 +1,11 @@
+# Experiment 03 frozen direct-source 256 MiB arm.
+schema_version = 1
+name = "golden_p1_direct256"
+extends = "golden_p1"
+owner = "golden-p1"
+
+[target]
+app = "sept-unetclip-03-direct256"
+
+[environment]
+COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES = "268435456"

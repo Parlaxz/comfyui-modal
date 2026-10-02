@@ -16,12 +16,21 @@ try:
 except ImportError:
     Image = None
 
+from comfymodal_runtime.contracts import (
+    DEFAULT_OUTPUT_QUALITY,
+    DEFAULT_PREVIEW_QUALITY,
+    normalize_output_format,
+    normalize_quality,
+    normalize_webp_lossless_compression,
+    resolve_webp_pillow_method,
+)
+
 # ── Public enum values (must match frontend) ──────────────────────────
 OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
 WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
 
 # ── Quality defaults ──────────────────────────────────────────────────
-DEFAULT_QUALITY = 75
+DEFAULT_QUALITY = DEFAULT_OUTPUT_QUALITY
 
 # WebP lossless method mapping (method 0-6, higher = slower + smaller)
 _WEBP_LOSSLESS_METHOD = {
@@ -30,7 +39,10 @@ _WEBP_LOSSLESS_METHOD = {
     "max": 6,
 }
 
-# WebP lossy method
+# E2D: lossy WebP resolves its Pillow method from the same effort vocabulary
+# via contracts.resolve_webp_pillow_method (fast→0, balanced→4, max→6).  The
+# constant below remains the defensive fallback for an unknown label and
+# preserves the pre-E2D encoder for the default balanced path.
 _WEBP_LOSSY_METHOD = 4
 
 # ── Extension / MIME mapping ──────────────────────────────────────────
@@ -92,7 +104,7 @@ def _sanitize_filename(name: str) -> str:
 def convert_image_bytes(
     input_bytes: bytes,
     output_format: str = "original",
-    quality: int = 75,
+    quality: int | float | str | None = None,
     webp_lossless_compression: str = "balanced",
 ) -> dict:
     """Convert raw PNG bytes to the requested output format.
@@ -122,36 +134,60 @@ def convert_image_bytes(
         }
     """
     t0 = time.time()
+    raw_output_format = output_format
     meta = {
         "bytes": input_bytes,
         "mime_type": "image/png",
         "file_ext": ".png",
-        "output_format": output_format,
+        "output_format": "original",
         "original_size_bytes": len(input_bytes),
         "returned_size_bytes": len(input_bytes),
         "conversion_time_ms": 0,
+        "output_codec_ms": 0.0,
+        "codec": "png",
+        "encoded_bytes": len(input_bytes),
+        "conversion_fallback": False,
         "quality": None,
         "webp_lossless_compression": None,
+        "webp_effort": None,
+        "webp_method": None,
         "fallback": False,
         "error": None,
     }
 
     # ── Clamp / validate inputs ──────────────────────────────────────
-    if output_format not in OUTPUT_FORMATS:
+    try:
+        output_format = normalize_output_format(output_format)
+    except ValueError as exc:
         meta["error"] = f"unknown output_format: {output_format!r}"
-        meta["output_format"] = "original"
-        output_format = "original"
-
-    if not isinstance(quality, (int, float)):
-        quality = 75
-    quality = max(0, min(100, int(quality)))
-
-    if webp_lossless_compression not in WEBP_LOSSLESS_COMPRESSION:
-        webp_lossless_compression = "balanced"
+        meta["fallback"] = True
+        meta["conversion_fallback"] = True
+        meta["conversion_time_ms"] = round((time.time() - t0) * 1000, 1)
+        return meta
+    meta["output_format"] = output_format
+    quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(raw_output_format or "").strip().lower() == "webp"
+        else DEFAULT_QUALITY
+    )
+    quality = normalize_quality(quality, default=quality_default)
+    try:
+        webp_lossless_compression = normalize_webp_lossless_compression(
+            webp_lossless_compression
+        )
+    except ValueError as exc:
+        meta["error"] = str(exc)
+        meta["fallback"] = True
+        meta["conversion_fallback"] = True
+        meta["conversion_time_ms"] = round((time.time() - t0) * 1000, 1)
+        return meta
 
     fmt_ext = _FORMAT_META.get(output_format, _FORMAT_META["original"])
     meta["mime_type"] = fmt_ext["mime"]
     meta["file_ext"] = fmt_ext["ext"]
+    meta["codec"] = "png" if output_format == "original" else (
+        "webp" if output_format.startswith("webp_") else "jpeg"
+    )
 
     # ── Original / no-op ─────────────────────────────────────────────
     if output_format == "original":
@@ -161,6 +197,7 @@ def convert_image_bytes(
     if Image is None:
         meta["error"] = "Pillow not available; returning original PNG"
         meta["fallback"] = True
+        meta["conversion_fallback"] = True
         meta["conversion_time_ms"] = round((time.time() - t0) * 1000, 1)
         return meta
 
@@ -169,35 +206,44 @@ def convert_image_bytes(
     except Exception as exc:
         meta["error"] = f"failed to open image: {exc}"
         meta["fallback"] = True
+        meta["conversion_fallback"] = True
         meta["conversion_time_ms"] = round((time.time() - t0) * 1000, 1)
         return meta
 
     width, height = img.size
     out_buf = io.BytesIO()
+    codec_t0 = time.monotonic_ns()
 
     try:
         if output_format == "webp_lossless":
             meta["quality"] = None
             meta["webp_lossless_compression"] = webp_lossless_compression
-            method = _WEBP_LOSSLESS_METHOD.get(
-                webp_lossless_compression, 4
+            meta["webp_effort"] = webp_lossless_compression
+            meta["webp_method"] = resolve_webp_pillow_method(
+                webp_lossless_compression
             )
             img.save(
                 out_buf,
                 format="WEBP",
                 lossless=True,
-                method=method,
+                method=meta["webp_method"],
             )
 
         elif output_format == "webp_lossy":
             meta["quality"] = quality
             meta["webp_lossless_compression"] = None
+            # E2D: the effort vocabulary drives the lossy encoder too; the
+            # default balanced label resolves to the historical method 4.
+            meta["webp_effort"] = webp_lossless_compression
+            meta["webp_method"] = resolve_webp_pillow_method(
+                webp_lossless_compression
+            )
             img.save(
                 out_buf,
                 format="WEBP",
                 lossless=False,
                 quality=quality,
-                method=_WEBP_LOSSY_METHOD,
+                method=meta["webp_method"],
             )
 
         elif output_format == "jpeg":
@@ -220,7 +266,12 @@ def convert_image_bytes(
         meta["returned_size_bytes"] = len(input_bytes)
         meta["file_ext"] = ".png"
         meta["mime_type"] = "image/png"
+        meta["codec"] = "png"
+        meta["conversion_fallback"] = True
 
+    meta["output_codec_ms"] = round((time.monotonic_ns() - codec_t0) / 1_000_000, 3)
+    meta["encoded_bytes"] = len(meta["bytes"])
+    meta["conversion_fallback"] = bool(meta["fallback"])
     meta["conversion_time_ms"] = round((time.time() - t0) * 1000, 1)
 
     if meta.get("fallback"):

@@ -2,7 +2,7 @@
 //
 // Shared helper for resolving image URLs from run-history entries, plus
 // timing/annotation normalization consumed by BOTH Playground and History.
-// Callers: studio-history.js, studio-playground.js, and any other
+// Callers: studio-playground.js and any other
 // module that needs to display run output images or metadata.
 //
 // Image URL resolution order (per the spec):

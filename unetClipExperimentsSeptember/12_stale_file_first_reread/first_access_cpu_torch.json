@@ -1,0 +1,81 @@
+{
+  "arm": "source_only",
+  "attempt_id": "stale_clip_first_access_cpu_torch_738686581b48",
+  "buffer_type": "pytorch_pinned_host",
+  "cpu_allocation": {
+    "allocation_match": true,
+    "allocation_match_classification": "match",
+    "cpu_request": 12,
+    "declared_modal_function_cpu": 12,
+    "declared_modal_function_cpu_request": 12,
+    "identity_source": "runtime_shape_config.cpu_request",
+    "observed_runtime_shape_cpu": 12,
+    "observed_runtime_shape_cpu_request": 12,
+    "production_relevance_classification": "production_relevant",
+    "production_relevant": true,
+    "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+    "strict_allocation_classification": "match",
+    "strict_allocation_match": true
+  },
+  "cpu_request": 12,
+  "cuda_used": false,
+  "error": "pinned_buffer_allocation:RuntimeError:pin_memory=True requires a CUDA or other accelerator backend; no pinned memory allocator is available on this system.",
+  "execution_arm": "source_only",
+  "h2d_used": false,
+  "identity": {
+    "accelerator": "none",
+    "container_session_id": "ta-01M1TCB522Q3YBR047YCQTFBKR",
+    "cpu": 12,
+    "cpu_allocation": {
+      "allocation_match": true,
+      "allocation_match_classification": "match",
+      "cpu_request": 12,
+      "declared_modal_function_cpu": 12,
+      "declared_modal_function_cpu_request": 12,
+      "identity_source": "runtime_shape_config.cpu_request",
+      "observed_runtime_shape_cpu": 12,
+      "observed_runtime_shape_cpu_request": 12,
+      "production_relevance_classification": "production_relevant",
+      "production_relevant": true,
+      "runtime_shape_fingerprint": "17e44209f52591d09f3bb6c1",
+      "strict_allocation_classification": "match",
+      "strict_allocation_match": true
+    },
+    "cpu_allocation_classification": "match",
+    "cpu_allocation_match": true,
+    "cpu_request": 12,
+    "gpu": null,
+    "hostname": "modal",
+    "image_id": "im-GKpKNecRn8GVd2dIGaVxmU",
+    "provider": "CLOUD_PROVIDER_AZURE",
+    "region": "eastus"
+  },
+  "model_construction": false,
+  "model_name": "qwen_3_4b.safetensors",
+  "oracle_wall_ms": 3419.6721,
+  "path_resolution": "fixed_read_only_models_mount",
+  "pinned_host": false,
+  "pinned_host_evidence": {
+    "buffer_type": "pytorch_pinned_host",
+    "buffers": [
+      {
+        "allocation_exception": "RuntimeError:pin_memory=True requires a CUDA or other accelerator backend; no pinned memory allocator is available on this system.",
+        "buffer_type": "pytorch_pinned_host",
+        "bytes": 4194304,
+        "is_pinned": false,
+        "worker_id": 0
+      }
+    ],
+    "is_pinned": false
+  },
+  "probe": "exp04_source_ceiling_oracle",
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "snapshot_capture": {
+    "applicable": false,
+    "counted": false
+  },
+  "source_only": true,
+  "status": "error",
+  "torch_imported": false
+}\n

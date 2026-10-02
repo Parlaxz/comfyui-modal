@@ -92,6 +92,8 @@ export async function installStudioMockApi(page, options = {}) {
     unhandledCalls: [], // {method, pathname} from catch-all only
     pollCounts: new Map(), // expId → integer
     saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
+    configPost: null, // last POST /comfymodal/config body (Settings page)
+    profileLevel: "off", // in-memory /comfymodal/profile/level stored value
   };
 
   let lastRunRequest = null;
@@ -888,6 +890,27 @@ export async function installStudioMockApi(page, options = {}) {
     });
   }
 
+  /** GET /comfymodal/history-v2/feed — empty deterministic feed.
+   *
+   * The Studio shell/playground calls refreshRecentRuns during startup,
+   * which reads this endpoint. The mocked workflows specs never seed
+   * history-v2 data, so an empty (but well-shaped) envelope keeps the call
+   * handled without affecting any assertions. Shape mirrors the
+   * fake-backend envelope {status, items, next_cursor, limit, total,
+   * has_more}. Purely additive — no existing route semantics change.
+   */
+  async function listHistoryV2Feed(route, url) {
+    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    return _json({
+      status: "ok",
+      items: [],
+      next_cursor: null,
+      limit,
+      total: 0,
+      has_more: false,
+    });
+  }
+
   /** GET /comfymodal/assets/:asset_id — returns 1-pixel PNG */
   async function serveAsset(route, url) {
     return {
@@ -916,7 +939,7 @@ export async function installStudioMockApi(page, options = {}) {
    * The Playground does not read this directly; it is called during
    * ComfyUI extension setup for diagnostics.  Return a minimal stub.
    */
-  async function serveConfig(route, url) {
+  async function serveConfig(route, url, body) {
     return _json({
       status: "ok",
       modal_token_configured: true,
@@ -924,6 +947,108 @@ export async function installStudioMockApi(page, options = {}) {
       deploy_state: "deployed",
       frontend_version: "0.1.0",
     });
+  }
+
+  // ── Settings page routes (used by studio-settings.spec.mjs) ──────────────
+  //
+  // The redesigned Studio Settings page (web/studio-settings.js) reads a
+  // full /comfymodal/config response to populate the Execution Engine and
+  // GPU selects and the Outputs section, and it refreshes the deploy status
+  // and heavy-tracing profile level on every render.  These handlers stay
+  // purely additive — the pre-existing serveConfig handler above remains
+  // untouched (the new route entries are registered before it in the table).
+
+  /** GET /comfymodal/config — full settings config (engine, GPU, output prefs). */
+  async function serveSettingsConfig(route, url, body) {
+    return _json({
+      status: "ok",
+      // Prior stub fields preserved — ComfyUI extension setup reads these
+      modal_token_configured: true,
+      gpu: "rtx-pro-6000",
+      deploy_state: "deployed",
+      frontend_version: "0.1.0",
+      // Execution engine options
+      execution_mode: "v2",
+      available_execution_modes: [
+        { value: "v2", label: "V2 - Recommended" },
+        { value: "v1", label: "V1 - Legacy fallback" },
+      ],
+      execution_mode_locked: false,
+      // GPU options
+      default_gpu: "rtx-pro-6000",
+      available_gpus: [
+        { value: "rtx-pro-6000", label: "rtx-pro-6000" },
+        { value: "a100-40gb", label: "a100-40gb" },
+      ],
+      // Output preferences (server-side authority for the Outputs section)
+      output_format: "original",
+      quality: 75,
+      webp_lossless_compression: "balanced",
+      auto_save_local: false,
+      save_folder: "output/modal",
+      save_metadata_sidecar: true,
+    });
+  }
+
+  /** POST /comfymodal/config — record the last posted body and acknowledge. */
+  async function saveSettingsConfig(route, url, body) {
+    state.configPost = body || null;
+    return _json({ status: "ok" });
+  }
+
+  /** GET /comfymodal/profile/level — in-memory stored/effective level. */
+  async function serveProfileLevel(route, url, body) {
+    return _json({
+      status: "ok",
+      level: state.profileLevel,
+      effective: state.profileLevel,
+    });
+  }
+
+  /** POST /comfymodal/profile/level — persist the requested level. */
+  async function saveProfileLevel(route, url, body) {
+    if (body && typeof body.level === "string") {
+      state.profileLevel = body.level;
+    }
+    return _json({ status: "ok", level: state.profileLevel });
+  }
+
+  /** GET /comfymodal/deploy/status — idle deployment. */
+  async function serveDeployStatus(route, url, body) {
+    return _json({ status: "ok", state: "idle", message: "" });
+  }
+
+  /** GET /comfymodal/workspaces — empty registry (Backend overview probe). */
+  async function listWorkspacesRegistry(route, url, body) {
+    return _json({ status: "ok", workspaces: [], active_workspace_id: null });
+  }
+
+  /** GET /comfymodal/auth/status — connected (Backend overview probe). */
+  async function serveAuthStatus(route, url, body) {
+    return _json({ status: "ok", connected: true });
+  }
+
+  /** GET /comfymodal/health — ready (Backend overview probe). */
+  async function serveHealth(route, url, body) {
+    return _json({ status: "ok", message: "Mock runtime ready" });
+  }
+
+  /**
+   * POST /comfymodal/studio/custom-nodes/refresh — canonical registry refresh
+   * (wizard best-effort refresh after an explicit Manager install).
+   */
+  async function refreshCustomNodesMock(route, url, body) {
+    return _json({ status: "ok", custom_nodes: [] });
+  }
+
+  /**
+   * GET /comfymodal/models — remote model-volume inventory. The shared mock
+   * has no remote volume, so return an empty folder map: the wizard's overlay
+   * then leaves every local report state untouched. Specs that need remote
+   * availability override this route in the test.
+   */
+  async function listRemoteModelsMock(route, url, body) {
+    return _json({});
   }
 
   /** Catch-all: 599 JSON for any unhandled /comfymodal/ request */
@@ -966,12 +1091,34 @@ export async function installStudioMockApi(page, options = {}) {
     ["PATCH", "/comfymodal/run-history/:run_id/annotations", patchRunAnnotations],
     ["POST", "/comfymodal/run-history/:run_id/save", saveRunOutput],
 
+    // History V2 feed (empty deterministic envelope — see listHistoryV2Feed).
+    ["GET", "/comfymodal/history-v2/feed", listHistoryV2Feed],
+
     // Asset & output serving (1-pixel PNG)
     ["GET", "/comfymodal/assets/:asset_id", serveAsset],
     ["GET", "/comfymodal/studio/outputs/:filename", serveStudioOutput],
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Remote model-volume inventory (wizard Dependencies overlay).
+    ["GET", "/comfymodal/models", listRemoteModelsMock],
+
+    // Custom-node registry refresh (wizard post-install best-effort refresh)
+    ["POST", "/comfymodal/studio/custom-nodes/refresh", refreshCustomNodesMock],
+
+    // Settings page (studio-settings.spec.mjs) — full config, profile level,
+    // and deploy status. Registered before the legacy stub config entries so
+    // the Settings page sees the full payload while /api/comfymodal/config
+    // still uses the pre-existing minimal stub.
+    ["GET", "/comfymodal/config", serveSettingsConfig],
+    ["POST", "/comfymodal/config", saveSettingsConfig],
+    ["GET", "/comfymodal/profile/level", serveProfileLevel],
+    ["POST", "/comfymodal/profile/level", saveProfileLevel],
+    ["GET", "/comfymodal/deploy/status", serveDeployStatus],
+    ["GET", "/comfymodal/workspaces", listWorkspacesRegistry],
+    ["GET", "/comfymodal/auth/status", serveAuthStatus],
+    ["GET", "/comfymodal/health", serveHealth],
 
     // ComfyUI config endpoint — called during extension setup
     ["GET", "/api/comfymodal/config", serveConfig],
@@ -1092,6 +1239,8 @@ export async function installStudioMockApi(page, options = {}) {
       state.unhandledCalls.length = 0;
       state.pollCounts.clear();
       state.saveRequests.length = 0;
+      state.configPost = null;
+      state.profileLevel = "off";
       lastRunRequest = null;
       lastExperimentRequest = null;
       failQueue.length = 0;

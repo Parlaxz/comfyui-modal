@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import io
+import fnmatch
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,12 +18,17 @@ from comfymodal_runtime.deployment_spec import (
     EXCLUDED_INFIXES,
     EXCLUDED_PREFIXES,
     GENERATED_JSON_PREFIXES,
+    build_canonical_boundary_identity,
     build_deployment_identity,
     compute_aggregate_hash,
     compute_file_hashes,
     compute_source_bytes,
+    deployment_identity_from_dict,
+    is_excluded_path,
     is_excluded_name,
+    validate_persisted_identity_pair,
 )
+from comfymodal_runtime import publication_policy
 
 
 class TestExclusionPredicate(unittest.TestCase):
@@ -86,6 +94,103 @@ class TestExclusionPredicate(unittest.TestCase):
         self.assertTrue(is_excluded_name(".model_manifest.json"))
         self.assertTrue(is_excluded_name(".profile_config.json"))
 
+    def test_publication_excludes_artifacts_and_bundles_but_keeps_source(self):
+        excluded_paths = (
+            "artifacts/phase_p1/manifest.json",
+            "legitimate-node/artifacts/manifest.json",
+            "comfyui-modal-P4-all.bundle",
+            "legitimate-node/comfyui-modal-P4-all.bundle",
+        )
+        for path in excluded_paths:
+            self.assertTrue(is_excluded_path(path), path)
+            self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/source.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/source.py"))
+
+    def test_publication_excludes_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        for directory in excluded_dirs:
+            for path in (
+                f"{directory}/state.json",
+                f"legitimate-node/{directory}/nested/runtime.py",
+            ):
+                self.assertTrue(is_excluded_path(path), path)
+                self.assertTrue(publication_policy.is_excluded_path(path), path)
+
+        self.assertFalse(is_excluded_path("legitimate-node/runtime.py"))
+        self.assertFalse(publication_policy.is_excluded_path("legitimate-node/runtime.py"))
+
+    def test_publication_walk_skips_known_non_runtime_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "node-a"
+            node.mkdir()
+            (node / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+            for directory in (".repowise", "ra11f", "reports", "example_workflows", "workflows"):
+                excluded = node / "nested" / directory
+                excluded.mkdir(parents=True)
+                (excluded / "ignored.py").write_text("ignored = True\n", encoding="utf-8")
+
+            published = {
+                path.relative_to(root).as_posix()
+                for path in publication_policy.iter_publication_files(root)
+            }
+
+        self.assertEqual(published, {"node-a/runtime.py"})
+
+    def test_image_ignore_patterns_cover_known_non_runtime_directories_recursively(self):
+        excluded_dirs = (".repowise", "ra11f", "reports", "example_workflows", "workflows")
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for directory in excluded_dirs:
+            self.assertIn(f"{directory}/", patterns)
+            self.assertIn(f"**/{directory}/", patterns)
+
+    def test_image_ignore_patterns_cover_generated_json_and_generated_images(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+        for prefix in GENERATED_JSON_PREFIXES:
+            self.assertIn(f"{prefix}*.json", patterns)
+            self.assertIn(f"**/{prefix}*.json", patterns)
+        for extension in (".png", ".jpg", ".webp"):
+            self.assertIn(f"*screenshot*{extension}", patterns)
+            self.assertIn(f"**/*validation*{extension}", patterns)
+
+    def test_image_ignore_patterns_match_exclusions_without_hiding_runtime_files(self):
+        patterns = (
+            publication_policy.image_ignore_patterns()
+            + publication_policy.image_ignore_patterns("**/")
+        )
+
+        def ignored(path):
+            return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+        for path in (
+            "temp_result.json",
+            "nested/_last_trace_result.json",
+            "nested/screenshot-result.PNG",
+            "nested/studio-validation-desktop.webp",
+            "README.md",
+            "nested/README.MD",
+        ):
+            self.assertTrue(ignored(path), path)
+
+        for path in (
+            "REPORTS/",
+            "nested/Workflows/",
+            "BEFORE_deploy.patch",
+            "nested/BEFORE_v2_manifest.diff",
+        ):
+            self.assertTrue(ignored(path), path)
+
+        for path in ("runtime.py", "nested/runtime.py", "runtime_asset.png"):
+            self.assertFalse(ignored(path), path)
+
     def test_excluded_screenshot_png(self):
         self.assertTrue(is_excluded_name("studio-validation-desktop.png"))
         self.assertTrue(is_excluded_name("screenshot-result.png"))
@@ -107,6 +212,34 @@ class TestExclusionPredicate(unittest.TestCase):
         # Extension matching should be case-insensitive
         self.assertTrue(is_excluded_name("README.MD"))
         self.assertTrue(is_excluded_name("readme.Md"))
+
+    def test_deployment_identity_and_publication_share_file_policy(self):
+        names = (
+            ".commandcode/settings.json",
+            ".v2ctl/runs/run.json",
+            "before_v2_16_20.patch",
+            "studio-validation-desktop.png",
+            "runtime_state.json",
+            "module.MJS",
+        )
+        for name in names:
+            self.assertEqual(
+                is_excluded_path(name),
+                publication_policy.is_excluded_path(name),
+                name,
+            )
+
+    def test_source_walkers_both_reject_symlinked_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "real.py").write_text("value = 1", encoding="utf-8")
+            link = root / "linked.py"
+            try:
+                link.symlink_to(root / "real.py")
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable on this host")
+            self.assertNotIn("linked.py", compute_file_hashes(root))
+            self.assertNotIn(link, set(publication_policy.iter_source_files(root)))
 
 
 class TestBuildDeploymentIdentity(unittest.TestCase):
@@ -265,6 +398,28 @@ class TestBuildDeploymentIdentity(unittest.TestCase):
         )
         self.assertNotEqual(id1.combined_hash, id2.combined_hash)
 
+    def test_multiple_custom_node_roots_keep_same_relative_paths_distinct(self):
+        self._write("runtime.py", "runtime code")
+        first = self.tmp_path / "custom-one"
+        second = self.tmp_path / "custom-two"
+        first.mkdir()
+        second.mkdir()
+        (first / "node.py").write_text("node one", encoding="utf-8")
+        (second / "node.py").write_text("node two", encoding="utf-8")
+
+        identity = build_deployment_identity(
+            self.tmp_path, custom_node_paths=[first, second]
+        )
+
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_0/node.py"],
+            compute_file_hashes(first)["node.py"],
+        )
+        self.assertEqual(
+            identity.file_hashes["custom_node_root_1/node.py"],
+            compute_file_hashes(second)["node.py"],
+        )
+
     # ── Dependency-only change ───────────────────────────────────────
 
     def test_dependency_hash_is_carried_through(self):
@@ -285,6 +440,34 @@ class TestBuildDeploymentIdentity(unittest.TestCase):
         id2 = build_deployment_identity(self.tmp_path)
         self.assertEqual(id1.combined_hash, id2.combined_hash)
         self.assertEqual(id1.to_dict(), id2.to_dict())
+
+
+class TestEmptyCustomNodeHashBoundary(unittest.TestCase):
+    """Identities built without a custom-node tree walk still round-trip."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_empty_custom_node_hash_passes_boundary_and_persisted_roundtrip(self):
+        (self.tmp_path / "runtime.py").write_text("runtime = True\n", encoding="utf-8")
+        source_identity = build_deployment_identity(
+            self.tmp_path, dependency_hash="d" * 64
+        )
+        self.assertEqual(source_identity.custom_node_hash, "")
+        canonical = build_canonical_boundary_identity(
+            source_identity=source_identity,
+            foundation_inputs={"foundation": "stable"},
+            dependency_inputs={"dependency": "stable"},
+            accelerator_inputs={"accelerator": "stable"},
+            late_config_inputs={"late": "stable"},
+        )
+        persisted = source_identity.with_deployment_hash(canonical.deployment)
+        restored = deployment_identity_from_dict(persisted.to_dict())
+        validate_persisted_identity_pair(restored, canonical)
 
 
 class TestComputeHelpers(unittest.TestCase):
@@ -327,6 +510,35 @@ class TestComputeHelpers(unittest.TestCase):
         # SHA-256 of empty input (no paths fed into the hasher)
         empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         self.assertEqual(compute_aggregate_hash({}), empty_hash)
+
+
+class TestPublisherArchiveFilter(unittest.TestCase):
+    """The deploy-time publisher must apply the shared source policy."""
+
+    def test_archive_excludes_artifacts_and_bundles_but_keeps_source(self):
+        from tools.publish_custom_nodes_volume import _build_custom_nodes_archive
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            node = root / "legitimate-node"
+            node.mkdir()
+            (node / "source.py").write_text("value = 1", encoding="utf-8")
+            (node / "artifacts").mkdir()
+            (node / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+            (node / "comfyui-modal-P4-all.bundle").write_bytes(b"bundle")
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "manifest.json").write_text("{}", encoding="utf-8")
+
+            archive = _build_custom_nodes_archive(str(root))
+
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            names = set(tar.getnames())
+
+        self.assertIn("legitimate-node/source.py", names)
+        self.assertNotIn("legitimate-node/artifacts", names)
+        self.assertNotIn("legitimate-node/artifacts/manifest.json", names)
+        self.assertNotIn("legitimate-node/comfyui-modal-P4-all.bundle", names)
+        self.assertFalse(any(name == "artifacts" or name.startswith("artifacts/") for name in names))
 
 
 if __name__ == "__main__":

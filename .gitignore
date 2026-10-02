@@ -9,7 +9,12 @@ __pycache__/
 .deploy_log
 .custom_node_requirements/
 .baked_custom_node_deps/
+# Generated benchmark output. This broad pattern also matches source paths whose
+# directory name contains "benchmark", so re-include the one skill directory
+# rather than anchoring the rule and losing nested output coverage.
+.comfymodal_first_party_sources/
 *benchmark*/
+!.opencode/skills/benchmark-modal/
 optimization_logs/
 latest_benchmark_workflow.json
 
@@ -37,6 +42,15 @@ playwright/.cache/
 .studio_presets.json
 .studio_snapshots.json
 .studio_backends.json
+# Studio workflow-domain state (user-local, not committed)
+.studio_workflows.json
+.studio_workflow_versions.json
+.studio_workflow_mappings.json
+.studio_workflow_presets.json
+.studio_model_library.json
+.studio_custom_nodes.json
+.studio_dependency_overrides.json
+.studio_workflow_compatibility.json
 .deploy_warmup_state.json
 .run_history/
 # Studio output images (generated at runtime, not source)
@@ -85,8 +99,21 @@ playwright-*.md
 # Local orchestrator deepwork state
 .slim/deepwork/
 
+# BEGIN oh-my-opencode-slim worktrees
+.slim/worktrees/
+.slim/worktrees.json
+# END oh-my-opencode-slim worktrees
+
 # Lane A disk-persisted caches
 .cache/
 
 # Runtime-state volume directory (restore-plan + snapshot-seed payloads)
 .runtime_state/
+
+# v2ctl local control-plane state (deploy/run manifests, locks, gates)
+.v2ctl/
+
+# Generated audit/deployment artifacts and temporary workspace bundles
+artifacts/
+.slim/
+*.bundle

@@ -446,15 +446,15 @@ def test_v2_stages_survive_run_plan_stream_merge():
 
 def test_v2_runtime_revision_digest_deterministic():
     """COMFYMODAL_V2_RUNTIME_REVISION digest in comfyapp env block is a
-    16-char hex string and matches deterministic hash of modal_app.py."""
+    16-char hex string and matches the packaged runtime source revision."""
     import comfyapp
     _rev = comfyapp._V2_RUNTIME_REVISION
     assert isinstance(_rev, str)
     assert len(_rev) == 16
     int(_rev, 16)
-    _expected = hashlib.sha256(
-        Path(modal_app.__file__).resolve().read_bytes()
-    ).hexdigest()[:16]
+    _expected = comfyapp._compute_v2_runtime_revision(
+        Path(modal_app.__file__).resolve().parent
+    )
     assert _rev == _expected
 
 

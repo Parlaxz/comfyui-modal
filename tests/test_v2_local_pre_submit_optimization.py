@@ -85,8 +85,19 @@ class TestProfilePrepCacheHits(unittest.TestCase):
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
+        # Pin the effective env profile to production so the pre-submission
+        # profile checker/setter path always runs (the inherit no-op gate
+        # would otherwise skip setter invocation, breaking the pinned
+        # setter-invocation / cache-hit assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_profile_prep_cache()
         _reset_last_stable_profile_cache()
         _reset_restore_publish_cache()
@@ -1028,7 +1039,7 @@ class TestBreakdownIntact(unittest.TestCase):
         from comfymodal_runtime.trace import _build_local_submission_breakdown
         source = inspect.getsource(_build_local_submission_breakdown)
         for field in ("handle_cache_hit", "created_modal_client",
-                       "performed_cls_from_name", "constructed_class_instance"):
+                       "performed_cls_from_name", "constructed_instance"):
             self.assertIn(field, source,
                           f"Breakdown must reference {field}")
 
@@ -1040,6 +1051,24 @@ class TestBreakdownIntact(unittest.TestCase):
 
 class TestOperationCounts(unittest.TestCase):
     """Verifying the reduction in operation counts after optimisation."""
+
+    def setUp(self):
+        # Pin the effective env profile to production so the profile setter
+        # path runs (the inherit no-op gate would skip the setter entirely,
+        # breaking the setter-count assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        _reset_profile_prep_cache()
+        _reset_last_stable_profile_cache()
 
     def test_plan_to_dict_called_exactly_once(self):
         """``plan.to_dict()`` is called EXACTLY ONCE in execute_plan."""
@@ -1415,8 +1444,19 @@ class TestInstrumentationDiagnostics(unittest.TestCase):
     def setUp(self):
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the profile setter
+        # path runs (the inherit no-op gate would skip setter invocation and
+        # never populate the profile prep cache, breaking the cache-hit /
+        # miss-reason assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
 
@@ -1578,8 +1618,18 @@ class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
     def setUp(self):
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the profile setter
+        # path runs (the inherit no-op gate would skip the setter entirely,
+        # breaking the setter-call-count assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         from canonical_execution import _reset_all_cache_counters
         _reset_all_cache_counters()
 
@@ -1689,3 +1739,20 @@ class TestTwoIdenticalExecutionsSkipBothRemoteOps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

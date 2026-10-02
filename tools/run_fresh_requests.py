@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from canonical_execution import build_execution_plan, execute_plan
+from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
 from comfymodal_runtime.modal_transport import ModalTransport, HandleCache
 from comfymodal_runtime.restore_plan import RemoteRestorePlanPublisher
 from comfymodal_runtime.trace import RuntimeTrace
@@ -220,9 +221,17 @@ async def run_one_fresh(
     )
 
     started = time.perf_counter()
+    # Legacy remote restore-plan publication is opt-in only
+    # (COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1).  Default path passes None so
+    # execute_plan performs EXACTLY ONE Modal submission (run_plan_stream).
+    _publisher = (
+        RemoteRestorePlanPublisher(transport, workspace)
+        if publish_restore_plan_enabled()
+        else None
+    )
     result = await execute_plan(
         plan, transport=transport,
-        restore_publisher=RemoteRestorePlanPublisher(transport, workspace),
+        restore_publisher=_publisher,
         profile_setter=set_active_warmup_profile,
         profile_checker=check_active_warmup_profile,
         gpu=GPU, workspace=workspace, trace=runtime_trace,

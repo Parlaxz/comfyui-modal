@@ -1,0 +1,432 @@
+[v2.env_profile]
+env_profile=production
+thread_policy=TBASE
+snapshot_model_order=O0
+baseline_cpu_request=12
+baseline_memory_request=32768
+memory_request_mb=32768
+vae_policy=v1
+release_gpu_after_request=1
+cpu_model_snapshot=1
+native_fast_disk_unet=1
+publish_restore_plan=0
+vae_snapshot=1
+clip_conditioning_cache=1
+unet_activation_mode=late
+vae_activation_mode=sampling_end
+persistent_local_handle=1
+full_trace=0
+residency_diagnostics=0
+deep_model_diag=0
+pagefault_tracking=0
+eviction_enabled=0
+eviction_role=none
+eviction_idle_seconds=0
+prefill_lanes=critical
+prefill_wait_for_unet=0
+restore_torch_threads=none
+variance_pretouch=0
+volume_read_run_count=3
+restore_only_app=stable-modal-comfy-v2-restore-only-shadow
+restore_only_run_count=6
+snapshot_exclude_unet=
+=== Running V2 variance-cold benchmark - explicit opt-in ===
+[v2.host] python_first_line_wall_unix_ns=1786747389782557800
+{"guard": {"allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768, "changed_axes": []}, "runtime_shape": {"cpu_request": 12, "malloc_arena_max": null, "memory_request": 32768, "mkl_num_threads": null, "numexpr_num_threads": null, "omp_num_threads": null, "openblas_num_threads": null, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "snapshot_model_order": "O0", "thread_policy": "TBASE", "torch_interop_threads": null, "torch_intraop_threads": null}}
+[v2.variance_cold] mode=start runs=1 gap=25.0s pretouch=0 teardown=full pin_transfer=0 app=stable-modal-comfy-v2-variance-shadow
+WARNING:root:WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
+[v2.harness] prompt_server_mirror instance_set=True
+WARNING:root:
+----------------------------------------------------------------------------
+[Impact Pack] The SAM2 functionality is unavailable because the `facebook/sam2` dependency is not installed.
+
+Installation command:
+C:\Program Files\Python311\python.exe -m pip install git+https://github.com/facebookresearch/sam2
+----------------------------------------------------------------------------
+
+WARNING:root:
+----------------------------------------------------------------------------
+[Impact Pack] The SAM2 functionality is unavailable because the `facebook/sam2` dependency is not installed.
+
+Installation command:
+C:\Program Files\Python311\python.exe -m pip install git+https://github.com/facebookresearch/sam2
+----------------------------------------------------------------------------
+
+Package diffusers installed failed
+Package diffusers installed failed
+[33mModule 'diffusers' load failed. If you don't have it installed, do it:[0m
+[33mpip install diffusers[0m
+[34m[ComfyUI-Easy-Use] server: [0mv1.3.6 [92mLoaded[0m
+[34m[ComfyUI-Easy-Use] web root: [0mC:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-easy-use\web_version/v2 [92mLoaded[0m
+[exact_prefill.local] enabled=1 source=env
+[timing_trace] module loaded __file__=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\timing_trace.py TRACE_VERSION=2.0.0
+[timing_trace] module directory in sys.path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+WARNING:root:Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\__init__.py", line 7, in <module>
+    from .src.interfaces import comfy_entrypoint, SeedVR2Extension
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\interfaces\__init__.py", line 8, in <module>
+    from .video_upscaler import SeedVR2VideoUpscaler
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\interfaces\video_upscaler.py", line 10, in <module>
+    from ..utils.downloads import download_weight
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\utils\downloads.py", line 14, in <module>
+    from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\utils\model_registry.py", line 12, in <module>
+    from ..models.dit_3b.nadit import NaDiT as NaDiT3B
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\models\dit_3b\nadit.py", line 24, in <module>
+    from .embedding import TimeEmbedding
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\models\dit_3b\embedding.py", line 17, in <module>
+    from diffusers.models.embeddings import get_timestep_embedding
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\__init__.py", line 3, in <module>
+    from .configuration_utils import ConfigMixin
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\configuration_utils.py", line 34, in <module>
+    from .utils import DIFFUSERS_CACHE, HUGGINGFACE_CO_RESOLVE_ENDPOINT, DummyObject, deprecate, logging
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\utils\__init__.py", line 37, in <module>
+    from .dynamic_modules_utils import get_class_from_dynamic_module
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\utils\dynamic_modules_utils.py", line 29, in <module>
+    from huggingface_hub import HfFolder, cached_download, hf_hub_download, model_info
+ImportError: cannot import name 'cached_download' from 'huggingface_hub' (C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\huggingface_hub\__init__.py)
+
+WARNING:root:Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler module for custom nodes: cannot import name 'cached_download' from 'huggingface_hub' (C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\huggingface_hub\__init__.py)
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using ckpts path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux\ckpts[0m
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using symlinks: False[0m
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using ort providers: ['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider', 'CoreMLExecutionProvider'][0m
+C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux\node_wrappers\dwpose.py:26: UserWarning: DWPose: Onnxruntime not found or doesn't come with acceleration providers, switch to OpenCV with CPU device. DWPose might run very slowly
+  warnings.warn("DWPose: Onnxruntime not found or doesn't come with acceleration providers, switch to OpenCV with CPU device. DWPose might run very slowly")
+WARNING:root:Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes\__init__.py", line 2, in <module>
+    from .nodes.ai.FL_Fal_Gemini_ImageEdit import FL_Fal_Gemini_ImageEdit
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes\nodes\ai\FL_Fal_Gemini_ImageEdit.py", line 10, in <module>
+    import fal_client
+ModuleNotFoundError: No module named 'fal_client'
+
+WARNING:root:Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes module for custom nodes: No module named 'fal_client'
+WARNING:root:Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\__init__.py", line 11, in <module>
+    from .src.comfyui_sam3.nodes import NODE_CLASS_MAPPINGS
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\src\comfyui_sam3\nodes.py", line 6, in <module>
+    from sam3.model_builder import build_sam3_image_model, build_sam3_video_model
+ModuleNotFoundError: No module named 'sam3'
+
+WARNING:root:Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3 module for custom nodes: No module named 'sam3'
+WARNING:root:Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 936, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1073, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1130, in get_data
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comyui-modal-pagesfile-probe\\__init__.py'
+
+WARNING:root:Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comyui-modal-pagesfile-probe module for custom nodes: [Errno 2] No such file or directory: 'C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comyui-modal-pagesfile-probe\\__init__.py'
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*, /comfymodal/history-v2/feed, /comfymodal/history-v2/generations/{id}/*, /comfymodal/history-v2/experiments/{id}/*, /comfymodal/history-v2/assets/{id}
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+[exact_prefill.local] enabled=1 source=env
+[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/models/inject, /comfymodal/models/inject-all, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes, /comfymodal/runtime/resync, /comfymodal/runtime/state, /comfymodal/comparison/*, /comfymodal/experiments/*, /comfymodal/presets/*, /comfymodal/assets/{id}, /comfymodal/run-history/*, /comfymodal/deploy-warmup/*, /comfymodal/history/*
+⚠️  SeedVR2 optimizations check: SageAttention ❌ | Flash Attention ❌ | Triton ❌
+💡 For best performance: pip install sageattention flash-attn triton
+📊 Initial CUDA memory: 6.91GB free / 8.00GB total
+### ComfyUI-Workflow-Encrypt: Copy .js from 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-workflow-encrypt\js\comfyui-workflow-encrypt.js' to 'C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\web\extensions\comfyui-workflow-encrypt'
+# 😺dzNodes: LayerStyle -> [1;33mCannot import name 'guidedFilter' from 'cv2.ximgproc'
+A few nodes cannot works properly, while most nodes are not affected. Please REINSTALL package 'opencv-contrib-python'.
+For detail refer to [4mhttps://github.com/chflame163/ComfyUI_LayerStyle/issues/5[0m[m
+(RES4LYF) Init
+(RES4LYF) Importing beta samplers.
+(RES4LYF) Importing legacy samplers.
+
+[92m[rgthree-comfy] Loaded 48 exciting nodes. 🎉[0m
+
+[33m[rgthree-comfy] ComfyUI's new Node 2.0 rendering may be incompatible with some rgthree-comfy nodes and features, breaking some rendering as well as losing the ability to access a node's properties (a vital part of many nodes). It also appears to run MUCH more slowly spiking CPU usage and causing jankiness and unresponsiveness, especially with large workflows. Personally I am not planning to use the new Nodes 2.0 and, unfortunately, am not able to invest the time to investigate and overhaul rgthree-comfy where needed. If you have issues when Nodes 2.0 is enabled, I'd urge you to switch it off as well and join me in hoping ComfyUI is not planning to deprecate the existing, stable canvas rendering all together.
+[0m
+[v2.harness] production_output_registered output=True comparer=True
+[v2.harness] node_registry_initialized classes=2192
+[critical_path.flags] critical_path=1 unet_phase=1 validation_phase=1 coordinator=0 coordinator_diag=1 source=module_import
+[v2.plan_proof] schema=1 payload=yes validated=True outputs=2 wf_hash=2e43d4c0ba3b82c0 dep_complete=True reg_proof=1 memo=miss
+cpu_snapshot_unet_mode=reuse
+[v2.benchmark] phase=execute_plan_start
+[v2.restore_publish] skipped reason=flag_disabled
+[v2.seed_build] source=invocation_plan schema=2 topology_available=1 persisted=1 workflow_hash=2e43d4c0ba3b82c0 loader_nodes=3 sampler_nodes=1 reachable_nodes=43 static_signatures=43
+[v2.local_submission_breakdown.pre_dispatch] request_id=v2-benchmark-0-8bed47f84054 local_receive_to_worker_start_ms=26093.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=26093.0 worker_queue_ms=0.0 plan_build_ms=94.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=absent payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=26187.0 generator_create_ms=absent generator_created_to_first_iteration_ms=absent local_receive_to_actual_submission_ms=absent measured_children_ms=absent residual_ms=absent reconciliation_status=incomplete profile_cache_hit=True profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=20564 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.003 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.003 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+[v2.local_handle] owner_ready pid=19496
+[v2.local_handle] decision=persistent_hit
+FETCH ComfyRegistry Data: 5/172
+FETCH ComfyRegistry Data: 10/172
+FETCH ComfyRegistry Data: 15/172
+FETCH ComfyRegistry Data: 20/172
+FETCH ComfyRegistry Data: 25/172
+[v2.local_submission_breakdown] request_id=v2-benchmark-0-8bed47f84054 local_receive_to_worker_start_ms=26093.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=26093.0 worker_queue_ms=0.0 plan_build_ms=94.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=16.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=26187.0 generator_create_ms=16.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=26203.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=True profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=20564 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.003 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.003 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent
+FETCH ComfyRegistry Data: 30/172
+FETCH ComfyRegistry Data: 35/172
+FETCH ComfyRegistry Data: 40/172
+FETCH ComfyRegistry Data: 45/172
+FETCH ComfyRegistry Data: 50/172
+FETCH ComfyRegistry Data: 55/172
+FETCH ComfyRegistry Data: 60/172
+[v2.request_origin] request_id=v2-benchmark-0-8bed47f84054 trigger_source=benchmark local_prompt_enqueued_unix_ns=None local_prompt_ack_ready_unix_ns=None modal_generator_created_unix_ns=1786747416640134800 modal_submission_attempt_unix_ns=1786747416640134800 modal_first_event_received_unix_ns=1786747429208306400 modal_first_iteration_start_unix_ns=1786747416640134800 modal_first_remote_event_unix_ns=1786747429208306400 dispatch_to_modal_entry_ms=13297.799 local_receive_to_actual_submission_ms=26203.0 local_receive_to_result_return_ms=61401.723 t0_to_t1_ms=0.263 t1_to_queue_enqueue_ms=None local_receive_to_enqueue_ms=None queue_wait_before_worker_ms=None plan_build_ms=94.0 active_profile_ms=0.0 handle_lookup_ms=16.0 payload_serialize_ms=0.0 local_residual_ms=0.0 clock_reconciliation_residual_ms=0.0 route_unattributed_ms=None worker_unattributed_ms=None reconciliation_status=incomplete missing_stages=local_receive_to_enqueue_ms overlap_error= modal_input_id=in-01M0173X2BP82ZRCZYRS9M5VQH:1786747417676-0 trigger_to_local_receive_ms=0.263 local_receive_to_generator_create_start_ms=26200.872 generator_create_ms=3.0 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=12568.172 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=2460.527 restore_end_to_modal_method_entry_ms=160.359 modal_method_entry_to_executor_ms=12442.58 submission_to_remote_python_resume_ms=10676.913 unexplained_pre_remote_ms=12568.172
+[v2.remote_request_origin] request_id=v2-benchmark-0-8bed47f84054 trigger_source=benchmark ui_trigger_unix_ms=1786747390436 local_receive_wall_unix_ns=1786747390436263168 local_receive_mono_ns=203515000000000 modal_generator_create_start_wall_unix_ns=1786747416637135200 modal_generator_create_start_mono_ns=203541187000000 modal_generator_created_wall_unix_ns=1786747416640134800 modal_generator_created_mono_ns=203541203000000 modal_first_iteration_start_wall_unix_ns=1786747416640134800 modal_first_iteration_start_mono_ns=203541203000000 modal_submission_attempt_wall_unix_ns=1786747416640134800 modal_submission_attempt_mono_ns=203541203000000 modal_first_remote_event_wall_unix_ns=1786747429208306400 modal_first_remote_event_mono_ns=203553765000000 modal_submission_boundary_source=first_iteration_proxy remote_python_resume_wall_unix_ns=1786747427317047808 restore_method_start_wall_unix_ns=1786747427317047808 restore_method_end_wall_unix_ns=1786747429777574656 modal_method_entry_wall_unix_ns=1786747429937933824 prompt_executor_invoke_start_wall_unix_ns=1786747442380513792 trigger_to_local_receive_ms=0.263 local_receive_to_generator_create_start_ms=26200.872 generator_create_ms=3.0 generator_created_to_first_iteration_ms=0.0 first_iteration_to_first_remote_event_ms=12568.172 remote_python_resume_to_restore_start_ms=0.0 restore_method_ms=2460.527 restore_end_to_modal_method_entry_ms=160.359 modal_method_entry_to_executor_ms=12442.58 submission_to_remote_python_resume_ms=10676.913 unexplained_pre_remote_ms=12568.172 modal_input_id=in-01M0173X2BP82ZRCZYRS9M5VQH:1786747417676-0
+[v2.local_submission_breakdown.final] request_id=v2-benchmark-0-8bed47f84054 local_receive_to_worker_start_ms=26093.0 worker_start_to_normalize_start_ms=0.0 normalize_production_options_ms=0.0 normalize_end_to_trace_construct_start_ms=0.0 runtime_trace_construct_ms=0.0 trace_construct_to_options_copy_start_ms=0.0 benchmark_options_copy_ms=0.0 options_copy_to_client_id_start_ms=0.0 client_id_generation_ms=0.0 client_id_end_to_plan_call_ms=0.0 plan_call_to_function_entry_ms=0.0 worker_start_to_plan_build_ms=0.0 local_receive_to_plan_build_start_ms=26093.0 worker_queue_ms=0.0 plan_build_ms=94.0 plan_build_to_execute_plan_entry_ms=0.0 execute_plan_entry_to_plan_materialization_ms=0.0 plan_materialization_ms=0.0 plan_materialization_to_active_profile_ms=0.0 active_profile_ms=0.0 restore_plan_build_ms=absent restore_publish_ms=absent restore_publish_to_transport_entry_ms=absent transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=16.0 payload_materialization_ms=0.0 payload_size_measurement_ms=0.0 payload_size_to_serialize_end_ms=0.0 payload_ready_to_modal_call_ms=0.0 local_receive_to_modal_call_ms=26187.0 generator_create_ms=16.0 generator_created_to_first_iteration_ms=invalid_negative local_receive_to_actual_submission_ms=26203.0 measured_children_ms=absent residual_ms=absent reconciliation_status=overlap profile_cache_hit=True profile_remote_call_performed=False profile_checker_matched=False restore_publish_cache_hit=absent restore_remote_call_performed=absent handle_cache_hit=absent plan_to_dict_count=1 payload_bytes=20564 active_profile_local_ms=0.0 active_profile_cache_lookup_ms=0.003 active_profile_checker_ms=0.0 active_profile_setter_ms=0.0 active_profile_total_ms=0.003 created_modal_client=False performed_cls_from_name=False constructed_class_instance=False input_image_count=0 workflow_node_count=43 unmeasured_boundary=absent modal_submission_attempt_unix_ns=1786747416640134800 modal_generator_created_unix_ns=1786747416640134800 modal_first_iteration_start_unix_ns=1786747416640134800 modal_first_remote_event_unix_ns=1786747429208306400 dispatch_to_modal_entry_ms=13297.799 local_receive_to_actual_submission_ms=26203.0 local_receive_to_result_return_ms=61401.723
+FETCH ComfyRegistry Data: 65/172
+WATERFALL RECONCILIATION (local rebuild) replaced remote PARTIAL report with the full host-reconciled report
+WATERFALL RECONCILIATION (local rebuild)
+  command_to_response_ms            62492.0
+  top_level_accounted_ms            27566.0
+  global_residual_ms                -11.1
+  global_residual_pct               -0.0
+  reconciliation_status             OK
+  controllable_application_wall_ms  24567.0
+  platform_wall_ms                  10676.9
+  modal_restore_begin_unavailable   no
+  OLD vs NEW accounted_ms 24567.0 -> 27566.0 | residual_ms -11.1 -> -11.1
+production_adjusted_total_wall_ms=28730.705
+[v2.experiment] saved=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-14_22-43-10\run_001_sample.json
+{"run_index": 0, "request_id": "v2-benchmark-0-8bed47f84054", "identity": {"app_name": "stable-modal-comfy-v2-variance-shadow", "class_name": "ModalRuntimeEntrypoint", "method_name": "run_plan_stream", "gpu": ["RTX-PRO-6000"], "cpu": 12, "memory_mb": 32768, "fingerprint": "26882022799db5c8731c248d693cc3870e59d60bcb4ecab853a2a490df701d95", "runtime_shape": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "stored_snapshot_model_order": "O0", "restore_count": 1, "request_count": 1, "restored_instance_id": "d1b62b13466d46e99e0b4353fc7e878c", "restore_session_id": "e6a9ca032a454dd79db0acebf6d7a175", "container_task_id": "ta-01M01741ZVKNSTPHSVSZ588EMR", "modal_container_id": "", "image_id": "im-a2IIJylwwXvbZWobiJofec", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east1", "modal_input_id": "in-01M0173X2BP82ZRCZYRS9M5VQH:1786747417676-0", "container_session_id": "9d918f0a192243b8"}, "runtime_shape": {"requested": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "deployed": {"thread_policy": "TBASE", "torch_intraop_threads": null, "torch_interop_threads": null, "omp_num_threads": null, "mkl_num_threads": null, "openblas_num_threads": null, "numexpr_num_threads": null, "malloc_arena_max": null, "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null}, "observed": {"stage": "request_entry", "runtime_shape_fingerprint": "f504e296c398bdcb2c4c07e2", "runtime_shape_label": null, "thread_policy": "TBASE", "snapshot_model_order": "O0", "cpu_request": 12, "memory_request": 32768, "native_thread_count": 51, "configured_omp": null, "configured_mkl": null, "configured_openblas": null, "configured_numexpr": null, "malloc_arena_max": null, "native_library_settings": {"OMP_NUM_THREADS": "12", "MKL_NUM_THREADS": "12", "OPENBLAS_NUM_THREADS": "12", "NUMEXPR_NUM_THREADS": null, "MALLOC_ARENA_MAX": null}, "torch_intraop_threads": 12, "torch_interop_threads": 14, "actual_torch_intraop_threads": 12, "actual_torch_interop_threads": 14, "requested_torch_intraop_threads": null, "requested_torch_interop_threads": null, "requested_vs_actual_match": true, "status": "baseline_passthrough", "error": "", "trace_id": "bb7704605188437b", "pid": 2, "thread_native_id": 2, "restored_instance_id": "d1b62b13466d46e99e0b4353fc7e878c", "restore_session_id": "e6a9ca032a454dd79db0acebf6d7a175", "legacy_container_session_id": "9d918f0a192243b8", "container_task_id": "ta-01M01741ZVKNSTPHSVSZ588EMR", "modal_input_id": "in-01M0173X2BP82ZRCZYRS9M5VQH:1786747417676-0", "image_id": "im-a2IIJylwwXvbZWobiJofec", "cloud": "CLOUD_PROVIDER_GCP", "region": "us-east1", "app_name": "stable-modal-comfy-v2-variance-shadow", "class_name": "ModalRuntimeEntrypoint"}, "stored_snapshot_model_order": "O0", "snapshot_target_fingerprint": "26882022799db5c8731c248d693cc3870e59d60bcb4ecab853a2a490df701d95", "guard": {"changed_axes": [], "allow_multi_axis": false, "baseline_cpu_request": 12, "baseline_memory_request": 32768}, "construction_order_semantics": "model_construction_order_only"}, "timing": {"wall_ms": 35243.7, "handle_lookup_ms": 3.0, "submission_to_first_remote_event_ms": 12568.172, "command_to_response_ms": 62494.0, "submit2entry_ms": 13300.799, "t3b_to_t8_ms": 6589.479, "restore_total_ms": 2451.587, "pre_sampler_ms": 1354.699, "sampler_ms": 3698.466, "vae_decode_ms": 405.319, "output_collection_ms": 9.075, "snapshot_callback_age_at_restore_ms": 3312097.819, "snapshot_callback_to_command_start_ms": 3274161.324, "command_start_to_restore_start_ms": 37936.048, "local_timing": {"t0_to_t1_ms": 0.263, "t1_to_queue_enqueue_ms": null, "local_receive_to_enqueue_ms": null, "local_body_read_ms": null, "local_json_parse_ms": null, "local_preflight_ms": null, "local_queue_lock_wait_ms": null, "local_queue_enqueue_ms": null, "queue_wait_before_worker_ms": null, "plan_build_ms": 94.0, "active_profile_ms": 0.0, "restore_plan_build_ms": null, "restore_publish_ms": null, "handle_lookup_ms": 16.0, "payload_serialize_ms": 0.0, "payload_materialization_ms": 0.0, "payload_size_measurement_ms": 0.0, "generator_create_ms": 3.0, "local_residual_ms": 0.0, "clock_reconciliation_residual_ms": 0.0, "route_unattributed_ms": null, "worker_unattributed_ms": null, "reconciliation_status": "incomplete", "missing_stages": ["local_receive_to_enqueue_ms"], "overlap_error": "", "stage_attribution_residual_ms": {"route_unattributed_ms": null, "worker_unattributed_ms": null, "missing_stages": ["local_receive_to_enqueue_ms"], "reconciliation_status": "incomplete", "overlap_error": ""}, "local_receive_to_generator_create_ms": 26187.0, "generator_create_to_first_iteration_ms": 0.0, "first_iteration_to_first_remote_event_ms": 12568.172, "local_receive_to_actual_submission_ms": 26203.0, "trigger_to_local_receive_ms": 0.263, "local_receive_to_generator_create_start_ms": 26200.872, "generator_created_to_first_iteration_ms": 0.0, "remote_python_resume_to_restore_start_ms": 0.0, "restore_method_ms": 2460.527, "restore_end_to_modal_method_entry_ms": 160.359, "modal_method_entry_to_executor_ms": 12442.58, "submission_to_remote_python_resume_ms": 10676.913, "unexplained_pre_remote_ms": 12568.172, "local_result_received_wall_ns": 1786747451837986600, "local_result_received_mono_ns": 203576390000000, "local_receive_to_result_return_ms": 61401.723, "result_received_to_return_ms": 34.001, "remote_result_emit_wall_unix_ns": 1786747450079916082, "remote_result_emit_to_local_receipt_ms": 1758.071, "caller_return_wall_unix_ns": 1786747451872986100, "caller_return_mono_ns": 203576437000000, "local_result_received_to_caller_return_ms": 47.0, "modal_restore_begin_wall_unix_ns": null}, "restore_breakdown": {"restore_total_ms": 2451.587, "models_symlink_ms": 3.66, "manager_offline_ms": 0.96, "reload_models_ms": 0.0, "reload_runtime_state_ms": 228.766, "v2_startup_custom_node_source_copy_ms": 230.69, "sync_custom_nodes_ms": 1389.23, "install_requirements_ms": 0.01, "v2_startup_comfyui_path_startup_ms": 0.1, "comfyui_path_setup_ms": 0.75, "v2_startup_backend_startup_ms": 18961.53, "backend_startup_ms": 18963.62, "observe_generations_ms": 0.21, "snapshot_restore_ms": 2383.42, "folder_warm_ms": 1148.849, "snapshot_callback_age_at_restore_ms": 3312097.819, "restore_gpu_state_ms": 435.206, "cuda_init_ms": 9.5, "sage_policy_ms": 57.52, "v2_startup_snapshot_execution_seed_ms": 3.29, "initialize_cuda_ms": 9.352, "snapshot_identity_checks_ms": 0.0, "cpu_snapshot_retargeting_ms": 0.0}, "early_activation_total_ms": 4353.095, "queue_delay_ms": 2.768, "cpu_snapshot_wait_ms": 0.185, "dtype_layout_preparation_ms": 3.268, "post_load_bookkeeping_ms": 3.564, "submission_to_remote_python_resume_ms": 10676.913, "remote_python_resume_to_restore_start_ms": 0.0, "restore_to_method_entry_ms": 160.359, "method_entry_to_first_remote_event_ms": null, "first_remote_event_to_final_result_ms": 22628.681, "transfer_queue_delay_ms": 7.647, "synchronized_transfer_ms": 4341.427, "quiesce_wait_ms": null, "graph_activity_ms": 77.785, "sampler_lane_wait_ms": 0.084, "quiesced_transfer": null}}
+WATERFALL (host-reconciled)
+V2 COLD WATERFALL - run 1 (local reconcile)
+Request:   v2-benchmark-0-8bed47f84054 | Instance: d1b62b13466d46e99e0b4353fc7e878c | Fresh: YES
+Platform:  GCP/us-east1 | GPU: RTX PRO 6000 Blackwell | VRAM 97,250 MiB | CUDA 13.0 | CC 12.0
+CPU:       AMD Family 191 Model 2 | visible=28
+Telemetry: maxRSS=34.86 GiB
+
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   # | Stage                                          |   Duration |       Cum. |        % | Relative wall (non-scheduling)           |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|   1 | Modal pre-Python snapshot restoration          |     2.999s |     2.999s |  10.884% | ####                                     |
+|   2 | Python/application restore                     |     2.460s |     5.459s |   8.929% | ####                                     |
+|   3 | Restore-to-method entry                        | 160.357 ms |     5.620s |   0.582% | #                                        |
+|   4 | Remote method setup                            |    12.443s |    18.062s |  45.156% | ##################                       |
+|     |   method entry to graph start                  | 176.385 ms |            |          |                                          |
+|     |   method entry to runtime configuration        | 176.319 ms |            |          |                                          |
+|     |   graph setup                                  |    12.266s |            |          |                                          |
+|     |   certificate                                  |     1.284s |            |          |                                          |
+|     |   preflight                                    |    10.638s |            |          |                                          |
+|     |   validation                                   |  33.801 ms |            |          |                                          |
+|     |   UNET synchronized transfer                   |     4.341s |            |          |                                          |
+|   5 | PromptExecutor/cache setup                     |   6.158 ms |    18.068s |   0.022% | #                                        |
+|   6 | Pre-sampler execution                          |  71.581 ms |    18.140s |   0.260% | #                                        |
+|     |   Conditioning cache exact_hit lookup=22.327ms |  22.327 ms |            |          |                                          |
+|     |   CLIP encode skipped (cache hit)              |          - |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  28.470 ms |            |          |                                          |
+|     |   Node: ImpactSwitch                           |  29.007 ms |            |          |                                          |
+|     |   Node: ClownsharKSampler_Beta                 |  73.335 ms |            |          |                                          |
+|     |   UNET ready -> sampler demand                 |     7.272s |            |          |                                          |
+|   7 | Sampler node to sampling                       |  67.081 ms |    18.207s |   0.243% | #                                        |
+|     |   lane acquired to actual stage                |  67.053 ms |            |          |                                          |
+|   8 | Sampling                                       |     4.912s |    23.120s |  17.828% | #######                                  |
+|   9 | Post-sampling / VAE transition                 | 945.747 ms |    24.065s |   3.432% | #                                        |
+|  10 | VAE decode                                     | 405.319 ms |    24.471s |   1.471% | #                                        |
+|     |   VAE load/H2D                                 | 996.507 ms |            |          |                                          |
+|  11 | Output encode / descriptor                     |     1.290s |    25.761s |   4.683% | ##                                       |
+|     |   PNG encode                                   | 171.903 ms |            |          |                                          |
+|  12 | Remote result handoff                          |     1.758s |    27.519s |   6.380% | ###                                      |
+|  13 | Local result handling / caller return          |  47.000 ms |    27.566s |   0.171% | #                                        |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+|     | RECONCILIATION                                 | -11.105 ms |            |          |                                          |
+|     | STATUS                                         |         OK |            |          |                                          |
+|     | TARGET 10MS                                    |     MISSED |            |          |                                          |
++-----+------------------------------------------------+------------+------------+----------+------------------------------------------+
+Required data: checkpoint_read_unavailable
+VALIDATION: INCOMPLETE
+COMMAND -> RESPONSE:                     62.492s
+Command (without scheduling) -> Response:   27.555s
+Scheduling time:                         34.937s
+[v2.prompt_executor_breakdown] request_id=v2-benchmark-0-8bed47f84054 exec_to_cached_ms=5.32 dynamic_prompt_ms=0.007 is_changed_ms=absent signature_keys_ms=absent seed_apply_ms=0.307 clean_unused_ms=0.024 cache_gather_ms=0.073 cleanup_gc_ms=0.4 residual_ms=4.509 c2f_cached_to_first_node_ms=0.536 c2f_topo_walk_ms=0.442 c2f_topo_input_info_ms=0.09 c2f_topo_other_ms=0.352 c2f_stage_ms=1.027 c2f_first_node_prefix_ms=0.121 c2f_residual_ms=-1.054 signature_cache_eligible=True signature_cache_fallback= signature_cache_hit=True signature_cache_key_hash=7eb61a6d530f7dc1eaa9ab2bdcad3aae920b274218e8d5047f1a0d7b820b2da4 signature_cache_requested=True signature_cache_source=volume signature_reuse_ms=3.204 topo_lazy_hits=36
+[v2.conditioning_exact_hit_breakdown] request_id=v2-benchmark-0-8bed47f84054 decision=exact_hit lookup_wall_ms=22.327 total_ms=21.955 key_build_ms=0.243 lock_wait_ms=0.002 manifest_read_ms=0.0 manifest_bytes=0 manifest_entries=44 entry_lookup_ms=18.742 header_bytes=3752 data_bytes=2900184 lru_touch_ms=2.508 lru_touch_mode=sync children_ms=21.495 residual_ms=0.46 entries_requested=1 hit_count=1 lru_async_batch_size=0 lru_async_batches=0 lru_async_dropped=0 lru_async_enqueued=0 lru_async_failed=0 lru_async_flush_count=0 lru_async_persist_ms=0.0 manifest_memory_hit=1 miss_count=0 normal_lookup_fallback=0 payload_memory_hit=1 payload_memory_source=key_hit prefetch_join_ms=381.588 prefetch_join_timeout=0 prefetch_overlap_ms=137.694 prefetch_payload_entries=3 prefetch_reason=key_build_partial:weight_dtype prefetch_reload=skipped_first prefetch_requested=1 prefetch_source=full prefetch_wall_ms=709.851 volume_reload_ms=0.0
+[v2.folder_warm] request_id=v2-benchmark-0-8bed47f84054 folder_warm_ms=1148.849 folder_warm_folders=29
+[v2.input_types_warm] request_id=v2-benchmark-0-8bed47f84054 input_types_warm_ms=605.819 input_types_warm_classes=31
+[v2.png_output] request_id=v2-benchmark-0-8bed47f84054 compress_level=1 png_encode_ms=171.885 png_compress_ms=165.648 width=1088 height=1920 bytes=3129718 sha=20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260
+[v2.host_submission_breakdown] request_id=v2-benchmark-0-8bed47f84054 command_start_to_python_first_line_ms=401.558 python_first_line_to_local_receive_ms=653.705 local_receive_to_registry_start_ms=0.0 node_registry_init_ms=26083.31 registry_end_to_worker_start_ms=22.0 worker_start_to_plan_build_start_ms=1.0 plan_build_ms=94.0 plan_build_to_transport_entry_ms=5.997 transport_entry_to_handle_lookup_ms=0.0 handle_lookup_ms=16.0 payload_serialize_ms=0.0 generator_create_ms=3.0 generator_created_to_submission_ms=0.0 local_receive_to_submission_ms=26203.0 submission_boundary_source=first_anext first_remote_signal_ms=12568.172 scheduling_ms=7677.971 scheduling_source=modal_app_log
+[v2.variance_cold] run=0 id=variance-cold-p0-0-4a8372d8 status=COLD instance=d1b62b13466d task=ta-01M01741ZVKNS
+[v2.variance_cold] report=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\comfymodal-data\benchmarks\runs\v2_2026-08-14_22-43-10\variance_cold_report.md
+{"output_dir": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\comfymodal-data\\benchmarks\\runs\\v2_2026-08-14_22-43-10", "run_count": 1, "cold_count": 1, "warm_or_invalid_count": 0, "pretouch": 0, "root_cause": "transfer/throughput"}
+# V2 Variance-Cold Benchmark Report
+
+> Mode: `variance_cold`. One request at a time with a fixed gap; each run asserts true cold identity from the request-scoped `remote_method_entry` metadata.
+
+## Scope and completeness
+
+- Generated: `2026-08-14T22:44:14.377624Z`
+- Run records: **1**
+- Confirmed cold runs: **1**
+- Warm-reused or invalid runs: **0**
+- UNET pretouch mode: `0` (0 = disabled, 1 = enabled)
+- Gap between runs: `25.0s`
+
+## Cold-identity validity
+
+Each run is only labeled cold when the request-scoped `remote_method_entry` proves `restore_count == 1`, `request_count == 1`, a non-empty `restored_instance_id`, and (when available) a container/task identity distinct from the previous run. Warm/reused runs are never relabeled cold.
+
+### Overall timing (ms)
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| Wall time | 1 | 35,243.700 | 35,243.700 | 35,243.700 | 35,243.700 |
+| Restore total | 1 | 2,451.587 | 2,451.587 | 2,451.587 | 2,451.587 |
+| Sampling | 1 | 3,698.466 | 3,698.466 | 3,698.466 | 3,698.466 |
+
+### Slow-run rate
+
+- Threshold: `70487.4 ms`
+- Slow runs: `0` / `1` (rate `0.0`)
+
+### Restore breakdown (ms)
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| restore_total_ms | 1 | 2,451.587 | 2,451.587 | 2,451.587 | 2,451.587 |
+| snapshot_restore_ms | 1 | 2,383.420 | 2,383.420 | 2,383.420 | 2,383.420 |
+| backend_startup_ms | 1 | 18,963.620 | 18,963.620 | 18,963.620 | 18,963.620 |
+| restore_breakdown_backend_startup_ms | 1 | 18,963.620 | 18,963.620 | 18,963.620 | 18,963.620 |
+| restore_breakdown_comfyui_path_setup_ms | 1 | 0.750 | 0.750 | 0.750 | 0.750 |
+| restore_breakdown_cpu_snapshot_retargeting_ms | 1 | 0.000 | 0.000 | 0.000 | 0.000 |
+| restore_breakdown_cuda_init_ms | 1 | 9.500 | 9.500 | 9.500 | 9.500 |
+| restore_breakdown_folder_warm_ms | 1 | 1,148.849 | 1,148.849 | 1,148.849 | 1,148.849 |
+| restore_breakdown_initialize_cuda_ms | 1 | 9.352 | 9.352 | 9.352 | 9.352 |
+| restore_breakdown_install_requirements_ms | 1 | 0.010 | 0.010 | 0.010 | 0.010 |
+| restore_breakdown_manager_offline_ms | 1 | 0.960 | 0.960 | 0.960 | 0.960 |
+| restore_breakdown_models_symlink_ms | 1 | 3.660 | 3.660 | 3.660 | 3.660 |
+| restore_breakdown_observe_generations_ms | 1 | 0.210 | 0.210 | 0.210 | 0.210 |
+| restore_breakdown_reload_models_ms | 1 | 0.000 | 0.000 | 0.000 | 0.000 |
+| restore_breakdown_reload_runtime_state_ms | 1 | 228.766 | 228.766 | 228.766 | 228.766 |
+| restore_breakdown_restore_gpu_state_ms | 1 | 435.206 | 435.206 | 435.206 | 435.206 |
+| restore_breakdown_restore_total_ms | 1 | 2,451.587 | 2,451.587 | 2,451.587 | 2,451.587 |
+| restore_breakdown_sage_policy_ms | 1 | 57.520 | 57.520 | 57.520 | 57.520 |
+| restore_breakdown_snapshot_callback_age_at_restore_ms | 1 | 3,312,097.819 | 3,312,097.819 | 3,312,097.819 | 3,312,097.819 |
+| restore_breakdown_snapshot_identity_checks_ms | 1 | 0.000 | 0.000 | 0.000 | 0.000 |
+| restore_breakdown_snapshot_restore_ms | 1 | 2,383.420 | 2,383.420 | 2,383.420 | 2,383.420 |
+| restore_breakdown_sync_custom_nodes_ms | 1 | 1,389.230 | 1,389.230 | 1,389.230 | 1,389.230 |
+| restore_breakdown_v2_startup_backend_startup_ms | 1 | 18,961.530 | 18,961.530 | 18,961.530 | 18,961.530 |
+| restore_breakdown_v2_startup_comfyui_path_startup_ms | 1 | 0.100 | 0.100 | 0.100 | 0.100 |
+| restore_breakdown_v2_startup_custom_node_source_copy_ms | 1 | 230.690 | 230.690 | 230.690 | 230.690 |
+| restore_breakdown_v2_startup_snapshot_execution_seed_ms | 1 | 3.290 | 3.290 | 3.290 | 3.290 |
+
+### CPU page traversal
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| major_faults | 0 | unavailable | unavailable | unavailable | unavailable |
+| minor_faults | 0 | unavailable | unavailable | unavailable | unavailable |
+| variance_stage_faults_major | 1 | 0.000 | 0.000 | 0.000 | 0.000 |
+| unet_demand_to_first_forward_ms | 1 | 111.370 | 111.370 | 111.370 | 111.370 |
+| cpu_page_traversal_wall_ms | 0 | unavailable | unavailable | unavailable | unavailable |
+| cpu_page_traversal_gb_per_s | 0 | unavailable | unavailable | unavailable | unavailable |
+| cpu_to_gpu_transfer_wall_ms | 1 | 4,310.903 | 4,310.903 | 4,310.903 | 4,310.903 |
+| early_activation_total_ms | 1 | 4,353.095 | 4,353.095 | 4,353.095 | 4,353.095 |
+| queue_delay_ms | 1 | 2.768 | 2.768 | 2.768 | 2.768 |
+| cpu_snapshot_wait_ms | 1 | 0.185 | 0.185 | 0.185 | 0.185 |
+| dtype_layout_preparation_ms | 1 | 3.268 | 3.268 | 3.268 | 3.268 |
+| post_load_bookkeeping_ms | 1 | 3.564 | 3.564 | 3.564 | 3.564 |
+
+### Pretouch
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| pretouch_enabled | 1 | 0.000 | 0.000 | 0.000 | 0.000 |
+| pretouch_effect_ms | 0 | unavailable | unavailable | unavailable | unavailable |
+| pretouch_bytes | 0 | unavailable | unavailable | unavailable | unavailable |
+| pretouch_touched_pages | 0 | unavailable | unavailable | unavailable | unavailable |
+
+### Transfer / throughput
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| output_commit_ms | 0 | unavailable | unavailable | unavailable | unavailable |
+| command_to_response_ms | 1 | 62,494.000 | 62,494.000 | 62,494.000 | 62,494.000 |
+| variance_bytes | 0 | unavailable | unavailable | unavailable | unavailable |
+| variance_gb_per_s | 0 | unavailable | unavailable | unavailable | unavailable |
+| cpu_to_gpu_transfer_wall_ms | 1 | 4,310.903 | 4,310.903 | 4,310.903 | 4,310.903 |
+| cpu_to_gpu_transfer_bytes | 1 | 12,309,817,472.000 | 12,309,817,472.000 | 12,309,817,472.000 | 12,309,817,472.000 |
+| cpu_to_gpu_transfer_gb_per_s | 1 | 2.856 | 2.856 | 2.856 | 2.856 |
+
+### Bookkeeping (ms)
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| handle_lookup_ms | 1 | 3.000 | 3.000 | 3.000 | 3.000 |
+| plan_build_ms | 1 | 94.000 | 94.000 | 94.000 | 94.000 |
+| t3b_to_t8_ms | 1 | 6,589.479 | 6,589.479 | 6,589.479 | 6,589.479 |
+| variance_process_cpu_ms | 1 | 22,180.000 | 22,180.000 | 22,180.000 | 22,180.000 |
+| patcher_bookkeeping_ms | 0 | unavailable | unavailable | unavailable | unavailable |
+| patch_weight_count | 0 | unavailable | unavailable | unavailable | unavailable |
+| cast_count | 0 | unavailable | unavailable | unavailable | unavailable |
+
+### Sampler wait / sampling (ms)
+
+| Metric | Count | Median ms | p90 ms | Max ms | Mean ms |
+|---|---:|---:|---:|---:|---:|
+| sampler_node_to_sampler_start_ms | 0 | unavailable | unavailable | unavailable | unavailable |
+| sampling_ms | 1 | 3,698.466 | 3,698.466 | 3,698.466 | 3,698.466 |
+| sampling_wall_ms | 1 | 4,913.056 | 4,913.056 | 4,913.056 | 4,913.056 |
+| activation_wait_ms | 1 | 112.814 | 112.814 | 112.814 | 112.814 |
+| vae_decode_ms | 1 | 405.319 | 405.319 | 405.319 | 405.319 |
+
+### Sampler activation-wait source labels
+
+`demand_to_first_forward`
+
+## Best-supported root cause / competing explanations / next fix
+
+- Best-supported root cause: **transfer/throughput**
+- Competing explanations: unavailable
+- Next fix: Reduce transfer/throughput cost: inspect output_commit_ms and first_iteration_to_first_remote_event_ms for serialization overhead.
+
+## Per-run inventory
+
+### `variance-cold-p0-0-4a8372d8` / mode `variance_cold`
+
+- Cold identity: **COLD**
+  - Provider/region: `CLOUD_PROVIDER_GCP` / `us-east1`
+  - Image: `im-a2IIJylwwXvbZWobiJofec`
+  - Task/container: `ta-01M01741ZVKNSTPHSVSZ588EMR` / ``
+  - Container session: `9d918f0a192243b8`
+  - Restored instance: `d1b62b13466d46e99e0b4353fc7e878c`
+  - Runtime fingerprint: `26882022799db5c8731c248d693cc3870e59d60bcb4ecab853a2a490df701d95`
+- Metrics: restore={restore_total_ms: 2,451.587, snapshot_restore_ms: 2,383.420, restore_gpu_state_ms: 435.206, cuda_init_ms: 9.500, reload_models_ms: 0.000, reload_runtime_state_ms: 228.766, backend_startup_ms: 18,963.620, restore_breakdown_restore_total_ms: 2,451.587, restore_breakdown_models_symlink_ms: 3.660, restore_breakdown_manager_offline_ms: 0.960, restore_breakdown_reload_models_ms: 0.000, restore_breakdown_reload_runtime_state_ms: 228.766, restore_breakdown_v2_startup_custom_node_source_copy_ms: 230.690, restore_breakdown_sync_custom_nodes_ms: 1,389.230, restore_breakdown_install_requirements_ms: 0.010, restore_breakdown_v2_startup_comfyui_path_startup_ms: 0.100, restore_breakdown_comfyui_path_setup_ms: 0.750, restore_breakdown_v2_startup_backend_startup_ms: 18,961.530, restore_breakdown_backend_startup_ms: 18,963.620, restore_breakdown_observe_generations_ms: 0.210, restore_breakdown_snapshot_restore_ms: 2,383.420, restore_breakdown_folder_warm_ms: 1,148.849, restore_breakdown_snapshot_callback_age_at_restore_ms: 3,312,097.819, restore_breakdown_restore_gpu_state_ms: 435.206, restore_breakdown_cuda_init_ms: 9.500, restore_breakdown_sage_policy_ms: 57.520, restore_breakdown_v2_startup_snapshot_execution_seed_ms: 3.290, restore_breakdown_initialize_cuda_ms: 9.352, restore_breakdown_snapshot_identity_checks_ms: 0.000, restore_breakdown_cpu_snapshot_retargeting_ms: 0.000, restore_breakdown: {'restore_total_ms': 2451.587, 'models_symlink_ms': 3.66, 'manager_offline_ms': 0.96, 'reload_models_ms': 0.0, 'reload_runtime_state_ms': 228.766, 'v2_startup_custom_node_source_copy_ms': 230.69, 'sync_custom_nodes_ms': 1389.23, 'install_requirements_ms': 0.01, 'v2_startup_comfyui_path_startup_ms': 0.1, 'comfyui_path_setup_ms': 0.75, 'v2_startup_backend_startup_ms': 18961.53, 'backend_startup_ms': 18963.62, 'observe_generations_ms': 0.21, 'snapshot_restore_ms': 2383.42, 'folder_warm_ms': 1148.849, 'snapshot_callback_age_at_restore_ms': 3312097.819, 'restore_gpu_state_ms': 435.206, 'cuda_init_ms': 9.5, 'sage_policy_ms': 57.52, 'v2_startup_snapshot_execution_seed_ms': 3.29, 'initialize_cuda_ms': 9.352, 'snapshot_identity_checks_ms': 0.0, 'cpu_snapshot_retargeting_ms': 0.0}}; page_traversal={major_faults: unavailable, minor_faults: unavailable, pagein_duration_ms: unavailable, unet_demand_to_first_forward_ms: 111.370, demand_start_present: 1.000, variance_stage_faults_major: 0, variance_stage_faults_minor: 0, cpu_page_traversal_wall_ms: unavailable, cpu_page_traversal_minor_faults: unavailable, cpu_page_traversal_major_faults: unavailable, cpu_page_traversal_bytes: unavailable, cpu_page_traversal_gb_per_s: unavailable, cpu_page_traversal_process_cpu_ms: unavailable, cpu_page_traversal_thread_cpu_ms: unavailable, cpu_to_gpu_transfer_wall_ms: 4,310.903, cpu_to_gpu_transfer_minor_faults: 0.000, cpu_to_gpu_transfer_major_faults: 0.000, cpu_to_gpu_transfer_bytes: 12,309,817,472.000, cpu_to_gpu_transfer_gb_per_s: 2.856, cpu_to_gpu_transfer_process_cpu_ms: 8,070.000, cpu_to_gpu_transfer_thread_cpu_ms: 4,020.000, activation_total_ms: 4,353.095, reconciliation_residual_ms: 29.190, loader_reconciliation_status: unmeasured_gap, activation_future_publication_ms: 4,353.095, activation_future_publication_source: early_activation_completed, registry_setup_ms: 3.217, queue_delay_ms: 2.768, cpu_snapshot_wait_ms: 0.185, dtype_layout_preparation_ms: 3.268, post_load_bookkeeping_ms: 3.564, early_activation_total_ms: 4,353.095, transfer_queue_delay_ms: 7.647, synchronized_transfer_ms: 4,341.427, quiesce_wait_ms: unavailable, graph_activity_ms: 77.785, sampler_lane_wait_ms: 0.084}; pretouch={pretouch_enabled: 0, pretouch_effect_ms: unavailable, pretouch_bytes: unavailable, pretouch_total_pages: unavailable, pretouch_touched_pages: unavailable, pretouch_bytes_read: unavailable, pretouch_checksum: unavailable, pretouch_status: unavailable, pretouch_valid: False, pretouch_reason: no pretouch record}; transfer={output_commit_ms: unavailable, first_iteration_to_first_remote_event_ms: 12,568.172, command_to_response_ms: 62,494.000, wall_ms: 35,243.700, variance_bytes: unavailable, variance_gb_per_s: unavailable, variance_rss_delta_bytes: 3,046,322,176.000, cpu_to_gpu_transfer_wall_ms: 4,310.903, cpu_to_gpu_transfer_bytes: 12,309,817,472.000, cpu_to_gpu_transfer_gb_per_s: 2.856, synchronized_load_wall_ms: 4,310.903, synchronized_load_bytes: 12,309,817,472.000, synchronized_load_gb_per_s: 2.856, submission_to_remote_python_resume_ms: 10,676.913, remote_python_resume_to_restore_start_ms: 0.000, restore_to_method_entry_ms: 160.359, method_entry_to_first_remote_event_ms: unavailable, first_remote_event_to_final_result_ms: 22,628.681, pre_python_modal_scheduling_ms: 10,676.913, transfer_queue_delay_ms: 7.647, synchronized_transfer_ms: 4,341.427, quiesce_wait_ms: unavailable, graph_activity_ms: 77.785, sampler_lane_wait_ms: 0.084, quiesced_transfer_enabled: 0, quiesced_transfer_duration_ms: unavailable, quiesced_transfer_bytes: unavailable, quiesced_transfer_gb_per_s: unavailable, quiesced_transfer_process_cpu_ms: unavailable, quiesced_transfer_thread_cpu_ms: unavailable, quiesced_transfer_sample_count: unavailable, quiesced_transfer_native_threads: unavailable, quiesced_transfer_affinity: unavailable, quiesced_transfer_numa_nodes: unavailable, quiesced_transfer_current_cpu: unavailable, quiesced_thread_cpu_owners: []}; bookkeeping={handle_lookup_ms: 3.000, plan_build_ms: 94.000, generator_create_ms: 3.000, t3b_to_t8_ms: 6,589.479, variance_process_cpu_ms: 22,180.000, variance_thread_cpu_ms: 19,170.000, patcher_bookkeeping_ms: unavailable, patch_weight_count: unavailable, cast_count: unavailable}; sampler={sampler_node_to_sampler_start_ms: unavailable, sampling_ms: 3,698.466, sampling_source: sampler_ms, vae_decode_ms: 405.319, sampling_wall_ms: 4,913.056, sampling_process_cpu_ms: 5,700.000, activation_wait_ms: 112.814, activation_wait_source: demand_to_first_forward, sampler_lane_wait_ms: 0.084}; storage={storage_unique_count: 453.000, storage_raw_bytes: 12,309,817,472.000, storage_unsupported_count: 0.000, storage_total_bytes: 12,309,817,472.000, page_readiness_total_pages: unavailable, page_readiness_touched_pages: unavailable, page_readiness_bytes: unavailable, page_readiness_status: unavailable, pretouch_expected_pages: unavailable, pretouch_touched_pages: unavailable, bytes_read: unavailable, read_count: unavailable, checksum_count: unavailable}
+
+Cannot connect to comfyregistry.
+FETCH DATA from: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/custom-node-list.json[ComfyUI-Manager] Due to a network error, switching to local mode.
+=> custom-node-list.json
+=> cannot schedule new futures after shutdown
+FETCH DATA from: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-manager\custom-node-list.json [DONE]
+=== Single V2 benchmark completed ===
+=== Total command-to-response time: 67.814s ===

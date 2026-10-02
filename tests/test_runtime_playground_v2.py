@@ -22,7 +22,7 @@ Tests verify:
    info, and production_plan_used.
 
 6. **Adapter compatibility** — ``playground_adapter_direct_run`` returns the
-   same response shape as ``direct_studio_run_completion``.
+   same response shape as the canonical single-run contract.
 
 All tests use injected fakes — no real Modal or ComfyUI calls.
 """
@@ -1164,8 +1164,8 @@ class AdapterCompatibilityTests(unittest.TestCase):
         fn = self.adapter_mod.playground_adapter_sync_run
         self.assertTrue(callable(fn))
 
-    def test_adapter_returns_same_shape_as_direct_studio_run_completion(self):
-        """Response dict has the same top-level keys as direct_studio_run_completion.
+    def test_adapter_returns_canonical_single_run_shape(self):
+        """Response dict has the canonical single-run top-level keys.
 
         We check the key set rather than exact values since the adapter
         uses fakes in this test environment.
@@ -1213,7 +1213,7 @@ class AdapterCompatibilityTests(unittest.TestCase):
                     node_dir="/tmp/fake",
                 )
                 self.assertEqual(result["status"], "ok")
-                # Required top-level keys matching direct_studio_run_completion
+                # Required canonical single-run top-level keys
                 self.assertIn("runId", result)
                 self.assertIn("experimentId", result)
                 self.assertIn("runHistoryId", result)
@@ -1561,7 +1561,7 @@ class TestEventSinkWiring(unittest.TestCase):
         self.mod = _load_playground_module()
 
     def test_event_sink_passed_to_execute_plan(self):
-        """The event_sink injected into execute reaches execute_modal_prompt."""
+        """The event_sink injected into execute reaches the V2 plan execution."""
         observed_events: list[tuple[str, dict]] = []
 
         def fake_sink(etype, payload):
@@ -1660,88 +1660,6 @@ class TestHandleStudioRunAsyncDispatch(unittest.TestCase):
                 asyncio.run(_test())
         finally:
             self.adapter.playground_adapter_direct_run = original
-
-    def test_direct_false_does_not_call_playground_adapter(self):
-        """handle_studio_run_async(direct=False) does NOT call the playground adapter;
-        it goes through the scheduler path instead."""
-        _playground_called = []
-        _scheduler_called = []
-
-        original_direct = self.adapter.playground_adapter_direct_run
-
-        async def fake_direct_run(preset_id, feature_id, controls, node_dir, **kw):
-            _playground_called.append(kw)
-            return {"status": "ok", "direct_run": True}
-
-        def fake_scheduler(ctx, nd, **kw):
-            _scheduler_called.append((ctx, nd, kw))
-            return {"status": "ok", "runId": "sched_run_123"}
-
-        self.adapter.playground_adapter_direct_run = fake_direct_run
-        # _handle_studio_run_scheduler is a module-level function
-        original_scheduler = getattr(self.adapter, "_handle_studio_run_scheduler", None)
-        setattr(self.adapter, "_handle_studio_run_scheduler", fake_scheduler)
-
-        # We need a valid store to get past _prepare_studio_run_context
-        import tempfile, json
-        with tempfile.TemporaryDirectory() as tmp:
-            snap_path = Path(tmp) / ".studio_snapshots.json"
-            preset_path = Path(tmp) / ".studio_presets.json"
-            snap_path.write_text(json.dumps([{
-                "id": "snap1", "name": "Test",
-                "compatibleFeatures": ["txt2img"],
-                "apiPromptJson": {
-                    "3": {"class_type": "KSampler", "inputs": {
-                        "seed": 42, "steps": 20, "cfg": 7.0,
-                        "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
-                    }},
-                    "107": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
-                },
-                "nodeBindings": {
-                    "prompt": {"kind": "widget", "nodeId": "3", "widgetName": "text"},
-                    "output": {"kind": "output", "nodeId": "107"},
-                },
-                "outputNodeId": "107",
-                "archived": False,
-                "status": "runnable",
-                "featureStatus": {"txt2img": {"status": "runnable", "reason": ""}},
-                "disabledReason": "",
-            }]), encoding="utf-8")
-            preset_path.write_text(json.dumps([{
-                "id": "preset1", "label": "Test",
-                "snapshotId": "snap1",
-                "compatibleFeatures": ["txt2img"],
-                "defaults": {}, "sourceType": "snapshot",
-                "archived": False, "status": "runnable",
-                "disabledReason": "",
-            }]), encoding="utf-8")
-
-            from unittest.mock import patch
-            import experiment_service
-            fake_registry = MagicMock()
-            fake_registry.history.return_value.record_run.return_value = {"run_id": "r1"}
-            fake_registry.history.return_value.update_run.return_value = None
-            # Also need experiment_service._fire_and_forget to exist
-            experiment_service._fire_and_forget = MagicMock()
-            experiment_service.REGISTRY = fake_registry
-
-            async def _test():
-                result = await self.adapter.handle_studio_run_async(
-                    "preset1", "txt2img", {"prompt": "hello"}, tmp,
-                    direct=False,
-                )
-                # Playground adapter must NOT have been called
-                self.assertEqual(len(_playground_called), 0,
-                                 "direct=False must NOT call playground adapter")
-                # Scheduler path should have been called
-                self.assertGreaterEqual(len(_scheduler_called), 0)
-
-            try:
-                asyncio.run(_test())
-            finally:
-                self.adapter.playground_adapter_direct_run = original_direct
-                if original_scheduler is not None:
-                    setattr(self.adapter, "_handle_studio_run_scheduler", original_scheduler)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2101,6 +2019,225 @@ class TestProductionCompilationPath(unittest.TestCase):
         self.assertNotEqual(plan.source_workflow_hash, plan.workflow_hash)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Stage 7 frozen-workflow serialization (bounded backend fix)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class FrozenWorkflowSerializationTests(unittest.TestCase):
+    """Stage 7 converts frozen workflow containers (mappingproxy/tuples)
+    into plain JSON dict/list containers for ``meta["workflow_json"]``.
+
+    The frozen ``ExecutionPlan.workflow`` is a ``MappingProxyType`` whose
+    nested links are tuples; a shallow ``dict(plan.workflow)`` leaves those
+    containers frozen, which breaks downstream ``json.dumps``.  These tests
+    prove the recursive conversion, that the frozen source is never mutated,
+    that scalars/dict order are preserved, and that the execution boundary
+    still receives an equivalent workflow without executing Modal.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_playground_module()
+        cls.contracts = _load_contracts()
+
+    def _make_frozen_plan(self, workflow: dict) -> Any:
+        """Build an ExecutionPlan whose workflow is frozen (mappingproxy)."""
+        return self.contracts.ExecutionPlan(
+            workflow=workflow,
+            execution_options=self.contracts.ExecutionOptions(production_enabled=False),
+        )
+
+    def test_jsonable_workflow_converts_nested_mappingproxy_and_tuples(self):
+        """_jsonable_workflow recursively converts mappingproxy/tuple to dict/list."""
+        from types import MappingProxyType
+
+        frozen = MappingProxyType({
+            "3": MappingProxyType({
+                "class_type": "KSampler",
+                "inputs": MappingProxyType({
+                    "seed": 42,
+                    "steps": 20,
+                    "cfg": 7.0,
+                    "sampler_name": "euler",
+                    "model": ("4", 0),  # tuple link
+                }),
+            }),
+            "107": MappingProxyType({
+                "class_type": "SaveImage",
+                "inputs": MappingProxyType({"images": [("3", 0)]}),
+            }),
+            "nested_list": ("a", ("b", ("c", 1))),
+        })
+        converted = self.mod._jsonable_workflow(frozen)
+
+        # Ordinary JSON containers everywhere
+        self.assertIsInstance(converted, dict)
+        self.assertIsInstance(converted["3"], dict)
+        self.assertIsInstance(converted["3"]["inputs"], dict)
+        self.assertIsInstance(converted["3"]["inputs"]["model"], list)
+        self.assertEqual(converted["3"]["inputs"]["model"], ["4", 0])
+        self.assertIsInstance(converted["107"]["inputs"]["images"], list)
+        self.assertEqual(converted["107"]["inputs"]["images"], [["3", 0]])
+        self.assertEqual(converted["nested_list"], ["a", ["b", ["c", 1]]])
+
+        # Scalars preserved (never stringified)
+        self.assertEqual(converted["3"]["inputs"]["seed"], 42)
+        self.assertEqual(converted["3"]["inputs"]["cfg"], 7.0)
+
+        # Source unchanged — still frozen mappingproxy/tuple containers
+        self.assertEqual(type(frozen).__name__, "mappingproxy")
+        self.assertEqual(type(frozen["3"]).__name__, "mappingproxy")
+        self.assertEqual(type(frozen["3"]["inputs"]["model"]).__name__, "tuple")
+
+        # json.dumps succeeds on the converted output and round-trips
+        dumped = json.dumps(converted)
+        self.assertEqual(json.loads(dumped), converted)
+
+    def test_jsonable_workflow_preserves_dict_order_and_unknown_scalars(self):
+        """Dict insertion order is preserved; unknown objects pass through."""
+        from types import MappingProxyType
+
+        frozen = MappingProxyType({
+            "z_last": MappingProxyType({"flag": True, "none": None, "t": 1.5}),
+            "a_first": MappingProxyType({"x": 1}),
+        })
+        converted = self.mod._jsonable_workflow(frozen)
+        self.assertEqual(list(converted.keys()), ["z_last", "a_first"])
+        self.assertIs(converted["z_last"]["flag"], True)
+        self.assertIsNone(converted["z_last"]["none"])
+
+        # Unknown objects are never stringified — same object passes through
+        sentinel = object()
+        self.assertIs(self.mod._jsonable_workflow(sentinel), sentinel)
+        self.assertIs(self.mod._jsonable_workflow([sentinel])[0], sentinel)
+
+    def test_stage7_workflow_json_is_json_dumps_compatible_and_source_unchanged(self):
+        """End-to-end execute(): meta.workflow_json is plain JSON, matches the
+        frozen plan topology/inputs, and the plan is not mutated."""
+        frozen_workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20, "cfg": 7.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                "model": ("4", 0),  # tuple link
+            }},
+            "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "test.ckpt"}},
+            "107": {"class_type": "SaveImage", "inputs": {"images": [("3", 0)]}},
+        }
+        plan = self._make_frozen_plan(frozen_workflow)
+        self.assertEqual(type(plan.workflow).__name__, "mappingproxy",
+                         "ExecutionPlan freezes workflow into a mappingproxy")
+
+        service = self.mod.PlaygroundService(
+            load_preset_fn=lambda pid, nd: ({"id": "p1", "label": "Test"}, {"id": "s1"}, None),
+            validate_fn=lambda p, s, fid: None,
+            build_plan_fn=lambda *a, **kw: (plan, None),
+            execute_plan_fn=FakeExecutionService(),
+            materialize_fn=FakeMaterializeService(),
+            save_history_fn=FakeHistoryService(),
+        )
+
+        async def _test():
+            result = await service.execute(
+                preset_id="p1", feature_id="txt2img",
+                controls={}, node_dir="/tmp/fake",
+            )
+            self.assertEqual(result["status"], "ok")
+            wj = result.get("meta", {}).get("workflow_json")
+            self.assertIsInstance(wj, dict)
+            # Nested containers are plain dict/list, not mappingproxy/tuple
+            self.assertIsInstance(wj["3"]["inputs"], dict)
+            self.assertIsInstance(wj["3"]["inputs"]["model"], list)
+            self.assertEqual(wj["3"]["inputs"]["model"], ["4", 0])
+            self.assertIsInstance(wj["107"]["inputs"]["images"], list)
+            self.assertEqual(wj["107"]["inputs"]["images"], [["3", 0]])
+            # Scalars preserved
+            self.assertEqual(wj["3"]["inputs"]["seed"], 42)
+            self.assertEqual(wj["3"]["inputs"]["cfg"], 7.0)
+            # json.dumps succeeds and round-trips
+            dumped = json.dumps(wj)
+            self.assertEqual(json.loads(dumped), wj)
+            # Topology/input equivalence with the frozen source
+            expected = self.mod._jsonable_workflow(plan.workflow)
+            self.assertEqual(wj, expected)
+            # Source unchanged — still frozen with tuple links
+            self.assertEqual(type(plan.workflow).__name__, "mappingproxy")
+            self.assertEqual(type(plan.workflow["3"]["inputs"]["model"]).__name__, "tuple")
+
+        asyncio.run(_test())
+
+    def test_execution_boundary_receives_equivalent_workflow_without_modal(self):
+        """The execution boundary (injected ``_execute_plan``) receives a plan
+        whose workflow is equivalent to the frozen source — without executing
+        Modal.  The injected boundary stands in for the real Modal-invoking
+        ``_default_execute_plan``; it captures the plan and returns a canned
+        result, so no Modal call can occur."""
+        frozen_workflow = {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 42, "steps": 20, "cfg": 7.0,
+                "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                "model": ("4", 0),
+            }},
+            "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "test.ckpt"}},
+            "107": {"class_type": "SaveImage", "inputs": {"images": [("3", 0)]}},
+        }
+        plan = self._make_frozen_plan(frozen_workflow)
+
+        captured_plans: list[Any] = []
+
+        async def boundary(boundary_plan, **kw):
+            # This fake IS the Modal boundary — it must return without any
+            # Modal construction/invocation and record what it received.
+            captured_plans.append(boundary_plan)
+            return {
+                "outputs": {"107": {"images": [{"filename": "t.png", "data": "aGVsbG8="}]}},
+                "trace": {
+                    "stages": {
+                        "browser_run_click": 1000.0,
+                        "studio_route_received": 1000.05,
+                        "remote_submit": 1000.1,
+                        "first_remote_event": 1000.2,
+                        "result_received": 1001.25,
+                        "output_materialized": 1001.30,
+                    },
+                    "deltas_ms": {},
+                    "derived_ms": {},
+                    "metadata": {},
+                },
+            }
+
+        service = self.mod.PlaygroundService(
+            load_preset_fn=lambda pid, nd: ({"id": "p1"}, {"id": "s1"}, None),
+            validate_fn=lambda p, s, fid: None,
+            build_plan_fn=lambda *a, **kw: (plan, None),
+            execute_plan_fn=boundary,
+            materialize_fn=lambda *a, **kw: ["studio_out.png"],
+            save_history_fn=lambda *a, **kw: None,
+        )
+
+        async def _test():
+            result = await service.execute(
+                preset_id="p1", feature_id="txt2img",
+                controls={}, node_dir="/tmp/fake",
+            )
+            self.assertEqual(result["status"], "ok")
+            # The boundary was reached exactly once — with the plan itself.
+            self.assertEqual(len(captured_plans), 1,
+                             "execution boundary must be called exactly once")
+            boundary_plan = captured_plans[0]
+            self.assertIs(boundary_plan, plan)
+            # The workflow the boundary receives is equivalent to the frozen
+            # source (topology/inputs) and fully JSON-serializable.
+            expected = self.mod._jsonable_workflow(plan.workflow)
+            got = self.mod._jsonable_workflow(boundary_plan.workflow)
+            self.assertEqual(got, expected)
+            json.dumps(got)
+            # The canned result proves the boundary completed without Modal.
+            self.assertEqual(result["output_paths"], ["studio_out.png"])
+
+        asyncio.run(_test())
+
+
 # ── Helpers used by production compilation tests ──
 
 
@@ -2136,3 +2273,20 @@ def _compute_hash(workflow: dict) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

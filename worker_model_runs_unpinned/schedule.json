@@ -1,0 +1,246 @@
+{
+  "arms": [
+    "threads",
+    "processes"
+  ],
+  "min_launch_gap_ms": 4.0,
+  "pinned": false,
+  "processes_first": 7,
+  "provider_only": false,
+  "qd": 4,
+  "read_mib": 64,
+  "region_counts": {
+    "unpinned": 15
+  },
+  "rounds": 15,
+  "schedule": [
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 1,
+      "run_ordinals": {
+        "processes": 1,
+        "threads": 2
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 2,
+      "run_ordinals": {
+        "processes": 4,
+        "threads": 3
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 3,
+      "run_ordinals": {
+        "processes": 6,
+        "threads": 5
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 4,
+      "run_ordinals": {
+        "processes": 7,
+        "threads": 8
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 5,
+      "run_ordinals": {
+        "processes": 10,
+        "threads": 9
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 6,
+      "run_ordinals": {
+        "processes": 12,
+        "threads": 11
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 7,
+      "run_ordinals": {
+        "processes": 13,
+        "threads": 14
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 8,
+      "run_ordinals": {
+        "processes": 15,
+        "threads": 16
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 9,
+      "run_ordinals": {
+        "processes": 17,
+        "threads": 18
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 10,
+      "run_ordinals": {
+        "processes": 19,
+        "threads": 20
+      },
+      "second": "threads"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 11,
+      "run_ordinals": {
+        "processes": 22,
+        "threads": 21
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 12,
+      "run_ordinals": {
+        "processes": 24,
+        "threads": 23
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 13,
+      "run_ordinals": {
+        "processes": 26,
+        "threads": 25
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "threads",
+      "order": [
+        "threads",
+        "processes"
+      ],
+      "region": "",
+      "round": 14,
+      "run_ordinals": {
+        "processes": 28,
+        "threads": 27
+      },
+      "second": "processes"
+    },
+    {
+      "cloud": "",
+      "first": "processes",
+      "order": [
+        "processes",
+        "threads"
+      ],
+      "region": "",
+      "round": 15,
+      "run_ordinals": {
+        "processes": 29,
+        "threads": 30
+      },
+      "second": "threads"
+    }
+  ],
+  "seed": 20260927,
+  "threads_first": 8,
+  "workers": 4
+}

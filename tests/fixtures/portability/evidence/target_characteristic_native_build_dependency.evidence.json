@@ -1,0 +1,54 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 platform-specific risk matrix",
+    "PHASE_G5 §5 broad semantics",
+    "PHASE_G3 §11 RunComfy native support UNKNOWN"
+  ],
+  "capability_evidence": {
+    "baseten": {
+      "mechanisms": [
+        "system_packages",
+        "build_commands"
+      ],
+      "native_build": "supported_with_setup"
+    },
+    "comfy_cloud": {
+      "native_build": "unsupported"
+    },
+    "local": {
+      "native_build": "supported",
+      "toolchain_burden": "user-machine"
+    },
+    "modal": {
+      "native_build": "supported",
+      "precedent": "image-recipe-solves-it"
+    },
+    "runcomfy": {
+      "native_build": "unknown"
+    },
+    "runpod": {
+      "native_build": "supported_with_setup",
+      "setup": "dockerfile-apt-build"
+    }
+  },
+  "characteristic": "native_build_dependency",
+  "determinism_notes": [
+    "runcomfy capability is audited unknown; rule must emit target_capability_unknown with risk_level unknown (never assume).",
+    "G3 gave baseten MEDIUM-HIGH; a verified setup path exists (build_commands/system_packages), so the deterministic resolution is medium per the lower-bound-with-verified-setup-path tie-break."
+  ],
+  "evidence_id": "target_characteristic_native_build_dependency",
+  "expected_target_risk": {
+    "baseten": "medium",
+    "comfy_cloud": "high",
+    "local": "medium",
+    "modal": "low",
+    "runcomfy": "unknown",
+    "runpod": "high"
+  },
+  "provider_independent_facts": {
+    "requires_cuda_toolchain": true,
+    "source_build": true,
+    "system_packages_required": true
+  },
+  "scenario_id": "native_build_dependency"
+}

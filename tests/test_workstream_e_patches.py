@@ -129,132 +129,26 @@ class EventsEndpointProgressTests(unittest.TestCase):
         self.assertEqual(snap["checkpoints"]["ck1"]["cells"]["c1"]["pct"], 50)
 
 
-# ── Results UI: cell error inline ──────────────────────────────────────
+# ── Results UI / A/B slider: retired with their modules (H18 Wave G) ───
 
 
-class ResultsUIErrorInlineTests(unittest.TestCase):
-    def setUp(self):
-        self._js_path = NODE_DIR / "web" / "testing-results.js"
-        self.assertTrue(self._js_path.exists())
+class ResultsUIRetiredContractTests(unittest.TestCase):
+    """The legacy Results UI and A/B slider modules were deleted in Wave G
+    (History V2 is the sole durable History; the slider is Phase-I scope).
+    Their inline-error/confirm/progress behaviors have no surviving owner."""
 
-    def _read(self):
-        return self._js_path.read_text(encoding="utf-8")
+    def test_retired_modules_absent(self):
+        for name in ["testing-results.js", "testing-ab-slider.js"]:
+            self.assertFalse(
+                (NODE_DIR / "web" / name).exists(),
+                f"web/{name} must stay deleted (Wave G)",
+            )
 
-    def test_error_class_present(self):
-        text = self._read()
-        self.assertIn("testing-results-cell-error", text)
-
-    def test_error_role_alert(self):
-        text = self._read()
-        self.assertIn('role: "alert"', text)
-        self.assertIn("cell-error", text)
-
-    def test_error_data_testid(self):
-        text = self._read()
-        self.assertIn('"data-testid": "cell-error"', text)
-
-    def test_failed_status_in_class(self):
-        text = self._read()
-        # renderCellCard builds class with status suffix
-        self.assertIn("testing-results-cell-${status}", text)
-
-
-# ── Results UI: confirm dialogs ────────────────────────────────────────
-
-
-class ResultsUIConfirmDialogTests(unittest.TestCase):
-    def setUp(self):
-        self._js_path = NODE_DIR / "web" / "testing-results.js"
-        self.assertTrue(self._js_path.exists())
-
-    def test_stop_now_confirm(self):
-        text = (NODE_DIR / "web" / "testing-results.js").read_text(encoding="utf-8")
-        self.assertIn("Stop now kills all running cells immediately", text)
-        self.assertIn("window.confirm", text)
-
-    def test_stop_after_current_confirm(self):
-        text = (NODE_DIR / "web" / "testing-results.js").read_text(encoding="utf-8")
-        self.assertIn("Stop after current", text)
-
-
-# ── Results UI: progress bar in checkpoint card ────────────────────────
-
-
-class ResultsUIProgressBarTests(unittest.TestCase):
-    def setUp(self):
-        self._js_path = NODE_DIR / "web" / "testing-results.js"
-        self.assertTrue(self._js_path.exists())
-
-    def test_progress_bar_class(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("testing-results-progress-bar-wrap", text)
-        self.assertIn("testing-results-progress-bar-fill", text)
-
-    def test_role_progressbar(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn('role: "progressbar"', text)
-        self.assertIn('"aria-valuemin": "0"', text)
-        self.assertIn('"aria-valuemax": "100"', text)
-
-    def test_aria_label(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn('"aria-label": `checkpoint ${id} progress`', text)
-
-    def test_aggregate_pct_helper(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("function computeAggregatePct", text)
-        self.assertIn("Object.values(cells).forEach", text)
-
-    def test_window_worker_progress(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("__comfymodal_worker_progress", text)
-        self.assertIn("data.progress", text)
-
-
-# ── A/B slider: keyboard + aria + actual=actual ───────────────────────
-
-
-class ABSliderKeyboardTests(unittest.TestCase):
-    def setUp(self):
-        self._js_path = NODE_DIR / "web" / "testing-ab-slider.js"
-        self.assertTrue(self._js_path.exists())
-
-    def test_inline_slider_role(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn('role: "slider"', text)
-        self.assertIn('"aria-label":', text)
-        self.assertIn('"aria-valuemin": "0"', text)
-        self.assertIn('"aria-valuemax": "100"', text)
-        self.assertIn("tabindex: \"0\"", text)
-
-    def test_inline_slider_keydown(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("wrap.addEventListener(\"keydown\"", text)
-        self.assertIn("ArrowLeft", text)
-        self.assertIn("ArrowRight", text)
-        self.assertIn("Home", text)
-        self.assertIn("End", text)
-
-    def test_fullscreen_escape_closes(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("Escape", text)
-        self.assertIn("close();", text)
-        self.assertIn("onKey", text)
-
-    def test_fullscreen_actual_uses_natural_size(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("naturalWidth", text)
-        self.assertIn("naturalHeight", text)
-        # Pan offsets to center
-        self.assertIn("(rect.width - aw * scale) / 2", text)
-        self.assertIn("(rect.height - ah * scale) / 2", text)
-
-    def test_fullscreen_keyboard_zoom(self):
-        text = self._js_path.read_text(encoding="utf-8")
-        self.assertIn("zoomIn();", text)
-        self.assertIn("zoomOut();", text)
-        self.assertIn('ev.key === "+"', text)
-        self.assertIn('ev.key === "-"', text)
+    def test_no_production_reference(self):
+        for path in (NODE_DIR / "web").glob("*.js"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("testing-results.js", text)
+            self.assertNotIn("testing-ab-slider.js", text)
 
 
 # ── service registry exposes worker_progress ───────────────────────────

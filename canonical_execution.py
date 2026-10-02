@@ -1,9 +1,13 @@
-"""Canonical Modal prompt execution — single shared path for normal dispatch and Playground single runs.
+"""Canonical Modal plan execution — single shared path for normal dispatch and Playground single runs.
 
-Provides ``RunTrace`` (in-memory hierarchical spans using ``perf_counter_ns``)
-and ``execute_modal_prompt`` (owns final workflow input, production compile,
-profile preparation, modal-args construction, ``modal_client.run_prompt_stream``
-call, result collection, and canonical trace/counts).
+Provides ``RunTrace`` (in-memory hierarchical spans using ``perf_counter_ns``),
+``build_execution_plan`` and ``execute_plan`` (own final workflow input,
+production compile, profile preparation, modal-args construction, the V2
+transport call, result collection, and canonical trace/counts).
+
+H19 Wave G: the retired V1 ``execute_modal_prompt`` /
+``prepare_modal_execution`` pair was deleted (zero production callers
+after H12/H15; the V2 pipeline is the only executor).
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from production_workflow import (
 )
 # Note: modal_options are passed through without reconstructing model-loading policy.
 from warmup_profile import (
+    active_next_publication_required,
     compute_profile_identity_keys,
     prepare_active_next_profile,
 )
@@ -41,7 +46,13 @@ from workflow_metadata import (
     stack_to_warmup_profile,
     summarize_prompt_fields,
 )
-from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, stable_hash
+from comfymodal_runtime.contracts import (
+    VALIDATION_PROOF_SCHEMA_VERSION,
+    ExecutionOptions,
+    ExecutionPlan,
+    stable_hash,
+)
+from comfymodal_runtime.execution_seed import publish_restore_plan_enabled
 from comfymodal_runtime.modal_transport import ModalTransport
 from comfymodal_runtime.restore_plan import (
     RestorePlan,
@@ -50,6 +61,7 @@ from comfymodal_runtime.restore_plan import (
     derive_prefill_key,
 )
 from comfymodal_runtime.trace import (
+    LOCAL_SUBMISSION_FIELD_KEYS,
     RuntimeTrace,
     _build_local_submission_breakdown,
     _emit_breakdown_line,
@@ -870,8 +882,568 @@ def _event_span_ms(trace: RuntimeTrace, start_name: str, end_name: str) -> float
     return None
 
 
+# ── Host-side transport boundary helpers ────────────────────────────────
+# modal_transport emits the generator/submission/result boundaries as
+# RuntimeTrace events (with wall_unix_ns + monotonic_ns) and a metadata
+# backfill.  These pure helpers read the LAST occurrence of a named event
+# from the merged trace so the local prints can surface boundaries that
+# never landed in the origin dict.  All return None when unavailable so
+# callers can render a literal "absent".
+
+
+def _host_boundary_event(trace: RuntimeTrace | None, event_name: str) -> Any | None:
+    """Return the LAST event named *event_name* in *trace*, or None.
+
+    Last occurrence wins: the merged trace may contain lifecycle/startup
+    events from earlier requests, and the most recent one is the boundary
+    for the current request.
+    """
+    if trace is None:
+        return None
+    last: Any | None = None
+    for event in getattr(trace, "events", ()):
+        if getattr(event, "name", None) == event_name:
+            last = event
+    return last
+
+
+def _host_boundary_wall_ns(trace: RuntimeTrace | None, event_name: str) -> int | None:
+    """Return the wall_unix_ns of the last *event_name* event, or None."""
+    event = _host_boundary_event(trace, event_name)
+    value = getattr(event, "wall_unix_ns", None) if event is not None else None
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def _host_boundary_field(
+    trace: RuntimeTrace | None,
+    event_name: str,
+    ref_wall_ns: Any = None,
+) -> float | None:
+    """Return ms from *ref_wall_ns* to the last *event_name* wall time.
+
+    Pure helper used to surface host-side transport boundaries in the
+    [v2.request_origin] / [v2.local_submission_breakdown] prints.  Returns
+    None when the event or reference boundary is missing, or when the
+    ordering is negative (event wall before the reference).
+    """
+    event_wall = _host_boundary_wall_ns(trace, event_name)
+    if event_wall is None or not isinstance(ref_wall_ns, (int, float)):
+        return None
+    delta_ns = event_wall - int(ref_wall_ns)
+    if delta_ns < 0:
+        return None
+    return round(delta_ns / 1_000_000, 3)
+
+
+# Host-side transport boundary fields appended to the canonical
+# [v2.local_submission_breakdown] field map by the local emitter.
+_HOST_BOUNDARY_FIELD_KEYS: tuple[tuple[str, str], ...] = (
+    ("modal_submission_attempt_unix_ns", "modal_submission_attempt_unix_ns"),
+    ("modal_generator_created_unix_ns", "modal_generator_created_unix_ns"),
+    ("modal_first_iteration_start_unix_ns", "modal_first_iteration_start_unix_ns"),
+    ("modal_first_remote_event_unix_ns", "modal_first_remote_event_unix_ns"),
+    ("dispatch_to_modal_entry_ms", "dispatch_to_modal_entry_ms"),
+    ("local_receive_to_actual_submission_ms", "local_receive_to_actual_submission_ms"),
+    ("local_receive_to_result_return_ms", "local_receive_to_result_return_ms"),
+)
+
+
 # _strict_event_span_ms, _event_mono_ns, _derived_mono_delta_ms
 # are imported from comfymodal_runtime.trace above.
+
+
+# ── Step-2 baked custom-node dependency manifest (host-side reader) ──────
+# The deploy tooling writes the canonical (immutable) custom-node dependency
+# manifest into the repo's ``.baked_custom_node_deps/`` directory.  The
+# container bakes the same artifact into the image (comfyapp reads it from
+# ``BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH``).  The host reader below consumes
+# the same deploy-generated artifact so plan identity provenance matches the
+# snapshot-side freeze.  Reads are pure file I/O — no Modal/network/Volume.
+# NOTE: this file is a CONSTRUCTION-time artifact and may be regenerated by
+# other workflows after deploy.  For an already-deployed runtime, plan
+# identity is derived from the deploy-frozen ``.deployed_state.json`` record
+# instead (see ``_read_frozen_deployed_identity``), so regeneration can never
+# change the identity of an existing deployment.
+_BAKED_CUSTOM_NODE_DEPS_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".baked_custom_node_deps",
+    "custom_node_deps_baked.json",
+)
+
+
+def _read_baked_custom_node_manifest() -> dict:
+    """Return the deploy-generated baked custom-node dependency manifest."""
+    try:
+        with open(_BAKED_CUSTOM_NODE_DEPS_LOCAL, "r", encoding="utf-8") as _f:
+            import json
+            _m = json.load(_f)
+        return _m if isinstance(_m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_baked_custom_node_generation() -> str:
+    """Canonical custom-node generation from the deploy-generated manifest."""
+    return str(_read_baked_custom_node_manifest().get("production_custom_node_generation", "") or "")
+
+
+def _host_requirements_repair_mode() -> str:
+    """Mirror the container's repair-mode resolution (comfyapp).
+
+    ``_resolve_requirements_repair_mode()`` reads ``COMFYMODAL_REQUIREMENTS_REPAIR_MODE``
+    (default ``fail_fast``) and normalizes to the allowed set.  Mirroring the
+    container exactly is required so the host-computed dependency manifest
+    identity matches the snapshot-frozen one when the deployment envs agree.
+    """
+    import os
+    _mode = str(os.environ.get("COMFYMODAL_REQUIREMENTS_REPAIR_MODE", "fail_fast") or "fail_fast").strip().lower()
+    if _mode not in ("off", "fail_fast", "dev"):
+        _mode = "fail_fast"
+    return _mode
+
+
+# ── Step-3 host-side canonical deployment combined hash ──────────────────
+# Mirrors the container's ``_V2_DEPLOYMENT_COMBINED_HASH`` (modal_app.py:
+# ``build_modal_resources`` + the module-level ``stable_hash`` wrapper) from
+# pure modules so the plan carries the same deployment identity the container
+# froze into its snapshot proof.  Computed at most once per process — a
+# repo-wide filesystem scan is NEVER performed per request.  Returns "" when
+# the mirror cannot be reproduced (never fabricated).
+_HOST_DEPLOYMENT_HASH_COMPUTED: str | None = None
+
+
+def _compute_host_deployment_combined_hash() -> str:
+    global _HOST_DEPLOYMENT_HASH_COMPUTED
+    if _HOST_DEPLOYMENT_HASH_COMPUTED is not None:
+        return _HOST_DEPLOYMENT_HASH_COMPUTED
+    try:
+        from comfymodal_runtime.deployment_spec import build_deployment_identity
+        from comfymodal_runtime.runtime_shape import runtime_shape_config
+        from comfymodal_runtime.contracts import stable_hash as _stable_hash
+        from comfymodal_runtime.publication_policy import resolve_custom_nodes_root
+        # Mirror build_modal_resources: runtime_root is the runtime package,
+        # while custom_root is the same published custom-nodes tree used by
+        # image/archive/volume publication.
+        _repo_root = os.path.dirname(os.path.abspath(__file__))
+        _runtime_root = os.path.join(_repo_root, "comfymodal_runtime")
+        _custom_root = resolve_custom_nodes_root(_repo_root)
+        # The container call passes no dependency_hash (defaults to "").
+        _identity = build_deployment_identity(
+            runtime_root=_runtime_root,
+        )
+        _payload = runtime_shape_config().identity_payload()
+        _HOST_DEPLOYMENT_HASH_COMPUTED = _stable_hash({
+            "source_combined_hash": _identity.combined_hash,
+            "runtime_shape": _payload,
+        })
+    except Exception:
+        _HOST_DEPLOYMENT_HASH_COMPUTED = ""
+    return _HOST_DEPLOYMENT_HASH_COMPUTED
+
+
+_DEPLOY_STATE_JSON_LOCAL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".deployed_state.json"
+)
+
+
+def _read_frozen_deployed_identity() -> dict:
+    """Read the deploy-frozen identity record (``.deployed_state.json``).
+
+    Written at deploy time by ``tools/record_deployment_identity.py`` from the
+    container readback, so ``deployment_combined_hash`` /
+    ``custom_nodes_generation`` / ``overall_dependency_hash`` are the identity
+    frozen for the DEPLOYED image — NOT the mutable local
+    ``.baked_custom_node_deps/`` manifest, which other workflows may
+    regenerate after deploy.  Missing/unreadable record → {} (never
+    fabricated).  Pure local file I/O — no Modal/network.
+    """
+    try:
+        import json
+        with open(_DEPLOY_STATE_JSON_LOCAL, "r", encoding="utf-8") as _f:
+            _m = json.load(_f)
+        return _m if isinstance(_m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_persisted_deployment_combined_hash() -> str:
+    """Read the deploy-bookkeeping ``.deployed_state.json`` hash (repo root).
+
+    Written by the deploy-time identity record tool from the container
+    readback (and, for version bookkeeping, ``__init__._save_deploy_state``).
+    Missing file/key → "".
+    """
+    return str(_read_frozen_deployed_identity().get("deployment_combined_hash", "") or "")
+
+
+# ── Step-2 host validation memoization ───────────────────────────────────
+# ``execution.validate_prompt`` runs once per (workflow, deployment identity).
+# Identical subsequent builds reuse the cached payload.  Simple bounded dict;
+# a full clear is used as the documented eviction policy.  Exceptions are
+# never cached (fail-closed unchanged).
+_PLAN_VALIDATION_MEMO_MAX = 64
+_PLAN_VALIDATION_MEMO: dict = {}
+
+
+def _memo_key_plan_validation(workflow_hash: str, dep_identity: dict) -> tuple:
+    return (
+        workflow_hash,
+        str(dep_identity.get("deployment_combined_hash", "")),
+        str(dep_identity.get("custom_nodes_generation", "")),
+        stable_hash(dep_identity.get("registry_proof") or {}),
+        VALIDATION_PROOF_SCHEMA_VERSION,
+    )
+
+
+def _collect_plan_validation_proof(prompt_id: str, workflow: dict) -> dict:
+    """Run the parent-ComfyUI ``execution.validate_prompt`` (fail-closed).
+
+    Host-only, lazy imports only — module import must NOT import
+    ``execution``/``nodes``.  Returns the plan-carried validation proof
+    payload.  Raises ``RuntimeError`` when validation fails or raises, so an
+    invalid workflow never reaches dispatch.
+    """
+    import asyncio
+    import concurrent.futures
+    import execution  # parent ComfyUI module — lazy, host-only
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION
+    try:
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+        # ComfyUI validation may coerce scalar inputs in place.  Validation is
+        # a proof-producing read of the dispatch workflow, not an authoring
+        # step; never let that implementation detail change the hash used for
+        # registry-store lookup or the immutable plan payload.
+        _validation_workflow = copy.deepcopy(workflow)
+        _coro = execution.validate_prompt(prompt_id, _validation_workflow, None)
+        if _loop is not None and _loop.is_running():
+            # Running loop in the current thread (v2 dispatch runs on the
+            # ComfyUI event loop).  Blocking that loop via
+            # ``asyncio.run_coroutine_threadsafe(...).result()`` would stall it
+            # (the loop cannot progress while its own thread is blocked), so
+            # drive the coroutine on a fresh loop in a worker thread instead.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                _result = _pool.submit(lambda: asyncio.run(_coro)).result(timeout=120)
+            _valid, _error, _outputs, _node_errors = _result
+        else:
+            _valid, _error, _outputs, _node_errors = asyncio.run(_coro)
+    except Exception as _exc:
+        raise RuntimeError(f"plan validation failed (exception): {_exc}") from _exc
+    if not _valid:
+        _err_text = str(_error or {})[:300]
+        raise RuntimeError(f"plan validation failed (invalid workflow): {_err_text}")
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "validated": bool(_valid),
+        "outputs_to_execute": sorted(str(o) for o in (_outputs or [])),
+        "node_errors": dict(_node_errors or {}),
+        "validated_workflow_hash": "",
+        # E29: node-type fingerprint (sorted class_type list) so a stored
+        # deployed proof can be matched even when a per-run nonce mutates
+        # literal text values and changes the full workflow hash.
+        "node_type_fingerprint": sorted(
+            str(n.get("class_type", ""))
+            for n in (workflow or {}).values()
+            if isinstance(n, dict)
+        ),
+        "source": "host_validate_prompt",
+    }
+
+
+def _registry_proof_cache_entry_is_usable(
+    entry: object, workflow: object, workflow_hash: str,
+) -> bool:
+    """Defensively validate a registry-store hit before consuming it."""
+    if not isinstance(entry, Mapping):
+        return False
+    entry_hash = str(entry.get("workflow_hash", "") or "")
+    if entry_hash and entry_hash != str(workflow_hash or ""):
+        return False
+    proof = entry.get("registry_proof")
+    if not isinstance(proof, Mapping) or not proof.get("complete"):
+        return False
+    if proof.get("schema_version") != 1:
+        return False
+    classes = proof.get("classes")
+    identities = proof.get("identities")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or any(not isinstance(name, str) or not name for name in classes)
+        or len(classes) != len(set(classes))
+    ):
+        return False
+    if not isinstance(identities, Mapping) or set(identities) != set(classes):
+        return False
+    if proof.get("workflow_class_count") != len(classes):
+        return False
+    if proof.get("missing_host") or proof.get("unresolved_identity"):
+        return False
+    if any(not isinstance(value, str) or not value for value in identities.values()):
+        return False
+    expected_classes = sorted({
+        str(node.get("class_type", ""))
+        for node in (workflow or {}).values()
+        if isinstance(node, dict) and node.get("class_type")
+    }) if isinstance(workflow, dict) else []
+    if classes != expected_classes:
+        return False
+    # Real store entries carry both the current anchor and proof hash.  The
+    # relaxed branch is only for legacy test doubles; public store.lookup never
+    # returns an entry without these fields.
+    if "identity_anchor" in entry:
+        try:
+            from comfymodal_runtime.registry_proof_store import current_identity_anchor
+            from comfymodal_runtime.registry_proof_store import REGISTRY_PROOF_STORE_SCHEMA_VERSION
+            if entry.get("schema_version") != REGISTRY_PROOF_STORE_SCHEMA_VERSION:
+                return False
+            if entry.get("identity_anchor") != current_identity_anchor():
+                return False
+        except Exception:
+            return False
+        if str(proof.get("workflow_hash", "") or "") != str(workflow_hash or ""):
+            return False
+    return True
+
+
+def _collect_plan_deployment_identity(request_metadata=None, comfyui_root: str = "", workflow=None) -> dict:
+    """Best-effort deployment identity for the plan (never fabricated).
+
+    ``registry_fingerprint`` returns ``""`` when ``nodes`` is unavailable, so
+    ``complete`` is only ever True when every component is known.  The
+    ``custom_nodes_generation`` and ``overall_dependency_hash`` are taken from
+    the deploy-frozen ``.deployed_state.json`` record when the deployment hash
+    source is ``persisted`` (already-deployed runtime) — NEVER from the mutable
+    local baked manifest, which other workflows may regenerate after deploy.
+    Fail closed: a persisted record missing the generation or dependency hash
+    yields an incomplete identity (``deployment_identity_fail_closed_reason``)
+    and never silently falls back to the baked manifest.  For non-persisted
+    sources (metadata/env) the legacy baked-manifest provenance is preserved.
+    ``dependency_manifest_identity`` mirrors the shared
+    identity builder the container's manifest writer uses; it is carried
+    separately for parity and never affects ``complete`` (Step-1 semantics).
+
+    Deployment hash fail-closed: the authoritative value comes only from
+    ``request_metadata`` → env ``COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH`` →
+    persisted ``.deployed_state.json``.  The host mirror
+    (``_compute_host_deployment_combined_hash``) is DIAGNOSTIC only and never
+    grants identity when the baked value is unknown.
+
+    Registry proof: when ``workflow`` is provided, a per-class canonical
+    identity proof over exactly the workflow's class set is built
+    (``registry_proof``).  It is the Step-3 registry-parity authority;
+    ``registry_proof_complete`` fails closed (False) whenever ``workflow`` is
+    None or the proof cannot be built.
+    """
+    import os
+    from comfymodal_runtime.contracts import VALIDATION_PROOF_SCHEMA_VERSION, compute_registry_fingerprint
+    _meta = dict(request_metadata or {})
+    _dep = str(_meta.get("deployment_combined_hash", "") or "")
+    _dep_source = "metadata"
+    if not _dep:
+        _dep = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
+        _dep_source = "env"
+    if not _dep:
+        _dep = _read_persisted_deployment_combined_hash()
+        _dep_source = "persisted"
+    if not _dep:
+        # NO host-mirror fallback for the authoritative value: the mirror must
+        # not grant identity when the actual baked value is unknown.
+        _dep_source = "unavailable"
+    # Host mirror recomputation — DIAGNOSTIC ONLY, never used in ``complete``.
+    _host_mirror_dep = _compute_host_deployment_combined_hash()
+    _identity_frozen = _dep_source == "persisted"
+    _identity_fail_closed_reason = ""
+    if _identity_frozen:
+        # Deploy-frozen identity mode: an already-deployed runtime derives its
+        # plan identity EXCLUSIVELY from the deploy-frozen .deployed_state.json
+        # record (container readback at deploy time).  The mutable local baked
+        # manifest (.baked_custom_node_deps/) may be regenerated by other
+        # workflows after deploy and must NEVER change the plan identity of an
+        # existing deployment.  Fail closed: when the frozen record lacks the
+        # generation or the dependency hash, do NOT silently substitute the
+        # mutable manifest — the plan is incomplete and the fast path is not
+        # eligible until a new deployment freezes a complete record.
+        _frozen = _read_frozen_deployed_identity()
+        _gen = str(_frozen.get("custom_nodes_generation", "") or "")
+        _overall = str(_frozen.get("overall_dependency_hash", "") or "")
+        if not _gen:
+            _identity_fail_closed_reason = "deploy_frozen_custom_nodes_generation_missing"
+            _gen = ""
+            _overall = ""
+        elif not _overall:
+            _identity_fail_closed_reason = "deploy_frozen_overall_dependency_hash_missing"
+            _overall = ""
+    else:
+        # No deployed record (or metadata/env override): keep the legacy
+        # construction-time baked manifest as the identity source.
+        _baked = _read_baked_custom_node_manifest()
+        _gen = str(_baked.get("production_custom_node_generation", "") or "")
+        if not _gen:
+            _gen = str(_meta.get("custom_node_generation", "") or "")
+        _overall = str(_baked.get("overall_dependency_hash", "") or "")
+    _repair = _host_requirements_repair_mode()
+    _dep_identity = ""
+    if _dep and _gen and _overall:
+        from comfymodal_runtime.dependency_manifest import (
+            DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+            build_identity,
+        )
+        _dep_identity = build_identity(
+            combined_hash=_dep,
+            custom_node_fingerprint={"overall_dependency_hash": _overall},
+            custom_node_generation=_gen,
+            repair_mode=_repair,
+            schema_version=DEPENDENCY_MANIFEST_SCHEMA_VERSION,
+        )
+    # Root-filtered registry fingerprint.  repo_root = the comfyui-modal dir
+    # (this file lives at the repo root); custom_nodes_dir = parent of
+    # repo_root.  If roots derivation is impossible, fall back to the full
+    # registry (no roots).  Diagnostic only (Step-3 parity uses the
+    # workflow-relevant registry_proof instead).
+    #
+    # D1 persisted registry-proof fast path: when the deploy-frozen identity is
+    # current AND a store entry covers this workflow, reuse the persisted
+    # fingerprint + workflow proof instead of importing the live registry
+    # (17-90 s per fresh command).  Fail-closed: any mismatch falls back to the
+    # live computation below.
+    _reg = ""
+    _reg_proof = {}
+    _reg_proof_complete = False
+    _wf_hash = prompt_sha256(workflow) if isinstance(workflow, dict) else ""
+    if _identity_frozen and _wf_hash:
+        try:
+            from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+            _entry = _proof_store_lookup(
+                workflow_hash=_wf_hash, comfyui_root=str(comfyui_root or ""),
+            )
+        except Exception:
+            _entry = None
+        if _registry_proof_cache_entry_is_usable(_entry, workflow, _wf_hash):
+            _reg = str(_entry.get("registry_fingerprint", "") or "")
+            _reg_proof = _entry.get("registry_proof") or {}
+            _reg_proof_complete = True
+    if not _reg and not _reg_proof:
+        _repo_root = os.path.dirname(os.path.abspath(__file__))
+        _custom_nodes_dir = os.path.dirname(_repo_root)
+        _roots = [r for r in (str(comfyui_root or ""), _custom_nodes_dir, _repo_root) if r]
+        if _roots:
+            _reg = compute_registry_fingerprint(roots=_roots)
+        else:
+            _reg = compute_registry_fingerprint()  # full registry fallback
+        _reg_proof = {}
+        if workflow:
+            try:
+                from comfymodal_runtime.registry_proof import build_workflow_registry_proof
+                _reg_proof = build_workflow_registry_proof(
+                    workflow,
+                    roots=[
+                        r for r in (
+                            str(comfyui_root or ""),
+                            _custom_nodes_dir,
+                            _repo_root,
+                        ) if r
+                    ],
+                    workflow_hash=_wf_hash,
+                )
+            except Exception:
+                _reg_proof = {}
+        if isinstance(_reg_proof, dict) and _reg_proof.get("complete"):
+            _proof_hash = str(_reg_proof.get("workflow_hash", "") or "")
+            if _proof_hash and _proof_hash != _wf_hash:
+                _reg_proof = {}
+            else:
+                # Bind a complete live proof to the finalized dispatch hash
+                # before it can be persisted or carried by the plan.
+                _reg_proof = dict(_reg_proof)
+                _reg_proof["workflow_hash"] = _wf_hash
+        _reg_proof_complete = bool(_reg_proof.get("complete", False))
+    return {
+        "schema_version": VALIDATION_PROOF_SCHEMA_VERSION,
+        "deployment_combined_hash": _dep,
+        "deployment_combined_hash_source": _dep_source,
+        "host_mirror_deployment_combined_hash": str(_host_mirror_dep or ""),
+        "custom_nodes_generation": _gen,
+        "registry_fingerprint": _reg,
+        "registry_proof": _reg_proof,
+        "registry_proof_complete": _reg_proof_complete,
+        "dependency_manifest_identity": _dep_identity,
+        "deployment_identity_frozen": _identity_frozen,
+        "deployment_identity_fail_closed_reason": _identity_fail_closed_reason,
+        "workflow_hash": _wf_hash,
+        "complete": bool(
+            _dep and _gen and _reg_proof_complete
+            and not _identity_fail_closed_reason
+            # A deploy-frozen identity must include its frozen dependency
+            # pair.  Legacy metadata/env construction remains descriptive;
+            # the parity evaluator still gates it on dependency identity.
+            and (
+                not _identity_frozen
+                or bool(_overall and _dep_identity)
+            )
+        ),
+    }
+
+
+def resolve_dispatch_workflow_hash(
+    workflow: dict,
+    modal_options: dict | None = None,
+    production_options: dict | None = None,
+    production_report: dict | None = None,
+) -> str:
+    """Mirror ``build_execution_plan``'s compile step and return the dispatch
+    workflow hash WITHOUT importing the node registry.
+
+    ``build_execution_plan`` keys the registry-proof store, the plan, and the
+    validation memo by the hash of the DISPATCH workflow — which differs from
+    ``prompt_sha256(source_workflow)`` whenever production compile rewrites the
+    dict.  This helper replicates the exact compile decision (pure dict work,
+    never imports ``nodes``/``execution``):
+
+    * ``production_report.get("enabled")``  → dispatch stays the source
+      (the report already describes the compiled workflow).
+    * ``production_options`` provided and enabled → normalize + compile, hash
+      ``compiled.compiled_workflow``.
+    * ``production_options`` absent but ``modal_options`` given → derive the
+      options exactly as the benchmark call sites do
+      (``normalize_production_options(modal_options)``), then compile.
+    * otherwise → hash the source (no compile).
+
+    Callers pass the same inputs they give ``build_execution_plan`` so the
+    lookup key is identical to the persisted store key.
+    """
+    source_workflow = copy.deepcopy(workflow or {})
+    dispatch_workflow = source_workflow
+    report = dict(production_report or {})
+    if report.get("enabled"):
+        # production_report already describes the compiled workflow; the
+        # source dict IS the dispatch workflow (no recompile).
+        pass
+    elif production_options is not None:
+        if production_options.get("enabled"):
+            normalized_production = normalize_production_options(production_options)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+    elif modal_options:
+        # Mirror the benchmark call sites: production options are derived
+        # from modal_options, normalized, then re-normalized by the plan
+        # build (the same double-normalization the production path performs).
+        _derived = normalize_production_options(modal_options)
+        if _derived.get("enabled"):
+            normalized_production = normalize_production_options(_derived)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+    return prompt_sha256(dispatch_workflow)
 
 
 def build_execution_plan(
@@ -889,6 +1461,7 @@ def build_execution_plan(
     comfyui_root: str = "",
     trace: RuntimeTrace | None = None,
     validate: bool = True,
+    collect_validation_proof: bool = False,
 ) -> ExecutionPlan:
     """Normalize, validate, compile, and freeze one dispatch plan."""
     if trace:
@@ -915,7 +1488,178 @@ def build_execution_plan(
         )
         dispatch_workflow = compiled.compiled_workflow
         report = dict(compiled.report)
+    elif modal_options:
+        # Keep plan construction identical to resolve_dispatch_workflow_hash:
+        # callers that provide only modal_options still dispatch the compiled
+        # workflow and therefore receive proof keyed to that exact hash.
+        _derived_production = normalize_production_options(modal_options)
+        if _derived_production.get("enabled"):
+            normalized_production = normalize_production_options(_derived_production)
+            compiled = compile_production_workflow(
+                source_workflow,
+                normalized_production,
+                allow_direct_output_rewrite=True,
+            )
+            dispatch_workflow = compiled.compiled_workflow
+            report = dict(compiled.report)
+    # Deployment identity is computed ONCE up-front: it feeds the host-side
+    # validation memo key AND the plan arg / instrumentation line below
+    # (never recomputed twice).  ``dispatch_workflow`` is finalized above.
+    _deployment_identity = _collect_plan_deployment_identity(
+        request_metadata, comfyui_root, workflow=dispatch_workflow
+    )
+    # Step-1/Step-2 plan-carried validation proof.  Runs AFTER the dispatch
+    # workflow is finalized and uses the exact dispatch hash.  Validation is
+    # given a defensive copy, so the object used by the proof-store lookup is
+    # also the object frozen into the plan.  Fail-closed: any validation
+    # failure aborts the build and exceptions are never cached.
+    _validation_payload: dict = {}
+    _validation_memo_state = "off"
+    if collect_validation_proof:
+        _memo_key = _memo_key_plan_validation(
+            prompt_sha256(dispatch_workflow), _deployment_identity
+        )
+        _cached = _PLAN_VALIDATION_MEMO.get(_memo_key)
+        if _cached is None:
+            # D1 persisted validation-proof fast path (cross-process): the
+            # same memo key persisted by a prior command makes plan
+            # construction skip the live `execution.validate_prompt`.
+            if _deployment_identity.get("deployment_identity_frozen"):
+                try:
+                    from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+                    _store_entry = _proof_store_lookup(
+                        workflow_hash=prompt_sha256(dispatch_workflow),
+                        comfyui_root=str(comfyui_root or ""),
+                    )
+                except Exception:
+                    _store_entry = None
+                _stored_validation = (
+                    _store_entry.get("validation") if isinstance(_store_entry, dict) else None
+                )
+                if isinstance(_stored_validation, dict) and _stored_validation:
+                    _cached = dict(_stored_validation)
+                    _PLAN_VALIDATION_MEMO[_memo_key] = dict(_cached)
+        if _cached is not None:
+            _validation_payload = dict(_cached)
+            _validation_memo_state = "hit"
+        else:
+            try:
+                _validation_payload = _collect_plan_validation_proof(prompt_id, dispatch_workflow)
+                _validation_memo_state = "miss"
+            except RuntimeError as _validation_exc:
+                # ── E29 host-registry fallback (fail-closed → stored proof) ──
+                # The host ComfyUI node registry can be incomplete/broken (a
+                # third-party custom node shadowing ``utils`` breaks
+                # PromptServer imports, so nodes like
+                # PairConditioningSetProperties are missing HOST-side while
+                # present in the DEPLOYED container).  The D1 registry-proof
+                # store holds a validation proof from the DEPLOYED registry
+                # (parity-correct by construction).  When live host validation
+                # fails for a missing node, fall back to the stored deployed
+                # proof for the SAME workflow — never fabricate success.
+                #
+                # The frozen flag is not required here: the store lookup is
+                # itself anchor-validated against .deployed_state.json, and the
+                # run carries the deploy-frozen hash via env/metadata.  Any
+                # store entry whose anchor matches the CURRENT
+                # .deployed_state.json is deploy-frozen by construction.
+                _fallback_payload: dict | None = None
+                if _deployment_identity.get("deployment_combined_hash"):
+                    try:
+                        from comfymodal_runtime.registry_proof_store import lookup as _proof_store_lookup
+                        # Primary: exact dispatch-hash lookup (nonce included).
+                        _store_entry = _proof_store_lookup(
+                            workflow_hash=prompt_sha256(dispatch_workflow),
+                            comfyui_root=str(comfyui_root or ""),
+                        )
+                        _stored_validation = (
+                            _store_entry.get("validation")
+                            if isinstance(_store_entry, dict) else None
+                        )
+                        if isinstance(_stored_validation, dict) and _stored_validation.get("validated"):
+                            _fallback_payload = dict(_stored_validation)
+                        else:
+                            # Secondary: node-type fingerprint scan.  The
+                            # per-run conditioning nonce mutates literal text
+                            # values only, so the NODE-TYPE structure of the
+                            # dispatch workflow is identical to the stored
+                            # workflow; match on the sorted class_type list.
+                            _current_types = sorted(
+                                str(n.get("class_type", ""))
+                                for n in (dispatch_workflow or {}).values()
+                                if isinstance(n, dict)
+                            )
+                            if _current_types:
+                                from comfymodal_runtime.registry_proof_store import entries as _proof_store_entries
+                                for _wf_hash, _entry in (_proof_store_entries() or {}).items():
+                                    # ``entries()`` is already anchor-filtered,
+                                    # but retain a defensive check here so a
+                                    # substituted/scanned store cannot promote
+                                    # stale or validation-only data.
+                                    if not _registry_proof_cache_entry_is_usable(
+                                        _entry,
+                                        dispatch_workflow,
+                                        str(_entry.get("workflow_hash", "") or ""),
+                                    ):
+                                        continue
+                                    _val = _entry.get("validation") or {}
+                                    _stored_types = _val.get("node_type_fingerprint") or []
+                                    if (
+                                        _val.get("validated")
+                                        and isinstance(_stored_types, list)
+                                        and _stored_types == _current_types
+                                    ):
+                                        _fallback_payload = dict(_val)
+                                        break
+                    except Exception:
+                        _fallback_payload = None
+                if _fallback_payload is not None:
+                    _validation_payload = _fallback_payload
+                    _validation_memo_state = "deployed-proof-fallback"
+                else:
+                    # E29 diagnostic: make the fallback miss VISIBLE so the
+                    # next run can be fixed from evidence, not guessing.
+                    print(
+                        f"[v2.plan_proof] fallback=miss frozen="
+                        f"{_deployment_identity.get('deployment_identity_frozen')} "
+                        f"wf_hash={prompt_sha256(dispatch_workflow)[:12]} "
+                        f"types={len([n for n in (dispatch_workflow or {}).values() if isinstance(n, dict)])} "
+                        f"error={str(_validation_exc)[:160]}",
+                        flush=True,
+                    )
+                    raise _validation_exc
+            if len(_PLAN_VALIDATION_MEMO) >= _PLAN_VALIDATION_MEMO_MAX:
+                _PLAN_VALIDATION_MEMO.clear()  # simple documented eviction
+            _PLAN_VALIDATION_MEMO[_memo_key] = dict(_validation_payload)
+            _validation_memo_state = "miss" if _validation_memo_state == "miss" else _validation_memo_state
+    # Hash the finalized object that is actually frozen into the plan.  Do
+    # not independently recompile here: a second normalization/compile can
+    # diverge from the workflow passed to the proof-store lookup.
     dispatch_hash = prompt_sha256(dispatch_workflow)
+    if _validation_payload:
+        _validation_payload["validated_workflow_hash"] = dispatch_hash
+        # E29: always carry the node-type fingerprint (the per-run nonce
+        # mutates literal text but not node structure), so a stored deployed
+        # proof can be matched by the fallback even for a nonce'd workflow.
+        _validation_payload["node_type_fingerprint"] = sorted(
+            str(n.get("class_type", ""))
+            for n in (dispatch_workflow or {}).values()
+            if isinstance(n, dict)
+        )
+    # D1 persisted registry-proof/validation store write: the next process can
+    # rebuild the identical plan payloads without importing the registry.
+    if _deployment_identity.get("deployment_identity_frozen"):
+        try:
+            from comfymodal_runtime.registry_proof_store import save as _proof_store_save
+            _proof_store_save({
+                "workflow_hash": dispatch_hash,
+                "comfyui_root": str(comfyui_root or ""),
+                "registry_fingerprint": str(_deployment_identity.get("registry_fingerprint", "") or ""),
+                "registry_proof": _deployment_identity.get("registry_proof") or {},
+                "validation": dict(_validation_payload) if _validation_payload else None,
+            })
+        except Exception:
+            pass
     if report.get("enabled"):
         compiled_hash = str(report.get("compiled_workflow_hash", ""))
         if compiled_hash and compiled_hash != dispatch_hash:
@@ -972,7 +1716,18 @@ def build_execution_plan(
         input_images=input_images or {},
         execution_options=options,
         request_metadata=metadata,
+        validation=_validation_payload,
+        deployment_identity=_deployment_identity,
     )
+    if _validation_payload:
+        print(
+            f"[v2.plan_proof] schema={_validation_payload.get('schema_version')} payload=yes "
+            f"validated={_validation_payload.get('validated')} outputs={len(_validation_payload.get('outputs_to_execute', []))} "
+            f"wf_hash={dispatch_hash[:16]} dep_complete={_deployment_identity.get('complete')} "
+            f"reg_proof={int(bool(_deployment_identity.get('registry_proof_complete')))} "
+            f"memo={'hit' if _validation_memo_state == 'hit' else 'miss'}",
+            flush=True,
+        )
     if trace:
         trace.emit("plan_build_end", phase="local", metadata={
             "workflow_hash": plan.workflow_hash,
@@ -1040,7 +1795,16 @@ async def execute_plan(
     # ── Profile preparation (before restore publication / Modal submission) ──
     runtime_trace.emit("active_profile_prepare_start", phase="local")
     runtime_trace.emit("active_next_profile_start", phase="local")
-    if profile_setter is not None:
+    # Effective requested env profile: request-carried origin first, process
+    # env fallback (deploy default "inherit" is a no-op request override).
+    _profile_req_meta = plan.request_metadata if isinstance(plan.request_metadata, Mapping) else {}
+    _profile_origin = _profile_req_meta.get("request_origin_info", {})
+    _profile_requested_env = str(
+        _profile_origin.get("env_profile", "") if isinstance(_profile_origin, Mapping) else ""
+    ).strip().lower()
+    if not _profile_requested_env:
+        _profile_requested_env = os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower()
+    if profile_setter is not None and active_next_publication_required(_profile_requested_env):
         # ── Profile prep cache identity keys ──
         _profile_ws_id = _workspace_identity(workspace)
         _profile_app_identity = _app_identity()
@@ -1235,6 +1999,89 @@ async def execute_plan(
                     _PROFILE_PREP_CACHE.pop(_profile_cache_key, None)
                 # Also remove from disk cache (invalidation)
                 _remove_profile_disk_entry(_profile_cache_key)
+    elif profile_setter is not None:
+        # ── Inherit no-op gate (default single-invocation V2 path) ──
+        _noop_start_s = time.time()
+        _container_default_profile = os.environ.get(
+            "COMFYMODAL_V2_ENV_PROFILE", "inherit"
+        ).strip().lower()
+        _cpu_snapshot_enabled = 1 if os.environ.get(
+            "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT", ""
+        ).strip() == "1" else 0
+        _snapshot_build_phase = 1 if os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", ""
+        ).strip() == "1" else 0
+        # Lifecycle-accurate no-op: the requested profile is the deploy
+        # default (inherit — a no-op in-container override) and no warmup-
+        # profile consumer is active.  A CPU-model-snapshot deployment
+        # consumes active_next_profile.json only during snapshot
+        # CONSTRUCTION (startup, snap=True); normal restored generations
+        # (snap=False) derive all request state from invocation_plan and
+        # never read the volume record, so the remote checker/setter here
+        # is pure pre-submission latency.  Explicit profile changes and
+        # construction/consumer invocations still use the full path above.
+        _noop_reason = "post_snapshot" if _cpu_snapshot_enabled else "inherit_default_no_consumer"
+        _noop_decision = (
+            "skipped_post_snapshot_noop" if _cpu_snapshot_enabled
+            else "skipped_inherit_noop"
+        )
+        runtime_trace.emit("active_profile_skip_noop", phase="local", metadata={
+            "reason": _noop_reason,
+            "requested_env_profile": _profile_requested_env,
+            "container_default_profile": _container_default_profile,
+            "checker_remote_call": 0,
+            "setter_remote_call": 0,
+            "override_applied": 0,
+            "snapshot_build_phase": _snapshot_build_phase,
+            "cpu_model_snapshot_enabled": _cpu_snapshot_enabled,
+            "consumer_requires_publication": 0,
+        })
+        runtime_trace.set_metadata(
+            active_profile_publish_decision=_noop_decision,
+            active_profile_stable_key="",
+            active_profile_token="",
+            local_active_profile_prepare_ms=0.0,
+            active_profile_remote_call=0,
+            active_profile_remote_ms=0.0,
+            active_profile_prepare_count=0,
+            profile_cache_hit=False,
+            profile_cache_lookup_ms=0.0,
+            profile_remote_call_performed=False,
+            profile_checker_performed=False,
+            profile_checker_matched=False,
+            profile_setter_performed=False,
+            active_profile_local_ms=0.0,
+            active_profile_cache_lookup_ms=0.0,
+            active_profile_checker_ms=0.0,
+            active_profile_setter_ms=0.0,
+            active_profile_total_ms=round((time.time() - _noop_start_s) * 1000, 2),
+            source_workflow_hash=plan.source_workflow_hash,
+            model_stack=dict(plan.model_stack),
+            prompt_summary=dict(plan.prompt_bundle),
+            profile_noop_reason=_noop_reason,
+            profile_requested_env=_profile_requested_env,
+            profile_container_default=_container_default_profile,
+            profile_effective=_profile_requested_env,
+            profile_override_applied=False,
+            snapshot_build_phase=_snapshot_build_phase,
+            cpu_model_snapshot_enabled=_cpu_snapshot_enabled,
+            consumer_requires_publication=0,
+        )
+        runtime_trace.emit("active_next_profile_end", phase="local", metadata={
+            "decision": _noop_decision,
+            "reason": _noop_reason,
+        })
+        print(
+            f"[active_profile.publish] decision={_noop_decision} "
+            f"requested={_profile_requested_env or '(inherit)'} "
+            f"container_default={_container_default_profile} "
+            f"cpu_model_snapshot={_cpu_snapshot_enabled} "
+            f"snapshot_build_phase={_snapshot_build_phase} "
+            f"consumer_requires_publication=0 "
+            f"checker_remote=0 setter_remote=0 "
+            f"active_profile_noop_ms={round((time.time() - _noop_start_s) * 1000, 2)}",
+            flush=True,
+        )
     else:
         runtime_trace.emit("active_next_profile_end", phase="local", metadata={"status": "dry_run"})
     runtime_trace.emit("active_profile_prepare_end", phase="local")
@@ -1269,6 +2116,13 @@ async def execute_plan(
     # workflow is empty, publication is unavailable, or persistence fails,
     # restore() falls back to a minimal startup seed — never guessed and
     # never claiming seeded parity.
+    #
+    # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN (default "0") disables the remote
+    # publication: on that path the seed payload is labelled
+    # ``seed_source=invocation_plan`` (the REQUEST derives its own seed on
+    # the container side) and the local persistence below never claims
+    # ``publisher_plan``.  When the flag is "1" the payload keeps the legacy
+    # ``publisher_plan`` label for the diagnostic publisher path.
     _seed_payload_ctx: dict[str, Any] = {
         "built": 0, "topology_available": 0, "schema_version": 0,
         "persisted": 0, "error": "",
@@ -1277,10 +2131,18 @@ async def execute_plan(
     _seed_obs_fields: dict[str, Any] = {}
     try:
         from comfymodal_runtime.execution_seed import (
+            build_invocation_seed_payload,
             build_snapshot_seed_payload,
             snapshot_seed_observability,
         )
 
+        # The payload label follows the DESTINATION: when a publisher is
+        # configured the payload is published remotely and keeps the legacy
+        # ``publisher_plan`` label; when publication is skipped (default
+        # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN path passes restore_publisher=None)
+        # the payload is labelled ``invocation_plan`` and only persisted
+        # locally — never claiming a publisher-side seed.
+        _publish_enabled = restore_publisher is not None
         _seed_req_meta = plan.request_metadata or {}
         _seed_cn_gen = str(
             _seed_req_meta.get("custom_node_generation", "") if hasattr(_seed_req_meta, "get") else ""
@@ -1290,7 +2152,10 @@ async def execute_plan(
         )
         if not _seed_dep_hash:
             _seed_dep_hash = os.environ.get("COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH", "")
-        _seed_payload = build_snapshot_seed_payload(
+        _seed_builder = (
+            build_snapshot_seed_payload if _publish_enabled else build_invocation_seed_payload
+        )
+        _seed_payload = _seed_builder(
             _canonical_workflow,
             output_node_ids=plan.output_node_ids,
             workflow_hash=plan.workflow_hash,
@@ -1305,6 +2170,10 @@ async def execute_plan(
                 "topology_available": 1,
                 "schema_version": int(_seed_payload.get("schema_version", 0) or 0),
                 **_seed_obs_fields,
+                # NOTE: must come AFTER **_seed_obs_fields — that helper
+                # hardcodes seed_source="" (it derives observability from the
+                # seed object only); the payload-level source wins here.
+                "seed_source": str(_seed_payload.get("seed_source", "") or ""),
             })
     except Exception as _seed_exc:
         _seed_payload_ctx["error"] = f"{type(_seed_exc).__name__}: {str(_seed_exc)[:120]}"
@@ -1557,18 +2426,43 @@ async def execute_plan(
                 runtime_trace.set_metadata(restore_publish_generation=observed_generation)
             runtime_trace.emit("restore_plan_publish_end", phase="local", metadata={"generation": observed_generation})
     else:
-        # Dry-run / no remote publisher configured — persist the seed to the
-        # local .runtime_state path (existing local-observability behavior).
-        # No remote publication is performed or simulated: the publish
-        # markers bound the local not-configured handling and carry an honest
-        # status so downstream breakdown consumers can attribute the gap.
-        runtime_trace.emit("restore_plan_publish_start", phase="local",
-                           metadata={"status": "not_configured"})
+        # ── Publish skipped (no remote publisher configured) ──
+        # Default production path: COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is unset
+        # (or "0"), so no remote ``publish_restore_plan`` RPC is performed.
+        # Emit a bounded marker so the artifact proves the skip:
+        #   * one trace event ``restore_publish_skipped``
+        #   * one console line ``[v2.restore_publish] skipped ...``
+        # ``restore_plan_publish_start/end`` are NOT emitted here, so
+        # ``restore_publish_ms`` / ``restore_publish_to_transport_entry_ms``
+        # render absent downstream (never a misleading tiny span).
+        # The seed payload (labelled ``invocation_plan`` on this path) is
+        # still persisted to the local .runtime_state path (existing
+        # local-observability behavior) — a local write only, never a remote
+        # RPC.
+        _restore_skip_reason = (
+            "flag_disabled"
+            if not publish_restore_plan_enabled()
+            else "publisher_not_configured"
+        )
+        runtime_trace.emit(
+            "restore_publish_skipped",
+            phase="local",
+            metadata={
+                "reason": _restore_skip_reason,
+                "restore_remote_call_performed": False,
+                "status": "skipped",
+            },
+        )
         runtime_trace.set_metadata(
             restore_publish_cache_skipped=None,
             restore_publish_cache_hit=False,
             restore_remote_call_performed=False,
-            restore_publish_status="not_configured",
+            restore_publish_status="skipped",
+            restore_publish_skip_reason=_restore_skip_reason,
+        )
+        print(
+            f"[v2.restore_publish] skipped reason={_restore_skip_reason}",
+            flush=True,
         )
         if _seed_payload is not None:
             try:
@@ -1577,12 +2471,11 @@ async def execute_plan(
                 _seed_payload_ctx["persisted"] = 1 if _seed_persisted else 0
             except Exception:
                 _seed_payload_ctx["persisted"] = 0
-        runtime_trace.emit("restore_plan_publish_end", phase="local",
-                           metadata={"status": "not_configured"})
 
     if _seed_payload is not None and _seed_payload_ctx.get("persisted"):
+        _seed_source_label = str(_seed_payload.get("seed_source", "") or "unknown")
         print(
-            f"[v2.seed_build] source=publisher_plan schema=2 "
+            f"[v2.seed_build] source={_seed_source_label} schema=2 "
             f"topology_available=1 persisted=1 "
             f"workflow_hash={str(_seed_payload.get('workflow_hash', ''))[:16]} "
             f"loader_nodes={_seed_obs_fields.get('loader_node_count', 0)} "
@@ -1602,25 +2495,47 @@ async def execute_plan(
                        metadata={"request_id": runtime_trace.request_id})
     runtime_trace.emit("gpu_invocation_submit", phase="local")
     result: dict[str, Any] | None = None
-    async for message in active_transport.run_plan_stream(
+    _transport_stream = active_transport.run_plan_stream(
         plan,
         gpu=gpu or str(plan.request_metadata.get("selected_gpu", "")) or None,
         workspace=workspace,
         trace=runtime_trace.to_legacy_timing(prompt_id=str(plan.request_metadata.get("prompt_id", ""))),
         runtime_trace=runtime_trace,
         plan_dict=_canonical_dict,
-    ):
-        message_type = message.get("type") if isinstance(message, dict) else ""
-        if event_sink is not None and message_type in {"progress", "status", "executing"}:
-            event_sink(message_type, message.get("data") or message.get("event") or message)
-        if message_type == "error":
-            raise RuntimeError(message.get("message", "Modal execution error"))
-        if message_type == "result":
-            result = message.get("data")
-            break
+    )
+    try:
+        async for message in _transport_stream:
+            message_type = message.get("type") if isinstance(message, dict) else ""
+            if event_sink is not None and message_type in {"progress", "status", "executing"}:
+                event_sink(message_type, message.get("data") or message.get("event") or message)
+            if message_type == "error":
+                raise RuntimeError(message.get("message", "Modal execution error"))
+            if message_type == "result":
+                result = message.get("data")
+                break
+    finally:
+        # Deterministic bounded-close seam: close the transport stream so its
+        # finally spawns the post-result persistence drain immediately.  Runs
+        # strictly AFTER the result was captured — never delays delivery and
+        # never contributes to caller-visible stages/TOTAL WALL (the drain runs
+        # in the background and is joined/cancelled at teardown).
+        try:
+            await _transport_stream.aclose()
+        except Exception:  # noqa: BLE001
+            pass
     if not isinstance(result, dict):
         raise RuntimeError("execution plan stream ended without result")
     runtime_trace.emit("remote_return_start", process="local", phase="transport")
+    # Host-side result-receipt boundary: captures the exact wall/mono instant
+    # the local executor received the remote result (before any post-merge
+    # processing below).  emit_at preserves the cross-process wall clock.
+    runtime_trace.emit_at(
+        "local_result_received",
+        process="local",
+        phase="transport",
+        wall_unix_ns=time.time_ns(),
+        monotonic_ns=time.monotonic_ns(),
+    )
 
     # ── Merge local trace into remote result without dropping remote evidence ──
     raw_remote_trace = result.get("trace")
@@ -1848,6 +2763,21 @@ async def execute_plan(
             _remote_modal_method_entry_ns = _raw_ts["t4_modal_method_entry_wall_unix_ns"]
         if _remote_prompt_executor_invoke_start_ns is None and _raw_ts.get("t5_prompt_executor_invoke_start_wall_unix_ns") is not None:
             _remote_prompt_executor_invoke_start_ns = _raw_ts["t5_prompt_executor_invoke_start_wall_unix_ns"]
+
+    # ── Host-boundary tier: merged trace event walls ──
+    # modal_transport emits modal_generator_created / modal_submission_attempt /
+    # modal_first_iteration_start / modal_first_remote_event as trace events
+    # with wall_unix_ns (plus a metadata backfill).  The local prints must
+    # surface these boundaries even when the origin dict never carried the
+    # wall-ns keys — read the LAST occurrence from the merged trace.
+    if _local_modal_submission_attempt_ns is None:
+        _local_modal_submission_attempt_ns = _host_boundary_wall_ns(merged_trace, "modal_submission_attempt")
+    if _local_modal_gen_created_ns is None:
+        _local_modal_gen_created_ns = _host_boundary_wall_ns(merged_trace, "modal_generator_created")
+    if _local_modal_first_iter_start_ns is None:
+        _local_modal_first_iter_start_ns = _host_boundary_wall_ns(merged_trace, "modal_first_iteration_start")
+    if _local_modal_first_remote_event_ns is None:
+        _local_modal_first_remote_event_ns = _host_boundary_wall_ns(merged_trace, "modal_first_remote_event")
 
     # ── Fifth-tier fallback: merged trace event metadata ──
     # Inspect merged trace events for modal_method_entry / remote_method_entry
@@ -2096,6 +3026,85 @@ async def execute_plan(
     _stage_attribution_residual_ms["reconciliation_status"] = _reconciliation_status
     _stage_attribution_residual_ms.setdefault("overlap_error", "")
 
+    # ── Host-side result-receipt boundary (additive; see #2) ──────────
+    # local_result_received was emitted via emit_at at the result break
+    # point (wall + mono captured together).  Read it from the merged trace
+    # (last occurrence) and derive the return-side deltas.
+    _local_result_received_event = _host_boundary_event(merged_trace, "local_result_received")
+    _local_result_received_wall_ns: Any = None
+    _local_result_received_mono_ns: Any = None
+    if _local_result_received_event is not None:
+        _evt_wall = getattr(_local_result_received_event, "wall_unix_ns", None)
+        _evt_mono = getattr(_local_result_received_event, "monotonic_ns", None)
+        if isinstance(_evt_wall, (int, float)):
+            _local_result_received_wall_ns = int(_evt_wall)
+        if isinstance(_evt_mono, (int, float)):
+            _local_result_received_mono_ns = int(_evt_mono)
+    _local_receive_to_result_return_ms: Any = None
+    if _local_result_received_wall_ns is not None and isinstance(_t1_wall_ns, (int, float)):
+        _delta_return_ns = _local_result_received_wall_ns - int(_t1_wall_ns)
+        if _delta_return_ns >= 0:
+            _local_receive_to_result_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # ── Remote emit → local receipt interval ──────────────────────────
+    # remote_result_emit is stamped by the remote container immediately
+    # before it yields the result event; reading it here (merged trace first,
+    # then the result payload raw field) lets the host distinguish the true
+    # transport hop from the output-encode tail that precedes emission.
+    _remote_result_emit_event = _host_boundary_event(merged_trace, "remote_result_emit")
+    _remote_result_emit_wall_ns: Any = None
+    if _remote_result_emit_event is not None:
+        _evt_wall = getattr(_remote_result_emit_event, "wall_unix_ns", None)
+        if isinstance(_evt_wall, (int, float)):
+            _remote_result_emit_wall_ns = int(_evt_wall)
+    if _remote_result_emit_wall_ns is None and isinstance(result, dict):
+        _rre_raw = result.get("remote_result_emit_wall_unix_ns")
+        if isinstance(_rre_raw, (int, float)):
+            _remote_result_emit_wall_ns = int(_rre_raw)
+    _remote_result_emit_to_local_receipt_ms: Any = None
+    if (
+        _remote_result_emit_wall_ns is not None
+        and isinstance(_local_result_received_wall_ns, (int, float))
+    ):
+        _delta_ns = _local_result_received_wall_ns - _remote_result_emit_wall_ns
+        if _delta_ns >= 0:
+            _remote_result_emit_to_local_receipt_ms = round(_delta_ns / 1_000_000, 3)
+    # execute_plan "return" wall captured at the local_timing assembly
+    # boundary (finalization of the result for return; the remaining
+    # statements are diagnostic prints only).
+    _exec_exit_wall_ns = time.time_ns()
+    _result_received_to_return_ms: Any = None
+    if _local_result_received_wall_ns is not None:
+        _delta_return_ns = _exec_exit_wall_ns - _local_result_received_wall_ns
+        if _delta_return_ns >= 0:
+            _result_received_to_return_ms = round(_delta_return_ns / 1_000_000, 3)
+    # dispatch → remote modal entry (actual submission → first method entry).
+    _dispatch_to_modal_entry_ms: Any = None
+    for _entry_name in ("remote_method_entry", "modal_method_entry", "run_plan_method_first_line"):
+        _dispatch_to_modal_entry_ms = _host_boundary_field(
+            merged_trace, _entry_name, _local_modal_submission_attempt_ns,
+        )
+        if _dispatch_to_modal_entry_ms is not None:
+            break
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _transport_meta.get("dispatch_to_modal_entry_ms")
+    if _dispatch_to_modal_entry_ms is None:
+        _dispatch_to_modal_entry_ms = _origin.get("dispatch_to_modal_entry_ms")
+    # passthrough modal_restore_begin_wall_unix_ns — forwarded only; never
+    # computed here (a separate lane feeds it into the result/timing dicts).
+    _modal_restore_begin_wall_unix_ns: Any = None
+    _mrb_timing = result.get("_restore_timing") if isinstance(result, dict) else None
+    if not isinstance(_mrb_timing, dict):
+        _mrb_timing = {}
+    for _mrb_val in (
+        (result.get("modal_restore_begin_wall_unix_ns") if isinstance(result, dict) else None),
+        _mrb_timing.get("modal_restore_begin_wall_unix_ns"),
+        _origin.get("modal_restore_begin_wall_unix_ns"),
+        _transport_meta.get("modal_restore_begin_wall_unix_ns"),
+    ):
+        if _mrb_val is not None:
+            _modal_restore_begin_wall_unix_ns = _mrb_val
+            break
+
     # Flatten key stage-attribution fields directly under local_timing
     # (benchmark consumers read these top-level keys). Nested dict kept for compat.
     _sar = _stage_attribution_residual_ms
@@ -2128,6 +3137,22 @@ async def execute_plan(
         "modal_method_entry_to_executor_ms": _modal_method_entry_to_executor_ms,
         "submission_to_remote_python_resume_ms": _submission_to_remote_python_resume_ms,
         "unexplained_pre_remote_ms": _unexplained_pre_remote_ms,
+        # Host-side result-receipt boundary (additive; existing keys untouched)
+        "local_result_received_wall_ns": _local_result_received_wall_ns,
+        "local_result_received_mono_ns": _local_result_received_mono_ns,
+        "local_receive_to_result_return_ms": _local_receive_to_result_return_ms,
+        "result_received_to_return_ms": _result_received_to_return_ms,
+        # Remote emit → local receipt (direct remote result emission boundary;
+        # never inferred from an output-encode tail).
+        "remote_result_emit_wall_unix_ns": _remote_result_emit_wall_ns,
+        "remote_result_emit_to_local_receipt_ms": _remote_result_emit_to_local_receipt_ms,
+        # Dedicated caller-return boundary (stamped at the return site after
+        # all local trace merge/timing processing; filled immediately before
+        # execute_plan returns so it measures the true post-receipt tail).
+        "caller_return_wall_unix_ns": None,
+        "caller_return_mono_ns": None,
+        "local_result_received_to_caller_return_ms": None,
+        "modal_restore_begin_wall_unix_ns": _modal_restore_begin_wall_unix_ns,
     }
     result["local_timing"] = _local_summary
     def _fmt_bd(v: Any) -> str:
@@ -2140,9 +3165,14 @@ async def execute_plan(
         f"trigger_source={_origin.get('trigger_source', 'unknown')} "
         f"local_prompt_enqueued_unix_ns={_origin.get('local_prompt_enqueued_wall_ns')} "
         f"local_prompt_ack_ready_unix_ns={_origin.get('local_prompt_ack_ready_wall_ns')} "
-        f"modal_generator_created_unix_ns={_transport_meta.get('modal_generator_created_wall_ns')} "
-        f"modal_submission_attempt_unix_ns={_transport_meta.get('modal_submission_attempt_wall_ns')} "
+        f"modal_generator_created_unix_ns={_fmt_bd(_local_modal_gen_created_ns)} "
+        f"modal_submission_attempt_unix_ns={_fmt_bd(_local_modal_submission_attempt_ns)} "
         f"modal_first_event_received_unix_ns={_transport_meta.get('modal_first_event_received_wall_ns')} "
+        f"modal_first_iteration_start_unix_ns={_fmt_bd(_local_modal_first_iter_start_ns)} "
+        f"modal_first_remote_event_unix_ns={_fmt_bd(_local_modal_first_remote_event_ns)} "
+        f"dispatch_to_modal_entry_ms={_fmt_bd(_dispatch_to_modal_entry_ms)} "
+        f"local_receive_to_actual_submission_ms={_fmt_bd(_t1_to_submission_ms)} "
+        f"local_receive_to_result_return_ms={_fmt_bd(_local_receive_to_result_return_ms)} "
         f"t0_to_t1_ms={_t0_to_t1_ms} t1_to_queue_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"local_receive_to_enqueue_ms={_origin.get('local_receive_to_enqueue_ms')} "
         f"queue_wait_before_worker_ms={_origin.get('queue_wait_before_worker_ms')} "
@@ -2259,15 +3289,77 @@ async def execute_plan(
         transport_meta=_transport_meta,
         plan_to_dict_count=1,
     )
-    _emit_breakdown_line("[v2.local_submission_breakdown.final]", _breakdown)
+    # ── Host-side transport boundaries (surfaced from merged trace events +
+    #    metadata backfill; rendered "absent" when missing) ──
+    _breakdown["modal_submission_attempt_unix_ns"] = _local_modal_submission_attempt_ns
+    _breakdown["modal_generator_created_unix_ns"] = _local_modal_gen_created_ns
+    _breakdown["modal_first_iteration_start_unix_ns"] = _local_modal_first_iter_start_ns
+    _breakdown["modal_first_remote_event_unix_ns"] = _local_modal_first_remote_event_ns
+    _breakdown["dispatch_to_modal_entry_ms"] = _dispatch_to_modal_entry_ms
+    _breakdown["local_receive_to_actual_submission_ms"] = _t1_to_submission_ms
+    _breakdown["local_receive_to_result_return_ms"] = _local_receive_to_result_return_ms
+    _emit_breakdown_line(
+        "[v2.local_submission_breakdown.final]",
+        _breakdown,
+        field_keys=LOCAL_SUBMISSION_FIELD_KEYS + _HOST_BOUNDARY_FIELD_KEYS,
+    )
     result["trace"] = remote_trace
     # Local fallback: finalize a waterfall if the remote path omitted one.
     # Idempotent — an existing valid remote report is preserved unchanged.
     try:
         from comfymodal_runtime.v2_waterfall import attach_waterfall
-        attach_waterfall(result, run_label="canonical execute_plan")
+        # Host-side fallback attach: the remote container already prints the
+        # waterfall render, and the host re-renders the reconciled table
+        # elsewhere, so suppress this duplicate render.
+        attach_waterfall(result, run_label="canonical execute_plan", print_render=False)
     except Exception:  # noqa: BLE001
         pass
+    # ── Dedicated caller-return boundary ──────────────────────────────
+    # Stamped immediately before execute_plan returns, after ALL local trace
+    # merge/timing processing, so local_result_received → caller return is
+    # measured exactly (distinct from remote emit → local receipt).
+    _caller_return_wall_ns = time.time_ns()
+    _caller_return_mono_ns = time.monotonic_ns()
+    runtime_trace.emit_at(
+        "execute_plan_return",
+        wall_unix_ns=_caller_return_wall_ns,
+        monotonic_ns=_caller_return_mono_ns,
+        process="local",
+        phase="transport",
+        metadata={"request_id": runtime_trace.request_id},
+    )
+    _lt = result.get("local_timing")
+    if isinstance(_lt, dict):
+        _lt["caller_return_wall_unix_ns"] = _caller_return_wall_ns
+        _lt["caller_return_mono_ns"] = _caller_return_mono_ns
+        _local_result_received_to_caller_return_ms: Any = None
+        if (
+            isinstance(_local_result_received_mono_ns, (int, float))
+            and _caller_return_mono_ns >= _local_result_received_mono_ns
+        ):
+            _local_result_received_to_caller_return_ms = round(
+                (_caller_return_mono_ns - _local_result_received_mono_ns) / 1_000_000, 3
+            )
+        _lt["local_result_received_to_caller_return_ms"] = _local_result_received_to_caller_return_ms
+    _rt_meta = result.get("trace")
+    if isinstance(_rt_meta, dict) and isinstance(_rt_meta.get("metadata"), dict):
+        _rt_meta["metadata"].setdefault("caller_return_wall_unix_ns", _caller_return_wall_ns)
+        _rt_meta["metadata"].setdefault("caller_return_mono_ns", _caller_return_mono_ns)
+    # Surface the caller-return boundary in the final merged trace event list
+    # (the serialized merged trace was snapshotted before this stamp, so append
+    # it the same way the remote result-emit boundary is carried).
+    if isinstance(_rt_meta, dict) and isinstance(_rt_meta.get("events"), list):
+        _rt_meta["events"].append({
+            "name": "execute_plan_return",
+            "process": "local",
+            "phase": "transport",
+            "wall_unix_ns": _caller_return_wall_ns,
+            "monotonic_ns": _caller_return_mono_ns,
+            "request_id": runtime_trace.request_id,
+            "container_session_id": _rt_meta.get("container_session_id", ""),
+            "trace_id": _rt_meta.get("trace_id", ""),
+            "metadata": {"request_id": runtime_trace.request_id},
+        })
     return result
 
 
@@ -2277,435 +3369,3 @@ async def execute_plan(
 
 
 # ---------------------------------------------------------------------------
-# Prepare-only variant (for callers that need to stream events themselves)
-# ---------------------------------------------------------------------------
-
-
-async def prepare_modal_execution(
-    workflow: dict,
-    *,
-    prompt_id: str,
-    client_id: str = "",
-    input_images: dict[str, str] | None = None,
-    modal_options: dict | None = None,
-    production_report: dict | None = None,
-    gpu: str | None = None,
-    workspace: dict | None = None,
-    trace_payload: dict | None = None,
-    profile_setter: Callable[..., Any] | None = None,
-    profile_checker: Callable[..., Any] | None = None,
-    run_trace: RunTrace | None = None,
-    comfyui_root: str = "",
-) -> dict[str, Any]:
-    """Prepare a Modal execution — same pre-work as ``execute_modal_prompt``,
-    but returns a dict of prepared arguments instead of calling
-    ``run_prompt_stream``.  The caller can then iterate ``run_prompt_stream``
-    with these arguments and forward events as needed.
-
-    Returns::
-
-        {
-            "input_images": {...},
-            "trace": {...},
-            "production_report": {...},
-            "modal_options": {...},
-            "gpu": ...,
-            "workspace": ...,
-            "profile_result": {...},   # from prepare_active_next_profile
-        }
-    """
-    if run_trace is not None:
-        run_trace.begin("prepare_modal_execution")
-
-    try:
-        # 1. Workflow integrity — compute hash once, reuse for activation
-        current_hash = prompt_sha256(workflow)
-        expected_hash = trace_payload.get("workflow_hash", "") if trace_payload else ""
-
-        if run_trace is not None:
-            run_trace.count("full_workflow_hash_count", 1)
-
-        if expected_hash and current_hash != expected_hash:
-            raise RuntimeError(
-                f"Workflow hash mismatch: expected {expected_hash[:12]}..., got {current_hash[:12]}..."
-            )
-
-        # Stash the workflow hash for activation and metadata
-        _activation_workflow_hash = current_hash
-
-        # Skip API prompt structure validation when a production report is
-        # present — the compiler has already validated structural integrity.
-        # Non-fatal for synthetic fixtures / test / warmup workflows.
-        _skip_validation = bool(
-            production_report
-            and isinstance(production_report, dict)
-            and production_report.get("enabled")
-        )
-        if not _skip_validation:
-            try:
-                assert_valid_api_prompt_structure(workflow)
-            except Exception:
-                pass
-        _validate_class_types(workflow, production_report)
-
-        # 2. Model stack / prompt summary (single call boundary)
-        model_stack = extract_model_stack(workflow) if hasattr(extract_model_stack, "__call__") else {}
-        prompt_summary = summarize_prompt_fields(workflow) if hasattr(summarize_prompt_fields, "__call__") else {}
-
-        if run_trace is not None:
-            run_trace.count("model_stack_extract_count", 1)
-            run_trace.count("model_stack_nodes", len(model_stack))
-            _node_count = sum(
-                1 for n in workflow.values()
-                if isinstance(n, dict) and isinstance(n.get("class_type"), str) and n["class_type"]
-            )
-            run_trace.count("workflow_nodes", _node_count)
-            # Record used node classes (no prompt content)
-            _used_classes = sorted(set(
-                n.get("class_type", "") for n in workflow.values()
-                if isinstance(n, dict) and isinstance(n.get("class_type"), str)
-            ))
-            run_trace.count("used_node_class_count", len(_used_classes))
-            run_trace.record_payload_size("used_node_classes_key_bytes", len(json.dumps(_used_classes)))
-            # Store canonical metadata (no workflow/image bytes)
-            run_trace.set_meta(
-                model_stack_nodes=len(model_stack),
-                model_stack=model_stack,
-                prompt_summary=prompt_summary,
-                workflow_nodes=_node_count,
-                used_node_classes=_used_classes,
-                prompt_id=prompt_id,
-                client_id=client_id,
-            )
-
-        # 3. Input image collection (caller may pre-provide)
-        if input_images is None:
-            input_images = _collect_input_images(workflow, comfyui_root) if comfyui_root else {}
-        if run_trace is not None:
-            if input_images:
-                run_trace.record_payload_size("input_images_bytes", sum(
-                    len(base64.b64decode(d)) for d in input_images.values()
-                ))
-            run_trace.count("input_images", len(input_images or {}))
-
-        # 4. Canonical hashes validation (compile was done by execute_modal_prompt if needed)
-        _production_enabled = bool(
-            production_report and isinstance(production_report, dict) and production_report.get("enabled")
-        )
-        if _production_enabled:
-            compiled_hash = production_report.get("compiled_workflow_hash", "")
-            if compiled_hash:
-                actual_hash = current_hash
-                if actual_hash and actual_hash != compiled_hash:
-                    _src_h = production_report.get("source_workflow_hash", "")[:8]
-                    raise AssertionError(
-                        f"[canonical_execution] production dispatch hash mismatch: "
-                        f"source={_src_h} compiled={compiled_hash[:8]} "
-                        f"dispatch={actual_hash[:8]}. Recompile."
-                    )
-
-        if run_trace is not None:
-            run_trace.count("production_enabled", 1 if _production_enabled else 0)
-
-        # 5. Active-next profile preparation (single call boundary)
-        if run_trace is not None:
-            run_trace.begin("prepare_active_next_profile")
-            run_trace.count("active_profile_prepare_count", 1)
-
-        _prod_opts_for_activation: dict | None = None
-
-        if production_report and isinstance(production_report, dict) and production_report.get("enabled"):
-            # Use production report's source hash — no recomputation needed
-            _activation_workflow_hash = production_report.get("source_workflow_hash", _activation_workflow_hash)
-            _prod_opts_for_activation = {
-                "enabled": True,
-                "output_node_ids": production_report.get("output_node_ids", []),
-                "bypass_node_ids": production_report.get("bypass_node_ids", []),
-                "source_workflow_hash": production_report.get("source_workflow_hash", ""),
-                "compiled_workflow_hash": production_report.get("compiled_workflow_hash", ""),
-                "production_plan_hash": production_report.get("production_plan_hash", ""),
-                "compiler_version": production_report.get("compiler_version", COMPILER_SCHEMA_VERSION),
-                "hash_schema_version": production_report.get("hash_schema_version", HASH_SCHEMA_VERSION),
-                "production_plan_schema_version": production_report.get("production_plan_schema_version", PRODUCTION_PLAN_SCHEMA_VERSION),
-            }
-
-        _pn_result = await prepare_active_next_profile(
-            workflow,
-            _activation_workflow_hash,
-            production_options=_prod_opts_for_activation,
-            workspace=workspace,
-            setter=profile_setter,
-            checker=profile_checker,
-        )
-
-        if run_trace is not None:
-            run_trace.end("prepare_active_next_profile")
-            run_trace.record_payload_size("active_profile_payload_bytes", _pn_result.get("payload_bytes", 0))
-            # Store canonical metadata for every run (production-disabled included).
-            # No full workflow/image bytes — only hashes, model stack, and env fields.
-            _prod_meta: dict[str, Any] = {}
-            # Source/compiled hashes: from production report when enabled,
-            # otherwise fall back to the current dispatch hash.
-            if _production_enabled:
-                _prod_meta["source_workflow_hash"] = production_report.get("source_workflow_hash", current_hash)
-                _prod_meta["compiled_workflow_hash"] = production_report.get("compiled_workflow_hash", current_hash)
-                _prod_meta["production_plan_hash"] = production_report.get("production_plan_hash", "")
-                _prod_meta["output_node_ids"] = production_report.get("output_node_ids", [])
-                _prod_meta["compiler_version"] = production_report.get("compiler_version", 0)
-                _prod_meta["hash_schema_version"] = production_report.get("hash_schema_version", 0)
-            else:
-                _prod_meta["source_workflow_hash"] = current_hash
-                _prod_meta["compiled_workflow_hash"] = current_hash
-                _prod_meta["production_plan_hash"] = ""
-                _prod_meta["output_node_ids"] = []
-                _prod_meta["compiler_version"] = 0
-                _prod_meta["hash_schema_version"] = 0
-            # GPU selection
-            _prod_meta["selected_gpu"] = gpu or ""
-            # Placement/correlation fields — read env-gated region/cloud without enabling placement
-            _prod_meta["region"] = os.environ.get("COMFYMODAL_COMPUTE_REGION", "").strip()
-            _prod_meta["cloud"] = os.environ.get("COMFYMODAL_COMPUTE_CLOUD", "").strip()
-            _prod_meta["min_containers"] = 0
-            _prod_meta["scaledown_window"] = 4
-            # Allocated GPU / session fields (empty when not available at trace time)
-            _prod_meta["allocated_gpu"] = ""
-            _prod_meta["container_session"] = ""
-            _prod_meta["restore_session"] = ""
-            _prod_meta["request_sequence"] = 0
-            # Workspace metadata
-            if workspace and isinstance(workspace, dict):
-                for _wk in ("id", "workspace_id", "cloud", "region"):
-                    _wv = workspace.get(_wk) or workspace.get(f"_{_wk}") or ""
-                    if _wv:
-                        _prod_meta[f"workspace_{_wk}"] = str(_wv)[:64]
-            # Run surface — already a RunTrace property, include explicitly for consumers
-            _prod_meta["run_surface"] = run_trace.run_surface
-            # Active profile preparation results (lane A) — always present
-            # for both production and non-production paths.
-            _prod_meta["local_active_profile_prepare_ms"] = _pn_result.get("local_active_profile_prepare_ms", 0.0)
-            _prod_meta["active_profile_publish_decision"] = _pn_result.get("active_profile_publish_decision", "")
-            _prod_meta["active_profile_stable_key"] = _pn_result.get("active_profile_stable_key", "")
-            _prod_meta["active_profile_token"] = _pn_result.get("active_profile_token", "")
-            _prod_meta["active_profile_remote_call"] = _pn_result.get("active_profile_remote_call", 0)
-            _prod_meta["active_profile_remote_ms"] = _pn_result.get("active_profile_remote_ms", 0.0)
-            run_trace.set_meta(**_prod_meta)
-
-        # 6. Pass caller modal_options through without reconstructing model-loading policy.
-        # Production output_node_ids are only set when a valid enabled production_report
-        # is explicitly provided by the caller.  No default production is injected.
-        _mo: dict = {}
-        if modal_options:
-            _mo = dict(modal_options)
-        if production_report and isinstance(production_report, dict) and production_report.get("enabled"):
-            _mo["production"] = {
-                "enabled": True,
-                "output_node_ids": production_report.get("output_node_ids", []),
-            }
-
-        if run_trace is not None:
-            run_trace.record_payload_size("modal_args_workflow_bytes", len(str(workflow)))
-
-        # Stash the computed dispatch hash so modal_client can skip recomputation
-        _trace_for_modal = dict(trace_payload or {})
-        _trace_for_modal["canonical_workflow_hash"] = current_hash
-
-        return {
-            "input_images": input_images or {},
-            "trace": _trace_for_modal,
-            "production_report": production_report or {},
-            "modal_options": _mo if _mo else {},
-            "gpu": gpu,
-            "workspace": workspace,
-            "profile_result": _pn_result,
-        }
-    finally:
-        if run_trace is not None:
-            run_trace.end("prepare_modal_execution")
-
-
-async def execute_modal_prompt(
-    workflow: dict,
-    *,
-    prompt_id: str,
-    client_id: str = "",
-    input_images: dict[str, str] | None = None,
-    modal_options: dict | None = None,
-    production_report: dict | None = None,
-    production_options: dict | None = None,
-    gpu: str | None = None,
-    workspace: dict | None = None,
-    trace_payload: dict | None = None,
-    profile_setter: Callable[..., Any] | None = None,
-    profile_checker: Callable[..., Any] | None = None,
-    run_trace: RunTrace | None = None,
-    comfyui_root: str = "",
-    event_sink: Callable[[str, dict[str, Any]], None] | None = None,
-    run_prompt_stream_fn: Callable[..., Any] | None = None,
-) -> dict[str, Any]:
-    """Execute a workflow on Modal and return the raw result.
-
-    Owns every step:
-    1. Workflow integrity (hash check, API structure, class types)
-    2. Model-stack extraction
-    3. Input-image collection
-    4. Production compile / canonical hashes (when *production_options* are
-       provided and *production_report* is not pre-compiled)
-    5. Active-next profile preparation
-    6. Run-prompt-options construction
-    7. Modal-arguments construction
-    8. ``modal_client.run_prompt_stream`` call
-    9. Result collection
-    10. Canonical trace / count merge
-
-    Parameters
-    ----------
-    workflow:
-        The workflow dict (source or already compiled).
-    prompt_id:
-        Unique prompt identifier.
-    client_id:
-        Client session identifier.
-    input_images:
-        Pre-collected base64-encoded input images.
-    modal_options:
-        User-provided modal options.
-    production_report:
-        Pre-compiled production report (when the caller already compiled).
-    production_options:
-        Production options (output_node_ids, etc.) — used when
-        *production_report* is not provided and the canonical executor
-        should perform compilation.
-    gpu:
-        Target GPU identifier.
-    workspace:
-        Modal workspace dict.
-    trace_payload:
-        Browser/client trace context.
-    profile_setter:
-        Callable for ``set_active_warmup_profile``.
-    run_trace:
-        ``RunTrace`` instance for instrumentation.
-    comfyui_root:
-        ComfyUI root path for image resolution.
-    event_sink:
-        Optional callback ``(event_type, payload)`` for forwarding
-        progress/status events without rebuilding the request.
-
-    **Caller** owns UI event forwarding, output materialization, and
-    history finalization.
-
-    Returns the raw result dict from Modal (``{"outputs": ..., "images": ...,
-    "trace": ...}``) on success or raises on failure.
-    """
-    if run_trace is not None:
-        run_trace.begin("execute_modal_prompt", reason="canonical")
-
-    try:
-        _wf = workflow
-
-        # ── Production compile (when not pre-compiled) — exactly once ──
-        _prod_report = production_report
-        _prod_opts = production_options
-        if _prod_report is None and _prod_opts and isinstance(_prod_opts, dict) and _prod_opts.get("enabled"):
-            if run_trace is not None:
-                run_trace.count("production_compile_count", 1)
-            from production_workflow import compile_production_workflow, normalize_production_options
-            _normalized = normalize_production_options(_prod_opts)
-            _plan = compile_production_workflow(
-                _wf, _normalized, allow_direct_output_rewrite=True
-            )
-            _prod_report = _plan.report
-            _wf = _plan.compiled_workflow
-            # Count the real deepcopy that production compile creates
-            if run_trace is not None:
-                run_trace.count("workflow_deepcopy_count", 1)
-
-        # model_stack_extract_count is counted inside prepare_modal_execution
-
-        # Delegate all pre-work to prepare_modal_execution
-        prepared = await prepare_modal_execution(
-            _wf,
-            prompt_id=prompt_id,
-            client_id=client_id,
-            input_images=input_images,
-            modal_options=modal_options,
-            production_report=_prod_report,
-            gpu=gpu,
-            workspace=workspace,
-            trace_payload=trace_payload,
-            profile_setter=profile_setter,
-            profile_checker=profile_checker,
-            run_trace=run_trace,
-            comfyui_root=comfyui_root,
-        )
-
-        _input_images = prepared["input_images"]
-        _trace = prepared["trace"]
-        _mo = prepared["modal_options"]
-
-        if run_trace is not None:
-            run_trace.count("run_prompt_stream_call_count", 1)
-            run_trace.count("modal_handle_lookup_count", 1)
-            # ── emit_local_summary exactly once before Modal generator invocation ──
-            # Stored in-memory in the trace payload (no file/database/remote logging).
-            _pre_submit_summary = run_trace.emit_local_summary()
-            run_trace.set_meta(_pre_submit_summary=_pre_submit_summary)
-            run_trace.begin("run_prompt_stream")
-
-        # 8. Call run_prompt_stream, collect result
-        _run_prompt_stream_fn = run_prompt_stream_fn
-        if _run_prompt_stream_fn is None:
-            from modal_client import run_prompt_stream as _run_prompt_stream_fn
-        _modal_result: dict | None = None
-        async for _msg in _run_prompt_stream_fn(
-            workflow=_wf,
-            input_images=_input_images,
-            trace=_trace,
-            production_report=_prod_report or {},
-            gpu=gpu,
-            modal_options=_mo,
-            workspace=workspace,
-        ):
-            # Forward non-terminal events through event_sink
-            if event_sink is not None and _msg.get("type") in ("progress", "status", "executing"):
-                event_sink(_msg["type"], _msg.get("data") or _msg.get("event") or _msg)
-            if _msg.get("type") == "result":
-                _modal_result = _msg.get("data")
-                break
-            elif _msg.get("type") == "error":
-                raise RuntimeError(_msg.get("message", "Modal execution error"))
-
-        if _modal_result is None:
-            raise RuntimeError("run_prompt_stream ended without result")
-
-        if run_trace is not None:
-            run_trace.end("run_prompt_stream")
-            _result_outputs = _modal_result.get("outputs", {}) if isinstance(_modal_result, dict) else {}
-            _result_images = _modal_result.get("images", []) if isinstance(_modal_result, dict) else []
-            run_trace.count("output_nodes", len(_result_outputs))
-            run_trace.count("output_images", len(_result_images))
-            # Record payload sizing (no prompt/image content)
-            if isinstance(_modal_result, dict):
-                run_trace.record_payload_size("result_outputs_bytes", len(json.dumps(_result_outputs)))
-                run_trace.record_payload_size("result_images_count", len(_result_images))
-
-        # 9. Merge canonical trace/counts
-        result = _modal_result
-        if isinstance(result, dict):
-            if run_trace is not None:
-                run_trace.merge_into_trace(
-                    result.setdefault("trace", {})
-                )
-            # Local fallback: finalize a waterfall if the remote path omitted
-            # one.  Idempotent — an existing valid remote report is preserved.
-            try:
-                from comfymodal_runtime.v2_waterfall import attach_waterfall
-                attach_waterfall(result, run_label="canonical execute_modal_prompt")
-            except Exception:  # noqa: BLE001
-                pass
-
-        return result
-
-    finally:
-        if run_trace is not None:
-            run_trace.end("execute_modal_prompt")

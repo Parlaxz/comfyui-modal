@@ -3,9 +3,12 @@
 Owns the per-checkpoint worker loop. One checkpoint is processed by one
 worker_invocation; a checkpoint is never split across workers. The actual
 remote execution is delegated to a `_RemoteInvoker` implementation
-(LocalRemoteInvoker wraps the existing modal_client.run_prompt_stream
-surface; the future comfyapp.py run_checkpoint_stream will provide a
-single-invocation implementation that satisfies the same protocol).
+(CheckpointStreamInvoker drives the comfyapp.py run_checkpoint_stream
+single-invocation surface; the V2 pipeline uses
+comfymodal_runtime.v2_experiment_invoker.V2ExperimentInvoker).
+
+H19 Wave G: the retired V1 ``LocalRemoteInvoker`` class was deleted
+(zero production registrations since H12).
 
 Conventions:
 - Every event appended to the journal includes (experiment_id, revision,
@@ -20,23 +23,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import json
 import os
-import time
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Callable, Protocol
 
-from timing_trace import TRACE_VERSION, Trace, coerce_t0_from_browser, extract_remote_timing_payload, merge_remote_trace_into
-from run_prompt_options import (
-    build_run_prompt_options,
-    ensure_run_prompt_options,
-)
 from worker_control import (
     ControlBackend,
     ModalDictControlBackend,
-    control_key,
 )
 
 
@@ -693,7 +687,7 @@ def _desired_map_stream_message(msg: dict, context: dict) -> dict | None:
     }
 
     # Inject total_nodes from context (truthful workflow node count, set by
-    # LocalRemoteInvoker from the resolved workflow dict, never from remote).
+    # the invoker from the resolved workflow dict, never from remote).
     total_nodes = context.get("total_nodes")
     if total_nodes is not None:
         detail["total_nodes"] = total_nodes
@@ -770,8 +764,9 @@ class CheckpointStreamEvent:
 # ── _RemoteInvoker protocol ──────────────────────────────────────────────
 
 class _RemoteInvoker(Protocol):
-    """Protocol for the remote executor. Implemented by LocalRemoteInvoker
-    in production; tests use a FakeInvoker."""
+    """Protocol for the remote executor. Implemented by
+    CheckpointStreamInvoker in production (and by the V2 pipeline's
+    ``V2ExperimentInvoker``); tests use a FakeInvoker."""
 
     async def open_worker(self, worker_invocation_id: str, checkpoint_id: str,
                           profile_id: str, workflow: dict, triple: dict) -> None: ...
@@ -904,6 +899,23 @@ class ExperimentRunner:
             ]
             terminal_payload["error"] = (ck_errors[-1] if ck_errors else "checkpoint failed")[:200]
         await self._emit(terminal_event, terminal_payload)
+        # History V2: persist the experiment terminal state (idempotent).
+        try:
+            if not self._compilation.get("run_history_id"):
+                from history_v2_writer import get_writer as _get_v2_writer
+                _v2_w = _get_v2_writer()
+                if _v2_w is not None:
+                    if self._stop_mode:
+                        _v2_status = "stopped"
+                    elif has_fatal_checkpoint:
+                        _v2_status = "failed"
+                    elif failed > 0:
+                        _v2_status = "completed_with_failures"
+                    else:
+                        _v2_status = "completed"
+                    _v2_w.finalize_experiment(self._compilation.get("experiment_id", ""), _v2_status)
+        except Exception:
+            pass
         return {"completed": completed, "failed": failed, "interrupted": interrupted, "total_cells": total_cells}
 
     async def _run_checkpoint(self, ck: dict, cells: list, sem: asyncio.Semaphore) -> None:
@@ -949,7 +961,7 @@ class ExperimentRunner:
                 # single-run path where controls were applied before compile),
                 # skip resolve_and_inject_cell — it would deep-copy the workflow
                 # and re-inject values, changing its canonical hash and failing
-                # the fail-closed hash guard in LocalRemoteInvoker.run_cell.
+                # the fail-closed dispatch hash guard.
                 profile_slots = ck.get("slots", {})
                 loader_target_groups = ck.get("loader_target_groups", [])
                 lora_slots = ck.get("lora_slots", [])
@@ -973,7 +985,7 @@ class ExperimentRunner:
                         cell["_resolved_lora_chain"] = resolved.lora_chain
                         # input_images is already built inside resolve_and_inject_cell.
                         # The canonical payload lives at cell["input_images"]; it is
-                        # consumed directly by LocalRemoteInvoker.run_cell and the
+                        # consumed directly by the invoker run_cell implementations and the
                         # remote-side run_checkpoint_stream / _materialize_input_images.
                         # Remove any stale _input_images field from a previous version.
                         cell.pop("_input_images", None)
@@ -1059,6 +1071,43 @@ class ExperimentRunner:
                         if tp:
                             cell_completed_payload["timing_payload"] = tp
                         await self._emit("cell.completed", cell_completed_payload)
+                    # History V2 mirror (Studio experiments; idempotent).
+                    if not self._compilation.get("run_history_id"):
+                        try:
+                            from history_v2_writer import get_writer as _get_v2_writer
+                            _v2_w = _get_v2_writer()
+                            if _v2_w is not None:
+                                _v2_tp = result.get("timing_payload")
+                                _v2_w.mirror_cell_terminal(
+                                    self._compilation.get("experiment_id", ""),
+                                    cell_key=str(cell.get("cell_key", "")),
+                                    attempt_id=str(attempt_id),
+                                    status="completed",
+                                    checkpoint_id=str(ck["id"]),
+                                    sequence=cell.get("sequence"),
+                                    axis_values=dict(cell.get("axis_values") or {}),
+                                    params={
+                                        "prompt": cell.get("prompt", ""),
+                                        "negative_prompt": cell.get("negative_prompt", ""),
+                                        "seed": cell.get("seed"),
+                                        "steps": cell.get("steps"),
+                                        "guidance": cell.get("guidance"),
+                                        "sampler": cell.get("sampler", ""),
+                                        "scheduler": cell.get("scheduler", ""),
+                                        "denoise": cell.get("denoise"),
+                                        "width": cell.get("width"),
+                                        "height": cell.get("height"),
+                                        "unet": cell.get("unet", ""),
+                                        "clip": cell.get("clip", ""),
+                                        "vae": cell.get("vae", ""),
+                                        "lora_chain": cell.get("lora_chain", []),
+                                    },
+                                    output_paths=[str(p) for p in (result.get("output_paths") or [])],
+                                    workflow_hash=str(cell.get("workflow_hash", "") or ck.get("workflow_hash", "") or ""),
+                                    timings=dict(_v2_tp) if isinstance(_v2_tp, dict) else None,
+                                )
+                        except Exception:
+                            pass
                     if result.get("status") == "completed":
                         ck_completed += 1
                     elif result.get("status") == "interrupted":
@@ -1069,7 +1118,7 @@ class ExperimentRunner:
                         # when the invoker failure provides any timing data.
                         # CheckpointStreamInvoker uses its own stream event
                         # sink (_on_remote_event) so this only fires for
-                        # LocalRemoteInvoker (Studio single runs).
+                        # the retired V1 invoker (Studio single runs; deleted H19).
                         if not hasattr(self._invoker, "_drive"):
                             cell_failed_payload = {
                                 "cell_key": cell.get("cell_key", ""),
@@ -1083,6 +1132,42 @@ class ExperimentRunner:
                             if tp:
                                 cell_failed_payload["timing_payload"] = tp
                             await self._emit("cell.failed", cell_failed_payload)
+                            # History V2 mirror (Studio experiments; idempotent).
+                            if not self._compilation.get("run_history_id"):
+                                try:
+                                    from history_v2_writer import get_writer as _get_v2_writer
+                                    _v2_w = _get_v2_writer()
+                                    if _v2_w is not None:
+                                        _v2_w.mirror_cell_terminal(
+                                            self._compilation.get("experiment_id", ""),
+                                            cell_key=str(cell.get("cell_key", "")),
+                                            attempt_id=str(attempt_id),
+                                            status="failed",
+                                            checkpoint_id=str(ck["id"]),
+                                            error=str(result.get("error", "Cell execution failed")),
+                                            sequence=cell.get("sequence"),
+                                            axis_values=dict(cell.get("axis_values") or {}),
+                                            params={
+                                                "prompt": cell.get("prompt", ""),
+                                                "negative_prompt": cell.get("negative_prompt", ""),
+                                                "seed": cell.get("seed"),
+                                                "steps": cell.get("steps"),
+                                                "guidance": cell.get("guidance"),
+                                                "sampler": cell.get("sampler", ""),
+                                                "scheduler": cell.get("scheduler", ""),
+                                                "denoise": cell.get("denoise"),
+                                                "width": cell.get("width"),
+                                                "height": cell.get("height"),
+                                                "unet": cell.get("unet", ""),
+                                                "clip": cell.get("clip", ""),
+                                                "vae": cell.get("vae", ""),
+                                                "lora_chain": cell.get("lora_chain", []),
+                                            },
+                                            output_paths=[],
+                                            workflow_hash=str(cell.get("workflow_hash", "") or ck.get("workflow_hash", "") or ""),
+                                        )
+                                except Exception:
+                                    pass
                 # Determine checkpoint completion type
                 if self._pause_requested:
                     final_type = "checkpoint.paused"
@@ -1135,399 +1220,6 @@ class ExperimentRunner:
         })
         # In a real runner, also send via PromptServer.send_sync here.
         # Tests verify the journal append; UI integration is Phase 9.
-
-
-# ── LocalRemoteInvoker (production wrapper) ─────────────────────────────
-
-class LocalRemoteInvoker:
-    """Production implementation of _RemoteInvoker. Wraps the existing
-    modal_client.run_prompt_stream surface."""
-
-    def __init__(self, modal_run_prompt_stream, experiment_id="", node_dir="",
-                 stream_event_sink=None, profile_preparer=None,
-                 gpu=None, modal_options=None, workspace=None,
-                 production_report=None,
-                 studio_output_dir=None):
-        self._run_prompt_stream = modal_run_prompt_stream
-        self._experiment_id = experiment_id
-        self._node_dir = Path(node_dir) if node_dir else Path(os.path.dirname(os.path.abspath(__file__)))
-        self._stream_event_sink = stream_event_sink
-        self._profile_preparer = profile_preparer
-        self._gpu = gpu
-        self._modal_options = modal_options
-        self._workspace = workspace
-        self._production_report = production_report  # global report for single-run
-        self._studio_output_dir = Path(studio_output_dir) if studio_output_dir else None
-        # Fix: track the asyncio task currently executing run_cell per worker
-        self._run_cell_tasks: dict[str, asyncio.Task] = {}
-        # Fix: track cancellation-requested workers
-        self._cancelled_workers: set[str] = set()
-
-    async def open_worker(self, worker_invocation_id, checkpoint_id, profile_id,
-                          workflow, triple) -> None:
-        return None
-
-    async def _save_output_images(self, result_data: dict, cell_key: str) -> list[str]:
-        """Save output images from a Modal result to disk and return URL paths.
-
-        Safety guarantees:
-        - Remote filenames are never trusted as-is; basename is sanitised.
-        - Only supported image extensions are accepted.
-        - Path traversal (``../``) is stripped.
-        - Each output gets a unique ``studio_<exp>_<cell>_<node>_<index>_<token>.<ext>``
-          filename so repeated remote names never overwrite.
-        - The original remote name is preserved in a ``_remote_filename``
-          diagnostic key in the result data.
-        """
-        import base64
-        import re
-        import secrets
-        from datetime import datetime
-
-        outputs = (result_data or {}).get("outputs", {})
-        saved_urls: list[str] = []
-        if self._studio_output_dir is not None:
-            output_dir = self._studio_output_dir
-        else:
-            output_dir = self._node_dir / "output" / "studio"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        supported_exts = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
-        diagnostic_meta: list[dict] = []
-
-        for node_id, node_outputs in outputs.items():
-            if not isinstance(node_outputs, dict):
-                continue
-            for _output_key, entries in node_outputs.items():
-                if not isinstance(entries, list):
-                    continue
-                for idx, img in enumerate(entries):
-                    if isinstance(img, dict):
-                        remote_fname = img.get("filename", "")
-                        image_data = img.get("data", "")
-                    elif isinstance(img, str):
-                        remote_fname = ""
-                        image_data = img
-                    else:
-                        continue
-                    if not image_data:
-                        continue
-
-                    # ── Sanitise remote filename ──────────────────────────
-                    # Use only the basename portion (strip directory components)
-                    safe_basename = Path(remote_fname).name if remote_fname else ""
-                    # Check extension is a supported image type
-                    ext = Path(safe_basename).suffix.lower()
-                    if ext not in supported_exts:
-                        ext = ".png"  # fallback default
-                    # Sanitise the stem: keep only alphanumeric, underscore, hyphen
-                    stem = Path(safe_basename).stem if safe_basename else f"{node_id}_{idx}"
-                    stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)[:64]
-
-                    # ── Generate unique local filename ─────────────────────
-                    token = secrets.token_hex(4)
-                    local_fname = (
-                        f"studio_{self._experiment_id}_{cell_key}_"
-                        f"{node_id}_{idx}_{token}{ext}"
-                    )
-                    filepath = output_dir / local_fname
-
-                    # Never overwrite (extremely unlikely with token, but be safe)
-                    counter = 0
-                    while filepath.exists():
-                        counter += 1
-                        local_fname = (
-                            f"studio_{self._experiment_id}_{cell_key}_"
-                            f"{node_id}_{idx}_{token}_{counter}{ext}"
-                        )
-                        filepath = output_dir / local_fname
-
-                    image_bytes = base64.b64decode(image_data)
-                    filepath.write_bytes(image_bytes)
-                    saved_urls.append(local_fname)
-
-                    # Preserve original remote name in diagnostics
-                    if remote_fname:
-                        diagnostic_meta.append({
-                            "local": local_fname,
-                            "remote": remote_fname,
-                        })
-
-        # Attach diagnostic metadata back to result_data for traceability
-        if diagnostic_meta:
-            result_data.setdefault("_image_save_diagnostics", []).extend(diagnostic_meta)
-
-        return saved_urls
-
-    async def run_cell(self, worker_invocation_id, cell) -> dict:
-        # Fix: short-circuit if cancellation was requested before entering the stream
-        if worker_invocation_id in self._cancelled_workers:
-            return {"status": "interrupted", "cell_key": cell.get("cell_key", ""),
-                    "error": "cancelled"}
-
-        # Fix: track the current task so cancel_worker can interrupt it
-        _current_task = asyncio.current_task()
-        if _current_task is not None:
-            self._run_cell_tasks[worker_invocation_id] = _current_task
-        # Initialise holders so the exception path can check None
-        # instead of probing NameError/UnboundLocalError.
-        _last_remote_data: dict | None = None
-        _local_timing_summary: dict | None = None
-        try:
-            raw = cell.get("input_images") or {}
-            flat = {}
-            for filename, entry in raw.items():
-                if isinstance(entry, dict) and "data" in entry:
-                    flat[filename] = entry["data"]
-                elif isinstance(entry, str):
-                    flat[filename] = entry
-
-            # ── Establish local trace from browser context ────────────────
-            # The cell carries a "trace" dict with browser timestamps.
-            # Build a single mutable dict that we pass to run_prompt_stream
-            # AND use for local markers — so both sides see the same t0.
-            trace_ctx = cell.get("trace")
-            _mutable_trace: dict = {}
-            if isinstance(trace_ctx, dict):
-                _mutable_trace.update(trace_ctx)
-            # Also build a Trace object for the local summary (backward compat)
-            local_trace = Trace(cell.get("cell_key", ""), t0=coerce_t0_from_browser(_mutable_trace))
-            local_trace.update(_mutable_trace)
-
-            # Stage: scheduler_execution_started (cell execution entry)
-            _now = time.time()
-            local_trace.mark("scheduler_execution_started")
-            _mutable_trace.setdefault("scheduler_execution_started", _now)
-
-            # Resolved workflow is available
-            _resolved_wf = cell.get("_resolved_workflow", cell.get("_workflow", {}))
-            local_trace.mark("t5_workflow_materialized")
-            local_trace.mark("workflow_materialization_completed")
-            _mutable_trace["t5_workflow_materialized"] = local_trace.get("t5_workflow_materialized")
-            _mutable_trace["workflow_materialization_completed"] = local_trace.get("workflow_materialization_completed")
-
-            # ── Delegate to canonical executor ──
-            # execute_modal_prompt handles: production compile (if not
-            # pre-compiled), hash validation, model-stack extraction,
-            # profile preparation, run-prompt-options construction, and
-            # the run_prompt_stream call with event forwarding.
-            # This replaces the pre-work (preparer, hash validation,
-            # options building) and the stream loop that previously
-            # lived here.  No second modal invocation is created.
-
-            # Select per-cell or global production options/report.
-            _cell_report = cell.get("production_report")
-            _cell_prod_opts = cell.get("production_options")
-            _effective_prod_report = _cell_report if _cell_report is not None else self._production_report
-            _effective_prod_opts = _cell_prod_opts if _cell_prod_opts else (
-                self._modal_options.get("production") if self._modal_options else None
-            )
-
-            # Event sink: forward progress/status events to the existing
-            # stream_event_sink AND record timing markers.
-            # This is a sync callback (execute_modal_prompt expects sync)
-            # so async forwarding uses fire-and-forget via ensure_future.
-            _first_event = True
-            _sink_seq = 0
-
-            def _canonical_event_sink(event_type: str, payload: dict) -> None:
-                nonlocal _first_event, _sink_seq
-                if _first_event:
-                    local_trace.mark("first_remote_message_received")
-                    local_trace.mark("first_remote_event")
-                    local_trace.mark("t7_local_first_remote_event")
-                    _mutable_trace["first_remote_message_received"] = local_trace.get("first_remote_message_received")
-                    _mutable_trace["first_remote_event"] = local_trace.get("first_remote_event")
-                    _mutable_trace["t7_local_first_remote_event"] = local_trace.get("t7_local_first_remote_event")
-                    _first_event = False
-                # Forward to existing stream_event_sink with normalized mapping
-                if self._stream_event_sink is not None and event_type in ("progress", "status"):
-                    try:
-                        _workflow = cell.get("_resolved_workflow", cell.get("_workflow", {}))
-                        _total_nodes = len(_workflow) if isinstance(_workflow, dict) else None
-                        normalized = _desired_map_stream_message(
-                            {"type": event_type, **payload},
-                            {
-                                "experiment_id": self._experiment_id,
-                                "checkpoint_id": cell.get("checkpoint_id", ""),
-                                "cell_key": cell.get("cell_key", ""),
-                                "attempt_id": cell.get("attempt_id", ""),
-                                "total_nodes": _total_nodes,
-                            },
-                        )
-                        if normalized is not None:
-                            _sink_seq += 1
-                            normalized["detail"]["sequence"] = _sink_seq
-                            # Fire-and-forget: async sink must not block the sync callback
-                            asyncio.ensure_future(self._stream_event_sink(normalized["detail"]))
-                    except Exception:
-                        pass
-
-            from canonical_execution import execute_modal_prompt as _canonical_exec
-            from canonical_execution import RunTrace as _RunTrace
-
-            # Collect input images for canonical executor
-            _canonical_input_images = flat if flat else None
-
-            # Profile setter/checker for the canonical executor (matches direct_studio_run_completion pattern)
-            try:
-                from modal_client import set_active_warmup_profile as _canonical_profile_setter
-                from modal_client import check_active_warmup_profile as _canonical_profile_checker
-            except ImportError:
-                _canonical_profile_setter = None
-                _canonical_profile_checker = None
-
-            # ── Create RunTrace for this cell ──────────────────────────────
-            # Use a stable trace_id from _mutable_trace when present.
-            _cell_trace_id = _mutable_trace.get("trace_id", "")
-            _cell_run_id = _mutable_trace.get("run_id", cell.get("cell_key", "exp_cell"))
-            _cell_run_trace = _RunTrace(
-                trace_id=_cell_trace_id,
-                run_id=_cell_run_id,
-                prompt_id=cell.get("cell_key", "exp_cell"),
-                run_surface="experiment",
-            )
-            _cell_run_trace.begin("local_remote_invoker_run_cell", reason="experiment_cell")
-
-            # Call canonical executor (single path — no second compile/stream)
-            _remote_submit = time.time()
-            local_trace.mark("remote_submit")
-            local_trace.mark("t2_local_modal_submit_start")
-            _mutable_trace["remote_submit"] = _remote_submit
-            _mutable_trace["t2_local_modal_submit_start"] = _remote_submit
-            _mutable_trace.setdefault("t2_local_dispatch", _remote_submit)
-
-            # Derive comfyui_root from node_dir for LoadImage collection.
-            # node_dir = <comfyui_root>/custom_nodes/comfyui-modal
-            _comfyui_root = str(self._node_dir.parent.parent) if self._node_dir else ""
-
-            data = await _canonical_exec(
-                _resolved_wf,
-                prompt_id=cell.get("cell_key", "exp_cell"),
-                client_id="",
-                input_images=_canonical_input_images,
-                modal_options=self._modal_options,
-                production_report=_effective_prod_report,
-                production_options=_effective_prod_opts,
-                gpu=self._gpu,
-                workspace=self._workspace,
-                trace_payload=_mutable_trace,
-                profile_setter=_canonical_profile_setter,
-                profile_checker=_canonical_profile_checker,
-                comfyui_root=_comfyui_root,
-                event_sink=_canonical_event_sink,
-                run_trace=_cell_run_trace,
-                run_prompt_stream_fn=self._run_prompt_stream,
-            )
-
-            # ── Merge RunTrace summary into result trace ──────────────────
-            _cell_run_trace.end("local_remote_invoker_run_cell", reason="experiment_cell_complete")
-            if isinstance(data, dict):
-                _data_trace = data.setdefault("trace", {})
-                _cell_run_trace.merge_into_trace(_data_trace)
-
-            # ── Result processing (preserves existing output/timing path) ──
-            _last_remote_data = data
-            local_trace.mark("result_received")
-            local_trace.mark("remote_result_received")
-            local_trace.mark("t8_local_result_received")
-            _mutable_trace["result_received"] = local_trace.get("result_received")
-
-            remote_trace_data = data.get("trace", {}) or {}
-            local_stages = dict(local_trace.fields())
-            local_summary: dict[str, Any] = {
-                "stages": local_stages,
-                "deltas_ms": {},
-                "derived_ms": {},
-                "trace_version": TRACE_VERSION,
-            }
-            merge_remote_trace_into(local_summary, remote_trace_data)
-            _local_timing_summary = local_summary
-
-            saved = await self._save_output_images(data, cell.get("cell_key", "unknown"))
-            local_trace.mark("output_materialized")
-            local_trace.mark("t9_local_materialized")
-            local_trace.mark("t10_local_materialized")
-            _mutable_trace["output_materialized"] = local_trace.get("output_materialized")
-            result = {
-                "status": "completed",
-                "result": data,
-                "output_paths": saved,
-                "execution_mode": (self._modal_options or {}).get("execution_mode", "v1"),
-                "execution_mode_source": (self._modal_options or {}).get("execution_mode_source", "request"),
-            }
-
-            # ── Merge mutable-trace markers back into local_trace ──
-            if isinstance(_mutable_trace, dict):
-                for _mk, _mv in _mutable_trace.items():
-                    if isinstance(_mk, str) and isinstance(_mv, (int, float)) and local_trace.get(_mk) is None:
-                        local_trace.mark(_mk, _mv)
-
-            # ── Derive local materialization wall time ───────────
-            _t8 = local_trace.get("t8_local_result_received")
-            _t10 = local_trace.get("t10_local_materialized")
-            if _t8 is not None and _t10 is not None:
-                _mat_ms = round((_t10 - _t8) * 1000, 2)
-                if _mat_ms >= 0:
-                    local_summary.setdefault("derived_ms", {})["local_output_materialization_ms"] = _mat_ms
-
-            # ── Add semantic aliases from remote trace ──────────
-            _remote_stages = remote_trace_data.get("stages", {}) or {}
-            if isinstance(_remote_stages, dict):
-                _t3 = _remote_stages.get("t3_modal_entry")
-                if _t3 is not None:
-                    local_summary.setdefault("stages", {})["remote_method_entered"] = _t3
-            _restore_blk = data.get("_restore_timing", {}) or {}
-            _rs = _restore_blk.get("restore_start_unix_s")
-            _re = _restore_blk.get("restore_end_unix_s")
-            if _rs is not None:
-                local_summary.setdefault("stages", {})["app_restore_started"] = _rs
-            if _re is not None:
-                local_summary.setdefault("stages", {})["app_restore_completed"] = _re
-
-            # ── Snapshot stages AFTER all markers are set ──────────
-            _final_stages = dict(local_trace.fields())
-            local_summary["stages"].update(_final_stages)
-
-            # Extract compact timing payload from data, then embed
-            # the merged trace as the canonical trace record.
-            merged_payload = extract_remote_timing_payload(data)
-            merged_payload["trace"] = local_summary
-            if merged_payload:
-                result["timing_payload"] = merged_payload
-            return result
-
-        except Exception as exc:
-            result: dict[str, Any] = {"status": "failed", "error": str(exc)}
-            # Preserve any partial timing accumulated before the crash.
-            if _last_remote_data is not None:
-                tp = extract_remote_timing_payload(_last_remote_data)
-                if tp:
-                    result["timing_payload"] = tp
-                if _local_timing_summary is not None:
-                    result.setdefault("timing_payload", {})["trace"] = _local_timing_summary
-            return result
-        finally:
-            # Fix: clean task tracking in finally block
-            if self._run_cell_tasks.get(worker_invocation_id) is _current_task:
-                self._run_cell_tasks.pop(worker_invocation_id, None)
-
-    async def close_worker(self, worker_invocation_id) -> None:
-        # Fix: clean up cancelled state so it's safe and idempotent
-        self._cancelled_workers.discard(worker_invocation_id)
-        self._run_cell_tasks.pop(worker_invocation_id, None)
-
-    async def cancel_worker(self, worker_invocation_id) -> None:
-        # Fix: mark the worker and cancel the active run_cell task
-        self._cancelled_workers.add(worker_invocation_id)
-        task = self._run_cell_tasks.get(worker_invocation_id)
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-
-    async def request_pause(self, worker_invocation_id: str) -> None:
-        return None
-
-    async def request_stop_after_current(self, worker_invocation_id: str) -> None:
-        return None
 
 
 # ── CheckpointStreamInvoker (real single-invocation) ─────────────────────

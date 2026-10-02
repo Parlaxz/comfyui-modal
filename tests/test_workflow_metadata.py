@@ -1,15 +1,21 @@
 import unittest
 
+import pytest
+
 from workflow_metadata import (
     extract_model_stack,
+    extract_ui_graph_model_refs,
     extract_warmup_stack,
     extract_workflow_model_refs,
+    iter_graph_nodes,
     normalize_flux_clip_pair,
     prompt_sha256,
     stack_to_warmup_profile,
     summarize_prompt_fields,
     warmup_profile_matches_stack,
 )
+
+pytestmark = pytest.mark.fast_unit
 
 
 WORKFLOW_A = {
@@ -135,6 +141,54 @@ class WorkflowMetadataTests(unittest.TestCase):
         })
         self.assertEqual(refs, [{"role": "clip", "filename": "clip_l.safetensors"}])
 
+    # ── Generic custom-loader extraction (nonstandard Donut-style loaders) ──
+
+    def test_extract_model_refs_custom_checkpoint_loader(self):
+        refs = extract_workflow_model_refs({
+            "1": {
+                "class_type": "DonutCheckpointLoader",
+                "inputs": {"model_name": "donut_base.safetensors"},
+            },
+        })
+        self.assertEqual(refs, [{"role": "model", "filename": "donut_base.safetensors"}])
+
+    def test_extract_model_refs_custom_loader_role_from_input_token(self):
+        refs = extract_workflow_model_refs({
+            "1": {"class_type": "DonutLoader", "inputs": {"vae_file": "donut_vae.safetensors"}},
+            "2": {"class_type": "DonutLoader", "inputs": {"unet_name": "donut_unet.safetensors"}},
+        })
+        self.assertIn({"role": "vae", "filename": "donut_vae.safetensors"}, refs)
+        self.assertIn({"role": "unet", "filename": "donut_unet.safetensors"}, refs)
+
+    def test_extract_model_refs_preserves_path_like_filenames(self):
+        refs = extract_workflow_model_refs({
+            "1": {
+                "class_type": "DonutLoader",
+                "inputs": {"model_path": "subdir/donut_base.safetensors"},
+            },
+        })
+        self.assertEqual(refs, [{"role": "model", "filename": "subdir/donut_base.safetensors"}])
+
+    def test_extract_model_refs_ignores_prompts_and_urls(self):
+        refs = extract_workflow_model_refs({
+            "1": {"class_type": "DonutLoader", "inputs": {"text": "a photo of a cat.safetensors"}},
+            "2": {"class_type": "DonutLoader", "inputs": {"url": "https://example.com/base.safetensors"}},
+            "3": {"class_type": "DonutLoader", "inputs": {"model_url": "http://example.com/base.ckpt"}},
+        })
+        self.assertEqual(refs, [])
+
+    def test_extract_model_refs_ignores_extensions_without_model_hint(self):
+        refs = extract_workflow_model_refs({
+            "1": {"class_type": "SomePromptNode", "inputs": {"text": "notes.ckpt"}},
+        })
+        self.assertEqual(refs, [])
+
+    def test_extract_model_refs_ignores_non_model_extensions(self):
+        refs = extract_workflow_model_refs({
+            "1": {"class_type": "DonutLoader", "inputs": {"model_name": "readme.txt"}},
+        })
+        self.assertEqual(refs, [])
+
     # ── Bounded CLIP extraction acceptance ──────────────────────────────
 
     def test_clip_extraction_acceptance(self):
@@ -191,3 +245,305 @@ class WorkflowMetadataTests(unittest.TestCase):
             finally:
                 sys.stdout = old_stdout
         self.assertIn("COMFYMODAL_WARMUP_CLIP2=\n", out)
+
+    # ── Captured UI/static graph named-widget extraction ────────────────
+
+    def test_ui_graph_named_widgets_standard_loader(self):
+        refs = extract_ui_graph_model_refs({
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "inputs": [],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {"ckpt_name": "donut_base.safetensors"},
+                },
+            ],
+        })
+        self.assertEqual(refs, [{"role": "checkpoint", "filename": "donut_base.safetensors"}])
+
+    def test_ui_graph_named_widgets_custom_loader(self):
+        refs = extract_ui_graph_model_refs({
+            "nodes": [
+                {
+                    "id": 2,
+                    "type": "DonutLoader",
+                    "inputs": [{"name": "clip", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {
+                        "model_name": "donut_base.safetensors",
+                        "vae_file": "donut_vae.safetensors",
+                    },
+                },
+            ],
+        })
+        self.assertIn({"role": "model", "filename": "donut_base.safetensors"}, refs)
+        self.assertIn({"role": "vae", "filename": "donut_vae.safetensors"}, refs)
+
+    def test_ui_graph_named_widgets_reject_urls_and_prompts(self):
+        refs = extract_ui_graph_model_refs({
+            "nodes": [
+                {
+                    "id": 3,
+                    "type": "DonutLoader",
+                    "inputs": [{"name": "clip", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets_values_named": {
+                        "text": "a photo of a cat.safetensors",
+                        "url": "https://example.com/base.safetensors",
+                        "model_url": "http://example.com/base.ckpt",
+                    },
+                },
+            ],
+        })
+        self.assertEqual(refs, [])
+
+    def test_ui_graph_equivalent_named_widget_fields(self):
+        refs = extract_ui_graph_model_refs({
+            "nodes": [
+                {
+                    "id": 4,
+                    "type": "DonutLoader",
+                    "inputs": [{"name": "clip", "link": None}],
+                    "outputs": [{"name": "MODEL"}],
+                    "widgets": [{"name": "unet_name", "value": "donut_unet.safetensors"}],
+                },
+            ],
+        })
+        self.assertEqual(refs, [{"role": "unet", "filename": "donut_unet.safetensors"}])
+
+    def test_ui_graph_virtual_panel_metadata_ignored(self):
+        refs = extract_ui_graph_model_refs({
+            "nodes": [
+                {
+                    "id": 5,
+                    "type": "DonutWorkflowPanel",
+                    "inputs": [],
+                    "outputs": [],
+                    "widgets_values_named": {"model_name": "ghost.safetensors"},
+                },
+            ],
+        })
+        self.assertEqual(refs, [])
+
+    def test_ui_graph_model_refs_never_raise_on_malformed(self):
+        self.assertEqual(extract_ui_graph_model_refs(None), [])
+        self.assertEqual(extract_ui_graph_model_refs({"nodes": "nope"}), [])
+        self.assertEqual(
+            extract_ui_graph_model_refs({"nodes": [None, "x", {"type": ""}, {}]}), []
+        )
+
+    # ── Recursive nested graph traversal ────────────────────────────────
+
+    def test_iter_graph_nodes_walks_group_and_subgraph_containers(self):
+        """Real nodes nested under definitions.subgraphs and extra.groupNodes
+        are yielded; slot definitions and link rows are not."""
+        graph = {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "TopNode",
+                    "inputs": [],
+                    "outputs": [{"name": "A"}],
+                    "properties": {},
+                },
+            ],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg1",
+                        "name": "Nested",
+                        "inputs": [
+                            {"id": 0, "name": "model", "type": "MODEL", "link": None}
+                        ],
+                        "outputs": [
+                            {"id": 0, "name": "out", "type": "MODEL", "links": []}
+                        ],
+                        "nodes": [
+                            {
+                                "id": 10,
+                                "type": "SubNodeA",
+                                "inputs": [],
+                                "outputs": [{"name": "A"}],
+                                "properties": {},
+                            },
+                            {
+                                "id": 11,
+                                "type": "SubNodeB",
+                                "inputs": [{"name": "m", "link": None}],
+                                "outputs": [],
+                                "properties": {},
+                            },
+                        ],
+                    }
+                ]
+            },
+            "extra": {
+                "groupNodes": {
+                    "g1": {
+                        "nodes": [
+                            {
+                                "id": 20,
+                                "type": "GroupNodeC",
+                                "inputs": [],
+                                "outputs": [{"name": "C"}],
+                                "properties": {},
+                            },
+                        ],
+                        "links": [
+                            {
+                                "id": 5,
+                                "origin_id": 20,
+                                "origin_slot": 0,
+                                "target_id": 1,
+                                "target_slot": 0,
+                                "type": "C",
+                            }
+                        ],
+                    }
+                }
+            },
+            "links": [
+                {
+                    "id": 6,
+                    "origin_id": 10,
+                    "origin_slot": 0,
+                    "target_id": 1,
+                    "target_slot": 0,
+                    "type": "A",
+                }
+            ],
+        }
+        yielded = list(iter_graph_nodes(graph))
+        self.assertEqual(
+            sorted(n["type"] for n in yielded),
+            ["GroupNodeC", "SubNodeA", "SubNodeB", "TopNode"],
+        )
+
+    def test_iter_graph_nodes_skips_slot_and_link_dicts(self):
+        graph = {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "Parent",
+                    "inputs": [{"name": "in", "type": "MODEL", "link": None}],
+                    "outputs": [{"name": "out", "type": "MODEL", "links": [7]}],
+                    "properties": {},
+                }
+            ],
+            "links": [
+                {
+                    "id": 7,
+                    "origin_id": 1,
+                    "origin_slot": 0,
+                    "target_id": 2,
+                    "target_slot": 0,
+                    "type": "MODEL",
+                }
+            ],
+        }
+        self.assertEqual([n["type"] for n in iter_graph_nodes(graph)], ["Parent"])
+
+    def test_iter_graph_nodes_deduplicates_shared_containers(self):
+        subgraph = {
+            "id": "sg1",
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "SharedNode",
+                    "inputs": [],
+                    "outputs": [{"name": "A"}],
+                    "properties": {},
+                }
+            ],
+        }
+        graph = {
+            "nodes": [],
+            "definitions": {"subgraphs": [subgraph]},
+            "extra": {"groupNodes": {"g": subgraph}},
+        }
+        self.assertEqual([n["type"] for n in iter_graph_nodes(graph)], ["SharedNode"])
+
+    def test_iter_graph_nodes_accepts_ui_and_api_rows_only(self):
+        graph = {
+            "nodes": [
+                {"id": 1, "type": "UiNode", "inputs": [], "outputs": [], "properties": {}},
+                {"id": 2, "class_type": "ApiNode", "inputs": {"x": 1}},
+                {"name": "not-a-node", "type": "MODEL", "link": None},
+            ]
+        }
+        self.assertEqual(
+            sorted(
+                str(n.get("type") or n.get("class_type") or "")
+                for n in iter_graph_nodes(graph)
+            ),
+            ["ApiNode", "UiNode"],
+        )
+
+    def test_ui_graph_named_widgets_nested_nodes_and_virtual_excluded(self):
+        graph = {
+            "nodes": [
+                {
+                    "id": 1,
+                    "type": "CheckpointLoaderSimple",
+                    "inputs": [],
+                    "outputs": [{"name": "M"}],
+                    "properties": {},
+                    "widgets_values_named": {"ckpt_name": "top.safetensors"},
+                },
+            ],
+            "definitions": {
+                "subgraphs": [
+                    {
+                        "id": "sg",
+                        "nodes": [
+                            {
+                                "id": 2,
+                                "type": "SubLoader",
+                                "inputs": [],
+                                "outputs": [{"name": "M"}],
+                                "properties": {},
+                                "widgets_values_named": {
+                                    "unet_name": "nested_unet.safetensors"
+                                },
+                            },
+                            {
+                                # Nested virtual panel: empty collections, no
+                                # identity — its widget must not become a model.
+                                "id": 3,
+                                "type": "NestedPanel",
+                                "inputs": [],
+                                "outputs": [],
+                                "properties": {},
+                                "widgets_values_named": {
+                                    "model_name": "ghost.safetensors"
+                                },
+                            },
+                        ],
+                    }
+                ]
+            },
+            "extra": {
+                "groupNodes": {
+                    "g": {
+                        "nodes": [
+                            {
+                                "id": 4,
+                                "type": "GroupLoader",
+                                "inputs": [],
+                                "outputs": [{"name": "M"}],
+                                "properties": {},
+                                "widgets_values_named": {
+                                    "vae_name": "group_vae.safetensors"
+                                },
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+        refs = extract_ui_graph_model_refs(graph)
+        self.assertIn({"role": "checkpoint", "filename": "top.safetensors"}, refs)
+        self.assertIn({"role": "unet", "filename": "nested_unet.safetensors"}, refs)
+        self.assertIn({"role": "vae", "filename": "group_vae.safetensors"}, refs)
+        self.assertNotIn({"role": "model", "filename": "ghost.safetensors"}, refs)

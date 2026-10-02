@@ -297,17 +297,21 @@ class SnapshotDualClipSpecTests(unittest.TestCase):
         self.trace = RuntimeTrace(request_id="snap-dual", process="remote")
         self.clip_obj = _FakeClip()
         self.unet_obj = object()
+        self.workflow = {
+            "1": {"class_type": "DualCLIPLoader", "inputs": {
+                "clip_name1": "clip_g.safetensors", "clip_name2": "clip_g.safetensors", "type": "sd3",
+            }},
+            "2": {"class_type": "UNETLoader", "inputs": {
+                "unet_name": "u.safetensors", "weight_dtype": "default",
+            }},
+        }
         self.dual_spec = _make_snapshot_spec(
             unet_name="u.safetensors",
             clip_name="clip_g.safetensors",
             dual=True,
             clip_name2="clip_g.safetensors",  # same filename twice
         )
-        self.model_key = ModelRestoreKey(
-            unet_identity="u.safetensors",
-            clip_identity="clip_g.safetensors",
-            clip_type="sd3",
-        )
+        self.model_key = derive_model_key(self.workflow)
         self.bridge.use_ready_models(
             model_key=self.model_key,
             prefill_key=PrefillKey(model_key=self.model_key),
@@ -341,16 +345,8 @@ class SnapshotDualClipSpecTests(unittest.TestCase):
 
     def test_duplicate_dual_workflow_key_and_spec_match(self):
         """Real workflow with duplicate DualCLIPLoader matches snapshot key/spec."""
-        workflow = {
-            "1": {"class_type": "DualCLIPLoader", "inputs": {
-                "clip_name1": "clip_g.safetensors", "clip_name2": "clip_g.safetensors", "type": "sd3",
-            }},
-            "2": {"class_type": "UNETLoader", "inputs": {
-                "unet_name": "u.safetensors", "weight_dtype": "default",
-            }},
-        }
-        request_key = derive_model_key(workflow)
-        request_spec = build_restore_model_spec(workflow)
+        request_key = derive_model_key(self.workflow)
+        request_spec = build_restore_model_spec(self.workflow)
         self.assertTrue(
             _cpu_snapshot_model_keys_match(request_key, self.bridge._model_key),
             "request key must match snapshot key for duplicate dual CLIP",

@@ -66,6 +66,39 @@ except ImportError:
     pass
 
 
+# ---------------------------------------------------------------------------
+# Deterministic fake comfy modules
+#
+# The code under test (``modal_app._load_cpu_snapshot_unet``,
+# ``resolve_unet_effective_dtype``) executes ``import comfy.sd`` /
+# ``import comfy.memory_management`` / ``import comfy.cli_args`` /
+# ``import folder_paths``.  In a fresh process those imports fail unless the
+# tests install fakes; if a *real* ComfyUI is importable (e.g. a prior suite
+# polluted the process) the same imports resolve to the real package and the
+# tests would behave differently.  Installing the parent ``comfy`` package
+# (with ``__path__``) together with leaf fakes in ``sys.modules`` makes the
+# resolution identical in BOTH environments.
+# ---------------------------------------------------------------------------
+
+
+def _fake_comfy_parent():
+    """Return a fake ``comfy`` package so ``import comfy.<sub>`` resolves to
+    the sys.modules fakes whether or not a real ComfyUI is importable."""
+    import types
+    mod = types.ModuleType("comfy")
+    mod.__path__ = []  # mark as a package
+    return mod
+
+
+def _fake_aimdo_memory_management(aimdo_enabled=True):
+    """Return a fake ``comfy.memory_management`` module carrying aimdo_enabled."""
+    import types
+    mm = types.ModuleType("comfy.memory_management")
+    mm.aimdo_enabled = aimdo_enabled
+    return mm
+
+
+
 class _FakeTensor:
     """Minimal tensor stub for device attribute checks."""
     def __init__(self, device="cpu", is_meta=False):
@@ -531,25 +564,48 @@ class TestModelSpec(unittest.TestCase):
 
     def test_unet_effective_dtype_explicit_bf16(self):
         """Explicit bf16 CLI override remains bf16."""
+        import types as _types
         import unittest.mock as mock
-        import comfy.cli_args
-        with mock.patch.object(comfy.cli_args.args, "bf16_unet", True):
-            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
-            import torch
-            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("T4",))
-            self.assertIs(eff_dtype, torch.bfloat16)
-            self.assertEqual(eff_label, "bfloat16")
+        # Install a deterministic fake comfy.cli_args so this test does not
+        # depend on whether a real ComfyUI is importable in this process.
+        # NOTE: ``args`` must be a plain namespace (not a MagicMock) so the
+        # ``getattr(_ca.args, "fp32_unet", False)`` probe returns the default
+        # instead of an auto-created truthy attribute.
+        _cli = _types.ModuleType("comfy.cli_args")
+        _cli.args = _types.SimpleNamespace()
+        _comfy = _fake_comfy_parent()
+        _comfy.cli_args = _cli  # bare `import comfy.cli_args` binds `comfy`
+        with mock.patch.dict(sys.modules, {
+            "comfy": _comfy,
+            "comfy.cli_args": _cli,
+        }):
+            import comfy.cli_args
+            with mock.patch.object(comfy.cli_args.args, "bf16_unet", True, create=True):
+                from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+                import torch
+                eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("T4",))
+                self.assertIs(eff_dtype, torch.bfloat16)
+                self.assertEqual(eff_label, "bfloat16")
 
     def test_unet_effective_dtype_explicit_fp32(self):
         """Explicit fp32 CLI override remains fp32 even on BF16-capable GPU."""
+        import types as _types
         import unittest.mock as mock
-        import comfy.cli_args
-        with mock.patch.object(comfy.cli_args.args, "fp32_unet", True):
-            from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
-            import torch
-            eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("RTX-PRO-6000",))
-            self.assertIs(eff_dtype, torch.float32)
-            self.assertEqual(eff_label, "float32")
+        _cli = _types.ModuleType("comfy.cli_args")
+        _cli.args = _types.SimpleNamespace()
+        _comfy = _fake_comfy_parent()
+        _comfy.cli_args = _cli
+        with mock.patch.dict(sys.modules, {
+            "comfy": _comfy,
+            "comfy.cli_args": _cli,
+        }):
+            import comfy.cli_args
+            with mock.patch.object(comfy.cli_args.args, "fp32_unet", True, create=True):
+                from comfymodal_runtime.model_preload import resolve_unet_effective_dtype
+                import torch
+                eff_dtype, eff_label = resolve_unet_effective_dtype("default", target_gpus=("RTX-PRO-6000",))
+                self.assertIs(eff_dtype, torch.float32)
+                self.assertEqual(eff_label, "float32")
 
     def test_unet_effective_dtype_no_new_flag_needed(self):
         """Default env (no COMFYMODAL_V2_GPU set) works — policy uses V2_DEFAULT_GPU."""
@@ -1726,6 +1782,93 @@ class TestCollectUnetRuntimeState(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Tests: _two_lane_read_residency (graph early-exit proof)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestTwoLaneReadResidency(unittest.TestCase):
+    """_two_lane_read_residency reads the actual ComfyUI residency fields.
+
+    ComfyUI's ``ModelPatcher.partially_load`` early-exits when
+    ``model_lowvram is False and model_loaded_weight_memory > 0``.  Both
+    fields live on ``ModelPatcher.model`` (the BaseModel), not on the
+    patcher wrapper or the inner diffusion model.  The proof reads them
+    from a deduplicated candidate list and synthesis succeeds only when
+    that inner target is valid; otherwise it fails closed (never claims
+    resident).
+    """
+
+    @staticmethod
+    def _read(patcher):
+        from comfymodal_runtime.cpu_snapshot_models import _two_lane_read_residency
+        return _two_lane_read_residency(patcher)
+
+    def test_resident_when_base_model_claims_full_load(self):
+        """BaseModel with lowvram=False and loaded_weight_memory>0 is resident."""
+        out = self._read(_FakeRealPatcher("cpu"))
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["base_model_present"])
+        self.assertIs(out["model_lowvram"], False)
+        self.assertEqual(out["model_loaded_weight_memory"], float(1234567890))
+        self.assertTrue(out["resident"])
+        self.assertEqual(out["source"], "base_model")
+        self.assertEqual(out["reason"], "resident")
+
+    def test_not_resident_when_base_model_marks_lowvram(self):
+        """lowvram=True means the full model is not loaded -> not resident."""
+        patcher = _FakeRealPatcher("cpu")
+        patcher.model.model_lowvram = True
+        out = self._read(patcher)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["reason"], "not_resident")
+
+    def test_not_resident_when_no_loaded_memory(self):
+        """loaded_weight_memory == 0 means nothing loaded -> not resident."""
+        patcher = _FakeRealPatcher("cpu")
+        patcher.model.model_loaded_weight_memory = 0
+        out = self._read(patcher)
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["resident"])
+
+    def test_fails_closed_when_inner_target_missing(self):
+        """No .model at all -> synthesis fails closed, never resident."""
+        out = self._read(_FakeUNETNoModel())
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["base_model_present"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["reason"], "fields_unavailable")
+
+    def test_fails_closed_when_inner_target_lacks_fields(self):
+        """Inner .model present but without the residency fields -> fail closed."""
+        out = self._read(_FakeUNETMinimal())
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["base_model_present"])
+        self.assertFalse(out["resident"])
+        self.assertEqual(out["model_lowvram"], "absent")
+        self.assertEqual(out["model_loaded_weight_memory"], "absent")
+
+    def test_direct_fake_coverage(self):
+        """A fake carrying the fields directly (no .model) still resolves."""
+        class _DirectFake:
+            model_lowvram = False
+            model_loaded_weight_memory = 999
+        out = self._read(_DirectFake())
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["base_model_present"])
+        self.assertTrue(out["resident"])
+        self.assertEqual(out["source"], "candidate")
+
+    def test_json_safe_no_objects(self):
+        """Verdict contains only JSON-safe primitives, never object reprs."""
+        out = self._read(_FakeRealPatcher("cpu"))
+        for key, value in out.items():
+            self.assertIsInstance(value, (str, int, float, bool, list, dict))
+            self.assertNotIn("<", str(value), msg=f"object repr leaked in {key}")
+            self.assertNotIn("FakeTensor", str(value), msg=f"tensor leaked in {key}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Tests: diff_unet_runtime_states
 # ══════════════════════════════════════════════════════════════════════
 
@@ -2038,6 +2181,8 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
+                "comfy": _fake_comfy_parent(),
+                "comfy.memory_management": _fake_aimdo_memory_management(),
                 "comfy.sd": fake_sd,
                 "folder_paths": fake_folder_paths,
             },
@@ -2079,6 +2224,8 @@ class TestCpuSnapshotUnetConstruction(unittest.TestCase):
         with patch.dict(
             sys.modules,
             {
+                "comfy": _fake_comfy_parent(),
+                "comfy.memory_management": _fake_aimdo_memory_management(),
                 "comfy.sd": fake_sd,
                 "folder_paths": fake_folder_paths,
             },
@@ -2223,6 +2370,10 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         fake_sd.load_diffusion_model = tracking_load
 
         with patch.dict(sys.modules, {
+            # Install the parent package so `import comfy.sd` / 
+            # `import comfy.memory_management` resolve to these fakes whether
+            # or not a real ComfyUI is importable in this process.
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2249,6 +2400,7 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         )
 
         with patch.dict(sys.modules, {
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2273,6 +2425,7 @@ class TestAimDOFlagDuringSnapshotUnetLoad(unittest.TestCase):
         fake_sd, fake_fp = self._make_fake_sd_and_folder_paths()
 
         with patch.dict(sys.modules, {
+            "comfy": _fake_comfy_parent(),
             "comfy.memory_management": mm,
             "comfy.sd": fake_sd,
             "folder_paths": fake_fp,
@@ -2858,18 +3011,33 @@ class TestConstructionSelectionAndExceptionRestoration(unittest.TestCase):
     """_load_cpu_snapshot_unet construction selection and exception restoration."""
 
     def setUp(self):
-        # Install fake model_management in sys.modules
+        # Install fake model_management in sys.modules, plus a fake parent
+        # ``comfy`` package and ``comfy.memory_management`` so the code under
+        # test resolves deterministic fakes whether or not a real ComfyUI is
+        # importable in this process.
         self._mm = _FakeMMForContext()
         self._orig_mm = sys.modules.get("comfy.model_management")
         sys.modules["comfy.model_management"] = self._mm
+        self._orig_comfy = sys.modules.get("comfy")
+        self._orig_memmm = sys.modules.get("comfy.memory_management")
         self._orig_cm = sys.modules.get("comfy.sd")
         self._orig_fp = sys.modules.get("folder_paths")
+        sys.modules["comfy"] = _fake_comfy_parent()
+        sys.modules["comfy.memory_management"] = _fake_aimdo_memory_management()
 
     def tearDown(self):
         if self._orig_mm is not None:
             sys.modules["comfy.model_management"] = self._orig_mm
         else:
             sys.modules.pop("comfy.model_management", None)
+        if self._orig_comfy is not None:
+            sys.modules["comfy"] = self._orig_comfy
+        else:
+            sys.modules.pop("comfy", None)
+        if self._orig_memmm is not None:
+            sys.modules["comfy.memory_management"] = self._orig_memmm
+        else:
+            sys.modules.pop("comfy.memory_management", None)
         if self._orig_cm is not None:
             sys.modules["comfy.sd"] = self._orig_cm
         else:

@@ -142,6 +142,12 @@ class TestDiskCacheBootstrap(unittest.TestCase):
 
         _reset_restore_publish_cache()
         self.assertNotIn(ck, _RESTORE_PUBLISH_CACHE)
+        # ``_reset_restore_publish_cache`` also wipes the disk mirror, so
+        # re-flush the entry before repopulating (mirrors a fresh process
+        # that still has the on-disk entry).
+        with _restore_disk_lock:
+            _restore_disk_cache[ck] = entry
+        _flush_restore_disk_cache()
         _populate_restore_cache_from_disk()
         self.assertIn(ck, _RESTORE_PUBLISH_CACHE)
 
@@ -169,8 +175,18 @@ class TestDiskCacheWriteOnSuccess(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs and writes the disk cache (the inherit no-op gate
+        # would skip the setter entirely and never persist a profile entry).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def test_profile_cache_written_on_success(self):
@@ -458,6 +474,12 @@ class TestSubprocessSimulation(unittest.TestCase):
         _flush_restore_disk_cache()
 
         _reset_restore_publish_cache()
+        # ``_reset_restore_publish_cache`` also wipes the disk mirror, so
+        # re-flush the entry before repopulating (mirrors a fresh process
+        # that still has the on-disk entry).
+        with _restore_disk_lock:
+            _restore_disk_cache[ck] = _make_restore_disk_entry(ck)
+        _flush_restore_disk_cache()
         _populate_restore_cache_from_disk()
         self.assertIn(ck, _RESTORE_PUBLISH_CACHE)
 
@@ -544,8 +566,18 @@ class TestNoSensitiveData(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path actually writes the disk cache (the inherit no-op gate
+        # would skip the write, making the no-sensitive-data scan vacuous).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def _scan_for_sensitive(self, entries: dict, label: str) -> list[str]:
@@ -724,8 +756,18 @@ class TestInvalidationReason(unittest.TestCase):
 
     def setUp(self):
         _reset_all_cache_counters()
+        # Pin the effective env profile to production so the full profile
+        # setter path runs (the inherit no-op gate would leave miss_reason
+        # empty and omit the disk-cache telemetry fields from the trace).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         _reset_all_cache_counters()
 
     def test_trace_metadata_has_miss_reason(self):
@@ -839,3 +881,20 @@ class TestResetDiskCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

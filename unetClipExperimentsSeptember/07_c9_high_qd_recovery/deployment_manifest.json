@@ -1,0 +1,31 @@
+{
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "branch": "TESTING2",
+  "captured_at": "2026-09-05T03:23:29.577778+00:00",
+  "cpu": 4,
+  "deployment_environment": "main",
+  "deployment_receipt": "deploy.log",
+  "deployment_url": "https://modal.com/apps/testing3/main/deployed/sept-unetclip-c9-recovery-source-only",
+  "directional_evidence_accepted_by_operator": true,
+  "directional_evidence_note": "48 eligible measurements, 8 per cell; operator stopped before 10 per cell",
+  "function": "run_c9_recovery",
+  "gpu_attached": false,
+  "head": "f21b3ae29685abbc429813fadc32c8f41264c03e",
+  "image_ids": [
+    "im-CXmqu77s2wROxKB78AS9KG",
+    "im-D52zqBkWn9Bg5hNCxcxCEI"
+  ],
+  "memory_mib": 8192,
+  "modal_profile_workspace": "testing3",
+  "mount": "/root/models",
+  "mount_read_only": true,
+  "single_use_containers": true,
+  "source_files_sha256": {
+    "c9_recovery_modal.py": "73f6a35cb11e06a5760c2cf405a3178143f03f68ab1ed3b95738cee7d14f2273",
+    "comfymodal_runtime/e27_source_mechanism.py": "e1eef20071f6f6b59488bdae44ee02ca01c092554cf8c5d8fb622c6d625e0d24",
+    "comfymodal_runtime/source_ceiling_oracle.py": "9484c402a10ca9f1d05c11a2d566a05bab2d983d5604aa77733e18c13f503fcb",
+    "tools/run_c9_recovery.py": "71d3b3dda9a9b3c96aa33cb0256aec2e195238746c9c25106dc76102407026f9"
+  },
+  "volume": "comfyui-models",
+  "worktree": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal"
+}

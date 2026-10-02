@@ -1,0 +1,174 @@
+{
+  "assets": [],
+  "custom_nodes": [],
+  "manifest_version": 1,
+  "mapping": {
+    "entries": {
+      "positive_prompt": {
+        "control_kind": "multiline",
+        "data_type": "STRING",
+        "display_name": "Positive Prompt",
+        "enum_options": [],
+        "input_name": "text",
+        "kind": "node_input",
+        "maximum": null,
+        "minimum": null,
+        "multiline": true,
+        "node_id": "2",
+        "output_name": "",
+        "required": true,
+        "semantic_role": "positive_prompt",
+        "step": null
+      },
+      "seed": {
+        "control_kind": "integer",
+        "data_type": "INT",
+        "display_name": "Seed",
+        "enum_options": [],
+        "input_name": "seed",
+        "kind": "widget",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "multiline": false,
+        "node_id": "3",
+        "output_name": "",
+        "required": false,
+        "semantic_role": "seed",
+        "step": 1
+      }
+    },
+    "mapping_id": "wm_fixture_subgraph_frontend_v1",
+    "output_node_id": "4",
+    "workflow_version_id": "wv_fixture_subgraph_frontend_v1"
+  },
+  "metadata": {
+    "captured_at": "2026-08-23T00:00:00+00:00",
+    "exported_at": "2026-08-23T00:00:00+00:00",
+    "generator": "phase-g8-fixture-corpus",
+    "synthetic": true
+  },
+  "models": [
+    {
+      "compatibility": "fixture",
+      "display_name": "Fixture Core Checkpoint",
+      "filename": "fixture_core_checkpoint.safetensors",
+      "folder": "checkpoints",
+      "model_type": "checkpoint",
+      "provider": "fixture",
+      "revision": "main",
+      "role": "checkpoint",
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "size": 4096,
+      "source_urls": []
+    }
+  ],
+  "presets": [],
+  "version": {
+    "created_at": "2026-08-23T00:00:00+00:00",
+    "graph_hash": "3564e14f3fff083782594920e512db1616245e5b1443bdb43738f374e9a17a8c",
+    "immutable": true,
+    "version_number": 1,
+    "workflow_id": "wf_fixture_subgraph_frontend",
+    "workflow_version_id": "wv_fixture_subgraph_frontend_v1"
+  },
+  "workflow": {
+    "display": {
+      "description": "Synthetic Phase-G portability fixture (subgraph_frontend)",
+      "name": "Fixture subgraph_frontend"
+    },
+    "graph": {
+      "config": {},
+      "definitions": {
+        "subgraphs": [
+          {
+            "id": "sg_fixture_001",
+            "links": [],
+            "name": "Fixture Subgraph",
+            "nodes": [
+              {
+                "flags": {},
+                "id": 101,
+                "inputs": [],
+                "mode": 0,
+                "order": 101,
+                "outputs": [],
+                "pos": [
+                  4040,
+                  2020
+                ],
+                "properties": {},
+                "size": [
+                  220,
+                  60
+                ],
+                "type": "CLIPTextEncode",
+                "widgets_values": [
+                  "inner fixture prompt"
+                ]
+              }
+            ],
+            "version": 0.4
+          }
+        ]
+      },
+      "extra": {},
+      "groups": [],
+      "id": "fixture-graph",
+      "last_link_id": 0,
+      "last_node_id": 14,
+      "links": [],
+      "nodes": [
+        {
+          "flags": {},
+          "id": 14,
+          "inputs": [],
+          "mode": 0,
+          "order": 14,
+          "outputs": [],
+          "pos": [
+            560,
+            280
+          ],
+          "properties": {
+            "subgraph_id": "sg_fixture_001"
+          },
+          "size": [
+            220,
+            60
+          ],
+          "type": "Fixture Subgraph"
+        },
+        {
+          "flags": {},
+          "id": 4,
+          "inputs": [],
+          "mode": 0,
+          "order": 4,
+          "outputs": [],
+          "pos": [
+            160,
+            80
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "SaveImage",
+          "widgets_values": [
+            "fixture"
+          ]
+        }
+      ],
+      "revision": 0,
+      "version": 0.4
+    },
+    "graph_hash": "3564e14f3fff083782594920e512db1616245e5b1443bdb43738f374e9a17a8c",
+    "source": {
+      "author": "phase-g8-fixture-corpus",
+      "url": ""
+    },
+    "version_id": "wv_fixture_subgraph_frontend_v1",
+    "workflow_id": "wf_fixture_subgraph_frontend"
+  }
+}

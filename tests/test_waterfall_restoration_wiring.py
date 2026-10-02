@@ -13,8 +13,12 @@ audit-test style) that pin the backend wiring contract:
 """
 
 import ast
+from contextlib import redirect_stdout
+from io import StringIO
 import unittest
 from pathlib import Path
+
+from comfymodal_runtime.v2_waterfall import attach_waterfall
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -141,6 +145,24 @@ class LocalMetaPersistenceTests(unittest.TestCase):
             self.src,
         )
         self.assertIn('run_label="experiment cell materialize"', self.src)
+
+    def test_golden_cell_fallback_suppresses_only_duplicate_render(self):
+        self.assertIn('result_data.get("golden_telemetry")', self.src)
+        self.assertIn('result_data.get("golden_identity")', self.src)
+        self.assertIn("print_render=not _is_golden_result", self.src)
+
+    def test_generic_cell_fallback_remains_print_enabled(self):
+        self.assertIn("_is_golden_result = (", self.src)
+        self.assertIn("print_render=not _is_golden_result", self.src)
+
+    def test_generic_graph_fallback_still_renders_to_console(self):
+        result = {"trace": {"events": []}}
+        output = StringIO()
+        with redirect_stdout(output):
+            attach_waterfall(result, run_label="experiment cell materialize")
+
+        assert result["waterfall"]
+        assert "V2 COLD WATERFALL - REMOTE/PARTIAL" in output.getvalue()
 
 
 class InvokerTimingPayloadTests(unittest.TestCase):

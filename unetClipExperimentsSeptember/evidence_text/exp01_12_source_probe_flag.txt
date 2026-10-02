@@ -1,0 +1,14 @@
+python : usage: v2ctl [-h] [--profile PROFILE] [--set NAME=VALUE] [--inherit NAME]
+At line:1 char:1
++ python tools/v2ctl.py --profile golden_p1 --app sept-unetclip-01-tran ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (usage: v2ctl [-...--inherit NAME]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+             [--owner OWNER] [--dry-run] [--json] [--app APP]
+             [--workspace WORKSPACE_ID] [--environment ENVIRONMENT]
+             [--gpu GPU] [--memory-mb MEMORY_MB] [--cpu CPU]
+             [--run-count RUN_COUNT] [--allow-production]
+             {version,doctor,config,flags,deploy,deploy-run,run,gate,confirm,golden,source-probe,runtime-flags,lock}
+             ...
+v2ctl: error: unrecognized arguments: --acknowledge-volume-drift

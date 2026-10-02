@@ -485,9 +485,10 @@ class ExperimentCellCompiledDispatchTests(unittest.TestCase):
         self.assertIn("production_report", cell)
         self.assertTrue(cell["production_report"]["enabled"])
 
-    def test_local_remote_invoker_passes_report(self):
-        """The LocalRemoteInvoker must have _production_report field for
-        experiment single-run dispatch."""
+    def test_cell_report_fallback_precedence(self):
+        """Cell-level report falls back to the global single-run report.
+        (H19: renamed from test_local_remote_invoker_passes_report — the
+        retired V1 invoker was deleted; the precedence contract remains.)"""
         cell = {"cell_key": "c1"}
         report = {"enabled": True, "compiled_workflow_hash": "aaa"}
         _effective = cell.get("production_report") or report

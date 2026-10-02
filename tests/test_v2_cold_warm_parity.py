@@ -23,11 +23,13 @@ Deterministic and CPU-only: no ComfyUI, no Modal, no CUDA imports.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan, SnapshotExecutionSeed
 from comfymodal_runtime.execution_seed import (
@@ -411,6 +413,10 @@ class TestPublisherSeedBuild(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meta.get("schema_version"), 2)
         self.assertEqual(meta.get("topology_available"), 1)
         self.assertEqual(meta.get("persisted"), 1)
+        # On the default no-publish path (no restore_publisher passed) the
+        # locally persisted payload is honest: seed_source=invocation_plan,
+        # never a fake publisher_plan.
+        self.assertEqual(meta.get("seed_source"), "invocation_plan")
 
         # The deployment-scoped payload must be persisted and re-readable.
         from comfymodal_runtime.execution_seed import read_snapshot_seed_payload
@@ -418,8 +424,11 @@ class TestPublisherSeedBuild(unittest.IsolatedAsyncioTestCase):
         loaded = read_snapshot_seed_payload()
         self.assertIsNotNone(loaded)
         assert loaded is not None
-        self.assertEqual(loaded["seed_source"], "publisher_plan")
+        self.assertEqual(loaded["seed_source"], "invocation_plan")
         self.assertTrue(loaded["topology_available"])
+        # The request-derived seed still carries the full structural topology.
+        self.assertEqual(loaded["seed"]["schema_version"], 2)
+        self.assertTrue(loaded["seed"]["static_node_signatures"])
 
 
 # ── 6. Restore-time hydration / minimal fallback ──────────────────────────
@@ -451,7 +460,12 @@ class TestRestoreHydration(unittest.TestCase):
             deployment_combined_hash="dep-hash-1",
         )
         assert payload is not None
-        with tempfile.TemporaryDirectory() as tmp:
+        # Restore-time hydration of a published payload requires the opt-in
+        # COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1 flag: on the default no-publish
+        # path the volume read is skipped so a stale snapshot_seed.json can
+        # never emit source=publisher_plan.
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False):
             self.assertTrue(persist_snapshot_seed_payload(payload, root=tmp))
             config = BootstrapConfig(
                 seed_payload_path=str(Path(tmp, "snapshot_seed.json")),
@@ -538,3 +552,20 @@ class TestColdWarmRequestParity(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

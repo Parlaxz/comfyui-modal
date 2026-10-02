@@ -1,13 +1,19 @@
-"""Phase 8 unit tests for execution-mode resolver, config, dispatch, and invoker selection.
+"""H12 execution-mode tests: V2-only resolver, config, dispatch, invoker.
 
 Scope
 -----
-- ``execution_runtime``: resolve order/locking/default/config validation.
-- Normal dispatch: captured mode usage in ``_execute_job``.
-- Studio mode capture/immutability: ``handle_studio_run_async`` route through resolver.
-- V2 invoker protocol selection: ``_schedule_and_start`` chooses V2 when captured mode is v2.
-- Experiment retry/resume mode persistence: mode stays fixed in compiled spec.
-- Frontend config payload/display contract.
+- ``execution_runtime``: collapsed vocabulary — only ``v2`` resolves/executes;
+  retired strings (v1/legacy/shadow) remain RECOGNIZED for migration and
+  truthful rejection but are never executable.
+- ``COMFYMODAL_RUNTIME`` ops lock: mechanism preserved, vocabulary collapsed
+  to ``{v2}``; retired values logged-and-refused.
+- Explicit request-captured retired modes: surfaced via ``retired=True`` /
+  ``retired_request_mode`` so dispatchers reject truthfully (never silently
+  relabeled as V2).
+- POST /comfymodal/config validation: v2 accepted; v1/legacy/shadow rejected.
+- Studio Single dispatch: retired requests rejected before acceptance; the
+  non-V2 branch through ``direct_studio_run_completion`` is gone.
+- Scheduler registration: V2ExperimentInvoker is the only registered invoker.
 
 All tests mock transports and remote calls (no Modal, no GPU, no deploy).
 """
@@ -17,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import patch
 
 # Ensure the custom-node root is importable
 _NODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,15 +38,21 @@ from execution_runtime import (
     MODE_V1,
     MODE_V2,
     MODE_SHADOW,
+    RETIRED_MODES,
     normalize_mode,
+    is_retired_mode,
     resolve_execution_mode,
+    retired_request_mode,
+    retired_mode_error,
+    engine_v1_retired_notice,
     validate_config_payload,
-    AVAILABLE_EXECUTION_MODES,
     capture_execution_mode,
 )
 
 
-class TestNormalizeMode(unittest.TestCase):
+class TestNormalizeModeRecognition(unittest.TestCase):
+    """Recognition survives retirement (needed for migration + rejection)."""
+
     def test_v1_aliases(self):
         for alias in ("v1", "V1", "legacy", "LEGACY", "Legacy"):
             self.assertEqual(normalize_mode(alias), MODE_V1, f"alias={alias!r}")
@@ -59,76 +71,147 @@ class TestNormalizeMode(unittest.TestCase):
         self.assertIsNone(normalize_mode(None))
         self.assertIsNone(normalize_mode(42))
 
+    def test_retired_classification(self):
+        self.assertTrue(is_retired_mode(MODE_V1))
+        self.assertTrue(is_retired_mode(MODE_SHADOW))
+        self.assertFalse(is_retired_mode(MODE_V2))
+        self.assertEqual(RETIRED_MODES, (MODE_V1, MODE_SHADOW))
 
-class TestResolveExecutionMode(unittest.TestCase):
+
+class TestResolveExecutionModeV2Only(unittest.TestCase):
     def tearDown(self):
-        for key in ("COMFYMODAL_RUNTIME",):
-            os.environ.pop(key, None)
+        os.environ.pop("COMFYMODAL_RUNTIME", None)
 
     def test_default_is_v2(self):
-        """Resolution order #4: default v2."""
         resolved = resolve_execution_mode()
         self.assertEqual(resolved["mode"], MODE_V2)
         self.assertEqual(resolved["source"], "default")
         self.assertFalse(resolved["locked"])
+        self.assertFalse(resolved.get("retired"))
 
-    def test_persisted_setting(self):
-        """Resolution order #3: persisted server setting."""
-        settings = {"execution_mode": "v1"}
-        resolved = resolve_execution_mode(modal_settings=settings)
-        self.assertEqual(resolved["mode"], MODE_V1)
-        self.assertEqual(resolved["source"], "server_setting")
-        self.assertFalse(resolved["locked"])
-
-    def test_env_override(self):
-        """Resolution order #2: env override is locked."""
-        os.environ["COMFYMODAL_RUNTIME"] = "v1"
+    def test_persisted_v2_honored(self):
         resolved = resolve_execution_mode(modal_settings={"execution_mode": "v2"})
-        self.assertEqual(resolved["mode"], MODE_V1)
+        self.assertEqual(resolved["mode"], MODE_V2)
+        self.assertEqual(resolved["source"], "server_setting")
+
+    def test_persisted_v1_cannot_resolve_to_v1(self):
+        """A stale persisted v1 value can never select the retired engine."""
+        resolved = resolve_execution_mode(modal_settings={"execution_mode": "v1"})
+        self.assertEqual(resolved["mode"], MODE_V2)
+        self.assertNotEqual(resolved["source"], "server_setting")
+        self.assertFalse(resolved.get("retired"))
+
+    def test_env_v2_is_locked(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "v2"
+        resolved = resolve_execution_mode(
+            extra={"execution_mode": "v2"},
+            modal_settings={"execution_mode": "v2"},
+        )
+        # Request precedence still wins over env for captured requests.
+        self.assertEqual(resolved["mode"], MODE_V2)
+        self.assertEqual(resolved["source"], "request")
+
+    def test_env_v2_locks_uncaptured_requests(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "v2"
+        resolved = resolve_execution_mode(modal_settings={"execution_mode": "v2"})
+        self.assertEqual(resolved["mode"], MODE_V2)
         self.assertEqual(resolved["source"], "env_override")
         self.assertTrue(resolved["locked"])
 
+    def test_env_v1_refused_falls_through_to_v2(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "v1"
+        resolved = resolve_execution_mode()
+        self.assertEqual(resolved["mode"], MODE_V2)
+        self.assertFalse(resolved["locked"])
+
+    def test_env_legacy_refused(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "legacy"
+        resolved = resolve_execution_mode()
+        self.assertEqual(resolved["mode"], MODE_V2)
+
+    def test_env_shadow_refused(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "shadow"
+        resolved = resolve_execution_mode()
+        self.assertEqual(resolved["mode"], MODE_V2)
+
+    def test_env_garbage_ignored(self):
+        os.environ["COMFYMODAL_RUNTIME"] = "bogus"
+        resolved = resolve_execution_mode()
+        self.assertEqual(resolved["mode"], MODE_V2)
+        self.assertEqual(resolved["source"], "default")
+
     def test_request_captured_wins_over_persisted(self):
-        """Resolution order #1: request mode beats persisted."""
         resolved = resolve_execution_mode(
             extra={"execution_mode": "v2"},
             modal_settings={"execution_mode": "v1"},
         )
         self.assertEqual(resolved["mode"], MODE_V2)
         self.assertEqual(resolved["source"], "request")
-        self.assertFalse(resolved["locked"])
 
-    def test_modal_options_fallback(self):
-        """Request mode can come from modal_options."""
-        resolved = resolve_execution_mode(
-            modal_options={"execution_mode": "shadow"},
-        )
+    def test_explicit_retired_request_surfaced_not_executable(self):
+        """An explicit v1 request is surfaced with retired=True — never
+        silently relabeled as V2 and never returned as executable."""
+        resolved = resolve_execution_mode(modal_options={"execution_mode": "v1"})
+        self.assertEqual(resolved["mode"], MODE_V1)
+        self.assertEqual(resolved["source"], "request")
+        self.assertTrue(resolved["retired"])
+
+    def test_explicit_legacy_alias_request_surfaced_as_v1(self):
+        resolved = resolve_execution_mode(modal_options={"execution_mode": "legacy"})
+        self.assertEqual(resolved["mode"], MODE_V1)
+        self.assertTrue(resolved["retired"])
+
+    def test_explicit_shadow_request_surfaced(self):
+        resolved = resolve_execution_mode(modal_options={"execution_mode": "shadow"})
         self.assertEqual(resolved["mode"], MODE_SHADOW)
-        self.assertEqual(resolved["source"], "request")
+        self.assertTrue(resolved["retired"])
 
-    def test_env_locked_cannot_be_overridden_by_request(self):
-        """A captured request mode remains immutable even if env changes later."""
+    def test_env_cannot_resurrect_retired_engines(self):
+        """Even COMFYMODAL_RUNTIME=v1 cannot make a clean request execute V1."""
         os.environ["COMFYMODAL_RUNTIME"] = "v1"
-        resolved = resolve_execution_mode(
-            extra={"execution_mode": "v2"},
-            modal_settings={"execution_mode": "v2"},
-        )
+        resolved = resolve_execution_mode(extra={"execution_mode": "v2"})
         self.assertEqual(resolved["mode"], MODE_V2)
-        self.assertEqual(resolved["source"], "request")
-        self.assertFalse(resolved["locked"])
+
+
+class TestRetiredRequestGuard(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("COMFYMODAL_RUNTIME", None)
+
+    def test_clean_request_returns_none(self):
+        self.assertIsNone(retired_request_mode(None))
+        self.assertIsNone(retired_request_mode({"execution_mode": "v2"}))
+        self.assertIsNone(retired_request_mode({}))
+
+    def test_retired_requests_detected(self):
+        self.assertEqual(retired_request_mode({"execution_mode": "v1"}), MODE_V1)
+        self.assertEqual(retired_request_mode({"execution_mode": "legacy"}), MODE_V1)
+        self.assertEqual(retired_request_mode({"execution_mode": "shadow"}), MODE_SHADOW)
+
+    def test_error_message_truthful(self):
+        msg = retired_mode_error("v1")
+        self.assertIn("retired", msg)
+        self.assertIn(engine_v1_retired_notice(), msg)
+        self.assertIn("shadow", retired_mode_error("shadow"))
 
 
 class TestValidateConfigPayload(unittest.TestCase):
-    def test_accepts_v1(self):
-        self.assertIsNone(validate_config_payload({"execution_mode": "v1"}))
-
     def test_accepts_v2(self):
         self.assertIsNone(validate_config_payload({"execution_mode": "v2"}))
+
+    def test_rejects_v1(self):
+        err = validate_config_payload({"execution_mode": "v1"})
+        self.assertIsNotNone(err)
+        self.assertIn("Engine V1 retired", err)
+
+    def test_rejects_legacy_alias(self):
+        err = validate_config_payload({"execution_mode": "legacy"})
+        self.assertIsNotNone(err)
+        self.assertIn("Engine V1 retired", err)
 
     def test_rejects_shadow(self):
         err = validate_config_payload({"execution_mode": "shadow"})
         self.assertIsNotNone(err)
-        self.assertIn("Shadow", err)
+        self.assertIn("retired", err)
 
     def test_rejects_invalid(self):
         err = validate_config_payload({"execution_mode": "invalid"})
@@ -144,181 +227,136 @@ class TestValidateConfigPayload(unittest.TestCase):
         self.assertIsNone(validate_config_payload({"gpu": "rtx-pro-6000"}))
 
 
-class TestAvailableExecutionModes(unittest.TestCase):
-    def test_public_modes_only(self):
-        """Shadow mode is NOT in available_execution_modes."""
-        values = [m["value"] for m in AVAILABLE_EXECUTION_MODES]
-        self.assertIn(MODE_V2, values)
-        self.assertIn(MODE_V1, values)
-        self.assertNotIn(MODE_SHADOW, values)
-
-    def test_v2_is_first(self):
-        """V2 is recommended, listed first."""
-        self.assertEqual(AVAILABLE_EXECUTION_MODES[0]["value"], MODE_V2)
+class TestAvailableExecutionModesRemoved(unittest.TestCase):
+    def test_constant_removed_from_module(self):
+        import execution_runtime
+        self.assertFalse(hasattr(execution_runtime, "AVAILABLE_EXECUTION_MODES"))
 
 
 class TestCaptureExecutionMode(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("COMFYMODAL_RUNTIME", None)
 
-    def test_captures_from_settings(self):
-        mode = capture_execution_mode(modal_settings={"execution_mode": "v1"})
-        self.assertEqual(mode, MODE_V1)
+    def test_capture_defaults_to_v2(self):
+        self.assertEqual(capture_execution_mode(), MODE_V2)
 
-    def test_captures_v2_default(self):
-        mode = capture_execution_mode()
-        self.assertEqual(mode, MODE_V2)
+    def test_capture_v2_request(self):
+        self.assertEqual(capture_execution_mode(modal_options={"execution_mode": "v2"}), MODE_V2)
 
+    def test_capture_never_returns_retired_engine(self):
+        """Capture refuses retired requests (callers guard first; this is the
+        defensive backstop)."""
+        with self.assertRaises(ValueError):
+            capture_execution_mode(modal_options={"execution_mode": "v1"})
+        with self.assertRaises(ValueError):
+            capture_execution_mode(modal_options={"execution_mode": "shadow"})
 
-# ---------------------------------------------------------------------------
-# 2. Normal dispatch unit tests (mock transport)
-# ---------------------------------------------------------------------------
-
-class TestNormalDispatchExecutionMode(unittest.TestCase):
-    """Verify that _execute_job uses captured execution_mode from extra_data."""
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_uses_captured_mode(self):
-        """When extra_data contains execution_mode=v2, v2 path is taken."""
-        from __init__ import _execute_job
-        # We can't easily test the full _execute_job without heavy mocking.
-        # Instead, verify that extra_data.get("execution_mode") routing works
-        # by testing the internal dispatch logic pattern.
-        pass
+    def test_capture_with_retired_persisted_value_yields_v2(self):
+        self.assertEqual(
+            capture_execution_mode(modal_settings={"execution_mode": "v1"}),
+            MODE_V2,
+        )
 
 
 # ---------------------------------------------------------------------------
-# 3. Studio mode capture/immutability
+# 2. Studio Single dispatch — retired requests rejected before execution
 # ---------------------------------------------------------------------------
 
-class TestStudioModeCapture(unittest.TestCase):
-    """Verify handle_studio_run_async routes through resolver."""
-
-    @patch("studio_run_adapter._prepare_studio_run_context")
-    @patch("studio_run_adapter.direct_studio_run_completion")
+class TestStudioSingleRetiredRejection(unittest.TestCase):
     @patch("__init__._load_modal_settings")
-    def test_legacy_mode_calls_direct_completion(
-        self, mock_settings, mock_completion, mock_context
-    ):
-        """When resolved mode is not v2, legacy direct completion is used."""
-        mock_settings.return_value = {"execution_mode": "v1"}
-        mock_context.return_value = {"status": "ok", "checkpoints": []}
-        mock_completion.return_value = {"status": "ok", "output_paths": []}
-
-        from studio_run_adapter import handle_studio_run_async
-        import asyncio
-        result = asyncio.run(handle_studio_run_async(
-            "preset_1", "txt2img", {"prompt": "test"},
-            _NODE_DIR, direct=True,
-        ))
-        self.assertEqual(result.get("status"), "ok")
-
-    @patch("__init__._load_modal_settings")
-    def test_v2_routes_to_playground(self, mock_settings):
-        """When captured mode is v2, playground_adapter_direct_run is called."""
+    def test_v1_request_rejected_without_execution(self, mock_settings):
         mock_settings.return_value = {"execution_mode": "v2"}
-
         from studio_run_adapter import handle_studio_run_async
         import asyncio
-        # The playground path will try to load presets — it will fail with
-        # a "Preset not found" error instead of a mode mismatch.
-        result = asyncio.run(handle_studio_run_async(
-            "preset_not_found", "txt2img", {"prompt": "test"},
-            _NODE_DIR, direct=True,
-        ))
-        # Should get a load error, not a mode/routing error
-        self.assertIn(result.get("status"), ("error",))
 
+        executed = {}
 
-# ---------------------------------------------------------------------------
-# 4. V2 invoker protocol selection
-# ---------------------------------------------------------------------------
+        async def _must_not_execute(*args, **kwargs):
+            executed["called"] = True
+            return {"status": "ok"}
 
-class TestV2ExperimentInvoker(unittest.TestCase):
-    """Verify V2ExperimentInvoker implements _RemoteInvoker protocol."""
+        with patch("studio_run_adapter.playground_adapter_direct_run", new=_must_not_execute):
+            result = asyncio.run(handle_studio_run_async(
+                "preset_1", "txt2img", {"prompt": "test"},
+                _NODE_DIR, modal_options={"execution_mode": "v1"},
+            ))
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_code"), "EXECUTION_MODE_RETIRED")
+        self.assertNotIn("called", executed)
 
-    def setUp(self):
-        from comfymodal_runtime.v2_experiment_invoker import V2ExperimentInvoker
-        self.invoker = V2ExperimentInvoker(experiment_id="exp_test")
-
-    async def _test_open_and_close(self):
-        await self.invoker.open_worker("w1", "ck1", "p1", {}, {"unet": "", "clip": "", "vae": ""})
-        await self.invoker.close_worker("w1")
-        # Should not raise
-        self.assertTrue(True)
-
-    def test_open_close_worker(self):
+    @patch("__init__._load_modal_settings")
+    def test_shadow_request_rejected_without_execution(self, mock_settings):
+        mock_settings.return_value = {"execution_mode": "v2"}
+        from studio_run_adapter import handle_studio_run_async
         import asyncio
-        asyncio.run(self._test_open_and_close())
 
-    async def _test_run_cell_needs_resolved_workflow(self):
-        await self.invoker.open_worker("w2", "ck1", "p1", {}, {"unet": "", "clip": "", "vae": ""})
-        result = await self.invoker.run_cell("w2", {"cell_key": "c1"})
-        self.assertEqual(result["status"], "error")
-        self.assertIn("_resolved_workflow", result["error"])
+        async def _must_not_execute(*args, **kwargs):
+            return {"status": "ok"}
 
-    def test_run_cell_needs_resolved_workflow(self):
-        import asyncio
-        asyncio.run(self._test_run_cell_needs_resolved_workflow())
-
-    async def _test_cancel_worker(self):
-        await self.invoker.open_worker("w3", "ck1", "p1", {}, {"unet": "", "clip": "", "vae": ""})
-        await self.invoker.cancel_worker("w3")
-        # Should not raise
-        self.assertTrue(True)
-
-    def test_cancel_worker(self):
-        import asyncio
-        asyncio.run(self._test_cancel_worker())
+        with patch("studio_run_adapter.playground_adapter_direct_run", new=_must_not_execute):
+            result = asyncio.run(handle_studio_run_async(
+                "preset_1", "txt2img", {"prompt": "test"},
+                _NODE_DIR, modal_options={"execution_mode": "shadow"},
+            ))
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_code"), "EXECUTION_MODE_RETIRED")
 
 
 # ---------------------------------------------------------------------------
-# 5. _schedule_and_start V2 invoker selection
+# 3. Scheduler registration — V2 invoker only
 # ---------------------------------------------------------------------------
 
-class TestScheduleAndStartV2Selection(unittest.TestCase):
-    """Verify _schedule_and_start selects V2ExperimentInvoker when mode is v2."""
+class TestSchedulerV2OnlyRegistration(unittest.TestCase):
+    def test_no_local_remote_invoker_registration_in_schedule_and_start(self):
+        """The mode-selected LocalRemoteInvoker branch is removed from
+        ``_schedule_and_start``."""
+        import inspect
+        import studio_run_adapter
+        src = inspect.getsource(studio_run_adapter._schedule_and_start)
+        self.assertNotIn("LocalRemoteInvoker(", src)
+        self.assertIn("V2ExperimentInvoker(", src)
 
-    def test_v2_invoker_created_when_mode_v2(self):
-        """When execution_mode resolves to v2, V2ExperimentInvoker is used."""
-        # We verify the V2ExperimentInvoker exists and implements the protocol:
-        from comfymodal_runtime.v2_experiment_invoker import V2ExperimentInvoker
-        self.assertTrue(hasattr(V2ExperimentInvoker, "run_cell"))
-        self.assertTrue(hasattr(V2ExperimentInvoker, "open_worker"))
-        self.assertTrue(hasattr(V2ExperimentInvoker, "close_worker"))
-        self.assertTrue(hasattr(V2ExperimentInvoker, "cancel_worker"))
-
-    def test_legacy_invoker_created_when_mode_v1(self):
-        """When execution_mode resolves to v1, LocalRemoteInvoker is used."""
-        from experiment_runner import LocalRemoteInvoker
-        self.assertTrue(hasattr(LocalRemoteInvoker, "run_cell"))
-        self.assertTrue(hasattr(LocalRemoteInvoker, "open_worker"))
-        self.assertTrue(hasattr(LocalRemoteInvoker, "close_worker"))
-        self.assertTrue(hasattr(LocalRemoteInvoker, "cancel_worker"))
+    def test_single_dispatch_has_no_direct_completion_branch(self):
+        """The direct=True non-V2 branch (V1 fallback + shadow comparison) is
+        removed from ``handle_studio_run_async``."""
+        import inspect
+        import studio_run_adapter
+        src = inspect.getsource(studio_run_adapter.handle_studio_run_async)
+        self.assertNotIn("_record_shadow_plan_comparison(", src)
+        self.assertNotIn("direct_studio_run_completion(", src)
 
 
 # ---------------------------------------------------------------------------
-# 6. Frontend config payload contract
+# 4. Workflow dispatch — legacy run removed, retired requests rejected
 # ---------------------------------------------------------------------------
 
-class TestFrontendConfigContract(unittest.TestCase):
-    """Verify the shape returned by GET /comfymodal/config."""
+class TestWorkflowV2Only(unittest.TestCase):
+    def test_workflow_legacy_run_removed(self):
+        import studio_workflow_run
+        self.assertFalse(hasattr(studio_workflow_run, "_workflow_legacy_run"))
 
-    def test_available_execution_modes_shape(self):
-        """available_execution_modes is a list of {value, label}."""
-        for entry in AVAILABLE_EXECUTION_MODES:
-            self.assertIn("value", entry)
-            self.assertIn("label", entry)
-            self.assertIsInstance(entry["value"], str)
-            self.assertIsInstance(entry["label"], str)
+    def test_workflow_handler_has_no_legacy_branch(self):
+        import inspect
+        import studio_workflow_run
+        src = inspect.getsource(studio_workflow_run.handle_workflow_run_async)
+        self.assertNotIn("_workflow_legacy_run", src)
+        self.assertIn("EXECUTION_MODE_RETIRED", src)
 
-    def test_resolve_execution_mode_returns_expected_keys(self):
-        """resolve_execution_mode returns mode/source/locked."""
-        resolved = resolve_execution_mode()
-        self.assertIn("mode", resolved)
-        self.assertIn("source", resolved)
-        self.assertIn("locked", resolved)
-        self.assertIsInstance(resolved["locked"], bool)
+
+# ---------------------------------------------------------------------------
+# 5. Canvas dispatch — V2-only structural proof
+# ---------------------------------------------------------------------------
+
+class TestCanvasV2Only(unittest.TestCase):
+    def test_canvas_prompt_handler_has_no_v1_executor_call(self):
+        """The canvas prompt job executes through execute_plan only; the
+        execute_modal_prompt branch is gone."""
+        with open(os.path.join(_NODE_DIR, "__init__.py"), encoding="utf-8") as f:
+            src = f.read()
+        # The canvas dispatch region must not call the V1 executor anymore.
+        self.assertNotIn("result = await execute_modal_prompt(", src)
+        self.assertNotIn('if _mode in {"v2", "shadow"}:', src)
+        self.assertIn('"error": "execution_mode_retired"', src)
 
 
 # ---------------------------------------------------------------------------

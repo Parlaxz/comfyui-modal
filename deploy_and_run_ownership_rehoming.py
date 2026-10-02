@@ -188,7 +188,10 @@ def main() -> None:
         })
         print("=== Total-wall deploy-only requested; study skipped ===")
         return
-    if "--deploy-only" in args:
+    if "--deploy-only" in args and (not args or args[0] not in ("total-wall", "snapshot-ab", "lean")):
+        # Legacy no-mode --deploy-only: redeploys the four ownership study
+        # apps.  total-wall / snapshot-ab / lean handle --deploy-only in
+        # their own branches and must NOT be intercepted here.
         deploy(APP_OWNERSHIP_PROBES, cloud="gcp", extra={
             "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": "1",
@@ -381,6 +384,12 @@ def main() -> None:
         no_deploy = "--no-deploy" in args
         cloud = "gcp"  # same region-pinned pool for causal isolation
         app = APP_RESTORE if arm == "current" else f"{APP_RESTORE}-lean"
+        if "--app-name" in args:
+            # Explicit app-name override (e.g. a dedicated arm-B deployment
+            # name so the A/B cannot disturb the production app lineage).
+            _idx = args.index("--app-name")
+            if _idx + 1 < len(args) and args[_idx + 1].strip():
+                app = args[_idx + 1].strip()
         extra: dict[str, str] = {
             "COMFYMODAL_V2_UNET_EXCLUSIVE_OWNER": "1",
             "COMFYMODAL_V2_LEAN_SNAPSHOT": "1" if arm == "lean" else "0",

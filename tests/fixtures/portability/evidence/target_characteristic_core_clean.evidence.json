@@ -1,0 +1,49 @@
+{
+  "audit_basis": [
+    "PHASE_G3 §7 platform-specific risk matrix",
+    "PHASE_G5 §5 broad semantics"
+  ],
+  "capability_evidence": {
+    "baseten": {
+      "bake_required": true,
+      "json_import": "embedded_per_deployment"
+    },
+    "comfy_cloud": {
+      "curated_env_sufficient": true,
+      "json_import": "supported"
+    },
+    "local": {
+      "execution": "supported",
+      "json_import": "supported"
+    },
+    "modal": {
+      "execution": "supported",
+      "json_import": "supported"
+    },
+    "runcomfy": {
+      "auto_setup": "supported",
+      "json_import": "supported"
+    },
+    "runpod": {
+      "execution": "supported",
+      "json_import": "supported"
+    }
+  },
+  "characteristic": "core_clean",
+  "evidence_id": "target_characteristic_core_clean",
+  "expected_target_risk": {
+    "baseten": "medium",
+    "comfy_cloud": "low",
+    "local": "low",
+    "modal": "low",
+    "runcomfy": "low",
+    "runpod": "low"
+  },
+  "provider_independent_facts": {
+    "core_nodes_only": true,
+    "requires_native_build": false,
+    "requires_private_access": false,
+    "standard_checkpoint_basename": true
+  },
+  "scenario_id": "core_clean"
+}

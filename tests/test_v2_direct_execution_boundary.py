@@ -3,9 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
+
+import pytest
 
 from canonical_execution import build_execution_plan, execute_plan
 from comfymodal_runtime.modal_transport import ModalTransport
+
+
+@pytest.fixture(autouse=True)
+def _d1_isolate_store(tmp_path):
+    """Never write the real shared D1 registry-proof store (the real
+    build_execution_plan under the deploy-frozen identity would otherwise
+    write/evict it; see tests/d1_store_isolation.py)."""
+    os.environ["COMFYMODAL_V2_REGISTRY_PROOF_STORE"] = str(tmp_path / "store.json")
+    yield
+    os.environ.pop("COMFYMODAL_V2_REGISTRY_PROOF_STORE", None)
 
 
 def test_execute_plan_submits_before_any_legacy_publisher_can_run():

@@ -144,21 +144,21 @@ class TestEnsureRunPromptOptions(unittest.TestCase):
         )
 
 
-class TestLocalRemoteInvokerActualLoad(unittest.TestCase):
-    """Verify that LocalRemoteInvoker.run_cell stream kwargs include
+class TestActualLoadStreamKwargsDefaults(unittest.TestCase):
+    """Verify that the scheduler/V2 stream-kwargs construction includes
     actual_load config on the default path.
 
-    This test checks that --- after the production-report merge --- the
-    builder and merge helper produce a modal_options dict with
-    actual_load.enabled=True and mode="unet_vae_only".
+    H19 rename: formerly TestLocalRemoteInvokerActualLoad — the retired V1
+    invoker was deleted; this pins the still-live build/ensure
+    run-prompt-options contract its callers rely on.
     """
 
     def setUp(self):
         self.mod = load_module()
 
     def test_default_stream_kwargs_include_actual_load(self):
-        """Simulate what LocalRemoteInvoker.run_cell does:
-        1. Build _mo from self._modal_options (None for default path)
+        """Simulate the shared stream-kwargs construction:
+        1. Build _mo from modal_options (None for default path)
         2. Merge production report if present
         3. Call build/ensure_run_prompt_options
         4. Verify actual_load is present with correct defaults.
@@ -182,7 +182,7 @@ class TestLocalRemoteInvokerActualLoad(unittest.TestCase):
                 "metadata_mode": "none",
             })
 
-        # Builder step (same as what we added to LocalRemoteInvoker.run_cell)
+        # Builder step (shared by every execution path)
         _prod_ids_for_builder = []
         if _mo.get("production") and _mo["production"].get("enabled"):
             _prod_ids_for_builder = _mo["production"].get("output_node_ids", [])

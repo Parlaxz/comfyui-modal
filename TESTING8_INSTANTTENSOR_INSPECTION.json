@@ -1,0 +1,354 @@
+{
+  "backend_objects": {
+    "instanttensor": {
+      "AIO": "Backend.AIO",
+      "URING": "Backend.URING"
+    },
+    "instanttensor._impl": {
+      "AIO": "Backend.AIO",
+      "URING": "Backend.URING"
+    }
+  },
+  "package_file": "/usr/local/lib/python3.11/site-packages/instanttensor/__init__.py",
+  "phase": "instanttensor_inspection",
+  "public_names": [
+    "Backend",
+    "BackendPolicy",
+    "safe_open"
+  ],
+  "safe_open_signature": "(filename: Union[str, list[str]], framework: str, device: Union[int, str, torch.device], process_group=None, *, buffer_size: Optional[int] = None, chunk_size: Optional[int] = None, concurrency: Optional[int] = None, io_depth: Optional[int] = None, max_free_mem_usage: Optional[float] = None, load_now: bool = True, copy: bool = True, backend: Union[instanttensor._impl.Backend, instanttensor._impl.BackendPolicy, list[Union[instanttensor._impl.Backend, instanttensor._impl.BackendPolicy]], NoneType] = None)",
+  "source_hits": [
+    {
+      "file": "/usr/local/lib/python3.11/site-packages/instanttensor/_impl.py",
+      "hits": [
+        {
+          "line": 31,
+          "text": "    # _C module is mocked (e.g., during Sphinx documentation build)"
+        },
+        {
+          "line": 35,
+          "text": "# How to choose a backend:"
+        },
+        {
+          "line": 39,
+          "text": "#     page cache pollution. Prefer URING > AIO > CUFILE: URING delivers the best"
+        },
+        {
+          "line": 40,
+          "text": "#     performance on newer platforms, AIO has the broadest compatibility, and"
+        },
+        {
+          "line": 43,
+          "text": "#   Buffered I/O:"
+        },
+        {
+          "line": 44,
+          "text": "#     Use buffered I/O when the same model is expected to be loaded repeatedly"
+        },
+        {
+          "line": 46,
+          "text": "#     usually slower than Direct I/O. Prefer URING_BUFFERED > AIO_BUFFERED > MMAP:"
+        },
+        {
+          "line": 47,
+          "text": "#     URING_BUFFERED is faster but less compatible than AIO_BUFFERED, while MMAP"
+        },
+        {
+          "line": 50,
+          "text": "#     When storing models on an in-memory filesystem such as tmpfs to accelerate"
+        },
+        {
+          "line": 51,
+          "text": "#     loading, prefer MMAP > URING_BUFFERED > AIO_BUFFERED. MMAP provides the"
+        },
+        {
+          "line": 52,
+          "text": "#     best performance and compatibility; the other two backends work but are not"
+        },
+        {
+          "line": 54,
+          "text": "# Default backend:"
+        },
+        {
+          "line": 56,
+          "text": "#   it tries URING first and falls back to AIO to balance performance and broad"
+        },
+        {
+          "line": 58,
+          "text": "_backend_values = _C.backend_values()"
+        },
+        {
+          "line": 61,
+          "text": "class Backend(Enum):"
+        },
+        {
+          "line": 62,
+          "text": "    AIO = _backend_values[\"AIO\"]"
+        },
+        {
+          "line": 63,
+          "text": "    AIO_BUFFERED = _backend_values[\"AIO_BUFFERED\"]"
+        },
+        {
+          "line": 64,
+          "text": "    URING = _backend_values[\"URING\"]"
+        },
+        {
+          "line": 65,
+          "text": "    URING_BUFFERED = _backend_values[\"URING_BUFFERED\"]"
+        },
+        {
+          "line": 66,
+          "text": "    CUFILE = _backend_values[\"CUFILE\"]"
+        },
+        {
+          "line": 67,
+          "text": "    MMAP = _backend_values[\"MMAP\"]"
+        },
+        {
+          "line": 70,
+          "text": "del _backend_values"
+        },
+        {
+          "line": 73,
+          "text": "class BackendPolicy(Enum):"
+        },
+        {
+          "line": 74,
+          "text": "    BUFFERED = \"BUFFERED\""
+        },
+        {
+          "line": 77,
+          "text": "default_backend = [Backend.URING, Backend.AIO]"
+        },
+        {
+          "line": 78,
+          "text": "default_buffered_io_backend = [Backend.URING_BUFFERED, Backend.MMAP]"
+        },
+        {
+          "line": 79,
+          "text": "default_in_memory_backend = [Backend.MMAP]"
+        },
+        {
+          "line": 80,
+          "text": "available_in_memory_backends = [Backend.MMAP, Backend.URING_BUFFERED, Backend.AIO_BUFFERED]"
+        },
+        {
+          "line": 85,
+          "text": "BackendCandidate = Union[Backend, BackendPolicy]"
+        },
+        {
+          "line": 86,
+          "text": "BackendCandidates = Optional[Union[BackendCandidate, list[BackendCandidate]]]"
+        },
+        {
+          "line": 87,
+          "text": "_emitted_backend_warnings = set()"
+        },
+        {
+          "line": 92,
+          "text": "    buffer_size: Optional[int]"
+        },
+        {
+          "line": 97,
+          "text": "    backend: BackendCandidates"
+        },
+        {
+          "line": 100,
+          "text": "def parse_backend(name: str) -> BackendCandidate:"
+        },
+        {
+          "line": 101,
+          "text": "    str_to_backend = {backend.name: backend for backend in Backend}"
+        },
+        {
+          "line": 102,
+          "text": "    str_to_backend.update({policy.name: policy for policy in BackendPolicy})"
+        },
+        {
+          "line": 104,
+          "text": "    if name not in str_to_backend:"
+        },
+        {
+          "line": 105,
+          "text": "        raise ValueError(f\"backend={name} is invalid. Available backends: {str_to_backend.keys()}\")"
+        },
+        {
+          "line": 106,
+          "text": "    return str_to_backend[name]"
+        },
+        {
+          "line": 109,
+          "text": "def expand_backend_candidate(backend: BackendCandidate) -> list[Backend]:"
+        },
+        {
+          "line": 110,
+          "text": "    if isinstance(backend, Backend):"
+        },
+        {
+          "line": 111,
+          "text": "        return [backend]"
+        },
+        {
+          "line": 112,
+          "text": "    if backend == BackendPolicy.BUFFERED:"
+        },
+        {
+          "line": 113,
+          "text": "        return list(default_buffered_io_backend)"
+        },
+        {
+          "line": 114,
+          "text": "    raise TypeError(\"backend must be a `Backend`, `BackendPolicy`, or list of them\")"
+        },
+        {
+          "line": 117,
+          "text": "def parse_backend_candidates(backends: BackendCandidates) -> Optional[list[Backend]]:"
+        },
+        {
+          "line": 118,
+          "text": "    if backends is None:"
+        },
+        {
+          "line": 121,
+          "text": "    backend_list = backends if isinstance(backends, list) else [backends]"
+        },
+        {
+          "line": 122,
+          "text": "    if len(backend_list) == 0:"
+        },
+        {
+          "line": 123,
+          "text": "        raise ValueError(\"backend cannot be an empty list; use None to select the default backend candidates\")"
+        },
+        {
+          "line": 126,
+          "text": "    for backend in backend_list:"
+        },
+        {
+          "line": 127,
+          "text": "        if not isinstance(backend, (Backend, BackendPolicy)):"
+        },
+        {
+          "line": 128,
+          "text": "            raise TypeError(\"backend must be a `Backend`, `BackendPolicy`, or list of them\")"
+        },
+        {
+          "line": 129,
+          "text": "        candidates.extend(expand_backend_candidate(backend))"
+        },
+        {
+          "line": 133,
+          "text": "def backend_names(backends: list[Backend]) -> list[str]:"
+        },
+        {
+          "line": 134,
+          "text": "    return [backend.name for backend in backends]"
+        },
+        {
+          "line": 137,
+          "text": "def _emit_backend_warning(message: str) -> None:"
+        },
+        {
+          "line": 138,
+          "text": "    if not message or message in _emitted_backend_warnings:"
+        },
+        {
+          "line": 146,
+          "text": "    _emitted_backend_warnings.add(message)"
+        },
+        {
+          "line": 149,
+          "text": "def select_backend(candidates: list[Backend], supported_backends: Optional[list[Backend]] = None) -> Backend:"
+        },
+        {
+          "line": 151,
+          "text": "    for backend in candidates:"
+        },
+        {
+          "line": 152,
+          "text": "        if supported_backends is not None and backend not in supported_backends:"
+        },
+        {
+          "line": 153,
+          "text": "            rejected.append(f\"{backend.name} is not supported for this filesystem.\")"
+        },
+        {
+          "line": 155,
+          "text": "        available, reason, warning = _C.backend_status(backend.value)"
+        },
+        {
+          "line": 158,
+          "text": "                reason or f\"{backend.name} is not available on this system.\""
+        },
+        {
+          "line": 161,
+          "text": "        _emit_backend_warning(warning)"
+        },
+        {
+          "line": 162,
+          "text": "        debug_log(\"Using backend %s\", backend.name)"
+        },
+        {
+          "line": 163,
+          "text": "        return backend"
+        },
+        {
+          "line": 165,
+          "text": "    candidates_str = \", \".join(backend_names(candidates))"
+        },
+        {
+          "line": 168,
+          "text": "        f\"No available backend was found among candidates [{candidates_str}]. \""
+        },
+        {
+          "line": 175,
+          "text": "def env_backend():"
+        },
+        {
+          "line": 176,
+          "text": "    ret = os.environ.get(\"INSTANTTENSOR_BACKEND\")"
+        },
+        {
+          "line": 179,
+          "text": "    candidates = [parse_backend(name) for name in ret.split(\",\") if name.strip()]"
+        },
+        {
+          "line": 181,
+          "text": "        raise ValueError(\"INSTANTTENSOR_BACKEND cannot be empty\")"
+        },
+        {
+          "line": 200,
+          "text": "def env_buffer_size():"
+        },
+        {
+          "line": 201,
+          "text": "    ret = os.environ.get(\"INSTANTTENSOR_BUFFER_SIZE\")"
+        },
+        {
+          "line": 206,
+          "text": "    buffer_size: Optional[int],"
+        },
+        {
+          "line": 211,
+          "text": "    backend: BackendCandidates,"
+        },
+        {
+          "line": 214,
+          "text": "        buffer_size=buffer_size if buffer_size is not None else env_buffer_size(),"
+        },
+        {
+          "line": 223,
+          "text": "        backend=backend if backend is not None else env_backend(),"
+        }
+      ]
+    }
+  ],
+  "source_root": "/usr/local/lib/python3.11/site-packages/instanttensor",
+  "status": "ok",
+  "version": "0.2.0",
+  "waterfall": {
+    "method": "run_testing8_gds_instanttensor_probe",
+    "status": "non_applicable"
+  }
+}

@@ -1,8 +1,10 @@
 ﻿import contextlib
 import hashlib
+import inspect
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,17 +13,80 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import modal
-from comfymodal_runtime.contracts import stable_hash
+from comfymodal_runtime.contracts import (
+    DEFAULT_OUTPUT_QUALITY,
+    DEFAULT_PREVIEW_QUALITY,
+    normalize_output_format,
+    normalize_quality,
+    normalize_webp_lossless_compression,
+    resolve_webp_pillow_method,
+    stable_hash,
+)
 from comfymodal_runtime.env import env_flag
+import comfymodal_runtime.baseline_resolvers as _baseline_resolvers
+from comfymodal_runtime.baseline_resolvers import (
+    production_baseline_value,
+    _resolve_production_baseline_flag,
+    _resolve_runtime_flag,
+    _resolve_runtime_string,
+    _resolve_sage_runtime_env_override,
+    _resolve_sage_probe_on_restore,
+    _resolve_preload_mode,
+)
+
+# Compatibility handle for older tests/callers; the mapping remains owned by
+# baseline_resolvers and is not copied here.
+_PRODUCTION_BASELINE_OVERRIDES = _baseline_resolvers._PRODUCTION_BASELINE_OVERRIDES
+from comfymodal_runtime.sage_policy import (
+    SAGE_RUNTIME_BASELINE,
+    SAGE_RUNTIME_CACHE_SCHEMA_VERSION,
+    SAGE_RUNTIME_POLICY_VERSION,
+    SAGEATTENTION_SOURCE_REPOSITORY,
+    SAGEATTENTION_GIT_REF,
+    SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
+    SAGEATTENTION_SOURCE_POLICY,
+    build_sage_runtime_identity as _sage_policy_build_identity,
+    choose_sage_runtime_mode as _sage_policy_choose_mode,
+    list_sageattention_extension_files as _sage_policy_list_extensions,
+    resolve_sage_probe_on_restore,
+    resolve_sage_runtime_mode,
+    sage_runtime_cache_usable as _sage_policy_cache_usable,
+    sage_runtime_identity_matches as _sage_policy_identity_matches,
+    select_public_sageattention_callable as _sage_policy_select_callable,
+    sageattention_artifact_identity as _sage_policy_artifact_identity,
+)
+from comfymodal_runtime.deployment_spec import (
+    build_v2_late_config,
+)
+from comfymodal_runtime import publication_policy as _publication_policy
+from comfymodal_runtime.custom_node_root import (
+    CustomNodesRootResolution as _CustomNodesRootResolution,
+    resolve_custom_nodes_root_details as _resolve_custom_nodes_root_details,
+)
+# ── E40 Lane A: single configuration authority ──────────────────────────
+# One resolved-config truth for the runtime. Golden-semantics controls are
+# resolved centrally; the fingerprint binds requested↔deployed↔runtime, and
+# any algorithm-changing env var OUTSIDE the authority is detected at import
+# instead of silently mutating behavior.
+try:
+    from comfymodal_runtime.config_authority import (
+        resolve as _config_authority_resolve,
+        detect_unregistered_mutations as _config_authority_detect_mutations,
+    )
+    RESOLVED_CONFIG = _config_authority_resolve()
+    UNREGISTERED_ENV_MUTATIONS = _config_authority_detect_mutations()
+except Exception:  # pragma: no cover - authority must never block import
+    RESOLVED_CONFIG = None
+    UNREGISTERED_ENV_MUTATIONS = []
 from comfymodal_runtime.runtime_shape import (
     apply_torch_thread_policy,
     log_effective_runtime_shape,
     runtime_shape_config,
 )
-
 # Gö─Gö─ Optimizations module (Phase 1-7 wiring) Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─Gö─
 # Imported lazily with a guarded fallback so a missing/import-error in
 # optimizations.py never breaks the rest of comfyapp.py.
@@ -159,6 +224,91 @@ THIRD_PARTY_LOG_ALLOWLIST = [] if not _OPTIMIZATIONS_AVAILABLE else THIRD_PARTY_
 PROMPT_BUNDLE_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else PROMPT_BUNDLE_SCHEMA_VERSION
 CUSTOM_NODE_GENERATION_SCHEMA_VERSION = 1 if not _OPTIMIZATIONS_AVAILABLE else CUSTOM_NODE_GENERATION_SCHEMA_VERSION
 
+# ── V2 optimization diagnostics (measurement-only; gated off by default) ──
+# Mirrors the fail-open import style used above for comfymodal_runtime.
+try:
+    from comfymodal_runtime.optimization_diagnostics import (
+        opt_diag_enabled as _opt_diag_enabled,
+        emit_opt as _opt_emit,
+    )
+except Exception:
+    _opt_diag_enabled = lambda: False  # type: ignore
+    _opt_emit = lambda *a, **k: None  # type: ignore
+
+# ── V2 experiment registry (Experiments 3/6) — fail-open when absent. ─────
+try:
+    from comfymodal_runtime.v2_experiments import (
+        png_compress_level as _v2_png_compress_level,
+        restore_total_vram_frozen_enabled as _v2_restore_total_vram_frozen_enabled,
+        experiment_line as _v2_experiment_line,
+        resolve_experiment as _v2_resolve_experiment,
+    )
+except Exception:
+    _v2_png_compress_level = lambda: 1  # type: ignore
+    _v2_restore_total_vram_frozen_enabled = lambda: False  # type: ignore
+    _v2_experiment_line = lambda _s: ""  # type: ignore
+    _v2_resolve_experiment = lambda _n: None  # type: ignore
+
+# One-time per-process experiment logs (Experiments 3/6).
+_PNG_EXPERIMENT_LOGGED = False
+_RESTORE_MEMORY_EXPERIMENT_LOGGED = False
+_PNG_EXPERIMENT_LOCK = threading.Lock()
+_RESTORE_MEMORY_EXPERIMENT_LOCK = threading.Lock()
+
+# ── Ungated last-output-encode record (additive, trace-artifact path) ──
+# Set by encode_image_tensor_batch after its PIL save loop so
+# comfymodal_runtime.modal_app can enrich the output_encode_end trace event
+# with PNG compress level + save-loop wall time even when the opt-gated
+# decomposition is off.  Never raises; thread-safe via a dedicated lock.
+_LAST_PNG_ENCODE_INFO: dict[str, Any] | None = None
+_LAST_PNG_ENCODE_INFO_LOCK = threading.Lock()
+
+
+def get_last_png_encode_info() -> dict[str, Any] | None:
+    """Return a copy of the last output-encode record, or None when absent.
+
+    The encode runs on a worker thread; a lock guards the read so the copy is
+    never torn.  Never raises.
+    """
+    try:
+        with _LAST_PNG_ENCODE_INFO_LOCK:
+            info = _LAST_PNG_ENCODE_INFO
+            return dict(info) if isinstance(info, dict) else None
+    except Exception:
+        return None
+
+
+get_last_output_encode_info = get_last_png_encode_info
+
+
+def _png_experiment_log_once() -> None:
+    """Print the canonical ``[v2.experiment]`` line once per process when a
+    non-default PNG level (6, via env override) is first exercised.  Never
+    raises."""
+    global _PNG_EXPERIMENT_LOGGED
+    with _PNG_EXPERIMENT_LOCK:
+        if _PNG_EXPERIMENT_LOGGED:
+            return
+        _PNG_EXPERIMENT_LOGGED = True
+    try:
+        print(_v2_experiment_line(_v2_resolve_experiment("png_encode")), flush=True)
+    except Exception:
+        pass
+
+
+def _restore_memory_experiment_log_once() -> None:
+    """Print the canonical ``[v2.experiment]`` line once per process when the
+    frozen-VRAM (optimized) restore_memory arm ran.  Never raises."""
+    global _RESTORE_MEMORY_EXPERIMENT_LOGGED
+    with _RESTORE_MEMORY_EXPERIMENT_LOCK:
+        if _RESTORE_MEMORY_EXPERIMENT_LOGGED:
+            return
+        _RESTORE_MEMORY_EXPERIMENT_LOGGED = True
+    try:
+        print(_v2_experiment_line(_v2_resolve_experiment("restore_memory")), flush=True)
+    except Exception:
+        pass
+
 # Process-wide waterfall recorder (per-request usage preferred)
 _WATERFALL = WaterfallRecorder()
 
@@ -204,9 +354,13 @@ from production_workflow import (
 # ── Immutable dependency manifest (pure logic extracted for testability) ──
 import comfymodal_runtime.dependency_manifest as _dep_mft
 
-# GÃ¶Ã‡GÃ¶Ã‡ Inline output-converter constants & helpers (self-contained for Modal) GÃ¶Ã‡GÃ¶Ã‡
+# ── Inline output-converter constants & helpers (self-contained for Modal) ──
 _OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
 _WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
+# E2D: the effort vocabulary now drives BOTH WebP modes.  The lossy save
+# resolves its Pillow method from the mapped effort (fast→0, balanced→4,
+# max→6); the constant below is only the defensive fallback for an unknown
+# label and preserves the pre-E2D encoder for the default balanced path.
 _WEBP_LOSSLESS_METHOD = {"fast": 0, "balanced": 4, "max": 6}
 _WEBP_LOSSY_METHOD = 4
 _FORMAT_META = {
@@ -232,118 +386,18 @@ def _change_extension(filename: str, new_ext: str) -> str:
 def _convert_image_bytes(
     input_bytes: bytes,
     output_format: str = "original",
-    quality: int = 75,
+    quality: int | float | str | None = None,
     webp_lossless_compression: str = "balanced",
 ) -> dict:
-    """Convert raw PNG bytes to target format.  Returns metadata dict."""
-    import io as _io
-    import time as _time
+    """Compatibility wrapper around the canonical output converter."""
+    from output_converter import convert_image_bytes
 
-    _t0 = _time.time()
-    meta = {
-        "bytes": input_bytes,
-        "mime_type": "image/png",
-        "file_ext": ".png",
-        "output_format": output_format,
-        "original_size_bytes": len(input_bytes),
-        "returned_size_bytes": len(input_bytes),
-        "conversion_time_ms": 0,
-        "quality": None,
-        "webp_lossless_compression": None,
-        "fallback": False,
-        "error": None,
-    }
-
-    if output_format not in _OUTPUT_FORMATS:
-        meta["error"] = f"unknown output_format: {output_format!r}"
-        meta["output_format"] = "original"
-        output_format = "original"
-    if not isinstance(quality, (int, float)):
-        quality = 75
-    quality = max(0, min(100, int(quality)))
-    if webp_lossless_compression not in _WEBP_LOSSLESS_COMPRESSION:
-        webp_lossless_compression = "balanced"
-
-    fmt_ext = _FORMAT_META.get(output_format, _FORMAT_META["original"])
-    meta["mime_type"] = fmt_ext["mime"]
-    meta["file_ext"] = fmt_ext["ext"]
-
-    if output_format == "original":
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        from PIL import Image as _PillowImage
-    except ImportError:
-        meta["error"] = "Pillow not available; returning original PNG"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    try:
-        img = _PillowImage.open(_io.BytesIO(input_bytes))
-    except Exception as exc:
-        meta["error"] = f"failed to open image: {exc}"
-        meta["fallback"] = True
-        meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-        return meta
-
-    out_buf = _io.BytesIO()
-    try:
-        if output_format == "webp_lossless":
-            meta["quality"] = None
-            meta["webp_lossless_compression"] = webp_lossless_compression
-            method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
-            img.save(out_buf, format="WEBP", lossless=True, method=method)
-        elif output_format == "webp_lossy":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
-        elif output_format == "jpeg":
-            meta["quality"] = quality
-            meta["webp_lossless_compression"] = None
-            # Composite alpha onto white background
-            if img.mode in ("RGBA", "LA", "PA"):
-                if img.mode == "RGBA":
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                elif img.mode == "LA":
-                    bg = _PillowImage.new("L", img.size, 255)
-                    bg.paste(img, mask=img.split()[1])
-                    img = bg.convert("RGB")
-                elif img.mode == "PA":
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-            elif img.mode == "P":
-                if "transparency" in img.info:
-                    img = img.convert("RGBA")
-                    bg = _PillowImage.new("RGB", img.size, (255, 255, 255))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                else:
-                    img = img.convert("RGB")
-            elif img.mode != "RGB":
-                img = img.convert("RGB")
-            img.save(out_buf, format="JPEG", quality=quality)
-
-        out_buf.seek(0)
-        meta["bytes"] = out_buf.read()
-        meta["returned_size_bytes"] = len(meta["bytes"])
-    except Exception as exc:
-        meta["error"] = f"conversion failed: {exc}"
-        meta["fallback"] = True
-        meta["bytes"] = input_bytes
-        meta["returned_size_bytes"] = len(input_bytes)
-        meta["file_ext"] = ".png"
-        meta["mime_type"] = "image/png"
-
-    meta["conversion_time_ms"] = round((_time.time() - _t0) * 1000, 1)
-    if meta.get("fallback"):
-        print(f"[comfyapp.convert] FALLBACK to PNG: fmt={output_format} err={meta['error']}")
-    return meta
+    return convert_image_bytes(
+        input_bytes,
+        output_format=output_format,
+        quality=quality,
+        webp_lossless_compression=webp_lossless_compression,
+    )
 
 # GÃ¶Ã‡GÃ¶Ã‡ PART 12: Silent exception logging helper GÃ¶Ã‡GÃ¶Ã‡
 _SILENT_EXCEPTION_DEBUG = env_flag("COMFYMODAL_SILENT_EXCEPTION_DEBUG")
@@ -364,6 +418,13 @@ def _log_silent_exception(context: str, exc: Exception, detail: str = "") -> Non
 PROFILING_ENABLED = env_flag("COMFYMODAL_PROFILING")
 DEFAULT_EXECUTION_BACKEND = os.getenv("COMFYMODAL_EXECUTION_BACKEND", "in_process")
 ENABLE_WARMUP = env_flag("COMFYMODAL_ENABLE_WARMUP", default=True)
+# E37 restore contract: the restored method must return after lifecycle
+# identity/timing setup and the minimum backend/CUDA reattachment.  Keep the
+# complete restore implementation below for opt-out/debug runs rather than
+# deleting its lifecycle code.  The effective value is read at restore time so
+# the controlled profile can select the path without changing this module's
+# import-time environment.
+MINIMAL_RESTORE_DEFAULT = True
 ENABLE_TORCH_COMPILE = env_flag("COMFYMODAL_ENABLE_TORCH_COMPILE")
 ENABLE_GPU_SNAPSHOT = env_flag("COMFYMODAL_ENABLE_GPU_SNAPSHOT")
 CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S = int(os.getenv("COMFYMODAL_CUSTOM_NODE_REQUIREMENTS_TIMEOUT_S", "180"))
@@ -371,6 +432,10 @@ CUSTOM_NODE_COPY_MODE = os.getenv("COMFYMODAL_CUSTOM_NODE_COPY_MODE", "combined"
 if CUSTOM_NODE_COPY_MODE not in ("combined", "per_node"):
     print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_COPY_MODE={CUSTOM_NODE_COPY_MODE!r}, falling back to 'combined'")
     CUSTOM_NODE_COPY_MODE = "combined"
+CUSTOM_NODE_DELIVERY = os.getenv("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
+    print(f"[comfyapp] WARNING: invalid COMFYMODAL_CUSTOM_NODE_DELIVERY={CUSTOM_NODE_DELIVERY!r}, falling back to 'image'")
+    CUSTOM_NODE_DELIVERY = "image"
 
 # Generic collector for custom-node import/entrypoint failures during startup.
 # Populated by the logging.warning patch in _start_in_process_backend.
@@ -457,10 +522,70 @@ def _is_authorized_production_direct_sink_request(prompt_id: str, node_id: str) 
 # ComfyModalProductionImageComparerOutput can use them.
 
 
+# ── V2 PNG/output-encode decomposition diagnostics (measurement-only) ──
+# Bounded module-level stores; no runtime policy/behavior impact when the
+# COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS gate is off (all no-ops).
+_OPT_ENCODE_DIAG_MAX_ENTRIES = 8
+_OPT_ENCODE_DIAG = []
+_OPT_CLAMP_PENDING_MAX_ENTRIES = 16
+_OPT_CLAMP_PENDING = {}
+
+
+def _opt_diag_append(diag_list, entry, cap):
+    """Append *entry* to a bounded diagnostics list, dropping the oldest."""
+    diag_list.append(entry)
+    if len(diag_list) > cap:
+        del diag_list[: len(diag_list) - cap]
+
+
+def _opt_active_trace():
+    """Return the active ``RuntimeTrace`` via model_preload's ContextVar.
+
+    ``request_execution_trace_scope`` (comfymodal_runtime/model_preload.py)
+    sets ``_ACTIVE_REQUEST_TRACE`` for the duration of a prompt execution;
+    the encode node runs synchronously inside that scope on the v2 path.
+    Falls back to the ``request_execution_trace_scope`` form.  All access is
+    guarded — an unreachable trace yields ``None`` and emission is skipped.
+    """
+    try:
+        from comfymodal_runtime import model_preload as _mp
+    except Exception:
+        return None
+    try:
+        return _mp._ACTIVE_REQUEST_TRACE.get()
+    except Exception:
+        pass
+    try:
+        return _mp.request_execution_trace_scope.get()
+    except Exception:
+        return None
+
+
+def _opt_active_request_id():
+    """Return the current request id when a request trace is reachable."""
+    _tr = _opt_active_trace()
+    if _tr is None:
+        return None
+    try:
+        return getattr(_tr, "request_id", None) or None
+    except Exception:
+        return None
+
+
+def _opt_clamp_pending_store(tensor_id, clamp_entry):
+    """Store clamp timings keyed by the clamped tensor's id (bounded)."""
+    _OPT_CLAMP_PENDING[tensor_id] = clamp_entry
+    if len(_OPT_CLAMP_PENDING) > _OPT_CLAMP_PENDING_MAX_ENTRIES:
+        for _k in list(_OPT_CLAMP_PENDING)[
+            : len(_OPT_CLAMP_PENDING) - _OPT_CLAMP_PENDING_MAX_ENTRIES
+        ]:
+            _OPT_CLAMP_PENDING.pop(_k, None)
+
+
 def encode_image_tensor_batch(
     images_t,
     output_format="original",
-    quality=75,
+    quality=DEFAULT_OUTPUT_QUALITY,
     webp_lossless_compression="balanced",
 ):
     """Encode a single image batch tensor to bytes.
@@ -471,32 +596,103 @@ def encode_image_tensor_batch(
     import io as _io
     from PIL import Image as _PILImage
 
+    _raw_output_format = output_format
+    output_format = normalize_output_format(output_format)
+    _quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(_raw_output_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    quality = normalize_quality(quality, default=_quality_default)
+    webp_lossless_compression = normalize_webp_lossless_compression(
+        webp_lossless_compression
+    )
+    # E2D: effective WebP encoder-effort policy.  The mapped Pillow method
+    # drives BOTH WebP modes (lossy previously hardcoded method 4); the label
+    # and integer are exposed additively in codec diagnostics.
+    _is_webp = output_format in ("webp_lossless", "webp_lossy")
+    _webp_effort = webp_lossless_compression if _is_webp else None
+    _webp_method = (
+        _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, _WEBP_LOSSY_METHOD)
+        if _is_webp else None
+    )
+
+    # ── V2 png_encode experiment (default level 1; level 6 via env override) ──
+    # compress_level only changes the compression ratio — PNG is lossless at
+    # every level, so decoded pixels are byte-identical.
+    _png_level = _v2_png_compress_level()
+
+    # ── V2 output-encode decomposition (measurement-only, gated) ──
+    _opt_on = _opt_diag_enabled()
+    _opt_trace = _opt_active_trace() if _opt_on else None
+    _opt_req_id = (
+        getattr(_opt_trace, "request_id", None) if _opt_trace is not None else None
+    )
+    # Clamp timings captured by the preceding _clamp_image_tensor call; the
+    # clamped tensor object flows directly from it into this function.
+    _opt_clamp = _OPT_CLAMP_PENDING.pop(id(images_t), None) if _opt_on else None
+    if _opt_clamp is None:
+        _opt_clamp = {
+            "gpu_to_cpu_ms": None,
+            "clamp_scale_ms": None,
+            "dtype_convert_ms": None,
+        }
+
     B, H, W, C = images_t.shape
     fmt_meta = _FORMAT_META.get(output_format, _FORMAT_META["original"])
     ext = fmt_meta["ext"]
     mime_type = fmt_meta["mime"]
 
     entries = []
+    _codec_timings_ms = []
+    _encoded_sizes = []
+    # Ungated timing of the PIL save loop (additive; independent of the
+    # opt-gated decomposition below).  Recorded after the loop so the runtime
+    # can enrich output_encode_end even when the opt path is disabled.
+    _png_save_loop_t0 = time.monotonic_ns()
     for batch_idx in range(B):
+        _opt_batch_t0 = time.monotonic_ns() if _opt_on else None
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         arr = images_t[batch_idx].numpy()
+        _opt_numpy_view_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         if output_format == "jpeg" and arr.shape[-1] == 4:
             from PIL import Image as _PILImg
             pil_img = _PILImg.fromarray(arr, mode="RGBA")
+            _opt_pil_create_ms = (
+                round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+                if _opt_t0 is not None else None
+            )
             bg = _PILImg.new("RGB", pil_img.size, (255, 255, 255))
             bg.paste(pil_img, mask=pil_img.split()[3])
             pil_img = bg
         else:
             mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
             pil_img = _PILImage.fromarray(arr, mode=mode)
+            _opt_pil_create_ms = (
+                round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+                if _opt_t0 is not None else None
+            )
 
         out_buf = _io.BytesIO()
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
+        _codec_t0 = time.monotonic_ns()
         if output_format == "original":
-            pil_img.save(out_buf, format="PNG")
+            pil_img.save(out_buf, format="PNG", compress_level=_png_level)
         elif output_format == "webp_lossless":
             method = _WEBP_LOSSLESS_METHOD.get(webp_lossless_compression, 4)
             pil_img.save(out_buf, format="WEBP", lossless=True, method=method)
         elif output_format == "webp_lossy":
-            pil_img.save(out_buf, format="WEBP", lossless=False, quality=quality, method=_WEBP_LOSSY_METHOD)
+            pil_img.save(
+                out_buf,
+                format="WEBP",
+                lossless=False,
+                quality=quality,
+                method=_webp_method,
+            )
         elif output_format == "jpeg":
             if pil_img.mode == "RGBA":
                 bg = _PILImage.new("RGB", pil_img.size, (255, 255, 255))
@@ -504,15 +700,203 @@ def encode_image_tensor_batch(
                 pil_img = bg
             pil_img.save(out_buf, format="JPEG", quality=quality)
         else:
-            pil_img.save(out_buf, format="PNG")
+            raise ValueError(f"unsupported normalized output format: {output_format!r}")
+        _codec_timings_ms.append(
+            round((time.monotonic_ns() - _codec_t0) / 1_000_000, 3)
+        )
+        _opt_png_compress_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
 
         out_buf.seek(0)
+        _opt_t0 = time.monotonic_ns() if _opt_on else None
         raw_bytes = out_buf.read()
+        _opt_raw_bytes_ms = (
+            round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+            if _opt_t0 is not None else None
+        )
+        if _opt_on:
+            _opt_entry = {
+                "request_id": _opt_req_id,
+                "batch_index": batch_idx,
+                "gpu_to_cpu_ms": _opt_clamp.get("gpu_to_cpu_ms"),
+                "clamp_scale_ms": _opt_clamp.get("clamp_scale_ms"),
+                "dtype_convert_ms": _opt_clamp.get("dtype_convert_ms"),
+                "numpy_view_ms": _opt_numpy_view_ms,
+                "pil_create_ms": _opt_pil_create_ms,
+                "png_compress_ms": _opt_png_compress_ms,
+                "output_codec_ms": _codec_timings_ms[-1],
+                "raw_bytes_ms": _opt_raw_bytes_ms,
+                "total_ms": round((time.monotonic_ns() - _opt_batch_t0) / 1_000_000, 3),
+                "width": W,
+                "height": H,
+                "channels": C,
+                "output_bytes": len(raw_bytes),
+                "compress_level": _png_level,
+                "backend": "PIL",
+                "optimizer": False,
+            }
+            _opt_diag_append(_OPT_ENCODE_DIAG, _opt_entry, _OPT_ENCODE_DIAG_MAX_ENTRIES)
+            _opt_emit(
+                _opt_trace,
+                "output_encode_decomposition",
+                phase="execution",
+                metadata=_opt_entry,
+            )
+            print(f"[v2.opt.output_encode] total_ms={_opt_entry['total_ms']} "
+                  f"png_compress_ms={_opt_entry['png_compress_ms']} "
+                  f"gpu_to_cpu_ms={_opt_entry['gpu_to_cpu_ms']}")
         entries.append((raw_bytes, ext, mime_type))
+        _encoded_sizes.append(len(raw_bytes))
+    # ── Ungated last-output-encode record (additive) ──
+    # Records the PNG compress level and the wall time of the entire PIL save
+    # loop so the runtime can enrich the output_encode_end trace event even
+    # when the opt-gated decomposition is off.  Never raises.
+    try:
+        global _LAST_PNG_ENCODE_INFO
+        _last_encode: dict[str, Any] = {
+            "compress_level": int(_png_level),
+            "png_compress_ms": round(
+                (time.monotonic_ns() - _png_save_loop_t0) / 1_000_000, 3
+            ),
+            "codec": "png" if output_format == "original" else (
+                "webp" if output_format.startswith("webp_") else "jpeg"
+            ),
+            "format": output_format,
+            "quality": quality if output_format in ("webp_lossy", "jpeg") else None,
+            "webp_lossless_compression": (
+                webp_lossless_compression if output_format == "webp_lossless" else None
+            ),
+            "webp_effort": _webp_effort,
+            "webp_method": _webp_method,
+            "output_codec_ms": round(sum(_codec_timings_ms), 3),
+            "encoded_bytes": sum(_encoded_sizes),
+            "source_bytes": B * H * W * C,
+            "conversion_fallback": False,
+            "items": [
+                {
+                    "codec": "png" if output_format == "original" else (
+                        "webp" if output_format.startswith("webp_") else "jpeg"
+                    ),
+                    "format": output_format,
+                    "quality": quality if output_format in ("webp_lossy", "jpeg") else None,
+                    "webp_lossless_compression": (
+                        webp_lossless_compression if output_format == "webp_lossless" else None
+                    ),
+                    "webp_effort": _webp_effort,
+                    "webp_method": _webp_method,
+                    "output_codec_ms": codec_ms,
+                    "encoded_bytes": encoded_bytes,
+                    "source_bytes": H * W * C,
+                    "conversion_fallback": False,
+                }
+                for codec_ms, encoded_bytes in zip(_codec_timings_ms, _encoded_sizes)
+            ],
+        }
+        with _LAST_PNG_ENCODE_INFO_LOCK:
+            _LAST_PNG_ENCODE_INFO = _last_encode
+    except Exception:
+        pass
+    # ── V2 png_encode experiment: log the arm once per process.  The default
+    # level 1 logs nothing (it IS the default; no noise); a level-6 override
+    # is the only thing that needs flagging.
+    if _png_level != 1:
+        _png_experiment_log_once()
     return entries, ext, mime_type, W, H
 
 
 _encode_image_tensor_batch = encode_image_tensor_batch
+
+
+# ── E2C: producer-side Thumbnail derivative encoding ─────────────────────
+# The direct sink already holds the clamped tensor locally, so the Thumbnail
+# derivative is encoded from the SAME in-memory pixels (resize → WebP) —
+# never by fetching a remote managed Original back.  Failure is graceful:
+# a missing Thumbnail must never invalidate the required primary output.
+_PRODUCTION_THUMBNAIL_MAX = 256
+_THUMBNAIL_QUALITY = 75
+
+
+def encode_thumbnail_batch(images_t, max_size=_PRODUCTION_THUMBNAIL_MAX):
+    """Encode a lightweight WebP Thumbnail derivative per batch item.
+
+    Source order: already-available clamped tensor → PIL resize (aspect
+    preserved) → WebP bytes.  Returns a list of dicts shaped::
+
+        {"bytes", "mime_type", "file_ext", "width", "height",
+         "byte_count", "output_codec_ms"}
+
+    with one entry per batch item; a failed item encodes as ``None``
+    (derivative failure is never fatal to the required output).
+    """
+    import io as _io
+    from PIL import Image as _PILImage
+
+    thumbnails: list[dict[str, Any] | None] = []
+    B = int(images_t.shape[0])
+    for batch_idx in range(B):
+        try:
+            arr = images_t[batch_idx].numpy()
+            mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
+            pil_img = _PILImage.fromarray(arr, mode=mode)
+            orig_width, orig_height = pil_img.size
+            pil_img.thumbnail((max_size, max_size))
+            thumb_width, thumb_height = pil_img.size
+            buffer = _io.BytesIO()
+            _codec_t0 = time.monotonic_ns()
+            pil_img.save(buffer, format="WEBP", quality=_THUMBNAIL_QUALITY)
+            codec_ms = round((time.monotonic_ns() - _codec_t0) / 1_000_000, 3)
+            thumb_bytes = buffer.getvalue()
+            thumbnails.append({
+                "bytes": thumb_bytes,
+                "mime_type": "image/webp",
+                "file_ext": ".webp",
+                "width": thumb_width,
+                "height": thumb_height,
+                "source_width": orig_width,
+                "source_height": orig_height,
+                "byte_count": len(thumb_bytes),
+                "output_codec_ms": codec_ms,
+                "quality": _THUMBNAIL_QUALITY,
+                "codec": "webp",
+            })
+        except Exception as exc:
+            print(
+                f"[ComfyModalProductionOutput] thumbnail derivative {batch_idx} "
+                f"failed (non-fatal): {type(exc).__name__}: {exc}"
+            )
+            thumbnails.append(None)
+    return thumbnails
+
+
+def _attach_thumbnail_to_entry(entry: dict[str, Any], thumbnail: dict[str, Any] | None) -> None:
+    """Attach one optional Thumbnail derivative dict onto a registry entry."""
+    if not thumbnail:
+        return
+    entry["thumbnail"] = thumbnail
+
+
+def _encode_entry_metadata(encode_info: dict[str, Any], batch_idx: int, raw_bytes: bytes) -> dict[str, Any]:
+    items = encode_info.get("items", [])
+    item_info = items[batch_idx] if batch_idx < len(items) else {}
+    codec_ms = item_info.get("output_codec_ms", encode_info.get("output_codec_ms", 0.0))
+    return {
+        "codec": item_info.get("codec", encode_info.get("codec", "")),
+        "quality": item_info.get("quality", encode_info.get("quality")),
+        "webp_lossless_compression": item_info.get(
+            "webp_lossless_compression", encode_info.get("webp_lossless_compression")
+        ),
+        "webp_effort": item_info.get("webp_effort", encode_info.get("webp_effort")),
+        "webp_method": item_info.get("webp_method", encode_info.get("webp_method")),
+        "output_codec_ms": codec_ms,
+        "conversion_time_ms": codec_ms,
+        "encoded_bytes": item_info.get("encoded_bytes", len(raw_bytes)),
+        "source_bytes": item_info.get("source_bytes", 0),
+        "conversion_fallback": bool(
+            item_info.get("conversion_fallback", encode_info.get("conversion_fallback", False))
+        ),
+    }
 
 
 def _clamp_image_tensor(images):
@@ -522,22 +906,60 @@ def _clamp_image_tensor(images):
     gracefully by detecting the actual value range and avoiding double-scaling.
     """
     import torch
+    _opt_on = _opt_diag_enabled()
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
     images_t = images.detach().cpu()
+    _opt_gpu_to_cpu_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
     if images_t.dtype == torch.uint8:
-        return images_t.contiguous()
+        _result = images_t.contiguous()
+        if _opt_on:
+            _opt_clamp_pending_store(id(_result), {
+                "gpu_to_cpu_ms": _opt_gpu_to_cpu_ms,
+                "clamp_scale_ms": 0.0,
+                "dtype_convert_ms": 0.0,
+            })
+        return _result
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
     images_t = images_t.float()
     if float(images_t.max()) <= 1.0:
         images_t.clamp_(0.0, 1.0).mul_(255.0)
     else:
         images_t.clamp_(0.0, 255.0)
-    return images_t.to(torch.uint8)
+    _opt_clamp_scale_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
+    _opt_t0 = time.monotonic_ns() if _opt_on else None
+    _result = images_t.to(torch.uint8)
+    _opt_dtype_convert_ms = (
+        round((time.monotonic_ns() - _opt_t0) / 1_000_000, 3)
+        if _opt_t0 is not None else None
+    )
+    if _opt_on:
+        _opt_clamp_pending_store(id(_result), {
+            "gpu_to_cpu_ms": _opt_gpu_to_cpu_ms,
+            "clamp_scale_ms": _opt_clamp_scale_ms,
+            "dtype_convert_ms": _opt_dtype_convert_ms,
+        })
+    return _result
 
 
 def _collect_production_request_params(req):
     """Extract output format params from production request dict."""
-    output_format = req.get("output_format", "original")
-    quality = int(req.get("quality", 75))
-    webp_lossless_compression = req.get("webp_lossless_compression", "balanced")
+    raw_output_format = req.get("output_format", "original")
+    output_format = normalize_output_format(raw_output_format)
+    quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(raw_output_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    quality = normalize_quality(req.get("quality"), default=quality_default)
+    webp_lossless_compression = normalize_webp_lossless_compression(
+        req.get("webp_lossless_compression", "balanced")
+    )
     return output_format, quality, webp_lossless_compression
 
 
@@ -625,6 +1047,8 @@ class ComfyModalProductionOutput:
         entries, ext, mime_type, W, H = encode_image_tensor_batch(
             images_t, output_format, quality, webp_lossless_compression
         )
+        encode_info = get_last_output_encode_info() or {}
+        thumbnails = encode_thumbnail_batch(images_t)
 
         prompt_id_short = str(prompt_id)[:8]
         nodestr = str(node_id)
@@ -632,7 +1056,7 @@ class ComfyModalProductionOutput:
         result_entries = []
         for batch_idx, (raw_bytes, _, _) in enumerate(entries):
             filename = f"production_{prompt_id_short}_{nodestr}_{batch_idx}{ext}"
-            result_entries.append({
+            entry: dict[str, Any] = {
                 "filename": filename,
                 "bytes": raw_bytes,
                 "mime_type": mime_type,
@@ -642,7 +1066,12 @@ class ComfyModalProductionOutput:
                 "output_index": batch_idx,
                 "node_id": node_id,
                 "format": output_format,
-            })
+                **_encode_entry_metadata(encode_info, batch_idx, raw_bytes),
+            }
+            _attach_thumbnail_to_entry(
+                entry, thumbnails[batch_idx] if batch_idx < len(thumbnails) else None
+            )
+            result_entries.append(entry)
 
         # Store in registry
         for _entry in result_entries:
@@ -748,14 +1177,21 @@ class ComfyModalProductionImageComparerOutput:
             b_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
+            b_encode_info = get_last_output_encode_info() or {}
+            b_thumbnails = encode_thumbnail_batch(images_b_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
-                })
+                    **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
+                }
+                _attach_thumbnail_to_entry(
+                    entry, b_thumbnails[batch_idx] if batch_idx < len(b_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             encoded_unique = b_count
         elif has_image_b:
@@ -766,14 +1202,21 @@ class ComfyModalProductionImageComparerOutput:
             a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
+            a_encode_info = get_last_output_encode_info() or {}
+            a_thumbnails = encode_thumbnail_batch(images_a_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "a_images",
                     "comparison_side": "a", "format": output_format,
-                })
+                    **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
+                }
+                _attach_thumbnail_to_entry(
+                    entry, a_thumbnails[batch_idx] if batch_idx < len(a_thumbnails) else None
+                )
+                result_entries.append(entry)
                 a_count += 1
 
             images_b_t = _clamp_image_tensor(image_b)
@@ -782,14 +1225,21 @@ class ComfyModalProductionImageComparerOutput:
             b_encoded_tensors, _, _, _, _ = encode_image_tensor_batch(
                 images_b_t, output_format, quality, webp_lossless_compression
             )
+            b_encode_info = get_last_output_encode_info() or {}
+            b_thumbnails = encode_thumbnail_batch(images_b_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(b_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_b_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
-                })
+                    **_encode_entry_metadata(b_encode_info, batch_idx, raw_bytes),
+                }
+                _attach_thumbnail_to_entry(
+                    entry, b_thumbnails[batch_idx] if batch_idx < len(b_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             encoded_unique = a_count + b_count
         else:
@@ -800,14 +1250,21 @@ class ComfyModalProductionImageComparerOutput:
             a_encoded_tensors, ext, mime_type, W, H = encode_image_tensor_batch(
                 images_a_t, output_format, quality, webp_lossless_compression
             )
+            a_encode_info = get_last_output_encode_info() or {}
+            a_thumbnails = encode_thumbnail_batch(images_a_t)
             for batch_idx, (raw_bytes, _, _) in enumerate(a_encoded_tensors):
                 filename = f"production_{prompt_id_short}_{nodestr}_a_{batch_idx}{ext}"
-                result_entries.append({
+                entry: dict[str, Any] = {
                     "filename": filename, "bytes": raw_bytes, "mime_type": mime_type, "file_ext": ext,
                     "width": W, "height": H, "output_index": batch_idx,
                     "node_id": node_id, "output_key": "b_images",
                     "comparison_side": "b", "format": output_format,
-                })
+                    **_encode_entry_metadata(a_encode_info, batch_idx, raw_bytes),
+                }
+                _attach_thumbnail_to_entry(
+                    entry, a_thumbnails[batch_idx] if batch_idx < len(a_thumbnails) else None
+                )
+                result_entries.append(entry)
                 b_count += 1
             a_count = b_count
             encoded_unique = b_count
@@ -1002,23 +1459,6 @@ PROMPT_ASYNC_ACTUAL_LOAD_UNET = env_flag("PROMPT_ASYNC_ACTUAL_LOAD_UNET")
 DISABLE_CACHEDIT_FOR_Z_IMAGE = env_flag("DISABLE_CACHEDIT_FOR_Z_IMAGE")
 _DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE = env_flag("DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE")
 
-# GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, default 0) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-# NOTE: Cold UNET early load performs speculative independent model file reads
-# that are NOT joined by the graph loader. This causes duplicate physical I/O
-# on cold start and makes performance worse. Disabled by default.
-# Requires COMFYMODAL_ALLOW_SPECULATIVE_LOAD=1 debug escape hatch to override.
-_GENERIC_SPECULATIVE_LOAD_ALLOWED = env_flag("COMFYMODAL_ALLOW_SPECULATIVE_LOAD")
-COLD_UNET_EARLY_LOAD = env_flag("COMFYMODAL_COLD_UNET_EARLY_LOAD")
-if COLD_UNET_EARLY_LOAD and not _GENERIC_SPECULATIVE_LOAD_ALLOWED:
-    COLD_UNET_EARLY_LOAD = False
-COLD_UNET_EARLY_LOAD_MODE = os.getenv("COMFYMODAL_COLD_UNET_EARLY_LOAD_MODE", "actual_load").strip().lower()
-COLD_UNET_EARLY_LOAD_BUDGET_MS = int(os.getenv("COMFYMODAL_COLD_UNET_EARLY_LOAD_BUDGET_MS", "0"))
-COLD_UNET_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT")
-if COLD_UNET_EARLY_LOAD_MODE == "restore_direct":
-    COLD_UNET_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_COLD_UNET_REQUIRE_CPU_CACHE_HIT", default=True)
-COLD_UNET_MAX_FILE_GB = float(os.getenv("COMFYMODAL_COLD_UNET_MAX_FILE_GB", "12"))
-COLD_UNET_DISABLE_ON_VOLUME_STALL = env_flag("COMFYMODAL_COLD_UNET_DISABLE_ON_VOLUME_STALL", default=True)
-COLD_UNET_DEBUG = env_flag("COMFYMODAL_COLD_UNET_DEBUG")
 
 
 def _resolve_disable_restore_warmup_for_z_image() -> bool:
@@ -1080,7 +1520,23 @@ DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT = env_flag("COMFYMODAL_DIRECT_WARMUP_REQUIRE
 #   auto           GÃ‡Ã¶ (default) probe and select automatically
 #   baked_cuda     GÃ‡Ã¶ skip probing, assume Blackwell baked CUDA path
 #   triton_fallback GÃ‡Ã¶ skip probing, force Triton fallback
-SAGE_RUNTIME_MODE = os.getenv("COMFYMODAL_SAGE_RUNTIME_MODE", "auto").strip().lower()
+_SAGE_RUNTIME_MODE_CONFIGURED = os.getenv(
+    "COMFYMODAL_SAGE_RUNTIME_MODE", "auto"
+).strip().lower()
+
+
+def _golden_sage_runtime_enabled() -> bool:
+    return (
+        os.getenv("COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+        or os.getenv("COMFYMODAL_V2CTL_PROFILE", "").strip().lower() == "golden_p1"
+    )
+
+
+# Keep the deploy-baked selector intact for Golden as well as production.
+SAGE_RUNTIME_MODE = _SAGE_RUNTIME_MODE_CONFIGURED
 
 # P3 GÃ‡Ã¶ Restore direct CLIP policy.
 #   auto           GÃ‡Ã¶ (default) load_and_encode unless CLIP already cached or no CLIP in profile
@@ -1119,6 +1575,16 @@ if SAFETENSORS_READ_MODE not in ("auto", "normal", "read_bytes"):
     SAFETENSORS_READ_MODE = "normal"
 SAFETENSORS_READ_BYTES_MIN_MB = int(os.getenv("COMFYMODAL_SAFETENSORS_READ_BYTES_MIN_MB", "512"))
 SAFETENSORS_STRICT = env_flag("COMFYMODAL_SAFETENSORS_STRICT")
+
+# E40 Lane D: canonical semantic owner identity for restore-time model reads.
+# One semantic operation -> one canonical owner identity. Producers register
+# active model reads under these names; consumers (physical-read coordinator,
+# request preflight, duplicate-reader wait) join on the SAME names.
+RESTORE_ROLE_OWNER_MAP = {
+    "clip": "restore_preload",
+    "unet": "restore_background_unet",
+    "vae": "restore_vae_loader",
+}
 
 # â”€â”€ v2.16.21 combined cold-start fast path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Master toggle: when 0, all v2.16.21 features are disabled and v2.16.20
@@ -1466,7 +1932,7 @@ MODELS_GENERATION_CONTROL_PATH = os.path.join(MODELS_GENERATION_CONTROL_DIR, "mo
 # contents.  It must NEVER be used as a proxy for the models
 # generation; a model-only change does not advance it and a
 # custom-node-only change does advance it.
-CUSTOM_NODES_GENERATION_SCHEMA_VERSION = 1
+CUSTOM_NODES_GENERATION_SCHEMA_VERSION = 2
 CUSTOM_NODES_GENERATION_CONTROL_DIR = MODELS_GENERATION_CONTROL_DIR
 CUSTOM_NODES_GENERATION_CONTROL_PATH = os.path.join(
     CUSTOM_NODES_GENERATION_CONTROL_DIR, "custom_nodes_generation.json"
@@ -1540,8 +2006,9 @@ def _current_models_generation_id() -> str:
 def _read_custom_nodes_generation_record() -> dict | None:
     """Read the authoritative custom-nodes generation record.
 
-    Returns a dict with ``generation``, ``updated_at_unix``, ``reason``,
-    and ``schema_version``, or ``None`` when missing/invalid.
+    Returns a dict with ``content_generation``, ``updated_at_unix``, ``reason``,
+    and ``schema_version``, or ``None`` when missing/invalid.  A matching
+    ``generation`` echo is retained only for older runtime diagnostics.
     Distinct from the models generation: a model-only change does
     NOT advance this record.
     """
@@ -1556,23 +2023,35 @@ def _read_custom_nodes_generation_record() -> dict | None:
         return None
     if _data.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION:
         return None
-    _gen = _data.get("generation")
-    if not _gen or not isinstance(_gen, str):
+    _content_generation = _data.get("content_generation")
+    if (
+        not isinstance(_content_generation, str)
+        or not _content_generation.strip()
+        or _content_generation != _content_generation.strip()
+    ):
+        return None
+    # Keep a read-only compatibility echo for older runtime diagnostics, but
+    # never accept a disagreement with the canonical content identity.
+    if "generation" in _data and _data["generation"] != _content_generation:
         return None
     return _data
 
 
-def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str | None = None) -> dict:
+def _write_custom_nodes_generation_record_no_commit(
+    reason: str,
+    content_generation: str,
+) -> dict:
     """Create a new custom-nodes generation record and atomically
     persist it (without committing the volume). The caller is
     responsible for calling ``custom_nodes_vol.commit()`` after
     this returns. Raises on failure.
 
-    When *generation* is provided it is used as-is (caller-chosen
-    deterministic value).  When omitted a UUID is generated.  Using
-    a content-derived deterministic generation ensures concurrent
-    containers syncing identical custom-node content converge on the
-    same persisted value — the atomic ``os.replace`` still resolves
+    ``content_generation`` is the required canonical full-content identity.
+    A legacy ``generation``-only call is intentionally rejected rather than
+    being treated as a content identity.  Using a content-derived
+    deterministic generation ensures concurrent containers syncing identical
+    custom-node content converge on the same persisted value — the atomic
+    ``os.replace`` still resolves
     races, but the identical value makes last-writer-wins harmless.
 
     **Temp-path uniqueness**: each invocation uses a distinct per-process
@@ -1582,9 +2061,14 @@ def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str
     in-flight writer, causing a ``FileNotFoundError``.  On failure the
     temp file is cleaned up before re-raising.
     """
+    if not isinstance(content_generation, str) or not content_generation.strip():
+        raise ValueError("content_generation is required for a publication record")
     _record = {
         "schema_version": CUSTOM_NODES_GENERATION_SCHEMA_VERSION,
-        "generation": generation if generation is not None else uuid.uuid4().hex,
+        "content_generation": content_generation.strip(),
+        # Compatibility for runtime diagnostics that still read this field;
+        # all trust decisions use content_generation and validate the echo.
+        "generation": content_generation.strip(),
         "updated_at_unix": time.time(),
         "reason": reason,
     }
@@ -1607,15 +2091,20 @@ def _write_custom_nodes_generation_record_no_commit(reason: str, generation: str
         except Exception:
             pass
         raise
-    print(f"[comfyapp.custom_nodes_gen] wrote generation={_record['generation'][:12]}... reason={reason}")
+    print(
+        f"[comfyapp.custom_nodes_gen] wrote content_generation="
+        f"{_record['content_generation'][:12]}... reason={reason}"
+    )
     return _record
 
 
-def _write_custom_nodes_generation_record(reason: str) -> dict:
-    """Legacy wrapper that writes the generation record and commits.
-    Kept for backward-compatibility with external callers.
-    """
-    _record = _write_custom_nodes_generation_record_no_commit(reason)
+def _write_custom_nodes_generation_record(
+    reason: str, content_generation: str
+) -> dict:
+    """Write the generation record and commit the custom-nodes volume."""
+    _record = _write_custom_nodes_generation_record_no_commit(
+        reason, content_generation=content_generation
+    )
     custom_nodes_vol.commit()
     return _record
 
@@ -1624,7 +2113,7 @@ def _current_custom_nodes_generation_id() -> str:
     _rec = _read_custom_nodes_generation_record()
     if _rec is None:
         return ""
-    return _rec["generation"]
+    return _rec["content_generation"]
 
 
 def _resolve_custom_nodes_generation(
@@ -1634,7 +2123,7 @@ def _resolve_custom_nodes_generation(
 ) -> tuple[str, str]:
     """Authoritative request-time custom-node generation resolution.
 
-    Priority (first non-empty value wins):
+    Priority (first non-empty value wins) for ordinary request diagnostics:
     1. ``api._custom_nodes_generation_seen`` (hydrated API field — fast path)
     2. ``_read_custom_nodes_generation_record()`` (persisted record fallback)
 
@@ -1642,11 +2131,13 @@ def _resolve_custom_nodes_generation(
     ``"persisted_record"``, or ``"missing"``.  Never raises: both paths are
     wrapped in try/except.  The returned *value* is always a ``str``,
     possibly empty when neither source is available.  ``authoritative_only``
-    restricts the resolver to the in-memory API token and the small deployed
-    generation record; it never fingerprints source directories.
+    ignores the hydrated API field and restricts the resolver to the mounted
+    generation record; it never fingerprints source directories.  A field
+    restored in the memory snapshot is not evidence that the current Volume
+    has the same generation.
     """
     # First: hydrated API field (fast path, set by _sync_custom_nodes_from_volume)
-    if api is not None:
+    if not authoritative_only and api is not None:
         try:
             val = str(getattr(api, "_custom_nodes_generation_seen", "") or "").strip()
             if val:
@@ -1657,7 +2148,7 @@ def _resolve_custom_nodes_generation(
     # Fallback: persisted generation record on the custom-nodes volume
     try:
         rec = _read_custom_nodes_generation_record()
-        gen = str((rec or {}).get("generation", "") or "").strip()
+        gen = str((rec or {}).get("content_generation", "") or "").strip()
         if gen:
             return gen, "persisted_record"
     except Exception:
@@ -2020,43 +2511,23 @@ def _build_immutable_dependency_manifest_identity(
 
 
 # Canonical deployment combined hash, set by modal_app._configure_runtime()
-# from ``_MODAL_RESOURCES['source_identity'].combined_hash``.  When nonempty
-# ``_resolve_deployment_combined_hash()`` returns this value first, falling
-# back to the legacy derivation only as a backward-compatible safety net.
+# from the canonical image-plan identity.  There is deliberately no runtime
+# derivation from mounted manifests: incomplete source coverage must fail
+# closed rather than become a plausible deployment identity.
 _CANONICAL_DEPLOYMENT_COMBINED_HASH: str = ""
 
 
 def _resolve_deployment_combined_hash() -> str:
     """Build a deterministic combined hash representing deployment identity.
 
-    Priority:
-    1. ``_CANONICAL_DEPLOYMENT_COMBINED_HASH`` (set by modal_app's
-       ``_configure_runtime`` from deployment builder's combined hash).
-    2. Legacy derivation from COMFYAPP_VERSION, runtime revision, baked
-       dependency hash, and custom-nodes generation (fail-closed fallback).
-
-    Returns empty string when no identity component is available.
+    Returns the canonical image-plan deployment hash, or empty when the plan
+    was not constructed.  Runtime manifests are not an identity fallback.
     """
     # Canonical source: deployment builder combined hash
     if _CANONICAL_DEPLOYMENT_COMBINED_HASH:
         return _CANONICAL_DEPLOYMENT_COMBINED_HASH
 
-    # Legacy fail-closed fallback
-    _baked = load_baked_custom_node_dependency_manifest()
-    _baked_hash = _baked.get("overall_dependency_hash", "") if _baked else ""
-    if not _baked_hash:
-        return ""
-    _cn_gen_rec = _read_custom_nodes_generation_record()
-    _cn_gen = _cn_gen_rec.get("generation", "") if _cn_gen_rec else ""
-    if not _cn_gen:
-        return ""
-    import hashlib
-    _h = hashlib.sha256()
-    _h.update(f"comfyapp_version={COMFYAPP_VERSION}\n".encode())
-    _h.update(f"runtime_revision={_V2_RUNTIME_REVISION}\n".encode())
-    _h.update(f"baked_hash={_baked_hash}\n".encode())
-    _h.update(f"custom_nodes_generation={_cn_gen}\n".encode())
-    return _h.hexdigest()
+    return ""
 
 
 def _build_and_persist_dependency_manifest(
@@ -3160,48 +3631,28 @@ def _apply_return_mode(result: dict, return_mode: str, payload_image_count: int,
 
 
 def _resolve_runtime_flag(name: str, default: str) -> bool:
-    """Read a runtime ``0``/``1`` flag from file or env var.
+    return _baseline_resolvers._resolve_runtime_flag(
+        name,
+        default,
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
-    Priority:
-    1. File on the model volume at ``runtime_config/{name}.txt``.
-    2. Env var ``COMFYMODAL_{name}``.
-    3. ``default`` string (``"0"`` or ``"1"``).
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("0", "1"):
-                return v == "1"
-    except Exception:
-        pass
-    env = os.environ.get(f"COMFYMODAL_{name}", default)
-    return env == "1"
+
+def _resolve_production_baseline_flag(name: str) -> str | None:
+    return _baseline_resolvers.production_baseline_value(name)
 
 
 def _resolve_runtime_string(name: str, default: str, allowed: set[str] | tuple[str, ...] | None = None) -> str:
-    """Read a runtime string flag from file or env var.
-
-    Priority:
-    1. File on the model volume at ``runtime_config/{name}.txt``.
-    2. Env var ``COMFYMODAL_{name}``.
-    3. ``default`` string.
-
-    When *allowed* is provided, the value is validated against the set.
-    Returns *default* if an invalid value is encountered.
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, f"{name}.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v and (allowed is None or v in allowed):
-                return v
-    except Exception:
-        pass
-    env = os.environ.get(f"COMFYMODAL_{name}", default).strip().lower()
-    if allowed is not None and env not in allowed:
-        return default
-    return env
+    return _baseline_resolvers._resolve_runtime_string(
+        name,
+        default,
+        allowed=allowed,
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_restore_direct_clip_policy_name() -> str:
@@ -3220,56 +3671,31 @@ def _resolve_restore_direct_clip_policy_name() -> str:
 
 
 def _resolve_sage_runtime_env_override() -> str:
-    """Return the effective SAGE_RUNTIME_MODE from file, env, or module default.
-
-    Priority:
-    1. File ``runtime_config/sage_runtime_mode.txt``.
-    2. Module-level ``SAGE_RUNTIME_MODE`` (from env var ``COMFYMODAL_SAGE_RUNTIME_MODE``).
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_mode.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("auto", "baked_cuda", "triton_fallback"):
-                return v
-    except Exception:
-        pass
-    return SAGE_RUNTIME_MODE
+    return _baseline_resolvers._resolve_sage_runtime_env_override(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_sage_probe_on_restore() -> bool:
-    """Return whether to probe Sage runtime during restore.
-
-    Priority:
-    1. File ``runtime_config/sage_runtime_probe.txt``.
-    2. Module-level ``SAGE_RUNTIME_PROBE_ON_RESTORE``.
-    """
-    path = os.path.join(RUNTIME_CONFIG_DIR, "sage_runtime_probe.txt")
-    try:
-        if os.path.isfile(path):
-            v = open(path).read().strip().lower()
-            if v in ("0", "1"):
-                return v == "1"
-    except Exception:
-        pass
-    return SAGE_RUNTIME_PROBE_ON_RESTORE
+    return _baseline_resolvers._resolve_sage_probe_on_restore(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_preload_mode() -> str:
-    """Return the effective preload mode.
-
-    Priority:
-    1. File on the model volume (set by ``set_preload_mode``).
-    2. Module-level env-var default (``PRELOAD_MODE``).
-    """
-    try:
-        if os.path.isfile(PRELOAD_MODE_PATH):
-            _v = open(PRELOAD_MODE_PATH).read().strip().lower()
-            if _v:
-                return _v
-    except Exception:
-        pass
-    return PRELOAD_MODE
+    return _baseline_resolvers._resolve_preload_mode(
+        is_golden=_golden_sage_runtime_enabled(),
+        runtime_config_dir=RUNTIME_CONFIG_DIR,
+        preload_mode_path=PRELOAD_MODE_PATH,
+        file_exists=os.path.isfile,
+        read_file=open,
+    )
 
 
 def _resolve_return_mode() -> str:
@@ -3375,21 +3801,99 @@ def _safe_listdir(path: str) -> list[str]:
     return sorted(os.listdir(path))
 
 
-# Shared hash-input filters for the custom-node source generation.  Generated
-# and environment files/directories must never change the persisted
-# generation, so identical baked/runtime canonical content produces an
-# identical generation regardless of mtime or build artifacts.
-_CUSTOM_NODE_GENERATED_DIRS = frozenset({
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".ipynb_checkpoints", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".tox", ".eggs", ".cache", "wheelhouse", "wheels", "build", "dist",
-    "tests", "test", "examples", "benchmarks", "benchmark", "traces",
-    "logs", "scripts", ".github",
-})
-_CUSTOM_NODE_GENERATED_FILE_SUFFIXES = (
-    ".log", ".tmp", ".trace", ".jsonl", ".whl",
+def decide_custom_node_volume_gate(
+    *,
+    volume_entries: list[str] | None,
+    importable_node_count: int | None,
+    generation_record: dict | None,
+    expected_generation: str,
+) -> dict:
+    """Decide whether a Volume-backed custom-node tree may be imported.
+
+    This is deliberately pure so the startup contract can be tested without a
+    Modal container.  The caller supplies the directory and record reads; any
+    missing or unreadable input is represented by ``None`` and fails closed.
+    """
+    reasons: list[str] = []
+    if volume_entries is None:
+        reasons.append("volume_directory_missing_or_unreadable")
+    elif not volume_entries:
+        reasons.append("volume_directory_empty")
+    if not isinstance(importable_node_count, int) or importable_node_count < 1:
+        reasons.append("no_importable_custom_node_init_py")
+
+    actual_generation = ""
+    if not isinstance(generation_record, dict):
+        reasons.append("generation_record_missing_or_unreadable")
+    else:
+        actual_generation = str(generation_record.get("content_generation", "") or "").strip()
+        if not actual_generation:
+            reasons.append("generation_record_missing_or_unreadable")
+    expected_generation = str(expected_generation or "").strip()
+    if not expected_generation:
+        reasons.append("deployment_expected_generation_missing")
+    elif actual_generation and actual_generation != expected_generation:
+        reasons.append("generation_mismatch")
+
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "volume_entries": len(volume_entries) if volume_entries is not None else None,
+        "importable_node_count": importable_node_count,
+        "actual_generation": actual_generation,
+        "expected_generation": expected_generation,
+    }
+
+
+def verify_custom_node_volume_gate(
+    volume_root: str,
+    generation_record_path: str,
+    expected_generation: str,
+) -> dict:
+    """Read the mounted Volume inputs and return the fail-closed gate result."""
+    try:
+        volume_entries = sorted(os.listdir(volume_root)) if os.path.isdir(volume_root) else None
+    except OSError:
+        volume_entries = None
+    importable_node_count = 0
+    if volume_entries is not None:
+        for name in volume_entries:
+            node_root = os.path.join(volume_root, name)
+            if os.path.isdir(node_root) and os.path.isfile(os.path.join(node_root, "__init__.py")):
+                importable_node_count += 1
+    try:
+        with open(generation_record_path, "r", encoding="utf-8") as record_file:
+            generation_record = json.load(record_file)
+    except (OSError, TypeError, ValueError):
+        generation_record = None
+    if isinstance(generation_record, dict):
+        content_generation = generation_record.get("content_generation")
+        if (
+            generation_record.get("schema_version") != CUSTOM_NODES_GENERATION_SCHEMA_VERSION
+            or not isinstance(content_generation, str)
+            or not content_generation.strip()
+            or content_generation != content_generation.strip()
+            or (
+                "generation" in generation_record
+                and generation_record["generation"] != content_generation
+            )
+        ):
+            generation_record = None
+    return decide_custom_node_volume_gate(
+        volume_entries=volume_entries,
+        importable_node_count=importable_node_count,
+        generation_record=generation_record,
+        expected_generation=expected_generation,
+    )
+
+
+# Shared hash-input policy.  Keep this compatibility alias because diagnostics
+# and older callers expose the name, but do not maintain a second filter here.
+_CUSTOM_NODE_GENERATED_DIRS = _publication_policy.EXCLUDED_DIR_NAMES
+_CUSTOM_NODE_GENERATED_FILE_SUFFIXES = tuple(
+    sorted(_publication_policy.EXCLUDED_EXTENSIONS)
 )
-_CUSTOM_NODE_GENERATED_FILE_PREFIXES = ("benchmark_", "trace_")
+_CUSTOM_NODE_GENERATED_FILE_PREFIXES = _publication_policy.EXCLUDED_PREFIXES
 
 
 def custom_node_source_fingerprint(source_root: str) -> dict:
@@ -3409,27 +3913,30 @@ def custom_node_source_fingerprint(source_root: str) -> dict:
         if os.path.islink(node_path):
             entry["realpath_if_symlink"] = os.path.realpath(node_path)
         _hasher = hashlib.sha256()
-        _tracked_exts = {".py", ".txt", ".toml", ".cfg"}
-        _tracked_files = {"requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"}
+        _source_files = []
         try:
-            for _dirpath, _dirnames, _filenames in os.walk(node_path):
+            for _dirpath, _dirnames, _filenames in os.walk(node_path, followlinks=False):
                 _dirnames[:] = sorted(
-                    d for d in _dirnames if d not in _CUSTOM_NODE_GENERATED_DIRS
+                    d for d in _dirnames
+                    if not _publication_policy.is_excluded_dir_name(d)
+                    and not os.path.islink(os.path.join(_dirpath, d))
                 )
                 for _fn in sorted(_filenames):
                     _ext = os.path.splitext(_fn)[1].lower()
-                    if _ext in _tracked_exts or _fn in _tracked_files:
-                        if _fn.lower().endswith(_CUSTOM_NODE_GENERATED_FILE_SUFFIXES):
-                            continue
-                        if _fn.lower().startswith(_CUSTOM_NODE_GENERATED_FILE_PREFIXES):
+                    if _ext in _publication_policy.GENERATION_SOURCE_EXTENSIONS:
+                        if _publication_policy.is_excluded_name(_fn):
                             continue
                         _fp = os.path.join(_dirpath, _fn)
+                        if os.path.islink(_fp):
+                            continue
                         _rel = os.path.relpath(_fp, node_path).replace("\\", "/")
-                        _hasher.update(f"{_rel}:".encode())
-                        try:
-                            _hasher.update(_canonical_dependency_bytes(_fp))
-                        except OSError:
-                            pass
+                        _source_files.append((_rel, _fp))
+            for _rel, _fp in sorted(_source_files, key=lambda item: item[0]):
+                _hasher.update(f"{_rel}:".encode())
+                try:
+                    _hasher.update(_canonical_dependency_bytes(_fp))
+                except OSError:
+                    pass
         except Exception:
             pass
         entry["content_hash"] = _hasher.hexdigest()[:16]
@@ -3452,13 +3959,17 @@ def custom_node_source_generation(
     and same-process comparisons.  The persisted generation must not include
     that path because the build context and Modal volume use different roots.
     """
-    fingerprint = fingerprint or custom_node_source_fingerprint(source_root)
-    stable_fingerprint = {
-        key: value for key, value in fingerprint.items() if key != "source_root"
-    }
-    return hashlib.md5(
-        json.dumps(stable_fingerprint, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    # ``fingerprint`` remains accepted for compatibility with older callers,
+    # but generation is owned by the shared full publication policy.  The host
+    # archive publisher and this remote post-extract readback therefore hash
+    # the same semantic file set and manifest projection.
+    _ = fingerprint
+    # Modal exposes a mounted Volume root through a symlink.  Resolve only the
+    # adapter's expected root; the shared walker still rejects symlinks within
+    # the publication tree (and direct host archive roots) as before.
+    return _publication_policy.compute_publication_generation(
+        os.path.realpath(source_root)
+    )
 
 
 # Alias for backward compatibility
@@ -3508,6 +4019,23 @@ def sync_custom_nodes_into_comfy(volume_root: str, comfy_custom_nodes_root: str,
             req_file = os.path.join(path, "requirements.txt")
             req_mtime_ns = os.stat(req_file).st_mtime_ns if os.path.isfile(req_file) else None
             state.append((name, stat.st_mtime_ns, req_mtime_ns))
+
+    if os.path.realpath(volume_root) == os.path.realpath(comfy_custom_nodes_root):
+        # Volume delivery exposes the Volume itself at ComfyUI's discovery
+        # root.  Do not turn its real package directories into self-links.
+        result = {
+            "created": [],
+            "removed": [],
+            "kept": sorted(volume_dirs),
+            "blocked": [],
+        }
+        if include_state:
+            result["state"] = tuple(state)
+        print(
+            "[comfyapp] sync_custom_nodes_into_comfy: direct Volume root; "
+            f"nodes={len(volume_dirs)}"
+        )
+        return result
 
     removed = []
     created = []
@@ -3593,7 +4121,7 @@ def requirements_file_hash(path: str) -> str | None:
 
 
 _DEPENDENCY_TEXT_SUFFIXES = frozenset({
-    ".cfg", ".in", ".pip", ".py", ".toml", ".txt", ".yaml", ".yml",
+    ".cfg", ".in", ".js", ".mjs", ".pip", ".py", ".toml", ".txt", ".yaml", ".yml",
 })
 
 
@@ -5009,6 +5537,25 @@ def _complete_active_model_read(canonical_key: str) -> None:
         entry["status"] = "completed"
         entry["result_available"] = True
         entry["completed_at"] = time.time()
+        # ── E40 Lane B: single loader-observation authority ──────────────
+        # Every completed model read reports its loader arm per semantic
+        # role exactly once, here at the central read tracker.
+        try:
+            from comfymodal_runtime import loader_selection as _ls
+            _owner_l = str(entry.get("owner") or "").lower()
+            _loader_l = str(entry.get("loader_type") or "").lower()
+            if "unet" in _owner_l or "unet" in _loader_l or "diffusion" in _loader_l:
+                _obs_role = "unet"
+            elif "vae" in _owner_l or "vae" in _loader_l:
+                _obs_role = "vae"
+            elif "clip" in _owner_l or "clip" in _loader_l or "text_encoder" in _loader_l:
+                _obs_role = "clip"
+            else:
+                _obs_role = ""
+            if _obs_role:
+                _ls.record_observed(_obs_role, _loader_l or _owner_l or "unknown")
+        except Exception:
+            pass
         entry["complete_wall_unix_ns"] = _complete_wall_ns
         entry["complete_monotonic_ns"] = _complete_now_ns
         entry["complete_thread_time_ns"] = _complete_thread_time_ns
@@ -5110,11 +5657,26 @@ def _complete_active_model_read(canonical_key: str) -> None:
             "loader_type": entry.get("loader_type", ""),
             "phase": entry.get("phase", ""),
             "request_id": entry.get("request_id", ""),
+            # Exact restore-session association: the entry carries these at
+            # read-start (request may be empty for lifecycle/preload reads),
+            # and the completed record preserves them so the drain can match
+            # on restore identity when no request_id was captured.
+            "restored_instance_id": _rid,
+            "restore_session_id": entry.get("restore_session_id", ""),
             "path_hash": entry.get("active_read_path_hash", ""),
             "file_size": entry.get("active_read_file_size"),
             "wall_ms": entry.get("active_read_wall_ms"),
             "thread_cpu_ms": entry.get("active_read_thread_cpu_ms"),
             "process_cpu_ms": entry.get("active_read_process_cpu_ms"),
+            # ── Start/end boundaries for the waterfall "Checkpoint read" row ──
+            # The engine (v2_waterfall._request_detail_stages) reads
+            # start_wall_unix_ns/start_monotonic_ns and end_wall_unix_ns/
+            # end_monotonic_ns from these records to build the real read span
+            # instead of falling back to the H2D .to() pair.  All units are ns.
+            "start_wall_unix_ns": entry.get("start_wall_unix_ns"),
+            "start_monotonic_ns": entry.get("start_monotonic_ns"),
+            "end_wall_unix_ns": _complete_wall_ns,
+            "end_monotonic_ns": _complete_now_ns,
         })
         if len(_COMPLETED_ACTIVE_READS) > 256:
             del _COMPLETED_ACTIVE_READS[:-256]
@@ -6041,39 +6603,130 @@ def normalize_flux_clip_pair(clip1: str, clip2: str) -> tuple[str, str]:
     return clip1, clip2
 
 
-def list_sageattention_extension_files(site_packages_root: str) -> list[Path]:
-    root = Path(site_packages_root) / "sageattention"
-    if not root.is_dir():
-        return []
-    return sorted(root.glob("*.so"))
+# Compatibility exports remain available to the runtime and older callers,
+# but the dependency-free module above is the canonical implementation.
+list_sageattention_extension_files = _sage_policy_list_extensions
+sageattention_artifact_identity = _sage_policy_artifact_identity
+build_sage_runtime_identity = _sage_policy_build_identity
+sage_runtime_identity_matches = _sage_policy_identity_matches
+sage_runtime_cache_usable = _sage_policy_cache_usable
+select_public_sageattention_callable = _sage_policy_select_callable
+choose_sage_runtime_mode = _sage_policy_choose_mode
 
 
-def choose_sage_runtime_mode(enabled: bool, extension_files: list[Path], import_ok: bool, smoke_ok: bool) -> tuple[str, str]:
-    if not enabled:
-        return "disabled", "explicitly-disabled"
-    if not extension_files:
-        return "triton_fallback", "compiled-extensions-missing"
-    if not import_ok:
-        return "triton_fallback", "compiled-extensions-unusable"
-    if not smoke_ok:
-        return "triton_fallback", "smoke-test-failed"
-    return "baked_cuda", "compiled-extensions-usable"
-
-
-def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool) -> bool:
+def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool, *, strict: bool = False) -> bool:
     original = getattr(module, "get_sage_func", None)
     fallback = getattr(module, "attention_pytorch", None)
     wrap_attn_fn = getattr(module, "wrap_attn", None)
     if original is None or fallback is None or wrap_attn_fn is None:
+        if strict:
+            raise RuntimeError("Strict SageAttention policy could not locate KJNodes integration")
         return False
 
+    if strict and not baked_cuda_available:
+        raise RuntimeError(
+            "Strict SageAttention policy rejected KJNodes PyTorch fallback"
+        )
+
     module._comfy_modal_baked_cuda_available = baked_cuda_available
+    module._comfy_modal_strict_sage = strict
     if getattr(module, "_comfy_modal_get_sage_func_patched", False):
         return True
 
+    def _validate_strict_attention_inputs(
+        q, k, v, heads, mask, attn_precision, skip_reshape, kwargs
+    ) -> None:
+        if mask is not None or kwargs.get("attn_mask") is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention mask"
+            )
+        if kwargs.get("enable_gqa", False):
+            raise RuntimeError("Strict SageAttention policy rejected GQA")
+        if kwargs.get("is_causal", False):
+            raise RuntimeError("Strict SageAttention policy rejected causal attention")
+        if attn_precision is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention precision"
+            )
+        if kwargs.get("low_precision_attention", True) is False:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected KJNodes PyTorch fallback"
+            )
+        try:
+            shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+        except Exception as exc:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected invalid attention shape"
+            ) from exc
+        if skip_reshape:
+            if not all(len(shape) == 4 for shape in shapes):
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected non-HND attention"
+                )
+            head_counts = tuple(shape[1] for shape in shapes)
+            if head_counts != (heads, heads, heads):
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+        else:
+            if not all(len(shape) == 3 for shape in shapes):
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected non-NHD attention"
+                )
+            if shapes[0][-1] != shapes[1][-1] or shapes[0][-1] != shapes[2][-1]:
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+            if not isinstance(heads, int) or isinstance(heads, bool) or heads <= 0:
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected invalid head count"
+                )
+            if shapes[0][-1] % heads:
+                raise RuntimeError(
+                    "Strict SageAttention policy rejected invalid head dimension"
+                )
+
     def wrapped_get_sage_func(sage_attention, allow_compile=False):
+        strict_sage = bool(getattr(module, "_comfy_modal_strict_sage", False))
+        if strict_sage and getattr(module, "_comfy_modal_baked_cuda_available", False):
+            # Do not call KJNodes' factory first.  Its factory imports/binds a
+            # selector-specific private symbol, even though the RA5 arm must
+            # use SageAttention's public native dispatcher.
+            if sage_attention == "auto" or "sageattn_qk_" in str(sage_attention):
+                return _strict_public_sage_attention(wrap_attn_fn)
+
         if getattr(module, "_comfy_modal_baked_cuda_available", False) or sage_attention == "disabled":
-            return original(sage_attention, allow_compile=allow_compile)
+            selected = original(sage_attention, allow_compile=allow_compile)
+            if not strict_sage or sage_attention == "disabled":
+                return selected
+
+            # Sage3 is a separate KJNodes backend.  Keep its native factory
+            # semantics, but retain the fail-closed guard for any fallback
+            # that it may acquire in a future KJNodes release.
+
+            selected_body = getattr(selected, "__wrapped__", selected)
+
+            @wrap_attn_fn
+            def strict_attention(q, k, v, heads, mask=None, attn_precision=None,
+                                  skip_reshape=False, skip_output_reshape=False, **kwargs):
+                _validate_strict_attention_inputs(
+                    q, k, v, heads, mask, attn_precision, skip_reshape, kwargs
+                )
+
+                def reject_inner_fallback(*_args, **_kwargs):
+                    raise RuntimeError(
+                        "Strict SageAttention policy rejected KJNodes attention_pytorch fallback"
+                    )
+
+                previous_fallback = module.attention_pytorch
+                module.attention_pytorch = reject_inner_fallback
+                try:
+                    return selected_body(
+                        q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                        skip_reshape=skip_reshape,
+                        skip_output_reshape=skip_output_reshape,
+                        **kwargs,
+                    )
+                finally:
+                    module.attention_pytorch = previous_fallback
+
+            return strict_attention
         if sage_attention != "auto" and "sageattn" not in str(sage_attention):
             return original(sage_attention, allow_compile=allow_compile)
 
@@ -6096,6 +6749,129 @@ def patch_kjnodes_get_sage_func(module, baked_cuda_available: bool) -> bool:
     module.get_sage_func = wrapped_get_sage_func
     module._comfy_modal_get_sage_func_patched = True
     return True
+
+
+def _strict_public_sage_attention(wrap_attn_fn):
+    """Build the strict KJNodes adapter around Sage's public native callable.
+
+    KJNodes normally binds a selector-specific closure and its wrapper can
+    intentionally choose ``attention_pytorch``.  The RA5 production arm must
+    instead bind ``sageattention.sageattn`` itself, while retaining KJNodes'
+    tensor-layout/output-shape convention.
+    """
+    try:
+        import torch
+        import sageattention
+    except Exception as exc:
+        raise RuntimeError(
+            f"Strict SageAttention native callable unavailable:{type(exc).__name__}"
+        ) from exc
+
+    native = getattr(sageattention, "sageattn", None)
+    if not callable(native):
+        raise RuntimeError("Strict SageAttention native callable unavailable:sageattn")
+
+    def supports_sm_scale() -> bool:
+        try:
+            parameter = inspect.signature(native).parameters.get("sm_scale")
+        except (TypeError, ValueError):
+            return False
+        return parameter is not None and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+
+    @wrap_attn_fn
+    def strict_attention(q, k, v, heads, mask=None, attn_precision=None,
+                         skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if mask is not None or kwargs.get("attn_mask") is not None:
+            raise RuntimeError("Strict SageAttention policy rejected unsupported attention mask")
+        if kwargs.get("enable_gqa", False):
+            raise RuntimeError("Strict SageAttention policy rejected GQA")
+        if kwargs.get("is_causal", False):
+            raise RuntimeError("Strict SageAttention policy rejected causal attention")
+        if attn_precision is not None:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected unsupported attention precision"
+            )
+        if kwargs.get("low_precision_attention", True) is False:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected KJNodes attention_pytorch fallback"
+            )
+        if not isinstance(heads, int) or isinstance(heads, bool) or heads <= 0:
+            raise RuntimeError("Strict SageAttention policy rejected invalid head count")
+
+        in_dtype = getattr(v, "dtype", None)
+        # Match KJNodes' established conversion contract: Sage2 accepts fp16
+        # and bf16, while the model path may present fp32 activations.
+        if any(getattr(t, "dtype", None) is torch.float32 for t in (q, k, v)):
+            q, k, v = (t.to(torch.float16) for t in (q, k, v))
+        if any(getattr(t, "dtype", None) not in (torch.float16, torch.bfloat16)
+               for t in (q, k, v)):
+            raise RuntimeError("Strict SageAttention policy rejected unsupported attention dtype")
+
+        try:
+            shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+        except Exception as exc:
+            raise RuntimeError(
+                "Strict SageAttention policy rejected invalid attention shape"
+            ) from exc
+        if skip_reshape:
+            if not all(len(shape) == 4 for shape in shapes):
+                raise RuntimeError("Strict SageAttention policy rejected non-HND attention")
+            if tuple(shape[1] for shape in shapes) != (heads, heads, heads):
+                raise RuntimeError("Strict SageAttention policy rejected GQA")
+            if len({shape[0] for shape in shapes}) != 1 or len({shape[-1] for shape in shapes}) != 1:
+                raise RuntimeError("Strict SageAttention policy rejected incompatible attention shapes")
+            batch, dim_head = shapes[0][0], shapes[0][-1]
+            q_native, k_native, v_native = q, k, v
+            tensor_layout = "HND"
+        else:
+            if not all(len(shape) == 3 for shape in shapes):
+                raise RuntimeError("Strict SageAttention policy rejected non-NHD attention")
+            if len({shape[0] for shape in shapes}) != 1 or len({shape[-1] for shape in shapes}) != 1:
+                raise RuntimeError("Strict SageAttention policy rejected incompatible attention shapes")
+            if shapes[0][-1] % heads:
+                raise RuntimeError("Strict SageAttention policy rejected invalid head dimension")
+            batch = shapes[0][0]
+            dim_head = shapes[0][-1] // heads
+            q_native, k_native, v_native = (
+                tensor.view(batch, -1, heads, dim_head) for tensor in (q, k, v)
+            )
+            tensor_layout = "NHD"
+
+        sage_kwargs = {
+            "attn_mask": None,
+            "is_causal": False,
+            "tensor_layout": tensor_layout,
+        }
+        requested_scale = kwargs.get("scale", None)
+        if "scale" in kwargs:
+            if requested_scale is not None and (
+                isinstance(requested_scale, bool)
+                or not isinstance(requested_scale, (int, float))
+            ):
+                raise RuntimeError("Strict SageAttention policy rejected invalid attention scale")
+            if not supports_sm_scale():
+                raise RuntimeError("Strict SageAttention policy rejected unsupported sm_scale")
+            sage_kwargs["sm_scale"] = requested_scale
+
+        try:
+            out = native(q_native, k_native, v_native, **sage_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Strict SageAttention native call failed:{type(exc).__name__}"
+            ) from exc
+        if in_dtype is not None and getattr(out, "dtype", in_dtype) != in_dtype:
+            out = out.to(in_dtype)
+        if tensor_layout == "HND":
+            if not skip_output_reshape:
+                out = out.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+        elif skip_output_reshape:
+            out = out.transpose(1, 2)
+        else:
+            out = out.reshape(batch, -1, heads * dim_head)
+        return out
+
+    strict_attention._comfy_modal_selected_callable = "sageattention.sageattn"
+    return strict_attention
 
 
 def build_replay_warmup_workflow(workflow: dict) -> dict:
@@ -6226,7 +7002,7 @@ def _verify_model_file(path: str, expected_size: int | None = None, expected_sha
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.16.30"
+COMFYAPP_VERSION = "2.16.31"
 CONTROL_BASELINE = "v2.16.5_exact_plus_direct_memory_production"
 
 
@@ -6235,7 +7011,7 @@ APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
 RUNTIME_CONFIG_VOLUME_NAME = "comfymodal-runtime-config"
 RUNTIME_CONFIG_PATH = "/root/comfymodal_runtime_state"
-CUSTOM_NODES_VOLUME_NAME = "comfyui-custom-nodes"
+CUSTOM_NODES_VOLUME_NAME = _publication_policy.CUSTOM_NODES_VOLUME_NAME
 # P2: dedicated prompt-encoding cache volume. NEVER written to the
 # models or custom-nodes volumes. The volume is mounted only by the
 # persist + lookup functions below; the GPU class does not need to
@@ -6249,56 +7025,23 @@ COMFYUI_PORT = 8188
 
 
 def _looks_like_custom_nodes_source_root(path: str) -> bool:
-    if not path or not os.path.isdir(path):
-        return False
-    real = os.path.realpath(path)
-    if real in ("/", "/root", "/home", "/mnt", "/tmp", "/usr", "/opt"):
-        return False
-    try:
-        entries = sorted(os.listdir(path))
-    except OSError:
-        return False
-    candidate_count = 0
-    for name in entries:
-        p = os.path.join(path, name)
-        if not os.path.isdir(p) or name.startswith("."):
-            continue
-        if os.path.isfile(os.path.join(p, "__init__.py")) or os.path.isfile(os.path.join(p, "requirements.txt")):
-            candidate_count += 1
-    return candidate_count >= 3
+    return _publication_policy._looks_like_custom_nodes_source_root(path)
+
+
+def _resolve_local_custom_nodes_root_details() -> _CustomNodesRootResolution:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return _resolve_custom_nodes_root_details(
+        here,
+        fallback_roots=(
+            "/root/comfy/ComfyUI/custom_nodes",
+            os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
+        ),
+    )
 
 
 def _resolve_local_custom_nodes_root() -> str:
-    explicit = os.getenv("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
-    candidates.extend([
-        os.path.abspath(os.path.join(here, "..")),
-        os.path.abspath(os.path.join(here, "..", "custom_nodes")),
-        os.path.abspath(os.path.join(here, "..", "ComfyUI", "custom_nodes")),
-        "/root/comfy/ComfyUI/custom_nodes",
-        os.path.abspath(os.path.join(here, "comfy", "ComfyUI", "custom_nodes")),
-    ])
-    for candidate in candidates:
-        candidate = os.path.abspath(candidate)
-        if _looks_like_custom_nodes_source_root(candidate):
-            return candidate
-    if env_flag("COMFYMODAL_RUNTIME"):
-        return "/root/comfy/ComfyUI/custom_nodes"
-    if os.path.isdir("/root/comfy/ComfyUI/custom_nodes"):
-        # Runtime fallback: even without COMFYMODAL_RUNTIME, if the ComfyUI
-        # custom-nodes directory exists, use it.  This handles cases where
-        # Modal's .env() vars are not yet available at import time.
-        return "/root/comfy/ComfyUI/custom_nodes"
-    raise RuntimeError(
-        "Could not resolve local custom-node source root. "
-        "Set env COMFYMODAL_LOCAL_CUSTOM_NODES to the local directory "
-        "that contains your custom node folders (the parent directory "
-        "containing 'comfyui-modal' and other custom-node directories). "
-        f"Tried: {candidates}"
-    )
+    """Return the canonical local root while retaining the old API."""
+    return _resolve_local_custom_nodes_root_details().root
 
 
 def _assert_valid_local_custom_nodes_root(path: str) -> None:
@@ -6324,14 +7067,32 @@ def _assert_valid_local_custom_nodes_root(path: str) -> None:
 # MODAL_IMAGE_ID.  Use this to skip local-only build-time setup.
 _INSIDE_MODAL_CONTAINER = bool(os.environ.get("MODAL_IMAGE_ID")) or os.path.isdir("/pkg/modal")
 
+# The publisher bootstrap is a control-plane operation, not a GPU runtime
+# deployment.  Its deploy process opts into the lightweight image before this
+# module constructs the canonical accelerator DAG.  No ordinary deploy sets
+# this selector.
+_PUBLISHER_ONLY = os.environ.get("COMFYMODAL_PUBLISHER_ONLY", "").strip() == "1"
+
 # Resolved at deploy time to copy local custom nodes into the image.
 _COMFYUI_MODAL_DIR = os.path.dirname(os.path.abspath(__file__))
 if not _INSIDE_MODAL_CONTAINER:
-    _LOCAL_CUSTOM_NODES = _resolve_local_custom_nodes_root()
+    _LOCAL_CUSTOM_NODES_RESOLUTION = _resolve_local_custom_nodes_root_details()
+    _LOCAL_CUSTOM_NODES = _LOCAL_CUSTOM_NODES_RESOLUTION.root
 else:
     # Remote runtime GÃ‡Ã¶ skip local source resolution.  The custom nodes will
     # be synced from the Modal volume at restore() time.
     _LOCAL_CUSTOM_NODES = "/root/comfy/ComfyUI/custom_nodes"
+    _LOCAL_CUSTOM_NODES_RESOLUTION = _CustomNodesRootResolution(
+        _LOCAL_CUSTOM_NODES,
+        "remote_runtime_mount",
+        (_LOCAL_CUSTOM_NODES,),
+    )
+
+
+def _local_custom_nodes_root_diagnostics() -> dict[str, object]:
+    """Return the selected root and its auditable resolution details."""
+    return _LOCAL_CUSTOM_NODES_RESOLUTION.as_dict()
+
 
 # Requirements-only build context so pip-install layers cache independently of
 # non-requirements custom node source changes.
@@ -6343,82 +7104,29 @@ _CACHEDIT_LOCK_SRC = os.path.join(_COMFYUI_MODAL_DIR, _CACHEDIT_LOCK_FILENAME)
 _CACHEDIT_LOCK_DST = "/opt/comfymodal/cachedit_dependency_lock.txt"
 """In-image destination for the lock file (used at build and runtime)."""
 
-_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".ipynb_checkpoints"}
-_CUSTOM_NODE_LOCAL_CLONE_RE = re.compile(
-    r"^comfyui-modal-(?:agent\d+(?:[-_].*)?|agent[-_].*|worktree(?:[-_].*)?|wt(?:[-_].*)?|dc\d+)$",
-    re.IGNORECASE,
+_CUSTOM_NODE_SYNC_EXCLUDE_DIRS = _publication_policy.EXCLUDED_DIR_NAMES
+_CUSTOM_NODE_LOCAL_CLONE_RE = _publication_policy.LOCAL_CLONE_RE
+_COMFYMODAL_CANONICAL_NODE_NAME = "comfyui-modal"
+_COMFYMODAL_DUPLICATE_TYPO_NAMES = frozenset({"comyui-modal-pagesfile-probe"})
+
+
+def _is_comfymodal_duplicate_dir(node_name: str, node_path: str) -> str | None:
+    return _publication_policy.comfymodal_duplicate_reason(node_name, node_path)
+_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = (
+    _publication_policy.image_ignore_patterns()
+    + _publication_policy.image_ignore_patterns("**/")
 )
-_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS = [
-    ".git/",
-    "__pycache__/",
-    "*.pyc",
-    ".venv/",
-    "venv/",
-    "node_modules/",
-]
-_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = [
-    ".gitignore",
-    "*.md",
-    ".deploy_log",
-    ".tmp",
-    "*.tmp",
-    ".comfymodal_experiments/",
-    ".custom_node_requirements/",
-    ".hf_token",
-    ".civitai_token",
-    ".deployed_state.json",
-    ".deployed_version",
-    ".modal_settings.json",
-    "latest_benchmark_workflow.json",
-    "modal_logs.txt",
-    "_deploy_output.log",
-    "comfymodal_experiment_presets.json",
-    "comfymodal_experiment_state.json",
-    "apply_experiment_preset.py",
-    "run_experiment_stage.py",
-    "BENCHMARK_WORKFLOW.md",
-]
-_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = [
-    "*/.git/",
-    "*/__pycache__/",
-    "*/.ipynb_checkpoints/",
-    "*/node_modules/",
-    "*/.venv/",
-    "*/venv/",
-    "*.pyc",
-    "*.pyo",
-    "comfyui-modal/.gitignore",
-    "comfyui-modal/.deploy_log",
-    "comfyui-modal/.tmp",
-    "comfyui-modal/*.tmp",
-    "comfyui-modal/*.log",
-    "comfyui-modal/modal_logs.txt",
-    "comfyui-modal/_deploy_output.log",
-    "comfyui-modal/latest_benchmark_workflow.json",
-    "comfyui-modal/.hf_token",
-    "comfyui-modal/.civitai_token",
-    "comfyui-modal/.deployed_state.json",
-    "comfyui-modal/.deployed_version",
-    "comfyui-modal/.modal_settings.json",
-    "comfyui-modal/.last_v2_dependency_cache_identity.json",
-    "comfyui-modal/.last_custom_node_context_manifest.json",
-    "comfyui-modal/.comfymodal_experiments/",
-    "comfyui-modal/.comfymodal_experiments/*",
-    "comfyui-modal/.playwright-mcp/",
-    "comfyui-modal/.playwright-mcp/*",
-    "comfyui-modal/.custom_node_requirements/",
-    "comfyui-modal/.baked_custom_node_deps/",
-    "comfyui-modal/*.md",
-    "comfyui-modal/comfymodal_experiment_presets.json",
-    "comfyui-modal/comfymodal_experiment_state.json",
-    "comfyui-modal/apply_experiment_preset.py",
-    "comfyui-modal/run_experiment_stage.py",
-    "comfyui-modal/BENCHMARK_WORKFLOW.md",
-    "comfyui-modal-agent*/",
-    "comfyui-modal-worktree*/",
-    "comfyui-modal-wt*/",
-    "comfyui-modal-dc*/",
-]
+_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS = (
+    _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS
+    + ["comfymodal_experiment_presets.json", "comfymodal_experiment_state.json"]
+)
+_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS = (
+    _CUSTOM_NODE_IMAGE_IGNORE_PATTERNS
+    + [
+        "comfyui-modal-agent*/", "comfyui-modal-worktree*/",
+        "comfyui-modal-wt*/", "comfyui-modal-dc*/",
+    ]
+)
 _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
     ".git",
     "__pycache__",
@@ -6453,17 +7161,7 @@ _CUSTOM_NODE_REQUIREMENTS_COPY_IGNORE = shutil.ignore_patterns(
 
 
 def _custom_node_filter_reason(node_name: str, node_path: str) -> str | None:
-    if not os.path.isdir(node_path):
-        return "not_directory"
-    if os.path.islink(node_path):
-        return "symlink"
-    if node_name.startswith("."):
-        return "hidden_directory"
-    if node_name in _CUSTOM_NODE_SYNC_EXCLUDE_DIRS:
-        return "generated_or_environment_directory"
-    if _CUSTOM_NODE_LOCAL_CLONE_RE.fullmatch(node_name):
-        return "local_agent_or_worktree_clone"
-    return None
+    return _publication_policy.custom_node_filter_reason(node_name, node_path)
 
 
 def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
@@ -6475,15 +7173,7 @@ def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
     - must not be in the exclude set (``.git``, ``__pycache__``, GÃ‡Âª)
     - broken symlinks are excluded (``os.path.isdir`` returns ``False``)
     """
-    if not os.path.isdir(cn_root):
-        return []
-    names = []
-    for node_name in sorted(os.listdir(cn_root)):
-        node_path = os.path.join(cn_root, node_name)
-        if _custom_node_filter_reason(node_name, node_path) is not None:
-            continue
-        names.append(node_name)
-    return names
+    return _publication_policy.iter_syncable_custom_node_dirs(cn_root)
 
 
 def _diagnose_custom_node_selection(cn_root: str) -> None:
@@ -6502,11 +7192,44 @@ def _diagnose_custom_node_selection(cn_root: str) -> None:
     print("[comfyapp.custom_node_filter] end")
 
 
+def custom_node_filter_diagnostics(cn_root: str) -> dict:
+    """Return bounded counts of the canonical custom-node filter for a root."""
+    result = {
+        "total_source_dirs": 0,
+        "accepted_dirs": 0,
+        "duplicate_comfymodal_dirs": 0,
+        "duplicate_names_bounded": "[]",
+    }
+    if not os.path.isdir(cn_root):
+        return result
+    dup_names: list[str] = []
+    accepted = 0
+    total = 0
+    for node_name in sorted(os.listdir(cn_root)):
+        node_path = os.path.join(cn_root, node_name)
+        if not os.path.isdir(node_path) or os.path.islink(node_path):
+            continue
+        total += 1
+        reason = _custom_node_filter_reason(node_name, node_path)
+        if reason in ("comfymodal_duplicate_worktree", "comfymodal_duplicate_typo"):
+            dup_names.append(node_name)
+        elif reason is None:
+            accepted += 1
+    result["total_source_dirs"] = total
+    result["accepted_dirs"] = accepted
+    result["duplicate_comfymodal_dirs"] = len(dup_names)
+    _bounded = dup_names[:20]
+    _shown = ",".join(_bounded)
+    if len(dup_names) > 20:
+        _shown += ",..."
+    result["duplicate_names_bounded"] = f"[{_shown}]"
+    return result
+
+
 def _custom_node_image_ignore_patterns(node_name: str) -> list[str]:
-    patterns = list(_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
     if node_name == os.path.basename(_COMFYUI_MODAL_DIR):
-        patterns.extend(_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS)
-    return patterns
+        return list(_COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS)
+    return list(_CUSTOM_NODE_IMAGE_IGNORE_PATTERNS)
 
 
 def _custom_node_requirements_context_dir(node_name: str) -> str:
@@ -6702,6 +7425,9 @@ def _normalize_requirements_context_metadata(root: str) -> None:
     and modes even when every dependency file is byte-for-byte unchanged.
     Normalize files and directories so metadata-only changes cannot invalidate
     the custom-node dependency image layer.
+
+    The staged copy path is intentionally content-based (the equivalent of
+    ``shutil.copyfile(src, dst)``), never metadata-based.
     """
     if not os.path.isdir(root):
         return
@@ -6812,7 +7538,7 @@ _V2_DEPENDENCY_CACHE_IDENTITY_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     _V2_DEPENDENCY_CACHE_IDENTITY_FILENAME,
 )
-_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-loop-v2"
+_V2_DEPENDENCY_INSTALLER_VERSION = "custom-node-pip-per-node-v3"
 _V2_DEPENDENCY_BASE_INPUTS = {
     "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
     "python": "3.11",
@@ -6852,21 +7578,60 @@ def _build_v2_dependency_cache_identity(requirements_key: str = "") -> dict[str,
     }
 
 
-def _drain_completed_active_read_diagnostics(request_id: str = "") -> list[dict]:
-    if not request_id:
-        return []
+def _completed_active_read_matches(
+    record: dict,
+    *,
+    request_id: str = "",
+    restored_instance_id: str = "",
+    restore_session_id: str = "",
+) -> bool:
+    """Exact-match one completed active-read record against drain identities.
+
+    A record that carries its own ``request_id`` is consumed only by the
+    exact same request (prevents another request/model read from being
+    consumed).  A record without a request_id (lifecycle/preload reads) is
+    associated only when BOTH restore identities match exactly — never
+    partial, so cross-session leakage is impossible.
+    """
+    record_request_id = record.get("request_id", "")
+    if record_request_id:
+        return bool(request_id) and str(record_request_id) == str(request_id)
+    return (
+        bool(restored_instance_id)
+        and bool(restore_session_id)
+        and str(record.get("restored_instance_id", "")) == str(restored_instance_id)
+        and str(record.get("restore_session_id", "")) == str(restore_session_id)
+    )
+
+
+def _drain_completed_active_read_diagnostics(
+    request_id: str = "",
+    restored_instance_id: str = "",
+    restore_session_id: str = "",
+) -> list[dict]:
+    """Drain completed active-read records matching *request_id* and/or the
+    exact restore identities, preserving every record field verbatim.
+
+    Records carrying their own request_id require an exact request match;
+    records without one require exact ``restored_instance_id`` +
+    ``restore_session_id``.  Non-matching records are retained for later
+    requests — a read is never consumed by a different request/model load.
+    """
     with _ACTIVE_MODEL_READS_LOCK:
-        matched = [
-            dict(record)
-            for record in _COMPLETED_ACTIVE_READS
-            if record.get("request_id") == request_id
-        ]
+        matched: list[dict] = []
+        retained: list[dict] = []
+        for record in _COMPLETED_ACTIVE_READS:
+            if _completed_active_read_matches(
+                record,
+                request_id=request_id,
+                restored_instance_id=restored_instance_id,
+                restore_session_id=restore_session_id,
+            ):
+                matched.append(dict(record))
+            else:
+                retained.append(record)
         if matched:
-            _COMPLETED_ACTIVE_READS[:] = [
-                record
-                for record in _COMPLETED_ACTIVE_READS
-                if record.get("request_id") != request_id
-            ]
+            _COMPLETED_ACTIVE_READS[:] = retained
         return matched
 
 
@@ -7082,6 +7847,15 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print("[comfyapp] === Requirements Context Diagnostics ===")
     print(f"[comfyapp] COMFYAPP_VERSION={COMFYAPP_VERSION}")
     print(f"[comfyapp] source_root={source_root}")
+    _root_resolution_diag = _local_custom_nodes_root_diagnostics()
+    print(
+        "[comfyapp] custom_nodes_root_resolution_method="
+        f"{_root_resolution_diag['custom_nodes_root_resolution_method']}"
+    )
+    print(
+        "[comfyapp] custom_nodes_root_candidates="
+        f"{_root_resolution_diag['custom_nodes_root_candidates']}"
+    )
     print(f"[comfyapp] requirements_dir={requirements_dir}")
 
     # Task 7: Cache killer flags
@@ -7180,9 +7954,14 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
 
     # Task 8: Verify actual build order
     _node_names = _iter_syncable_custom_node_dirs(source_root)
+    print(f"[comfyapp] custom_node_delivery={CUSTOM_NODE_DELIVERY}")
     print(f"[comfyapp] custom_node_copy_mode={CUSTOM_NODE_COPY_MODE}")
     print(f"[comfyapp] syncable_custom_nodes={len(_node_names)}")
-    _combined_layers = 1 if CUSTOM_NODE_COPY_MODE == "combined" else len(_node_names)
+    _combined_layers = (
+        0 if CUSTOM_NODE_DELIVERY == "volume"
+        else 1 if CUSTOM_NODE_COPY_MODE == "combined"
+        else len(_node_names)
+    )
     print(f"[comfyapp] source_copy_layers={_combined_layers}")
     print(f"[comfyapp] local_custom_node_root={source_root}")
     combined_excluded_ok = (
@@ -7193,16 +7972,33 @@ def _diagnose_custom_node_requirements_context(source_root: str, requirements_di
     print(f"[comfyapp] comfyui_modal_excluded_baked_custom_node_deps={'yes' if combined_excluded_ok else 'check_logs'}")
     print(f"[comfyapp] build_order:")
     print(f"  1. base CUDA image (nvidia/cuda:13.0.0-devel-ubuntu24.04)")
-    print(f"  2. comfy-cli install")
-    print(f"  3. PyTorch CUDA reinstall (cu130)")
-    print(f"  4. triton install")
-    print(f"  5. SageAttention build")
-    print(f"  6. env vars")
+    print(f"  2. install comfy-cli build utility")
+    print(f"  3. fetch/checkout pinned ComfyUI v0.34.2")
+    print(f"  4. install pinned ComfyUI requirements")
+    print(f"  5. PyTorch CUDA reinstall (cu130)")
+    print(f"  6. triton install")
     print(f"  7. add .custom_node_requirements (as local_dir)")
     print(f"  8. run custom-node prereq pip loop")
-    print(f"  9. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
-    print(f"  10. generate/add baked dependency manifest")
-    print(f"  11. add helper Python sources")
+    print(f"  9. install/verify comfy-kitchen==0.2.31")
+    print(f"  10. install/verify fastsafetensors and SageAttention")
+    print(f"  11. apply late runtime env vars")
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print("  12. mount publisher custom-node Volume at ComfyUI import path")
+    else:
+        print(f"  12. add custom-node source (mode={CUSTOM_NODE_COPY_MODE}, layers={_combined_layers})")
+    print(f"  13. generate/add baked dependency manifest")
+    print(
+        f"  14. golden GPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  15. publisher first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
+    print(
+        f"  16. download CPU first-party source | comfyapp + runtime modules | "
+        f"dst=/root | files={_FIRST_PARTY_SOURCE_FILE_COUNT}"
+    )
     print(f"[comfyapp] ===========================================")
 
     _save_last_context_manifest(current)
@@ -7248,6 +8044,42 @@ def _diagnose_experiment_harness_context() -> None:
     print(f"[comfyapp] experiment_harness_diag: modal_ignore_has_local_only_dir={'1' if any('comfymodal_experiments' in p for p in _COMFYUI_MODAL_IMAGE_IGNORE_PATTERNS) else '0'}")
     print(f"[comfyapp] experiment_harness_diag: mutable_state_location={_state_path}")
     print(f"[comfyapp] experiment_harness_diag: state_inside_ignored_dir={'1' if _state_inside_ignored else '0'}")
+
+
+def run_custom_node_build_diagnostics(
+    source_root: str | None = None,
+    requirements_dir: str | None = None,
+    dep_manifest: dict | None = None,
+) -> None:
+    """Run the opt-in diagnostics for a local custom-node build context.
+
+    These diagnostics intentionally include recursive source-size inspection,
+    so they are kept out of ordinary module import and runtime paths.  Callers
+    performing an explicit production/build investigation may invoke this
+    entry point directly; omitted arguments use the module's resolved build
+    context.
+    """
+    resolved_source_root = source_root or _LOCAL_CUSTOM_NODES
+    resolved_requirements_dir = requirements_dir or _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    resolved_manifest = dep_manifest
+    if resolved_manifest is None:
+        resolved_manifest = {}
+        manifest_path = globals().get("_BAKED_MANIFEST_TEMP")
+        if manifest_path and os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+                    loaded_manifest = json.load(manifest_file)
+                if isinstance(loaded_manifest, dict):
+                    resolved_manifest = loaded_manifest
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+
+    _diagnose_custom_node_requirements_context(
+        resolved_source_root,
+        resolved_requirements_dir,
+        resolved_manifest,
+    )
+    _diagnose_experiment_harness_context()
 
 
 def _safe_dependency_relpath(filepath: str, node_root: str) -> str:
@@ -7417,13 +8249,48 @@ GPU_PROFILES = {
     "high_mem": {"cpu": 4, "memory": 32768, "target_inputs": 1, "max_inputs": 1},
 }
 
-SAGEATTENTION_GIT_REF = "v2.2.0"
+# Authoritative ComfyUI core for Step-3 host<->image parity: the upstream
+# v0.34.2 tag commit the image checkout is pinned to
+# (Comfy-Org/ComfyUI, lightweight tag v0.34.2).  comfy-cli 1.3.7's default
+# "nightly" install clones master WITHOUT a tag checkout, so the image must
+# be re-pinned explicitly; the string change also busts the image layer hash
+# so a new pin always triggers a rebuild of the affected layers.
+_COMFYUI_PINNED_COMMIT = "169fcf35a2fc163fec31338b816503ddac0d3fcf"
+
 SAGEATTENTION_SITE_PACKAGES = "/usr/local/lib/python3.11/site-packages"
 
+
+def _compute_v2_runtime_revision(runtime_root: Path) -> str:
+    """Return the stable content revision for packaged runtime sources.
+
+    Keep this small standalone spelling for source-level tooling that loads
+    this function without importing comfyapp; the implementation mirrors the
+    shared deployment-spec algorithm.
+    """
+    root = Path(runtime_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"runtime package is not a directory: {root}")
+    source_files = []
+    for path in root.rglob("*.py"):
+        resolved_path = path.resolve()
+        if not resolved_path.is_relative_to(root):
+            raise ValueError(f"runtime source escapes package: {path}")
+        if not resolved_path.is_file():
+            raise OSError(f"runtime source is not a file: {path}")
+        source_files.append((path.relative_to(root).as_posix(), resolved_path))
+    digest = hashlib.sha256()
+    for relative_path, path in sorted(source_files, key=lambda item: item[0]):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
 try:
-    _V2_RUNTIME_REVISION = hashlib.sha256(
-        (Path(__file__).resolve().parent / "comfymodal_runtime" / "modal_app.py").read_bytes()
-    ).hexdigest()[:16]
+    _V2_RUNTIME_REVISION = _compute_v2_runtime_revision(
+        Path(__file__).resolve().parent / "comfymodal_runtime"
+    )
 except Exception:
     _V2_RUNTIME_REVISION = "0000000000000000"
 
@@ -7450,8 +8317,23 @@ _image_base = (
         "clang",
     )
     .pip_install("comfy-cli==1.3.7", "httpx>=0.27.0")
+    # Fetch only the pinned ComfyUI source.  Do not use ``comfy install`` here:
+    # that command installs requirements from an implicit moving checkout and
+    # makes ordinary source changes ancestors of heavyweight dependency work.
     .run_commands(
-        "comfy --skip-prompt install --nvidia",
+        "rm -rf /root/comfy/ComfyUI && "
+        "git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git /root/comfy/ComfyUI && "
+        "git -C /root/comfy/ComfyUI fetch --depth=1 origin " + _COMFYUI_PINNED_COMMIT + " && "
+        "git -C /root/comfy/ComfyUI checkout --force " + _COMFYUI_PINNED_COMMIT + " && "
+        "git -C /root/comfy/ComfyUI log -1 --format='pinned=%H'",
+        gpu="a10g",
+    )
+    # Install the requirements belonging to the pinned checkout in a distinct
+    # dependency step.  Torch is re-pinned immediately below because upstream
+    # requirements may declare a different CUDA wheel.
+    .run_commands(
+        "python -m pip install --disable-pip-version-check --no-input "
+        "-r /root/comfy/ComfyUI/requirements.txt",
         gpu="a10g",
     )
     # Force CUDA 13.0 PyTorch after comfy install (which may install older CUDA build)
@@ -7465,113 +8347,538 @@ _image_base = (
     .run_commands(
         "python -m pip install --upgrade 'triton>=3.0.0'",
     )
-    .run_commands(
-        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
-        "python -m pip install --upgrade --force-reinstall "
-        "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
-        "--no-build-isolation --no-deps",
-        gpu="a10g",
-    )
-    .run_commands(
-        "python -X utf8 -c \"import pathlib, site; "
-        "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
-        "files = list(pathlib.Path(site_root).joinpath('sageattention').glob('*.so')); "
-        "print([f.name for f in files]); "
-        "assert files, 'no sageattention shared objects built'\"",
-        gpu="a10g",
-    )
-    .run_commands(
-        "python -X utf8 -c \"import sageattention._fused; print('sageattention._fused ok')\"",
-        gpu="a10g",
-    )
 )
+
+# Stable OS/CUDA/Python plus the pinned ComfyUI core ABI (Torch/Triton) stop
+# here.  Later custom-node dependency and accelerator layers are children of
+# this boundary, never parents of it.
+_FOUNDATION_IMAGE = _image_base
 
 # Runtime/source-only environment belongs to the child image, after the
 # stable dependency boundary.  It must not be an ancestor of the pip layer.
-_V2_RUNTIME_ENV = {
-    "TORCHINDUCTOR_CACHE_DIR": "/root/comfymodal_runtime_state/.inductor-cache",
-    "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
-    "TRITON_CACHE_DIR": "/tmp/triton_cache",
-    "TORCHINDUCTOR_EMULATE_PRECISION_CASTS": "1",
-    "TORCHINDUCTOR_COMPILE_THREADS": "1",
-    "COMFYMODAL_ENABLE_TORCH_COMPILE": "0",
-    "COMFYMODAL_ENABLE_GPU_SNAPSHOT": "0",
-    "COMFYMODAL_WARMUP_TEXT": "warmup",
-    "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
-    "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
-    "COMFYMODAL_PRELOAD_MODE": "clip_only",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
-    "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
-    "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
-    "COMFYMODAL_EXACT_CLIP_PREFILL": "1",
-    "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
-    "COMFYMODAL_SAFETENSORS_READ_MODE": "normal",
-    "COMFYMODAL_RUNTIME": "1",
-    "PROMPT_ASYNC_PRELOAD": "0",
-    "PROMPT_PRELOAD_WORKERS": "2",
-    "PROMPT_ASYNC_ACTUAL_LOAD": "1",
-    "PROMPT_ASYNC_ACTUAL_LOAD_UNET": "1",
-    "ACTUAL_LOAD_MODE": "unet_vae_only",
-    "DISABLE_CACHEDIT_FOR_Z_IMAGE": "0",
-    "DISABLE_RESTORE_WARMUP_FOR_Z_IMAGE": "0",
-    "COMFYMODAL_REQUIREMENTS_REPAIR_MODE": "fail_fast",
-    "COMFYMODAL_PRELOAD_UNKNOWN_PROFILES": "0",
-    "COMFYMODAL_PRELOAD_MAX_TOTAL_GB": "12",
-    "COMFYMODAL_PRELOAD_MAX_FILE_GB": "10",
-    "COMFYMODAL_PRELOAD_MIN_THROUGHPUT_GBPS": "0.5",
-    "COMFYMODAL_PRELOAD_OUTLIER_ABORT_SECONDS": "10",
-    "COMFYMODAL_ENABLE_REMOTE_BACKGROUND_DEPLOY": "0",
-    "COMFYMODAL_EXPERIMENTAL_RESTORE_BACKGROUND_CODE": "0",
-    "COMFYMODAL_RESTORE_BACKGROUND_UNET": "0",
-    "COMFYMODAL_V2_RUNTIME_REVISION": _V2_RUNTIME_REVISION,
-    "COMFYMODAL_V2_PREFILL_LANES": os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical"),
-}
-_V2_RUNTIME_ENV.update(runtime_shape_config().environment())
+_V2_RUNTIME_ENV = build_v2_late_config(
+    environment=dict(os.environ),
+    runtime_root=Path(__file__).resolve().parent / "comfymodal_runtime",
+    runtime_revision=_V2_RUNTIME_REVISION,
+)
 
-# Combined requirements layer: one COPY + one pip loop (single cache unit).
-# When no requirements.txt changes, the layer is cached (~5s deploy).
-# Changed requirements cause all pip installs to re-run within this layer.
+
+_GPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "optimizations",
+    "worker_control",
+)
+
+_CPU_COMFYMODAL_PYTHON_SOURCES = (
+    "gpu_catalog",
+    "timing_trace",
+    "wall_clock_trace_v3",
+    "profiler_trace_v4",
+    "api_prompt_validator",
+    "failure_summary",
+    "production_workflow",
+    "worker_control",
+)
+
+_CANONICAL_GPU_SOURCE_MODULES = tuple(dict.fromkeys(
+    _GPU_COMFYMODAL_PYTHON_SOURCES + (
+        "canonical_execution", "modal_client", "run_prompt_options",
+        "warmup_profile", "workflow_metadata", "model_manifest",
+    )
+))
+
+_FIRST_PARTY_SOURCE_STAGING_DIR = os.path.join(
+    _COMFYUI_MODAL_DIR, ".comfymodal_first_party_sources"
+)
+
+
+def _first_party_source_file_map() -> dict[str, Path]:
+    """Return the exact source tree mounted into each runtime image."""
+    source_root = Path(_COMFYUI_MODAL_DIR)
+    files: dict[str, Path] = {"comfyapp.py": Path(__file__)}
+    module_names = tuple(dict.fromkeys(
+        _CANONICAL_GPU_SOURCE_MODULES
+        + _CPU_COMFYMODAL_PYTHON_SOURCES
+        + ("optimizations",)
+    ))
+    for module_name in module_names:
+        source = source_root / f"{module_name}.py"
+        if not source.is_file():
+            raise FileNotFoundError(f"first-party image source is missing: {source}")
+        files[f"{module_name}.py"] = source
+
+    runtime_root = source_root / "comfymodal_runtime"
+    if not runtime_root.is_dir():
+        raise FileNotFoundError(f"first-party image package is missing: {runtime_root}")
+    for source in sorted(runtime_root.rglob("*.py")):
+        if "__pycache__" not in source.parts:
+            files[source.relative_to(source_root).as_posix()] = source
+    return files
+
+
+def _prepare_first_party_source_build_context() -> tuple[int, int]:
+    """Synchronize the small source mount without rewriting unchanged bytes."""
+    staging_root = Path(_FIRST_PARTY_SOURCE_STAGING_DIR)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    desired = _first_party_source_file_map()
+
+    for existing in sorted(staging_root.rglob("*"), reverse=True):
+        if not existing.is_file():
+            continue
+        relative = existing.relative_to(staging_root).as_posix()
+        if relative not in desired:
+            existing.unlink()
+
+    total_bytes = 0
+    for relative, source in sorted(desired.items()):
+        destination = staging_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_bytes = source.read_bytes()
+        total_bytes += len(source_bytes)
+        try:
+            unchanged = destination.read_bytes() == source_bytes
+        except FileNotFoundError:
+            unchanged = False
+        if not unchanged:
+            destination.write_bytes(source_bytes)
+            os.chmod(destination, 0o644)
+
+    for directory in sorted(
+        (path for path in staging_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return len(desired), total_bytes
+
+
+_FIRST_PARTY_SOURCE_FILE_COUNT, _FIRST_PARTY_SOURCE_BYTES = (
+    _prepare_first_party_source_build_context()
+)
+
+
+def _prepare_custom_node_archive(source_root: str) -> tuple[str, str]:
+    """Return one cached archive built from the canonical publication inventory.
+
+    The inventory is collected once and feeds both the publication generation
+    and the archive.  The cache key includes raw bytes and modes, so an
+    executable-bit change cannot reuse an older archive with the same semantic
+    publication generation.
+    """
+    from tools.v2_control.custom_nodes import (
+        archive_content_digest,
+        build_archive,
+        build_source_identity,
+        collect_semantic_files,
+    )
+
+    files = collect_semantic_files(source_root)
+    identity = build_source_identity(source_root, semantic_files=files)
+    archive_key = archive_content_digest(files)
+    cache_root = Path(tempfile.gettempdir()) / "comfymodal-custom-node-archives"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    archive_path = cache_root / f"custom_nodes-{archive_key}.tar.gz"
+    if not archive_path.is_file():
+        archive_data = build_archive(files)
+        temporary = archive_path.with_name(f".{archive_path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(archive_data)
+        os.replace(temporary, archive_path)
+    return str(archive_path), identity.content_generation
+
+# Custom-node requirements are copied and installed one node at a time.  The
+# staged context is deliberately split here as well as in the shell commands:
+# a changed node must not invalidate an unchanged node's parent layer.
+def _staged_custom_node_requirement_names(requirements_root: str) -> tuple[str, ...]:
+    """Return deterministic staged node names that have requirements.txt."""
+    return tuple(
+        node_name
+        for node_name in _iter_syncable_custom_node_dirs(requirements_root)
+        if os.path.isfile(
+            os.path.join(requirements_root, node_name, "requirements.txt")
+        )
+    )
+
+
+def _custom_node_requirement_context_hash(context_dir: str) -> str:
+    """Hash only the canonical staged dependency context for one node."""
+    return stable_hash(_build_requirements_context_manifest(context_dir))
+
+
+def _custom_node_install_command(node_name: str, context_hash: str) -> str:
+    """Build a deterministic, fail-closed install command for one node."""
+    # The destination is an image path and the node name is the stable
+    # published directory name; no host path is embedded in this command.
+    node_path = shlex.quote(node_name)
+    return (
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        f'_req_root="/root/comfy-build/custom_node_requirements"; '
+        f'echo "CUSTOM_NODE_PREREQ_INSTALL node={node_name} '
+        f'context_sha256={context_hash}"; '
+        f'cd "$_req_root"/{node_path} && '
+        'python -m pip install --disable-pip-version-check --no-input '
+        '-r requirements.txt -c "$_lock" --quiet 2>&1 || '
+        '{ echo "CUSTOM_NODE_PREREQ_FAILED"; exit 1; }'
+    )
+
+
+_CUSTOM_NODE_PREREQ_CHECK_PROGRAM = r"""
+_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_SPEC_RE = re.compile(r"^(===|~=|==|!=|<=|>=|<|>)\s*([^,\s]+)(?:\s*,\s*(.*))?$")
+_VERSION_RE = re.compile(
+    r"^[vV]?(\d+(?:\.\d+)*)(?:(a|alpha|b|beta|rc|c|pre|preview)(\d*))?"
+    r"(?:\.post(\d+))?(?:\.dev(\d+))?(?:\+([0-9A-Za-z.-]+))?$"
+)
+_MARKER_RE = re.compile(
+    r"^(sys_platform|platform_system|python_version|python_full_version|"
+    r"implementation_name)\s*(==|!=|in|not in)\s*(['\"])(.*?)\3$"
+)
+
+
+def _version_key(value):
+    match = _VERSION_RE.fullmatch(value.strip())
+    if not match:
+        return None
+    release = tuple(int(part) for part in match.group(1).split("."))
+    release = release + (0,) * (4 - len(release))
+    stage_name, stage_number = match.group(2), int(match.group(3) or 0)
+    if stage_name is None:
+        stage = 3
+    elif stage_name in ("a", "alpha"):
+        stage = 0
+    elif stage_name in ("b", "beta"):
+        stage = 1
+    elif stage_name in ("rc", "c", "pre", "preview"):
+        stage = 2
+    else:
+        stage = 3
+    post = int(match.group(4) or 0)
+    dev = int(match.group(5) or 0)
+    return release, stage, stage_number, post, dev
+
+
+def _split_specifiers(specifiers):
+    if not specifiers:
+        return []
+    parts = []
+    remainder = specifiers
+    while remainder:
+        match = _SPEC_RE.match(remainder)
+        if not match:
+            return None
+        parts.append((match.group(1), match.group(2)))
+        remainder = match.group(3) or ""
+    return parts
+
+
+def _satisfies(installed, specifiers):
+    parts = _split_specifiers(specifiers)
+    if parts is None:
+        return None
+    if not parts:
+        return bool(installed)
+    installed_key = _version_key(installed)
+    if installed_key is None:
+        return None
+    for operator, expected in parts:
+        if operator == "===":
+            satisfied = installed == expected
+        else:
+            wildcard = expected.endswith(".*")
+            expected_base = expected[:-2] if wildcard else expected
+            expected_key = _version_key(expected_base)
+            if expected_key is None:
+                return None
+            if operator in ("==", "!=") and wildcard:
+                prefix = expected_base.split(".")
+                actual_prefix = installed.lstrip("vV").split(".")[: len(prefix)]
+                satisfied = actual_prefix == prefix
+                if operator == "!=":
+                    satisfied = not satisfied
+            elif operator == "==":
+                satisfied = installed_key == expected_key
+            elif operator == "!=":
+                satisfied = installed_key != expected_key
+            elif operator == ">=":
+                satisfied = installed_key >= expected_key
+            elif operator == "<=":
+                satisfied = installed_key <= expected_key
+            elif operator == ">":
+                satisfied = installed_key > expected_key
+            elif operator == "<":
+                satisfied = installed_key < expected_key
+            elif operator == "~=":
+                expected_parts = tuple(int(part) for part in expected_base.split("."))
+                upper_parts = list(expected_parts)
+                upper_index = max(0, len(upper_parts) - 2)
+                upper_parts[upper_index] += 1
+                upper_parts = upper_parts[: upper_index + 1]
+                upper_key = _version_key(".".join(str(part) for part in upper_parts))
+                satisfied = installed_key >= expected_key and installed_key < upper_key
+            else:
+                return None
+        if not satisfied:
+            return False
+    return True
+
+
+def _marker_applies(marker):
+    if not marker:
+        return True
+    if " and " in marker or " or " in marker:
+        return None
+    match = _MARKER_RE.fullmatch(marker.strip())
+    if not match:
+        return None
+    key, operator, _, expected = match.groups()
+    values = {
+        "sys_platform": sys.platform,
+        "platform_system": __import__("platform").system(),
+        "python_version": ".".join(str(part) for part in sys.version_info[:2]),
+        "python_full_version": ".".join(str(part) for part in sys.version_info[:3]),
+        "implementation_name": __import__("platform").python_implementation().lower(),
+    }
+    actual = values[key]
+    if operator == "==":
+        return actual == expected
+    if operator == "!=":
+        return actual != expected
+    if operator == "in":
+        return actual in expected
+    if operator == "not in":
+        return actual not in expected
+    return None
+
+
+def _parse_requirement(raw):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return "skip", None, None
+    line = line.split(" #", 1)[0].strip()
+    if not line:
+        return "skip", None, None
+    if line.startswith("-e ") or line.startswith("--editable"):
+        return "unchecked", line, "editable"
+    if line.startswith("-"):
+        return "skip", None, None
+    if line.startswith(("git+", "hg+", "svn+", "bzr+", "http://", "https://", "file:")):
+        return "unchecked", line, "vcs_or_url"
+    if line.startswith(("./", "../", "/", "~/")) or " @ " in line:
+        return "unchecked", line, "path_or_direct_url"
+    requirement, _, marker = line.partition(";")
+    match = _NAME_RE.match(requirement.strip())
+    if not match:
+        return "unchecked", line, "unparseable"
+    name = match.group(0)
+    remainder = requirement.strip()[match.end() :].strip()
+    if remainder.startswith("["):
+        end = remainder.find("]")
+        if end < 0:
+            return "unchecked", line, "unparseable"
+        remainder = remainder[end + 1 :].strip()
+    if remainder and remainder[0] not in "<>!=~":
+        return "unchecked", line, "unparseable"
+    applies = _marker_applies(marker.strip())
+    if applies is None:
+        return "unchecked", line, "unsupported_marker"
+    if not applies:
+        return "conditional_skip", None, None
+    return "check", (name, remainder, line), None
+
+
+def check_requirement_lines(lines, version_lookup):
+    checked = []
+    unsatisfied = []
+    unchecked = []
+    for raw in lines:
+        status, parsed, reason = _parse_requirement(raw)
+        if status in ("skip", "conditional_skip"):
+            continue
+        if status == "unchecked":
+            unchecked.append({
+                "req": parsed,
+                "reason": reason,
+                "fatal": reason not in ("editable", "vcs_or_url", "path_or_direct_url"),
+            })
+            continue
+        name, specifiers, requirement = parsed
+        try:
+            installed = version_lookup(name)
+        except Exception as exc:
+            if exc.__class__.__name__ == "PackageNotFoundError":
+                installed = None
+            else:
+                unchecked.append({"req": requirement, "reason": "metadata_error", "fatal": True})
+                continue
+        if installed is None:
+            unsatisfied.append({"req": requirement, "installed": None})
+            continue
+        satisfied = _satisfies(installed, specifiers)
+        if satisfied is None:
+            unchecked.append({"req": requirement, "reason": "unsupported_specifier", "fatal": True})
+        elif satisfied:
+            checked.append({"req": requirement, "installed": installed})
+        else:
+            unsatisfied.append({"req": requirement, "installed": installed})
+    return {
+        "checked": sorted(checked, key=lambda item: item["req"]),
+        "unsatisfied": sorted(unsatisfied, key=lambda item: item["req"]),
+        "unchecked": sorted(unchecked, key=lambda item: item["req"]),
+    }
+
+
+def verify_nodes(node_requirements, version_lookup):
+    return [
+        (node, check_requirement_lines(node_requirements[node], version_lookup))
+        for node in sorted(node_requirements)
+    ]
+
+
+def render_results(results):
+    output = []
+    for node, result in results:
+        for item in result["unsatisfied"]:
+            installed = item["installed"] or "missing"
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNSATISFIED node={node} req={item['req']} installed={installed}"
+            )
+        for item in result["unchecked"]:
+            output.append(
+                f"CUSTOM_NODE_PREREQ_UNCHECKED node={node} req={item['req']} "
+                f"reason={item['reason']} fatal={int(item['fatal'])}"
+            )
+        marker = "CUSTOM_NODE_PREREQ_PASSED"
+        if result["unsatisfied"] or any(item["fatal"] for item in result["unchecked"]):
+            marker = "CUSTOM_NODE_PREREQ_FAILED"
+        output.append(
+            f"{marker} node={node} checked={len(result['checked'])} "
+            f"unchecked={len(result['unchecked'])} unsatisfied={len(result['unsatisfied'])}"
+        )
+    checked = sum(len(result["checked"]) for _, result in results)
+    unchecked = sum(len(result["unchecked"]) for _, result in results)
+    unsatisfied = sum(len(result["unsatisfied"]) for _, result in results)
+    output.append(
+        f"CUSTOM_NODE_PREREQ_SUMMARY nodes={len(results)} checked={checked} "
+        f"unchecked={unchecked} unsatisfied={unsatisfied}"
+    )
+    return "\n".join(output)
+
+
+def results_ok(results):
+    return not any(
+        result["unsatisfied"]
+        or any(item["fatal"] for item in result["unchecked"])
+        for _, result in results
+    )
+""".strip()
+
+
+def _custom_node_verification_command(node_names: tuple[str, ...]) -> str:
+    """Build the uncached final-environment requirement verification layer."""
+    # This preserves the false-positive guarantee: every checkable requirement
+    # is compared with the installed distribution's version, so no requirement
+    # is left unsatisfied in the final environment.  Re-resolving the graph
+    # would only repeat work for installed candidates (already checked here) or
+    # require a network install, which this layer does not permit.  A cached
+    # install layer can only be absent or wrong-version, and this catches both.
+    command = 'python3 << "PYEOF"\n'
+    if not node_names:
+        return command + 'print("CUSTOM_NODE_PREREQ_VERIFY no_requirements")\nPYEOF\n'
+    command += (
+        'import importlib.metadata as metadata\n'
+        'import os\n'
+        'import re\n'
+        'import sys\n'
+        f'ROOT = {json.dumps("/root/comfy-build/custom_node_requirements")}\n'
+        f'NODES = {json.dumps(sorted(node_names))}\n'
+        + _CUSTOM_NODE_PREREQ_CHECK_PROGRAM
+        + '\n'
+        'results = verify_nodes(\n'
+        '    {node: open(os.path.join(ROOT, node, "requirements.txt"), encoding="utf-8").read().splitlines() for node in NODES},\n'
+        '    metadata.version,\n'
+        ')\n'
+        'print(render_results(results))\n'
+        'if not results_ok(results):\n'
+        '    raise SystemExit(1)\n'
+        'PYEOF\n'
+    )
+    return command
+
+
+def _add_custom_node_requirement_layers(
+    image: Any, requirements_root: str
+) -> tuple[Any, tuple[str, ...]]:
+    """Add one cached install layer per staged node."""
+    node_names = _staged_custom_node_requirement_names(requirements_root)
+    for node_name in node_names:
+        context_dir = os.path.join(requirements_root, node_name)
+        image = image.add_local_dir(
+            context_dir,
+            f"/root/comfy-build/custom_node_requirements/{node_name}",
+            copy=True,
+        ).run_commands(
+            _custom_node_install_command(
+                node_name,
+                _custom_node_requirement_context_hash(context_dir),
+            )
+        )
+
+    return image, node_names
+
+
+def _add_custom_node_verification_layer(
+    image: Any, node_names: tuple[str, ...]
+) -> Any:
+    """Add the forced check after all dependency/image layers are complete."""
+    # This is deliberately the final image layer.  It checks the assembled
+    # environment even when an earlier per-node install layer was cached,
+    # without forcing any expensive descendant layer to rebuild.
+    return image.run_commands(
+        _custom_node_verification_command(node_names),
+        force_build=True,
+    )
+
+
 # Only runs during local deploy. Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _image_base = _image_base.add_local_file(
         _CACHEDIT_LOCK_SRC,
         _CACHEDIT_LOCK_DST,
         copy=True,
-    ).add_local_dir(
-        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
-        "/root/comfy-build/custom_node_requirements",
-        copy=True,
-    ).run_commands(
+    )
+    _image_base = _image_base.run_commands(
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CUSTOM_NODE_PREREQ_INSTALL_START"; '
+        'echo "CUSTOM_NODE_PREREQ_CONTEXT_READY"'
+    )
+    _image_base, _V2_CUSTOM_NODE_REQUIREMENT_NAMES = _add_custom_node_requirement_layers(
+        _image_base,
+        _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+    )
+
+    # CacheDiT final family reinstall (after all custom-node reqs).
+    _image_base = _image_base.run_commands(
         '__ts_ms() { python3 -c "import time; print(int(time.time()*1000))"; }; '
-        '_lock="' + _CACHEDIT_LOCK_DST + '"; '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_START ts_ms=$(__ts_ms)"; '
-        '_total_req=0; _total_installed=0; _total_skipped=0; '
-        '_pip_node() { local d="$1"; '
-        '  local name; name=$(basename "$d"); '
-        '  [ -f "$d/requirements.txt" ] || { _total_skipped=$((_total_skipped+1)); return 0; }; '
-        '  _total_req=$((_total_req+1)); '
-        '  local t0; t0=$(__ts_ms); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name start_ts=$t0"; '
-        '  cd "$d" && python -m pip install --disable-pip-version-check --no-input -r requirements.txt -c "$_lock" --quiet || { echo "CUSTOM_NODE_PREREQ_PIP_FAILED name=$name"; return 1; }; '
-        '  local t1; t1=$(__ts_ms); '
-        '  local dur; dur=$((t1 - t0)); '
-        '  echo "CUSTOM_NODE_PREREQ_INSTALL_NODE name=$name end_ts=$t1 duration_ms=$dur"; '
-        '  _total_installed=$((_total_installed+1)); '
-        '}; '
-        'for d in /root/comfy-build/custom_node_requirements/*/; do '
-        '  _pip_node "$d" || exit 1; '
-        'done; '
-        '_end_ts=$(__ts_ms); '
-        'echo "CUSTOM_NODE_PREREQ_INSTALL_END ts_ms=$_end_ts total_nodes=$_total_req installed=$_total_installed skipped_no_req=$_total_skipped"; '
-        # CacheDiT final family reinstall (after all custom-node reqs)
+        f'_lock="{_CACHEDIT_LOCK_DST}"; '
+        'echo "CACHEDIT_LOCK_FAMILY_REINSTALL_START ts_ms=$(__ts_ms)"; '
         'echo "CACHEDIT_LOCK_FAMILY_ENSURE_START ts_ms=$(__ts_ms)"; '
-        'python -m pip install --disable-pip-version-check --no-input --no-deps -r "$_lock" --quiet || { echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
-        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"; '
-        # CacheDiT image-build import gate
-        # Override compiler cache envs to /tmp paths — the image env sets
-        # TORCHINDUCTOR_CACHE_DIR=/root/comfymodal_runtime_state/.inductor-cache,
-        # so imports during the gate would create content under the future
-        # volume mount point and cause "cannot mount volume on non-empty path".
+        'python -m pip install --disable-pip-version-check --no-input --no-deps '
+        '-r "$_lock" --quiet 2>&1 || '
+        '{ echo "CACHEDIT_LOCK_FAMILY_FAILED"; exit 1; }; '
+        'echo "CACHEDIT_LOCK_FAMILY_ENSURE_END ts_ms=$(__ts_ms)"'
+    )
+
+    # CacheDiT image-build import gate.  Override compiler cache envs to /tmp
+    # paths so the gate cannot populate the future volume mount point.
+    _image_base = _image_base.run_commands(
         'export TORCHINDUCTOR_CACHE_DIR=/tmp/build_gate_inductor_cache; '
         'export TRITON_CACHE_DIR=/tmp/build_gate_triton_cache; '
         'python3 << "PYEOF"\n'
@@ -7623,24 +8930,161 @@ if not _INSIDE_MODAL_CONTAINER:
         'PYEOF\n'
     )
 
-_STABLE_DEPENDENCY_IMAGE = _image_base
-_image_base = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
+def _build_canonical_accelerator_images(base: Any) -> tuple[Any, Any]:
+    """Build the canonical third-party and native accelerator image layers."""
+    # Canonical accelerator/native boundary.  These installs intentionally
+    # happen after the complete third-party environment: SageAttention's
+    # build imports torch/triton and fastsafetensors is required by the later
+    # direct-GPU loader.  There is no runtime/image descendant that is allowed
+    # to add these packages.
+    third_party = base.run_commands(
+        "python -m pip install --disable-pip-version-check --no-input "
+        "--upgrade --force-reinstall --no-deps 'comfy-kitchen==0.2.31'",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import importlib, importlib.metadata; "
+        "version = importlib.metadata.version('comfy-kitchen'); "
+        "assert version == '0.2.31', f'expected comfy-kitchen==0.2.31, got {version}'; "
+        "kitchen = importlib.import_module('comfy_kitchen'); "
+        "assert callable(getattr(kitchen, 'int8_attention', None)), "
+        "'comfy_kitchen.int8_attention is unavailable'; "
+        "available = getattr(kitchen, 'int8_attention_is_available', None); "
+        "assert callable(available), "
+        "'comfy_kitchen.int8_attention_is_available is unavailable'; "
+        "assert available(), 'comfy_kitchen INT8 attention is unavailable'; "
+        "print(f'comfy-kitchen {version}: int8_attention available')\"",
+        gpu="a10g",
+    )
+    accelerator = third_party.pip_install("fastsafetensors==0.3.3")
+    if env_flag("COMFYMODAL_V2_C9QD_EXTRAS"):
+        # Explicit diagnostic/benchmark opt-in; never part of the normal image.
+        accelerator = accelerator.pip_install("runai-model-streamer==0.16.1")
+    if env_flag("COMFYMODAL_TESTING8_INSTANTTENSOR"):
+        # TESTING8-only transport probe dependency; never enabled by production profiles.
+        accelerator = accelerator.pip_install("instanttensor")
+    accelerator = accelerator.run_commands(
+        "CXX_APPEND_FLAGS=-std=c++20 NVCC_APPEND_FLAGS=-std=c++20 "
+        "CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=12.0+PTX MAX_JOBS=4 "
+        "python -m pip install --upgrade --force-reinstall "
+        "git+https://github.com/thu-ml/SageAttention.git@v2.2.0 "
+        "--no-build-isolation --no-deps",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import pathlib, site; "
+        "site_root = next((p for p in site.getsitepackages() if 'site-packages' in p), site.getsitepackages()[0]); "
+        "files = list(pathlib.Path(site_root).joinpath('sageattention').rglob('*.so')); "
+        "print([f.name for f in files]); "
+        "assert any('_fused' in f.name for f in files), 'sageattention._fused was not built'; "
+        "assert any('_qattn_sm89' in f.name for f in files), "
+        "'SageAttention v2.2.0 native _qattn_sm89 family was not built'\"",
+        gpu="a10g",
+    ).run_commands(
+        "python -X utf8 -c \"import sageattention._fused; "
+        "from sageattention import sageattn; "
+        "assert callable(sageattn), 'public sageattn dispatcher is not callable'; "
+        "print('sageattention._fused and sageattention.sageattn ok')\"",
+        gpu="a10g",
+    )
+    return third_party, accelerator
 
-# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source copy (combined or per-node) GÃ¶Ã‡GÃ¶Ã‡
+
+if _PUBLISHER_ONLY:
+    # Do not even construct the accelerator image DAG for the publisher
+    # bootstrap; in particular this keeps SageAttention out of that deploy.
+    _THIRD_PARTY_DEPENDENCY_IMAGE = _image_base
+    _ACCELERATOR_NATIVE_IMAGE = _image_base
+else:
+    _THIRD_PARTY_DEPENDENCY_IMAGE, _ACCELERATOR_NATIVE_IMAGE = (
+        _build_canonical_accelerator_images(_image_base)
+    )
+
+
+def _add_explicit_diagnostic_dependencies(img: Any) -> Any:
+    """Add diagnostics only when explicitly requested at image build time."""
+    if env_flag("COMFYMODAL_V2_FULL_TRACE"):
+        return img.pip_install("viztracer==1.1.1")
+    return img
+
+
+if not _PUBLISHER_ONLY:
+    _ACCELERATOR_NATIVE_IMAGE = _add_explicit_diagnostic_dependencies(
+        _ACCELERATOR_NATIVE_IMAGE
+    )
+
+# Build-time configuration is isolated from both dependency and source
+# identities.  Modal requires env/build operations before local Python source;
+# this is the final config boundary and is consumed as a finished image.
+_STABLE_DEPENDENCY_IMAGE = _ACCELERATOR_NATIVE_IMAGE
+_LATE_CONFIG_IMAGE = _STABLE_DEPENDENCY_IMAGE.env(_V2_RUNTIME_ENV)
+_image_base = _LATE_CONFIG_IMAGE
+
+# GÃ¶Ã‡GÃ¶Ã‡ PART 3b: Custom-node source delivery (image or Volume) GÃ¶Ã‡GÃ¶Ã‡
 # Only runs during local deploy/image build.  Skipped inside remote Modal containers.
 if not _INSIDE_MODAL_CONTAINER:
     _syncable_node_names = _iter_syncable_custom_node_dirs(_LOCAL_CUSTOM_NODES)
     _cn_copy_layer_count = 0
-    if CUSTOM_NODE_COPY_MODE == "combined":
-        _image_base = _image_base.add_local_dir(
-            _LOCAL_CUSTOM_NODES,
-            "/root/comfy/ComfyUI/custom_nodes",
+    _custom_node_archive_path = None
+    _custom_node_archive_generation = None
+    # Verified ComfyModal duplicate worktrees/typo copies must never be baked
+    # into the image: ComfyUI would import them as extra custom nodes, inflating
+    # snapshot startup (2,398 registered nodes in the baseline).  The canonical
+    # filter above is the single source of truth for the duplicate set.
+    _duplicate_node_names = sorted(
+        name for name in os.listdir(_LOCAL_CUSTOM_NODES)
+        if _custom_node_filter_reason(
+            name, os.path.join(_LOCAL_CUSTOM_NODES, name)
+        ) in ("comfymodal_duplicate_worktree", "comfymodal_duplicate_typo")
+    ) if os.path.isdir(_LOCAL_CUSTOM_NODES) else []
+    if _duplicate_node_names:
+        _COMBINED_CUSTOM_NODE_IGNORE_PATTERNS.extend(
+            f"{_dup_name}/" for _dup_name in _duplicate_node_names
+        )
+        print(
+            f"[comfyapp] custom_node_filter: excluding ComfyModal duplicate dirs "
+            f"from image ({len(_duplicate_node_names)}): {_duplicate_node_names}"
+        )
+    if CUSTOM_NODE_DELIVERY == "volume":
+        print(
+            "[comfyapp] custom_node_delivery=volume; skipping custom-node source "
+            "add_local_dir (publisher Volume is the runtime source)"
+        )
+        # Modal cannot mount a Volume over the non-empty ComfyUI discovery
+        # directory.  Mount the Volume at the empty compatibility path and
+        # make ComfyUI resolve its normal import path to that mount in the
+        # built image; runtime code only verifies this link.
+        _image_base = _image_base.run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "ln -s /root/custom_nodes_vol /root/comfy/ComfyUI/custom_nodes"
+        )
+        print(
+            "[comfyapp] custom_node_delivery=volume; baked import-path symlink "
+            "/root/comfy/ComfyUI/custom_nodes -> /root/custom_nodes_vol"
+        )
+    elif CUSTOM_NODE_COPY_MODE == "combined":
+        _custom_node_archive_path, _custom_node_archive_generation = (
+            _prepare_custom_node_archive(_LOCAL_CUSTOM_NODES)
+        )
+        _custom_node_archive_name = os.path.basename(_custom_node_archive_path)
+        _custom_node_archive_destination = (
+            f"/root/comfy-build/{_custom_node_archive_name}"
+        )
+        _image_base = _image_base.add_local_file(
+            _custom_node_archive_path,
+            _custom_node_archive_destination,
             copy=True,
-            ignore=_COMBINED_CUSTOM_NODE_IGNORE_PATTERNS,
+        ).run_commands(
+            "rm -rf /root/comfy/ComfyUI/custom_nodes && "
+            "mkdir -p /root/comfy/ComfyUI/custom_nodes && "
+            f"tar --extract --gzip --no-same-owner --preserve-permissions "
+            f"--file {shlex.quote(_custom_node_archive_destination)} "
+            "--directory /root/comfy/ComfyUI/custom_nodes"
         )
         _cn_copy_layer_count = 1
-        print(f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} layers=1 "
-              f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes")
+        print(
+            f"[comfyapp] custom_node_copy_mode=combined nodes={len(_syncable_node_names)} "
+            f"layers=1 archive={_custom_node_archive_name} "
+            f"src={_LOCAL_CUSTOM_NODES} dst=/root/comfy/ComfyUI/custom_nodes"
+        )
     else:
         for _node_name in _syncable_node_names:
             _node_src = os.path.join(_LOCAL_CUSTOM_NODES, _node_name)
@@ -7680,7 +9124,11 @@ if not _INSIDE_MODAL_CONTAINER:
 
     try:
         _baked_manifest = build_custom_node_dependency_manifest(_LOCAL_CUSTOM_NODES)
-        _source_generation = custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        _source_generation = (
+            _custom_node_archive_generation
+            if _custom_node_archive_generation is not None
+            else custom_node_source_generation(_LOCAL_CUSTOM_NODES)
+        )
         _baked_manifest["production_custom_node_generation"] = _source_generation
         _maybe_write_baked_manifest(_BAKED_MANIFEST_TEMP, _baked_manifest)
         _baked_nodes = _baked_manifest.get("nodes", {})
@@ -7692,6 +9140,15 @@ if not _INSIDE_MODAL_CONTAINER:
         _staged_count = len(os.listdir(_staged_reqs)) if os.path.isdir(_staged_reqs) else 0
         print(f"[comfyapp] build-context: comfyapp_dir={_COMFYUI_MODAL_DIR}")
         print(f"[comfyapp] build-context: local_source={_LOCAL_CUSTOM_NODES}")
+        _root_resolution_diag = _local_custom_nodes_root_diagnostics()
+        print(
+            "[comfyapp] build-context: custom_nodes_root_resolution_method="
+            f"{_root_resolution_diag['custom_nodes_root_resolution_method']}"
+        )
+        print(
+            "[comfyapp] build-context: custom_nodes_root_candidates="
+            f"{_root_resolution_diag['custom_nodes_root_candidates']}"
+        )
         print(f"[comfyapp] build-context: local_syncable_nodes={_baked_node_count} "
               f"nodes_with_dep_files={_baked_with_deps}")
         if _baked_node_names:
@@ -7724,39 +9181,18 @@ if not _INSIDE_MODAL_CONTAINER:
                     _baked_manifest_for_diag = json.load(_f)
         except Exception:
             pass
-    _diagnose_custom_node_requirements_context(
-        _LOCAL_CUSTOM_NODES, _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR, _baked_manifest_for_diag
-    )
-    _diagnose_experiment_harness_context()
+    if env_flag("COMFYMODAL_BUILD_CONTEXT_DIAGNOSTICS"):
+        run_custom_node_build_diagnostics(
+            _LOCAL_CUSTOM_NODES,
+            _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR,
+            _baked_manifest_for_diag,
+        )
 
     _image_base = _image_base.add_local_file(
         _BAKED_MANIFEST_TEMP,
         "/opt/comfymodal/custom_node_deps_baked.json",
         copy=True,
     )
-
-_GPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "optimizations",
-    "worker_control",
-)
-
-_CPU_COMFYMODAL_PYTHON_SOURCES = (
-    "gpu_catalog",
-    "timing_trace",
-    "wall_clock_trace_v3",
-    "profiler_trace_v4",
-    "api_prompt_validator",
-    "failure_summary",
-    "production_workflow",
-    "worker_control",
-)
 
 _COMFYAPP_SOURCE = Path(__file__).read_text(encoding="utf-8-sig")
 _COMFYMODAL_INCLUDE_SOURCE = False
@@ -7768,50 +9204,258 @@ _GPU_SOURCE_BYTES = sum(
 _APP_SOURCE_BYTES = os.path.getsize(__file__)
 
 def _add_gpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _GPU_COMFYMODAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_cpu_python_sources(img):
-    img = img.add_local_python_source("comfyapp", copy=True)
-    img = img.add_local_file(__file__, "/root/comfyapp.py", copy=True)
-    for _module_name in _CPU_COMFYMODAL_PYTHON_SOURCES:
-        img = img.add_local_python_source(_module_name, copy=True)
-    return img
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
 def _add_comfymodal_local_python_sources(img):
-    """Legacy wrapper: includes all CPU sources + optimizations + comfymodal_runtime."""
-    img = _add_cpu_python_sources(img)
-    img = img.add_local_python_source("optimizations", copy=True)
-    img = img.add_local_python_source("comfymodal_runtime", copy=True)
-    return img
+    """Mount the consolidated first-party source tree for lightweight images."""
+    return img.add_local_dir(
+        _FIRST_PARTY_SOURCE_STAGING_DIR,
+        "/root",
+        copy=True,
+    )
 
 
-image = _add_gpu_python_sources(_image_base).add_local_python_source("comfymodal_runtime", copy=True)
+@dataclass(frozen=True)
+class CanonicalImagePlan:
+    """The sole owner of the deploy image DAG and its identity boundaries."""
+
+    foundation: Any
+    third_party_dependency_environment: Any
+    accelerator_native_packages: Any
+    late_config: Any
+    source: Any
+    source_identity: Any
+    identity: Any
+
+    @property
+    def final_image(self) -> Any:
+        return self.source
+
+
+_CANONICAL_PLAN_METADATA_ENV = "COMFYMODAL_CANONICAL_IMAGE_PLAN"
+_CANONICAL_PLAN_METADATA_PATH_ENV = "COMFYMODAL_CANONICAL_IMAGE_PLAN_PATH"
+_CANONICAL_PLAN_METADATA_IMAGE_PATH = "/opt/comfymodal/canonical_image_plan.json"
+# Keep the generated handoff outside the Modal source tree.  Modal snapshots
+# local-file sources before/while importing this module; rewriting a file under
+# ``.baked_custom_node_deps`` during that lifecycle makes the deploy fail even
+# when the serialized identities are unchanged.  The destination inside the
+# image remains the stable runtime metadata path below.
+_CANONICAL_PLAN_METADATA_HOST_PATH = os.path.join(
+    tempfile.gettempdir(),
+    f"comfymodal-canonical-image-plan-{os.getpid()}.json",
+)
+
+
+def _persist_canonical_plan_metadata(source_identity: Any, identity: Any) -> None:
+    """Persist the typed image-plan identities for the local image build."""
+    if _INSIDE_MODAL_CONTAINER:
+        return
+    metadata_path = Path(_CANONICAL_PLAN_METADATA_HOST_PATH)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = json.dumps(
+        {
+            "source_identity": source_identity.to_dict(),
+            "canonical_identity": identity.to_dict(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if not metadata_path.is_file() or metadata_path.read_text(encoding="utf-8") != metadata:
+        metadata_path.write_text(metadata, encoding="utf-8")
+
+
+def _load_persisted_canonical_plan_metadata() -> tuple[Any, Any] | None:
+    """Read the typed plan record baked into the runtime image."""
+    raw = os.environ.get(_CANONICAL_PLAN_METADATA_ENV, "").strip()
+    if not raw:
+        metadata_path = os.environ.get(_CANONICAL_PLAN_METADATA_PATH_ENV, "").strip()
+        if not metadata_path:
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                raw = metadata_file.read().strip()
+        except OSError as exc:
+            raise RuntimeError(
+                f"invalid persisted canonical image-plan metadata: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not raw:
+            raise RuntimeError(
+                "invalid persisted canonical image-plan metadata: metadata file is empty"
+            )
+    from comfymodal_runtime.deployment_spec import (
+        CanonicalBoundaryIdentity,
+        deployment_identity_from_dict,
+    )
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("plan metadata is not an object")
+        return (
+            deployment_identity_from_dict(payload["source_identity"]),
+            CanonicalBoundaryIdentity.from_dict(payload["canonical_identity"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"invalid persisted canonical image-plan metadata: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def build_canonical_image_plan() -> CanonicalImagePlan:
+    """Return the finished image and typed identities for every boundary."""
+    from comfymodal_runtime.deployment_spec import (
+        build_canonical_boundary_identity,
+        build_deployment_identity,
+        validate_canonical_boundary_identity,
+    )
+
+    persisted = _load_persisted_canonical_plan_metadata() if _INSIDE_MODAL_CONTAINER else None
+    if persisted is not None:
+        source_identity, identity = persisted
+    else:
+        dependency_context = _compute_deterministic_context_hash(
+            _LOCAL_CUSTOM_NODE_REQUIREMENTS_DIR
+        )
+        if not dependency_context.get("context_hash"):
+            raise RuntimeError("canonical dependency identity unavailable")
+        source_identity = build_deployment_identity(
+            runtime_root=Path(__file__).resolve().parent / "comfymodal_runtime",
+            dependency_hash=_build_v2_dependency_cache_identity(
+                dependency_context["context_hash"]
+            ).get("dependency_key", ""),
+        )
+        if (
+            source_identity.source_bytes <= 0
+            or not source_identity.dependency_hash
+        ):
+            raise RuntimeError(
+                "canonical source identity incomplete: runtime/custom-node/dependency source is missing"
+            )
+
+        identity = build_canonical_boundary_identity(
+            source_identity=source_identity,
+            foundation_inputs={
+                "image": "nvidia/cuda:13.0.0-devel-ubuntu24.04",
+                "python": "3.11",
+                "comfyui_commit": _COMFYUI_PINNED_COMMIT,
+            },
+            dependency_inputs={
+                "context_hash": dependency_context["context_hash"],
+                "cachedit_lock": _sha256_file_canonical(_CACHEDIT_LOCK_SRC),
+                "installer": _V2_DEPENDENCY_INSTALLER_VERSION,
+            },
+            accelerator_inputs={
+                "fastsafetensors": "0.3.3",
+                "sageattention": "v2.2.0",
+                "triton": "3.x",
+                "c9_extras": env_flag("COMFYMODAL_V2_C9QD_EXTRAS"),
+            },
+            late_config_inputs=dict(_V2_RUNTIME_ENV),
+        )
+        validate_canonical_boundary_identity(identity)
+        source_identity = source_identity.with_deployment_hash(identity.deployment)
+
+    validate_canonical_boundary_identity(identity)
+    _persist_canonical_plan_metadata(source_identity, identity)
+    # ``_image_base`` is now the post-custom-node-source boundary.  Start the
+    # final source additions there so the canonical plan does not accidentally
+    # drop the published custom-node tree.
+    source = _add_gpu_python_sources(_image_base)
+    if not _INSIDE_MODAL_CONTAINER:
+        source = source.add_local_file(
+            _CANONICAL_PLAN_METADATA_HOST_PATH,
+            _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+            copy=True,
+        ).env({
+            _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        })
+        # Build-time only.  This layer needs the per-node requirement names bound
+        # above, which exist solely on the local deploy path.  Inside a Modal
+        # container the image is already built, so referencing the name here
+        # raised NameError and broke container startup.
+        source = _add_custom_node_verification_layer(
+            source, _V2_CUSTOM_NODE_REQUIREMENT_NAMES
+        )
+    return CanonicalImagePlan(
+        foundation=_FOUNDATION_IMAGE,
+        third_party_dependency_environment=_THIRD_PARTY_DEPENDENCY_IMAGE,
+        accelerator_native_packages=_ACCELERATOR_NATIVE_IMAGE,
+        late_config=_LATE_CONFIG_IMAGE,
+        source=source,
+        source_identity=source_identity,
+        identity=identity,
+    )
+
+
+if _PUBLISHER_ONLY:
+    # The publisher only needs Python/tar handling plus the existing volume;
+    # canonical image identities and accelerator metadata are GPU-deploy
+    # concerns and are deliberately not created for this control-plane path.
+    CANONICAL_IMAGE_PLAN = None
+    publisher_image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ).env({"COMFYMODAL_PUBLISHER_ONLY": "1"})
+    image = publisher_image
+elif _INSIDE_MODAL_CONTAINER:
+    # Runtime containers already have their deploy image. Rebuilding the host
+    # dependency identity during module import breaks lightweight functions.
+    CANONICAL_IMAGE_PLAN = None
+    image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    )
+    publisher_image = image
+else:
+    CANONICAL_IMAGE_PLAN = build_canonical_image_plan()
+    image = CANONICAL_IMAGE_PLAN.final_image
+    publisher_image = _add_comfymodal_local_python_sources(
+        modal.Image.debian_slim(python_version="3.11")
+    ).add_local_file(
+        _CANONICAL_PLAN_METADATA_HOST_PATH,
+        _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        copy=True,
+    ).env({
+        _CANONICAL_PLAN_METADATA_PATH_ENV: _CANONICAL_PLAN_METADATA_IMAGE_PATH,
+        "COMFYMODAL_PUBLISHER_ONLY": "1",
+    })
 
 download_image = _add_cpu_python_sources(
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("httpx>=0.27.0")
-).add_local_python_source("comfymodal_runtime", copy=True)
+)
 
 app = modal.App(APP_NAME, image=image, include_source=False)
-vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+_E16_READ_ONLY_VOLUME_LOOKUP = os.environ.get(
+    "COMFYMODAL_E16_SOURCE_BENCHMARK", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+_VOLUME_CREATE_IF_MISSING = not _E16_READ_ONLY_VOLUME_LOOKUP
+vol = modal.Volume.from_name(
+    VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
+)
 # P2: dedicated prompt-encoding cache volume. Independent of the
 # models and custom-nodes volumes so a bundle change cannot perturb
 # either.  ``create_if_missing=True`` is required so the very first
 # deploy creates the empty volume.
 prompt_cache_vol = modal.Volume.from_name(
-    PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
+    PROMPT_CACHE_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
 )
 # Runtime configuration and control state volume.  Never holds model
 # weights.  Always mounted alongside models/custom-nodes on GPU so
 # snapshot creation/restore see the same volume layout.
 runtime_config_vol = modal.Volume.from_name(
-    RUNTIME_CONFIG_VOLUME_NAME, create_if_missing=True
+    RUNTIME_CONFIG_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
 )
 
 
@@ -7837,7 +9481,9 @@ def _build_gpu_volumes() -> dict:
     if env_flag("COMFYMODAL_PERSISTENT_CLIP_CACHE"):
         base[PROMPT_CACHE_VOLUME_PATH] = prompt_cache_vol
     return base
-custom_nodes_vol = modal.Volume.from_name(CUSTOM_NODES_VOLUME_NAME, create_if_missing=True)
+custom_nodes_vol = modal.Volume.from_name(
+    CUSTOM_NODES_VOLUME_NAME, create_if_missing=_VOLUME_CREATE_IF_MISSING
+)
 
 
 def _ensure_url_scheme(url: str) -> str:
@@ -8019,12 +9665,13 @@ def _validate_safe_tar_member(member, staging_dir: str) -> None:
 
 
 @app.function(
-    image=_add_comfymodal_local_python_sources(
-        modal.Image.debian_slim(python_version="3.11")
-    ),
+    image=publisher_image,
     cpu=2,
     memory=4096,
     timeout=1800,
+    # The shared Volume has one publication authority.  Keep this function
+    # single-writer even when callers come from different hosts/routes.
+    max_containers=1,
     volumes={CUSTOM_NODES_PATH: custom_nodes_vol},
 )
 def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
@@ -8033,12 +9680,15 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
     import io
     import os
     import shutil
+    import tempfile
 
-    staging_dir = os.path.join(CUSTOM_NODES_PATH, ".staging")
-
-    # Clean any leftover staging dir (safe regardless of type)
-    _safe_remove_path(staging_dir)
-    os.makedirs(staging_dir)
+    # Stage on the container's ephemeral filesystem, not under the published
+    # tree.  The name is unique per invocation, so a bypassed platform gate
+    # cannot make one invocation delete or extract into another's staging.
+    staging_dir = tempfile.mkdtemp(
+        prefix="comfyui-custom-nodes-",
+        dir="/tmp",
+    )
 
     # Extract to staging with path traversal and symlink protection.
     # NOTE: old content is NOT removed until the new archive has been
@@ -8059,28 +9709,27 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         raise
 
     # GÃ¶Ã‡GÃ¶Ã‡ Old content removal (only after new archive is in staging) GÃ¶Ã‡GÃ¶Ã‡
-    _staging_name = os.path.basename(staging_dir)
-    for item in os.listdir(CUSTOM_NODES_PATH):
-        if item == _staging_name:
-            continue
-        if item == ".comfymodal_control":
-            continue
-        item_path = os.path.join(CUSTOM_NODES_PATH, item)
-        if os.path.islink(item_path):
-            os.unlink(item_path)
-        elif os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-        else:
-            os.remove(item_path)
+    try:
+        for item in os.listdir(CUSTOM_NODES_PATH):
+            if item == ".comfymodal_control":
+                continue
+            item_path = os.path.join(CUSTOM_NODES_PATH, item)
+            if os.path.islink(item_path):
+                os.unlink(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
 
-    # Move extracted items from staging to volume root
-    for item in os.listdir(staging_dir):
-        src = os.path.join(staging_dir, item)
-        dst = os.path.join(CUSTOM_NODES_PATH, item)
-        shutil.move(src, dst)
-
-    # Clean up staging
-    _safe_remove_path(staging_dir)
+        # Move extracted items from staging to volume root.  Cleanup is in a
+        # finally block so partial moves and all later failure paths cannot
+        # leave an invocation's staging directory behind.
+        for item in os.listdir(staging_dir):
+            src = os.path.join(staging_dir, item)
+            dst = os.path.join(CUSTOM_NODES_PATH, item)
+            shutil.move(src, dst)
+    finally:
+        _safe_remove_path(staging_dir)
 
     # P3 (corrected): Write the generation record BEFORE committing,
     # so the custom-node contents AND the generation record are part
@@ -8092,17 +9741,71 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         # random UUID here would break that identity after every local
         # archive sync even when nothing changed.
         _cn_gen_value = ""
+        _gen_failure_reason = ""
         try:
             _cn_gen_value = custom_node_source_generation(CUSTOM_NODES_PATH)
         except Exception as _gen_exc:
-            print(f"[comfyapp.sync_custom_nodes_to_volume] generation compute failed: {_gen_exc!r}")
+            # Surface enough detail to diagnose the failure, while keeping the
+            # returned diagnostic bounded and redacting credential-shaped
+            # values that may appear in filesystem/configuration errors.
+            try:
+                _gen_exc_detail = str(_gen_exc)
+            except Exception:
+                _gen_exc_detail = "<unavailable>"
+            _gen_exc_detail = re.sub(
+                r"(?i)(\b(?:authorization|bearer|password|passwd|token|secret|"
+                r"api[-_ ]?key|credential)\b\s*[:=]\s*)[^\s,;]+",
+                r"\1<redacted>",
+                _gen_exc_detail,
+            )
+            _gen_exc_detail = re.sub(
+                r"(?i)\b(?:modal[-_ ]?(?:token|secret)|"
+                r"(?:api|access|session)[-_ ]?(?:key|token|secret)|"
+                r"(?:token|secret|password|credential))[-_:][^\s,;]+",
+                "<redacted>",
+                _gen_exc_detail,
+            )[:256]
+            _gen_failure_reason = (
+                "custom_node_source_generation raised "
+                f"{type(_gen_exc).__name__}: {_gen_exc_detail}"
+            )
+        else:
+            if not isinstance(_cn_gen_value, str):
+                _gen_failure_reason = (
+                    "custom_node_source_generation returned invalid "
+                    f"{type(_cn_gen_value).__name__} content_generation"
+                )
+            elif not _cn_gen_value.strip():
+                _gen_failure_reason = (
+                    "custom_node_source_generation returned empty content_generation"
+                )
+
+        if _gen_failure_reason:
+            _gen_error = (
+                "generation_computation_failed: "
+                f"comfyapp_version={COMFYAPP_VERSION}; "
+                f"reason={_gen_failure_reason}"
+            )
+            print(
+                "[comfyapp.sync_custom_nodes_to_volume] "
+                f"{_gen_error}"
+            )
+            # The extracted tree is intentionally left uncommitted.  Without
+            # a canonical content generation there is no safe publication
+            # record to commit alongside it.
+            return {
+                "status": "error",
+                "comfyapp_version": COMFYAPP_VERSION,
+                "error": _gen_error,
+                "generation_failure_reason": _gen_failure_reason,
+            }
         _cn_gen = _write_custom_nodes_generation_record_no_commit(
             reason="post_sync_custom_nodes_to_volume",
-            generation=_cn_gen_value or None,
+            content_generation=_cn_gen_value,
         )
         print(
             f"[comfyapp.sync_custom_nodes_to_volume] advanced custom_nodes_generation="
-            f"{( _cn_gen.get('generation', '') or '')[:12]}"
+            f"{( _cn_gen.get('content_generation', '') or '')[:12]}"
         )
     except Exception as _cn_gen_exc:
         print(f"[comfyapp.sync_custom_nodes_to_volume] generation record write failed: {_cn_gen_exc!r}")
@@ -8123,7 +9826,17 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
         if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))
     ) if os.path.isdir(CUSTOM_NODES_PATH) else []
     print(f"[comfyapp] sync_custom_nodes_to_volume extracted syncable_nodes={len(nodes)} raw_dirs={len(raw_dirs)}")
-    return {"status": "ok", "nodes": nodes, "raw_dirs": raw_dirs}
+    return {
+        "status": "ok",
+        "comfyapp_version": COMFYAPP_VERSION,
+        "nodes": nodes,
+        "raw_dirs": raw_dirs,
+        # This is the value written before the commit, not a host-derived
+        # guess.  The publisher uses it to distinguish a successful remote
+        # write from a host-side generation-record readback failure.
+        "content_generation": _cn_gen.get("content_generation", ""),
+        "generation_record_path": CUSTOM_NODES_GENERATION_CONTROL_PATH,
+    }
 
 
 @app.function(
@@ -9832,9 +11545,11 @@ class _ComfyAPIMixin:
         # 1. Validate API prompt structure
         assert_valid_api_prompt_structure(workflow)
 
-        # 2. Sync custom nodes from volume
+        # 2. Custom nodes: manual publication only (no Volume/filesystem touch).
+        # Custom-node publication is manual. The deployed/snapshotted runtime uses
+        # the nodes already present; never sync from the Volume on the request path.
         _cn_start = time.time()
-        summary, state = self._sync_custom_nodes_from_volume()
+        summary = {"created": [], "removed": [], "kept": [], "blocked": [], "skipped": True, "skip_reason": "manual_publication"}
         _cn_created = summary.get("created", [])
         _cn_sync_ms = round((time.time() - _cn_start) * 1000, 1)
 
@@ -9857,7 +11572,7 @@ class _ComfyAPIMixin:
             _baked_mft_pre = load_baked_custom_node_dependency_manifest()
             _cn_fp_pre = _baked_mft_pre if _baked_mft_pre else None
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
-            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+            _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
             _manifest_snapshot = _load_dependency_manifest()
             _manifest_load_ms = round((time.time() - _dep_t0) * 1000, 2)
             _chk_t0 = time.time()
@@ -10059,7 +11774,7 @@ class _ComfyAPIMixin:
             _cn_gen_rec_pre = _read_custom_nodes_generation_record()
             _custom_node_generation_read_ms = round((time.time() - _cngr_t0) * 1000, 2)
 
-            _cn_gen_pre = _cn_gen_rec_pre.get("generation", "") if _cn_gen_rec_pre else ""
+            _cn_gen_pre = _cn_gen_rec_pre.get("content_generation", "") if _cn_gen_rec_pre else ""
 
             # 2a. Load persisted manifest (timed)
             _ml_t0 = time.time()
@@ -10589,7 +12304,7 @@ class _ComfyAPIMixin:
             try:
                 _cn_gen_rec = _read_custom_nodes_generation_record()
                 _cn_gen_now = (
-                    (_cn_gen_rec or {}).get("generation", "")
+                    (_cn_gen_rec or {}).get("content_generation", "")
                     if _cn_gen_rec else ""
                 )
                 if (
@@ -10625,7 +12340,7 @@ class _ComfyAPIMixin:
                 # the current value even on memoized-hit paths.
                 try:
                     _gen_rec_memo = _read_custom_nodes_generation_record()
-                    _gen_now_memo = (_gen_rec_memo or {}).get("generation", "") if _gen_rec_memo else ""
+                    _gen_now_memo = (_gen_rec_memo or {}).get("content_generation", "") if _gen_rec_memo else ""
                     if _gen_now_memo:
                         self._custom_nodes_generation_seen = _gen_now_memo
                 except Exception:
@@ -10644,75 +12359,81 @@ class _ComfyAPIMixin:
                 )
                 return _sanitized
 
-        # Step 2: Volume state changed GÃ‡Ã¶ compute full content fingerprint
-        current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
-        current_fp_hash = custom_node_source_generation(
-            CUSTOM_NODES_PATH, fingerprint=current_fp
-        )
+        # Step 2: Content change detection without re-hashing the volume.
+        # Re-fingerprinting every source file of every custom node over the
+        # (cold) volume mount cost ~86s per fresh-container boot while the
+        # sync below is an idempotent symlink pass (~3s).  The persisted
+        # generation record is content-derived and maintained by the local
+        # volume sync / image build, so a fresh container (no prior
+        # in-process fingerprint) does not need to re-hash content at all.
+        # The in-process fingerprint comparison is kept only for warm-cache
+        # repeat calls within the same container session.
         last_fp = getattr(self, "_last_custom_node_source_fingerprint", None)
+        if last_fp is not None:
+            current_fp = custom_node_source_fingerprint(CUSTOM_NODES_PATH)
+            if last_fp == current_fp:
+                node_count_fp = len(current_fp.get("nodes", []))
+                print(
+                    f"[comfyapp] custom_node_sync_skipped reason=source_fingerprint_unchanged "
+                    f"nodes={node_count_fp}"
+                )
+                _result = (
+                    {
+                        "created": [],
+                        "removed": [],
+                        "kept": [],
+                        "blocked": [],
+                        "skipped": True,
+                        "skip_reason": "source_fingerprint_unchanged",
+                    },
+                    cheap_state,
+                )
+                self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
+                # Sync the cached generation from the reloaded volume so
+                # observe_generations reflects current state even when the
+                # source fingerprint is unchanged across lifecycle boundaries.
+                try:
+                    _gen_rec_skip = _read_custom_nodes_generation_record()
+                    _gen_now_skip = (_gen_rec_skip or {}).get("content_generation", "") if _gen_rec_skip else ""
+                    if _gen_now_skip:
+                        self._custom_nodes_generation_seen = _gen_now_skip
+                except Exception:
+                    pass
+                return _result
 
-        if last_fp is not None and last_fp == current_fp:
-            node_count_fp = len(current_fp.get("nodes", []))
-            print(
-                f"[comfyapp] custom_node_sync_skipped reason=source_fingerprint_unchanged "
-                f"nodes={node_count_fp}"
-            )
-            _result = (
-                {
-                    "created": [],
-                    "removed": [],
-                    "kept": [],
-                    "blocked": [],
-                    "skipped": True,
-                    "skip_reason": "source_fingerprint_unchanged",
-                },
-                cheap_state,
-            )
-            self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
-            # Sync the cached generation from the reloaded volume so
-            # observe_generations reflects current state even when the
-            # source fingerprint is unchanged across lifecycle boundaries.
-            try:
-                _gen_rec_skip = _read_custom_nodes_generation_record()
-                _gen_now_skip = (_gen_rec_skip or {}).get("generation", "") if _gen_rec_skip else ""
-                if _gen_now_skip:
-                    self._custom_nodes_generation_seen = _gen_now_skip
-            except Exception:
-                pass
-            return _result
-
-        # Step 3: Content actually changed GÃ‡Ã¶ run the real sync
+        # Step 3: Run the idempotent sync (no content fingerprint on a
+        # fresh container).
         summary = sync_custom_nodes_into_comfy(CUSTOM_NODES_PATH, comfy_custom_nodes, include_state=True)
         state = summary.pop("state", cheap_state)
-        node_count_fp = len(current_fp.get("nodes", []))
+        node_count = len(state)
         print(
-            f"[comfyapp] custom_node_sync_ran reason=source_fingerprint_changed "
-            f"nodes={node_count_fp}"
+            f"[comfyapp] custom_node_sync_ran reason=volume_managed "
+            f"nodes={node_count}"
         )
-        self._last_custom_node_source_fingerprint = current_fp
+        if last_fp is not None:
+            self._last_custom_node_source_fingerprint = current_fp
         _result = (summary, state)
         self._validation_cache.set("custom_node_sync", _result, fingerprint=cheap_hash)
-        # Record the generation so the fast path works on subsequent calls
-        # within the same container session.
-        # V2 actual-sync branch: when no generation record exists yet
-        # (e.g. first sync after a v2 restore), create one atomically
-        # so downstream identity consumers see a non-empty value.
-        # Uses the content-derived ``current_fp_hash`` (MD5 of the synced
-        # custom-node source fingerprint) as the generation so that
+        # Record the generation so identity consumers see a stable value.
+        # The record is content-derived and maintained by the local volume
+        # sync / image build; never rewrite an existing record here (the
+        # previous rewrite-if-different recomputed the full content
+        # fingerprint on every fresh container, the dominant cost of the
+        # slow snapshot startup).  Only when the record is missing (fresh
+        # volume) is the content generation computed once and persisted
+        # atomically, with a deterministic content-derived value so
         # concurrent containers syncing identical content converge on the
-        # same persisted value.  The atomic ``os.replace`` inside the
-        # write helper resolves any race, but with an identical generation
-        # the race is harmless by construction.
+        # same generation.
         try:
             _gen_rec = _read_custom_nodes_generation_record()
-            _gen_now = (_gen_rec or {}).get("generation", "") if _gen_rec else ""
+            _gen_now = (_gen_rec or {}).get("content_generation", "") if _gen_rec else ""
             if not _gen_now:
-                _gen_rec = _write_custom_nodes_generation_record_no_commit(
+                _gen_now = custom_node_source_generation(CUSTOM_NODES_PATH)
+                _write_custom_nodes_generation_record_no_commit(
                     reason="actual_sync_created",
-                    generation=current_fp_hash,
+                    content_generation=_gen_now,
                 )
                 custom_nodes_vol.commit()
-                _gen_now = current_fp_hash
             if _gen_now:
                 self._custom_nodes_generation_seen = _gen_now
         except Exception:
@@ -11364,11 +13085,11 @@ class _ComfyAPIMixin:
 
                 def _load_one(path: str, filename: str, cache_key: str, role: str = "unknown") -> tuple[str, str, object, object | None, float, int, dict]:
                     # Map role to restore-specific owner label.
-                    _role_owner = {
-                        "clip": "restore_clip_loader",
-                        "unet": "restore_background_unet",
-                        "vae": "restore_vae_loader",
-                    }.get(role, "restore_preload")
+                    # E40 Lane D: canonical semantic owner identity for
+                    # restore-time model reads. Consumers (physical-read
+                    # coordinator + request preflight) join on the SAME name,
+                    # so every producer role must resolve into this map.
+                    _role_owner = RESTORE_ROLE_OWNER_MAP.get(role, "restore_preload")
                     started = time.time()
                     # ── Signal worker started from actual loader context ──
                     _worker_started_ns = time.perf_counter_ns()
@@ -12422,6 +14143,19 @@ class _ComfyAPIMixin:
         def _production_unet_worker():
             import nodes as _prod_nodes
             _thread_start_ns = time.perf_counter_ns()
+            # ── E29: canonical ledger production-UNET worker first instruction ──
+            try:
+                from comfymodal_runtime.critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "unet_worker_first_instruction",
+                    metadata={
+                        "request_id": "",
+                        "worker": "production_unet_worker",
+                        "unet_identity_hash": _canonical_key_str[:16],
+                    },
+                )
+            except Exception:
+                pass
             try:
                 self._record_critical_path_restore(
                     "production_unet_thread_start",
@@ -13562,894 +15296,6 @@ class _ComfyAPIMixin:
         print(f"[actual_load] actual_load_submit_order={result.get('actual_load_submit_order', [])} resolved_keys={resolved_keys}")
         return result
 
-    def _cold_unet_early_actual_load(self, workflow: dict, modal_options: dict | None = None) -> dict:
-        _cl_t0 = time.time()
-        result = {
-            "enabled": False, "submitted": False, "skipped": False,
-            "status": "not_started", "submit_ts": 0, "worker_start_ts": 0,
-            "file_read_start_ts": 0, "file_read_end_ts": 0, "done_ts": 0,
-            "error": "", "path": "", "size_gb": 0.0,
-            "cpu_cache_hit": False, "duplicate_prevented": False,
-            "graph_wait_ms": 0.0, "overlap_ms": 0.0,
-            "estimated_critical_path_saved_ms": 0.0,
-            "remaining_critical_path_wait_ms": 0.0,
-            "volume_read_ms": 0.0, "volume_read_gbps": 0.0,
-            "volume_stall_detected": False, "aborted": False, "abort_reason": "",
-        }
-        # Per-request runtime options from modal_options (benchmark preset injection)
-        _req_runtime = (modal_options or {}).get("runtime", {}) if isinstance(modal_options, dict) else {}
-        _req_cuel = _req_runtime.get("cold_unet_early_load", {}) if isinstance(_req_runtime, dict) else {}
-        # Resolve effective flags: request-level overrides module-level env defaults
-        _eff_enabled = _req_cuel.get("enabled", COLD_UNET_EARLY_LOAD)
-        _eff_mode = _req_cuel.get("mode", COLD_UNET_EARLY_LOAD_MODE)
-        _eff_debug = _req_cuel.get("debug", COLD_UNET_DEBUG)
-        _eff_disable_stall = _req_cuel.get("disable_on_volume_stall", COLD_UNET_DISABLE_ON_VOLUME_STALL)
-        _eff_max_gb = _req_cuel.get("max_file_gb", COLD_UNET_MAX_FILE_GB)
-        _eff_require_cpu = _req_cuel.get("require_cpu_cache_hit", COLD_UNET_REQUIRE_CPU_CACHE_HIT)
-        if not _eff_enabled:
-            return result
-        if _eff_mode not in ("actual_load", "restore_preload", "restore_direct"):
-            if _eff_debug:
-                print(f"[cold_unet_early_load] unknown mode={_eff_mode}")
-            return result
-        result["enabled"] = True
-        result["mode"] = _eff_mode
-        # Volume-stall guard
-        if _eff_disable_stall and getattr(self, "_volume_stall_degraded_mode", False):
-            result["skipped"] = True
-            result["status"] = "aborted_volume_stall"
-            result["aborted"] = True
-            result["abort_reason"] = "volume_stall_degraded_mode"
-            print(f"[cold_unet_early_load] aborted volume_stall=1 mode={_eff_mode}")
-            return result
-        if _eff_disable_stall and getattr(self, "_preload_failed", False):
-            result["skipped"] = True
-            result["status"] = "aborted_preload_failed"
-            result["aborted"] = True
-            result["abort_reason"] = "preload_failed"
-            print(f"[cold_unet_early_load] aborted preload_failed=1")
-            return result
-        # Extract UNET from workflow
-        import folder_paths as _cl_fp
-        unet_names = []
-        for _cl_node in workflow.values():
-            if not isinstance(_cl_node, dict):
-                continue
-            _cl_ct = _cl_node.get("class_type", "")
-            _cl_inp = _cl_node.get("inputs", {})
-            if not isinstance(_cl_inp, dict):
-                continue
-            if _cl_ct == "UNETLoader":
-                _cl_v = _cl_inp.get("unet_name")
-                if isinstance(_cl_v, str) and _cl_v and _cl_v not in unet_names:
-                    unet_names.append(_cl_v)
-            elif _cl_ct in ("CheckpointLoaderSimple", "CheckpointLoader"):
-                _cl_v = _cl_inp.get("ckpt_name")
-                if isinstance(_cl_v, str) and _cl_v and _cl_v not in unet_names:
-                    unet_names.append(_cl_v)
-        if not unet_names:
-            result["skipped"] = True
-            result["status"] = "no_unet_in_workflow"
-            print(f"[cold_unet_early_load] no UNET in workflow")
-            return result
-        unet_name = unet_names[0]
-        unet_path = _cl_fp.get_full_path("unet", unet_name) or unet_name
-        if not unet_path:
-            result["skipped"] = True
-            result["status"] = "unet_path_not_found"
-            print(f"[cold_unet_early_load] path not found for {unet_name}")
-            return result
-        import os as _cl_os
-        try:
-            unet_real = _cl_os.path.realpath(unet_path)
-        except Exception:
-            unet_real = unet_path
-        # Size guard
-        try:
-            _cl_size_bytes = _cl_os.path.getsize(unet_real)
-            _cl_size_gb = _cl_size_bytes / (1024**3)
-        except Exception:
-            _cl_size_gb = 0.0
-        result["path"] = unet_real
-        result["size_gb"] = round(_cl_size_gb, 3)
-        if _cl_size_gb > _eff_max_gb:
-            result["skipped"] = True
-            result["status"] = f"exceeds_max_file_gb={_eff_max_gb}"
-            print(f"[cold_unet_early_load] skipped size={_cl_size_gb:.2f}GB > max={_eff_max_gb}GB")
-            return result
-        _cl_key = (unet_real, "default")
-        # Use graph-loader-compatible key so the active-read registry matches
-        # what _check_active_model_read / _model_cpu_cache_key produce.
-        _graph_key = _model_cpu_cache_key(unet_real)
-        # Check active-read registry for duplicate using graph-loader key format
-        _existing = _check_active_model_read(_graph_key)
-        if _existing is not None:
-            result["duplicate_prevented"] = True
-            result["status"] = "duplicate_prevented"
-            print(f"[cold_unet_early_load] duplicate_prevented key={unet_real[:80]} owner={_existing.get('owner','?')}")
-            return result
-        # Also check all CPU cache lookup keys for any inflight read from preload/actual_load
-        for _lk in _model_cpu_cache_lookup_keys(unet_real):
-            _lk_existing = _check_active_model_read(_lk)
-            if _lk_existing is not None:
-                result["duplicate_prevented"] = True
-                result["status"] = "duplicate_prevented_via_lookup"
-                print(f"[cold_unet_early_load] duplicate_prevented_via_lookup owner={_lk_existing.get('owner','?')} key={_lk[:80]}")
-                return result
-        # Check CPU cache hit
-        _cpu_hit = self._model_in_cpu_cache(unet_real) if hasattr(self, "_model_in_cpu_cache") else False
-        result["cpu_cache_hit"] = _cpu_hit
-        if _eff_require_cpu and not _cpu_hit:
-            result["skipped"] = True
-            result["status"] = "require_cpu_cache_hit_miss"
-            print(f"[cold_unet_early_load] skipped require_cpu_cache=1 cpu_hit=0 key={unet_real[:80]}")
-            return result
-        # Register with active-read registry using graph-loader-compatible key
-        # BEFORE starting thread, so the graph loader finds this inflight read.
-        import threading as _cl_thr
-        _read_event = _cl_thr.Event()
-        _register_active_model_read(_graph_key, owner="restore_background_unet", path=unet_real, event=_read_event)
-
-        result["submit_ts"] = time.time()
-        self._init_actual_load_registry()
-        self._init_unet_cache()
-        _al_start_u = time.time()
-        self._wall_actual_load_per_model.append({
-            "loader_type": "UNET", "canonical_key": _graph_key,
-            "actual_load_start_unix_s": _al_start_u,
-            "actual_load_done_unix_s": None,
-        })
-        _rec_idx = len(self._wall_actual_load_per_model) - 1
-        result["submitted"] = True
-
-        def _cold_unet_worker(k=_cl_key, un=unet_name, _un_path=unet_real, _rec_idx_=_rec_idx,
-                              _gk=_graph_key, _evt=_read_event):
-            _tid = _cl_thr.current_thread().ident
-            result["worker_start_ts"] = time.time()
-            self._actual_load_owner_thread[k] = _tid
-            _cpu_hits_before = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
-            _cpu_misses_before = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0
-            if _eff_debug:
-                print(f"[cold_unet_early_load] worker_start key={k} thread_id={_tid} path={_un_path[:80]}")
-            t0 = time.time()
-            try:
-                import nodes as _cl_nodes
-                _orig_fn = self._original_loaders.get("UNETLoader.load_unet")
-                with _model_load_context(owner="restore_background_unet", loader_type="UNET", actual_key=k, canonical_path=_un_path, record_id=str(_rec_idx_)):
-                    if _orig_fn:
-                        obj = _orig_fn(_cl_nodes.NODE_CLASS_MAPPINGS["UNETLoader"](), unet_name=un, weight_dtype="default")
-                    else:
-                        obj = _cl_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=un, weight_dtype="default")
-                self._unet_object_cache[k] = obj[0]
-                _d_ms = round((time.time() - t0) * 1000, 1)
-                result["done_ts"] = time.time()
-                _cpu_hits_after = sum(self._cpu_cache_hits.values()) if hasattr(self, "_cpu_cache_hits") else 0
-                _cpu_misses_after = sum(self._cpu_cache_misses.values()) if hasattr(self, "_cpu_cache_misses") else 0
-                _cpu_cache_volume_read = _cpu_misses_after > _cpu_misses_before
-                _cpu_cache_hit_worker = _cpu_hits_after > _cpu_hits_before
-                if _cpu_cache_volume_read:
-                    try:
-                        _read_ms = _d_ms
-                        _read_gbps = round((_cl_size_gb / (_read_ms / 1000)) if _read_ms > 0 else 0, 3)
-                        result["volume_read_ms"] = _read_ms
-                        result["volume_read_gbps"] = _read_gbps
-                    except Exception:
-                        pass
-                if _rec_idx_ < len(self._wall_actual_load_per_model):
-                    self._wall_actual_load_per_model[_rec_idx_]["actual_load_done_unix_s"] = time.time()
-                result["status"] = "completed"
-                _complete_active_model_read(_gk)
-                if _eff_debug:
-                    print(f"[cold_unet_early_load] done key={k} ms={_d_ms} cpu_cache_hit={_cpu_cache_hit_worker} volume_read={_cpu_cache_volume_read}")
-            except Exception as e:
-                result["status"] = "failed"
-                result["error"] = str(e)[:200]
-                _fail_active_model_read(_gk, error=str(e)[:200])
-                if _eff_debug:
-                    print(f"[cold_unet_early_load] failed key={k} err={e}")
-            finally:
-                self._actual_load_owner_thread.pop(k, None)
-        _t = _cl_thr.Thread(target=_cold_unet_worker, daemon=True)
-        _t.start()
-        if _eff_debug:
-            print(f"[cold_unet_early_load] submitted graph_key={_graph_key[:80]} key={_cl_key}")
-        return result
-
-    def _finalize_cold_unet_early_load(self, cold_unet_info: dict):
-        if not cold_unet_info or not cold_unet_info.get("submitted"):
-            return
-        _cl_path = cold_unet_info.get("path", "")
-        if not _cl_path:
-            return
-        _graph_key = _model_cpu_cache_key(_cl_path)
-        _al_rec = None
-        for _rec in getattr(self, "_wall_actual_load_per_model", []):
-            if _rec.get("canonical_key") == _graph_key and _rec.get("loader_type") == "UNET":
-                _al_rec = _rec
-                break
-        if _al_rec is None:
-            # Also try the old tuple format for backwards compat
-            _canon = (_cl_path, "default")
-            for _rec in getattr(self, "_wall_actual_load_per_model", []):
-                if _rec.get("canonical_key") == str(_canon) and _rec.get("loader_type") == "UNET":
-                    _al_rec = _rec
-                    break
-        if _al_rec is None:
-            return
-        _graph_req_ts = _al_rec.get("graph_requested_model_unix_s")
-        _start_ts = _al_rec.get("actual_load_start_unix_s")
-        _done_ts = _al_rec.get("actual_load_done_unix_s")
-        if _graph_req_ts is not None and _start_ts is not None:
-            _head_start_ms = round((_graph_req_ts - _start_ts) * 1000, 3)
-            cold_unet_info["overlap_ms"] = max(0.0, _head_start_ms)
-            _total_load_ms = round(((_done_ts or time.time()) - _start_ts) * 1000, 3) if _start_ts else 0
-            cold_unet_info["estimated_critical_path_saved_ms"] = min(_total_load_ms, max(0.0, _head_start_ms)) if _total_load_ms > 0 else 0.0
-        if _graph_req_ts is not None and _done_ts is not None:
-            _remaining_ms = max(0.0, round((_done_ts - _graph_req_ts) * 1000, 3))
-            cold_unet_info["remaining_critical_path_wait_ms"] = _remaining_ms
-            cold_unet_info["graph_wait_ms"] = _remaining_ms
-        # Check volume stall
-        if cold_unet_info.get("volume_read_ms", 0) > 30000:
-            cold_unet_info["volume_stall_detected"] = True
-
-    def _patch_scheduler_clip_encode_prefetch(self, prefetch_cache: dict):
-        """Patch CLIPTextEncode to check scheduler prefetch cache first.
-
-        Called by``_start_scheduler_test`` when prefetch is active.
-        The prefetch worker populates *prefetch_cache* with keys:
-
-          (text_hash, clip_paths_tuple, clip_type)
-
-        This wrapper checks that cache before the normal CLIPTextEncode
-        logic.  Hits are counted on ``self._scheduler_prefetch_real_hit``.
-        """
-        try:
-            import nodes as _ps_nodes
-        except Exception:
-            return
-        _enc_cls = _ps_nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
-        if _enc_cls is None:
-            return
-        _func_name = getattr(_enc_cls, "FUNCTION", "encode")
-        _orig = getattr(_enc_cls, _func_name)
-        _api = self
-        if not hasattr(_api, "_scheduler_prefetch_real_hit"):
-            _api._scheduler_prefetch_real_hit = 0
-
-        def _with_scheduler_prefetch(self_node, clip, text):
-            _paths = tuple(getattr(clip, '_warmup_model_paths', None) or [])
-            _clip_type = getattr(clip, '_warmup_clip_type', '') or ''
-            _text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-            _key = (_text_hash, _paths, _clip_type)
-            if _key in prefetch_cache:
-                _api._scheduler_prefetch_real_hit += 1
-                return prefetch_cache[_key]
-            return _orig(self_node, clip, text)
-
-        setattr(_enc_cls, _func_name, _with_scheduler_prefetch)
-        print(f"[scheduler_test] prefetch_cache patch installed on {_enc_cls.__name__}.{_func_name}")
-
-    def _start_scheduler_test(self, workflow: dict, scheduler_config: dict) -> dict:
-        """Start controlled scheduler benchmark: dependency validation + model loads.
-
-        Returns a scheduler_trace dict populated asynchronously.
-        The caller (run_prompt_stream) waits via ``_scheduler_wait_and_finalize``.
-
-        Modes:
-          baseline_current           GÃ‡Ã¶ no override, existing pipeline
-          early_unet_vae             GÃ‡Ã¶ UNET+VAE at request start, no CLIP
-          clip_first                 GÃ‡Ã¶ CLIP at start_clip_ms, UNET at start_unet_ms, GÃ‡Âª
-          unet_first                 GÃ‡Ã¶ UNET at start_unet_ms, CLIP at start_clip_ms, GÃ‡Âª
-          clip_serial_then_unet      GÃ‡Ã¶ CLIP first, then UNET+VAE+encode after CLIP done
-          parallel_matrix            GÃ‡Ã¶ all loads start at configured delays
-          clip_load_then_unet_and_encode GÃ‡Ã¶ CLIP first, then UNET+VAE+encode
-          unet_load_then_clip        GÃ‡Ã¶ UNET first, then CLIP+encode
-        """
-        import threading
-        import os as _st_os
-        import nodes as _st_nodes
-        import folder_paths as _st_fp
-
-        t_start = time.time()
-        mode = scheduler_config.get("mode", "baseline_current")
-
-        trace = {
-            "enabled": True,
-            "mode": mode,
-            "request_start_unix": t_start,
-            "scheduler_origin": "comfyapp._start_scheduler_test",
-        }
-
-        if mode == "baseline_current":
-            trace["enabled"] = False
-            trace["notes"] = "baseline GÃ‡Ã¶ no scheduler override"
-            return trace
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 1. Validate prompt structure (cheap) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        assert_valid_api_prompt_structure(workflow)
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 2. Sync custom nodes (needed for node classes) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        _cn_sync_start = time.time()
-        _cn_summary, _cn_state = self._sync_custom_nodes_from_volume()
-        _cn_sync_ms = round((time.time() - _cn_sync_start) * 1000, 1)
-        trace["custom_nodes_sync_ms"] = _cn_sync_ms
-        trace["custom_nodes_created"] = len(_cn_summary.get("created", []))
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 3. Start dependency validation in background GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        dep_result = {"prepared": None, "reason": "", "error": None, "changed_nodes": []}
-        dep_done = threading.Event()
-        dep_start_ms = round((time.time() - t_start) * 1000, 1)
-        trace["dependency_validation_start_ms"] = dep_start_ms
-
-        def _dep_worker():
-            try:
-                dep_check = _run_dependency_validation_with_cache()
-                dep_result["prepared"] = dep_check.get("prepared", False)
-                dep_result["reason"] = dep_check.get("dependency_validation_reason", dep_check.get("reason", ""))
-                dep_result["changed_nodes"] = dep_check.get("changed_nodes", [])
-                dep_result["cache_layer"] = dep_check.get("dependency_validation_cache_layer", "none")
-                dep_result["cache_hit"] = dep_check.get("dependency_validation_cache_hit", False)
-                dep_result["validation_ms"] = dep_check.get("dependency_validation_ms", 0)
-            except Exception as e:
-                dep_result["error"] = str(e)
-            finally:
-                dep_done.set()
-
-        dep_thread = threading.Thread(target=_dep_worker, daemon=True)
-        dep_thread.start()
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 4. Extract model stack GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        stack = extract_requested_model_stack(workflow)
-        clip_type = stack.get("clip_type", "stable_diffusion")
-        trace["model_stack"] = {k: v for k, v in stack.items() if v}
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 5. Init caches/registry GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        self._init_actual_load_registry()
-        self._init_clip_cache()
-        self._init_unet_cache()
-        self._init_vae_cache()
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 6. Start model loads based on mode GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        prefetch = scheduler_config.get("prefetch_clip_encode", False)
-        start_clip_ms = scheduler_config.get("start_clip_ms")
-        start_unet_ms = scheduler_config.get("start_unet_ms")
-        start_vae_ms = scheduler_config.get("start_vae_ms")
-        unet_after_clip = scheduler_config.get("start_unet_after_clip_load", False)
-        vae_after_clip = scheduler_config.get("start_vae_after_clip_load", False)
-        clip_after_unet = scheduler_config.get("start_clip_after_unet_load", False)
-
-        # Threads + result dicts for each loader type
-        clip_thread = None
-        unet_thread = None
-        vae_thread = None
-        clip_encode_thread = None
-
-        _resolve = lambda bucket, name: _st_fp.get_full_path(
-            {"clip": "text_encoders", "unet": "diffusion_models", "vae": "vae"}.get(bucket, bucket), name
-        ) or name
-
-        clip_names = stack.get("clip", [])
-        unet_names = stack.get("unet", []) or stack.get("checkpoint", [])
-        vae_names = stack.get("vae", [])
-
-        # Prefetch cache: populated by the worker, checked by real graph
-        _scheduler_prefetch_cache: dict = {}
-        # Counter for real graph hits (patched in _patch_scheduler_clip_encode_prefetch)
-        self._scheduler_prefetch_real_hit = 0
-
-        # GÃ¶Ã‡GÃ¶Ã‡ Shared loader helpers GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        _loaded_models: list[dict] = []
-
-        def _record_load(label, basename, filepath, size_gb, t0, t1, sched_ms=0, error=None):
-            wall = round((t1 - t0) * 1000, 1) if t0 and t1 else 0
-            gbps = round(size_gb / (wall / 1000), 2) if wall > 0 and size_gb > 0 else 0
-            rec = {
-                "label": label, "basename": basename, "path": filepath,
-                "size_gb": size_gb, "effective_gbps": gbps,
-                "scheduled_start_ms": sched_ms,
-                "actual_start_ms": round((t0 - t_start) * 1000, 1) if t0 else 0,
-                "ready_ms": round((t1 - t_start) * 1000, 1) if t1 else 0,
-                "load_wall_ms": wall, "error": error,
-            }
-            _loaded_models.append(rec)
-            return rec
-
-        def _load_clip_worker(clip_name, ct, delay_ms, label):
-            if delay_ms:
-                time.sleep(delay_ms / 1000.0)
-            t0 = time.time()
-            trace[f"clip_scheduled_start_ms"] = delay_ms
-            trace[f"clip_start_ms"] = round((t0 - t_start) * 1000, 1)
-            clip_path = _resolve("clip", clip_name)
-            try:
-                clip_real = _st_os.path.realpath(clip_path) if _st_os.path.exists(clip_path) else clip_path
-            except Exception:
-                clip_real = clip_path
-            key = (clip_real, ct)
-            try:
-                obj = _st_nodes.NODE_CLASS_MAPPINGS["CLIPLoader"]().load_clip(clip_name=clip_name, type=ct)
-                self._clip_object_cache[key] = obj[0]
-            except Exception as e:
-                t_err = time.time()
-                trace["clip_error"] = str(e)
-                trace["clip_ready_ms"] = round((t_err - t_start) * 1000, 1)
-                trace["clip_load_wall_ms"] = round((t_err - t0) * 1000, 1)
-                trace["clip_size_gb"] = 0
-                trace["clip_gbps"] = 0
-                _record_load(label, _st_os.path.basename(clip_path), clip_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
-                return
-            t1 = time.time()
-            try:
-                sz = _st_os.path.getsize(clip_real)
-            except Exception:
-                sz = 0
-            size_gb = sz / (1024**3)
-            trace["clip_start_ms"] = round((t0 - t_start) * 1000, 1)
-            trace["clip_ready_ms"] = round((t1 - t_start) * 1000, 1)
-            trace["clip_load_wall_ms"] = round((t1 - t0) * 1000, 1)
-            trace["clip_size_gb"] = size_gb
-            trace["clip_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
-            _record_load(label, _st_os.path.basename(clip_path), clip_real, size_gb, t0, t1, sched_ms=delay_ms)
-
-        def _load_unet_worker(unet_name, delay_ms, label):
-            if delay_ms:
-                time.sleep(delay_ms / 1000.0)
-            t0 = time.time()
-            trace[f"unet_scheduled_start_ms"] = delay_ms
-            trace[f"unet_start_ms"] = round((t0 - t_start) * 1000, 1)
-            unet_path = _resolve("unet", unet_name)
-            try:
-                unet_real = _st_os.path.realpath(unet_path) if _st_os.path.exists(unet_path) else unet_path
-            except Exception:
-                unet_real = unet_path
-            try:
-                obj = _st_nodes.NODE_CLASS_MAPPINGS["UNETLoader"]().load_unet(unet_name=unet_name, weight_dtype="default")
-                self._unet_object_cache[(unet_real, "default")] = obj[0]
-            except Exception as e:
-                t_err = time.time()
-                trace["unet_error"] = str(e)
-                trace["unet_ready_ms"] = round((t_err - t_start) * 1000, 1)
-                trace["unet_load_wall_ms"] = round((t_err - t0) * 1000, 1)
-                trace["unet_size_gb"] = 0
-                trace["unet_gbps"] = 0
-                _record_load(label, _st_os.path.basename(unet_path), unet_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
-                return
-            t1 = time.time()
-            try:
-                sz = _st_os.path.getsize(unet_real)
-            except Exception:
-                sz = 0
-            size_gb = sz / (1024**3)
-            trace["unet_start_ms"] = round((t0 - t_start) * 1000, 1)
-            trace["unet_ready_ms"] = round((t1 - t_start) * 1000, 1)
-            trace["unet_load_wall_ms"] = round((t1 - t0) * 1000, 1)
-            trace["unet_size_gb"] = size_gb
-            trace["unet_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
-            _record_load(label, _st_os.path.basename(unet_path), unet_real, size_gb, t0, t1, sched_ms=delay_ms)
-
-        def _load_vae_worker(vae_name, delay_ms, label):
-            if delay_ms:
-                time.sleep(delay_ms / 1000.0)
-            t0 = time.time()
-            trace[f"vae_scheduled_start_ms"] = delay_ms
-            trace[f"vae_start_ms"] = round((t0 - t_start) * 1000, 1)
-            vae_path = _resolve("vae", vae_name)
-            try:
-                vae_real = _st_os.path.realpath(vae_path) if _st_os.path.exists(vae_path) else vae_path
-            except Exception:
-                vae_real = vae_path
-            try:
-                obj = _st_nodes.NODE_CLASS_MAPPINGS["VAELoader"]().load_vae(vae_name=vae_name)
-                self._vae_object_cache[("VAELoader", vae_real)] = obj[0]
-            except Exception as e:
-                t_err = time.time()
-                trace["vae_error"] = str(e)
-                trace["vae_ready_ms"] = round((t_err - t_start) * 1000, 1)
-                trace["vae_load_wall_ms"] = round((t_err - t0) * 1000, 1)
-                trace["vae_size_gb"] = 0
-                trace["vae_gbps"] = 0
-                _record_load(label, _st_os.path.basename(vae_path), vae_real, 0, t0, t_err, sched_ms=delay_ms, error=str(e))
-                return
-            t1 = time.time()
-            try:
-                sz = _st_os.path.getsize(vae_real)
-            except Exception:
-                sz = 0
-            size_gb = sz / (1024**3)
-            trace["vae_start_ms"] = round((t0 - t_start) * 1000, 1)
-            trace["vae_ready_ms"] = round((t1 - t_start) * 1000, 1)
-            trace["vae_load_wall_ms"] = round((t1 - t0) * 1000, 1)
-            trace["vae_size_gb"] = size_gb
-            trace["vae_gbps"] = round(size_gb / (max(t1 - t0, 0.001)), 2)
-            _record_load(label, _st_os.path.basename(vae_path), vae_real, size_gb, t0, t1, sched_ms=delay_ms)
-
-        def _find_eligible_clip_encode_nodes():
-            eligible = []
-            for node_id, node in workflow.items():
-                if not isinstance(node, dict):
-                    continue
-                if node.get("class_type") != "CLIPTextEncode":
-                    continue
-                inputs = node.get("inputs", {})
-                if not isinstance(inputs, dict):
-                    continue
-                text = inputs.get("text")
-                if not isinstance(text, str) or not text:
-                    continue
-                clip_src = inputs.get("clip")
-                if not isinstance(clip_src, list) or len(clip_src) < 2:
-                    continue
-                clip_node_id = clip_src[0]
-                clip_node = workflow.get(str(clip_node_id))
-                if not isinstance(clip_node, dict):
-                    continue
-                clip_ct = clip_node.get("class_type", "")
-                if clip_ct not in ("CLIPLoader", "DualCLIPLoader"):
-                    continue
-                eligible.append({
-                    "node_id": node_id,
-                    "text": text,
-                    "text_hash": hashlib.md5(text.encode('utf-8')).hexdigest(),
-                    "clip_node_id": clip_node_id,
-                    "clip_class_type": clip_ct,
-                })
-            return eligible
-
-        def _run_clip_encode_prefetch():
-            start = time.time()
-            trace["clip_encode_start_ms"] = round((start - t_start) * 1000, 1)
-            eligible = _find_eligible_clip_encode_nodes()
-            trace["clip_encode_prefetch_eligible_count"] = len(eligible)
-            if not eligible:
-                trace["clip_encode_prefetch_done_count"] = 0
-                trace["clip_encode_ready_ms"] = trace["clip_encode_start_ms"]
-                trace["clip_encode_wall_ms"] = 0
-                trace["clip_encode_prefetch_hit"] = 0
-                trace["clip_encode_prefetch_miss_reason"] = "no_eligible_nodes"
-                return
-            try:
-                import nodes as _ec_nodes
-                enc_cls = _ec_nodes.NODE_CLASS_MAPPINGS.get("CLIPTextEncode")
-                if enc_cls is None:
-                    trace["clip_encode_ready_ms"] = trace["clip_encode_start_ms"]
-                    trace["clip_encode_wall_ms"] = 0
-                    trace["clip_encode_prefetch_hit"] = 0
-                    trace["clip_encode_prefetch_done_count"] = 0
-                    trace["clip_encode_prefetch_miss_reason"] = "CLIPTextEncode_not_found"
-                    return
-                done = 0
-                for info in eligible:
-                    try:
-                        clip_node = workflow.get(str(info["clip_node_id"]))
-                        if not isinstance(clip_node, dict):
-                            continue
-                        clip_inputs = clip_node.get("inputs", {})
-                        ct = clip_inputs.get("type", clip_type)
-
-                        if info["clip_class_type"] == "CLIPLoader":
-                            cn = clip_inputs.get("clip_name", "")
-                            if not cn:
-                                continue
-                            clip_path = _resolve("clip", cn)
-                            clip_real = _st_os.path.realpath(clip_path) if _st_os.path.exists(clip_path) else clip_path
-                            key = (clip_real, ct)
-                            clip_obj = self._clip_object_cache.get(key)
-                            if clip_obj is None:
-                                continue
-                            if not hasattr(clip_obj, '_warmup_model_paths'):
-                                clip_obj._warmup_model_paths = (clip_real,)
-                                clip_obj._warmup_clip_type = ct
-                            enc_node = enc_cls()
-                            result = enc_node.encode(clip_obj, info["text"])
-                            # Store in prefetch cache for real-execution patch
-                            _pkey = (info["text_hash"], (clip_real,), ct)
-                            _scheduler_prefetch_cache[_pkey] = result
-                        elif info["clip_class_type"] == "DualCLIPLoader":
-                            cn1 = clip_inputs.get("clip_name1", "")
-                            cn2 = clip_inputs.get("clip_name2", "")
-                            if not cn1 or not cn2:
-                                continue
-                            clip1_path = _resolve("clip", cn1)
-                            clip2_path = _resolve("clip", cn2)
-                            clip1_real = _st_os.path.realpath(clip1_path) if _st_os.path.exists(clip1_path) else clip1_path
-                            clip2_real = _st_os.path.realpath(clip2_path) if _st_os.path.exists(clip2_path) else clip2_path
-                            key1 = (clip1_real, ct)
-                            key2 = (clip2_real, ct)
-                            clip_obj1 = self._clip_object_cache.get(key1)
-                            clip_obj2 = self._clip_object_cache.get(key2)
-                            if clip_obj1 is None or clip_obj2 is None:
-                                continue
-                            for clip_obj, cr in [(clip_obj1, clip1_real), (clip_obj2, clip2_real)]:
-                                if not hasattr(clip_obj, '_warmup_model_paths'):
-                                    clip_obj._warmup_model_paths = (clip1_real, clip2_real)
-                                    clip_obj._warmup_clip_type = ct
-                            from comfy.sd import CLIP
-                            combined = CLIP(
-                                clip_target = clip_obj1.clip_target,
-                                embedding_directory = getattr(clip_obj1, 'embedding_directory', None)
-                            )
-                            combined.clip = clip_obj1.clip
-                            combined.tokenizer = clip_obj1.tokenizer
-                            combined.patcher = clip_obj1.patcher
-                            combined.load_clip(clip_name2=cn2, type=ct)
-                            enc_node = enc_cls()
-                            result = enc_node.encode(combined, info["text"])
-                            _pkey = (info["text_hash"], (clip1_real, clip2_real), ct)
-                            _scheduler_prefetch_cache[_pkey] = result
-                        done += 1
-                    except Exception as exc:
-                        print(f"[scheduler_test] prefetch node {info.get('node_id','?')} failed: {exc}")
-                        continue
-                end = time.time()
-                trace["clip_encode_ready_ms"] = round((end - t_start) * 1000, 1)
-                trace["clip_encode_wall_ms"] = round((end - start) * 1000, 1)
-                trace["clip_encode_prefetch_hit"] = done
-                trace["clip_encode_prefetch_done_count"] = done
-                if done == 0 and eligible:
-                    trace["clip_encode_prefetch_miss_reason"] = "clip_not_in_cache"
-                print(f"[scheduler_test] clip_encode_prefetch done={done} eligible={len(eligible)} ms={trace['clip_encode_wall_ms']}")
-            except Exception as exc:
-                trace["clip_encode_error"] = str(exc)
-                trace["clip_encode_prefetch_hit"] = 0
-                trace["clip_encode_prefetch_done_count"] = 0
-                trace["clip_encode_prefetch_miss_reason"] = str(exc)
-                trace["clip_encode_ready_ms"] = trace.get("clip_encode_start_ms", round((time.time() - t_start) * 1000, 1))
-                trace["clip_encode_wall_ms"] = 0
-                print(f"[scheduler_test] clip_encode_prefetch failed: {exc}")
-
-        # Install prefetch cache patch on CLIPTextEncode
-        if prefetch:
-            self._patch_scheduler_clip_encode_prefetch(_scheduler_prefetch_cache)
-
-        # GÃ¶Ã‡GÃ¶Ã‡ Launch loads per mode GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        if mode == "early_unet_vae":
-            for un in unet_names:
-                d = start_unet_ms if start_unet_ms is not None else 0
-                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, d, "unet"), daemon=True)
-                unet_thread.start()
-            for vn in vae_names:
-                d = start_vae_ms if start_vae_ms is not None else 0
-                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, d, "vae"), daemon=True)
-                vae_thread.start()
-
-        elif mode in ("clip_first", "parallel_matrix"):
-            if start_clip_ms is not None:
-                for cn in clip_names:
-                    ct = clip_type
-                    clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, start_clip_ms, "clip"), daemon=True)
-                    clip_thread.start()
-            if start_unet_ms is not None:
-                for un in unet_names:
-                    unet_thread = threading.Thread(target=_load_unet_worker, args=(un, start_unet_ms, "unet"), daemon=True)
-                    unet_thread.start()
-            if start_vae_ms is not None:
-                for vn in vae_names:
-                    vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, start_vae_ms, "vae"), daemon=True)
-                    vae_thread.start()
-            # Post-CLIP prefetch
-            if prefetch and clip_thread is not None:
-                def _prefetch_after_clip():
-                    clip_thread.join(timeout=600)
-                    if clip_thread.is_alive():
-                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip")
-                        return
-                    _run_clip_encode_prefetch()
-                clip_encode_thread = threading.Thread(target=_prefetch_after_clip, daemon=True)
-                clip_encode_thread.start()
-
-        elif mode == "unet_first":
-            if start_unet_ms is not None:
-                for un in unet_names:
-                    unet_thread = threading.Thread(target=_load_unet_worker, args=(un, start_unet_ms, "unet"), daemon=True)
-                    unet_thread.start()
-            if start_vae_ms is not None:
-                for vn in vae_names:
-                    vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, start_vae_ms, "vae"), daemon=True)
-                    vae_thread.start()
-            if start_clip_ms is not None:
-                for cn in clip_names:
-                    ct = clip_type
-                    clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, start_clip_ms, "clip"), daemon=True)
-                    clip_thread.start()
-            # Post-CLIP prefetch
-            if prefetch and clip_thread is not None:
-                def _prefetch_after_clip_unet():
-                    clip_thread.join(timeout=600)
-                    if clip_thread.is_alive():
-                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip_unet")
-                        return
-                    _run_clip_encode_prefetch()
-                clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet, daemon=True)
-                clip_encode_thread.start()
-
-        elif mode in ("clip_serial_then_unet", "clip_load_then_unet_and_encode"):
-            for cn in clip_names[:1]:
-                ct = clip_type
-                clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
-                clip_thread.start()
-            if clip_thread is not None:
-                clip_thread.join(timeout=600)
-                if clip_thread.is_alive():
-                    print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in clip_serial_then_unet mode")
-            for un in unet_names:
-                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, 0, "unet"), daemon=True)
-                unet_thread.start()
-            for vn in vae_names:
-                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, 0, "vae"), daemon=True)
-                vae_thread.start()
-            if prefetch and clip_thread is not None:
-                def _prefetch_serial():
-                    _run_clip_encode_prefetch()
-                clip_encode_thread = threading.Thread(target=_prefetch_serial, daemon=True)
-                clip_encode_thread.start()
-
-        elif mode in ("unet_load_then_clip",):
-            for un in unet_names:
-                unet_thread = threading.Thread(target=_load_unet_worker, args=(un, 0, "unet"), daemon=True)
-                unet_thread.start()
-            for vn in vae_names:
-                vae_thread = threading.Thread(target=_load_vae_worker, args=(vn, 0, "vae"), daemon=True)
-                vae_thread.start()
-            if unet_thread is not None:
-                unet_thread.join(timeout=600)
-                if unet_thread.is_alive():
-                    print("[scheduler_test] WARNING: unet_thread.join timeout after 600s in unet_load_then_clip mode")
-            for cn in clip_names[:1]:
-                ct = clip_type
-                clip_thread = threading.Thread(target=_load_clip_worker, args=(cn, ct, 0, "clip"), daemon=True)
-                clip_thread.start()
-            if prefetch and clip_thread is not None:
-                def _prefetch_after_clip_unet_first():
-                    clip_thread.join(timeout=600)
-                    if clip_thread.is_alive():
-                        print("[scheduler_test] WARNING: clip_thread.join timeout after 600s in _prefetch_after_clip_unet_first")
-                        return
-                    _run_clip_encode_prefetch()
-                clip_encode_thread = threading.Thread(target=_prefetch_after_clip_unet_first, daemon=True)
-                clip_encode_thread.start()
-
-        # GÃ¶Ã‡GÃ¶Ã‡ 7. Store threads for caller to wait on GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        self._scheduler_dep_thread = dep_thread
-        self._scheduler_dep_done = dep_done
-        self._scheduler_dep_result = dep_result
-        self._scheduler_workflow = workflow
-        self._scheduler_trace = trace
-        self._scheduler_clip_thread = clip_thread
-        self._scheduler_unet_thread = unet_thread
-        self._scheduler_vae_thread = vae_thread
-        self._scheduler_clip_encode_thread = clip_encode_thread
-        self._scheduler_prefetch = prefetch
-        self._scheduler_t_start = t_start
-        self._scheduler_clip_names = clip_names
-        self._scheduler_unet_names = unet_names
-        self._scheduler_prefetch_cache = _scheduler_prefetch_cache
-
-        print(f"[scheduler_test] config={json.dumps(scheduler_config, default=str)} mode={mode}")
-        trace["loaded_models"] = _loaded_models
-        return trace
-
-    def _scheduler_wait_and_finalize(self) -> dict:
-        """Wait for all scheduler test tasks and finalize the trace.
-
-        Called by run_prompt_stream after scheduler test is started.
-        Blocks until dependency validation passes (or fails) and
-        required model loads complete. Returns the finalized trace.
-        """
-        trace = getattr(self, "_scheduler_trace", {})
-        if not trace.get("enabled"):
-            return trace
-
-        t_start = getattr(self, "_scheduler_t_start", time.time())
-        dep_thread = getattr(self, "_scheduler_dep_thread", None)
-        dep_done = getattr(self, "_scheduler_dep_done", None)
-        dep_result = getattr(self, "_scheduler_dep_result", None)
-        clip_thread = getattr(self, "_scheduler_clip_thread", None)
-        unet_thread = getattr(self, "_scheduler_unet_thread", None)
-        vae_thread = getattr(self, "_scheduler_vae_thread", None)
-        clip_encode_thread = getattr(self, "_scheduler_clip_encode_thread", None)
-        prefetch = getattr(self, "_scheduler_prefetch", False)
-        mode = trace.get("mode", "")
-
-        _repair_mode = self._resolve_requirements_repair_mode()
-
-        # Wait for dependency validation
-        if dep_thread is not None and dep_thread.is_alive():
-            dep_thread.join(timeout=600)
-            if dep_thread.is_alive():
-                print("[scheduler] WARNING: dep_thread.join timeout after 600s")
-        if dep_done is not None and dep_done.is_set():
-            trace["dependency_gate_done_ms"] = round((time.time() - t_start) * 1000, 1)
-            if dep_result:
-                trace["dependency_prepared"] = dep_result.get("prepared")
-                trace["dependency_reason"] = dep_result.get("reason", "")
-                if dep_result.get("error"):
-                    trace["dependency_error"] = dep_result["error"]
-        else:
-            trace["dependency_gate_done_ms"] = trace.get("dependency_validation_start_ms")
-
-        if _repair_mode in ("off", "fail_fast"):
-            if dep_result and not dep_result.get("prepared"):
-                raise RuntimeError(
-                    f"Custom node dependencies are not prepared. "
-                    f"Runtime repair is disabled in {_repair_mode} mode. "
-                    f"reason={dep_result.get('reason','')} "
-                    f"changed_nodes={dep_result.get('changed_nodes',[])} "
-                )
-
-        # Missing-node gate
-        _mn_workflow = getattr(self, "_scheduler_workflow", None) or {}
-        try:
-            _mn_result = self._enforce_workflow_node_classes_available_before_model_work(_mn_workflow)
-            trace["missing_node_gate_done_ms"] = round((time.time() - t_start) * 1000, 1)
-            trace["missing_nodes"] = _mn_result.get("missing_nodes_before_model_work", [])
-            if _mn_result.get("missing_node_blocked_by_mode") and _mn_result.get("missing_nodes_before_model_work"):
-                raise RuntimeError(
-                    f"Missing custom node class(es): "
-                    f"{_mn_result['missing_nodes_before_model_work']}"
-                )
-        except RuntimeError:
-            raise
-        except Exception as e:
-            trace["missing_node_error"] = str(e)
-
-        # Wait for model loads
-        for t in (clip_thread, unet_thread, vae_thread):
-            if t is not None and t.is_alive():
-                t.join(timeout=600)
-                if t.is_alive():
-                    print(f"[scheduler] WARNING: model thread.join timeout after 600s for {t.name}")
-
-        if prefetch and clip_encode_thread is not None and clip_encode_thread.is_alive():
-            clip_encode_thread.join(timeout=600)
-            if clip_encode_thread.is_alive():
-                print("[scheduler] WARNING: clip_encode_thread.join timeout after 600s")
-
-        # Read real-execution prefetch hit counter
-        real_hit = getattr(self, "_scheduler_prefetch_real_hit", 0)
-        if real_hit > 0:
-            trace["clip_encode_prefetch_real_hit"] = real_hit
-            trace["clip_encode_prefetch_hit"] = real_hit
-
-        # GÃ¶Ã‡GÃ¶Ã‡ Compute sampler gate GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        gate_candidates = []
-        dep_gate = trace.get("dependency_gate_done_ms")
-        if isinstance(dep_gate, (int, float)):
-            gate_candidates.append(dep_gate)
-        mn_gate = trace.get("missing_node_gate_done_ms")
-        if isinstance(mn_gate, (int, float)):
-            gate_candidates.append(mn_gate)
-        unet_ready = trace.get("unet_ready_ms")
-        if isinstance(unet_ready, (int, float)):
-            gate_candidates.append(unet_ready)
-        has_clip = bool(getattr(self, "_scheduler_clip_names", []))
-        if has_clip:
-            clip_encode_ready = trace.get("clip_encode_ready_ms")
-            if prefetch and isinstance(clip_encode_ready, (int, float)):
-                gate_candidates.append(clip_encode_ready)
-            else:
-                clip_ready = trace.get("clip_ready_ms")
-                if isinstance(clip_ready, (int, float)):
-                    gate_candidates.append(clip_ready)
-        vae_ready = trace.get("vae_ready_ms")
-        sampler_gate_without_vae = max(gate_candidates) if gate_candidates else 0
-        if isinstance(vae_ready, (int, float)):
-            gate_candidates.append(vae_ready)
-        trace["sampler_gate_ready_ms"] = max(gate_candidates) if gate_candidates else 0
-        trace["sampler_gate_ready_without_vae_ms"] = sampler_gate_without_vae
-        trace["sampler_gate_ready_with_vae_ms"] = max(gate_candidates) if gate_candidates else 0
-
-        # GÃ¶Ã‡GÃ¶Ã‡ Notes GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
-        notes_parts = []
-        if trace.get("clip_encode_prefetch_hit", 0) > 0:
-            notes_parts.append(f"clip_encode_prefetch_hit={trace['clip_encode_prefetch_hit']}")
-        if real_hit > 0:
-            notes_parts.append(f"prefetch_real_hit={real_hit}")
-        trace["notes"] = (trace.get("notes") or "") + " " + "; ".join(notes_parts)
-        trace["notes"] = trace["notes"].strip()
-
-        print(f"[scheduler_test] finalized mode={mode} sampler_gate_ready_ms={trace.get('sampler_gate_ready_ms')}")
-        return trace
-
     def _patch_model_cpu_cache(self, comfy_utils) -> None:
         """Patch ComfyUI model loading to reuse CPU-cached state dicts.
         Also coordinates with in-flight prompt-time async preloads."""
@@ -14826,15 +15672,75 @@ class _ComfyAPIMixin:
 
     def _preferred_sage_backend(self):
         import sageattention
+        return select_public_sageattention_callable(sageattention)
 
-        for name, kwargs in (
-            ("sageattn_qk_int8_pv_fp16_cuda", {"pv_accum_dtype": "fp32"}),
-            ("sageattn_qk_int8_pv_fp8_cuda", {"pv_accum_dtype": "fp32+fp32"}),
-        ):
-            candidate = getattr(sageattention, name, None)
-            if callable(candidate):
-                return name, candidate, kwargs
-        return None, None, {}
+    def _sage_runtime_identity(self, *, selected_symbol: str = "", kernel_family: str = "") -> dict[str, Any]:
+        """Collect restore-time identity; never called during snapshot startup."""
+        import torch
+
+        gpu_name = "unknown"
+        capability = None
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            try:
+                capability = tuple(torch.cuda.get_device_capability(0))
+            except Exception:
+                pass
+        driver_version = ""
+        try:
+            driver = getattr(getattr(torch, "_C", None), "_cuda_getDriverVersion", None)
+            if callable(driver):
+                driver_version = str(driver())
+        except Exception:
+            pass
+        sage_version = ""
+        selected = selected_symbol
+        try:
+            import sageattention
+            sage_version = str(getattr(sageattention, "__version__", "") or "")
+            if not selected:
+                selected, _, _ = select_public_sageattention_callable(sageattention)
+        except Exception:
+            pass
+        if not sage_version:
+            try:
+                from importlib.metadata import version
+                sage_version = version("sageattention")
+            except Exception:
+                pass
+        artifact = sageattention_artifact_identity(SAGEATTENTION_SITE_PACKAGES)
+        if not kernel_family:
+            kernel_family = (
+                "sage2++_sm89_dispatch"
+                if SAGEATTENTION_EXPECTED_NATIVE_FAMILY in " ".join(
+                    item["path"] for item in artifact["extension_manifest"]
+                )
+                else "sage2++_public_dispatch"
+            )
+        image_identity = "|".join(
+            os.environ.get(name, "")
+            for name in ("COMFYMODAL_IMAGE_ID", "MODAL_IMAGE_ID", "MODAL_IMAGE_VERSION")
+        )
+        deployment_identity = "|".join(
+            os.environ.get(name, "")
+            for name in ("COMFYMODAL_DEPLOYMENT_ID", "MODAL_APP_ID", "MODAL_FUNCTION_ID")
+        )
+        return build_sage_runtime_identity(
+            site_packages_root=SAGEATTENTION_SITE_PACKAGES,
+            selected_symbol=selected or "none",
+            kernel_family=kernel_family,
+            gpu_name=gpu_name,
+            capability=capability,
+            sage_version=sage_version,
+            torch_version=str(getattr(torch, "__version__", "") or ""),
+            torch_cuda=str(getattr(getattr(torch, "version", None), "cuda", "") or ""),
+            driver_version=driver_version,
+            image_identity=image_identity,
+            deployment_identity=deployment_identity,
+        )
 
     def _verify_baked_sageattention_runtime(self) -> tuple[bool, list[str]]:
         import importlib
@@ -14843,36 +15749,75 @@ class _ComfyAPIMixin:
         extension_files = list_sageattention_extension_files(SAGEATTENTION_SITE_PACKAGES)
         if not extension_files:
             return False, ["compiled-extensions-missing"]
+        if not any(
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY in path.name
+            for path in extension_files
+        ):
+            return False, [
+                f"expected-native-family-missing:{SAGEATTENTION_EXPECTED_NATIVE_FAMILY}"
+            ]
 
         try:
-            import sageattention._fused  # noqa: F401
             importlib.invalidate_caches()
-            import sageattention  # noqa: F401
+            import sageattention._fused  # noqa: F401
+            import sageattention
         except Exception as exc:
             return False, [f"_fused-import-failed:{type(exc).__name__}"]
 
         try:
             backend_name, backend, backend_kwargs = self._preferred_sage_backend()
             if backend is None:
-                return False, ["no-supported-kjnodes-backend-symbol"]
-            q = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            k = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            v = torch.randn(1, 16, 8, 64, device="cuda", dtype=torch.float16)
-            _ = backend(q, k, v, is_causal=False, attn_mask=None, tensor_layout="NHD", **backend_kwargs)
+                return False, ["public-sageattn-callable-missing"]
+            # HND is the layout used by KJNodes when skip_reshape=True.  The
+            # public dispatcher, rather than a private extension symbol,
+            # chooses the v2.2.0 Sage2++ native family for SM120.
+            q = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            k = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            v = torch.randn(1, 8, 16, 64, device="cuda", dtype=torch.float16)
+            _ = backend(q, k, v, attn_mask=None, **backend_kwargs)
             torch.cuda.synchronize()
-            return True, [str(backend_name or "unknown-backend"), *[p.name for p in extension_files]]
+            self._sage_probe_identity = self._sage_runtime_identity(
+                selected_symbol=str(backend_name),
+            )
+            return True, [
+                str(backend_name or "unknown-backend"),
+                self._sage_probe_identity.get("kernel_family", ""),
+                *[p.name for p in extension_files],
+            ]
         except Exception as exc:
-            return False, [f"cuda-smoke-test-failed:{type(exc).__name__}"]
+            return False, [f"public-dispatch-smoke-test-failed:{type(exc).__name__}"]
 
-    def _select_sage_runtime_mode(self) -> tuple[str, str]:
+    def _select_sage_runtime_mode(
+        self, *, force_probe: bool = False, strict: bool = False
+    ) -> tuple[str, str]:
+        """Select Sage mode, optionally requiring a request-local fresh probe.
+
+        ``force_probe``/``strict`` are used only by the dedicated V2 Golden
+        restore callback, after CUDA has been reattached.  Ordinary ComfyUI
+        restores retain their existing override/cache behavior.
+        """
+        force_probe = bool(force_probe)
+        strict = bool(strict)
+        golden_baked_selector = False
+        if not force_probe and not strict and _golden_sage_runtime_enabled():
+            golden_baked_selector = _resolve_sage_runtime_env_override() == "baked_cuda"
         # Sticky GÃ‡Ã¶ already selected earlier in this restore
-        if getattr(self, "_sage_runtime_mode", None) is not None:
+        if (
+            not force_probe
+            and not strict
+            and not golden_baked_selector
+            and getattr(self, "_sage_runtime_mode", None) is not None
+        ):
             return self._sage_runtime_mode, getattr(self, "_sage_runtime_reason", "sticky")
 
         # P2 GÃ‡Ã¶ runtime-configurable env override (file GÃ¥Ã† env GÃ¥Ã† module)
         _rt_sage_mode = _resolve_sage_runtime_env_override()
         _rt_sage_probe = _resolve_sage_probe_on_restore()
-        if _rt_sage_mode in ("baked_cuda", "triton_fallback"):
+        if (
+            not force_probe
+            and not strict
+            and _rt_sage_mode in ("baked_cuda", "triton_fallback")
+        ):
             self._sage_runtime_mode = _rt_sage_mode
             self._sage_runtime_reason = f"runtime_override"
             print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason} "
@@ -14880,11 +15825,12 @@ class _ComfyAPIMixin:
             return self._sage_runtime_mode, self._sage_runtime_reason
 
         # P2 GÃ‡Ã¶ skip probe on restore: prefer cached value, else env default
-        if not _rt_sage_probe:
+        if not force_probe and not _rt_sage_probe and not strict:
             cached = self._load_sage_runtime_cache()
             if cached:
                 print(f"[comfyapp] sage_runtime_cache hit mode={cached['mode']} reason={cached['reason']} "
                       f"gpu={cached['gpu_name']} sage_v={cached['sage_version']} (probe skipped)")
+                self._sage_probe_identity = cached
                 self._sage_runtime_mode = cached["mode"]
                 self._sage_runtime_reason = cached["reason"]
                 return self._sage_runtime_mode, self._sage_runtime_reason
@@ -14900,10 +15846,11 @@ class _ComfyAPIMixin:
 
         # Normal path: check persistent cache, probe if needed
         import json, os
-        cached = self._load_sage_runtime_cache()
+        cached = None if force_probe or strict else self._load_sage_runtime_cache()
         if cached:
             print(f"[comfyapp] sage_runtime_cache hit mode={cached['mode']} reason={cached['reason']} "
                   f"gpu={cached['gpu_name']} sage_v={cached['sage_version']}")
+            self._sage_probe_identity = cached
             self._sage_runtime_mode = cached["mode"]
             self._sage_runtime_reason = cached["reason"]
             return self._sage_runtime_mode, self._sage_runtime_reason
@@ -14921,12 +15868,17 @@ class _ComfyAPIMixin:
         self._sage_runtime_reason = details[0] if details else reason
         print(f"[comfyapp] sage_runtime_mode={self._sage_runtime_mode} reason={self._sage_runtime_reason}")
         # Persist to volume for future restores
-        self._save_sage_runtime_cache(mode, self._sage_runtime_reason)
+        if not force_probe and not strict:
+            self._save_sage_runtime_cache(mode, self._sage_runtime_reason)
+        if strict and mode != "baked_cuda":
+            raise RuntimeError(
+                f"Strict SageAttention probe failed: {self._sage_runtime_reason}"
+            )
         return self._sage_runtime_mode, self._sage_runtime_reason
 
     def _load_sage_runtime_cache(self) -> dict | None:
         """Read cached sage runtime mode from volume. Returns None if stale or missing."""
-        import json, os, torch
+        import json, os
         try:
             if not os.path.isfile(SAGE_RUNTIME_CACHE_PATH):
                 return None
@@ -14934,38 +15886,24 @@ class _ComfyAPIMixin:
                 data = json.load(f)
             if not isinstance(data, dict):
                 return None
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-            sage_version = ""
-            try:
-                import sageattention
-                sage_version = getattr(sageattention, "__version__", "") or ""
-            except ImportError:
-                pass
-            # Cache is valid if GPU and sage version match
-            if data.get("gpu_name") == gpu_name and data.get("sage_version") == sage_version:
+            current = self._sage_runtime_identity()
+            if sage_runtime_cache_usable(data, current):
                 return data
-            print(f"[comfyapp] sage_runtime_cache stale: gpu {data.get('gpu_name')}->{gpu_name} "
-                  f"sage {data.get('sage_version')}->{sage_version}")
+            print(f"[comfyapp] sage_runtime_cache stale: identity {data.get('identity_digest', '')[:16]}->"
+                  f"{current.get('identity_digest', '')[:16]}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache error: {exc}")
         return None
 
     def _save_sage_runtime_cache(self, mode: str, reason: str) -> None:
         """Persist sage runtime mode to volume for faster future restores."""
-        import json, os, torch, time
+        import json, os, time
         try:
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown"
-            sage_version = ""
-            try:
-                import sageattention
-                sage_version = getattr(sageattention, "__version__", "") or ""
-            except ImportError:
-                pass
+            identity = getattr(self, "_sage_probe_identity", None) or self._sage_runtime_identity()
             data = {
+                **identity,
                 "mode": mode,
                 "reason": reason,
-                "gpu_name": gpu_name,
-                "sage_version": sage_version,
                 "created_at": time.time(),
             }
             os.makedirs(os.path.dirname(SAGE_RUNTIME_CACHE_PATH), exist_ok=True)
@@ -14974,11 +15912,11 @@ class _ComfyAPIMixin:
                 json.dump(data, f, indent=2, sort_keys=True)
             os.replace(tmp, SAGE_RUNTIME_CACHE_PATH)
             _commit_runtime_config_vol_async("sage_runtime_cache", runtime_config_vol)
-            print(f"[comfyapp] sage_runtime_cache saved mode={mode} gpu={gpu_name} sage_v={sage_version}")
+            print(f"[comfyapp] sage_runtime_cache saved mode={mode} identity={identity['identity_digest'][:16]}")
         except Exception as exc:
             print(f"[comfyapp] sage_runtime_cache save error: {exc}")
 
-    def _apply_sage_attention_policy(self):
+    def _apply_sage_attention_policy(self, *, strict: bool = False):
         _t0 = time.time()
         baked_cuda_available = getattr(self, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
         found = False
@@ -14987,7 +15925,11 @@ class _ComfyAPIMixin:
             file_name = getattr(mod, "__file__", "") or ""
             if file_name.endswith("model_optimization_nodes.py"):
                 found = True
-                patched = patch_kjnodes_get_sage_func(mod, baked_cuda_available=baked_cuda_available)
+                patched = patch_kjnodes_get_sage_func(
+                    mod,
+                    baked_cuda_available=baked_cuda_available,
+                    strict=bool(strict),
+                )
                 _dur = round((time.time() - _t0) * 1000, 1)
                 print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
                       f"found=True patched={patched} "
@@ -14996,8 +15938,10 @@ class _ComfyAPIMixin:
                 return patched
         _dur = round((time.time() - _t0) * 1000, 1)
         print(f"[comfyapp] sage_policy module=model_optimization_nodes.py "
-              f"found=False baked_cuda_available={baked_cuda_available} "
-              f"duration={_dur}ms")
+               f"found=False baked_cuda_available={baked_cuda_available} "
+               f"duration={_dur}ms")
+        if strict:
+            raise RuntimeError("Strict SageAttention policy could not locate KJNodes integration")
         return False
 
     # GÃ¶Ã‡GÃ¶Ã‡ Backend scaffold (warmup + execution backend selection) GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
@@ -15863,13 +16807,12 @@ class _ComfyAPIMixin:
             duration_ms=_missing_node_repair_ms,
         )
         if repair_summary.get("blocked_by_mode") and repair_summary.get("missing_before"):
-            _mode = self._resolve_requirements_repair_mode()
+            # Custom-node publication is manual; never auto-publish/sync/repair here.
             raise RuntimeError(
-                f"Workflow references missing custom node class(es): "
-                f"{repair_summary['missing_before']}. "
-                f"Runtime repair is disabled in {_mode} mode. "
-                f"Install/sync the custom node and rebuild/deploy the "
-                f"Modal image if dependencies changed."
+                "Required ComfyUI custom node type is unavailable in this deployed snapshot.\n\n"
+                "Custom-node publishing is manual.\n"
+                "Run the canonical custom-node publisher, then perform a fresh deploy/snapshot if required."
+                f" Missing: {repair_summary['missing_before']}"
             )
 
         # GöÇGöÇ Fixed-workflow fast path: skip validation if hash matches GöÇGöÇ
@@ -16370,127 +17313,6 @@ class _ComfyAPIMixin:
                 _gsh_mod.cleanup_models = _gwrap("cleanup_models")(_gsh_mod.cleanup_models)
                 _gs_mod._comfy_modal_guider_prof_patched = True
                 _gs_mod._comfy_modal_guider_prof = _guider_prof_data
-
-        # GÃ¶Ã‡GÃ¶Ã‡ Deep sampler wrapper profiling GÃ¶Ã‡GÃ¶Ã‡
-        _deep_profiling = _resolve_runtime_flag('deep_profile', '0')
-        if _deep_profiling:
-            import comfy.sampler_helpers as _dsh_mod
-            import comfy.model_management as _dmm_mod
-            import comfy_extras.nodes_custom_sampler as _dcs_mod
-            _deep_prof = {}
-            def _dp_wrap(module, name, label):
-                orig = getattr(module, name, None)
-                if orig is None:
-                    return
-                def _dp(*args, **kwargs):
-                    _t0 = time.perf_counter()
-                    try:
-                        return orig(*args, **kwargs)
-                    finally:
-                        _deep_prof[label] = _deep_prof.get(label, 0) + (time.perf_counter() - _t0) * 1000
-                setattr(module, name, _dp)
-            _dp_wrap(_dsh_mod, 'get_additional_models', 'ps_get_additional_models')
-            _dp_wrap(_dsh_mod, 'get_additional_models_from_model_options', 'ps_get_additional_models_opts')
-            _dp_wrap(_dsh_mod, 'estimate_memory', 'ps_estimate_memory')
-            # GÃ¶Ã‡GÃ¶Ã‡ Comprehensive load_models_gpu profiler + fastpath diagnostics GÃ¶Ã‡GÃ¶Ã‡
-            _fp_dryrun = _resolve_runtime_flag('lmg_fastpath_dryrun', '0')
-            _fp_enabled = _resolve_runtime_flag('lmg_fastpath', '0')
-            _orig_lmg = _dmm_mod.load_models_gpu
-            _lmg_calls = []
-            def _profiled_lmg(models, memory_required=0, force_patch_weights=False, minimum_memory_required=None, force_full_load=False):
-                _classes = [m.model.__class__.__name__ for m in models if hasattr(m, 'model')]
-                _lm_models = list(getattr(_dmm_mod, 'current_loaded_models', []))
-                _loaded_before = len(_lm_models)
-                # Identity diagnostics for each requested model
-                _diag = []
-                _matched_idx = None
-                _model_patcher = models[0] if models else None
-                for mi, m in enumerate(models):
-                    _m_key = getattr(m, '_comfy_modal_stable_key', None) if hasattr(m, 'model') else None
-                    _md = {
-                        "class": m.model.__class__.__name__ if hasattr(m, 'model') else '?',
-                        "patcher_id": id(m) if hasattr(m, 'model') else 0,
-                        "model_id": id(m.model) if hasattr(m, 'model') else 0,
-                        "matched_idx": -1,
-                        "same_patcher": False,
-                        "stable_key_match": False,
-                        "lm_stable_key": None,
-                    }
-                    for li, lm in enumerate(_lm_models):
-                        _lm_p = lm.model if hasattr(lm, 'model') else None
-                        if _lm_p is not None:
-                            if _lm_p is m:
-                                _md["matched_idx"] = li
-                                _md["same_patcher"] = True
-                                _matched_idx = li
-                                break
-                            # Stable key fallback match
-                            _lm_key = getattr(_lm_p, '_comfy_modal_stable_key', None)
-                            if _m_key and _lm_key and _m_key.get("resolved_path") and _lm_key.get("resolved_path"):
-                                if _m_key["resolved_path"] == _lm_key["resolved_path"] and _m_key["options_str"] == _lm_key["options_str"]:
-                                    _md["matched_idx"] = li
-                                    _md["stable_key_match"] = True
-                                    _md["lm_stable_key"] = _lm_key
-                                    _matched_idx = li
-                                    break
-                    _diag.append(_md)
-                # Fastpath decision
-                _would_fastpath = _matched_idx is not None and len(models) == 1
-                _fp_reject = "none" if _would_fastpath else ("no_identity_match" if _matched_idx is None else "multiple_models")
-                _vram_ok = getattr(_dmm_mod, 'vram_state', None) == _dmm_mod.VRAMState.HIGH_VRAM
-                # GÃ¶Ã‡GÃ¶Ã‡ Guarded fast path execution GÃ¶Ã‡GÃ¶Ã‡
-                if _fp_enabled and _would_fastpath and _vram_ok:
-                    _t0 = time.perf_counter()
-                    _lm = _lm_models[_matched_idx]
-                    _lm.currently_used = True
-                    _t1 = time.perf_counter()
-                    _call_data = {
-                        "ms": round((_t1 - _t0) * 1000, 1),
-                        "models": _classes,
-                        "count": len(models),
-                        "loaded_before": _loaded_before,
-                        "loaded_after": len(getattr(_dmm_mod, 'current_loaded_models', [])),
-                        "identity": _diag,
-                        "fastpath_hit": True,
-                        "fastpath_saved_ms": 0,
-                    }
-                    _lmg_calls.append(_call_data)
-                    _deep_prof["lmg"] = list(_lmg_calls)
-                    return
-                else:
-                    _t0 = time.perf_counter()
-                    try:
-                        return _orig_lmg(models, memory_required, force_patch_weights, minimum_memory_required, force_full_load)
-                    finally:
-                        _t1 = time.perf_counter()
-                        _call_data = {
-                            "ms": round((_t1 - _t0) * 1000, 1),
-                            "models": _classes,
-                            "count": len(models),
-                            "loaded_before": _loaded_before,
-                            "loaded_after": len(getattr(_dmm_mod, 'current_loaded_models', [])),
-                            "identity": _diag,
-                            "would_fastpath": _would_fastpath,
-                            "fp_reject": _fp_reject if not _would_fastpath else ("not_high_vram" if not _vram_ok else "none"),
-                            "fastpath_hit": False,
-                        }
-                        _lmg_calls.append(_call_data)
-                        _deep_prof["lmg"] = list(_lmg_calls)
-            _dmm_mod.load_models_gpu = _profiled_lmg
-            # GÃ¶Ã‡GÃ¶Ã‡ Warmup registration logging GÃ¶Ã‡GÃ¶Ã‡
-            _warmup_lm = list(getattr(_dmm_mod, 'current_loaded_models', []))
-            _deep_prof["warmup"] = {
-                "registered_count": len(_warmup_lm),
-                "entries": [{
-                    "class": lm.model.__class__.__name__ if hasattr(lm, 'model') else '?',
-                    "actual_model": lm.model.model.__class__.__name__ if hasattr(lm, 'model') and hasattr(lm.model, 'model') else '?',
-                    "actual_model_id": id(lm.model.model) if hasattr(lm, 'model') and hasattr(lm.model, 'model') else 0,
-                    "patcher_id": id(lm) if hasattr(lm, 'model') else 0,
-                } for lm in _warmup_lm],
-            }
-            # KSAMPLER.sample setup proved ~0.35ms GÃ‡Ã¶ no further breakdown needed
-            import comfy as _comfy_mod
-            _comfy_mod._comfy_modal_deep_prof = _deep_prof
 
         # GÃ¶Ã‡GÃ¶Ã‡ Execute GÃ¶Ã‡GÃ¶Ã‡
         # PromptExecutor.reset() only clears ComfyUI's per-prompt execution
@@ -17546,6 +18368,8 @@ class _ComfyAPIMixin:
         """
         t0 = time.time()
         _stage = time.time()
+        # V2 snapshot-only pre-import profiling marks (real boundaries only)
+        _pre_import_marks: list[tuple[str, float]] = [("entry", time.perf_counter())]
 
         # GÃ¶Ã‡GÃ¶Ã‡ Match comfy launch CWD GÃ‡Ã¶ ComfyUI modules use relative path
         #    resolution (e.g. ``from utils.install_util import ...``). GÃ¶Ã‡GÃ¶Ã‡
@@ -17556,6 +18380,7 @@ class _ComfyAPIMixin:
 
         # Line-buffered stdout so container logs are not delayed
         sys.stdout.reconfigure(line_buffering=True)
+        _pre_import_marks.append(("path_setup", time.perf_counter()))
         self._log_profile("inproc_chdir_cwd", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17567,12 +18392,29 @@ class _ComfyAPIMixin:
         import utils.extra_config  # establishes utils as the /utils/ package
         import utils.mime_types  # reinforces utils package before comfy loads
 
+        # Match upstream main.py's AIMDO ordering for the isolated Golden
+        # profile.  This must happen before importing comfy model modules:
+        # host_buffer/model_vbar/vram_buffer capture control.lib at import time.
+        if (
+            os.environ.get(
+                "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            or os.environ.get("COMFYMODAL_V2CTL_PROFILE", "").strip().lower()
+            == "golden_p1"
+        ):
+            from comfymodal_runtime.golden_aimdo_activation import (
+                ensure_golden_aimdo_early_init,
+            )
+
+            ensure_golden_aimdo_early_init()
+
         import asyncio
         import comfy.model_management
         import comfy.model_patcher
         import comfy.utils
         import execution
         import nodes
+        _pre_import_marks.append(("core_import", time.perf_counter()))
 
         # GÃ¶Ã‡GÃ¶Ã‡ Generic entrypoint traceback collector GÃ¶Ã‡GÃ¶Ã‡
         # ComfyUI's load_custom_node catches entrypoint exceptions at
@@ -17632,8 +18474,10 @@ class _ComfyAPIMixin:
                 return result
             _comfy_logging.Logger.warning = _patched_logger_warning
             _comfy_logging.Logger._comfy_modal_warning_patched = True
+        _pre_import_marks.append(("logging_patch", time.perf_counter()))
 
         import server as comfy_server
+        _pre_import_marks.append(("server_import", time.perf_counter()))
         self._log_profile("inproc_imports", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17645,6 +18489,7 @@ class _ComfyAPIMixin:
         if PROFILING_ENABLED or _resolve_runtime_flag('model_mgmt_profile', '0'):
             self._patch_model_clone_profiling(comfy.model_patcher)
             self._patch_model_management_profiling(comfy.model_management)
+        _pre_import_marks.append(("model_management", time.perf_counter()))
         self._log_profile("inproc_patch", duration_ms=self._profile_ms(_stage))
         _stage = time.time()
 
@@ -17687,6 +18532,7 @@ class _ComfyAPIMixin:
                 return _orig_get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data)
             execution.get_input_data = _patched_get_input_data
             execution._comfy_modal_sync_cache_patched = True
+        _pre_import_marks.append(("execution_patch", time.perf_counter()))
 
         # GÃ¶Ã‡GÃ¶Ã‡ DummyServer: minimal PromptServer that doesn't bind a port GÃ¶Ã‡GÃ¶Ã‡
         event_loop = asyncio.new_event_loop()
@@ -17727,6 +18573,7 @@ class _ComfyAPIMixin:
         self._dummy_server = dummy
         self._event_loop = event_loop
         self._log_profile("inproc_executor_init", ram_gb=total_ram_gb, cache_gb=cache_ram_gb, duration_ms=self._profile_ms(_stage))
+        _pre_import_marks.append(("server_executor_init", time.perf_counter()))
         _stage = time.time()
 
         # GÃ¶Ã‡GÃ¶Ã‡ Wire up send_sync for execution-progress logging GÃ¶Ã‡GÃ¶Ã‡
@@ -17784,10 +18631,69 @@ class _ComfyAPIMixin:
             })
 
         comfy.utils.set_progress_bar_global_hook(_progress_hook)
+        _pre_import_marks.append(("progress_hook", time.perf_counter()))
 
         # Register built-in + custom nodes (async in ComfyUI v0.22+)
+        # V2 snapshot-only per-custom-node import timing: wraps ComfyUI's
+        # load_custom_node boundary (never edits third-party node source).
+        _snapshot_import_times: list[tuple[float, str, str]] = []
+        if getattr(self, "_snapshot_backend_init", False):
+            _orig_load_custom_node = nodes.load_custom_node
+
+            async def _timed_load_custom_node(
+                module_path: str,
+                ignore=set(),
+                module_parent: str = "custom_nodes",
+            ) -> bool:
+                if module_parent != "custom_nodes":
+                    return await _orig_load_custom_node(
+                        module_path, ignore=ignore, module_parent=module_parent
+                    )
+                _t0 = time.perf_counter()
+                _status = "error"
+                try:
+                    _ok = await _orig_load_custom_node(
+                        module_path, ignore=ignore, module_parent=module_parent
+                    )
+                    _status = "ok" if _ok else "error"
+                    return _ok
+                finally:
+                    _dur_ms = round((time.perf_counter() - _t0) * 1000, 3)
+                    _name = os.path.basename(module_path.rstrip("/\\")) or module_path
+                    _snapshot_import_times.append((_dur_ms, _name, _status))
+                    print(
+                        f"[v2.custom_node_import_timing] name={_name} "
+                        f"duration_ms={_dur_ms} status={_status}",
+                        flush=True,
+                    )
+
+            nodes.load_custom_node = _timed_load_custom_node
+        _pre_import_marks.append(("wrapper_setup", time.perf_counter()))
         _custom_import_wall_ns = time.time_ns()
         _custom_import_mono_ns = time.monotonic_ns()
+        if getattr(self, "_snapshot_backend_init", False):
+            try:
+                _pre_total_ms = round(
+                    (time.perf_counter() - _pre_import_marks[0][1]) * 1000, 3
+                )
+                _pre_parts: list[str] = []
+                _pre_sum_ms = 0.0
+                for _idx in range(1, len(_pre_import_marks)):
+                    _part_ms = round(
+                        (_pre_import_marks[_idx][1] - _pre_import_marks[_idx - 1][1]) * 1000, 3
+                    )
+                    _pre_sum_ms += _part_ms
+                    _pre_parts.append(f"{_pre_import_marks[_idx][0]}_ms={_part_ms}")
+                _pre_residual_ms = round(max(0.0, _pre_total_ms - _pre_sum_ms), 3)
+                print(
+                    "[v2.backend_pre_custom_import] "
+                    f"total_ms={_pre_total_ms} "
+                    + " ".join(_pre_parts)
+                    + f" residual_ms={_pre_residual_ms}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         print(
             f"[v2.startup_stage] stage=custom_node_import event=start "
             f"wall_unix_ns={_custom_import_wall_ns} monotonic_ns={_custom_import_mono_ns}",
@@ -17802,6 +18708,24 @@ class _ComfyAPIMixin:
             "slow_import_summary_source=comfyui.nodes.init_external_custom_nodes",
             flush=True,
         )
+        if getattr(self, "_snapshot_backend_init", False) and _snapshot_import_times:
+            try:
+                _import_total_ms = round(
+                    sum(_entry[0] for _entry in _snapshot_import_times), 3
+                )
+                _top_ten = sorted(_snapshot_import_times, reverse=True)[:10]
+                _top_ten_str = ",".join(
+                    f"{_entry[1]}={_entry[0]}ms" for _entry in _top_ten
+                )
+                print(
+                    f"[v2.custom_node_import_summary] total_ms={_import_total_ms} "
+                    f"node_count={len(_snapshot_import_times)} "
+                    f"slowest=[{_top_ten_str}]",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            self._snapshot_backend_init = False
         self._collect_custom_node_import_health()
         self._apply_sage_attention_policy()
 
@@ -18126,16 +19050,16 @@ class _ComfyAPIMixin:
                 print(f"[dep_manifest] generation compute failed during init: {_cn_init_gen_exc!r}")
             _cn_gen_rec_su = _write_custom_nodes_generation_record_no_commit(
                 reason="startup_init_generation_record",
-                generation=_cn_init_generation or None,
+                content_generation=_cn_init_generation or None,
             )
             # Commit the generation record so the manifest persists it atomically.
             # The manifest write below will be in a separate commit cycle.
             custom_nodes_vol.commit()
             print(
                 f"[dep_manifest] initialized generation="
-                f"{_cn_gen_rec_su['generation'][:12]} reason=startup_init_generation_record"
+                f"{_cn_gen_rec_su['content_generation'][:12]} reason=startup_init_generation_record"
             )
-        _cn_gen_str_su = _cn_gen_rec_su.get("generation", "")
+        _cn_gen_str_su = _cn_gen_rec_su.get("content_generation", "")
 
         # In production modes, missing baked hash must fail closed.
         if not _baked_mft_ok and _repair_mode_s in ("off", "fail_fast"):
@@ -18252,25 +19176,68 @@ class _ComfyAPIMixin:
         """
         import torch
         _started_ns = time.perf_counter_ns()
-        if not torch.cuda.is_available():
+        try:
+            _cuda_available = bool(torch.cuda.is_available())
+        except Exception as _available_exc:
+            _cuda_available = False
+            _available_error = repr(_available_exc)
+        else:
+            _available_error = ""
+        if not _cuda_available:
             return None, {
                 "cuda_available": 0,
                 "cuda_device_index": -1,
                 "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_unavailable",
+                "cuda_error": _available_error,
                 "cuda_context_sync_ms": 0.0,
                 "cuda_context_total_ms": round(
                     (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
                 ),
             }
-        _device_index = torch.cuda.current_device()
-        _device = torch.device(_device_index)
-        _sync_started_ns = time.perf_counter_ns()
-        torch.cuda.synchronize(_device)
+        try:
+            _device_index = torch.cuda.current_device()
+            _device = torch.device(_device_index)
+            _sync_started_ns = time.perf_counter_ns()
+            torch.cuda.synchronize(_device)
+        except Exception as _device_exc:
+            # ``is_available()`` can be true while the driver/device query is
+            # still unavailable (for example during CUDA driver reattachment).
+            # Treat that as unavailable rather than allowing restore to crash.
+            print(f"[comfyapp] cuda context probe deferred: {_device_exc!r}")
+            return None, {
+                "cuda_available": 0,
+                "cuda_device_index": -1,
+                "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_device_probe_failed",
+                "cuda_error": str(_device_exc)[:500],
+                "cuda_context_sync_ms": 0.0,
+                "cuda_context_total_ms": round(
+                    (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+                ),
+            }
         _sync_end_ns = time.perf_counter_ns()
+        try:
+            _device_name = torch.cuda.get_device_name(_device)
+        except Exception as _name_exc:
+            print(f"[comfyapp] cuda device name probe deferred: {_name_exc!r}")
+            return None, {
+                "cuda_available": 0,
+                "cuda_device_index": -1,
+                "cuda_device_name": "",
+                "cuda_skip_reason": "cuda_device_probe_failed",
+                "cuda_error": str(_name_exc)[:500],
+                "cuda_context_sync_ms": round(
+                    (_sync_end_ns - _sync_started_ns) / 1_000_000, 3,
+                ),
+                "cuda_context_total_ms": round(
+                    (time.perf_counter_ns() - _started_ns) / 1_000_000, 3,
+                ),
+            }
         _result = {
             "cuda_available": 1,
             "cuda_device_index": int(_device_index),
-            "cuda_device_name": torch.cuda.get_device_name(_device),
+            "cuda_device_name": _device_name,
             "cuda_context_sync_ms": round(
                 (_sync_end_ns - _sync_started_ns) / 1_000_000, 3,
             ),
@@ -18792,6 +19759,14 @@ class _ComfyAPIMixin:
 
     def _init_unet_cache(self):
         """Initialise instance-level UNET ModelPatcher cache."""
+        # Fast-disk snapshot activation can reach the patched graph loader
+        # without first running ``_start_production_restore_unet``, so the
+        # actual-load registry (``_actual_load_locks`` and its required
+        # companion ``_actual_load_futures``) may not be initialised yet.
+        # ``_init_actual_load_registry`` is hasattr-guarded and idempotent,
+        # so this is a safe no-op when already set.  Gate-OFF behaviour is
+        # unaffected: this only establishes instance attribute defaults.
+        self._init_actual_load_registry()
         if not hasattr(self, '_unet_object_cache'):
             self._unet_object_cache: dict[tuple, object] = {}
             self._unet_cache_hits = 0
@@ -19456,101 +20431,6 @@ class _ComfyAPIMixin:
             setattr(cls, "load_clip", _make_cached_load())
             print(f"[comfyapp] clip_loader_cache: patched {node_name}.load_clip")
 
-    def _patch_model_cache_comparison(self):
-        """Patch LoadedModel.__eq__ to match by class+size+device.
-
-        Gated behind ``deep_profile`` GÃ‡Ã¶ no measurable production win for the
-        current Flux2 workflow (0 hits out of 3 calls; class names differ
-        between warmup and prompt wrappers).  Retained as a diagnostic tool.
-
-        ComfyUI's GPU model cache (``current_loaded_models``) uses Python
-        identity to determine if a model is already loaded:
-        ``self.model is other.model``.  This patch logs cache hit/miss stats
-        in ``comfy.model_management._gpu_cache_eq_stats`` for diagnostic
-        visibility.
-        """
-        import comfy.model_management
-        if getattr(comfy.model_management.LoadedModel, '_comfy_modal_patched', False):
-            return
-        original_eq = comfy.model_management.LoadedModel.__eq__
-        _gpu_stats: dict = {
-            "calls": 0, "class_hits": 0, "modeltype_hits": 0,
-            "misses": 0, "details": {},
-        }
-        comfy.model_management._gpu_cache_eq_stats = _gpu_stats
-
-        def _eq(self, other):
-            _n1 = _n2 = "?"
-            try:
-                _n1 = self.model.model.__class__.__name__ if self.model and self.model.model else "?"
-                _n2 = other.model.model.__class__.__name__ if other.model and other.model.model else "?"
-            except Exception:
-                pass
-            key = f"{_n1}->{_n2}"
-            if self.model is other.model:
-                _gpu_stats["calls"] += 1
-                _gpu_stats["class_hits"] += 1
-                _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                _gpu_stats["details"][key]["hits"] += 1
-                _gpu_stats["details"][key]["last"] = "identity"
-                return True
-            if self.model is None or other.model is None:
-                _gpu_stats["calls"] += 1
-                _gpu_stats["misses"] += 1
-                _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                _gpu_stats["details"][key]["misses"] += 1
-                _gpu_stats["details"][key]["last"] = "none_model"
-                return False
-            if self.device != other.device:
-                _gpu_stats["calls"] += 1
-                _gpu_stats["misses"] += 1
-                _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                _gpu_stats["details"][key]["misses"] += 1
-                _gpu_stats["details"][key]["last"] = "device_mismatch"
-                return False
-            try:
-                n1 = self.model.model.__class__.__name__
-                n2 = other.model.model.__class__.__name__
-                sz1 = self.model.model_size()
-                sz2 = other.model.model_size()
-                if n1 == n2 and sz1 == sz2:
-                    _gpu_stats["calls"] += 1
-                    _gpu_stats["class_hits"] += 1
-                    _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                    _gpu_stats["details"][key]["hits"] += 1
-                    _gpu_stats["details"][key]["last"] = "class_match"
-                    return True
-                # Fallback: match by model_type if class names differ
-                # (e.g. CLIPLoader vs DualCLIPLoader wrappers)
-                try:
-                    t1 = self.model.model.model_type
-                    t2 = other.model.model.model_type
-                    if t1 == t2 and sz1 == sz2:
-                        _gpu_stats["calls"] += 1
-                        _gpu_stats["modeltype_hits"] += 1
-                        _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                        _gpu_stats["details"][key]["hits"] += 1
-                        _gpu_stats["details"][key]["last"] = "modeltype_match"
-                        return True
-                except Exception:
-                    pass
-                _gpu_stats["calls"] += 1
-                _gpu_stats["misses"] += 1
-                _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                _gpu_stats["details"][key]["misses"] += 1
-                _gpu_stats["details"][key]["last"] = f"no_match_{n1}_vs_{n2}_sz{sz1}_vs_{sz2}"
-                return False
-            except Exception:
-                _gpu_stats["calls"] += 1
-                _gpu_stats["misses"] += 1
-                _gpu_stats["details"].setdefault(key, {"hits": 0, "misses": 0})
-                _gpu_stats["details"][key]["misses"] += 1
-                _gpu_stats["details"][key]["last"] = "exception"
-                return original_eq(self, other)
-
-        comfy.model_management.LoadedModel.__eq__ = _eq
-        comfy.model_management.LoadedModel._comfy_modal_patched = True
-
     def _patch_clip_text_encode_cache(self):
         """Cache CLIPTextEncode outputs by text input.
 
@@ -19788,6 +20668,160 @@ class _ComfyAPIMixin:
         except Exception as exc:
             print(f"[comfyapp] clip_cache: patch failed: {exc}")
 
+    def _mark_gpu_restore_deferred(self, reason: str, error: str = "") -> dict:
+        """Keep ComfyUI in CPU mode until CUDA can be reattached safely."""
+        self._gpu_restore_deferred = True
+        result = {
+            # Keep the existing skipped result contract while making the
+            # deferred state explicit for restore/request diagnostics.
+            "status": "skipped",
+            "deferred": True,
+            "reason": reason,
+            "cuda_available": 0,
+        }
+        if error:
+            result["error"] = str(error)[:500]
+        self._gpu_restore_status = result
+        try:
+            import comfy.cli_args
+            comfy.cli_args.args.cpu = True
+        except Exception:
+            pass
+        try:
+            import comfy.model_management
+            _cpu_state = getattr(getattr(comfy.model_management, "CPUState", None), "CPU", None)
+            if _cpu_state is not None:
+                comfy.model_management.cpu_state = _cpu_state
+        except Exception:
+            pass
+        print(
+            f"[comfyapp] gpu_state restore deferred reason={reason}"
+            + (f" error={str(error)[:200]}" if error else "")
+        )
+        return result
+
+    def _refresh_gpu_snapshot_memory(self) -> dict:
+        """Refresh memory totals for a GPU snapshot without probing too early."""
+        import torch
+
+        try:
+            if not torch.cuda.is_available():
+                return self._mark_gpu_restore_deferred("cuda_unavailable")
+        except Exception as _available_exc:
+            return self._mark_gpu_restore_deferred("cuda_probe_failed", repr(_available_exc))
+
+        try:
+            # Validate the driver/device handoff before ComfyUI's helper.  The
+            # latter also calls current_device() on some ComfyUI revisions.
+            _device_index = torch.cuda.current_device()
+            import comfy.cli_args
+            import comfy.model_management
+            import psutil
+            # The snapshot can restore ComfyUI's import-time CPU state even
+            # though the CUDA driver is ready.  Flip that state before asking
+            # model-management for its device; otherwise it reports CPU and
+            # this path falsely defers the restore.
+            comfy.cli_args.args.cpu = False
+            comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
+            comfy.model_management.DISABLE_SMART_MEMORY = False
+            if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+                comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+            _comfy_device = comfy.model_management.get_torch_device()
+            _device_type = getattr(_comfy_device, "type", str(_comfy_device).split(":", 1)[0])
+            if _device_type != "cuda":
+                return self._mark_gpu_restore_deferred(
+                    "non_cuda_device", str(_comfy_device)
+                )
+            from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+            _frozen_vram = apply_frozen_total_vram_or_none()
+            if _frozen_vram is not None:
+                comfy.model_management.total_vram = _frozen_vram
+            else:
+                comfy.model_management.total_vram = (
+                    comfy.model_management.get_total_memory(_comfy_device)
+                    / (1024 * 1024)
+                )
+            comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+        except Exception as _restore_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_restore_exc)
+            )
+
+        self._gpu_restore_deferred = False
+        result = {"status": "ok", "reason": "gpu_snapshot", "cuda_available": 1}
+        self._gpu_restore_status = result
+        return result
+
+    def _ensure_gpu_ready_for_request(self) -> None:
+        """Retry a deferred in-process GPU restore before touching a prompt."""
+        if self._select_backend() != "in_process":
+            return
+        if not getattr(self, "_gpu_restore_deferred", False):
+            return
+
+        print("[comfyapp] retrying deferred GPU restore at request entry")
+        _restore_result = self._restore_in_process_gpu_state() or {}
+        if _restore_result.get("status") != "ok":
+            raise RuntimeError(
+                "CUDA unavailable after snapshot restore; refusing to execute "
+                "the request in ComfyUI CPU mode "
+                f"(reason={_restore_result.get('reason', 'unknown')})."
+            )
+        _device, _diag = self._initialize_cuda_context()
+        if _device is None:
+            _reason = (_diag or {}).get("cuda_skip_reason", "cuda_unavailable")
+            _error = (_diag or {}).get("cuda_error", "")
+            self._mark_gpu_restore_deferred(_reason, _error)
+            raise RuntimeError(
+                "CUDA unavailable after snapshot restore; refusing to execute "
+                "the request in ComfyUI CPU mode "
+                f"(reason={_reason})."
+            )
+        self._gpu_restore_deferred = False
+        _rt = getattr(self, "_last_restore_timing", None)
+        if isinstance(_rt, dict):
+            _rt["gpu_restore_request_retry"] = 1
+            _rt["gpu_restore_request_retry_status"] = "ok"
+        print("[comfyapp] deferred GPU restore succeeded at request entry")
+
+    def _record_degraded_restore(
+        self,
+        stages: dict,
+        restore_start: float,
+        restore_start_wall_s: float,
+        restore_start_ns: int,
+    ) -> None:
+        """Persist restore timing when GPU reattachment must be deferred."""
+        _restore_end = time.time()
+        stages["restore_degraded"] = 1
+        stages["restore_end_mono_ns"] = time.perf_counter_ns()
+        self._last_restore_timing = {
+            "restore_total_ms": self._profile_ms(restore_start),
+            "restore_start_unix_s": restore_start,
+            "restore_end_unix_s": _restore_end,
+            "restore_method_start_wall_unix_ns": int(restore_start_wall_s * 1_000_000_000),
+            "restore_method_start_mono_ns": restore_start_ns,
+            "restore_method_end_wall_unix_ns": int(_restore_end * 1_000_000_000),
+            "restore_method_end_mono_ns": stages["restore_end_mono_ns"],
+            "restore_method_status": "degraded",
+            "lifecycle_status": "degraded",
+            "lifecycle_method": "restore",
+            **stages,
+        }
+        print(
+            f"[comfyapp] restore degraded; GPU reattachment deferred "
+            f"restore_total_ms={self._last_restore_timing['restore_total_ms']}"
+        )
+        _log_remote_identity(
+            "restore",
+            cls_name=self.__class__.__name__,
+            method_name="restore",
+            restore_session_id=self._last_restore_timing.get("restore_session_id", ""),
+            snapshot_created=0,
+            restored_from_snapshot=1,
+            restored_instance_id=self._restored_instance_id,
+        )
+
     def _restore_in_process_gpu_state(self):
         """Re-enable ComfyUI GPU mode after a CPU-only snapshot import.
 
@@ -19800,26 +20834,86 @@ class _ComfyAPIMixin:
         paths fail with "Input tensors must be on cuda".
         """
         _t0 = time.time()
-        import comfy.cli_args
-        import comfy.model_management
-        import psutil
+        import torch
 
-        comfy.cli_args.args.cpu = False
-        comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
-        comfy.model_management.total_vram = (
-            comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-            / (1024 * 1024)
-        )
-        comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
-        comfy.model_management.DISABLE_SMART_MEMORY = False
-        if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
-            comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+        # A CPU-only restore must remain a no-op for GPU state.  In
+        # particular, do not let ComfyUI's device helper probe the driver
+        # before the raw CUDA availability and current-device checks below.
+        try:
+            if not torch.cuda.is_available():
+                return self._mark_gpu_restore_deferred("cuda_unavailable")
+        except Exception as _available_exc:
+            return self._mark_gpu_restore_deferred("cuda_probe_failed", repr(_available_exc))
+
+        try:
+            # Probe the raw CUDA driver before changing ComfyUI state.  This
+            # preserves the no-device guard while making the ordering explicit
+            # for snapshot restores where model-management still says CPU.
+            _device_index = torch.cuda.current_device()
+        except Exception as _device_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_device_exc)
+            )
+
+        try:
+            import comfy.cli_args
+            import comfy.model_management
+            import psutil
+        except Exception as _module_exc:
+            return self._mark_gpu_restore_deferred(
+                "gpu_restore_import_failed", repr(_module_exc)
+            )
+
+        try:
+            # Re-enable GPU mode before get_torch_device(): that helper derives
+            # its answer from the restored CPUState on deferred retries.
+            comfy.cli_args.args.cpu = False
+            comfy.model_management.cpu_state = comfy.model_management.CPUState.GPU
+            comfy.model_management.DISABLE_SMART_MEMORY = False
+            if hasattr(comfy.model_management, "VRAMState") and hasattr(comfy.model_management.VRAMState, "HIGH_VRAM"):
+                comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+
+            _device = comfy.model_management.get_torch_device()
+            _device_type = getattr(_device, "type", str(_device).split(":", 1)[0])
+            if _device_type != "cuda":
+                return self._mark_gpu_restore_deferred("non_cuda_device", str(_device))
+
+            # ── V2 restore_memory experiment (deployment-level, default baseline) ──
+            # When the optimized arm is active and a frozen GPU-capacity snapshot
+            # exists, skip the torch.cuda.mem_get_info round trip entirely — the
+            # frozen value is the SAME physical total VRAM of the deployment GPU.
+            from comfymodal_runtime.restore_memory_arm import apply_frozen_total_vram_or_none
+            _frozen_vram = apply_frozen_total_vram_or_none()
+            if _frozen_vram is not None:
+                comfy.model_management.total_vram = _frozen_vram
+                if _opt_diag_enabled():
+                    print(f"[v2.opt.gpu_state] total_memory_ms=frozen:{_frozen_vram:.0f}")
+                _restore_memory_experiment_log_once()
+            else:
+                # ── V2 Python-restore decomposition (measurement-only, gated) ──
+                _opt_t0 = time.monotonic_ns() if _opt_diag_enabled() else None
+                comfy.model_management.total_vram = (
+                    comfy.model_management.get_total_memory(_device)
+                    / (1024 * 1024)
+                )
+                if _opt_t0 is not None:
+                    _opt_total_memory_ms = round(
+                        (time.monotonic_ns() - _opt_t0) / 1_000_000, 3
+                    )
+                    print(f"[v2.opt.gpu_state] total_memory_ms={_opt_total_memory_ms}")
+            comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+        except Exception as _restore_exc:
+            return self._mark_gpu_restore_deferred(
+                "cuda_device_probe_failed", repr(_restore_exc)
+            )
         _t1 = time.time()
         print(f"[comfyapp] gpu_state restored vram={comfy.model_management.total_vram:.0f}MB "
               f"ram={comfy.model_management.total_ram:.0f}MB "
               f"vram_state={comfy.model_management.vram_state} "
               f"in {(_t1-_t0)*1000:.1f}ms")
-
+        self._gpu_restore_deferred = False
+        self._gpu_restore_status = {"status": "ok", "cuda_available": 1}
+        return self._gpu_restore_status
     def _should_reload_models_volume(self) -> bool:
         """Determine whether the models Volume needs a reload.
 
@@ -19839,10 +20933,17 @@ class _ComfyAPIMixin:
 
     @modal.enter(snap=False)
     def restore(self):
-        log_effective_runtime_shape(stage="after_restore")
+        # Avoid the optional runtime-shape diagnostic on the E37 path; the
+        # effective restore mode is logged below with the lifecycle identity.
+        if not env_flag("COMFYMODAL_MINIMAL_RESTORE", default=MINIMAL_RESTORE_DEFAULT):
+            log_effective_runtime_shape(stage="after_restore")
         # ── Post-snapshot restored-instance identity ──
         self._restored_instance_id = uuid.uuid4().hex[:16]
         self._restored_instance_start_unix = time.time()
+        # A new restore gets a fresh GPU handoff decision.  A previous
+        # degraded restore must not force a retry after this one succeeds.
+        self._gpu_restore_deferred = False
+        self._gpu_restore_status = {}
 
         # P1 (corrected): reset the UNET boundary barrier events at
         # the start of every restore. A memory snapshot or a
@@ -19927,6 +21028,141 @@ class _ComfyAPIMixin:
         )
 
         is_in_proc = (self._select_backend() == "in_process")
+        _cu_device = None
+
+        # E37 controlled restore path.  Keep this branch before *any* volume,
+        # generation, custom-node, profile, prompt-cache, preload, or model
+        # reads.  The only work retained here is backend creation when a
+        # deferred snapshot needs it and the CUDA context/state handoff that
+        # an in-process backend needs before the first method call.  The
+        # complete historical restore remains below and is selected with
+        # COMFYMODAL_MINIMAL_RESTORE=0 for rollback/debug runs.
+        _minimal_restore_effective = env_flag(
+            "COMFYMODAL_MINIMAL_RESTORE", default=MINIMAL_RESTORE_DEFAULT
+        )
+        print(
+            f"[comfyapp.restore] minimal_restore_effective={int(_minimal_restore_effective)} "
+            f"source=COMFYMODAL_MINIMAL_RESTORE default={int(MINIMAL_RESTORE_DEFAULT)}"
+        )
+        __stages["minimal_restore_effective"] = int(_minimal_restore_effective)
+        __stages["minimal_restore_path"] = (
+            "lifecycle_backend_cuda_only" if _minimal_restore_effective else "legacy_full_restore"
+        )
+        if _minimal_restore_effective:
+            __stages.update({
+                "minimal_restore_effective": 1,
+                "minimal_restore_path": "lifecycle_backend_cuda_only",
+                "custom_nodes_sync_skipped": 1,
+                "custom_nodes_sync_skip_reason": "minimal_restore",
+                "custom_node_requirements_skipped": 1,
+                "models_generation_read_skipped": 1,
+                "models_volume_reload_skipped": 1,
+                "prompt_cache_hydration_skipped": 1,
+                "restore_preload_submitted_early": 0,
+                "restore_preload_joined": 0,
+                "restore_background_unet_submitted": 0,
+                "production_unet_submitted": 0,
+                "direct_warmup_skipped": 1,
+                "vae_decode_warmup_submitted": 0,
+                "optional_cuda_warmup_skipped": 1,
+            })
+            _backend_deferred = False
+            if is_in_proc:
+                _backend_inited = getattr(self, "_event_loop", None) is not None
+                if not _backend_inited:
+                    _backend_started_at = time.time()
+                    self._start_backend()
+                    _backend_deferred = True
+                    __stages["deferred_backend_init_ms"] = self._profile_ms(
+                        _backend_started_at
+                    )
+                __stages["minimal_restore_backend"] = self._select_backend()
+                if self._select_backend() == "in_process":
+                    if not ENABLE_GPU_SNAPSHOT and not _backend_deferred:
+                        _gpu_started_at = time.time()
+                        _gpu_result = self._restore_in_process_gpu_state() or {}
+                        __stages["gpu_state_ms"] = self._profile_ms(_gpu_started_at)
+                    else:
+                        _gpu_result = {"status": "ok", "reason": "gpu_snapshot"}
+                        __stages["gpu_state_ms"] = 0.0
+                        __stages["gpu_state_skip_reason"] = (
+                            "backend_initialized_with_gpu" if _backend_deferred
+                            else "gpu_snapshot"
+                        )
+                    _cuda_started_at = time.time()
+                    _cu_device, _cu_diag = self._initialize_cuda_context()
+                    if _cu_device is None and _gpu_result.get("status") == "ok":
+                        _gpu_result = self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                    __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
+                    __stages["cuda_warmup_ms"] = self._profile_ms(_cuda_started_at)
+                    __stages["cuda_context_ready"] = 1 if _cu_device is not None else 0
+                    if _cu_diag:
+                        __stages["cuda_context_sync_ms"] = _cu_diag.get(
+                            "cuda_context_sync_ms", 0
+                        )
+                        __stages["cuda_context_total_ms"] = _cu_diag.get(
+                            "cuda_context_total_ms", 0
+                        )
+                else:
+                    __stages["cuda_context_ready"] = 0
+                    __stages["cuda_skip_reason"] = "subprocess_backend"
+            else:
+                __stages["minimal_restore_backend"] = self._select_backend()
+                __stages["cuda_context_ready"] = 0
+                __stages["cuda_skip_reason"] = "subprocess_backend"
+
+            _minimal_restore_end = time.time()
+            __stages["restore_end_mono_ns"] = time.perf_counter_ns()
+            self._last_restore_timing = {
+                "restore_total_ms": self._profile_ms(restore_start),
+                "restore_wall_ms_excluding_scheduling": self._profile_ms(restore_start),
+                "restore_timing_boundary": "restore_method_entry_to_restore_return",
+                "restore_start_unix_s": restore_start,
+                "restore_end_unix_s": _minimal_restore_end,
+                "restore_method_start_wall_unix_ns": int(restore_start_wall_s * 1_000_000_000),
+                "restore_method_start_mono_ns": restore_start_ns,
+                "restore_method_end_wall_unix_ns": int(_minimal_restore_end * 1_000_000_000),
+                "restore_method_end_mono_ns": __stages["restore_end_mono_ns"],
+                "restore_method_status": "success" if (not is_in_proc or _cu_device is not None) else "degraded",
+                "restore_session_id": __stages["restore_session_id"],
+                "restored_instance_id": self._restored_instance_id,
+                "container_session_id": CONTAINER_SESSION_ID,
+                "snapshot_import_session_id": CONTAINER_SESSION_ID,
+                "restore_count": _container_restore_count,
+                "lifecycle_status": "ok" if (not is_in_proc or _cu_device is not None) else "degraded",
+                "lifecycle_method": "restore",
+                "warmup_status": "skipped_minimal_restore",
+                "warmup_profile": {},
+                "warmup_profile_source": "none",
+                "warmup_profile_token": "",
+                **__stages,
+            }
+            if is_in_proc and _cu_device is None:
+                self._last_restore_timing["restore_degraded"] = 1
+            self._record_critical_path_restore(
+                "restore_minimal_exit",
+                extra={"minimal_restore_effective": 1},
+            )
+            print(
+                f"[comfyapp] minimal restore complete "
+                f"restore_session_id={self._last_restore_timing['restore_session_id']} "
+                f"restored_instance_id={self._restored_instance_id} "
+                f"restore_total_ms={self._last_restore_timing['restore_total_ms']}"
+            )
+            _log_remote_identity(
+                "restore",
+                cls_name=self.__class__.__name__,
+                method_name="restore",
+                restore_session_id=self._last_restore_timing["restore_session_id"],
+                snapshot_created=0,
+                restored_from_snapshot=1,
+                restored_instance_id=self._restored_instance_id,
+            )
+            return
 
         _s = time.time()
         self._ensure_models_symlink()
@@ -20511,13 +21747,9 @@ class _ComfyAPIMixin:
                 print(f"[restore.order] event=gpu_state_start "
                       f"gpu_snapshot={'enabled' if ENABLE_GPU_SNAPSHOT else 'cpu_only'} "
                       f"at_ms_from_restore_start={__stages['gpu_state_start_ms_from_restore_start']}")
-                import comfy.model_management
-                import psutil
-                comfy.model_management.total_vram = (
-                    comfy.model_management.get_total_memory(comfy.model_management.get_torch_device())
-                    / (1024 * 1024)
-                )
-                comfy.model_management.total_ram = psutil.virtual_memory().total / (1024 * 1024)
+                _gpu_result = self._refresh_gpu_snapshot_memory()
+                __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
                 __stages["gpu_state_ms"] = self._profile_ms(_s)
                 __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["gpu_state_end_ns"] = time.perf_counter_ns()
@@ -20525,12 +21757,29 @@ class _ComfyAPIMixin:
                 _s = time.time()
                 __stages["cuda_start_ms_from_restore_start"] = round((_s - restore_start) * 1000, 1)
                 _cu_device, _cu_diag = self._initialize_cuda_context()
+                if _cu_device is None and _gpu_result.get("status") == "ok":
+                    _gpu_result = self._mark_gpu_restore_deferred(
+                        (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                        (_cu_diag or {}).get("cuda_error", ""),
+                    )
+                    __stages["gpu_restore_status"] = _gpu_result.get("status", "unknown")
+                    __stages["gpu_restore_reason"] = _gpu_result.get("reason", "")
                 __stages["cuda_warmup_ms"] = self._profile_ms(_s)
                 __stages["cuda_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["cuda_context_end_ns"] = time.perf_counter_ns()
                 if _cu_diag:
                     __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
                     __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
+                if _cu_device is None:
+                    if not getattr(self, "_gpu_restore_deferred", False):
+                        self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    self._record_degraded_restore(
+                        __stages, restore_start, restore_start_wall_s, restore_start_ns
+                    )
+                    return
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
@@ -20553,6 +21802,10 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                _sage_identity = getattr(self, "_sage_probe_identity", {}) or {}
+                __stages["sage_identity_digest"] = _sage_identity.get("identity_digest", "")
+                __stages["sage_selected_symbol"] = _sage_identity.get("selected_symbol", "")
+                __stages["sage_kernel_family"] = _sage_identity.get("kernel_family", "")
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
                 __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(
@@ -20571,7 +21824,9 @@ class _ComfyAPIMixin:
                     print(f"[restore.order] event=gpu_state_start "
                           f"gpu_snapshot={'enabled' if ENABLE_GPU_SNAPSHOT else 'cpu_only'} "
                           f"at_ms_from_restore_start={__stages['gpu_state_start_ms_from_restore_start']}")
-                    self._restore_in_process_gpu_state()
+                    _gpu_result = self._restore_in_process_gpu_state()
+                    __stages["gpu_restore_status"] = (_gpu_result or {}).get("status", "unknown")
+                    __stages["gpu_restore_reason"] = (_gpu_result or {}).get("reason", "")
                     __stages["gpu_state_ms"] = self._profile_ms(_s)
                     __stages["gpu_state_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                     __stages["gpu_state_end_ns"] = time.perf_counter_ns()
@@ -20590,6 +21845,16 @@ class _ComfyAPIMixin:
                 if _cu_diag:
                     __stages["cuda_context_sync_ms"] = _cu_diag.get("cuda_context_sync_ms", 0)
                     __stages["cuda_context_total_ms"] = _cu_diag.get("cuda_context_total_ms", 0)
+                if _cu_device is None:
+                    if not getattr(self, "_gpu_restore_deferred", False):
+                        self._mark_gpu_restore_deferred(
+                            (_cu_diag or {}).get("cuda_skip_reason", "cuda_unavailable"),
+                            (_cu_diag or {}).get("cuda_error", ""),
+                        )
+                    self._record_degraded_restore(
+                        __stages, restore_start, restore_start_wall_s, restore_start_ns
+                    )
+                    return
                 print(f"[restore.order] event=cuda_context_ready "
                       f"cuda_warmup_ms={__stages.get('cuda_warmup_ms', 0)} "
                       f"at_ms_from_restore_start={__stages['cuda_end_ms_from_restore_start']}")
@@ -20605,8 +21870,6 @@ class _ComfyAPIMixin:
                 comfy.utils.DISABLE_MMAP = True
                 _patch_s = time.time()
                 __stages["patch_start_ms_from_restore_start"] = round((_patch_s - restore_start) * 1000, 1)
-                if _resolve_runtime_flag('deep_profile', '0'):
-                    self._patch_model_cache_comparison()
                 self._patch_clip_text_encode_cache()
                 self._patch_clip_loader_cache()
                 self._patch_unet_loader_cache()
@@ -20643,6 +21906,10 @@ class _ComfyAPIMixin:
                 __stages["sage_end_ms_from_restore_start"] = round((time.time() - restore_start) * 1000, 1)
                 __stages["sage_mode"] = mode
                 __stages["sage_reason"] = reason
+                _sage_identity = getattr(self, "_sage_probe_identity", {}) or {}
+                __stages["sage_identity_digest"] = _sage_identity.get("identity_digest", "")
+                __stages["sage_selected_symbol"] = _sage_identity.get("selected_symbol", "")
+                __stages["sage_kernel_family"] = _sage_identity.get("kernel_family", "")
                 __stages["sage_env_mode"] = SAGE_RUNTIME_MODE
                 __stages["sage_probe_on_restore"] = 1 if SAGE_RUNTIME_PROBE_ON_RESTORE else 0
                 self._log_profile(
@@ -21186,134 +22453,6 @@ class _ComfyAPIMixin:
                 __stages["volume_stall_degraded_mode"] = "1" if getattr(self, "_volume_stall_degraded_mode", False) else "0"
                 warmup_result = {"mode": profile.get("mode", "none") if profile else "none", "status": _pre_status, "preload_count": preload_result.get("count", 0)}
 
-                # GÃ¶Ã‡GÃ¶Ã‡ ModelPatcher lineage trace (creation / clone / flow) GÃ¶Ã‡
-                # Logs every ModelPatcher.__init__ and .clone() with caller
-                # context to find where identity diverges from warmup.
-                _mp_trace = _resolve_runtime_flag('modelpatcher_trace', '0')
-                if _mp_trace:
-                    try:
-                        import comfy.model_patcher as _cmpat
-                        import traceback as _ctb
-                        _orig_mp_init = _cmpat.ModelPatcher.__init__
-                        _orig_mp_clone = _cmpat.ModelPatcher.clone
-                        def _traced_init(self, model, load_device, offload_device, size=0, weight_inplace_update=False):
-                            _orig_mp_init(self, model, load_device, offload_device, size, weight_inplace_update)
-                            # Attach stable key from cached_patcher_init if available
-                            _stable_key = getattr(self, '_comfy_modal_stable_key', None)
-                            if _stable_key is None and hasattr(self, 'cached_patcher_init') and self.cached_patcher_init:
-                                try:
-                                    _func, _args = self.cached_patcher_init
-                                    if _func and len(_args) >= 1:
-                                        import os as _mp_os
-                                        _path = _mp_os.path.realpath(_args[0]) if hasattr(_mp_os.path, 'realpath') else str(_args[0])
-                                        _opts = str(sorted(_args[1].items())) if len(_args) > 1 and _args[1] else "default"
-                                        self._comfy_modal_stable_key = {"resolved_path": _path, "options_str": _opts, "model_class": model.__class__.__name__}
-                                        _stable_key = self._comfy_modal_stable_key
-                                except Exception:
-                                    pass
-                            # Fallback: compute from model attributes
-                            if _stable_key is None:
-                                self._comfy_modal_stable_key = {
-                                    "resolved_path": "unknown",
-                                    "options_str": "unknown",
-                                    "model_class": model.__class__.__name__ if hasattr(model, '__class__') else '?',
-                                }
-                                _stable_key = self._comfy_modal_stable_key
-                            import comfy.samplers as _mp_samp
-                            if not hasattr(_mp_samp, '_comfy_modal_mp_trace'):
-                                _mp_samp._comfy_modal_mp_trace = []
-                            _mp_trace_list = _mp_samp._comfy_modal_mp_trace
-                            _frames = list(_ctb.walk_stack(None))[-10:-1]
-                            _short = ["{}:{}:{}".format(f[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if f[0] else '?', f[1], f[0].f_code.co_name if f[0] else '?') for f in _frames]
-                            _mp_trace_list.append({"event":"CREATE","patcher_id":id(self),"model_id":id(model),"model_class":model.__class__.__name__,"stable_key":str(_stable_key),"callers":_short})
-                        def _traced_clone(self, disable_dynamic=False, model_override=None):
-                            _result = _orig_mp_clone(self, disable_dynamic, model_override)
-                            import comfy.samplers as _mp_samp2
-                            if hasattr(_mp_samp2, '_comfy_modal_mp_trace'):
-                                _tl = _mp_samp2._comfy_modal_mp_trace
-                                _frames = list(_ctb.walk_stack(None))[-10:-1]
-                                _short = []
-                                for _f2 in _frames:
-                                    _fn2 = _f2[0].f_code.co_filename.split('/')[-1].split('\\')[-1] if _f2[0] else '?'
-                                    _ln2 = _f2[1]
-                                    _nm2 = _f2[0].f_code.co_name if _f2[0] else '?'
-                                    _short.append("{}:{}:{}".format(_fn2, _ln2, _nm2))
-                                _same = hasattr(_result, 'model') and hasattr(self, 'model') and _result.model is self.model
-                                _tl.append({"event":"CLONE","from_id":id(self),"to_id":id(_result),"model_id":id(self.model) if hasattr(self,'model') else '?',"same_model":_same,"callers":_short})
-                            return _result
-                        _cmpat.ModelPatcher.__init__ = _traced_init
-                        _cmpat.ModelPatcher.clone = _traced_clone
-                        print("[comfyapp] modelpatcher_trace INSTALLED")
-                    except Exception as _mpt_exc:
-                        print(f"[comfyapp] modelpatcher_trace FAILED: {_mpt_exc}")
-                    # Also trace key node functions
-                    try:
-                        import comfy_extras.nodes_custom_sampler as _mpncs
-                        _orig_cfg_exec = _mpncs.CFGGuider.execute
-                        _orig_sca_exec = _mpncs.SamplerCustomAdvanced.execute
-                        @classmethod
-                        def _traced_cfg_exec(cls, model, positive, negative, cfg):
-                            import comfy.samplers as _mp_samp3
-                            if hasattr(_mp_samp3, '_comfy_modal_mp_trace'):
-                                _mp_samp3._comfy_modal_mp_trace.append({"event":"CFGGuider_INPUT","patcher_id":id(model),"model_id":id(model.model) if hasattr(model,'model') else '?'})
-                            result = _orig_cfg_exec(model, positive, negative, cfg)
-                            return result
-                        @classmethod
-                        def _traced_sca_exec(cls, noise, guider, sampler, sigmas, latent_image):
-                            import comfy.samplers as _mp_samp4
-                            _mp = getattr(guider, 'model_patcher', None)
-                            if _mp and hasattr(_mp_samp4, '_comfy_modal_mp_trace'):
-                                _mp_samp4._comfy_modal_mp_trace.append({"event":"SamplerCustomAdvanced_GUIDER_MP","patcher_id":id(_mp),"model_id":id(_mp.model) if hasattr(_mp,'model') else '?'})
-                            result = _orig_sca_exec(noise, guider, sampler, sigmas, latent_image)
-                            return result
-                        _mpncs.CFGGuider.execute = _traced_cfg_exec
-                        _mpncs.CFGGuider.get_guider = _traced_cfg_exec
-                        _mpncs.SamplerCustomAdvanced.execute = _traced_sca_exec
-                        _mpncs.SamplerCustomAdvanced.sample = _traced_sca_exec
-                    except Exception as _mptn_exc:
-                        print(f"[comfyapp] modelpatcher_trace node patch FAILED: {_mptn_exc}")
-
-                # GÃ¶Ã‡GÃ¶Ã‡ Canonical ModelPatcher cache (warmupGÃ¥Ã†prompt reuse) GÃ¶Ã‡GÃ¶Ã‡
-                _mp_cache = _resolve_runtime_flag('modelpatcher_cache', '0')
-                _mp_cache_dryrun = _resolve_runtime_flag('modelpatcher_cache_dryrun', '0')
-                _mp_cache_store = {}
-                if _mp_cache or _mp_cache_dryrun:
-                    try:
-                        import comfy.sd as _csd
-                        import os as _os
-                        _orig_load_diff = _csd.load_diffusion_model
-                        def _cached_load_diff(unet_path, model_options=None, disable_dynamic=False):
-                            if model_options is None:
-                                model_options = {}
-                            _real = _os.path.realpath(unet_path) if hasattr(_os.path, 'realpath') else unet_path
-                            _opts_str = str(sorted(model_options.items())) if model_options else "default"
-                            _key = (_real, _opts_str)
-                            _hit = _key in _mp_cache_store
-                            if _mp_cache_dryrun or _mp_cache:
-                                print(f"[comfyapp] modelpatcher_cache: key={_key} hit={_hit} dryrun={_mp_cache_dryrun} active={_mp_cache}")
-                            if _mp_cache and _hit:
-                                _cached = _mp_cache_store[_key]
-                                print(f"[comfyapp] modelpatcher_cache HIT GÃ‡Ã¶ returning cached ModelPatcher id={id(_cached)}")
-                                return _cached
-                            _result = _orig_load_diff(unet_path, model_options=model_options, disable_dynamic=disable_dynamic)
-                            if not _hit:
-                                _mp_cache_store[_key] = _result
-                                print(f"[comfyapp] modelpatcher_cache STORE GÃ‡Ã¶ key={_key} patcher_id={id(_result)} model_id={id(_result.model) if hasattr(_result,'model') else 0}")
-                            # Tag with stable key for identity matching
-                            try:
-                                _result._comfy_modal_stable_key = {
-                                    "resolved_path": _real,
-                                    "options_str": _opts_str,
-                                    "model_class": _result.model.__class__.__name__ if hasattr(_result, 'model') else '?',
-                                    "model_id": id(_result.model) if hasattr(_result, 'model') else 0,
-                                }
-                            except Exception:
-                                pass
-                            return _result
-                        _csd.load_diffusion_model = _cached_load_diff
-                    except Exception as _mp_exc:
-                        print(f"[comfyapp] modelpatcher_cache install FAILED: {_mp_exc}")
-
                 # â”€â”€ v2.16.21: Restore-background UNET â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if _fp_state.get("fastpath_background_unet") and _restore_preload_handle is not None and _preload_status == "ok":
                     _rbg_decision = self._maybe_submit_restore_background_unet(
@@ -21654,6 +22793,8 @@ class _ComfyAPIMixin:
         _restore_end = time.time()
         self._last_restore_timing = {
             "restore_total_ms": self._profile_ms(restore_start),
+            "restore_wall_ms_excluding_scheduling": self._profile_ms(restore_start),
+            "restore_timing_boundary": "restore_method_entry_to_restore_return",
             "restore_start_unix_s": restore_start,
             "restore_end_unix_s": _restore_end,
             "warmup_status": warmup_status,
@@ -21786,6 +22927,10 @@ class _ComfyAPIMixin:
             "request_modal_entry",
             extra={"method": "run_prompt"},
         )
+        # A restore that could not see CUDA deliberately leaves ComfyUI in
+        # CPU mode.  Retry that handoff before any request-side sync/preflight
+        # can touch model state, and fail closed if the GPU is still absent.
+        self._ensure_gpu_ready_for_request()
 
         _v4_events: list[dict] = []
         _pd_run = _collect_platform_diagnostics(self.__class__.__name__)
@@ -21838,28 +22983,17 @@ class _ComfyAPIMixin:
                 1,
             )
 
-        # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
-        _scheduler_config_ns = (modal_options or {}).get("comfymodal_scheduler_test")
-        _is_scheduler_test_ns = isinstance(_scheduler_config_ns, dict) and _scheduler_config_ns.get("enabled")
-        _scheduler_trace_ns = None
-
-        if _is_scheduler_test_ns:
-            self._preflight_already_ran = False
-            self._start_scheduler_test(workflow, _scheduler_config_ns)
-            _scheduler_trace_ns = self._scheduler_wait_and_finalize()
-            self._preflight_already_ran = True
-        else:
-            # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
-            # Replaces the inline custom-node sync + preflight logic with a
-            # single method used by both run_prompt and run_prompt_stream.
-            self._preflight_already_ran = False
-            _cn_sync_start = time.time()
-            _policy = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=False)
-            self._preflight_already_ran = True
-            __stages = getattr(self, "_last_restore_timing", None)
-            if isinstance(__stages, dict):
-                __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
-                __stages["run_prompt_cn_created"] = _policy.get("sync_created_count", 0)
+        # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
+        # Replaces the inline custom-node sync + preflight logic with a
+        # single method used by both run_prompt and run_prompt_stream.
+        self._preflight_already_ran = False
+        _cn_sync_start = time.time()
+        _policy = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=False)
+        self._preflight_already_ran = True
+        __stages = getattr(self, "_last_restore_timing", None)
+        if isinstance(__stages, dict):
+            __stages["run_prompt_cn_sync_ms"] = round((time.time() - _cn_sync_start) * 1000, 1)
+            __stages["run_prompt_cn_created"] = _policy.get("sync_created_count", 0)
 
         # GÃ¶Ã‡GÃ¶Ã‡ In-process backend: direct execution, no HTTP GÃ¶Ã‡GÃ¶Ã‡
         if self._select_backend() == "in_process":
@@ -22025,8 +23159,6 @@ class _ComfyAPIMixin:
             print(f"[container_id] session={CONTAINER_SESSION_ID} import_unix={CONTAINER_IMPORT_UNIX_S} restore_count={_container_restore_count} request_seq={_container_request_count} restore_session={trace_summary['restore_session_id']}")
             result["trace"] = trace_summary
             _log_cold_start_waterfall(trace_summary, label="run_prompt")
-            if isinstance(_scheduler_trace_ns, dict):
-                result["scheduler_trace"] = dict(_scheduler_trace_ns)
 
             # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡GÃ¶Ã‡
             self._finalize_actual_load_records()
@@ -22156,11 +23288,6 @@ class _ComfyAPIMixin:
                 result["_sampler_profile"] = dict(_sampler_prof)
                 print(f"[comfyapp] sampler_profile: {_sampler_prof}")
                 _sampler_prof.clear()
-            # ModelPatcher trace data
-            _mp_trace_data = getattr(_samplers_mod, '_comfy_modal_mp_trace', None)
-            if _mp_trace_data:
-                result["_modelpatcher_trace"] = list(_mp_trace_data)
-                _mp_trace_data.clear()
             # Guider profiling data
             _guider_prof = getattr(_samplers_mod, '_comfy_modal_guider_prof', None)
             if _guider_prof and _guider_prof.get("segments"):
@@ -22168,21 +23295,6 @@ class _ComfyAPIMixin:
                 _seg = _guider_prof["segments"]
                 print(f"[comfyapp] guider_profile: {dict(_seg)}")
                 _guider_prof["segments"].clear()
-            # Deep profiling data
-            import comfy as _comfy_mod
-            _deep_prof = getattr(_comfy_mod, '_comfy_modal_deep_prof', None)
-            if _deep_prof:
-                result["_deep_profile"] = dict(_deep_prof)
-                _dp_clean = {}
-                for k, v in _deep_prof.items():
-                    if isinstance(v, dict):
-                        _dp_clean[k] = {kk: round(vv, 2) if isinstance(vv, (int, float)) else vv for kk, vv in v.items()}
-                    elif isinstance(v, list):
-                        _dp_clean[k] = [{kk: round(vv, 2) if isinstance(vv, (int, float)) else vv for kk, vv in c.items()} for c in v]
-                    else:
-                        _dp_clean[k] = round(v, 2) if isinstance(v, (int, float)) else v
-                print(f"[comfyapp] deep_profile: {_dp_clean}")
-                _deep_prof.clear()
             print(f"[comfyapp] cache_diagnostics: cpu_hits={result['_cache_diagnostics']['cpu_hits']} "
                   f"cpu_misses={result['_cache_diagnostics']['cpu_misses']} "
                   f"gpu_eq_calls={result['_cache_diagnostics']['gpu_eq'].get('calls', '?')} "
@@ -22883,70 +23995,40 @@ class _ComfyAPIMixin:
 
         yield {"type": "status", "message": "Remote request entered", "phase": 'entry'}
 
-        # GÃ¶Ã‡GÃ¶Ã‡ Cold UNET early load (opt-in, before dependency policy) GÃ¶Ã‡GÃ¶Ã‡
-        # Start UNET actual_load as early as possible so it overlaps with
-        # dependency validation, prompt validation, Comfy graph setup,
-        # and CLIP encode.  Honours request-level runtime options from
-        # modal_options (injected by benchmark preset system).
-        print(f"[predispatch] phase=cold_unet_before t={time.time()}")
-        _cold_unet_info: dict = self._cold_unet_early_actual_load(workflow, modal_options=modal_options)
-        print(f"[predispatch] phase=cold_unet_after t={time.time()}")
 
         try:
-            # GÃ¶Ã‡GÃ¶Ã‡ Check for scheduler test mode GÃ¶Ã‡GÃ¶Ã‡
-            _scheduler_config = (modal_options or {}).get("comfymodal_scheduler_test")
-            _is_scheduler_test = isinstance(_scheduler_config, dict) and _scheduler_config.get("enabled")
+            try:
+                # The first request after a degraded restore is the safe point
+                # to retry GPU attachment.  Do this before dependency policy,
+                # preload, or any ComfyUI model operation.
+                self._ensure_gpu_ready_for_request()
+            except RuntimeError as _gpu_err:
+                yield {"type": "error", "message": str(_gpu_err)}
+                return
 
-            if _is_scheduler_test:
-                print(f"[scheduler_test] config={json.dumps(_scheduler_config, default=str)}")
-                self._preflight_already_ran = False
-
-                try:
-                    self._start_scheduler_test(workflow, _scheduler_config)
-                except RuntimeError as _dep_err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    yield {"type": "error", "message": str(_dep_err)}
-                    return
-
-                try:
-                    _scheduler_trace = self._scheduler_wait_and_finalize()
-                except RuntimeError as _dep_err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    yield {"type": "error", "message": str(_dep_err)}
-                    return
-
+            # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
+            # Runs before prompt preload, actual_load, and execution.
+            # Dependency failures yield a clear fatal stream event.
+            self._preflight_already_ran = False
+            try:
+                print(f"[predispatch] phase=dependency_policy_before t={time.time()}")
+                _policy_stream = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
+                self._policy_stream = _policy_stream
                 self._preflight_already_ran = True
-                _preload_info = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
-                _actual_load_info = {"enabled": False, "submitted": [], "skipped_unet": True, "futures": {}}
-            else:
-                # GÃ¶Ã‡GÃ¶Ã‡ Shared custom-node sync and dependency policy GÃ¶Ã‡GÃ¶Ã‡
-                # Runs before prompt preload, actual_load, and execution.
-                # Dependency failures yield a clear fatal stream event.
-                self._preflight_already_ran = False
-                try:
-                    print(f"[predispatch] phase=dependency_policy_before t={time.time()}")
-                    _policy_stream = self._handle_custom_node_sync_and_dependency_policy(workflow, stream=True)
-                    self._policy_stream = _policy_stream
-                    self._preflight_already_ran = True
-                    print(f"[predispatch] phase=dependency_policy_after t={time.time()}")
-                except RuntimeError as _dep_err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    yield {"type": "error", "message": str(_dep_err)}
-                    return
+                print(f"[predispatch] phase=dependency_policy_after t={time.time()}")
+            except RuntimeError as _dep_err:
+                import traceback as _tb
+                _tb.print_exc()
+                yield {"type": "error", "message": str(_dep_err)}
+                return
 
-                # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time async preload (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
-                _preload_info: dict = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
-                if PROMPT_ASYNC_PRELOAD:
-                    _preload_info = self._prompt_async_preload(workflow)
+            # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time async preload (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
+            _preload_info: dict = {"enabled": False, "workers": 0, "deduped_paths": [], "cache_hit": [], "submitted": [], "duplicate_skipped": 0}
+            if PROMPT_ASYNC_PRELOAD:
+                _preload_info = self._prompt_async_preload(workflow)
 
-                # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time actual loader futures (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
-                _actual_load_info: dict = self._prompt_async_actual_load(workflow)
-                _scheduler_trace = None
-                # Finalize cold UNET early load (compute overlap/graph_wait metrics)
-                self._finalize_cold_unet_early_load(_cold_unet_info)
+            # GÃ¶Ã‡GÃ¶Ã‡ Prompt-time actual loader futures (after dependency policy) GÃ¶Ã‡GÃ¶Ã‡
+            _actual_load_info: dict = self._prompt_async_actual_load(workflow)
 
             # GÃ¶Ã‡GÃ¶Ã‡ Ensure backend is initialised before _execute_in_process GÃ¶Ã‡GÃ¶Ã‡
             # The in-process backend (and its self._event_loop) is created
@@ -23168,40 +24250,6 @@ class _ComfyAPIMixin:
                     trace_summary.setdefault("derived_ms", {})["exec_model_load_io_ms"] = getattr(self, "_exec_model_load_io_ms", 0.0)
                     trace_summary.setdefault("derived_ms", {})["exec_deepcopy_ms"] = getattr(self, "_exec_deepcopy_ms", 0.0)
                     trace_summary.setdefault("derived_ms", {})["load_model_gpu_ms"] = getattr(self, "_load_model_gpu_total_ms", 0.0)
-                    # Cold UNET early load trace fields
-                    if isinstance(_cold_unet_info, dict):
-                        _cold_map = {
-                            "cold_unet_early_load_enabled": "enabled",
-                            "cold_unet_early_load_mode": None,
-                            "cold_unet_early_load_submitted": "submitted",
-                            "cold_unet_early_load_submit_ts": "submit_ts",
-                            "cold_unet_early_load_worker_start_ts": "worker_start_ts",
-                            "cold_unet_early_load_file_read_start_ts": "file_read_start_ts",
-                            "cold_unet_early_load_file_read_end_ts": "file_read_end_ts",
-                            "cold_unet_early_load_done_ts": "done_ts",
-                            "cold_unet_early_load_status": "status",
-                            "cold_unet_early_load_error": "error",
-                            "cold_unet_early_load_path": "path",
-                            "cold_unet_early_load_size_gb": "size_gb",
-                            "cold_unet_early_load_cpu_cache_hit": "cpu_cache_hit",
-                            "cold_unet_early_load_duplicate_prevented": "duplicate_prevented",
-                            "cold_unet_graph_wait_ms": "graph_wait_ms",
-                            "cold_unet_overlap_ms": "overlap_ms",
-                            "cold_unet_estimated_critical_path_saved_ms": "estimated_critical_path_saved_ms",
-                            "cold_unet_remaining_critical_path_wait_ms": "remaining_critical_path_wait_ms",
-                            "cold_unet_volume_read_ms": "volume_read_ms",
-                            "cold_unet_volume_read_gbps": "volume_read_gbps",
-                            "cold_unet_volume_stall_detected": "volume_stall_detected",
-                            "cold_unet_early_load_aborted": "aborted",
-                            "cold_unet_early_load_abort_reason": "abort_reason",
-                        }
-                        for _ct_key, _cs_key in _cold_map.items():
-                            if _cs_key is None:
-                                trace_summary.setdefault("derived_ms", {})[_ct_key] = COLD_UNET_EARLY_LOAD_MODE
-                            else:
-                                _cl_v = _cold_unet_info.get(_cs_key)
-                                if _cl_v is not None:
-                                    trace_summary.setdefault("derived_ms", {})[_ct_key] = _cl_v
                     trace_summary["container_session_id"] = CONTAINER_SESSION_ID
                     trace_summary["snapshot_import_session_id"] = CONTAINER_SESSION_ID
                     _rt_sid = getattr(self, "_last_restore_timing", None) or {}
@@ -23237,8 +24285,6 @@ class _ComfyAPIMixin:
                     # Per audit round 7: waterfall on the in-process
                     # streaming path — the actual production route.
                     _log_cold_start_waterfall(trace_summary, label="run_prompt_stream_in_process")
-                    if isinstance(_scheduler_trace, dict):
-                        _r["scheduler_trace"] = dict(_scheduler_trace)
 
                     # GÃ¶Ã‡GÃ¶Ã‡ Wall-clock trace v3 (streaming path) GÃ¶Ã‡GÃ¶Ã‡
                     self._finalize_actual_load_records()
@@ -23680,6 +24726,7 @@ def _register_gpu_classes():
             cpu=profile["cpu"],
             memory=profile["memory"],
             timeout=3600,
+            retries=0,
             min_containers=0,
             # Scale down quickly to avoid holding GPU resources when idle
             scaledown_window=4,

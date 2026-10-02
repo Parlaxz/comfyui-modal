@@ -22,6 +22,7 @@ no Modal SDK, no CUDA):
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import types
 import unittest
@@ -419,7 +420,12 @@ class TestRemoteStateReadHydration(unittest.TestCase):
 
         seed = _build_seed_payload()
         plan = RestorePlan(generation=0, source_workflow_hash="wf-modal")
+        # The legacy publisher path (restore-time hydration of the published
+        # payload) requires the opt-in COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1
+        # flag: on the default no-publish path the volume read is skipped so
+        # a stale file can never claim source=publisher_plan.
         with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False), \
              patch.object(modal_app, "_MODAL_RESOURCES", {"runtime_state_volume": _FakeModalVolume()}), \
              patch.object(modal_app, "RUNTIME_STATE_PATH", tmp):
             result = modal_app._publish_restore_plan_impl(plan, snapshot_seed=seed)
@@ -463,6 +469,7 @@ class TestRemoteStateReadHydration(unittest.TestCase):
         seed = _build_seed_payload()
         plan = RestorePlan(generation=0, source_workflow_hash="wf-modal")
         with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False), \
              patch.object(modal_app, "_MODAL_RESOURCES", {"runtime_state_volume": _FakeModalVolume()}), \
              patch.object(modal_app, "RUNTIME_STATE_PATH", tmp):
             result = asyncio.run(
@@ -732,7 +739,12 @@ class TestPublishThenRequestSameContainer(unittest.IsolatedAsyncioTestCase):
         )
         plan = _make_plan()
 
+        # This class exercises the LEGACY publisher + same-container request
+        # flow, so the opt-in COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1 flag is set
+        # (on the default no-publish path the request derives its own seed and
+        # never observes a publisher payload).
         with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"COMFYMODAL_V2_PUBLISH_RESTORE_PLAN": "1"}, clear=False), \
              patch.object(modal_app, "_MODAL_RESOURCES", {"runtime_state_volume": _FakeModalVolume()}), \
              patch.object(modal_app, "RUNTIME_STATE_PATH", tmp), \
              patch.object(modal_app, "_V2_DEPLOYMENT_COMBINED_HASH", ""):

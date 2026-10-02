@@ -1,0 +1,14 @@
+schema_version = 1
+name = "golden_p1_parallel_testing9_c0_source_threads_whole_h100"
+extends = "golden_p1_parallel_m2clip_h100"
+owner = "testing9-c0-source-threads"
+
+[target]
+app = "testing9-c0-source-threads-whole"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_SOURCE_THREADS = "1"
+COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY = "qd4_64"
+COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY = "qd4_64"
+COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE = "whole"
+COMFYMODAL_GOLDEN_C0_WINDOW_TRACE = "1"

@@ -1,0 +1,58 @@
+{
+  "reliable": true,
+  "h100_worktree": "C:\\Users\\parla\\OneDrive\\Documents\\AI HUB\\ComfyUI June Install\\ComfyUI\\custom_nodes\\comfyui-modal\\.slim\\worktrees\\authoritative-golden-core-sep14",
+  "h100_worktree_head": "d1fffd2f5da108f0a718ea80da56152ae29f9c57",
+  "rtx_reference_commit": "03ce24916958596717220167db496b1215544d09",
+  "commits_between": [
+    {
+      "sha": "d1fffd2",
+      "subject": "fix: bound Golden stream consumption"
+    },
+    {
+      "sha": "70ae50f",
+      "subject": "docs: record Sep14 Golden restore audit"
+    },
+    {
+      "sha": "41af7fc",
+      "subject": "refactor: minimize Sep14 Golden restore"
+    }
+  ],
+  "diff_files": [
+    {
+      "insertions": 159,
+      "deletions": 0,
+      "path": "SEP14_GOLDEN_RESTORE_AUDIT_2026-09-17.md"
+    },
+    {
+      "insertions": 84,
+      "deletions": 288,
+      "path": "comfymodal_runtime/modal_app.py"
+    },
+    {
+      "insertions": 15,
+      "deletions": 4,
+      "path": "comfymodal_runtime/model_preload.py"
+    },
+    {
+      "insertions": 58,
+      "deletions": 0,
+      "path": "tests/test_benchmark_v2_golden_acceptance.py"
+    },
+    {
+      "insertions": 323,
+      "deletions": 0,
+      "path": "tests/test_golden_minimal_restore_validity.py"
+    },
+    {
+      "insertions": 25,
+      "deletions": 1,
+      "path": "tools/benchmark_v2_direct.py"
+    }
+  ],
+  "errors": {
+    "rev_parse": null,
+    "log": null,
+    "numstat": null
+  },
+  "note": "Code-diff inventory computed read-only via git show/diff/numstat; no runtime files were changed."
+}

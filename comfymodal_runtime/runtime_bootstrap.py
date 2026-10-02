@@ -24,8 +24,49 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from .contracts import SnapshotExecutionSeed
 from .trace import RuntimeTrace
 from .variance_diagnostics import variance_stage
+from .optimization_diagnostics import emit_opt, opt_diag_enabled
+from .runtime_generation import (
+    DEFAULT_RUNTIME_STATE_MANIFEST_FILES,
+    DEFAULT_RUNTIME_STATE_MANIFEST_REQUIRED,
+    RUNTIME_STATE_GENERATION_FILENAME,
+    RUNTIME_STATE_GENERATION_SCHEMA_VERSION,
+    build_runtime_state_manifest as _default_runtime_state_manifest_builder,
+    read_runtime_state_generation_marker as _default_runtime_state_generation_reader,
+    verify_runtime_state_manifest as _default_runtime_state_manifest_verifier,
+    write_runtime_state_generation_marker as _default_runtime_state_generation_writer,
+)
 
 _log = logging.getLogger(__name__)
+
+# ── Measurement-only restore decomposition state ────────────────────────
+# Everything below is gated by COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS (off by
+# default; see optimization_diagnostics).  Only ``opt_``-prefixed trace events
+# are emitted; no runtime policy/decision/behavior changes.
+_OPT_SEED_READ_MS: dict[int, float] = {}
+"""Bounded module-level accumulator of seed-payload file-read durations (ms).
+
+Populated by ``_try_hydrate_snapshot_seed_payload`` (which may not always
+have a trace in scope) and consumed by the aggregated
+``opt_restore_decomposition`` event emitted at the end of ``restore``.
+Keyed by an insertion counter and pruned to the newest
+``_OPT_SEED_READ_MS_MAX`` entries so memory stays flat.
+"""
+_OPT_SEED_READ_MS_MAX = 8
+_OPT_SEED_READ_COUNT = 0
+
+
+def _opt_record_seed_read_ms(duration_ms: float) -> None:
+    """Record one seed-read duration into the bounded accumulator."""
+    global _OPT_SEED_READ_COUNT
+    _OPT_SEED_READ_MS[_OPT_SEED_READ_COUNT] = round(float(duration_ms), 3)
+    _OPT_SEED_READ_COUNT += 1
+    while len(_OPT_SEED_READ_MS) > _OPT_SEED_READ_MS_MAX:
+        _OPT_SEED_READ_MS.pop(next(iter(_OPT_SEED_READ_MS)))
+
+
+def _opt_seed_read_sum_ms() -> float:
+    """Sum of recorded seed-read durations (0.0 when none recorded)."""
+    return round(sum(_OPT_SEED_READ_MS.values()), 3)
 
 
 def _emit_startup_stage(
@@ -251,6 +292,15 @@ class BootstrapConfig:
     # Step 3 — deployment-scoped seed payload path (hydrated at restore when
     # present; empty disables hydration and falls back to the minimal seed)
     seed_payload_path: str = ""
+    # Batch B — construction-time runtime-state generation marker path
+    # ({RUNTIME_STATE_PATH}/runtime_config_generation.json).  Empty derives
+    # from the prescan record directory when available.
+    runtime_state_generation_path: str = ""
+    # Batch B rev 2 — correctness-relevant construction files (relative to
+    # the runtime-state Volume root) included in the content manifest, and
+    # the subset that must be present at construction (fail closed).
+    runtime_state_manifest_files: tuple[str, ...] = DEFAULT_RUNTIME_STATE_MANIFEST_FILES
+    runtime_state_manifest_required: tuple[str, ...] = DEFAULT_RUNTIME_STATE_MANIFEST_REQUIRED
 
 
 @dataclass
@@ -274,6 +324,7 @@ class BootstrapState:
     # SageAttention policy observability
     sage_mode: str = ""
     sage_reason: str = ""
+    sage_runtime_identity: dict[str, Any] = field(default_factory=dict)
     sage_identity_captured: bool = False
     # Lane B — snapshot Sage identity (frozen at CPU-snapshot time, verified at restore)
     snapshot_sage_identity: dict[str, str] = field(default_factory=dict)
@@ -282,6 +333,21 @@ class BootstrapState:
     snapshot_custom_node_source: str = ""
     snapshot_custom_node_schema: str = "0"
     deployment_combined_hash: str = ""
+    # Batch A — snapshot models-volume generation baseline (frozen at
+    # startup from models_generation.json, compared at restore; an empty
+    # baseline forces the existing reload — fail closed)
+    snapshot_models_generation: str = ""
+    # Batch B — snapshot runtime-state generation baseline (frozen at
+    # construction by finalize_runtime_state_generation from the marker
+    # written last on the runtime-state Volume; compared at restore; an empty
+    # baseline forces the existing reload_runtime_state — fail closed)
+    snapshot_runtime_state_generation: str = ""
+    runtime_state_generation_marker_written: bool = False
+    # Batch B rev 2 — content manifest of the correctness-relevant
+    # construction files ({rel_path: {"present": bool, "sha256": str}}),
+    # frozen at construction alongside the generation.  An empty manifest
+    # forces the existing reload at restore (fail closed).
+    snapshot_runtime_state_manifest: dict[str, Any] = field(default_factory=dict)
     # Lane B — snapshot-memory validation certificate
     snapshot_certificate: dict[str, Any] = field(default_factory=dict)
     snapshot_cert_valid: bool = False
@@ -303,7 +369,7 @@ class BootstrapState:
     snapshot_model_identities: dict[str, str] = field(default_factory=dict)
     snapshot_seed_built: bool = False
     # Step 3 — seed attestation observability (source/topology, JSON-safe only)
-    snapshot_seed_source: str = ""                      # "publisher_plan" | "startup_minimal" | ""
+    snapshot_seed_source: str = ""  # "publisher_plan" | "startup_minimal" | "invocation_plan" | ""
     snapshot_seed_topology_available: bool = False
     snapshot_seed_schema_version: int = 0
     snapshot_seed_workflow_hash: str = ""
@@ -328,6 +394,15 @@ class BootstrapState:
     dependency_scan_call_count: int = 0
     dependency_validation_call_count: int = 0
     dependency_manifest_build_call_count: int = 0
+    # -- Step-2 canonical deployment-static validation proof (frozen at
+    # snapshot creation; marked stale at restore on custom-node drift).
+    # Instrumentation only — never consumed by validation/certificate
+    # decisions in Step 2.
+    snapshot_validation_proof: dict[str, Any] = field(default_factory=dict)
+    # Restore-stage evidence only.  These records describe existing callback
+    # outcomes and generation-guard decisions; they never select a new path.
+    restore_stage_classifications: dict[str, str] = field(default_factory=dict)
+    restore_generation_guard_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def has_prescan_identity(self) -> bool:
         """Backward-compatible diagnostic — checks frozen prescan identity."""
@@ -545,6 +620,16 @@ class BootstrapState:
         self.snapshot_cert_retained = False
         self.snapshot_cert_reason = str(reason or "")
         self.snapshot_cert_timings = {}
+
+    def freeze_validation_proof(self, proof: dict[str, Any]) -> None:
+        self.snapshot_validation_proof = dict(proof or {})
+
+    def mark_validation_proof_stale(self, reason: str) -> None:
+        _p = dict(self.snapshot_validation_proof or {})
+        if _p:
+            _p["valid"] = False
+            _p["invalid_reason"] = str(reason or "stale")
+            self.snapshot_validation_proof = _p
 
     def set_graph_trimming_evidence(
         self, *, removable_ids: list[str], trimming_possible: bool,
@@ -1133,6 +1218,30 @@ def cpu_snapshot_environment() -> Iterator[None]:
             os.environ["CUDA_VISIBLE_DEVICES"] = previous
 
 
+def _default_models_generation_reader() -> dict[str, Any] | None:
+    """Best-effort reader for the existing models_generation.json contract.
+
+    Reuses comfyapp's authoritative ``_read_models_generation_record`` via
+    ``sys.modules`` (the V2 runtime imports comfyapp before bootstrap use,
+    so this is a dict lookup, not an import).  Any failure returns None,
+    which the guard treats as unknown and therefore reloads (fail closed).
+    """
+    try:
+        _mod = sys.modules.get("comfyapp")
+        if _mod is None:
+            import importlib
+            _mod = importlib.import_module("comfyapp")
+        _reader = getattr(_mod, "_read_models_generation_record", None)
+        if callable(_reader):
+            _result = _reader()
+            if isinstance(_result, dict) or _result is None:
+                return _result
+            return None
+    except Exception:
+        return None
+    return None
+
+
 class RuntimeBootstrap:
     """Coordinates exactly one CPU-snapshot and one post-restore lifecycle."""
 
@@ -1147,9 +1256,16 @@ class RuntimeBootstrap:
         start_backend: Callable[[], Any] | None = None,
         restore_gpu_state: Callable[[], Any] | None = None,
         initialize_cuda: Callable[[], Any] | None = None,
+        select_sage_runtime_mode: Callable[[], Any] | None = None,
         apply_sage_policy: Callable[[], Any] | None = None,
+        force_sage_selection_after_restore: bool = False,
         observe_generations: Callable[[], dict[str, str]] | None = None,
         read_current_custom_node_identity: Callable[[], dict[str, str]] | None = None,
+        read_models_generation_record: Callable[[], dict[str, Any] | None] | None = None,
+        write_runtime_state_generation_marker: Callable[..., str] | None = None,
+        read_runtime_state_generation_marker: Callable[[str], dict | None] | None = None,
+        build_runtime_state_manifest: Callable[..., dict] | None = None,
+        verify_runtime_state_manifest: Callable[[str, dict], tuple[bool, str]] | None = None,
         deployment_combined_hash: str = "",
     ) -> None:
         self.config = config or BootstrapConfig()
@@ -1160,9 +1276,29 @@ class RuntimeBootstrap:
         self.start_backend = start_backend
         self.restore_gpu_state = restore_gpu_state
         self.initialize_cuda = initialize_cuda
+        # Presence of this callback is an explicit Golden restore contract:
+        # snapshot identity may be observed, but it may not suppress the
+        # post-CUDA fresh capability selection.
+        self.select_sage_runtime_mode = select_sage_runtime_mode
         self.apply_sage_policy = apply_sage_policy
+        self.force_sage_selection_after_restore = bool(force_sage_selection_after_restore)
         self.observe_generations = observe_generations
         self.read_current_custom_node_identity = read_current_custom_node_identity
+        self.read_models_generation_record = read_models_generation_record
+        self.write_runtime_state_generation_marker = (
+            write_runtime_state_generation_marker
+            or _default_runtime_state_generation_writer
+        )
+        self.read_runtime_state_generation_marker = (
+            read_runtime_state_generation_marker
+            or _default_runtime_state_generation_reader
+        )
+        self.build_runtime_state_manifest = (
+            build_runtime_state_manifest or _default_runtime_state_manifest_builder
+        )
+        self.verify_runtime_state_manifest = (
+            verify_runtime_state_manifest or _default_runtime_state_manifest_verifier
+        )
         self.state = BootstrapState()
         self._deployment_combined_hash = str(deployment_combined_hash or "")
         self._sage_baked_cuda_available = False
@@ -1216,15 +1352,22 @@ class RuntimeBootstrap:
             if trace:
                 trace.emit("reload_runtime_state_end", phase="startup")
 
-            if trace:
-                trace.emit("sync_custom_nodes_start", phase="startup")
-            with variance_stage(trace, stage="custom_node_source_copy", phase="startup"):
-                _custom_node_copy_started = _emit_startup_stage("custom_node_source_copy", "start", trace=trace)
-                if self.sync_custom_nodes:
-                    self.sync_custom_nodes()
-                _emit_startup_stage("custom_node_source_copy", "end", started=_custom_node_copy_started, trace=trace)
-            if trace:
-                trace.emit("sync_custom_nodes_end", phase="startup")
+            # Manual publication policy: normal runtime startup must NOT
+            # sync, reconcile, publish, or Volume.reload custom nodes, and
+            # must NOT gate on the whole custom-node publication generation.
+            # The runtime uses the custom nodes already present
+            # (image-baked/snapshotted).
+            print(
+                "[v2.custom_node_startup] decision=manual_publication sync_called=0",
+                flush=True,
+            )
+
+            # ── Batch A: freeze the models-volume generation baseline ──
+            # O(1) local read of models_generation.json (custom-nodes
+            # Volume, just synced) so the restore-time guard can prove the
+            # restored mount matches construction.  Fail closed: an empty
+            # baseline forces the existing reload at restore.
+            self._capture_models_generation_baseline(trace=trace)
 
             if trace:
                 trace.emit("install_requirements_start", phase="startup")
@@ -1362,6 +1505,290 @@ class RuntimeBootstrap:
                 pass
         os.replace(tmp, record_path)
 
+    def _capture_models_generation_baseline(self, *, trace: RuntimeTrace | None = None) -> str:
+        """Capture the construction-time models generation baseline.
+
+        Reads the authoritative models_generation.json record (existing
+        contract, O(1) local file read) so the restore-time guard can
+        compare the restored mount against the snapshot's baseline.  Fail
+        closed: any missing/corrupt/unreadable record leaves the baseline
+        empty, which forces the existing reload at restore time.
+        """
+        _baseline = ""
+        _source = "unavailable"
+        _read_ms = 0.0
+        try:
+            _t0 = time.perf_counter()
+            _reader = self.read_models_generation_record or _default_models_generation_reader
+            _rec = _reader()
+            if isinstance(_rec, dict):
+                _g = _rec.get("generation")
+                if isinstance(_g, str) and _g:
+                    _baseline = _g
+                    _source = "models_generation_json"
+            _read_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        except Exception as _bg_exc:
+            _source = f"read_error:{type(_bg_exc).__name__}"
+        self.state.snapshot_models_generation = _baseline
+        print(
+            f"[v2.models_volume_baseline] source={_source} "
+            f"generation={(_baseline[:12] + '…') if len(_baseline) > 12 else (_baseline or '-')} "
+            f"read_ms={_read_ms}",
+            flush=True,
+        )
+        if trace:
+            trace.emit(
+                "models_generation_baseline",
+                phase="startup",
+                metadata={
+                    "source": _source,
+                    "generation": _baseline[:12],
+                    "read_ms": _read_ms,
+                    "fail_closed_reload": int(not bool(_baseline)),
+                },
+            )
+        return _baseline
+
+    def _decide_models_reload(self) -> dict[str, Any]:
+        """O(1) local decision: is the models Volume reload required?
+
+        Reuses the existing models_generation.json contract: the mounted
+        record (a local file read) is compared against the snapshot
+        construction baseline.  Performs NO network/RPC I/O.  Fail closed:
+        missing/corrupt/mismatched/unknown state means reload.
+        """
+        _t0 = time.perf_counter()
+        _expected = str(getattr(self.state, "snapshot_models_generation", "") or "")
+        _decision = "reloaded_generation_unknown"
+        _reason = "no_snapshot_baseline"
+        _current = ""
+        if _expected:
+            try:
+                _reader = self.read_models_generation_record or _default_models_generation_reader
+                _rec = _reader()
+            except Exception:
+                _rec = None
+                _reason = "record_read_error"
+                _decision = "reloaded_generation_unknown"
+                _read_failed = True
+            else:
+                _read_failed = False
+            if isinstance(_rec, dict):
+                _current = str(_rec.get("generation", "") or "")
+                if not _current:
+                    _reason = "record_invalid"
+                elif _current != _expected:
+                    _decision = "reloaded_generation_mismatch"
+                    _reason = "generation_mismatch"
+                elif not os.path.isdir(self.config.models_path):
+                    _reason = "mount_missing"
+                else:
+                    _decision = "skipped_generation_match"
+                    _reason = "exact_match"
+            elif not _read_failed:
+                _reason = "record_unavailable"
+        _check_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        return {
+            "decision": _decision,
+            "reason": _reason,
+            "expected_generation": _expected,
+            "current_generation": _current,
+            "check_ms": _check_ms,
+        }
+
+    def _runtime_state_generation_path(self) -> str:
+        """Resolve the runtime-state generation marker path.
+
+        Uses the explicit config path when set, otherwise derives it from the
+        prescan record directory (both live on the runtime-state Volume root,
+        e.g. ``{RUNTIME_STATE_PATH}/``).  Returns ``""`` when nothing is
+        resolvable — callers fail closed (no baseline, reload as before).
+        """
+        path = getattr(self.config, "runtime_state_generation_path", "") or ""
+        if not path:
+            prescan = getattr(self.config, "prescan_record_path", "") or ""
+            if prescan:
+                path = os.path.join(
+                    os.path.dirname(prescan), RUNTIME_STATE_GENERATION_FILENAME
+                )
+        return str(path or "")
+
+    def finalize_runtime_state_generation(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        reason: str = "construction",
+    ) -> str:
+        """Construction-time marker write + baseline capture (Batch B rev 2).
+
+        Called at the END of snapshot construction — after every
+        correctness-relevant runtime-state write (including the optional
+        GPU-capacity freeze) and before snapshot capture.
+
+        Builds the content manifest of the correctness-relevant construction
+        files via LOCAL reads/hashes, writes
+        ``{root}/runtime_config_generation.json`` (schema v2, generation +
+        files manifest) through the same plain local-filesystem atomic writer
+        used by the other construction files (no Volume API, no RPC), and
+        freezes the exact generation + manifest into BootstrapState.
+
+        Fail closed: any derivation/read/hash failure (including a missing
+        required file) leaves the baseline generation AND manifest empty,
+        which forces the existing reload at restore time.  Returns the
+        captured generation (``""`` on failure).  Never raises.
+        """
+        _t0 = time.perf_counter()
+        _baseline = ""
+        _manifest: dict[str, Any] = {}
+        _source = "unavailable"
+        try:
+            _path = self._runtime_state_generation_path()
+            if not _path:
+                _source = "path_unavailable"
+            else:
+                _root = os.path.dirname(_path)
+                _builder = self.build_runtime_state_manifest
+                _manifest = _builder(
+                    _root,
+                    tuple(getattr(self.config, "runtime_state_manifest_files", ()) or ()),
+                    required=tuple(
+                        getattr(self.config, "runtime_state_manifest_required", ()) or ()
+                    ),
+                ) or {}
+                if not _manifest:
+                    _source = "manifest_empty"
+                else:
+                    # The runtime-state Volume is shared by deployments. Keep
+                    # construction idempotent when its correctness manifest is
+                    # unchanged; otherwise a fresh UUID from one deployment
+                    # needlessly invalidates another deployment's snapshot.
+                    _existing = self.read_runtime_state_generation_marker(_root)
+                    if (
+                        isinstance(_existing, dict)
+                        and int(_existing.get("schema_version", 0) or 0)
+                        == RUNTIME_STATE_GENERATION_SCHEMA_VERSION
+                        and isinstance(_existing.get("generation"), str)
+                        and _existing.get("generation")
+                        and _existing.get("files") == _manifest
+                    ):
+                        _baseline = str(_existing["generation"])
+                        _source = "reused_matching_runtime_config_generation_json"
+                    else:
+                        _writer = self.write_runtime_state_generation_marker
+                        _baseline = (
+                            _writer(_root, reason=reason, files_manifest=_manifest) or ""
+                        )
+                    self.state.runtime_state_generation_marker_written = bool(_baseline)
+                    if _baseline and _source != "reused_matching_runtime_config_generation_json":
+                        _source = "runtime_config_generation_json"
+        except Exception as _gen_exc:
+            _source = f"write_error:{type(_gen_exc).__name__}"
+            _baseline = ""
+            _manifest = {}
+        self.state.snapshot_runtime_state_generation = _baseline
+        self.state.snapshot_runtime_state_manifest = dict(_manifest)
+        _write_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        print(
+            f"[v2.runtime_state_generation_baseline] source={_source} "
+            f"generation={(_baseline[:12] + '…') if len(_baseline) > 12 else (_baseline or '-')} "
+            f"files={len(_manifest)} "
+            f"write_ms={_write_ms}",
+            flush=True,
+        )
+        if trace:
+            trace.emit(
+                "runtime_state_generation_baseline",
+                phase="startup",
+                metadata={
+                    "source": _source,
+                    "generation": _baseline[:12],
+                    "files": len(_manifest),
+                    "write_ms": _write_ms,
+                    "fail_closed_reload": int(not bool(_baseline)),
+                },
+            )
+        return _baseline
+
+    def _decide_runtime_state_reload(self) -> dict[str, Any]:
+        """O(1) local decision: is the runtime-state Volume reload required?
+
+        Reads ``runtime_config_generation.json`` from the restored mount using
+        LOCAL filesystem access only (no ``Volume.reload()``, no RPC).
+
+        Exact skip requires BOTH:
+          A. marker generation == snapshot baseline generation, AND
+          B. every correctness-relevant file on the restored mount matches
+             the captured construction manifest (expected-present files exist
+             with matching sha256; expected-absent files remain absent).
+
+        Fail closed: missing/corrupt/mismatched/unknown state means reload.
+        """
+        _t0 = time.perf_counter()
+        _expected = str(getattr(self.state, "snapshot_runtime_state_generation", "") or "")
+        _expected_manifest = dict(
+            getattr(self.state, "snapshot_runtime_state_manifest", None) or {}
+        )
+        _decision = "reloaded_generation_unknown"
+        _reason = "no_snapshot_baseline"
+        _current = ""
+        if _expected and _expected_manifest:
+            _root = os.path.dirname(self._runtime_state_generation_path())
+            try:
+                _reader = self.read_runtime_state_generation_marker
+                _rec = _reader(_root)
+            except Exception:
+                _rec = None
+                _reason = "record_read_error"
+                _decision = "reloaded_generation_error"
+                _read_failed = True
+            else:
+                _read_failed = False
+            if isinstance(_rec, dict):
+                _schema = int(_rec.get("schema_version", 0) or 0)
+                _current = str(_rec.get("generation", "") or "")
+                _marker_files = _rec.get("files")
+                if _schema != RUNTIME_STATE_GENERATION_SCHEMA_VERSION:
+                    _reason = "record_invalid"
+                elif not _current:
+                    _reason = "record_invalid"
+                elif _current != _expected:
+                    _decision = "reloaded_generation_mismatch"
+                    _reason = "generation_mismatch"
+                elif not isinstance(_marker_files, dict) or not _marker_files:
+                    _reason = "manifest_invalid"
+                elif _marker_files != _expected_manifest:
+                    _reason = "manifest_mismatch"
+                elif not _root or not os.path.isdir(_root):
+                    _reason = "mount_missing"
+                else:
+                    try:
+                        _verifier = self.verify_runtime_state_manifest
+                        _ok, _v_reason = _verifier(_root, _expected_manifest)
+                    except Exception as _vexc:
+                        _ok = False
+                        _v_reason = f"manifest_read_error:{type(_vexc).__name__}"
+                    if not _ok:
+                        _reason = _v_reason
+                        if _v_reason.startswith("manifest_read_error"):
+                            _decision = "reloaded_generation_error"
+                    else:
+                        _decision = "skipped_generation_match"
+                        _reason = "exact_match"
+            elif not _read_failed:
+                _reason = "record_unavailable"
+        elif not _expected:
+            _reason = "no_snapshot_baseline"
+        else:
+            _reason = "manifest_no_baseline"
+        _check_ms = round((time.perf_counter() - _t0) * 1000, 3)
+        return {
+            "decision": _decision,
+            "reason": _reason,
+            "expected_generation": _expected,
+            "current_generation": _current,
+            "check_ms": _check_ms,
+        }
+
     def _read_current_custom_node_identity(self) -> dict[str, str]:
         """Authoritative-only read of the current custom-node identity.
 
@@ -1459,7 +1886,29 @@ class RuntimeBootstrap:
         applies it to ``self.state`` when valid.  Returns ``True`` when a
         schema-v2 payload was hydrated.  Never raises — any failure is an
         honest fallback to the minimal seed.
+
+        When the opt-in remote publication flag
+        (``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN``, default "0") is DISABLED the
+        volume read is skipped entirely so a stale ``snapshot_seed.json`` left
+        over from an earlier publisher deployment can never emit
+        ``source=publisher_plan``.  The container then restores with
+        ``startup_minimal`` and the REQUEST derives its own seed from the
+        invocation plan (see ``ModalRuntimeEntrypoint`` request-time seed
+        derivation).  The flag=1 path keeps the legacy publisher hydration.
         """
+        from .execution_seed import publish_restore_plan_enabled
+
+        if not publish_restore_plan_enabled():
+            if trace:
+                trace.emit(
+                    "snapshot_seed_volume_read_skipped",
+                    phase="restore",
+                    metadata={
+                        "seed_source": "startup_minimal",
+                        "reason": "publish_restore_plan_disabled",
+                    },
+                )
+            return False
         from .execution_seed import (
             read_snapshot_seed_payload,
             snapshot_seed_observability,
@@ -1471,7 +1920,20 @@ class RuntimeBootstrap:
         try:
             import os as _os
 
+            # Measurement-only bracket of just the payload file read.  The
+            # duration is emitted as opt_restore_seed_read_ms and accumulated
+            # into the module-level bounded dict for opt_restore_decomposition.
+            _opt_seed_read_t0 = time.perf_counter()
             payload = read_snapshot_seed_payload(root=_os.path.dirname(path))
+            _opt_seed_read_ms = round((time.perf_counter() - _opt_seed_read_t0) * 1000, 3)
+            if opt_diag_enabled():
+                _opt_record_seed_read_ms(_opt_seed_read_ms)
+            emit_opt(
+                trace,
+                "restore_seed_read_ms",
+                phase="restore",
+                metadata={"duration_ms": _opt_seed_read_ms, "seed_payload_path": path},
+            )
             if payload is None:
                 return False
             if not self.state.hydrate_snapshot_seed_payload(payload):
@@ -1505,9 +1967,96 @@ class RuntimeBootstrap:
     # REMOVED: _build_and_store_snapshot_certificate — placeholder superseded
     # by the V2 workflow certificate built in ModalRuntimeEntrypoint.startup().
 
+    def _record_restore_stage(
+        self,
+        stage: str,
+        classification: str,
+        *,
+        trace: RuntimeTrace | None = None,
+        decision: str = "",
+        reason: str = "",
+        callback_called: bool | None = None,
+        guard: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record additive restore evidence at an existing lifecycle boundary."""
+        payload: dict[str, Any] = {
+            "stage": str(stage),
+            "classification": str(classification),
+            "decision": str(decision),
+            "reason": str(reason),
+        }
+        if callback_called is not None:
+            payload["callback_called"] = int(bool(callback_called))
+        if guard is not None:
+            payload["generation_guard"] = dict(guard)
+            self.state.restore_generation_guard_decisions[str(stage)] = dict(guard)
+        self.state.restore_stage_classifications[str(stage)] = str(classification)
+        if trace is not None:
+            try:
+                trace.emit("restore_stage_classification", phase="restore", metadata=payload)
+            except Exception:
+                pass
+
     def restore(self, *, trace: RuntimeTrace | None = None) -> BootstrapState:
         started = time.perf_counter()
+        self.state.restore_stage_classifications = {}
+        self.state.restore_generation_guard_decisions = {}
+        # ── E29: canonical ledger restore boundary (measurement only) ────────
+        # The remote restore begins at this first executable line; record it on
+        # the canonical axis so the ledger can bridge bootstrap -> modal_app
+        # restore() -> request method entry without gaps.
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event(
+                "bootstrap_restore_entry",
+                mono_ns=time.monotonic_ns(),
+                metadata={"source": "runtime_bootstrap.restore"},
+            )
+        except Exception:
+            pass
+        # ── Measurement-only decomposition state (inert unless
+        # COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS is set) ──────────────────
+        _opt_fastdisk_wrapper_ms: float | None = None
+        _opt_metadata_ms: float | None = None
+        _opt_sage_identity_read_ms: float | None = None
+        _opt_prescan_identity_ms: float | None = None
+        _opt_custom_node_check_ms: float | None = None
+        # No gc.collect() call exists anywhere inside restore(); the GC
+        # barrier gap is therefore recorded as a constant 0.0 (kept explicit
+        # so opt_restore_decomposition lists every intended gap slot).
+        _opt_gc_ms: float = 0.0
+        # ── V2 native fast-disk UNET: graph UNETLoader wrapper (flag-gated) ──
+        # With COMFYMODAL_V2_CPU_MODEL_SNAPSHOT=0 the restore-time installer
+        # callers (external_model_lane_scope, coordinator lanes, bridge) never
+        # run, so the graph-time UNETLoader would execute an un-instrumented
+        # comfy.sd.load_diffusion_model.  Lazily install the flag-gated graph
+        # wrapper here; flag-off is a byte-identical no-op (no import, no
+        # call).  The env check mirrors _NATIVE_FAST_DISK_UNET so this block
+        # is inert unless the flag is on.
+        _opt_fd_t0 = time.perf_counter()
+        try:
+            if os.environ.get("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "").strip().lower() in ("1", "true", "yes", "on"):
+                from .model_preload import _ensure_graph_unet_loader_wrapper_lazy
+                _gwl_status = _ensure_graph_unet_loader_wrapper_lazy(trace=trace)
+                if _gwl_status not in ("installed", "already_installed", "inert_flag_off"):
+                    print(
+                        f"[bootstrap] graph_unet_loader_wrapper status={_gwl_status} "
+                        "(belt-and-braces _ensure_core_wrappers will retry)",
+                        flush=True,
+                    )
+        except Exception as _gwl_exc:
+            # Surface, never mask: a flag-on install failure is printed and
+            # restore continues (the wrapper retries via _ensure_core_wrappers).
+            print(f"[bootstrap] graph_unet_loader_wrapper install error: {_gwl_exc}", flush=True)
+        _opt_fastdisk_wrapper_ms = round((time.perf_counter() - _opt_fd_t0) * 1000, 3)
+        emit_opt(
+            trace,
+            "restore_fastdisk_wrapper_ms",
+            phase="restore",
+            metadata={"duration_ms": _opt_fastdisk_wrapper_ms},
+        )
         self.state.restore_started_at = time.time()
+        _opt_metadata_t0 = time.perf_counter()
         # Phase 0/3 — capture identity/environment metadata at lifecycle entry
         if trace:
             self.state.modal_task_id = os.environ.get("MODAL_TASK_ID", "")
@@ -1524,34 +2073,63 @@ class RuntimeBootstrap:
                     "modal_region": self.state.modal_region,
                 },
             )
+        _opt_metadata_ms = round((time.perf_counter() - _opt_metadata_t0) * 1000, 3)
+        emit_opt(
+            trace,
+            "restore_metadata_ms",
+            phase="restore",
+            metadata={"duration_ms": _opt_metadata_ms},
+        )
         try:
             # ── 1. restore_gpu_state ──
             def _do_restore_gpu_state():
+                _called = self.restore_gpu_state is not None
+                _classification = "restored" if _called else "skipped"
                 if trace:
                     trace.emit("restore_gpu_state_start", phase="restore")
-                if self.restore_gpu_state:
-                    self.restore_gpu_state()
-                if trace:
-                    trace.emit("restore_gpu_state_end", phase="restore")
+                try:
+                    if self.restore_gpu_state:
+                        self.restore_gpu_state()
+                except Exception:
+                    _classification = "unknown"
+                    raise
+                finally:
+                    if trace:
+                        trace.emit("restore_gpu_state_end", phase="restore")
+                    self._record_restore_stage(
+                        "restore_gpu_state", _classification, trace=trace,
+                        callback_called=_called,
+                    )
             with variance_stage(trace, stage="restore_gpu_state", phase="restore"):
                 _do_restore_gpu_state()
 
             # ── 2. initialize_cuda_context ──
             def _do_initialize_cuda():
+                _called = self.initialize_cuda is not None
+                _classification = "validated" if _called else "skipped"
                 if trace:
                     trace.emit("cuda_init_start", phase="restore")
-                if self.initialize_cuda:
-                    cuda_result = self.initialize_cuda()
-                    if isinstance(cuda_result, dict):
-                        self.state.cuda = dict(cuda_result)
-                if trace:
-                    trace.emit(
-                        "cuda_init_end",
-                        phase="restore",
-                        metadata={
-                            "device": str(self.state.cuda.get("device", "")),
-                            "cuda_available": str(self.state.cuda.get("cuda_available", "")),
-                        },
+                try:
+                    if self.initialize_cuda:
+                        cuda_result = self.initialize_cuda()
+                        if isinstance(cuda_result, dict):
+                            self.state.cuda = dict(cuda_result)
+                except Exception:
+                    _classification = "unknown"
+                    raise
+                finally:
+                    if trace:
+                        trace.emit(
+                            "cuda_init_end",
+                            phase="restore",
+                            metadata={
+                                "device": str(self.state.cuda.get("device", "")),
+                                "cuda_available": str(self.state.cuda.get("cuda_available", "")),
+                            },
+                        )
+                    self._record_restore_stage(
+                        "initialize_cuda", _classification, trace=trace,
+                        callback_called=_called,
                     )
             with variance_stage(trace, stage="cuda_init", phase="restore"):
                 _do_initialize_cuda()
@@ -1564,16 +2142,15 @@ class RuntimeBootstrap:
             _sage_verify_ok = False
             _sage_verify_ms = 0.0
             if self.state.snapshot_sage_identity:
-                _sage_current_identity = (
-                    self.read_current_custom_node_identity()
-                    if self.read_current_custom_node_identity is not None
-                    else {}
-                )
+                # Manual publication policy: do NOT read the current
+                # custom-node identity here — the injected reader reloads the
+                # custom-node Volume.  Use an empty identity so the verify
+                # below falls back to the snapshot's frozen
+                # snapshot_custom_node_generation /
+                # deployment_combined_hash values.
+                _sage_current_identity: dict[str, Any] = {}
                 _sage_t0 = time.perf_counter()
-                _sage_verify_ok = bool(
-                    not self.read_current_custom_node_identity
-                    or _sage_current_identity.get("custom_node_generation")
-                ) and _verify_sage_snapshot_identity(
+                _sage_verify_ok = _verify_sage_snapshot_identity(
                     snapshot_identity=self.state.snapshot_sage_identity,
                     current_custom_node_generation=str(
                         _sage_current_identity.get(
@@ -1589,7 +2166,11 @@ class RuntimeBootstrap:
                     ),
                 )
                 _sage_verify_ms = round((time.perf_counter() - _sage_t0) * 1000, 3)
-            if _sage_verify_ok:
+            _force_sage_selection = bool(
+                self.select_sage_runtime_mode is not None
+                or self.force_sage_selection_after_restore
+            )
+            if _sage_verify_ok and not _force_sage_selection:
                 _skipped_sage = True
                 print(
                     f"[v2.sage_restore] decision=snapshot_exact_skip "
@@ -1609,145 +2190,286 @@ class RuntimeBootstrap:
                 )
 
             if not _skipped_sage:
-                with variance_stage(trace, stage="sage_policy", phase="restore"):
-                    if trace:
-                        trace.emit("sage_policy_start", phase="restore")
-                    if self.apply_sage_policy:
-                        sage_result = self.apply_sage_policy()
-                        if isinstance(sage_result, bool):
-                            self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
-                            self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
-                        elif isinstance(sage_result, dict):
-                            self.state.sage_mode = str(sage_result.get("mode", ""))
-                            self.state.sage_reason = str(sage_result.get("reason", ""))
-                        # Lane B: capture sage identity after successful application
-                        if self.state.sage_mode:
-                            self.state.sage_identity_captured = True
-                    if trace:
-                        trace.emit(
-                            "sage_policy_end",
-                            phase="restore",
-                            metadata={
-                                "sage_mode": self.state.sage_mode,
-                                "sage_reason": self.state.sage_reason,
-                            },
-                        )
+                _sage_callback_called = self.apply_sage_policy is not None
+                _sage_selector_called = _force_sage_selection
+                _sage_classification = (
+                    "restored"
+                    if (_sage_callback_called or _sage_selector_called)
+                    else "skipped"
+                )
+                try:
+                    with variance_stage(trace, stage="sage_policy", phase="restore"):
+                        if trace:
+                            trace.emit("sage_policy_start", phase="restore")
+                        try:
+                            # This callback is intentionally reached only from
+                            # restore, after restore_gpu_state + initialize_cuda.
+                            # It must run before policy application so a
+                            # snapshot-carried fallback cannot remain sticky.
+                            if self.select_sage_runtime_mode:
+                                selected = self.select_sage_runtime_mode()
+                                if isinstance(selected, dict):
+                                    self.state.sage_mode = str(selected.get("mode", ""))
+                                    self.state.sage_reason = str(selected.get("reason", ""))
+                                    identity = selected.get("identity")
+                                    if isinstance(identity, Mapping):
+                                        self.state.sage_runtime_identity = dict(identity)
+                                elif isinstance(selected, (tuple, list)) and len(selected) >= 2:
+                                    self.state.sage_mode = str(selected[0])
+                                    self.state.sage_reason = str(selected[1])
+                            if self.apply_sage_policy:
+                                sage_result = self.apply_sage_policy()
+                                if isinstance(sage_result, bool):
+                                    self.state.sage_mode = "baked_cuda" if sage_result else "triton_fallback"
+                                    self.state.sage_reason = "patched" if sage_result else "not-patched-or-not-found"
+                                elif isinstance(sage_result, dict):
+                                    self.state.sage_mode = str(sage_result.get("mode", ""))
+                                    self.state.sage_reason = str(sage_result.get("reason", ""))
+                                # Lane B: capture sage identity after successful application
+                                if self.state.sage_mode:
+                                    self.state.sage_identity_captured = True
+                        finally:
+                            if trace:
+                                trace.emit(
+                                    "sage_policy_end",
+                                    phase="restore",
+                                    metadata={
+                                        "sage_mode": self.state.sage_mode,
+                                        "sage_reason": self.state.sage_reason,
+                                        "sage_runtime_identity": dict(
+                                            self.state.sage_runtime_identity
+                                        ),
+                                    },
+                                )
+                except Exception:
+                    _sage_classification = "unknown"
+                    raise
+                finally:
+                    self._record_restore_stage(
+                        "sage_policy",
+                        _sage_classification,
+                        trace=trace,
+                        decision="fallback_full_discovery",
+                        reason=(
+                            "fresh_selection_after_cuda_restore" if _sage_selector_called
+                            else "no_snapshot_sage_identity" if not self.state.snapshot_sage_identity
+                            else "verify_failed"
+                        ),
+                        callback_called=bool(_sage_callback_called or _sage_selector_called),
+                    )
+            else:
+                self._record_restore_stage(
+                    "sage_policy",
+                    "validated",
+                    trace=trace,
+                    decision="snapshot_exact_skip",
+                    reason="identity_match",
+                    callback_called=False,
+                )
 
-            # ── 3. reload_runtime_state ──
+            # ── 3. reload_runtime_state (Batch B guard) ──
+            # Skip the network Volume reload when the mounted
+            # runtime_config_generation.json marker exactly matches the
+            # snapshot construction baseline (single O(1) local file read —
+            # no RPC).  Fail closed: missing/corrupt/mismatched/unknown state
+            # performs the existing reload exactly as before.  A skip never
+            # invokes the reload callback, so the modal_app-side
+            # _RUNTIME_STATE_VOLUME_RELOADED_MONO stamp is never falsely
+            # populated (the 900 s cert-reload dedup keeps its meaning of
+            # "a remote Volume reload actually executed").
+            _runtime_state_reload_decision = "reloaded_generation_unknown"
+            _runtime_state_reload_reason = "unconditional"
+            _runtime_state_reload_check_ms = 0.0
+            _runtime_state_reload_skipped = False
+            _runtime_state_reload: dict[str, Any] = {}
+            if self.reload_runtime_state is not None:
+                _runtime_state_reload = self._decide_runtime_state_reload()
+                _runtime_state_reload_decision = _runtime_state_reload["decision"]
+                _runtime_state_reload_reason = _runtime_state_reload["reason"]
+                _runtime_state_reload_check_ms = _runtime_state_reload["check_ms"]
+                _runtime_state_reload_skipped = (
+                    _runtime_state_reload_decision == "skipped_generation_match"
+                )
+            else:
+                # No reload callback configured: legacy behavior preserved
+                # byte-identically (no-op stage), reported as legacy_path.
+                _runtime_state_reload_decision = "legacy_path"
+                _runtime_state_reload_reason = "unconditional"
+            _runtime_state_reload_invoked = (
+                (not _runtime_state_reload_skipped) and self.reload_runtime_state is not None
+            )
+            _runtime_state_classification = (
+                "skipped" if _runtime_state_reload_skipped
+                else ("reloaded" if _runtime_state_reload_invoked else "unknown")
+            )
+
             def _do_reload_runtime_state():
                 if trace:
                     trace.emit("reload_runtime_state_start", phase="restore")
-                if self.reload_runtime_state:
-                    self.reload_runtime_state()
-                if trace:
-                    trace.emit("reload_runtime_state_end", phase="restore")
-            with variance_stage(trace, stage="runtime_state", phase="restore"):
-                _do_reload_runtime_state()
+                try:
+                    if self.reload_runtime_state:
+                        self.reload_runtime_state()
+                finally:
+                    if trace:
+                        trace.emit("reload_runtime_state_end", phase="restore")
 
-            # ── 4. reload_models ──
+            try:
+                with variance_stage(trace, stage="runtime_state", phase="restore"):
+                    if _runtime_state_reload_skipped:
+                        # The construction-time generation marker already proves
+                        # the restored mount matches the snapshot write set.
+                        pass
+                    else:
+                        _do_reload_runtime_state()
+            except Exception:
+                _runtime_state_classification = "unknown"
+                raise
+            finally:
+                self._record_restore_stage(
+                    "reload_runtime_state",
+                    _runtime_state_classification,
+                    trace=trace,
+                    decision=_runtime_state_reload_decision,
+                    reason=_runtime_state_reload_reason,
+                    callback_called=_runtime_state_reload_invoked,
+                    guard=_runtime_state_reload,
+                )
+            print(
+                f"[v2.runtime_state_volume_restore] "
+                f"decision={_runtime_state_reload_decision} "
+                f"reason={_runtime_state_reload_reason} "
+                f"callback_called={int(_runtime_state_reload_invoked)} "
+                f"runtime_state_reload_invoked={int(_runtime_state_reload_invoked)} "
+                f"check_ms={_runtime_state_reload_check_ms}",
+                flush=True,
+            )
+            if trace:
+                trace.emit(
+                    "runtime_state_reload_decision",
+                    phase="restore",
+                    metadata={
+                        "decision": _runtime_state_reload_decision,
+                        "reason": _runtime_state_reload_reason,
+                        "callback_called": int(_runtime_state_reload_invoked),
+                        "runtime_state_reload_invoked": int(_runtime_state_reload_invoked),
+                        "check_ms": _runtime_state_reload_check_ms,
+                    },
+                )
+            # ── 4. reload_models (Batch A guard) ──
+            # Skip the network Volume reload when the mounted models
+            # generation record exactly matches the snapshot construction
+            # baseline (single O(1) local file read — no RPC).  Fail
+            # closed: missing/corrupt/mismatched/unknown state performs the
+            # existing reload exactly as before.
+            _models_reload_decision = "reloaded_generation_unknown"
+            _models_reload_reason = "unconditional"
+            _models_reload_check_ms = 0.0
+            _models_reload_skipped = False
+            _models_reload: dict[str, Any] = {}
+            if self.reload_models is not None:
+                _models_reload = self._decide_models_reload()
+                _models_reload_decision = _models_reload["decision"]
+                _models_reload_reason = _models_reload["reason"]
+                _models_reload_check_ms = _models_reload["check_ms"]
+                _models_reload_skipped = _models_reload_decision == "skipped_generation_match"
+            _models_reload_callback_called = (
+                (not _models_reload_skipped) and self.reload_models is not None
+            )
+            _models_reload_classification = (
+                "skipped" if _models_reload_skipped
+                else ("reloaded" if _models_reload_callback_called else "unknown")
+            )
+
             def _do_reload_models():
                 if trace:
                     trace.emit("reload_models_start", phase="restore")
-                if self.reload_models:
-                    self.reload_models()
-                if trace:
-                    trace.emit("reload_models_end", phase="restore")
-            with variance_stage(trace, stage="models", phase="restore"):
-                _do_reload_models()
+                try:
+                    if self.reload_models:
+                        self.reload_models()
+                finally:
+                    if trace:
+                        trace.emit("reload_models_end", phase="restore")
 
+            try:
+                with variance_stage(trace, stage="models", phase="restore"):
+                    if _models_reload_skipped:
+                        # The existing generation contract already proves the
+                        # mounted model state matches the snapshot baseline.
+                        pass
+                    else:
+                        _do_reload_models()
+            except Exception:
+                _models_reload_classification = "unknown"
+                raise
+            finally:
+                self._record_restore_stage(
+                    "reload_models",
+                    _models_reload_classification,
+                    trace=trace,
+                    decision=_models_reload_decision,
+                    reason=_models_reload_reason,
+                    callback_called=_models_reload_callback_called,
+                    guard=_models_reload,
+                )
+            print(
+                f"[v2.models_volume_restore] "
+                f"decision={_models_reload_decision} "
+                f"reason={_models_reload_reason} "
+                f"callback_called={int(_models_reload_callback_called)} "
+                f"check_ms={_models_reload_check_ms}",
+                flush=True,
+            )
+            if trace:
+                trace.emit(
+                    "models_reload_decision",
+                    phase="restore",
+                    metadata={
+                        "decision": _models_reload_decision,
+                        "reason": _models_reload_reason,
+                        "callback_called": int(_models_reload_callback_called),
+                        "check_ms": _models_reload_check_ms,
+                    },
+                )
             # Lane B: restore prescan identity from persisted record
+            # (measurement-only bracket; the function is a no-op fallback
+            # when no prescan record exists — it is still timed).
+            _opt_prescan_t0 = time.perf_counter()
             if self.read_current_custom_node_identity is None:
                 self._restore_prescan_identity()
+            _opt_prescan_identity_ms = round((time.perf_counter() - _opt_prescan_t0) * 1000, 3)
+            emit_opt(
+                trace,
+                "restore_prescan_identity_ms",
+                phase="restore",
+                metadata={"duration_ms": _opt_prescan_identity_ms},
+            )
 
-            # ── Lane B: custom-node restore fast path (authoritative-only) ──
-            # Reads current authoritative-only identity and compares schema,
-            # generation, and deployment hash against the snapshot identity.
-            # Exact match skips sync_custom_nodes, observe_generations, and
-            # fingerprint/hash scans.
-            _check_start = time.perf_counter()
-            _skipped_cn_sync = False
-            _cn_decision = "snapshot_exact_skip"
-            _cn_fallback_reason = ""
-
-            _current_source = "unavailable"
-            if self.read_current_custom_node_identity and self.sync_custom_nodes:
-                current = self.read_current_custom_node_identity()
-                _current_gen = current.get("custom_node_generation", "")
-                _current_schema = current.get("schema_version", "0")
-                _current_dep_hash = current.get("deployment_combined_hash", "")
-                _current_source = current.get("generation_source", "unavailable")
-
-                if not _current_gen:
-                    _cn_fallback_reason = "missing_current_token"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.snapshot_custom_node_schema and _current_schema != self.state.snapshot_custom_node_schema:
-                    _cn_fallback_reason = "schema_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.snapshot_custom_node_generation and _current_gen != self.state.snapshot_custom_node_generation:
-                    _cn_fallback_reason = "generation_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif self.state.deployment_combined_hash and _current_dep_hash != self.state.deployment_combined_hash:
-                    _cn_fallback_reason = "deployment_hash_mismatch"
-                    _cn_decision = "fallback_full_sync"
-                elif not self.state.has_snapshot_custom_node_identity():
-                    _cn_fallback_reason = "untrusted_source"
-                    _cn_decision = "fallback_full_sync"
-                else:
-                    _skipped_cn_sync = True
-            elif self.state.has_prescan_identity() and self.sync_custom_nodes:
-                # Fallback: use legacy prescan identity when read_current_custom_node_identity
-                # is not provided (backward-compatible path for tests and simpler callers).
-                _current_source = "prescan_identity"
-                _skipped_cn_sync = True
-
-            _check_ms = round((time.perf_counter() - _check_start) * 1000, 3)
-
-            with variance_stage(trace, stage="custom_node_sync", phase="restore"):
-                if _skipped_cn_sync:
-                    print(
-                        f"[v2.custom_node_restore] "
-                        f"decision={_cn_decision} "
-                        f"callback_called=0 "
-                        f"source={_current_source} "
-                        f"check_ms={_check_ms}",
-                        flush=True,
-                    )
-                else:
-                    if _cn_fallback_reason:
-                        print(
-                            f"[v2.custom_node_restore] "
-                            f"decision={_cn_decision} "
-                            f"callback_called=1 "
-                            f"source={_current_source if _current_source else 'unavailable'} "
-                            f"check_ms={_check_ms} "
-                            f"reason={_cn_fallback_reason}",
-                            flush=True,
-                        )
-                    if trace:
-                        trace.emit("sync_custom_nodes_start", phase="restore")
-                    if self.sync_custom_nodes:
-                        self.sync_custom_nodes()
-                    if trace:
-                        trace.emit("sync_custom_nodes_end", phase="restore")
-            with variance_stage(trace, stage="generation_observe", phase="restore"):
-                if not _skipped_cn_sync:
-                    if trace:
-                        trace.emit("observe_generations_start", phase="restore")
-                    if self.observe_generations:
-                        observed = self.observe_generations() or {}
-                        self.state.runtime_generation = str(observed.get("runtime_state", ""))
-                        self.state.custom_node_generation = str(observed.get("custom_nodes", ""))
-                    if trace:
-                        trace.emit("observe_generations_end", phase="restore")
-                    if self.state.custom_node_generation:
-                        self.state.snapshot_custom_node_generation = self.state.custom_node_generation
-                        self.state.snapshot_custom_node_source = "observe_generations"
-                        try:
-                            self._persist_custom_node_identity_record()
-                        except Exception as _pexc:
-                            print(f"[bootstrap] identity_publish_after_sync error: {_pexc}", flush=True)
-                else:
-                    self.state.custom_node_generation = self.state.snapshot_custom_node_generation
+            # ── Lane B: custom-node restore (manual publication policy) ──
+            # Normal restore must NOT sync, reconcile, publish, or
+            # Volume.reload custom nodes, and must NOT gate on the whole
+            # custom-node publication generation.  The runtime uses the
+            # custom nodes already present (image-baked/snapshotted).
+            # In particular this block must NOT call
+            # self.read_current_custom_node_identity() (it reloads the
+            # custom-node Volume) and must NOT call self.sync_custom_nodes().
+            if self.state.snapshot_custom_node_generation:
+                self.state.custom_node_generation = self.state.snapshot_custom_node_generation
+            print(
+                "[v2.custom_node_restore] decision=manual_publication callback_called=0",
+                flush=True,
+            )
+            self._record_restore_stage(
+                "sync_custom_nodes",
+                "skipped",
+                trace=trace,
+                decision="manual_publication",
+                reason="manual_publication",
+                callback_called=False,
+                guard={
+                    "decision": "manual_publication",
+                    "reason": "manual_publication",
+                },
+            )
 
             # Lane B — build/hydrate SnapshotExecutionSeed (Step 3)
             # Hydrate the persisted publisher seed payload when available;
@@ -1800,6 +2522,14 @@ class RuntimeBootstrap:
                             },
                         )
             _emit_startup_stage("snapshot_execution_seed", "end", started=_seed_started, trace=trace, phase="restore")
+            self._record_restore_stage(
+                "snapshot_execution_seed",
+                "restored" if _seed_hydrated else "reconstructed",
+                trace=trace,
+                decision="hydrated" if _seed_hydrated else "minimal_fallback",
+                reason="publisher_payload" if _seed_hydrated else "payload_unavailable",
+                callback_called=_seed_hydrated,
+            )
             if trace and self.state.snapshot_seed_built:
                 trace.emit(
                     "snapshot_execution_seed_built",
@@ -1818,6 +2548,17 @@ class RuntimeBootstrap:
                 )
 
             self.state.restore_completed_at = time.time()
+            # ── Host hardware telemetry (once per container restore) ──
+            # Runs OUTSIDE every variance_stage block so it can never alter
+            # stage timing.  Silent no-op when the telemetry module is not
+            # deployed (guarded import).
+            try:
+                from comfymodal_runtime import host_hardware_telemetry as _hht
+                _hht.set_trace(trace)
+                _hht.emit_host_fingerprint(trace)
+                _hht.capture_resource_snapshot("post_restore", trace)
+            except Exception:
+                pass
             if trace:
                 trace.emit(
                     "snapshot_restore_end",
@@ -1826,6 +2567,76 @@ class RuntimeBootstrap:
                 )
                 durations = trace.durations_ms()
                 self.state.stage_durations.update(durations)
+                if opt_diag_enabled():
+                    # ── Aggregated opt_restore_decomposition (measurement only) ──
+                    # Closes the untimed gaps between the already-timed
+                    # variance_stage sub-stages so the restore bootstrap can be
+                    # decomposed to ~100%.  Stage ms come from the same
+                    # durations_ms() mapping Agent 1's _restore_timing consumes;
+                    # absent stages (e.g. skipped sage_policy / custom_node_sync)
+                    # are reported as None.
+                    _stage_ms_map = {
+                        "restore_gpu_state": "restore_gpu_state_ms",
+                        "cuda_init": "cuda_init_ms",
+                        "sage_policy": "sage_policy_ms",
+                        "reload_runtime_state": "runtime_state_ms",
+                        "reload_models": "models_ms",
+                        "sync_custom_nodes": "custom_node_sync_ms",
+                        "observe_generations": "generation_observe_ms",
+                        "v2_startup_snapshot_execution_seed": "snapshot_seed_ms",
+                    }
+                    _dec_meta: dict[str, Any] = {}
+                    _measured_sum_ms = 0.0
+                    for _trace_key, _out_key in _stage_ms_map.items():
+                        _val = durations.get(_trace_key)
+                        if isinstance(_val, (int, float)):
+                            _dec_meta[_out_key] = round(float(_val), 3)
+                            _measured_sum_ms += _dec_meta[_out_key]
+                        else:
+                            _dec_meta[_out_key] = None
+                    _gap_fields = {
+                        "fastdisk_wrapper_ms": _opt_fastdisk_wrapper_ms,
+                        "metadata_ms": _opt_metadata_ms,
+                        "sage_identity_read_ms": _opt_sage_identity_read_ms,
+                        "sage_verify_ms": _sage_verify_ms,
+                        "prescan_identity_ms": _opt_prescan_identity_ms,
+                        "custom_node_check_ms": _opt_custom_node_check_ms,
+                        "models_reload_check_ms": _models_reload_check_ms,
+                        "runtime_state_reload_check_ms": _runtime_state_reload_check_ms,
+                        "seed_read_ms": _opt_seed_read_sum_ms(),
+                        "gc_ms": _opt_gc_ms,
+                    }
+                    for _out_key, _val in _gap_fields.items():
+                        if isinstance(_val, (int, float)):
+                            _dec_meta[_out_key] = round(float(_val), 3)
+                            _measured_sum_ms += _dec_meta[_out_key]
+                        else:
+                            _dec_meta[_out_key] = None
+                    _dec_meta["models_reload_decision"] = _models_reload_decision
+                    _dec_meta["runtime_state_reload_decision"] = _runtime_state_reload_decision
+                    _dec_meta["runtime_state_reload_invoked"] = int(_runtime_state_reload_invoked)
+                    _bootstrap_total_ms = round((time.perf_counter() - started) * 1000, 3)
+                    _dec_meta["bootstrap_total_ms"] = _bootstrap_total_ms
+                    _dec_meta["measured_sum_ms"] = round(_measured_sum_ms, 3)
+                    _dec_meta["residual_ms"] = round(
+                        max(_bootstrap_total_ms - _measured_sum_ms, 0.0), 3
+                    )
+                    _dec_meta["coverage_pct"] = (
+                        round(_measured_sum_ms / _bootstrap_total_ms * 100.0, 2)
+                        if _bootstrap_total_ms > 0
+                        else None
+                    )
+                    _dec_meta["composition_notes"] = (
+                        "seed_read_ms is measured inside the snapshot_seed stage "
+                        "(only non-zero when COMFYMODAL_V2_PUBLISH_RESTORE_PLAN=1); "
+                        "gc_ms is a constant 0.0 (no gc.collect() inside restore)"
+                    )
+                    emit_opt(
+                        trace,
+                        "restore_decomposition",
+                        phase="restore",
+                        metadata=_dec_meta,
+                    )
             return self.state
         except Exception as exc:
             self.state.errors.append(str(exc))

@@ -25,7 +25,12 @@ from typing import Any
 
 import pytest
 
-from comfymodal_runtime.full_trace_report import generate_full_trace_report
+from comfymodal_runtime.full_trace_report import (
+    _build_golden_profile,
+    _generate_golden_profile_report,
+    _golden_profile_json,
+    generate_full_trace_report,
+)
 
 
 # =========================================================================
@@ -571,6 +576,71 @@ class TestSemanticOperations:
         clip_dups = [d for d in sem_dups if d["operation_type"] == "clip_graph_encode"]
         assert len(clip_dups) == 1
         assert int(clip_dups[0]["call_count"]) >= 2
+
+    def test_wrapped_session_events_pair_operations_and_preserve_lifecycle(self, tmp_path: Path):
+        """RuntimeTrace's wrapped records become one measured operation plus lifecycle evidence."""
+        session_events = [
+            {
+                "timestamp": 1000.000,
+                "event": "mark",
+                "data": {"name": "request_entry", "pid": 7, "native_thread_id": 9},
+            },
+            {
+                "timestamp": 1000.100,
+                "event": "operation_start",
+                "data": {
+                    "operation_id": "op-1",
+                    "operation_type": "clip_graph_encode",
+                    "semantic_key_hash": "a" * 64,
+                    "request_id": "request-1",
+                    "restore_session_id": "restore-1",
+                    "pid": 7,
+                    "native_thread_id": 9,
+                    "asyncio_task_id": 11,
+                    "start_monotonic_ns": 1,
+                },
+            },
+            {
+                "timestamp": 1000.225,
+                "event": "operation_end",
+                "data": {
+                    "operation_id": "op-1",
+                    "pid": 7,
+                    "native_thread_id": 9,
+                    "asyncio_task_id": 11,
+                    "wall_ms": 125.0,
+                    "status": "ok",
+                },
+            },
+        ]
+        session_dir = _make_session(
+            tmp_path,
+            viztracer_events=[X("main", 1000, 500)],
+            session_events=session_events,
+        )
+        generate_full_trace_report(session_dir)
+        report_data = json.loads(
+            (session_dir / "derived" / "report_data.json").read_text("utf-8")
+        )
+
+        normalized = report_data["session_events"]
+        operations = [event for event in normalized if event.get("operation_type")]
+        assert len(operations) == 1
+        assert operations[0]["operation_id"] == "op-1"
+        assert operations[0]["start_ms"] == pytest.approx(1_000_100.0)
+        assert operations[0]["duration_ms"] == pytest.approx(125.0)
+        assert operations[0]["end_ms"] == pytest.approx(1_000_225.0)
+
+        semantic = [
+            event for event in report_data["timeline"]
+            if event["owner_type"] == "semantic_operation"
+        ]
+        assert any(event["owner_name"] == "clip_graph_encode" for event in semantic)
+        assert any(
+            event["owner_type"] == "milestone"
+            and event["owner_name"] == "request_entry"
+            for event in report_data["timeline"]
+        )
 
 
 class TestExpectedVsObserved:
@@ -1805,6 +1875,633 @@ class TestAdditionalEdgeCases:
                      "functions_summary", "duplicate_calls", "semantic_duplicates",
                      "expected_vs_observed", "torch_cpu_ops", "torch_cuda_ops"):
             assert key in report_data, f"Missing key in report_data.json: {key}"
+
+
+class TestSamplingDeepProjection:
+    """Sampling deep evidence stays outside ordinary trace accounting."""
+
+    @staticmethod
+    def _payload() -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "level": "blocks",
+            "status": "ok",
+            "steps": 2,
+            "authoritative_sampling_window_ms": 90.0,
+            "sampler_invocation": {"setup_to_first_eval_ms": 5.0},
+            "reconciliation": {
+                "setup_ms": 5.0,
+                "steps_ms": [
+                    {"step": 0, "pre_model_ms": 0.0, "eval0_ms": 20.0, "gap_ms": 2.0, "eval1_ms": 18.0, "post_model_ms": 1.0, "total_ms": 41.0},
+                    {"step": 1, "pre_model_ms": 3.0, "eval0_ms": 15.0, "gap_ms": 1.0, "eval1_ms": 14.0, "post_model_ms": 1.0, "total_ms": 34.0},
+                ],
+                "teardown_ms": 10.0,
+                "sampling_residual_ms": 0.0,
+            },
+            "evals": {"per_eval": [{"index": 0, "step": 0, "row": 0, "ms": 20.0, "forward_gpu_ms": 19.0, "categories_ms": {"attention": 12.0}}]},
+            "categories_ms": {"attention": 12.0},
+            "blocks": [{"block": 0, "total_ms": 12.0, "attention_ms": 8.0, "mlp_ms": 3.0, "norm_ms": 1.0}],
+            "cuda_timings_ms": {"forward": 19.0},
+        }
+
+    def test_headings_rows_field_and_no_child_contamination(self, tmp_path: Path):
+        payload = self._payload()
+        session_dir = _make_session(
+            tmp_path,
+            viztracer_events=[X("golden_serial_execute", 0, 100), X("sampling_deep_profile", 10, 20)],
+            session_events=[{"event": "sampling_deep_profile", "metadata": payload}],
+        )
+        generate_full_trace_report(session_dir)
+        markdown = (session_dir / "derived" / "report.md").read_text("utf-8")
+        data = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))
+        assert "## STEP BREAKDOWN" in markdown
+        assert "## DEEP MODEL BREAKDOWN" in markdown
+        for label in ("setup", "step 0", "finalization", "FIRST_PASS_WALL_MS", "SUBSEQUENT_STEPS_WALL_MS", "TOTAL_STEP_UNION_MS", "SAMPLER_PARENT_WALL_MS", "UNACCOUNTED_MS"):
+            assert label in markdown
+        assert data["sampling_deep_profile"]["status"] == "available"
+        assert data["sampling_deep_profile"]["hierarchy_included"] is False
+        assert len(data["calls"]) == 1
+        assert all(call["name"] != "sampling_deep_profile" for call in data["calls"])
+        assert data["golden_profile"]["root"]["direct_child_count"] == 0
+
+    def test_session_and_golden_telemetry_copies_are_deduplicated(self, tmp_path: Path):
+        payload = self._payload()
+        session_dir = _make_session(
+            tmp_path,
+            viztracer_events=[],
+            session_events=[{"event": "sampling_deep_profile", "metadata": payload}],
+            runtime_result={"golden_telemetry": {"events": [{"name": "sampling_deep_profile", "fields": {"metadata": payload}}]}},
+        )
+        generate_full_trace_report(session_dir)
+        data = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))
+        deep = data["sampling_deep_profile"]
+        assert deep["record_count"] == 1
+        assert deep["duplicate_count"] == 1
+        assert len(deep["records"][0]["sources"]) == 2
+
+    def test_malformed_sampling_event_is_not_reported_as_cleanly_absent(self, tmp_path: Path):
+        session_dir = _make_session(tmp_path, viztracer_events=[])
+        (session_dir / "raw" / "session_events.jsonl").write_text(
+            '{"event":"sampling_deep_profile","metadata":\n', encoding="utf-8"
+        )
+        generate_full_trace_report(session_dir)
+        data = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))
+        assert data["sampling_deep_profile"]["status"] == "invalid"
+        assert data["sampling_deep_profile"]["records"][0]["error"] == "payload_not_object"
+
+    @pytest.mark.parametrize("event", [
+        {"event": "sampling_deep_profile", "metadata": None},
+        {"event": "sampling_deep_profile", "metadata": {"status": "incomplete", "errors": ["x"]}},
+        {"event": "sampling_deep_profile", "metadata": {"status": "ok", "blob": "x" * (2 * 1024 * 1024)}},
+    ])
+    def test_invalid_non_ok_and_oversized_are_explicit(self, tmp_path: Path, event: dict[str, Any]):
+        session_dir = _make_session(tmp_path, viztracer_events=[], session_events=[event])
+        result = generate_full_trace_report(session_dir)
+        data = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))
+        deep = data["sampling_deep_profile"]
+        assert result["status"] in ("ready", "partial")
+        assert deep["status"] in ("invalid", "non_ok", "oversized")
+        assert deep["records"]
+        assert "sampling_deep_profile" in (session_dir / "derived" / "report.md").read_text("utf-8")
+
+
+class TestE27SourceH2DProjection:
+    """Persisted E27 transport evidence is projected without trace synthesis."""
+
+    @staticmethod
+    def _actual_source(**overrides: Any) -> dict[str, Any]:
+        actual: dict[str, Any] = {
+            "SOURCE_TOTAL_WALL_MS": 22.0,
+            "SOURCE_SYSCALL_UNION_BUSY_MS": 18.0,
+            "source_read_count": 4,
+            "source_bytes": 128,
+            "max_actual_source_inflight": 4,
+            "qd_occupancy_ms": {"0": 1.0, "1": 2.0, "2": 3.0, "3": 4.0, "4": 12.0},
+            "time_weighted_mean_qd": 3.1,
+            "H2D_TOTAL_WALL_MS": 31.0,
+            "h2d_submitted_bytes": 128,
+            "h2d_completed_bytes": 128,
+            "h2d_reconciliation_complete": True,
+            "h2d_events": [{"token": 1, "bytes": 128, "submit_ns": 10, "complete_ns": 20}],
+            "SOURCE_H2D_OVERLAP_MS": 9.0,
+            "SOURCE_TO_GPU_READY_MS": 35.0,
+            "POST_SOURCE_H2D_TAIL_MS": 4.0,
+            "starvation_gaps": [{"start_ns": 1, "end_ns": 2, "duration_ns": 1}],
+            "quiescence_evidence": {"workers_joined": True, "h2d_events_waited": True},
+            "source_fence_valid": True,
+        }
+        actual.update(overrides)
+        return actual
+
+    @classmethod
+    def _runtime_result(cls, actual: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "golden_telemetry": {
+                "stages": [{
+                    "name": "golden_vae_load",
+                    "details": {"transport_stats": {"role": "vae", "actual_source": actual}},
+                }],
+            },
+        }
+
+    def test_valid_projection_is_separate_from_golden_calls(self, tmp_path: Path):
+        session_dir = _make_session(
+            tmp_path,
+            viztracer_events=[X("golden_serial_execute", 0, 100), X("sampling_deep_profile", 10, 20)],
+            runtime_result=self._runtime_result(self._actual_source()),
+        )
+        generate_full_trace_report(session_dir)
+        data = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))
+        projection = data["source_h2d_transport"]
+        assert projection["status"] == "available"
+        assert projection["stage"] == "golden_vae_load"
+        assert projection["SOURCE_TOTAL_WALL_MS"] == 22.0
+        assert projection["read_count"] == 4
+        assert projection["read_bytes"] == 128
+        assert projection["max_inflight"] == 4
+        assert projection["reconciliation"]["state"] == "valid"
+        assert projection["SOURCE_H2D_OVERLAP_MS"] == 9.0
+        assert projection["timing_semantics"]["non_additive"] is True
+        assert all(call["name"] != "sampling_deep_profile" for call in data["calls"])
+        assert "## SOURCE/H2D TRANSPORT" in (session_dir / "derived" / "report.md").read_text("utf-8")
+
+    def test_missing_source_timestamps_are_explicitly_unavailable(self, tmp_path: Path):
+        actual = self._actual_source(
+            SOURCE_TOTAL_WALL_MS=None,
+            SOURCE_SYSCALL_UNION_BUSY_MS=None,
+            SOURCE_H2D_OVERLAP_MS=None,
+            SOURCE_TO_GPU_READY_MS=None,
+            POST_SOURCE_H2D_TAIL_MS=None,
+        )
+        session_dir = _make_session(tmp_path, viztracer_events=[], runtime_result=self._runtime_result(actual))
+        generate_full_trace_report(session_dir)
+        projection = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))["source_h2d_transport"]
+        assert projection["status"] == "timestamps_unavailable"
+        assert projection["SOURCE_TOTAL_WALL_MS"] == "measurement_unavailable"
+        assert projection["SOURCE_H2D_OVERLAP_MS"] == "measurement_unavailable"
+        assert projection["reconciliation"]["state"] == "valid"
+
+    def test_incomplete_h2d_reconciliation_does_not_expose_partial_intervals(self, tmp_path: Path):
+        actual = self._actual_source(
+            h2d_submitted_bytes=128,
+            h2d_completed_bytes=64,
+            h2d_reconciliation_complete=False,
+            H2D_TOTAL_WALL_MS=31.0,
+            SOURCE_H2D_OVERLAP_MS=9.0,
+        )
+        session_dir = _make_session(tmp_path, viztracer_events=[], runtime_result=self._runtime_result(actual))
+        generate_full_trace_report(session_dir)
+        projection = json.loads((session_dir / "derived" / "report_data.json").read_text("utf-8"))["source_h2d_transport"]
+        assert projection["status"] == "reconciliation_invalid"
+        assert projection["reconciliation"]["state"] == "invalid"
+        assert projection["h2d_submitted_bytes"] == 128
+        assert projection["h2d_completed_bytes"] == 64
+        assert projection["H2D_TOTAL_WALL_MS"] == "measurement_unavailable"
+        assert projection["SOURCE_TO_GPU_READY_MS"] == "measurement_unavailable"
+
+
+class TestGoldenCohortEnvelopeIntegration:
+    """Existing Golden cohort envelopes feed the report projections directly."""
+
+    def test_exact_cohort_envelope_preserves_sampling_and_e27_evidence(self, tmp_path: Path):
+        cohort = tmp_path / "cohort_2026-09-03_02-43-40_218394"
+        cohort.mkdir()
+        sampling = TestSamplingDeepProjection._payload()
+        actual_source = TestE27SourceH2DProjection._actual_source()
+        attempt = {
+            "golden_telemetry": {
+                "events": [{
+                    "name": "sampling_deep_profile",
+                    "fields": {"metadata": sampling},
+                }],
+                "stages": [{
+                    "name": "golden_vae_load",
+                    "details": {
+                        "transport_stats": {
+                            "role": "vae",
+                            "actual_source": actual_source,
+                        },
+                    },
+                }],
+            },
+        }
+        (cohort / "attempt_0.json").write_text(json.dumps(attempt), encoding="utf-8")
+
+        generate_full_trace_report(cohort)
+        data = json.loads((cohort / "derived" / "report_data.json").read_text("utf-8"))
+        markdown = (cohort / "derived" / "report.md").read_text("utf-8")
+
+        deep = data["sampling_deep_profile"]
+        assert deep["status"] == "available"
+        assert deep["record_count"] == 1
+        assert deep["step_breakdown"]
+        assert deep["model_breakdown"]
+        transport = data["source_h2d_transport"]
+        assert transport["status"] == "available"
+        assert transport["SOURCE_TOTAL_WALL_MS"] == 22.0
+        assert "## STEP BREAKDOWN" in markdown
+        assert "## DEEP MODEL BREAKDOWN" in markdown
+        assert "## SOURCE/H2D TRANSPORT" in markdown
+
+
+class TestGoldenProfile:
+    """Synthetic, stdlib-only fixtures for the Golden serial profile."""
+
+    def _profile(self, tmp_path: Path, events: list[dict[str, Any]], **kwargs: Any) -> tuple[Path, dict[str, Any]]:
+        session_dir = _make_session(tmp_path, viztracer_events=events, **kwargs)
+        result = generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        return session_dir, {"result": result, "summary": summary}
+
+    def test_hotspot_over_threshold_and_short_span_exclusion(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000),
+            X("hotspot", 10_000, 60_000),
+            X("short_span", 80_000, 40_000),
+        ])
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "YES"
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "DISABLED"
+        assert [n["name"] for n in report["summary"]["nodes"]] == ["hotspot"]
+        assert report["summary"]["root"]["direct_child_sum_ms"] == 100.0
+        assert report["summary"]["root"]["subthreshold_children_union_ms"] == 40.0
+        assert report["summary"]["root"]["direct_child_count"] == 2
+        assert report["summary"]["root"]["subthreshold_child_count"] == 1
+        assert report["summary"]["root"]["display_children_gt50ms"] == 1
+        assert report["summary"]["root"]["residual_reason"] == "DISPLAYED_CHILDREN_GT50MS"
+        assert "short_span" not in (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+
+    def test_nested_over_threshold_spans_render_recursively_with_explicit_accounting(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 400_000),
+            X("outer_stage", 10_000, 290_000),
+            X("inner_stage", 20_000, 160_000),
+            X("deep_stage", 30_000, 60_000),
+            X("short_inner_work", 100_000, 40_000),
+        ])
+
+        root = report["summary"]["root"]
+        outer = root["children"][0]
+        inner = outer["children"][0]
+        assert [outer["name"], inner["name"], inner["children"][0]["name"]] == [
+            "outer_stage", "inner_stage", "deep_stage",
+        ]
+        assert inner["direct_child_count"] == 2
+        assert inner["direct_child_sum_ms"] == 100.0
+        assert inner["direct_child_union_ms"] == 100.0
+        assert inner["direct_child_overlap_ms"] == 0.0
+        assert inner["subthreshold_child_count"] == 1
+        assert inner["subthreshold_child_union_ms"] == 40.0
+        assert inner["display_children_gt50ms"] == 1
+        assert inner["residual_ms"] == 60.0
+        assert inner["residual_pct"] == 37.5
+        assert inner["residual_reason"] == "DISPLAYED_CHILDREN_GT50MS"
+
+        markdown = (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+        assert "|       deep_stage |" in markdown
+        assert "|     short_inner_work |" not in markdown
+        for field in (
+            "WALL_MS", "DIRECT_CHILD_COUNT", "DIRECT_CHILD_SUM_MS",
+            "DIRECT_CHILD_UNION_MS", "DIRECT_CHILD_OVERLAP_MS",
+            "SUBTHRESHOLD_CHILD_COUNT", "SUBTHRESHOLD_CHILD_UNION_MS",
+            "RESIDUAL_MS", "RESIDUAL_PCT",
+        ):
+            assert field in markdown
+
+    def test_promoted_descendant_updates_display_summary_without_changing_direct_accounting(self):
+        calls = [
+            {
+                "event_index": 0,
+                "name": "golden_serial_execute",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "",
+                "start_us": 0.0,
+                "end_us": 300_000.0,
+                "complete": True,
+                "parent_event_index": None,
+            },
+            {
+                "event_index": 1,
+                "name": "short_wrapper",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "",
+                "start_us": 10_000.0,
+                "end_us": 50_000.0,
+                "complete": True,
+                "parent_event_index": 0,
+            },
+            {
+                "event_index": 2,
+                "name": "large_descendant",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "",
+                "start_us": 15_000.0,
+                "end_us": 115_000.0,
+                "complete": True,
+                "parent_event_index": 1,
+            },
+        ]
+        profile = _build_golden_profile(
+            calls,
+            [],
+            [],
+            {},
+            trace_truncated=False,
+            raw_trace_nonempty=True,
+        )
+        summary = _golden_profile_json(profile)
+        root = summary["root"]
+        assert root is not None
+        assert [child["name"] for child in root["children"]] == ["large_descendant"]
+        assert root["direct_child_count"] == 1
+        assert root["direct_child_sum_ms"] == 40.0
+        assert root["direct_child_union_ms"] == 40.0
+        assert root["direct_child_overlap_ms"] == 0.0
+        assert root["subthreshold_child_count"] == 1
+        assert root["subthreshold_child_union_ms"] == 40.0
+        assert root["display_children_gt50ms"] == 1
+        assert root["DISPLAY_CHILDREN_GT50MS"] == 1
+        assert root["residual_reason"] == "DISPLAYED_CHILDREN_GT50MS"
+        assert root["RESIDUAL_REASON"] == "DISPLAYED_CHILDREN_GT50MS"
+
+        markdown = _generate_golden_profile_report(profile)
+        assert "|   large_descendant |" in markdown
+
+    def test_union_and_overlap_accounting(self, tmp_path: Path):
+        _, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000),
+            X("overlap_a", 10_000, 70_000),
+            X("overlap_b", 50_000, 70_000),
+        ])
+        root = report["summary"]["root"]
+        assert root["direct_child_sum_ms"] == 140.0
+        assert root["direct_child_union_ms"] == 110.0
+        assert root["child_overlap_ms"] == 30.0
+        assert root["direct_child_count"] == 2
+        assert root["direct_child_overlap_ms"] == 30.0
+        assert root["residual_reason"] == "DISPLAYED_CHILDREN_GT50MS"
+
+    def test_only_subthreshold_children_have_explicit_residual_reason(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 100_000),
+            X("small_child", 10_000, 40_000),
+        ])
+        root = report["summary"]["root"]
+        assert root["traced_children"] == 1
+        assert root["display_children_gt50ms"] == 0
+        assert root["subthreshold_child_count"] == 1
+        assert root["subthreshold_child_union_ms"] == 40.0
+        assert root["true_self_or_untraced_residual_ms"] == 60.0
+        assert root["residual_reason"] == "ONLY_SUBTHRESHOLD_CHILDREN"
+        markdown = (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+        assert "DISPLAY_CHILDREN_GT50MS" in markdown
+        assert "RESIDUAL_REASON=ONLY_SUBTHRESHOLD_CHILDREN" in markdown
+
+    def test_cross_context_unparented_span_is_not_root_child(self, tmp_path: Path):
+        """Unparented spans from another execution context stay out of the root tree."""
+        _, report = self._profile(tmp_path, [
+            X("golden_serial_execute", 0, 200_000, pid=1, tid=1,
+              args={"task_id": "root-task"}),
+            X("same_context_child", 10_000, 70_000, pid=1, tid=1,
+              args={"task_id": "root-task"}),
+            X("cross_context_span", 20_000, 160_000, pid=2, tid=2,
+              args={"task_id": "other-task"}),
+        ])
+
+        root = report["summary"]["root"]
+        assert root["direct_child_union_ms"] == 70.0
+        assert [child["name"] for child in root["children"]] == ["same_context_child"]
+
+        def tree_names(nodes: list[dict[str, Any]]) -> set[str]:
+            return {
+                name
+                for node in nodes
+                for name in (node["name"], *tree_names(node["children"]))
+            }
+
+        assert "cross_context_span" not in tree_names(root["children"])
+
+    def test_explicit_cross_context_parent_is_not_attached_recursively(self):
+        """Explicit parent indices do not establish ownership across contexts."""
+        calls = [
+            {
+                "event_index": 0,
+                "name": "golden_serial_execute",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 0.0,
+                "end_us": 400_000.0,
+                "complete": True,
+                "parent_event_index": None,
+            },
+            {
+                "event_index": 1,
+                "name": "same_context_parent",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 10_000.0,
+                "end_us": 390_000.0,
+                "complete": True,
+                "parent_event_index": 0,
+            },
+            {
+                "event_index": 2,
+                "name": "same_context_nested",
+                "pid": 1,
+                "tid": 1,
+                "task_id": "root-task",
+                "start_us": 20_000.0,
+                "end_us": 100_000.0,
+                "complete": True,
+                "parent_event_index": 1,
+            },
+            {
+                "event_index": 3,
+                "name": "cross_context_explicit_child",
+                "pid": 2,
+                "tid": 2,
+                "task_id": "other-task",
+                "start_us": 30_000.0,
+                "end_us": 300_000.0,
+                "complete": True,
+                "parent_event_index": 1,
+            },
+        ]
+
+        profile = _build_golden_profile(
+            calls,
+            [],
+            [],
+            {},
+            trace_truncated=False,
+            raw_trace_nonempty=True,
+        )
+        root = profile["root"]
+        assert root is not None
+        assert root["direct_child_sum_ms"] == 380.0
+        assert [child["name"] for child in root["children"]] == ["same_context_parent"]
+        nested = root["children"][0]
+        assert nested["direct_child_sum_ms"] == 80.0
+        assert [child["name"] for child in nested["children"]] == ["same_context_nested"]
+
+        def tree_names(nodes: list[dict[str, Any]]) -> set[str]:
+            return {
+                name
+                for node in nodes
+                for name in (node["name"], *tree_names(node["children"]))
+            }
+
+        assert "cross_context_explicit_child" not in tree_names(root["children"])
+
+    def test_residual_absolute_and_percentage_flag(self, tmp_path: Path):
+        session_dir, report = self._profile(tmp_path, [X("golden_serial_execute", 0, 100_000)])
+        root = report["summary"]["root"]
+        assert root["exclusive_residual_ms"] == 100.0
+        assert root["traced_children"] == 0
+        assert root["residual_pct"] == 100.0
+        assert root["residual_reason"] == "NO_TRACED_CHILDREN"
+        assert root["needs_decomposition"] is True
+        markdown = (session_dir / "derived" / "golden_profile_report.md").read_text("utf-8")
+        assert "NEEDS_DECOMPOSITION" in markdown
+        assert "RESIDUAL_REASON=NO_TRACED_CHILDREN" in markdown
+
+    def test_ambiguous_root_and_truncation_fail_closed(self, tmp_path: Path):
+        _, ambiguous = self._profile(tmp_path / "ambiguous", [
+            X("golden_serial_execute", 0, 100_000),
+            X("golden_serial_execute", 0, 100_000),
+        ])
+        assert ambiguous["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert ambiguous["summary"]["GOLDEN_PROFILE_REASON"].startswith("ambiguous")
+
+        session_dir = _make_session(tmp_path / "truncated", viztracer_events=[X("golden_serial_execute", 0, 100_000)])
+        raw = json.loads(gzip.decompress((session_dir / "raw" / "viztracer.json.gz").read_bytes()))
+        raw["metadata"]["truncated"] = True
+        (session_dir / "raw" / "viztracer.json.gz").write_bytes(_gzip_json(raw))
+        generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        assert summary["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert summary["GOLDEN_PROFILE_REASON"] == "VizTracer trace is truncated"
+
+    def test_semantic_spans_and_deterministic_gantt_width(self, tmp_path: Path):
+        session_dir, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 200_000)],
+            session_events=[{"operation_type": "output_encode", "start_ms": 50.0, "duration_ms": 60.0}],
+        )
+        assert report["summary"]["semantic_spans"][0]["name"] == "output_encode"
+        gantt = (session_dir / "derived" / "golden_profile_gantt.txt").read_text("utf-8")
+        bars = [line.split("|")[1] for line in gantt.splitlines() if "|" in line and "█" in line]
+        assert bars and all(len(bar) == 100 for bar in bars)
+
+    def test_required_stage_reason_is_explicit(self, tmp_path: Path):
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            trace_config={"golden_profile_require_canonical_stages": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"] == "missing required canonical stage: golden_restore"
+
+    def test_explicit_async_golden_spans_are_real_root_and_canonical_stages(self, tmp_path: Path):
+        """VizEvent source suffixes must remain usable as raw Golden evidence."""
+        stage_names = (
+            "golden_restore", "golden_request_setup", "golden_clip_load",
+            "golden_clip_forward", "golden_unet_load", "golden_sampler_prepare",
+            "golden_vae_load", "golden_sampling", "golden_sampler_tail",
+            "golden_vae_decode", "golden_output",
+        )
+        events = [
+            X("golden_serial_execute (golden_serial.py:1)", 0, 1_000_000,
+              pid=1, tid=2, cat="FEE"),
+            *[
+                X(f"{name} (golden_serial.py:{index})", index * 10_000, 5_000,
+                  pid=1, tid=2, cat="FEE")
+                for index, name in enumerate(stage_names, start=1)
+            ],
+        ]
+        _, report = self._profile(
+            tmp_path,
+            events,
+            trace_config={"golden_profile_require_canonical_stages": True},
+        )
+        summary = report["summary"]
+        assert summary["GOLDEN_PROFILE_COMPLETE"] == "YES"
+        assert summary["root"]["name"] == "golden_serial_execute"
+        assert summary["root"]["source"] == "viztracer"
+        assert [span["name"] for span in summary["canonical_spans"]] == list(stage_names)
+
+    def test_cross_context_canonical_stage_does_not_satisfy_required_evidence(self, tmp_path: Path):
+        """A canonical stage in another pid/tid/task cannot complete this root."""
+        _, report = self._profile(
+            tmp_path,
+            [
+                X(
+                    "golden_serial_execute", 0, 100_000,
+                    pid=1, tid=1, args={"task_id": "root-task"},
+                ),
+                X(
+                    "golden_restore", 10_000, 60_000,
+                    pid=2, tid=2, args={"task_id": "other-task"},
+                ),
+            ],
+            trace_config={
+                "required_canonical_stages": ["golden_restore"],
+            },
+        )
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"] == (
+            "missing required canonical stage: golden_restore"
+        )
+        assert report["summary"]["observed_canonical_stages"] == []
+
+    def test_missing_root_and_incomplete_child_reasons(self, tmp_path: Path):
+        _, missing = self._profile(tmp_path / "missing", [X("ordinary_call", 0, 100_000)])
+        assert missing["summary"]["GOLDEN_PROFILE_REASON"] == "missing golden_serial_execute root call"
+
+        session_dir = _make_session(
+            tmp_path / "incomplete",
+            viztracer_events=[X("golden_serial_execute", 0, 100_000), B("unfinished", 20_000)],
+        )
+        generate_full_trace_report(session_dir)
+        summary = json.loads((session_dir / "derived" / "golden_profile_summary.json").read_text("utf-8"))
+        assert summary["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert summary["GOLDEN_PROFILE_REASON"] == "incomplete root-corrupting call: unfinished"
+
+    def test_enabled_torch_failure_is_not_python_complete(self, tmp_path: Path):
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            trace_config={"torch_enabled": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "ENABLED"
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"].startswith("Torch analysis failed")
+
+    def test_explicit_torch_false_ignores_placeholder_trace(self, tmp_path: Path):
+        """An empty trace artifact does not override explicit Torch disablement."""
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            torch_events=[],
+            trace_config={"torch_enabled": False},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "DISABLED"
+
+    def test_explicit_torch_true_with_empty_trace_is_incomplete(self, tmp_path: Path):
+        """Explicit Torch enablement remains enabled when its trace is empty."""
+        _, report = self._profile(
+            tmp_path,
+            [X("golden_serial_execute", 0, 100_000)],
+            torch_events=[],
+            trace_config={"torch_enabled": True},
+        )
+        assert report["summary"]["GOLDEN_PROFILE_TORCH"] == "ENABLED"
+        assert report["summary"]["GOLDEN_PROFILE_COMPLETE"] == "NO"
+        assert report["summary"]["GOLDEN_PROFILE_REASON"].startswith("Torch analysis failed")
 
 
 # =========================================================================

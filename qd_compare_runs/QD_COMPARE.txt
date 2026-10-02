@@ -1,0 +1,129 @@
+﻿====================================================================================================
+QD4 vs QD8 @ 4.0 ms global launch spacing
+====================================================================================================
+  QD4: 20 runs, 2400 pooled reads
+  QD8: 20 runs, 2400 pooled reads
+
+=== POOLED PREADV (all physical reads, pathological reads INCLUDED) ===
+
+[QD4]  reads=2400
+  best=19.14 p10=36.60 median=42.93 mean=49.81 p95=70.63 p99=144.70 worst=828.13 SD=44.29  (ms)
+    >=   250 ms :   14  (0.583%)
+    >=   500 ms :    9  (0.375%)
+    >=  1000 ms :    0  (0.000%)
+    >=  2000 ms :    0  (0.000%)
+    >=  5000 ms :    0  (0.000%)
+
+[QD8]  reads=2400
+  best=20.24 p10=44.99 median=102.67 mean=100.07 p95=152.48 p99=216.86 worst=1154.90 SD=53.94  (ms)
+    >=   250 ms :   18  (0.750%)
+    >=   500 ms :    7  (0.292%)
+    >=  1000 ms :    2  (0.083%)
+    >=  2000 ms :    0  (0.000%)
+    >=  5000 ms :    0  (0.000%)
+
+=== PER-RUN DISTRIBUTION ===
+
+[QD4]
+  wall ms      best=  1232.24  p10=  1362.21  median=  1682.19  mean=  1722.87  p95=  2126.23  p99=  2300.80  worst=  2344.44  SD=  303.07  [ms]
+  GB/s         best=     3.43  p10=     3.85  median=     4.78  mean=     4.82  p95=     6.38  p99=     6.50  worst=     6.53  SD=    0.86  [GB/s]
+  mean total wall = 1722.9 ms = 1.723 s
+
+[QD8]
+  wall ms      best=  1451.47  p10=  1688.74  median=  2035.11  mean=  2057.14  p95=  2523.58  p99=  2755.32  worst=  2813.26  SD=  339.73  [ms]
+  GB/s         best=     2.86  p10=     3.22  median=     3.95  mean=     4.02  p95=     4.88  p99=     5.41  worst=     5.54  SD=    0.66  [GB/s]
+  mean total wall = 2057.1 ms = 2.057 s
+
+=== TAIL BEHAVIOR ===
+
+[QD4] runs with >=500ms: 5/20   runs with >=1000ms: 0/20
+        physical reads >=500ms: 9   >=1000ms: 0
+        worst read 828 ms in qc-q4-r04 (us-east)
+
+[QD8] runs with >=500ms: 4/20   runs with >=1000ms: 1/20
+        physical reads >=500ms: 7   >=1000ms: 2
+        worst read 1155 ms in qc-q8-r08 (us-west)
+
+=== PACER VALIDITY (observed launch gaps, ms) ===
+  QD4: min=4.000 (range 4.000-4.151)  p10~4.23  median=8.03  p95~32.77
+  QD8: min=4.001 (range 4.001-4.111)  p10~4.26  median=6.29  p95~48.44
+
+=== CONCURRENCY ===
+  QD4: overlap mean=0.980 median=0.983 | eff conc mean=3.49 median=3.61 | max active=4
+  QD8: overlap mean=0.975 median=0.975 | eff conc mean=5.89 median=6.04 | max active=8
+
+=== GENERATION ANALYSIS ===
+  QD  gen     n   median      mean      p95    worst  >=500 >=1000
+ QD4   g0    80   105.14    180.58   606.93      828      9      0
+ QD4   g1    80    44.90     53.38    96.31      190      0      0
+ QD4   g2    80    49.55     57.81   103.05      201      0      0
+ QD4   g3    80    45.81     49.64    73.43       92      0      0
+ QD4   g4    80    43.51     46.63    64.43       94      0      0
+ QD8   g0   160   121.21    166.98   470.73     1155      7      2
+ QD8   g1   160    74.15     78.58   133.43      224      0      0
+ QD8   g2   160    94.28     96.56   143.71      231      0      0
+ QD8   g3   160   104.94    100.12   134.29      184      0      0
+ QD8   g4   160   107.97    107.17   138.62      201      0      0
+
+=== HEADLINE COMPARISON ===
+| metric                 |   QD4 @ 4 ms |   QD8 @ 4 ms |
+|------------------------|--------------|--------------|
+| runs                   |           20 |           20 |
+| total reads            |         2400 |         2400 |
+| preadv best            |        19.14 |        20.24 |
+| preadv p10             |        36.60 |        44.99 |
+| preadv median          |        42.93 |       102.67 |
+| preadv mean            |        49.81 |       100.07 |
+| preadv p95             |        70.63 |       152.48 |
+| preadv p99             |       144.70 |       216.86 |
+| preadv worst           |       828.13 |      1154.90 |
+| preadv SD              |        44.29 |        53.94 |
+| reads >=500            |            9 |            7 |
+| reads >=1000           |            0 |            2 |
+| runs >=500             |            5 |            4 |
+| runs >=1000            |            0 |            1 |
+| median GB/s            |        4.782 |        3.953 |
+| mean GB/s              |        4.818 |        4.018 |
+| best GB/s              |        6.529 |        5.543 |
+| worst GB/s             |        3.432 |        2.860 |
+| GB/s SD                |        0.859 |        0.660 |
+| avg total time ms      |       1722.9 |       2057.1 |
+| median total time ms   |       1682.2 |       2035.1 |
+| best total time ms     |       1232.2 |       1451.5 |
+| worst total time ms    |       2344.4 |       2813.3 |
+| total-time SD          |        303.1 |        339.7 |
+| overlap                |        0.980 |        0.975 |
+| eff concurrency        |         3.49 |         5.89 |
+
+=== QD8 vs QD4 THROUGHPUT DELTA ===
+  median GB/s : QD4=4.782  QD8=3.953  delta=-0.829 (-17.3%)
+  mean   GB/s : QD4=4.818  QD8=4.018  delta=-0.801 (-16.6%)
+  avg total   : QD4=1723 ms  QD8=2057 ms  delta=+334 ms (+19.4%)
+
+=== FIRST-LAUNCH TRACE for runs containing >=500 ms reads ===
+  QD4 qc-q4-r04 worst=828 ge500=2 ge1k=0
+      #0w3 t=0.0 gap=- lat=779 act=0 | #1w1 t=4.8 gap=4.80 lat=828 act=1 | #2w3 t=778.7 gap=773.85 lat=46 act=1 | #3w2 t=783.0 gap=4.40 lat=112 act=2
+  QD4 qc-q4-r06 worst=599 ge500=2 ge1k=0
+      #0w3 t=0.0 gap=- lat=599 act=0 | #1w1 t=5.1 gap=5.08 lat=594 act=1 | #2w2 t=546.3 gap=541.21 lat=104 act=2 | #3w1 t=599.2 gap=52.90 lat=41 act=2
+  QD4 qc-q4-r08 worst=797 ge500=2 ge1k=0
+      #0w3 t=0.0 gap=- lat=751 act=0 | #1w0 t=4.1 gap=4.07 lat=797 act=1 | #2w2 t=750.5 gap=746.41 lat=101 act=2 | #3w0 t=801.1 gap=50.58 lat=41 act=1
+  QD4 qc-q4-r11 worst=515 ge500=2 ge1k=0
+      #0w3 t=0.0 gap=- lat=515 act=0 | #1w1 t=4.2 gap=4.16 lat=511 act=1 | #2w0 t=465.6 gap=461.43 lat=100 act=2 | #3w1 t=514.8 gap=49.24 lat=41 act=2
+  QD4 qc-q4-r14 worst=520 ge500=1 ge1k=0
+      #0w3 t=0.0 gap=- lat=470 act=0 | #1w0 t=4.0 gap=4.04 lat=520 act=1 | #2w2 t=470.3 gap=466.24 lat=115 act=2 | #3w0 t=523.8 gap=53.49 lat=49 act=1
+  QD8 qc-q8-r07 worst=608 ge500=2 ge1k=0
+      #0w7 t=0.0 gap=- lat=521 act=0 | #1w3 t=4.8 gap=4.84 lat=608 act=1 | #2w6 t=520.1 gap=515.22 lat=47 act=2 | #3w6 t=566.8 gap=46.71 lat=46 act=1
+  QD8 qc-q8-r08 worst=1155 ge500=2 ge1k=2
+      #0w7 t=0.0 gap=- lat=1155 act=0 | #1w5 t=4.3 gap=4.31 lat=1151 act=1 | #2w6 t=1106.9 gap=1102.61 lat=96 act=2 | #3w7 t=1154.9 gap=48.01 lat=41 act=2
+  QD8 qc-q8-r10 worst=604 ge500=2 ge1k=0
+      #0w7 t=0.0 gap=- lat=548 act=0 | #1w6 t=4.2 gap=4.22 lat=604 act=1 | #2w7 t=547.7 gap=543.46 lat=42 act=1 | #3w5 t=552.3 gap=4.62 lat=117 act=2
+  QD8 qc-q8-r20 worst=534 ge500=1 ge1k=0
+      #0w7 t=0.0 gap=- lat=487 act=0 | #1w4 t=4.7 gap=4.70 lat=534 act=1 | #2w7 t=487.3 gap=482.59 lat=218 act=1 | #3w5 t=491.9 gap=4.65 lat=272 act=2
+
+=== FIRST LAUNCHES (first 3 runs per arm) ===
+  QD4 qc-q4-r01      :: #0w3 t=0.0 gap=- lat=215 act=0 | #1w1 t=4.7 gap=4.72 lat=266 act=1 | #2w3 t=215.3 gap=210.56 lat=101 act=1 | #3w0 t=219.7 gap=4.39 lat=153 act=2
+  QD4 qc-q4-r02      :: #0w3 t=0.0 gap=- lat=47 act=0 | #1w1 t=4.0 gap=4.03 lat=91 act=1 | #2w3 t=47.0 gap=42.92 lat=35 act=1 | #3w0 t=51.3 gap=4.38 lat=110 act=2
+  QD4 qc-q4-r03      :: #0w3 t=0.0 gap=- lat=46 act=0 | #1w1 t=4.2 gap=4.18 lat=88 act=1 | #2w0 t=46.4 gap=42.23 lat=89 act=2 | #3w3 t=92.0 gap=45.57 lat=43 act=2
+  QD8 qc-q8-r01      :: #0w7 t=0.0 gap=- lat=59 act=0 | #1w6 t=4.2 gap=4.17 lat=113 act=1 | #2w1 t=59.2 gap=55.01 lat=122 act=2 | #3w6 t=117.3 gap=58.10 lat=41 act=1
+  QD8 qc-q8-r02      :: #0w7 t=0.0 gap=- lat=105 act=0 | #1w2 t=4.8 gap=4.79 lat=99 act=1 | #2w3 t=52.8 gap=47.99 lat=112 act=2 | #3w2 t=104.3 gap=51.49 lat=48 act=2
+  QD8 qc-q8-r03      :: #0w7 t=0.0 gap=- lat=48 act=0 | #1w5 t=4.1 gap=4.06 lat=90 act=1 | #2w2 t=48.1 gap=44.00 lat=93 act=2 | #3w5 t=94.1 gap=46.07 lat=35 act=1

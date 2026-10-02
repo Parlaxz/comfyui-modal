@@ -27,6 +27,7 @@ tests/
 **/tests/**
 **/__pycache__/**
 .baked_custom_node_deps/
+.comfymodal_first_party_sources/
 .presets/
 .preset_blobs/
 MagicMock/

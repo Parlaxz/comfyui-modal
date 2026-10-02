@@ -282,7 +282,8 @@ class TestColdIdentityValidation(unittest.TestCase):
 class TestStatistics(unittest.TestCase):
     def test_percentile(self):
         self.assertEqual(percentile([], 90), None)
-        self.assertEqual(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 50), 5)
+        self.assertEqual(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 50), 5.5)
+        self.assertEqual(percentile([1, 2, 3, 4, 5], 90), 4.6)
         self.assertEqual(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 100), 10)
         self.assertEqual(percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0), 1)
 
@@ -298,6 +299,7 @@ class TestStatistics(unittest.TestCase):
         self.assertEqual(stats["count"], 0)
         self.assertEqual(stats["median"], "unavailable")
         self.assertEqual(stats["p90"], "unavailable")
+        self.assertEqual(stats["percentile_method"], "linear_interpolation")
 
     def test_slow_run_rate(self):
         rate = slow_run_rate([1.0, 2.0, 10.0], threshold_ms=5.0)

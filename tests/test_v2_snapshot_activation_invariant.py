@@ -180,7 +180,7 @@ class SnapshotActivationInvariantTests(unittest.TestCase):
         self.assertIn("clip_present=1", line)
         self.assertIn("unet_present=1", line)
         self.assertIn("snapshot_enabled_by_config=1", line)
-        self.assertIn("cpu_snapshot_active=1", line)
+        self.assertIn("cpu_snapshot_container_active=1", line)
         self.assertIn("loader_bridge_active=1", line)
         self.assertIn("execution_prefill_allowed=0", line)
         self.assertIn("status=pass", line)
@@ -202,7 +202,7 @@ class SnapshotActivationInvariantTests(unittest.TestCase):
         line = buf.getvalue()
         self.assertIn("status=fail", line)
         self.assertIn("reason=production_models_present_but_inactive", line)
-        self.assertIn("cpu_snapshot_active=0", line)
+        self.assertIn("cpu_snapshot_container_active=0", line)
 
     def test_production_present_but_inactive_guard_clears_bridge_diagnostic(self):
         """Diagnostic profile with present-but-inactive models must NOT serve

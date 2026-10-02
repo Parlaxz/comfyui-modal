@@ -1,0 +1,471 @@
+{
+  "generated_by": "tools/analysis/golden_sickness_derived.py",
+  "source": "per_request.json thresholds + per_read.csv (computed_valid rows only)",
+  "population": {
+    "all_attempts_n": 142,
+    "valid_n": 141,
+    "invalid_excluded_n": 1,
+    "invalid_excluded_request_ids": [
+      "golden-p1-0-9ceed22e46e8"
+    ],
+    "all_attempts_sham": 56,
+    "all_attempts_split": 86,
+    "valid_sham": 55,
+    "valid_split": 86,
+    "inclusion_rule": "Every rate/count/threshold/onset/conditional/provider-region/allocation/time/concentration/severity/correlation/statistical test uses computed_valid=true rows only. Canonical per_request.json retains all attempts for audit; canonical per_read.csv retains all reads."
+  },
+  "resource_semantics": {
+    "same_resource": "sham: identity.clip_resource == identity.unet_resource",
+    "switched_resource": "split: clip_resource != unet_resource",
+    "verified_counts": {
+      "('sham', False)": 55,
+      "('split', True)": 86
+    }
+  },
+  "overall": {
+    "label": "overall",
+    "n": 141,
+    "table": {
+      "both": 6,
+      "clip_only": 8,
+      "unet_only": 6,
+      "neither": 121
+    },
+    "clip_sick": 14,
+    "unet_sick": 12,
+    "p_unet_sick_given_clip_sick": 0.428571,
+    "p_unet_sick_given_clip_healthy": 0.047244,
+    "p_clip_sick_given_unet_sick": 0.5,
+    "p_clip_sick_given_unet_healthy": 0.062016,
+    "risk_difference_unet_given_clip": 0.381327,
+    "fisher_p_joint_independence": 0.000206
+  },
+  "by_arm": {
+    "sham": {
+      "label": "sham",
+      "n": 55,
+      "table": {
+        "both": 5,
+        "clip_only": 3,
+        "unet_only": 3,
+        "neither": 44
+      },
+      "clip_sick": 8,
+      "unet_sick": 8,
+      "p_unet_sick_given_clip_sick": 0.625,
+      "p_unet_sick_given_clip_healthy": 0.06383,
+      "p_clip_sick_given_unet_sick": 0.625,
+      "p_clip_sick_given_unet_healthy": 0.06383,
+      "risk_difference_unet_given_clip": 0.56117,
+      "fisher_p_joint_independence": 0.000771
+    },
+    "split": {
+      "label": "split",
+      "n": 86,
+      "table": {
+        "both": 1,
+        "clip_only": 5,
+        "unet_only": 3,
+        "neither": 77
+      },
+      "clip_sick": 6,
+      "unet_sick": 4,
+      "p_unet_sick_given_clip_sick": 0.166667,
+      "p_unet_sick_given_clip_healthy": 0.0375,
+      "p_clip_sick_given_unet_sick": 0.25,
+      "p_clip_sick_given_unet_healthy": 0.060976,
+      "risk_difference_unet_given_clip": 0.129167,
+      "fisher_p_joint_independence": 0.255221
+    }
+  },
+  "by_resource_relation": {
+    "same": {
+      "label": "same",
+      "n": 55,
+      "table": {
+        "both": 5,
+        "clip_only": 3,
+        "unet_only": 3,
+        "neither": 44
+      },
+      "clip_sick": 8,
+      "unet_sick": 8,
+      "p_unet_sick_given_clip_sick": 0.625,
+      "p_unet_sick_given_clip_healthy": 0.06383,
+      "p_clip_sick_given_unet_sick": 0.625,
+      "p_clip_sick_given_unet_healthy": 0.06383,
+      "risk_difference_unet_given_clip": 0.56117,
+      "fisher_p_joint_independence": 0.000771
+    },
+    "switched": {
+      "label": "switched",
+      "n": 86,
+      "table": {
+        "both": 1,
+        "clip_only": 5,
+        "unet_only": 3,
+        "neither": 77
+      },
+      "clip_sick": 6,
+      "unet_sick": 4,
+      "p_unet_sick_given_clip_sick": 0.166667,
+      "p_unet_sick_given_clip_healthy": 0.0375,
+      "p_clip_sick_given_unet_sick": 0.25,
+      "p_clip_sick_given_unet_healthy": 0.060976,
+      "risk_difference_unet_given_clip": 0.129167,
+      "fisher_p_joint_independence": 0.255221
+    }
+  },
+  "initial_sickness_and_carryover": {
+    "initial_clip_hard_sick": {
+      "same_resource_sham": 8,
+      "switched_resource_split": 6
+    },
+    "initial_unet_hard_sick": {
+      "same_resource_sham": 8,
+      "switched_resource_split": 4
+    },
+    "carryover_state": {
+      "unet_arena_reused_in_same_resource": 55,
+      "unet_arena_created_in_switched_resource": 86,
+      "other_resource_verified_pristine_before_unet_split": 86,
+      "other_resource_source_fills_before_unet_split_max": 0
+    }
+  },
+  "arm_vs_joint_sickness": {
+    "clip_sick": {
+      "sham": 8,
+      "split": 6,
+      "fisher_p": 0.159044
+    },
+    "unet_sick": {
+      "sham": 8,
+      "split": 4,
+      "fisher_p": 0.060913
+    }
+  },
+  "recovery_classes": {
+    "per_role_500ms": {
+      "sham": {
+        "clip": {
+          "alternating": 10,
+          "none": 40,
+          "single_episode": 5
+        },
+        "unet": {
+          "alternating": 8,
+          "none": 44,
+          "single_episode": 3
+        }
+      },
+      "split": {
+        "clip": {
+          "alternating": 6,
+          "none": 79,
+          "single_episode": 1
+        },
+        "unet": {
+          "alternating": 5,
+          "none": 80,
+          "single_episode": 1
+        }
+      }
+    },
+    "request_level_500ms": {
+      "alternating|alternating": 5,
+      "alternating|none": 8,
+      "alternating|single_episode": 3,
+      "none|alternating": 5,
+      "none|none": 113,
+      "none|single_episode": 1,
+      "single_episode|alternating": 3,
+      "single_episode|none": 3
+    }
+  },
+  "severity_bands": {
+    "cut_median": 4.317359,
+    "cut_p75": 4.644554,
+    "overall_counts": {
+      "high_>p75": 35,
+      "low_<=median": 71,
+      "mid_median_to_p75": 35
+    },
+    "by_arm": {
+      "sham": {
+        "high_>p75": 20,
+        "low_<=median": 29,
+        "mid_median_to_p75": 6
+      },
+      "split": {
+        "high_>p75": 15,
+        "low_<=median": 42,
+        "mid_median_to_p75": 29
+      }
+    },
+    "by_sickness_class": {
+      "BOTH_SICK": {
+        "high_>p75": 6
+      },
+      "CLIP_SICK_ONLY": {
+        "high_>p75": 8
+      },
+      "NEITHER": {
+        "high_>p75": 15,
+        "low_<=median": 71,
+        "mid_median_to_p75": 35
+      },
+      "UNET_SICK_ONLY": {
+        "high_>p75": 6
+      }
+    }
+  },
+  "discordant_transitions": {
+    "healthy_clip_sick_unet": [
+      {
+        "request_id": "golden-p1-0-cf4f240d3d6c",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-west4",
+        "clip_resource": "A",
+        "unet_resource": "B",
+        "unet_max_preadv_ms": 2358.270578,
+        "severity_score": 5.05754
+      },
+      {
+        "request_id": "golden-p1-0-5f9470cfb95a",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_resource": "A",
+        "unet_resource": "B",
+        "unet_max_preadv_ms": 1794.775611,
+        "severity_score": 5.25616
+      },
+      {
+        "request_id": "golden-p1-0-5ae9efa67e60",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_resource": "B",
+        "unet_resource": "B",
+        "unet_max_preadv_ms": 1787.746585,
+        "severity_score": 5.431909
+      },
+      {
+        "request_id": "golden-p1-0-907303a11d5c",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_resource": "A",
+        "unet_resource": "A",
+        "unet_max_preadv_ms": 1308.306746,
+        "severity_score": 5.250927
+      },
+      {
+        "request_id": "golden-p1-0-3826114a6c00",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_resource": "A",
+        "unet_resource": "B",
+        "unet_max_preadv_ms": 997.429109,
+        "severity_score": 5.138163
+      },
+      {
+        "request_id": "golden-p1-0-989a779e3893",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_UNSPECIFIED/us-central1",
+        "clip_resource": "A",
+        "unet_resource": "A",
+        "unet_max_preadv_ms": 860.170494,
+        "severity_score": 5.425264
+      }
+    ],
+    "sick_clip_healthy_unet": [
+      {
+        "request_id": "golden-p1-0-51fd5230eeee",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_max_preadv_ms": 5252.731718,
+        "severity_score": 6.6197
+      },
+      {
+        "request_id": "golden-p1-0-126cf4cbe4a8",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_max_preadv_ms": 2483.782751,
+        "severity_score": 6.151344
+      },
+      {
+        "request_id": "golden-p1-0-20ffd3348a64",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_AWS/us-east-2",
+        "clip_max_preadv_ms": 1838.574062,
+        "severity_score": 6.374997
+      },
+      {
+        "request_id": "golden-p1-0-b451904156c4",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_AWS/eu-south-2",
+        "clip_max_preadv_ms": 1776.222056,
+        "severity_score": 5.814517
+      },
+      {
+        "request_id": "golden-p1-0-d8df15190c1e",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_max_preadv_ms": 1735.525853,
+        "severity_score": 5.921553
+      },
+      {
+        "request_id": "golden-p1-0-1742b7c9b560",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_max_preadv_ms": 1450.927682,
+        "severity_score": 5.732119
+      },
+      {
+        "request_id": "golden-p1-0-f5508707fe42",
+        "arm": "split",
+        "provider_region": "CLOUD_PROVIDER_GCP/us-east1",
+        "clip_max_preadv_ms": 1307.136218,
+        "severity_score": 6.005158
+      },
+      {
+        "request_id": "golden-p1-0-bca55ee4d4f5",
+        "arm": "sham",
+        "provider_region": "CLOUD_PROVIDER_AWS/us-east-2",
+        "clip_max_preadv_ms": 1126.725352,
+        "severity_score": 5.786164
+      }
+    ]
+  },
+  "strongest_recovery_cases": [
+    {
+      "request_id": "golden-p1-0-0b56ab29f792",
+      "role": "clip",
+      "arm": "sham",
+      "sickness_class": "BOTH_SICK",
+      "max_preadv_ms": 2550.4346,
+      "p95_ms": 19.041659,
+      "read_count": 243,
+      "counts_ge_500": 3,
+      "last_seq_ge_500": 4,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-f18b437f0d56",
+      "role": "unet",
+      "arm": "split",
+      "sickness_class": "BOTH_SICK",
+      "max_preadv_ms": 1233.247812,
+      "p95_ms": 45.697368,
+      "read_count": 370,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 41,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-49cd54fb17f9",
+      "role": "unet",
+      "arm": "sham",
+      "sickness_class": "BOTH_SICK",
+      "max_preadv_ms": 1017.406292,
+      "p95_ms": 32.760682,
+      "read_count": 370,
+      "counts_ge_500": 2,
+      "last_seq_ge_500": 2,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-c9f6a763f3e8",
+      "role": "clip",
+      "arm": "sham",
+      "sickness_class": "NEITHER",
+      "max_preadv_ms": 898.547925,
+      "p95_ms": 19.45155,
+      "read_count": 243,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 44,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-907303a11d5c",
+      "role": "clip",
+      "arm": "sham",
+      "sickness_class": "UNET_SICK_ONLY",
+      "max_preadv_ms": 781.171626,
+      "p95_ms": 33.327177,
+      "read_count": 243,
+      "counts_ge_500": 3,
+      "last_seq_ge_500": 7,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-50c2f8922166",
+      "role": "clip",
+      "arm": "sham",
+      "sickness_class": "NEITHER",
+      "max_preadv_ms": 672.374653,
+      "p95_ms": 77.713359,
+      "read_count": 243,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 9,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-c65fa1dd507f",
+      "role": "unet",
+      "arm": "sham",
+      "sickness_class": "NEITHER",
+      "max_preadv_ms": 576.285586,
+      "p95_ms": 26.522298,
+      "read_count": 370,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 155,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-5f9470cfb95a",
+      "role": "clip",
+      "arm": "split",
+      "sickness_class": "UNET_SICK_ONLY",
+      "max_preadv_ms": 526.807925,
+      "p95_ms": 72.724571,
+      "read_count": 243,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 41,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-3a4aeb5f8f7b",
+      "role": "clip",
+      "arm": "sham",
+      "sickness_class": "NEITHER",
+      "max_preadv_ms": 520.027275,
+      "p95_ms": 24.429347,
+      "read_count": 243,
+      "counts_ge_500": 2,
+      "last_seq_ge_500": 2,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    },
+    {
+      "request_id": "golden-p1-0-20ffd3348a64",
+      "role": "unet",
+      "arm": "sham",
+      "sickness_class": "CLIP_SICK_ONLY",
+      "max_preadv_ms": 518.823408,
+      "p95_ms": 27.100265,
+      "read_count": 370,
+      "counts_ge_500": 1,
+      "last_seq_ge_500": 2,
+      "toggles_ge_500": 2,
+      "recovery_class": "single_episode"
+    }
+  ],
+  "strongest_residual_cases": []
+}

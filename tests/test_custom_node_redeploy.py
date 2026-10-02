@@ -80,6 +80,34 @@ def _make_modal_client_stub():
     return stub
 
 
+class _PublicationVolume:
+    def __init__(self, name="comfyui-custom-nodes"):
+        self.name = name
+        self.files = {}
+
+    def read_file(self, path):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return iter((self.files[path],))
+
+    class _Batch:
+        def __init__(self, volume):
+            self.volume = volume
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def put_file(self, handle, path):
+            self.volume.files[path] = handle.read()
+
+    def batch_upload(self, *, force):
+        assert force is True
+        return self._Batch(self)
+
+
 def _load_init_module():
     original_modal = sys.modules.pop("modal", None)
     original_modal_client = sys.modules.pop("modal_client", None)
@@ -264,11 +292,9 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
 
     def test_sync_custom_nodes_and_maybe_deploy_reports_started_flag(self):
         module = _load_init_module()
+        workspace = {"id": "ws-1", "label": "test", "token_id": "id", "token_secret": "secret"}
 
-        async def fake_sync(archive_data: bytes):
-            return {"status": "ok", "nodes": ["comfyui-easy-use"]}
-
-        async def fake_refresh(scope: str):
+        async def fake_refresh(scope: str, workspace: dict):
             return {"status": "ok", "scope": scope}
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,36 +304,142 @@ class CustomNodeRedeployFlowTests(unittest.TestCase):
             (node / "requirements.txt").write_text("numpy==1.26.4\n", encoding="utf-8")
 
             with (
-                patch.object(module, "sync_custom_nodes", side_effect=fake_sync),
+                patch.object(module, "_publish_custom_nodes_or_skip", return_value={
+                    "status": "ok",
+                    "publication": {"verified_publication": True},
+                }),
                 patch.object(module, "resync_runtime", side_effect=fake_refresh),
                 patch.object(module, "_ensure_modal_deploy_current", return_value={
                     "started": True,
                     "reason": "custom_nodes_changed",
                 }),
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root)))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
 
         self.assertEqual(result["deploy"], {"started": True, "reason": "custom_nodes_changed"})
         self.assertEqual(result["refresh"], {"status": "ok", "scope": "custom_nodes"})
 
     def test_sync_custom_nodes_and_maybe_deploy_skips_deploy_on_upload_error(self):
         module = _load_init_module()
-
-        async def fake_sync(archive_data: bytes):
-            return {"status": "error", "message": "upload failed"}
+        workspace = {"id": "ws-1", "label": "test", "token_id": "id", "token_secret": "secret"}
 
         with tempfile.TemporaryDirectory() as tmp:
             cn_root = Path(tmp) / "custom_nodes"
             (cn_root / "comfyui-easy-use").mkdir(parents=True)
 
             with (
-                patch.object(module, "sync_custom_nodes", side_effect=fake_sync),
+                patch.object(module, "_publish_custom_nodes_or_skip", return_value={
+                    "status": "error", "message": "upload failed"
+                }),
                 patch.object(module, "_ensure_modal_deploy_current") as ensure_mock,
             ):
-                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root)))
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
 
         self.assertNotIn("deploy", result)
         ensure_mock.assert_not_called()
+
+    def test_exact_publication_skips_archive_publisher_deploy_and_refresh(self):
+        module = _load_init_module()
+        workspace = {"id": "ws-1", "label": "test", "token_id": "id", "token_secret": "secret"}
+        from tools.v2_control.custom_nodes import (
+            RECEIPT_PATH,
+            PublicationReceipt,
+            prepare_publication,
+            publish_or_skip as shared_publish_or_skip,
+        )
+
+        volume = _PublicationVolume()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cn_root = Path(tmp) / "custom_nodes"
+            node = cn_root / "comfyui-easy-use"
+            node.mkdir(parents=True)
+            (node / "main.py").write_bytes(b"main")
+            identity, _archive, _files = prepare_publication(cn_root)
+            volume.files[RECEIPT_PATH] = PublicationReceipt.create(
+                identity, volume.name
+            ).to_bytes()
+
+            async def fake_publish(_root, **kwargs):
+                self.assertEqual(kwargs["volume_name"], volume.name)
+                self.assertIs(kwargs["workspace"], workspace)
+                return await shared_publish_or_skip(
+                    _root, volume=volume, **kwargs
+                )
+
+            with (
+                patch.object(module, "publish_or_skip", side_effect=fake_publish),
+                patch.object(module, "_build_custom_nodes_archive") as archive_mock,
+                patch("tools.v2_control.custom_nodes.build_archive", side_effect=AssertionError("archive built")),
+                patch.object(module, "sync_custom_nodes") as publisher_mock,
+                patch.object(module, "_ensure_modal_deploy_current") as deploy_mock,
+                patch.object(module, "resync_runtime") as refresh_mock,
+            ):
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["publication"]["reason"], "exact_match")
+        archive_mock.assert_not_called()
+        publisher_mock.assert_not_called()
+        deploy_mock.assert_not_called()
+        refresh_mock.assert_not_called()
+
+    def test_verified_publication_publishes_then_deploys_and_refreshes(self):
+        module = _load_init_module()
+        workspace = {"id": "ws-1", "label": "test", "token_id": "id", "token_secret": "secret"}
+        from tools.v2_control.custom_nodes import (
+            GENERATION_RECORD_PATH,
+            prepare_publication,
+            publish_or_skip as shared_publish_or_skip,
+        )
+
+        volume = _PublicationVolume()
+        publisher_calls = []
+
+        async def fake_sync(archive_data: bytes, workspace: dict):
+            publisher_calls.append((archive_data, workspace))
+            volume.files[GENERATION_RECORD_PATH] = json.dumps({
+                "schema_version": 2,
+                "content_generation": prepare_publication(cn_root)[0].content_generation,
+            }).encode()
+            return {
+                "status": "ok",
+                "content_generation": prepare_publication(cn_root)[0].content_generation,
+            }
+
+        async def fake_refresh(scope: str, workspace: dict):
+            return {"status": "ok", "scope": scope}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cn_root = Path(tmp) / "custom_nodes"
+            node = cn_root / "comfyui-easy-use"
+            node.mkdir(parents=True)
+            (node / "main.py").write_bytes(b"main")
+
+            async def fake_publish(_root, **kwargs):
+                return await shared_publish_or_skip(
+                    _root, volume=volume, **kwargs
+                )
+
+            with (
+                patch.object(module, "publish_or_skip", side_effect=fake_publish),
+                patch.object(module, "_build_custom_nodes_archive") as archive_mock,
+                patch.object(module, "sync_custom_nodes", side_effect=fake_sync),
+                patch.object(module, "_ensure_modal_deploy_current", return_value={
+                    "started": True, "reason": "custom_nodes_changed"
+                }) as deploy_mock,
+                patch.object(module, "resync_runtime", side_effect=fake_refresh) as refresh_mock,
+            ):
+                result = asyncio.run(module._sync_custom_nodes_and_maybe_deploy(str(cn_root), workspace))
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["publication"]["reason"], "published_verified")
+        self.assertEqual(len(publisher_calls), 1)
+        self.assertIs(publisher_calls[0][1], workspace)
+        self.assertTrue(publisher_calls[0][0])
+        archive_mock.assert_not_called()
+        deploy_mock.assert_called_once()
+        refresh_mock.assert_called_once_with("custom_nodes", workspace=workspace)
 
 
     def test_maybe_auto_deploy_skips_in_runtime_container(self):

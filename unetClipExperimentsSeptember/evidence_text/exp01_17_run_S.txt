@@ -1,0 +1,18 @@
+ATTEMPT=S
+COMMAND=python tools/v2ctl.py golden run --app sept-unetclip-01-transport-core --acknowledge-volume-drift
+EXIT_CODE=1
+FLAG_USED=true
+COMFYMODAL_V2CTL_ACKNOWLEDGED_VOLUME_DRIFT=1
+DEPLOYMENT_REUSE_REQUESTED=f6b59e429175eaa76fecbe6062a33c3d2e2c3d7bed53c3e4fc295be93e657919
+REMOTE_REQUEST_ISSUED=false
+AUTHORITATIVE_CAPTURE_GUARD=NOT_OBSERVED
+python.exe : [v2ctl.run] WARNING: local deploy identity drifted after deployment; binding the immutable remote receipt 
+(source drift is warning-only)
+At line:1 char:71
++ ... run_S.txt'; & python tools/v2ctl.py golden run --app sept-unetclip-01 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([v2ctl.run] WAR...s warning-only):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[v2ctl.run] WARNING: operator acknowledged volume drift; skipping exact-content publisher preflight gate
+ERROR: Golden requires successful source-probe evidence bound to the deployment receipt

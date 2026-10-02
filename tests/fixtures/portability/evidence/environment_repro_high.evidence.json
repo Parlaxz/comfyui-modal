@@ -1,0 +1,67 @@
+{
+  "audit_basis": [
+    "PHASE_G2 §1 executive verdict",
+    "PHASE_G2 §3 ComfyUI version authority",
+    "PHASE_G2 §5 pinning quality classification",
+    "PHASE_G2 §11 risk contribution table"
+  ],
+  "description": "Prepared synthetic evidence for the audited G2 source-environment debt. All numbers are synthetic; only the SHAPE of the debt is encoded.",
+  "does_not_dictate": {
+    "policy": "environment_reproducibility_never_forces_workflow_or_target_risk",
+    "target_readiness": "independent_dimension",
+    "workflow_portability_risk": "independent_dimension"
+  },
+  "evidence_id": "environment_repro_high",
+  "expected_environment_issue_codes": [
+    "torch_stack_unpinned",
+    "custom_node_source_unpinned",
+    "plugin_worktree_dirty",
+    "local_core_patch_divergence",
+    "model_hash_unpinned",
+    "base_image_digest_unpinned"
+  ],
+  "expected_environment_risk_level": "high",
+  "facts": {
+    "base_image": {
+      "digest_pinned": false,
+      "reference_style": "floating-tag"
+    },
+    "comfyui_core_local": {
+      "local_patch_divergence": true,
+      "patch_present_in_any_ref": false,
+      "patched_files": [
+        "comfy/model_management.py"
+      ],
+      "pin_kind": "commit",
+      "pinned": true
+    },
+    "comfyui_core_remote": {
+      "pin_kind": "commit",
+      "pinned": true
+    },
+    "custom_node_provenance": {
+      "provenance_complete": false,
+      "share_total_synthetic": 22,
+      "share_without_git_identity_synthetic": 13,
+      "working_tree_deployment": true
+    },
+    "model_hash_coverage": {
+      "populated_fraction": 0.0
+    },
+    "plugin_worktree": {
+      "dirty": true,
+      "uncommitted_changes_synthetic": 42
+    },
+    "torch_stack": {
+      "index_family": "cu130-fixture",
+      "packages": [
+        "torch",
+        "torchvision",
+        "torchaudio"
+      ],
+      "pinned": false
+    }
+  },
+  "kind": "environment_evidence",
+  "source": "current_studio_environment"
+}

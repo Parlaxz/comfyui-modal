@@ -10,6 +10,8 @@
 //
 // Functions are idempotent and safe to call multiple times.
 
+import { publishStudioSync } from "./studio-sync.js";
+
 const MODAL_PREFIX = "/comfymodal";
 
 export const STORAGE_KEYS = {
@@ -19,9 +21,58 @@ export const STORAGE_KEYS = {
   AUTOSAVE: "comfymodal_auto_save_local",
   SAVEFOLDER: "comfymodal_save_folder",
   SIDECAR: "comfymodal_save_metadata_sidecar",
+  PREVIEW_DEFAULT: "comfymodal_preview_default",
+  PREVIEW_CODEC: "comfymodal_preview_codec",
+  PREVIEW_QUALITY: "comfymodal_preview_quality",
 };
 
 export const DEFAULT_OUTPUT_SAVEFOLDER = "output/modal";
+
+export const PREVIEW_DEFAULTS = Object.freeze({
+  preview_default: "off",
+  preview_codec: "webp",
+  preview_quality: 70,
+});
+
+function _previewQuality(value) {
+  var quality = typeof value === "number" ? value : parseInt(value, 10);
+  return Number.isInteger(quality) && quality >= 1 && quality <= 100
+    ? quality
+    : PREVIEW_DEFAULTS.preview_quality;
+}
+
+function _readPreviewPreferences() {
+  var previewDefault = localStorage.getItem(STORAGE_KEYS.PREVIEW_DEFAULT);
+  var previewCodec = localStorage.getItem(STORAGE_KEYS.PREVIEW_CODEC);
+  return {
+    preview_default: previewDefault === "on" ? "on" : PREVIEW_DEFAULTS.preview_default,
+    preview_codec: previewCodec === "webp" ? previewCodec : PREVIEW_DEFAULTS.preview_codec,
+    preview_quality: _previewQuality(localStorage.getItem(STORAGE_KEYS.PREVIEW_QUALITY)),
+  };
+}
+
+export function normalizePreviewPreferences(prefs) {
+  var source = prefs || {};
+  var normalized = {};
+  if (source.preview_default !== undefined) {
+    if (source.preview_default !== "off" && source.preview_default !== "on") {
+      throw new Error("Invalid preview_default");
+    }
+    normalized.preview_default = source.preview_default;
+  }
+  if (source.preview_codec !== undefined) {
+    if (source.preview_codec !== "webp") throw new Error("Invalid preview_codec");
+    normalized.preview_codec = source.preview_codec;
+  }
+  if (source.preview_quality !== undefined) {
+    var quality = source.preview_quality;
+    if (typeof quality !== "number" || !Number.isInteger(quality) || quality < 1 || quality > 100) {
+      throw new Error("Invalid preview_quality");
+    }
+    normalized.preview_quality = quality;
+  }
+  return normalized;
+}
 
 /**
  * Normalize a save folder path: strip leading ./, convert backslashes,
@@ -46,6 +97,7 @@ export function normalizeOutputSaveFolder(savedFolder) {
  * Returns a plain object with all output preference keys.
  */
 export function getOutputPreferences() {
+  var preview = _readPreviewPreferences();
   var prefs = {
     output_format: localStorage.getItem(STORAGE_KEYS.OUTPUT_FORMAT) || "original",
     quality: parseInt(localStorage.getItem(STORAGE_KEYS.QUALITY), 10) || 75,
@@ -53,6 +105,9 @@ export function getOutputPreferences() {
     auto_save_local: localStorage.getItem(STORAGE_KEYS.AUTOSAVE) === "true",
     save_folder: normalizeOutputSaveFolder(localStorage.getItem(STORAGE_KEYS.SAVEFOLDER)),
     save_metadata_sidecar: localStorage.getItem(STORAGE_KEYS.SIDECAR) !== "false",
+    preview_default: preview.preview_default,
+    preview_codec: preview.preview_codec,
+    preview_quality: preview.preview_quality,
   };
   return prefs;
 }
@@ -78,6 +133,10 @@ export async function setOutputPreferences(prefs, syncToServer) {
       merged[k2] = prefs[k2];
     }
   }
+  var normalizedPreview = normalizePreviewPreferences(merged);
+  merged.preview_default = normalizedPreview.preview_default;
+  merged.preview_codec = normalizedPreview.preview_codec;
+  merged.preview_quality = normalizedPreview.preview_quality;
 
   // Sync to server
   if (syncToServer) {
@@ -92,6 +151,9 @@ export async function setOutputPreferences(prefs, syncToServer) {
           auto_save_local: merged.auto_save_local,
           save_folder: merged.save_folder,
           save_metadata_sidecar: merged.save_metadata_sidecar,
+          preview_default: merged.preview_default,
+          preview_codec: merged.preview_codec,
+          preview_quality: merged.preview_quality,
         }),
       });
       if (!response.ok) throw new Error("Output preferences were rejected");
@@ -110,6 +172,9 @@ export async function setOutputPreferences(prefs, syncToServer) {
     localStorage.setItem(STORAGE_KEYS.AUTOSAVE, String(merged.auto_save_local));
     localStorage.setItem(STORAGE_KEYS.SAVEFOLDER, merged.save_folder);
     localStorage.setItem(STORAGE_KEYS.SIDECAR, String(merged.save_metadata_sidecar));
+    localStorage.setItem(STORAGE_KEYS.PREVIEW_DEFAULT, merged.preview_default);
+    localStorage.setItem(STORAGE_KEYS.PREVIEW_CODEC, merged.preview_codec);
+    localStorage.setItem(STORAGE_KEYS.PREVIEW_QUALITY, String(merged.preview_quality));
   } catch (e) {
     // localStorage unavailable — runtime can still use the returned value
   }
@@ -121,6 +186,8 @@ export async function setOutputPreferences(prefs, syncToServer) {
   } catch (e) {
     // Event dispatch failure — non-critical
   }
+
+  if (syncToServer) publishStudioSync("settings");
 
   return merged;
 }
@@ -160,6 +227,15 @@ export async function syncOutputConfigFromServer() {
     }
     if (cfg.save_metadata_sidecar !== undefined) {
       updates.save_metadata_sidecar = cfg.save_metadata_sidecar !== false;
+    }
+    if (cfg.preview_default !== undefined) {
+      updates.preview_default = cfg.preview_default;
+    }
+    if (cfg.preview_codec !== undefined) {
+      updates.preview_codec = cfg.preview_codec;
+    }
+    if (cfg.preview_quality !== undefined) {
+      updates.preview_quality = cfg.preview_quality;
     }
 
     if (Object.keys(updates).length > 0) {
@@ -214,4 +290,47 @@ export function buildOutputModalOptions(prefs) {
     save_folder: source.save_folder,
     save_metadata_sidecar: source.save_metadata_sidecar !== false,
   };
+}
+
+export function buildPreviewModalOptions(prefs) {
+  var source = prefs || getOutputPreferences();
+  var preview = normalizePreviewPreferences({
+    preview_default: source.preview_default || PREVIEW_DEFAULTS.preview_default,
+    preview_codec: source.preview_codec || PREVIEW_DEFAULTS.preview_codec,
+    preview_quality: source.preview_quality != null ? source.preview_quality : PREVIEW_DEFAULTS.preview_quality,
+  });
+  return {
+    preview_default: preview.preview_default,
+    preview_enabled: preview.preview_default === "on",
+    preview_codec: preview.preview_codec,
+    preview_quality: preview.preview_quality,
+  };
+}
+
+export function buildModalOptions(prefs) {
+  var source = prefs || getOutputPreferences();
+  return Object.assign({}, buildOutputModalOptions(source), buildPreviewModalOptions(source));
+}
+
+export async function loadModalOptions(apiBase) {
+  var base = apiBase || MODAL_PREFIX;
+  var config = {};
+  try {
+    var response = await fetch(base + "/config");
+    if (response.ok) {
+      var remote = await response.json();
+      if (remote && typeof remote === "object") config = remote;
+    }
+  } catch (e) {
+    // Local cache remains the request-time fallback when config is unavailable.
+  }
+  var source = Object.assign({}, getOutputPreferences(), config);
+  var mode = source.execution_mode;
+  if (!mode && typeof window !== "undefined") {
+    mode = window._comfyModalExecutionMode;
+  }
+  return Object.assign(
+    { execution_mode: mode || "v2" },
+    buildModalOptions(source),
+  );
 }

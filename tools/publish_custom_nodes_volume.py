@@ -1,0 +1,173 @@
+#!/usr/bin/env python
+"""Publish the local custom-nodes tree to the Modal ``comfyui-custom-nodes`` Volume.
+
+The S2 control plane builds one deterministic semantic archive/identity and
+uses the existing remote ``sync_custom_nodes_to_volume`` function only as the
+compatibility publisher. A verified receipt is the only normal exact-skip
+proof.
+
+Dev-machine CLI tool: no GPU, no deploy.  Exit code 0 only when the remote
+sync returns status ``ok``.
+
+Usage:
+    python tools/publish_custom_nodes_volume.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+# Allow import of repo modules (modal_client) from tools/.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from comfymodal_runtime.publication_policy import (
+    CUSTOM_NODES_PUBLISHER_APP_NAME,
+    CUSTOM_NODES_VOLUME_NAME,
+    iter_syncable_custom_node_dirs as _iter_syncable_custom_node_dirs_policy,
+    resolve_custom_nodes_root as _resolve_custom_nodes_root_policy,
+)
+from tools.v2_control.custom_nodes import (
+    PACKAGING_POLICY_VERSION,
+    RECEIPT_SCHEMA_VERSION,
+    get_volume,
+    prepare_publication,
+    publish_or_skip,
+)
+from tools.v2_control.locking import DeployLock
+from tools.v2_control import environment as env_mod
+
+import modal_workspaces
+
+_ACTIVE_WORKSPACES_FILE = str(modal_workspaces.resolve_workspace_registry_path(_REPO_ROOT))
+
+
+def _iter_syncable_custom_node_dirs(cn_root: str) -> list[str]:
+    return _iter_syncable_custom_node_dirs_policy(cn_root)
+
+
+def _build_custom_nodes_archive(cn_root: str) -> bytes:
+    """Compatibility wrapper using the S2 semantic set and archive builder."""
+    _identity, archive, _files = prepare_publication(cn_root)
+    return archive
+
+
+def _resolve_custom_nodes_root() -> str:
+    """Resolve the custom-nodes source root (env override, then repo-relative).
+
+    Mirrors ``__init__._custom_nodes_root()``: the repo itself lives inside
+    ``<ComfyUI>/custom_nodes/``, so the custom-nodes root is the repo's parent
+    directory (the same tree the image bake archives).
+    """
+    return _resolve_custom_nodes_root_policy(_REPO_ROOT)
+
+
+def _load_active_workspace() -> dict:
+    """Return v2ctl's frozen destination, or resolve it for standalone use."""
+    if os.environ.get(env_mod.V2CTL_DESTINATION_FROZEN_ENV) == "1":
+        workspace_id = os.environ.get(env_mod.V2CTL_WORKSPACE_ID_ENV, "").strip()
+        label = os.environ.get(env_mod.V2CTL_WORKSPACE_LABEL_ENV, "").strip()
+        token_id = os.environ.get("MODAL_TOKEN_ID", "").strip()
+        token_secret = os.environ.get("MODAL_TOKEN_SECRET", "").strip()
+        if not all((workspace_id, label, token_id, token_secret)):
+            raise RuntimeError("frozen v2ctl destination is incomplete")
+        return {
+            "id": workspace_id,
+            "label": label,
+            "environment": os.environ.get("MODAL_ENVIRONMENT", "(default)"),
+            "token_id": token_id,
+            "token_secret": token_secret,
+        }
+    return modal_workspaces.resolve_modal_destination(_REPO_ROOT)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--allow-destructive-custom-node-publication",
+        action="store_true",
+        help="explicitly permit removal of previously-published external "
+        "package files/content; never inferred, recorded in the receipt",
+    )
+    args = parser.parse_args(argv)
+    try:
+        cn_root = _resolve_custom_nodes_root()
+        workspace = _load_active_workspace()
+
+        # Downstream SDK helpers receive the explicit workspace record.  Clear
+        # ambient Modal profile/auth selection before any client is created.
+        for name in list(os.environ):
+            if name.startswith("MODAL_") or name in {"COMFYMODAL_ENVIRONMENT", "COMFYMODAL_MODAL_PROFILE"}:
+                os.environ.pop(name, None)
+        os.environ["MODAL_TOKEN_ID"] = workspace["token_id"]
+        os.environ["MODAL_TOKEN_SECRET"] = workspace["token_secret"]
+        if workspace.get("environment") != "(default)":
+            os.environ["MODAL_ENVIRONMENT"] = workspace["environment"]
+
+        async def publish(data: bytes):
+            # Imported lazily: pulls in the modal SDK + repo modules only when
+            # an exact receipt did not prove the volume already matches.
+            from modal_client import sync_custom_nodes
+            return await sync_custom_nodes(
+                data, workspace=workspace,
+                publisher_app_name=CUSTOM_NODES_PUBLISHER_APP_NAME,
+            )
+
+        def run_publication():
+            return asyncio.run(publish_or_skip(
+                cn_root,
+                volume_name=CUSTOM_NODES_VOLUME_NAME,
+                publisher=publish,
+                volume_factory=lambda volume_name: get_volume(
+                    volume_name, workspace=workspace
+                ),
+                allow_destructive=args.allow_destructive_custom_node_publication,
+            ))
+
+        if os.environ.get("V2CTL_DEPLOY_LOCK_HELD") == "1":
+            decision = run_publication()
+        else:
+            lock = DeployLock(Path(_REPO_ROOT) / ".v2ctl" / "deploy.lock")
+            lock.acquire(
+                owner="publish_custom_nodes_volume",
+                target=CUSTOM_NODES_VOLUME_NAME,
+                profile="custom_nodes_publication",
+            )
+            try:
+                decision = run_publication()
+            finally:
+                lock.release()
+        identity = decision.identity
+        result = decision.result if isinstance(decision.result, dict) else {}
+        remote_status = result.get("status", "")
+        print(f"[v2.volume_publish] source_root={cn_root}")
+        print(f"[v2.volume_publish] nodes={len({path.split('/', 1)[0] for path, _, _ in identity.files})}")
+        decision_label = "skip_exact" if decision.skip else decision.action
+        print(f"[custom_nodes.publish] decision={decision_label} reason={decision.reason} "
+              f"generation={identity.generation[:12]} schema={RECEIPT_SCHEMA_VERSION} "
+              f"policy={PACKAGING_POLICY_VERSION}")
+        if decision.action == "blocked":
+            delta = decision.destructive_delta or {}
+            for entry in delta.get("packages", []):
+                print(f"[custom_nodes.publish] blocked_package package={entry.get('package')} "
+                      f"prev_files={entry.get('prev_files')} cand_files={entry.get('cand_files')} "
+                      f"missing_count={entry.get('missing_count')}")
+            print("[custom_nodes.publish] refused without --allow-destructive-custom-node-publication; "
+                  "remote generation is unchanged")
+            return 1
+        print(f"[v2.volume_publish] status={'ok' if decision.skip or decision.reason == 'published_verified' else 'failed'}")
+        print(f"[v2.volume_publish] remote_status={remote_status or ('skipped' if decision.skip else 'missing')}")
+        return 0 if decision.skip or decision.action == "recovered" or decision.reason == "published_verified" else 1
+    except Exception as exc:  # noqa: BLE001 — never raise silently
+        print(f"[v2.volume_publish] status=failed error={type(exc).__name__}:{exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

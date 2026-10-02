@@ -1,16 +1,85 @@
 // Modal Studio — Backend Presets Page
 //
 // Preset list/detail/form rendering and CRUD wiring.
-// Imports shared UI helpers from studio-ui.js and the chip grid / state
-// from the glue module (studio-backend.js).
+//
+// abs-2 (legacy absorption): this page is backed by the WORKFLOWS domain
+// only — presets are aggregated per workflow version through
+// listWorkflows / listWorkflowVersions / listVersionPresets, and every
+// mutation goes through the workflow preset routes (updateWorkflowPreset,
+// duplicateWorkflowPreset, deleteWorkflowPreset, and the abs-1 verified
+// from-legacy route for legacy-shaped creates). The unscoped legacy
+// /studio/presets route is never called here: there is no second authority
+// and no old-data migration. Legacy snapshotId linking is retired —
+// presets are version-scoped (see the workflows domain); binding edits live
+// in the Workflows tab mapping editor, the single bindings authority.
+// The page itself is kept (deletion with caller proof belongs to abs-3).
 
 import { el } from "./studio-ui.js";
-import { listPresets, createPreset, updatePreset, duplicatePreset, deletePreset } from "./studio-backend-api.js";
-import { _STATE, renderFeaturesChipGrid, launchPresetWizardForEdit, invalidateRuntimePresetsCache } from "./studio-backend.js";
-import { clearSelection } from "./studio-playground-state.js";
+import { renderLoadingState } from "./studio-loading.js";
 import {
-  getPresetCapabilitySummary,
-} from "./studio-preset-capabilities.js";
+  listWorkflows,
+  listWorkflowVersions,
+  listVersionPresets,
+  getWorkflowPreset,
+  updateWorkflowPreset,
+  duplicateWorkflowPreset,
+  deleteWorkflowPreset,
+  createPresetFromLegacy,
+} from "./studio-backend-api.js";
+import { _STATE, invalidateRuntimePresetsCache } from "./studio-backend.js";
+import { clearSelection } from "./studio-playground-state.js";
+
+// ── Workflow-backed preset loading ───────────────────────────────────────
+//
+// A flattened item carries the workflow preset plus the scope it was
+// resolved from so every management action can hit the version-scoped
+// workflow routes.
+
+async function loadWorkflowPresets(apiBase) {
+  const items = [];
+  const wfResp = await listWorkflows(apiBase, {});
+  const workflows = (wfResp && wfResp.workflows) || [];
+  for (const wf of workflows) {
+    const wfId = (wf && wf.workflow_id) || "";
+    if (!wfId) continue;
+    const verResp = await listWorkflowVersions(apiBase, wfId);
+    const versions = (verResp && verResp.versions) || [];
+    for (const v of versions) {
+      const vid = (v && v.workflow_version_id) || "";
+      if (!vid) continue;
+      const presResp = await listVersionPresets(apiBase, vid);
+      const presets = (presResp && presResp.presets) || [];
+      presets.forEach((p) => {
+        items.push({
+          preset: p,
+          workflowId: wfId,
+          workflowName: (wf && wf.name) || "",
+          versionId: vid,
+          versionNumber: (v && v.version_number) != null ? v.version_number : null,
+        });
+      });
+    }
+  }
+  return items;
+}
+
+function _presetIdOf(item) {
+  return (item && item.preset && item.preset.preset_id) || "";
+}
+
+function _presetLabelOf(item) {
+  const p = (item && item.preset) || {};
+  return p.name || p.preset_id || "Unnamed";
+}
+
+function _stateOf(preset) {
+  const st = (preset && preset.state) || {};
+  return {
+    status: st.status || "unknown",
+    reasons: Array.isArray(st.reasons) ? st.reasons : [],
+    runnable: !!st.runnable,
+  };
+}
 
 // ── Backend Presets page ──────────────────────────────────────────────────
 
@@ -24,40 +93,55 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
       class: "comfymodal-secondary-btn",
       text: "+ New Preset (Manual)",
       style: "font-size:10px;padding:3px 8px;",
-      title: "Advanced: manual creation without binding wizard",
+      title: "Advanced: manual creation on a workflow version",
       onclick: () => renderPresetForm(null, apiBase, listPanel, detailPanel),
     }),
   ]);
   listPanel.appendChild(header);
 
+  const countLine = el("p", {
+    "data-testid": "backend-presets-count",
+    style: "font-size:10px;color:#555;margin:0 0 8px;",
+    text: "",
+  });
+  listPanel.appendChild(countLine);
+
   const listContent = el("div", { style: "flex:1;overflow-y:auto;" });
   listPanel.appendChild(listContent);
 
-  // Legacy comparison profile discovery link
-  const legacyNote = el("div", { style: "margin-bottom:8px;" }, [
-    el("p", { text: "Presets from legacy comparison profiles are auto-discovered.", style: "font-size:10px;color:#555;" }),
+  // Presets live on workflow versions; binding edits happen in the
+  // Workflows tab mapping editor.
+  const domainNote = el("div", { style: "margin-bottom:8px;" }, [
+    el("p", { text: "Presets are stored on workflow versions. Edit bindings in the Workflows tab.", style: "font-size:10px;color:#555;" }),
   ]);
-  listPanel.appendChild(legacyNote);
+  listPanel.appendChild(domainNote);
 
-  listContent.textContent = "Loading presets...";
-  listPresets(apiBase).then((presets) => {
+  listContent.appendChild(renderLoadingState({
+    label: "Loading presets\u2026",
+    size: "page",
+    testid: "backend-presets-loading",
+  }));
+  loadWorkflowPresets(apiBase).then((items) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
     // null or undefined means network/API error (not just empty)
-    if (presets === null || presets === undefined) {
+    if (items === null || items === undefined) {
       listContent.appendChild(el("div", { class: "comfymodal-studio-card" }, [
         el("p", { text: "Could not load presets from server.", style: "font-weight:600;margin:0 0 4px;color:#f87171;" }),
         el("p", { text: "Check that the backend server is running and the API is accessible.", style: "font-size:11px;color:#888;margin:0;" }),
       ]));
       return;
     }
-    if (presets.length === 0) {
+    countLine.textContent = items.length === 1
+      ? "1 preset"
+      : `${items.length} presets`;
+    if (items.length === 0) {
       listContent.appendChild(renderPresetsEmpty(apiBase));
       return;
     }
-    renderPresetsList(listContent, presets, apiBase, detailPanel);
-    if (presets.length > 0 && !_STATE.selectedItemId) {
-      _STATE.selectedItemId = presets[0].id;
-      renderPresetDetail(detailPanel, presets[0], apiBase, listContent);
+    renderPresetsList(listContent, items, apiBase, detailPanel);
+    if (items.length > 0 && !_STATE.selectedItemId) {
+      _STATE.selectedItemId = _presetIdOf(items[0]);
+      renderPresetDetail(detailPanel, items[0], apiBase, listContent);
     }
   }).catch((err) => {
     while (listContent.firstChild) listContent.removeChild(listContent.firstChild);
@@ -70,23 +154,39 @@ export function renderPresetsPage(listPanel, detailPanel, apiBase) {
 
 function renderPresetsEmpty(apiBase) {
   return el("div", { class: "comfymodal-studio-card" }, [
-    el("p", { text: "No backend presets configured.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
-    el("p", { text: 'Use "Make Preset" above to create one from the current ComfyUI graph.', style: "font-size:12px;color:#555;margin:0 0 4px;" }),
-    el("p", { text: 'Or click "+ New Preset" for manual creation (advanced).', style: "font-size:11px;color:#666;margin:0;font-style:italic;" }),
+    el("p", { text: "No workflow presets configured.", style: "font-weight:600;margin:0 0 8px;color:#888;" }),
+    el("p", { text: "Create presets in the Workflows tab version view.", style: "font-size:12px;color:#555;margin:0 0 4px;" }),
+    el("p", { text: 'Or click "+ New Preset" for manual creation on a mapped version (advanced).', style: "font-size:11px;color:#666;margin:0;font-style:italic;" }),
   ]);
+}
+
+function _refreshPresetsList(listContainer, detailPanel, apiBase) {
+  return loadWorkflowPresets(apiBase).then((fresh) => {
+    while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
+    renderPresetsList(listContainer, fresh, apiBase, detailPanel);
+    const scope = (listContainer && listContainer.parentNode) || null;
+    const countEl = scope && scope.querySelector
+      ? scope.querySelector('[data-testid="backend-presets-count"]')
+      : null;
+    if (countEl) {
+      countEl.textContent = fresh.length === 1 ? "1 preset" : `${fresh.length} presets`;
+    }
+    return fresh;
+  });
 }
 
 /**
  * Render a single preset card (shared by grouped and ungrouped sections).
  */
-function _renderPresetCard(preset, apiBase, listContainer, detailPanel) {
-  const id = preset.id || "unknown";
+function _renderPresetCard(item, apiBase, listContainer, detailPanel) {
+  const preset = (item && item.preset) || {};
+  const id = preset.preset_id || "unknown";
   const isActive = _STATE.selectedItemId === id;
-  const label = preset.label || preset.name || preset.id || "Unnamed";
-  const snapshotId = preset.snapshotId || "";
-  const disabled = preset.disabledReason || "";
+  const label = _presetLabelOf(item);
   const desc = preset.description || "";
-  const canEdit = !preset.archived;
+  const state = _stateOf(preset);
+  const scope = `Workflow: ${(item && item.workflowName) || (item && item.workflowId) || ""}`
+    + ((item && item.versionNumber != null) ? ` \u00b7 v${item.versionNumber}` : "");
 
   const card = el("div", {
     class: "comfymodal-studio-preset-card" + (isActive ? " active" : ""),
@@ -96,73 +196,67 @@ function _renderPresetCard(preset, apiBase, listContainer, detailPanel) {
       allCards.forEach(function (c) { c.classList.remove("active"); });
       card.classList.add("active");
       while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-      renderPresetDetail(detailPanel, preset, apiBase, listContainer);
+      renderPresetDetail(detailPanel, item, apiBase, listContainer);
     },
     "data-testid": "preset-card-" + id.replace(/[^a-zA-Z0-9_-]/g, "_"),
   }, [
     el("h4", { text: label.substring(0, 60) }),
-    el("p", { text: ((desc || (snapshotId ? "Snapshot: " + snapshotId.substring(0, 12) : "") || "No description")).substring(0, 80) }),
+    el("p", { text: (desc || "No description").substring(0, 80) }),
+    el("p", { text: scope.substring(0, 80), style: "color:#666;font-size:9px;margin:2px 0;font-style:italic;" }),
   ]);
-  if (preset.group) {
-    card.appendChild(el("p", { text: "Group: " + preset.group, style: "color:#666;font-size:9px;margin:2px 0;font-style:italic;" }));
+  if (!state.runnable) {
+    card.appendChild(el("p", { text: "Not runnable" + (state.reasons.length ? `: ${state.reasons[0]}` : ""), style: "color:#fbbf24;font-size:10px;margin:2px 0;" }));
   }
-  if (disabled) {
-    card.appendChild(el("p", { text: "Disabled: " + disabled, style: "color:#f87171;font-size:10px;margin:2px 0;" }));
-  }
-  if (canEdit) {
-    var rowActions = el("div", { style: "display:flex;gap:4px;margin-top:4px;" });
-    var delRowBtn = el("button", {
-      class: "comfymodal-destructive-btn",
-      text: "Delete preset",
-      style: "font-size:9px;padding:2px 6px;",
-      onclick: function (e) {
-        e.stopPropagation();
-        if (confirm("Delete this preset? (soft-delete \u2014 it can be restored via the server)")) {
-          deletePreset(apiBase, preset.id).then(function () {
-            clearSelection();
-            invalidateRuntimePresetsCache();
-            _STATE.selectedItemId = null;
-            listPresets(apiBase).then(function (fresh) {
-              while (listContainer.firstChild) listContainer.removeChild(listContainer.firstChild);
-              renderPresetsList(listContainer, fresh, apiBase, detailPanel);
-              if (fresh.length > 0) {
-                _STATE.selectedItemId = fresh[0].id;
-                while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-                renderPresetDetail(detailPanel, fresh[0], apiBase, listContainer);
-              } else {
-                while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-              }
-            });
+  var rowActions = el("div", { style: "display:flex;gap:4px;margin-top:4px;" });
+  var delRowBtn = el("button", {
+    class: "comfymodal-destructive-btn",
+    text: "Delete preset",
+    style: "font-size:9px;padding:2px 6px;",
+    onclick: function (e) {
+      e.stopPropagation();
+      if (confirm("Delete this preset? (soft-delete \u2014 it can be restored via the server)")) {
+        deleteWorkflowPreset(apiBase, preset.preset_id).then(function () {
+          clearSelection();
+          invalidateRuntimePresetsCache();
+          _STATE.selectedItemId = null;
+          _refreshPresetsList(listContainer, detailPanel, apiBase).then(function (fresh) {
+            if (fresh.length > 0) {
+              _STATE.selectedItemId = _presetIdOf(fresh[0]);
+              while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+              renderPresetDetail(detailPanel, fresh[0], apiBase, listContainer);
+            } else {
+              while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+            }
           });
-        }
-      },
-    });
-    rowActions.appendChild(delRowBtn);
-    card.appendChild(rowActions);
-  }
+        });
+      }
+    },
+  });
+  rowActions.appendChild(delRowBtn);
+  card.appendChild(rowActions);
   return card;
 }
 
-export function renderPresetsList(container, presets, apiBase, detailPanel) {
+export function renderPresetsList(container, items, apiBase, detailPanel) {
   while (container.firstChild) container.removeChild(container.firstChild);
 
-  // Group presets by their optional `group` field
+  // Group presets by their workflow so versions stay distinguishable
   var groups = {};
   var ungrouped = [];
-  presets.forEach(function (preset) {
-    var g = preset.group;
+  (items || []).forEach(function (item) {
+    var g = item && (item.workflowName || item.workflowId);
     if (g && typeof g === "string" && g.trim() !== "") {
       if (!groups[g]) groups[g] = [];
-      groups[g].push(preset);
+      groups[g].push(item);
     } else {
-      ungrouped.push(preset);
+      ungrouped.push(item);
     }
   });
 
   var groupNames = Object.keys(groups).sort(function (a, b) { return a.localeCompare(b); });
 
   // Helper to create a collapsible group section
-  function _createGroupSection(groupLabel, presetsArr, testIdSuffix) {
+  function _createGroupSection(groupLabel, groupItems, testIdSuffix) {
     var section = el("div", { class: "comfymodal-studio-backend-group-section" });
 
     var summary = el("button", {
@@ -171,7 +265,7 @@ export function renderPresetsList(container, presets, apiBase, detailPanel) {
       "data-testid": "preset-group-" + testIdSuffix,
     }, [
       el("span", { class: "arrow", text: "\u25b6" }),
-      el("span", { text: groupLabel + " (" + presetsArr.length + ")" }),
+      el("span", { text: groupLabel + " (" + groupItems.length + ")" }),
     ]);
     summary.addEventListener("click", function () {
       var expanded = summary.getAttribute("aria-expanded") === "true";
@@ -180,8 +274,8 @@ export function renderPresetsList(container, presets, apiBase, detailPanel) {
     });
 
     var content = el("div", { class: "comfymodal-studio-collapsible-content is-visible" });
-    presetsArr.forEach(function (preset) {
-      content.appendChild(_renderPresetCard(preset, apiBase, container, detailPanel));
+    groupItems.forEach(function (item) {
+      content.appendChild(_renderPresetCard(item, apiBase, container, detailPanel));
     });
 
     section.appendChild(summary);
@@ -204,130 +298,47 @@ export function renderPresetsList(container, presets, apiBase, detailPanel) {
   }
 }
 
-export function renderPresetDetail(container, preset, apiBase, listContainer) {
+export function renderPresetDetail(container, item, apiBase, listContainer) {
   while (container.firstChild) container.removeChild(container.firstChild);
+  const preset = (item && item.preset) || {};
+  const presetId = preset.preset_id || "";
+  const state = _stateOf(preset);
 
   const card = el("div", { class: "comfymodal-studio-backend-detail-card" });
-  const fieldValues = { ...preset };
+  const fieldValues = { name: preset.name || "", description: preset.description || "" };
 
-  const canEdit = !preset.archived;
-
-  // ── Status banner ────────────────────────────────────────────────────
-  const isRunnable = preset.status === "runnable" && !preset.archived;
-  const bannerClass = "comfymodal-studio-status-banner" +
-    (isRunnable ? " runnable" : preset.archived ? " archived" : " not-runnable");
+  // ── Status banner (workflow-domain truth) ────────────────────────────
+  const isRunnable = state.status === "ready" && state.runnable;
+  const bannerClass = "comfymodal-studio-status-banner" + (isRunnable ? " runnable" : " not-runnable");
   const statusBanner = el("div", { class: bannerClass });
-  statusBanner.textContent = isRunnable ? "\u2713 Runnable" : preset.archived ? "\u26a0 Archived" : "\u26a0 Not Runnable";
+  statusBanner.textContent = isRunnable ? "\u2713 Runnable" : "\u26a0 Not Runnable";
   card.appendChild(statusBanner);
 
-  // Disabled reason (read-only, server-derived)
-  if (preset.disabledReason && !preset.archived) {
+  if (state.reasons.length > 0) {
     card.appendChild(el("p", {
-      text: `Reason: ${preset.disabledReason}`,
-      style: "font-size:10px;color:#f87171;margin:2px 0 6px;",
+      text: `Reason: ${state.reasons[0]}`,
+      style: "font-size:10px;color:#fbbf24;margin:2px 0 6px;",
     }));
   }
 
-  // ── Runnable Checklist ───────────────────────────────────────────────
-  const checklistGroup = el("ul", { class: "comfymodal-studio-checklist" });
-  checklistGroup.appendChild(el("p", {
-    text: "Runnable Checklist",
-    style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
+  // ── Workflow scope (read-only) ───────────────────────────────────────
+  const scopeGroup = el("div", { class: "comfymodal-studio-backend-field" });
+  scopeGroup.appendChild(el("label", { text: "Workflow Scope" }));
+  scopeGroup.appendChild(el("p", {
+    text: `${(item && item.workflowName) || (item && item.workflowId) || ""}`
+      + ((item && item.versionNumber != null) ? ` \u00b7 v${item.versionNumber}` : ""),
+    style: "font-size:10px;color:#888;margin:0;",
   }));
-  const hasSnapshot = !!(preset.snapshotId);
-  const hasCompatFeatures = (preset.compatibleFeatures || []).length > 0;
-  const hasApiPrompt = !!(preset.apiPromptJson || preset.graphJson);
-  const checklistItems = [
-    { label: "Snapshot linked", ok: hasSnapshot },
-    { label: "Compatible features assigned", ok: hasCompatFeatures },
-    { label: "API prompt available", ok: hasApiPrompt },
-  ];
-  checklistItems.forEach(function (item) {
-    checklistGroup.appendChild(el("li", { class: "comfymodal-studio-checklist-item" }, [
-      el("span", { text: item.ok ? "\u2713" : "\u2717", style: "font-size:10px;color:" + (item.ok ? "var(--color-success, #4ade80)" : "var(--color-danger, #ef4444)") + ";" }),
-      el("span", { text: item.label, style: "font-size:10px;color:#aaa;" }),
-    ]));
-  });
-  card.appendChild(checklistGroup);
+  scopeGroup.appendChild(el("p", {
+    text: `Preset ID: ${presetId}`,
+    style: "font-size:9px;color:#666;margin:2px 0 0;",
+  }));
+  card.appendChild(scopeGroup);
 
-  // ── Capability Summary ──────────────────────────────────────────────
-  (preset.compatibleFeatures || []).forEach((fid) => {
-    const summary = getPresetCapabilitySummary(preset, fid);
-    const summaryGroup = el("div", {
-      style: "margin-bottom:6px;padding:6px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:3px;",
-    });
-    summaryGroup.appendChild(el("p", {
-      text: `${fid} Capability`,
-      style: "font-size:10px;font-weight:600;color:#888;margin:0 0 4px;text-transform:uppercase;letter-spacing:0.05em;",
-    }));
-
-    // Feature status
-    const featStatus = summary.runnable ? "\u2713 Runnable" : `\u26a0 ${summary.disabledReason || "Not runnable"}`;
-    summaryGroup.appendChild(el("p", {
-      text: `Status: ${featStatus}`,
-      style: `font-size:10px;color:${summary.runnable ? "var(--color-success, #4ade80)" : "var(--color-warning, #fbbf24)"};margin:0 0 4px;`,
-    }));
-
-    // API graph status
-    summaryGroup.appendChild(el("p", {
-      text: `API graph: ${summary.hasApiGraph ? "\u2713 available" : "\u2717 missing"}`,
-      style: `font-size:10px;color:${summary.hasApiGraph ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 2px;`,
-    }));
-
-    // Output mapping status
-    summaryGroup.appendChild(el("p", {
-      text: `Output mapping: ${summary.hasOutputBinding ? "\u2713 mapped" : "\u2717 missing"}`,
-      style: `font-size:10px;color:${summary.hasOutputBinding ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 4px;`,
-    }));
-
-    // Required binding checklist
-    summaryGroup.appendChild(el("p", {
-      text: `Required bindings: ${summary.totalBoundRequired}/${summary.totalRequired} configured`,
-      style: `font-size:10px;color:${summary.allRequiredMet ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};margin:0 0 2px;`,
-    }));
-
-    summary.requiredBindings.forEach((d) => {
-      const item = el("div", { style: "display:flex;align-items:center;gap:4px;margin:2px 0;" }, [
-        el("span", { text: d.bound ? "\u2713" : "\u2717", style: `font-size:10px;color:${d.bound ? "var(--color-success, #4ade80)" : "var(--color-danger, #f87171)"};` }),
-        el("span", { text: d.label, style: "font-size:10px;color:#aaa;" }),
-      ]);
-      summaryGroup.appendChild(item);
-    });
-
-    // Optional exposed controls
-    if (summary.totalBoundOptional > 0) {
-      summaryGroup.appendChild(el("p", {
-        text: `Exposed controls: ${summary.totalBoundOptional} optional`,
-        style: "font-size:10px;color:#888;margin:4px 0 2px;",
-      }));
-      summary.optionalBindings.filter((d) => d.bound).forEach((d) => {
-        summaryGroup.appendChild(el("p", {
-          text: `  \u2713 ${d.label}`,
-          style: "font-size:9px;color:var(--color-success, #4ade80);margin:1px 0;",
-        }));
-      });
-    }
-
-    // Missing optional controls hint
-    const missingOpt = summary.optionalBindings.filter((d) => !d.bound);
-    if (missingOpt.length > 0) {
-      summaryGroup.appendChild(el("p", {
-        text: `Missing optional: ${missingOpt.length} (hidden in Playground)`,
-        style: "font-size:9px;color:#666;margin:4px 0 0;font-style:italic;",
-      }));
-    }
-
-    card.appendChild(summaryGroup);
-  });
-
-  // ── Fields ──────────────────────────────────────────────────────────
+  // ── Fields (workflow preset contract: name + description editable) ───
   const fields = [
-    { key: "label", label: "Label", type: "text", value: preset.label || preset.name || "" },
+    { key: "name", label: "Name", type: "text", value: preset.name || "" },
     { key: "description", label: "Description", type: "textarea", value: preset.description || "" },
-    { key: "group", label: "Group", type: "text", value: preset.group || "" },
-    { key: "snapshotId", label: "Snapshot ID", type: "text", value: preset.snapshotId || "" },
-    { key: "sourceType", label: "Source Type", type: "text", value: preset.sourceType || "" },
-    { key: "sourceId", label: "Source ID", type: "text", value: preset.sourceId || "" },
   ];
 
   fields.forEach((f) => {
@@ -335,107 +346,72 @@ export function renderPresetDetail(container, preset, apiBase, listContainer) {
     fg.appendChild(el("label", { text: f.label }));
     let input;
     if (f.type === "textarea") {
-      input = el("textarea", { value: f.value, rows: 2, disabled: !canEdit });
+      input = el("textarea", { value: f.value, rows: 2 });
     } else {
-      input = el("input", { type: "text", value: f.value, disabled: !canEdit });
+      input = el("input", { type: "text", value: f.value });
     }
     input.addEventListener("input", () => { fieldValues[f.key] = input.value; });
     fg.appendChild(input);
     card.appendChild(fg);
   });
 
-  // ── Compatible Features chip grid ──────────────────────────────────
-  const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  compatGroup.appendChild(el("label", { text: "Compatible Features" }));
-  const chipGrid = renderFeaturesChipGrid(preset.compatibleFeatures || [], (updated) => {
-    fieldValues.compatibleFeatures = updated;
-  });
-  compatGroup.appendChild(chipGrid);
-  card.appendChild(compatGroup);
-
-  // ── Defaults ────────────────────────────────────────────────────────
-  const defaults = preset.defaults || {};
-  if (Object.keys(defaults).length > 0) {
-    const defaultsGroup = el("div", { class: "comfymodal-studio-backend-field" });
-    defaultsGroup.appendChild(el("label", { text: "Defaults" }));
-    defaultsGroup.appendChild(el("p", { text: JSON.stringify(defaults, null, 2), style: "font-size:10px;color:#555;white-space:pre-wrap;" }));
-    card.appendChild(defaultsGroup);
+  // ── Values (canonical workflow keys, read-only here) ─────────────────
+  const values = preset.values || {};
+  if (Object.keys(values).length > 0) {
+    const valuesGroup = el("div", { class: "comfymodal-studio-backend-field" });
+    valuesGroup.appendChild(el("label", { text: "Values" }));
+    valuesGroup.appendChild(el("p", { text: JSON.stringify(values, null, 2), style: "font-size:10px;color:#555;white-space:pre-wrap;" }));
+    card.appendChild(valuesGroup);
   }
 
-  // ── Archived notice ────────────────────────────────────────────────
-  if (preset.archived) {
-    card.appendChild(el("p", { text: "\u26a0 Archived", style: "font-size:11px;color:#f87171;margin:4px 0;" }));
-  }
-
-  // ── Actions ────────────────────────────────────────────────────────
+  // ── Actions (all through the workflow preset routes) ─────────────────
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });
 
-  if (canEdit) {
-    const saveBtn = el("button", {
-      class: "comfymodal-primary-btn",
-      text: "Save",
-      style: "width:auto;padding:5px 16px;",
-      onclick: async () => {
-        await updatePreset(apiBase, preset.id, fieldValues);
-        invalidateRuntimePresetsCache();
-        const fresh = await listPresets(apiBase);
-        renderPresetsList(listContainer, fresh, apiBase, container);
-      },
-    });
-    actions.appendChild(saveBtn);
-
-    // Edit Bindings button — opens wizard in edit mode
-    const editBindingsBtn = el("button", {
-      class: "comfymodal-secondary-btn",
-      text: "Edit Bindings",
-      style: "font-size:10px;padding:5px 12px;",
-      onclick: async () => {
-        // Load the snapshot to pass to the wizard
-        const { listSnapshots } = await import("./studio-backend-api.js");
-        const snapshots = await listSnapshots(apiBase);
-        const snapshot = (snapshots || []).find((s) => s.id === preset.snapshotId) || null;
-        launchPresetWizardForEdit(preset, snapshot, apiBase);
-      },
-    });
-    actions.appendChild(editBindingsBtn);
-  }
+  const saveBtn = el("button", {
+    class: "comfymodal-primary-btn",
+    text: "Save",
+    style: "width:auto;padding:5px 16px;",
+    onclick: async () => {
+      await updateWorkflowPreset(apiBase, presetId, fieldValues);
+      invalidateRuntimePresetsCache();
+      const fresh = await _refreshPresetsList(listContainer, container, apiBase);
+      void fresh;
+    },
+  });
+  actions.appendChild(saveBtn);
 
   const dupBtn = el("button", {
     class: "comfymodal-secondary-btn",
     text: "Duplicate",
     style: "font-size:10px;padding:5px 12px;",
     onclick: async () => {
-      await duplicatePreset(apiBase, preset.id);
+      await duplicateWorkflowPreset(apiBase, presetId);
       invalidateRuntimePresetsCache();
-      const fresh = await listPresets(apiBase);
-      renderPresetsList(listContainer, fresh, apiBase, container);
+      await _refreshPresetsList(listContainer, container, apiBase);
     },
   });
   actions.appendChild(dupBtn);
 
-  if (canEdit) {
-    const deleteBtn = el("button", {
-      class: "comfymodal-destructive-btn",
-      text: "Delete preset",
-      style: "font-size:10px;padding:5px 12px;",
-      onclick: async () => {
-        if (confirm("Delete this preset? (soft-delete — it can be restored via the server)")) {
-          await deletePreset(apiBase, preset.id);
-          clearSelection();
-          invalidateRuntimePresetsCache();
-          _STATE.selectedItemId = null;
-          const fresh = await listPresets(apiBase);
-          while (container.firstChild) container.removeChild(container.firstChild);
-          renderPresetsList(listContainer, fresh, apiBase, container);
-          if (fresh.length > 0) {
-            _STATE.selectedItemId = fresh[0].id;
-            renderPresetDetail(container, fresh[0], apiBase, listContainer);
-          }
+  const deleteBtn = el("button", {
+    class: "comfymodal-destructive-btn",
+    text: "Delete preset",
+    style: "font-size:10px;padding:5px 12px;",
+    onclick: async () => {
+      if (confirm("Delete this preset? (soft-delete \u2014 it can be restored via the server)")) {
+        await deleteWorkflowPreset(apiBase, presetId);
+        clearSelection();
+        invalidateRuntimePresetsCache();
+        _STATE.selectedItemId = null;
+        const fresh = await _refreshPresetsList(listContainer, container, apiBase);
+        while (container.firstChild) container.removeChild(container.firstChild);
+        if (fresh.length > 0) {
+          _STATE.selectedItemId = _presetIdOf(fresh[0]);
+          renderPresetDetail(container, fresh[0], apiBase, listContainer);
         }
-      },
-    });
-    actions.appendChild(deleteBtn);
-  }
+      }
+    },
+  });
+  actions.appendChild(deleteBtn);
 
   card.appendChild(actions);
   container.appendChild(card);
@@ -450,11 +426,11 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
     style: "padding:6px 10px;border-radius:3px;margin-bottom:8px;background:#1a1a0a;border:1px solid #888;color:#d0d0d0;font-size:10px;",
   }, [
     el("p", {
-      text: "\u26a0 Advanced: Use \u201cMake Preset\u201d for the primary preset creation flow.",
+      text: "\u26a0 Advanced: prefer creating presets in the Workflows tab version view.",
       style: "margin:0 0 2px;font-weight:600;",
     }),
     el("p", {
-      text: "This form creates a raw preset without bindings. You can edit bindings after creation.",
+      text: "This form creates a preset on a mapped workflow version through the legacy-absorption route.",
       style: "margin:0;font-size:9px;color:#888;",
     }),
   ]);
@@ -466,12 +442,53 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
   });
   formCard.appendChild(heading);
 
-  const fieldValues = { label: "", description: "", group: "", snapshotId: "", compatibleFeatures: [] };
+  const fieldValues = { name: "", description: "" };
+  const statusEl = el("p", { style: "font-size:10px;color:#f87171;margin:0 0 8px;display:none;" });
+  formCard.appendChild(statusEl);
+
+  // Workflow + version scope: presets are version-scoped, so the target
+  // version is chosen explicitly (only mapped versions accept presets).
+  const workflowSelect = el("select", { class: "comfymodal-studio-select", "aria-label": "Workflow" });
+  const versionSelect = el("select", { class: "comfymodal-studio-select", "aria-label": "Workflow version" });
+  const scopeGroup = el("div", { class: "comfymodal-studio-backend-field" });
+  scopeGroup.appendChild(el("label", { text: "Workflow" }));
+  scopeGroup.appendChild(workflowSelect);
+  formCard.appendChild(scopeGroup);
+  const versionGroup = el("div", { class: "comfymodal-studio-backend-field" });
+  versionGroup.appendChild(el("label", { text: "Version" }));
+  versionGroup.appendChild(versionSelect);
+  formCard.appendChild(versionGroup);
+
+  async function _loadWorkflowsIntoSelect() {
+    while (workflowSelect.firstChild) workflowSelect.removeChild(workflowSelect.firstChild);
+    const wfResp = await listWorkflows(apiBase, {});
+    const workflows = (wfResp && wfResp.workflows) || [];
+    workflows.forEach((w) => {
+      const opt = el("option", { value: w.workflow_id || "", text: w.name || w.workflow_id || "" });
+      workflowSelect.appendChild(opt);
+    });
+    await _loadVersionsIntoSelect();
+  }
+
+  async function _loadVersionsIntoSelect() {
+    while (versionSelect.firstChild) versionSelect.removeChild(versionSelect.firstChild);
+    const wfId = workflowSelect.value || "";
+    if (!wfId) return;
+    const verResp = await listWorkflowVersions(apiBase, wfId);
+    const versions = (verResp && verResp.versions) || [];
+    versions.forEach((v) => {
+      const label = v.version_number != null ? `v${v.version_number}` : (v.workflow_version_id || "");
+      const opt = el("option", { value: v.workflow_version_id || "", text: label });
+      versionSelect.appendChild(opt);
+    });
+  }
+
+  workflowSelect.addEventListener("change", () => { _loadVersionsIntoSelect(); });
+  _loadWorkflowsIntoSelect();
+
   const fields = [
-    { key: "label", label: "Label", type: "text" },
+    { key: "name", label: "Name", type: "text" },
     { key: "description", label: "Description", type: "textarea" },
-    { key: "group", label: "Group", type: "text" },
-    { key: "snapshotId", label: "Snapshot ID", type: "text" },
   ];
 
   fields.forEach((f) => {
@@ -488,15 +505,6 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
     formCard.appendChild(fg);
   });
 
-  // Compatible Features
-  const compatGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  compatGroup.appendChild(el("label", { text: "Compatible Features" }));
-  const chipGrid = renderFeaturesChipGrid([], (updated) => {
-    fieldValues.compatibleFeatures = updated;
-  });
-  compatGroup.appendChild(chipGrid);
-  formCard.appendChild(compatGroup);
-
   const actions = el("div", { class: "comfymodal-studio-backend-actions" });
 
   const createBtn = el("button", {
@@ -504,15 +512,32 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
     text: "Create",
     style: "width:auto;padding:5px 16px;",
     onclick: async () => {
-      const result = await createPreset(apiBase, fieldValues);
-      if (result) {
-        invalidateRuntimePresetsCache();
-        _STATE.selectedItemId = null;
-        // Re-render the presets page
-        while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
-        while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
-        renderPresetsPage(listPanel, detailPanel, apiBase);
+      statusEl.style.display = "none";
+      const versionId = versionSelect.value || "";
+      const name = (fieldValues.name || "").trim();
+      if (!versionId || !name) {
+        statusEl.textContent = "Choose a workflow version and enter a preset name.";
+        statusEl.style.display = "block";
+        return;
       }
+      // Legacy-shaped entry payload → the abs-1 verified from-legacy
+      // route translates keys (LEGACY_ROLE_MAP) and persists through
+      // create_preset_from_legacy → create_preset under the version scope.
+      const result = await createPresetFromLegacy(apiBase, versionId, {
+        name,
+        description: fieldValues.description || "",
+      });
+      if (!result || result.status === "error" || !result.preset) {
+        statusEl.textContent = (result && (result.message || result.error)) || "Server rejected preset creation";
+        statusEl.style.display = "block";
+        return;
+      }
+      invalidateRuntimePresetsCache();
+      _STATE.selectedItemId = null;
+      // Re-render the presets page
+      while (listPanel.firstChild) listPanel.removeChild(listPanel.firstChild);
+      while (detailPanel.firstChild) detailPanel.removeChild(detailPanel.firstChild);
+      renderPresetsPage(listPanel, detailPanel, apiBase);
     },
   });
   actions.appendChild(createBtn);

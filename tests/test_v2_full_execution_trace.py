@@ -33,6 +33,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -77,6 +78,7 @@ from comfymodal_runtime.full_execution_trace import (
     _get_proc_self,
     _get_proc_root,
     _KNOWN_WRAPPER_SYMBOLS,
+    golden_trace_span,
 )
 
 
@@ -822,6 +824,46 @@ class TestMarkAndOperations(unittest.TestCase):
             if e.get("event") == "mark"
         ]
         self.assertGreaterEqual(len(mark_events), 1)
+
+
+class TestGoldenTraceSpan(unittest.TestCase):
+    """Golden spans use only an already-registered VizTracer."""
+
+    def test_registered_tracer_duration_event_is_entered_and_exited(self):
+        calls: list[tuple[str, str]] = []
+
+        class Event:
+            def __enter__(self):
+                calls.append(("enter", "golden.test"))
+
+            def __exit__(self, *_args):
+                calls.append(("exit", "golden.test"))
+
+        class Tracer:
+            def log_event(self, name):
+                calls.append(("log", name))
+                return Event()
+
+        fake_module = SimpleNamespace(get_tracer=lambda: Tracer())
+        with patch.dict(ft.sys.modules, {"viztracer": fake_module}):
+            with golden_trace_span("golden.test"):
+                calls.append(("body", "golden.test"))
+
+        self.assertEqual(
+            calls,
+            [
+                ("log", "golden.test"),
+                ("enter", "golden.test"),
+                ("body", "golden.test"),
+                ("exit", "golden.test"),
+            ],
+        )
+
+    def test_missing_or_broken_tracer_never_changes_body(self):
+        with patch.dict(ft.sys.modules, {}, clear=False):
+            with golden_trace_span("golden.noop"):
+                value = 42
+        self.assertEqual(value, 42)
 
 
 class TestResourceSampler(unittest.TestCase):
@@ -1681,6 +1723,31 @@ class TestStopTracing(unittest.TestCase):
         self.assertIn("elapsed_seconds", summary)
         self.assertEqual(summary["final_state"], "trace_stopped")
 
+    def test_viztracer_stop_keeps_finalization_parse_free(self):
+        """A missing live data count must not trigger a full trace parse."""
+        session = self._make_session()
+        session.start_restore()
+        session.set_restore_complete()
+        session.claim_first_request("req_1")
+        tracer = MagicMock()
+        tracer.tracer_entries = 123
+        tracer.data = None
+        tracer.parse.side_effect = AssertionError("parse is offline-only")
+        tracer.save.side_effect = lambda path: Path(path).write_text(
+            '{"traceEvents": []}', encoding="utf-8"
+        )
+        session._viztracer = tracer
+
+        result = session.stop_tracing()
+
+        tracer.parse.assert_not_called()
+        viz = result["viztracer"]
+        self.assertIsNone(viz["entry_count"])
+        self.assertEqual(viz["entry_capacity"], 123)
+        for field in ("stop_ms", "save_ms", "gzip_ms", "total_ms"):
+            self.assertIn(field, viz)
+            self.assertGreaterEqual(viz[field], 0)
+
     def test_stop_double_call(self):
         session = self._make_session()
         session.start_restore()
@@ -1712,6 +1779,9 @@ class TestTorchProfiler(unittest.TestCase):
         FullExecutionTraceSession.reset_instance()
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
+        self._torch_env = patch.dict(os.environ, {ft._ENV_TORCH: "1"}, clear=False)
+        self._torch_env.start()
+        self.addCleanup(self._torch_env.stop)
         self._sessions = []
 
     def tearDown(self):
@@ -1733,6 +1803,13 @@ class TestTorchProfiler(unittest.TestCase):
         session = self._make_session()
         session.start_torch_profiler()
         session.stop_tracing()
+
+    def test_torch_profiler_is_opt_in_by_default(self):
+        session = self._make_session()
+        with patch.dict(os.environ, {}, clear=True):
+            session.start_torch_profiler()
+        self.assertIsNone(session._torch_profiler)
+        self.assertFalse(session._torch_profiler_active)
 
     def test_start_torch_profiler_twice_no_op(self):
         session = self._make_session()
@@ -1792,6 +1869,9 @@ class TestTorchProfilerThreadSafety(unittest.TestCase):
         FullExecutionTraceSession.reset_instance()
         self.td = tempfile.TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
+        self._torch_env = patch.dict(os.environ, {ft._ENV_TORCH: "1"}, clear=False)
+        self._torch_env.start()
+        self.addCleanup(self._torch_env.stop)
         self._sessions: list[FullExecutionTraceSession] = []
 
     def tearDown(self):
@@ -2313,6 +2393,52 @@ class TestTraceConfig(unittest.TestCase):
         config_path = session.base_dir / "raw" / "trace_config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertIn("missing", config["include_paths"])
+
+    def test_update_trace_config_persists_only_contract_fields(self):
+        session = _create_test_session(self.td.name)
+        session.update_trace_config({
+            "golden_profile_contract": "direct_golden_serial",
+            "golden_profile_require_canonical_stages": True,
+            "output_durability_mode": "strict",
+            "required_canonical_stages": ["golden_output", "golden_durable_commit"],
+            "canonical_stage_order": ["golden_output", "golden_durable_commit"],
+            "unrelated_state": "must_not_persist",
+        })
+        config_path = session.base_dir / "raw" / "trace_config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config["golden_profile_contract"], "direct_golden_serial")
+        self.assertIs(config["golden_profile_require_canonical_stages"], True)
+        self.assertEqual(config["output_durability_mode"], "strict")
+        self.assertEqual(
+            config["required_canonical_stages"],
+            ["golden_output", "golden_durable_commit"],
+        )
+        self.assertNotIn("unrelated_state", config)
+        self.assertTrue(
+            any(event.get("event") == "trace_config_updated" for event in session.events)
+        )
+
+    def test_config_torch_enabled_false_when_unset_or_zero(self):
+        """Persist top-level torch_enabled as false unless explicitly enabled."""
+        for value in (None, "0"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, clear=False):
+                    if value is None:
+                        os.environ.pop(ft._ENV_TORCH, None)
+                    else:
+                        os.environ[ft._ENV_TORCH] = value
+                    session = _create_test_session(self.td.name)
+                    config_path = session.base_dir / "raw" / "trace_config.json"
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertIs(config["torch_enabled"], False)
+
+    def test_config_torch_enabled_true_when_one(self):
+        """Persist top-level torch_enabled as true for the enabled flag."""
+        with patch.dict(os.environ, {ft._ENV_TORCH: "1"}, clear=False):
+            session = _create_test_session(self.td.name)
+            config_path = session.base_dir / "raw" / "trace_config.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertIs(config["torch_enabled"], True)
 
 
 class TestLegacyCompatEnv(unittest.TestCase):

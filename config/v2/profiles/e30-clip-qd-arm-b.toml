@@ -1,0 +1,27 @@
+# v2ctl profile: E30 CLIP QD-IO ARM B — EXPERIMENT (QD reader ON, QD=4).
+# Extends e29-tracer to inherit identical E29 canonical measurements,
+# E31-OFF assertion, E28 base loader config, and harness selectors.
+# The ONLY difference vs ARM A is COMFYMODAL_V2_CLIP_QD_READER (1 vs 0).
+schema_version = 1
+name = "e30-clip-qd-arm-b"
+extends = "e29-tracer"
+owner = "E30"
+
+[workload]
+fresh_required = true
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# E30 QD reader: ON, QD=4 (experiment arm — genuine queued-pread source).
+COMFYMODAL_V2_CLIP_QD_READER = "1"
+# QD config: 4 independent reader threads, 32 MiB blocks.
+COMFYMODAL_V2_CLIP_QD_QD = "4"
+COMFYMODAL_V2_CLIP_QD_BLOCK_MIB = "32"
+COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY = "restore_earliest"
+# E31: OFF (not combined with QD experiment — fail-closed).
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+COMFYMODAL_V2_E31_FORENSICS = "0"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"

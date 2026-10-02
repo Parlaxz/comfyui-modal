@@ -1,0 +1,25 @@
+[im] qd=4 model=processes read_mib=64 gap=4.0 slots=2..10 pinned=False
+[im] launching 9 slots with parallel=1
+[im] start im-02
+[im] done im-02 provider=gcp region=eu-west wall=1452.54411 gbps=5.538545778138193 worst=0.0ms maxIF=4 flags=none
+[im] start im-03
+[im] done im-03 provider=gcp region=asia-south2 wall=1552.329023 gbps=5.1825237619099775 worst=0.0ms maxIF=4 flags=none
+[im] start im-04
+[im] done im-04 provider=gcp region=uk wall=1664.311334 gbps=4.8338203818300745 worst=0.0ms maxIF=4 flags=none
+[im] start im-05
+[im] done im-05 provider=gcp region=eu-west wall=1536.805403 gbps=5.234873610084517 worst=0.0ms maxIF=4 flags=none
+[im] start im-06
+[im] done im-06 provider=gcp region=uk wall=1465.059354 gbps=5.491232847348518 worst=0.0ms maxIF=4 flags=none
+[im] start im-07
+[im] done im-07 provider=gcp region=us-east wall=1572.2654 gbps=5.1168091901023836 worst=0.0ms maxIF=4 flags=none
+[im] start im-08
+[im] done im-08 provider=aws region=us-west wall=2211.536349 gbps=3.637734487899208 worst=0.0ms maxIF=4 flags=none
+[im] start im-09
+[im] done im-09 provider=unspecified region=ca wall=1243.979465 gbps=6.467134124275919 worst=0.0ms maxIF=4 flags=none
+[im] start im-10
+[im] done im-10 provider=aws region=us-west wall=2227.345218 gbps=3.6119151997568792 worst=0.0ms maxIF=4 flags=none
+
+[im] accepted 9 / 9
+  gbps med=5.183 mean=5.013 best=6.467 worst=3.612
+  wall med=1552 mean=1658
+  regions: {'gcp:eu-west': 2, 'gcp:asia-south2': 1, 'gcp:uk': 2, 'gcp:us-east': 1, 'aws:us-west': 2, 'unspecified:ca': 1}

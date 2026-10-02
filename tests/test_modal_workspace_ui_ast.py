@@ -9,61 +9,77 @@ UI_PLAYGROUND_PATH = REPO_ROOT / "web" / "studio-playground.js"
 
 
 class ModalWorkspaceUiAstTests(unittest.TestCase):
-    def test_workspace_controls_are_present(self):
-        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("Swap Workspace", source)
-        self.assertIn("Manifest Repair", source)
-        self.assertIn("Export Workflow Manifest", source)
-        self.assertIn("Import Workflow Manifest", source)
-        self.assertIn("Install from Manifest", source)
+    """H18 Wave G: the legacy overlay workspace/manifest UI is deleted;
+    these pins assert the retirement (modern owners: Backend page)."""
 
-    def test_edit_workspace_controls_are_present(self):
+    def test_workspace_controls_retired(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("Edit Workspace", source)
-        self.assertIn("Leave blank to keep current", source)
+        for retired in [
+            "Swap Workspace",
+            "Manifest Repair",
+            "Export Workflow Manifest",
+            "Import Workflow Manifest",
+            "Install from Manifest",
+        ]:
+            self.assertNotIn(retired, source, f"retired overlay control must stay deleted: {retired}")
 
-    def test_sidebar_launcher_can_open_legacy_settings(self):
+    def test_edit_workspace_controls_retired(self):
+        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("Edit Workspace", source)
+        self.assertNotIn("Leave blank to keep current", source)
+
+    def test_sidebar_launcher_opens_modern_settings(self):
+        """H10: the sidebar panel opens modern Settings, not the legacy overlay."""
         source = (REPO_ROOT / "web" / "modal-testing.js").read_text(encoding="utf-8")
-        self.assertIn("Open Legacy Settings", source)
-        self.assertIn("open_comfymodal_settings", source)
+        self.assertIn("Open Settings", source)
+        self.assertNotIn("Open Legacy Settings", source)
+        # H14 Wave E: the standalone legacy overlay global is retired.
+        settings_source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("open_comfymodal_settings", settings_source)
 
-    def test_workspace_routes_are_called(self):
+    def test_workspace_routes_not_called_from_settings_module(self):
+        """Workspace/manifest routes are consumed by the modern Backend
+        modules, never by the deleted overlay."""
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("MODAL_PREFIX}/workspaces", source)
-        self.assertIn("MODAL_PREFIX}/workspaces/swap", source)
-        self.assertIn("MODAL_PREFIX}/manifest/repair/scan", source)
-        self.assertIn("MODAL_PREFIX}/manifest/repair/apply", source)
-        self.assertIn("MODAL_PREFIX}/manifest/install", source)
-        self.assertIn("MODAL_PREFIX}/workflow-manifest/export", source)
-        self.assertIn("MODAL_PREFIX}/workflow-manifest/import", source)
+        for retired in [
+            "MODAL_PREFIX}/workspaces",
+            "MODAL_PREFIX}/workspaces/swap",
+            "MODAL_PREFIX}/manifest/repair/scan",
+            "MODAL_PREFIX}/manifest/repair/apply",
+            "MODAL_PREFIX}/manifest/install",
+        ]:
+            self.assertNotIn(retired, source)
 
     def test_swap_review_does_not_rewrite_body_with_innerhtml_append(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
         self.assertNotIn("body.innerHTML +=", source)
 
-    def test_swap_review_confirm_preserves_prompt_interrupt_approval(self):
-        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("confirm_prompt_interrupt: !!data.confirm_prompt_interrupt", source)
-
 
 class ModalProductionUiAstTests(unittest.TestCase):
-    """Phase 2 production-mode UI source-level tests."""
+    """Phase 2 production-mode UI source-level tests.
 
-    def test_simulate_production_checkbox_present(self):
-        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("Simulate Production", source)
-        # Label must be a semantic <label for="..."> element (not a <span> with htmlFor)
-        self.assertIn('createElement("label")', source)
-        self.assertIn("cm-prod-toggle", source)
+    Canvas Production mode lives in modal-node.js (untouched). The legacy
+    overlay's Simulate Production toggle was deleted in Wave G (H18).
+    """
 
-    def test_production_mode_enabled_persisted(self):
+    def test_legacy_production_toggle_retired(self):
         source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("Simulate Production", source)
+        self.assertNotIn("cm-prod-toggle", source)
+        self.assertNotIn("production_mode_enabled", source)
+
+    def test_canvas_production_mode_intact(self):
+        """Production-mode marking remains with the canvas layer (H5 §9)."""
+        source = UI_NODE_PATH.read_text(encoding="utf-8")
         self.assertIn("production_mode_enabled", source)
 
-    def test_production_summary_labels(self):
-        source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
-        self.assertIn("Production plan", source)
-        self.assertIn("Sampler previews: disabled", source)
+    def test_production_summary_labels_retired(self):
+        """H18 Wave G: the overlay production-summary UI is deleted; the
+        stale "Production plan" copy no longer exists anywhere in web/."""
+        playground_source = UI_PLAYGROUND_PATH.read_text(encoding="utf-8")
+        settings_source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("Production plan", settings_source)
+        self.assertNotIn("Production plan", playground_source)
 
     def test_context_menu_mark_output(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
@@ -108,12 +124,15 @@ class ModalProductionUiAstTests(unittest.TestCase):
         self.assertNotIn("node.mode =", source)
 
     def test_output_save_folder_defaults_are_normalized(self):
+        """The save-folder default lives in the shared output-preferences
+        authority; the overlay's copy is deleted (Wave G)."""
         node_source = UI_NODE_PATH.read_text(encoding="utf-8")
         settings_source = UI_SETTINGS_PATH.read_text(encoding="utf-8")
+        helper_source = (REPO_ROOT / "web" / "studio-output-preferences.js").read_text(encoding="utf-8")
         self.assertNotIn("ComfyUI/output/modal/", node_source)
         self.assertNotIn("ComfyUI/output/modal/", settings_source)
         self.assertIn("output/modal", node_source)
-        self.assertIn("output/modal", settings_source)
+        self.assertIn("output/modal", helper_source)
 
     def test_production_bypass_error_message(self):
         source = UI_NODE_PATH.read_text(encoding="utf-8")
@@ -187,10 +206,9 @@ class StudioPlaygroundNormalizerAndPersistenceTests(unittest.TestCase):
 class StudioHistoryNormalizerTests(unittest.TestCase):
     """History must import normalizeStudioRun from shared normalizer."""
 
-    def test_history_imports_normalize_studio_run(self):
-        """studio-history.js must import normalizeStudioRun."""
-        text = (REPO_ROOT / "web" / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn("normalizeStudioRun", text)
+    def test_history_v2_imports_normalize_studio_run(self):
+        """studio-history-v2.js (modern History) must reference the normalizer module."""
+        text = (REPO_ROOT / "web" / "studio-history-v2.js").read_text(encoding="utf-8")
         self.assertIn("./studio-run-normalizer.js", text)
 
 

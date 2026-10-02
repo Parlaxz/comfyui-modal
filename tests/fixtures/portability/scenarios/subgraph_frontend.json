@@ -1,0 +1,41 @@
+{
+  "audit_basis": [
+    "PHASE_G1 §8 subgraph definitions present",
+    "PHASE_G5 POLICY_SUBGRAPHS"
+  ],
+  "description": "Smallest valid graph carrying definitions.subgraphs while staying executable-minimal. Presence is NOT a universal failure: target-sensitive frontend requirement only.",
+  "expected": {
+    "issue_codes": [
+      "subgraph_frontend_requirement"
+    ],
+    "risk_level_hint_nonnormative": "medium",
+    "semantic_notes": [
+      "target-sensitive frontend requirement; policy target_sensitive_not_global_blocker; local/modal may stay low-impact with frontend >= 1.44."
+    ],
+    "signals": {
+      "custom_node_count": 0,
+      "custom_node_revision_pinned": true,
+      "custom_repo_count": 0,
+      "env_bound_registry_leak": false,
+      "exact_roundtrip_proven": true,
+      "has_absolute_path": false,
+      "has_external_endpoint": false,
+      "has_unresolved_node_type": false,
+      "model_extraction_gap": false,
+      "model_hash_pinned": true,
+      "model_ref_basename_only": true,
+      "requires_input_asset": false,
+      "unresolved_node_count": 0,
+      "uses_subgraphs": true
+    }
+  },
+  "kind": "workflow",
+  "manifest_file": "manifests/subgraph_frontend.manifest.json",
+  "manifest_readiness_expected": {
+    "missing_count": 0,
+    "ready": true
+  },
+  "manifest_sha256_canonical": "df3c8dce4983da2b02f0faf123e37ffdf49d0de404b79561689796b7af41231f",
+  "scenario_id": "subgraph_frontend",
+  "title": "Subgraph definitions need a sufficiently new frontend"
+}

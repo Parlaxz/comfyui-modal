@@ -1,0 +1,29 @@
+Exp01 direct-operator diagnosis (orchestrator, no subagent), 2026-09-03 ~15:20 local.
+
+1. HEAD moved since implementation freeze: c4bee23 -> 9f2ce64cfe93b1ae74567b802b30da4c3533e594.
+   9f2ce64 adds ONE root report .md (RX9P-M2R gantt repair); zero deploy-relevant content.
+   Foreign dirt unchanged and untouched: M tools/v2_control/cli.py, M .opencode/skills/comfymodal-golden-ops/SKILL.md.
+
+2. Direct source-probe retry (no flag; source-probe has no flag interface):
+   exit=1, ERROR: publisher preflight is not ready for consumer deploy:
+   decision=publish_required bootstrap_required=False
+   Full output: exp01_19_source_probe_retry.txt
+
+3. Binding preflight record (.v2ctl/publisher_preflight/publisher_ws_eaef96004dac.json), verbatim:
+{"BOOTSTRAP_REQUIRED": false, "ENVIRONMENT": "(default)", "LOCAL_CONTENT_GENERATION": "0423bf0b9a95ae8ecc17b505f11d217753c3562a32f4fe3c8ef80c662ab34ea5", "PUBLICATION_DECISION": "publish_required", "PUBLISHER_APP": "comfyui-custom-nodes-publisher", "PUBLISHER_EXISTS": true, "PUBLISHER_FUNCTION_EXISTS": true, "PUBLISHER_VERSION_BEFORE": 8, "READY_FOR_CONSUMER_DEPLOY": false, "REMOTE_CONTENT_GENERATION": "265e5768df6c5308ae34b31a888c1aded21a0242850016e5d202a6064d9605c1", "WORKSPACE": "ws_eaef96004dac"}
+
+4. Generation timeline (all three distinct):
+   deployed (ours, 14:09): 006b85813917fce36ab5a9f68b3dad56b7610508c569cd90ac8dd42eccdd76d1
+   volume (now):            265e5768df6c5308ae34b31a888c1aded21a0242850016e5d202a6064d9605c1
+   local (now):             0423bf0b9a95ae8ecc17b505f11d217753c3562a32f4fe3c8ef80c662ab34ea5
+   The shared Volume was overwritten after our deploy (deploy path publishes, then
+   requires ready; a later foreign publication moved it). Last-writer-wins confirmed.
+
+5. Bound probe evidence: .v2ctl/source-probes/ contains no probe_*_f6b59e42*.json.
+   require_source_probe_evidence therefore fails closed for every golden run;
+   the flag cannot substitute (skill: run still requires source-probe evidence).
+
+6. Ruled out: publish our tree (would overwrite another lane's live Volume content);
+   redeploy (one-deployment rule); flag-only runs (gate requires MATCH evidence).
+   Collection remains STOPPED. Awaiting Volume publication by the owning lane (or
+   operator direction); existing deployment f6b59e42 stays valid for reuse after that.

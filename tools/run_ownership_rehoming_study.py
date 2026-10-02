@@ -1507,6 +1507,8 @@ async def _run_snapshot_ab_study(
     expect_region: str = "",
     expect_lean: str = "",
     expect_manifest: str = "",
+    skip_env_assert: bool = False,
+    interleave_app: str = "",
 ) -> dict[str, Any]:
     """Same-image snapshot-composition A/B: entry-probe timing per arm.
 
@@ -1515,91 +1517,161 @@ async def _run_snapshot_ab_study(
     boundary as the historical pre-Python metric) with no graph execution.
     The snapshot builder and the immediately following request are
     excluded, mirroring the restore-study protocol.
+
+    ``interleave_app`` (when set) runs a second arm alternately in the same
+    window (attempts alternate primary/secondary; exclusions and validity
+    are tracked per arm).  ``skip_env_assert`` tolerates an arm whose
+    deployment has no ``run_env_probe`` method (e.g. a historical archive
+    surface): the arm's probe is recorded as skipped instead of failing;
+    arms that DO expose the method are still asserted.
     """
-    os.environ["COMFYMODAL_V2_APP_NAME"] = app_name
-    handle = await asyncio.to_thread(
-        transport._v2_handle, workspace=workspace, gpu=GPU,
+    _primary_arm = arm or "A"
+    _secondary_arm = "B"
+    arm_apps: dict[str, str] = {_primary_arm: app_name}
+    if interleave_app:
+        arm_apps[_secondary_arm] = interleave_app
+    handles: dict[str, Any] = {}
+
+    def _resolve_handle(_app: str) -> Any:
+        # The transport resolves the app name from the environment; swap it
+        # per arm so each handle (and handle-cache entry) targets the right
+        # deployment.  Synchronous; called via asyncio.to_thread below.
+        _prev = os.environ.get("COMFYMODAL_V2_APP_NAME", "")
+        os.environ["COMFYMODAL_V2_APP_NAME"] = _app
+        try:
+            return transport._v2_handle(workspace=workspace, gpu=GPU)
+        finally:
+            if _prev:
+                os.environ["COMFYMODAL_V2_APP_NAME"] = _prev
+            else:
+                os.environ.pop("COMFYMODAL_V2_APP_NAME", None)
+
+    handles[_primary_arm] = await asyncio.to_thread(
+        _resolve_handle, app_name,
     )
-    # ── Container env assertion (same machinery as the ownership study) ──
-    env_probe: dict[str, Any] = {}
-    env_failures: list[str] = []
-    try:
-        fn = getattr(handle, "run_env_probe", None)
-        if fn is None:
-            env_failures.append("deployed container has no run_env_probe method")
-        else:
-            remote = getattr(fn, "remote", None)
-            if remote is not None and callable(getattr(remote, "aio", None)):
-                probe = remote.aio(request_id="v2-env-probe")
+    if interleave_app:
+        handles[_secondary_arm] = await asyncio.to_thread(
+            _resolve_handle, interleave_app,
+        )
+    # ── Container env assertion per arm (same machinery as the ownership
+    #    study; skipped arms are recorded, never hard-failed) ──
+    arm_expectations: dict[str, dict[str, str]] = {
+        _primary_arm: {
+            "expect_cloud": expect_cloud,
+            "expect_region": expect_region,
+            "expect_lean": expect_lean,
+            "expect_manifest": expect_manifest,
+        },
+    }
+    if interleave_app:
+        # The secondary arm shares the cloud/region policy; lean/manifest
+        # expectations default to 0 unless the caller overrides them.
+        arm_expectations[_secondary_arm] = {
+            "expect_cloud": expect_cloud,
+            "expect_region": expect_region,
+            "expect_lean": expect_lean or "0",
+            "expect_manifest": expect_manifest or "0",
+        }
+    for _arm_key, _exp in arm_expectations.items():
+        _handle = handles[_arm_key]
+        env_failures: list[str] = []
+        env_probe: dict[str, Any] = {}
+        _skipped = False
+        try:
+            fn = getattr(_handle, "run_env_probe", None)
+            if fn is None:
+                if skip_env_assert:
+                    _skipped = True
+                else:
+                    env_failures.append(
+                        f"deployed container has no run_env_probe method"
+                    )
+            else:
+                remote = getattr(fn, "remote", None)
+                if remote is not None and callable(getattr(remote, "aio", None)):
+                    probe = remote.aio(request_id="v2-env-probe")
+                    if asyncio.iscoroutine(probe):
+                        probe = await probe
+                elif asyncio.iscoroutinefunction(fn):
+                    probe = await fn(request_id="v2-env-probe")
+                else:
+                    probe = await asyncio.to_thread(fn, request_id="v2-env-probe")
                 if asyncio.iscoroutine(probe):
                     probe = await probe
-            elif asyncio.iscoroutinefunction(fn):
-                probe = await fn(request_id="v2-env-probe")
-            else:
-                probe = await asyncio.to_thread(fn, request_id="v2-env-probe")
-            if asyncio.iscoroutine(probe):
-                probe = await probe
-            if isinstance(probe, dict):
-                env_probe = probe
-                env_failures = _assert_container_env(
-                    probe, app_name=app_name, gpu=GPU,
-                    expect_cloud=expect_cloud, expect_region=expect_region,
-                )
+                if isinstance(probe, dict):
+                    env_probe = probe
+                    env_failures = _assert_container_env(
+                        probe, app_name=arm_apps[_arm_key], gpu=GPU,
+                        expect_cloud=_exp["expect_cloud"],
+                        expect_region=_exp["expect_region"],
+                    )
+                else:
+                    env_failures.append(
+                        f"run_env_probe returned non-dict: {type(probe).__name__}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            if skip_env_assert:
+                _skipped = True
             else:
                 env_failures.append(
-                    f"run_env_probe returned non-dict: {type(probe).__name__}"
+                    f"run_env_probe call failed: {type(exc).__name__}: {str(exc)[:300]}"
                 )
-    except Exception as exc:  # noqa: BLE001
-        env_failures.append(
-            f"run_env_probe call failed: {type(exc).__name__}: {str(exc)[:300]}"
-        )
-    # Arm-specific gates: lean snapshot composition + manifest capture must
-    # match the arm that was deployed.
-    env = env_probe.get("env") or {}
-    for key, expected in (
-        ("COMFYMODAL_V2_LEAN_SNAPSHOT", expect_lean),
-        ("COMFYMODAL_V2_SNAPSHOT_MANIFEST", expect_manifest),
-    ):
-        actual = str(env.get(key, "") or "")
-        if expected == "0" and actual not in ("", "0", "false", "no", "off"):
-            env_failures.append(f"{key}: expected OFF, container has {actual!r}")
-        elif expected == "1" and actual not in ("1", "true", "yes", "on"):
-            env_failures.append(f"{key}: expected ON, container has {actual!r}")
-    if env_failures:
+        # Arm-specific gates: lean snapshot composition + manifest capture
+        # must match the arm that was deployed.
+        if not _skipped:
+            env = env_probe.get("env") or {}
+            for key, expected in (
+                ("COMFYMODAL_V2_LEAN_SNAPSHOT", _exp["expect_lean"]),
+                ("COMFYMODAL_V2_SNAPSHOT_MANIFEST", _exp["expect_manifest"]),
+            ):
+                if expected == "0" and env.get(key, "") not in ("", "0", "false", "no", "off"):
+                    env_failures.append(f"{key}: expected OFF, container has {env.get(key)!r}")
+                elif expected == "1" and env.get(key, "") not in ("1", "true", "yes", "on"):
+                    env_failures.append(f"{key}: expected ON, container has {env.get(key)!r}")
+        if env_failures:
+            print(
+                f"[v2.snapshot_ab] arm={_arm_key} CONTAINER ENV ASSERTION FAILED:",
+                flush=True,
+            )
+            for _f in env_failures:
+                print(f"  - {_f}", flush=True)
+            raise RuntimeError(
+                f"snapshot-ab: arm {_arm_key} container env assertion failed "
+                "(see container_env_assert.json)"
+            )
         print(
-            f"[v2.snapshot_ab] arm={arm} CONTAINER ENV ASSERTION FAILED:", flush=True,
+            f"[v2.snapshot_ab] arm={_arm_key} env assertion "
+            f"{'SKIPPED' if _skipped else 'PASSED'} "
+            f"lean={_exp['expect_lean'] or '0'} manifest={_exp['expect_manifest'] or '0'} "
+            f"cloud={_exp['expect_cloud'] or 'unpinned'} "
+            f"region={_exp['expect_region'] or 'unpinned'}",
+            flush=True,
         )
-        for _f in env_failures:
-            print(f"  - {_f}", flush=True)
-        raise RuntimeError(
-            f"snapshot-ab: arm {arm} container env assertion failed "
-            "(see container_env_assert.json)"
+        (output_dir / f"container_env_assert_{_arm_key}.json").write_text(
+            json.dumps({"probe": env_probe, "failures": env_failures, "arm": _arm_key,
+                        "skipped": _skipped},
+                       default=str, indent=2), encoding="utf-8",
         )
-    print(
-        f"[v2.snapshot_ab] arm={arm} env assertion PASSED "
-        f"lean={expect_lean or '0'} manifest={expect_manifest or '0'} "
-        f"cloud={expect_cloud or 'unpinned'} region={expect_region or 'unpinned'}",
-        flush=True,
-    )
-    (output_dir / f"container_env_assert_{arm}.json").write_text(
-        json.dumps({"probe": env_probe, "failures": env_failures, "arm": arm},
-                   default=str, indent=2), encoding="utf-8",
-    )
 
     records: list[dict[str, Any]] = []
-    valid = 0
+    valid_per_arm: dict[str, int] = {k: 0 for k in handles}
+    attempts_per_arm: dict[str, int] = {k: 0 for k in handles}
+    _arm_order = list(handles.keys())
     for index in range(max_attempts):
-        _run_id = f"snapshot_ab_{arm}_{index}-{uuid.uuid4().hex[:8]}"
-        _req_id = f"v2-snapab-{arm}-{index}-{uuid.uuid4().hex[:12]}"
+        _arm_key = _arm_order[index % len(_arm_order)] if interleave_app else _primary_arm
+        _handle = handles[_arm_key]
+        attempts_per_arm[_arm_key] += 1
+        _run_id = f"snapshot_ab_{_arm_key}_{index}-{uuid.uuid4().hex[:8]}"
+        _req_id = f"v2-snapab-{_arm_key}-{index}-{uuid.uuid4().hex[:12]}"
         _start_ts = datetime.now(timezone.utc).isoformat()
         _t0_wall = time.time_ns()
         _t0_perf = time.perf_counter()
         artifact: dict[str, Any] = {
             "run_index": index, "run_id": _run_id, "request_id": _req_id,
-            "arm": arm, "start_ts": _start_ts, "mode": "snapshot_ab",
+            "arm": _arm_key, "start_ts": _start_ts, "mode": "snapshot_ab",
         }
         try:
-            fn = handle.run_entry_probe
+            fn = _handle.run_entry_probe
             remote = getattr(fn, "remote", None)
             if remote is not None and callable(getattr(remote, "aio", None)):
                 result = remote.aio(request_id=_req_id)
@@ -1623,10 +1695,22 @@ async def _run_snapshot_ab_study(
             )
         else:
             artifact["submission_to_entry_wall_ms"] = None
+        # Primary metric: submission -> literal first line of restore()
+        # (restore_first_line_wall_unix_ns captured by the restore lifecycle;
+        # falls back to the method-entry wall when the field is absent).
+        _rlf_wall = _res.get("restore_first_line_wall_unix_ns")
+        if isinstance(_rlf_wall, (int, float)) and _rlf_wall:
+            artifact["submission_to_restore_first_line_wall_ms"] = round(
+                max(0, int(_rlf_wall) - _t0_wall) / 1_000_000.0, 3
+            )
+        else:
+            artifact["submission_to_restore_first_line_wall_ms"] = (
+                artifact.get("submission_to_entry_wall_ms")
+            )
         artifact["round_trip_wall_ms"] = round((time.perf_counter() - _t0_perf) * 1000.0, 1)
         artifact["end_ts"] = datetime.now(timezone.utc).isoformat()
-        artifact["excluded_snapshot_builder"] = index == 0
-        artifact["excluded_after_builder"] = index == 1
+        artifact["excluded_snapshot_builder"] = attempts_per_arm[_arm_key] <= skip_first and attempts_per_arm[_arm_key] == 1
+        artifact["excluded_after_builder"] = attempts_per_arm[_arm_key] == 2 and skip_first >= 2
         artifact["image_id"] = _res.get("image_id", "")
         artifact["cloud"] = _res.get("cloud", "")
         artifact["region"] = _res.get("region", "")
@@ -1638,46 +1722,61 @@ async def _run_snapshot_ab_study(
             and not artifact["excluded_after_builder"]
         )
         if artifact["valid_entry_probe"]:
-            valid += 1
-        artifact_path = output_dir / f"attempt_{index:04d}_{arm}.json"
+            valid_per_arm[_arm_key] += 1
+        artifact_path = output_dir / f"attempt_{index:04d}_{_arm_key}.json"
         artifact_path.write_text(
             json.dumps(artifact, default=str, indent=2), encoding="utf-8",
         )
         records.append(artifact)
         print(
-            f"[v2.snapshot_ab] arm={arm} index={index} "
+            f"[v2.snapshot_ab] arm={_arm_key} index={index} "
             f"excluded={int(artifact['excluded_snapshot_builder'] or artifact['excluded_after_builder'])} "
             f"valid={int(artifact['valid_entry_probe'])} "
-            f"submit_to_entry_ms={artifact['submission_to_entry_wall_ms']} "
+            f"restore_first_line_ms={artifact['submission_to_restore_first_line_wall_ms']} "
+            f"entry_ms={artifact['submission_to_entry_wall_ms']} "
             f"image={artifact['image_id']} cloud={artifact['cloud']} region={artifact['region']}",
             flush=True,
         )
-        if valid >= runs:
+        if interleave_app and all(valid_per_arm[k] >= runs for k in handles):
+            break
+        if not interleave_app and valid_per_arm[_primary_arm] >= runs:
             break
         if index < max_attempts - 1:
             print(
-                f"[v2.snapshot_ab] arm={arm} sleeping {GAP_SECONDS}s before next probe",
+                f"[v2.snapshot_ab] arm={_arm_key} sleeping {GAP_SECONDS}s before next probe",
                 flush=True,
             )
             await asyncio.sleep(GAP_SECONDS)
-    vals = sorted(
-        a["submission_to_entry_wall_ms"] for a in records if a["valid_entry_probe"]
-    )
     summary: dict[str, Any] = {
-        "arm": arm,
-        "runs_requested": runs,
-        "valid_entry_probes": valid,
-        "submission_to_entry_ms": {
-            "min": vals[0] if vals else None,
-            "median": vals[len(vals) // 2] if vals else None,
-            "max": vals[-1] if vals else None,
-        },
+        "arms": {},
         "records": len(records),
     }
-    (output_dir / f"summary_{arm}.json").write_text(
+    for _arm_key, _handle in handles.items():
+        _vals = sorted(
+            a["submission_to_restore_first_line_wall_ms"]
+            for a in records if a["arm"] == _arm_key and a["valid_entry_probe"]
+        )
+        _entry_vals = sorted(
+            a["submission_to_entry_wall_ms"]
+            for a in records if a["arm"] == _arm_key and a["valid_entry_probe"]
+        )
+        def _stats(v: list[float]) -> dict[str, Any]:
+            return {
+                "min": v[0] if v else None,
+                "median": v[len(v) // 2] if v else None,
+                "max": v[-1] if v else None,
+                "n": len(v),
+            }
+        summary["arms"][_arm_key] = {
+            "runs_requested": runs,
+            "valid_entry_probes": valid_per_arm[_arm_key],
+            "submission_to_restore_first_line_ms": _stats(_vals),
+            "submission_to_entry_ms": _stats(_entry_vals),
+        }
+    (output_dir / "summary.json").write_text(
         json.dumps(summary, default=str, indent=2), encoding="utf-8",
     )
-    print(f"[v2.snapshot_ab] arm={arm} summary={json.dumps(summary, default=str)}", flush=True)
+    print(f"[v2.snapshot_ab] summary={json.dumps(summary, default=str)}", flush=True)
     return summary
 
 
@@ -1738,6 +1837,14 @@ async def main() -> None:
     parser.add_argument("--expect-region", default="",
                         help="Expected COMFYMODAL_V2_REGION in the deployed container "
                              "for controlled restore-mode phases; default unpinned")
+    parser.add_argument("--skip-env-assert", action="store_true",
+                        help="snapshot-ab: tolerate an arm whose deployment has no "
+                             "run_env_probe method (e.g. a historical archive surface); "
+                             "arms that DO expose the method are still asserted")
+    parser.add_argument("--interleave-arm", default="",
+                        help="snapshot-ab: app name of a second arm run alternately in "
+                             "the same window (attempts alternate; exclusions and "
+                             "validity tracked per arm)")
     parser.add_argument("--accept-under-ms", type=float, default=13000.0,
                         help="Total-wall acceptance gate in ms (default 13000)")
     parser.add_argument("--stop-after-bad", type=int, default=0,
@@ -1783,6 +1890,8 @@ async def main() -> None:
             skip_first=args.skip_first,
             expect_cloud=args.expect_cloud, expect_region=args.expect_region,
             expect_lean=args.expect_lean, expect_manifest=args.expect_manifest,
+            skip_env_assert=args.skip_env_assert,
+            interleave_app=args.interleave_arm,
         )
     elif args.mode == "integrated":
         summary = await _run_integrated_study(

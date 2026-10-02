@@ -1,0 +1,65 @@
+# v2ctl profile: E29 ground-truth critical-path tracer.
+schema_version = 1
+name = "e29-tracer"
+extends = "production"
+owner = "E29"
+
+[workload]
+fresh_required = true
+conditioning_cache = "forced_miss"
+expected_output_sha = "20b10e1f99831bc758d9df82f43ce0beb1cbc636a740d11a29eb2bffe90e5260"
+run_count = 1
+gap_seconds = 35.0
+
+[runtime_overrides]
+policy = "forbid"
+
+[environment]
+# ── E29 tracer-only cold gate: measurement system ON, experiments OFF ──
+COMFYMODAL_V2_CRITICAL_PATH_LEDGER = "1"
+COMFYMODAL_V2_GANTT_TELEMETRY = "1"
+COMFYMODAL_V2_CRITICAL_GPU_COORDINATION = "1"
+V2_BENCHMARK_RUNS = "1"
+# ── Canonical backend selector (deploy AND run) ─────────────────────────
+# The BATs enter e28_single mode ONLY when V2_E28_VALIDATION=1 (via the
+# E28_VALIDATION selector argument or this env).  Without it the run BAT
+# falls back to the restore-only PROBE path (run_snapshot_restore_only_probe),
+# which never invokes run_plan_stream and produces no generation artifact.
+# E28 additionally REQUIRES the E19 base profile (V2_E19_FINAL_COLD_LOADER=1)
+# — the deploy/run BATs hard-abort when E28 is active without it.
+V2_BENCHMARK_MODE = "e28_single"
+V2_E28_VALIDATION = "1"
+V2_E19_FINAL_COLD_LOADER = "1"
+# E28 known-good selector (tracer gate runs the SAME production path as the
+# E28 validation baseline; only measurement is added).
+COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION = "1"
+COMFYMODAL_V2_GPU_FAST_RETURN = "1"
+COMFYMODAL_V2_VAE_ACTIVATION_MODE = "late"
+COMFYMODAL_V2_CHECKPOINT_PREWARM = "1"
+COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS = "1"
+# ── E28 loader profile (required by --verify-e28-profile) ───────────────
+# The deploy/run BATs run `benchmark_v2_direct.py --verify-e28-profile`
+# before any Modal spend and hard-reject a mismatch.  These are the exact
+# E28 canonical fastsafetensors values the verifier expects.
+COMFYMODAL_V2_CLIP_FASTSAFE_THREADS = "8"
+COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES = "67108864"
+COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB = "524288"
+COMFYMODAL_V2_UNET_FASTSAFE_THREADS = "8"
+COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES = "268435456"
+COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB = "524288"
+# ── E30/E31 experimental behavior: explicitly OFF for the tracer gate ──
+COMFYMODAL_V2_CLIP_QD_READER = "0"
+COMFYMODAL_V2_CLIP_FP32_CAST_ONCE = "0"
+COMFYMODAL_V2_E31_FORENSICS = "0"
+COMFYMODAL_V2_E31_FORWARD_PROFILE = "0"
+# ── Cold-gate container guarantee (cold-run semantics) ─────────────────
+# Single-use containers terminate after each request, so every gate request
+# runs on a freshly-restarted container — a genuine cold-generation boundary.
+# NOTE: a fresh container is NOT by itself source-identity proof: Modal
+# delivers the local Python source through its local-source packaging path,
+# so an unchanged base image ID or a fresh container does not prove the
+# Python source bytes are current.  Source identity is proven separately by
+# `v2ctl source-probe` (remote SHA-256 == expected local SHA-256).  The
+# class_name reported by the container is a legacy naming artifact, not a
+# stale-code signal.
+COMFYMODAL_V2_SINGLE_USE_CONTAINERS = "1"

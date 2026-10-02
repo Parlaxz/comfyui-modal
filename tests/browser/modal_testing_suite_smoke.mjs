@@ -39,6 +39,10 @@ try {
   await page.getByText("Backend", { exact: true }).click();
 
   await page.getByText("Settings", { exact: true }).click();
+  // Settings is now a modern seven-section page; legacy panels live under Advanced.
+  await page.getByRole("heading", { name: "Advanced", exact: true }).waitFor({ timeout: 10000 });
+  await page.getByRole("heading", { name: "Advanced", exact: true }).click();
+  await page.getByRole("button", { name: "Open Legacy Settings" }).click();
   await page.getByText("Connection & credentials", { exact: false }).waitFor({ timeout: 10000 });
 
   // Close the modal, verify it disappears, then reopen

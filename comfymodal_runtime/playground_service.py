@@ -25,6 +25,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -32,9 +33,13 @@ from typing import Any, Callable
 # Both direct and package-relative import paths are needed depending on
 # how the module is loaded (spec_from_file_location in tests vs. runtime).
 try:
-    from comfymodal_runtime.contracts import ExecutionOptions, ExecutionPlan  # noqa: F401
+    from comfymodal_runtime.contracts import (  # noqa: F401
+        ExecutionOptions,
+        ExecutionPlan,
+        normalize_output_intent_options,
+    )
 except ImportError:
-    from contracts import ExecutionOptions, ExecutionPlan  # noqa: F401
+    from contracts import ExecutionOptions, ExecutionPlan, normalize_output_intent_options  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
@@ -115,6 +120,20 @@ async def _offload_or_await(fn: Callable, *args: Any, **kwargs: Any) -> Any:
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+def _jsonable_workflow(workflow: Any) -> Any:
+    """Recursively convert a frozen workflow into plain JSON containers.
+
+    Mapping/mappingproxy → dict, tuple/list sequences → list.  Scalars and
+    dict insertion order are preserved, the frozen source is never mutated,
+    and unknown objects pass through untouched (never stringified).
+    """
+    if isinstance(workflow, Mapping):
+        return {k: _jsonable_workflow(v) for k, v in workflow.items()}
+    if isinstance(workflow, (list, tuple)):
+        return [_jsonable_workflow(v) for v in workflow]
+    return workflow
+
+
 # ── Injectable contract protocols ──────────────────────────────────────
 
 
@@ -156,6 +175,7 @@ def _default_build_execution_plan(
     controls: dict[str, Any],
     *,
     modal_options: dict[str, Any] | None = None,
+    gpu: Any = None,
 ) -> tuple[ExecutionPlan | None, str | None]:
     """Build a frozen ExecutionPlan from Studio preset/snapshot.
 
@@ -170,6 +190,10 @@ def _default_build_execution_plan(
     5. Apply control overrides
     6. Resolve production options
     7. Build and return ExecutionPlan
+
+    F8: *gpu* is the GPU captured at request acceptance; it is frozen into
+    ``request_metadata.selected_gpu`` so replay/resume/retry keep executing
+    on the plan's own GPU regardless of later Settings changes.
     """
     from studio_run_adapter import (
         _AUTO_DERIVE_CONTROLS,
@@ -186,6 +210,9 @@ def _default_build_execution_plan(
     from studio_models import validate_controls_against_schema
     from production_workflow import normalize_production_options
     from workflow_metadata import extract_model_stack, prompt_sha256
+
+    effective_modal_options = normalize_output_intent_options(modal_options)
+    output_mode = str(effective_modal_options.get("output_mode", "original"))
 
     # ── 0. Validate controls against snapshot schemas ──
     schemas = derive_control_schemas_from_snapshot(snapshot)
@@ -236,17 +263,22 @@ def _default_build_execution_plan(
             custom_prompt_bundle[ck] = cv
 
     # ── 7. Studio request metadata ──
+    _selected_gpu = str(gpu or "")
     studio_meta = {
         "studio_preset_id": preset.get("id", ""),
         "studio_snapshot_id": snapshot.get("id", ""),
         "studio_feature_id": feature_id,
         "studio_preset_label": preset.get("label", ""),
+        "studio_controls": copy.deepcopy(controls or {}),
+        "output_mode": output_mode,
+        "variant": output_mode,
+        "selected_gpu": _selected_gpu,
     }
 
     # ── 8. Resolve production options and compile when normalized production
     #    is enabled (defaults to enabled for None/{} per normalize_production_options
     #    contract).  Explicit production.enabled=False stays raw.
-    _production_options = normalize_production_options(modal_options)
+    _production_options = normalize_production_options(effective_modal_options)
     _production_enabled = _production_options.get("enabled", False)
 
     output_node_ids = _derive_output_node_ids(
@@ -276,9 +308,9 @@ def _default_build_execution_plan(
         plan = canonical_build_plan(
             workflow,
             prompt_id=str(uuid.uuid4().hex[:12]),
-            modal_options=modal_options,
+            modal_options=effective_modal_options,
             production_options=production_options,
-            gpu="",
+            gpu=_selected_gpu,
             request_metadata=studio_meta,
             validate=False,
         )
@@ -301,6 +333,10 @@ def _default_build_execution_plan(
         # Use the normalized production state for execution_options.
         exec_options = ExecutionOptions(
             production_enabled=_production_options.get("enabled", False),
+            output_mode=output_mode,
+            output_conversion_options=effective_modal_options.get(
+                "output_conversion_options", {}
+            ),
         )
         model_stack = extract_model_stack(workflow) if hasattr(extract_model_stack, "__call__") else {}
         plan = ExecutionPlan(
@@ -449,11 +485,41 @@ async def _default_save_history(
         meta["experiment_id"] = run_history_id
         meta["workflow_hash"] = plan.workflow_hash
 
+        try:
+            serialized_plan = plan.to_dict()
+            if isinstance(serialized_plan, dict):
+                request_metadata = serialized_plan.get("request_metadata") or {}
+                controls = request_metadata.get("studio_controls")
+                meta["workflow_json"] = serialized_plan.get("workflow") or {}
+                meta["request_json"] = {
+                    "controls": controls if isinstance(controls, dict) else {},
+                    "prompt_bundle": serialized_plan.get("prompt_bundle") or {},
+                    "model_stack": serialized_plan.get("model_stack") or {},
+                    "execution_options": serialized_plan.get("execution_options") or {},
+                    "request_metadata": request_metadata,
+                }
+                meta["execution_plan_json"] = serialized_plan
+                meta["deployment_identity_json"] = (
+                    serialized_plan.get("deployment_identity") or {}
+                )
+                meta["model_stack"] = serialized_plan.get("model_stack") or {}
+        except Exception:
+            _log.warning("Failed to serialize plan for history run %s", run_history_id)
+
         primary_asset_id = ""
         if isinstance(result, dict):
             primary_asset_id = str(result.get("primary_asset_id", "") or "")
         if primary_asset_id:
             meta["primary_asset_id"] = primary_asset_id
+        derivative_asset_ids: list[str] = []
+        if isinstance(result, dict):
+            raw_derivatives = result.get("derivative_asset_ids")
+            if isinstance(raw_derivatives, (list, tuple)):
+                derivative_asset_ids = [
+                    str(value) for value in raw_derivatives if str(value)
+                ]
+        if derivative_asset_ids:
+            meta["derivative_asset_ids"] = list(derivative_asset_ids)
 
         # Extract output paths from result — prefer pre-materialized paths
         # when available (passed by the PlaygroundService after materialization).
@@ -512,7 +578,7 @@ def _sync_materialize(
     """Synchronous materialization body — offloaded to thread by
     ``_default_materialize``.
 
-    Does NOT import or use: ``experiment_runner``, ``LocalRemoteInvoker``,
+    Does NOT import or use: ``experiment_runner``, any legacy invoker,
     scheduler, leases, journals, or worker pool.
     """
     if not isinstance(result, dict) or not result.get("outputs"):
@@ -542,6 +608,9 @@ def _sync_materialize(
         result["_local_primary_output"] = primary
     descriptors = result.get("asset_descriptors", []) if isinstance(result, dict) else []
     workspace_id = str((workspace or {}).get("id", ""))
+    result_mode = str((result or {}).get("output_mode", "original") or "original")
+    result_variant = str((result or {}).get("variant", result_mode) or result_mode)
+    derivative_asset_ids: list[str] = []
     if isinstance(descriptors, list) and workspace_id:
         try:
             from experiment_service import REGISTRY
@@ -553,15 +622,21 @@ def _sync_materialize(
                 backend_path = str(descriptor.get("backend_path") or descriptor.get("path") or "")
                 if not asset_id or not backend_path:
                     continue
+                descriptor_variant = str(
+                    descriptor.get("variant")
+                    or descriptor.get("output_mode")
+                    or result_variant
+                )
                 leases.register_asset(
                     asset_id=asset_id,
                     experiment_id="",
                     cell_key=experiment_id,
-                    variant="original",
+                    variant=descriptor_variant,
                     path=f"modal://{workspace_id}|{str(gpu or '')}|{backend_path}",
                     mime_type=str(descriptor.get("mime_type") or "application/octet-stream"),
                     byte_size=int(descriptor.get("byte_count", 0) or 0),
                     content_hash=asset_id,
+                    parent_asset_id=str(descriptor.get("parent_asset_id", "") or ""),
                     node_id=str(descriptor.get("node_id", "")),
                     output_key=str(descriptor.get("output_key", "")),
                     output_index=int(descriptor.get("output_index", 0) or 0),
@@ -569,8 +644,12 @@ def _sync_materialize(
                     width=int(descriptor.get("width", 0) or 0),
                     height=int(descriptor.get("height", 0) or 0),
                 )
+                if descriptor_variant == "thumbnail":
+                    derivative_asset_ids.append(asset_id)
         except Exception:
             _log.warning("Failed to register Playground output assets")
+    if derivative_asset_ids and isinstance(result, dict):
+        result["derivative_asset_ids"] = derivative_asset_ids
     return paths
 
 
@@ -595,7 +674,7 @@ async def _default_materialize(
     writes and returns a list of relative filenames matching the shape
     produced by the adapter for response compatibility.
 
-    Does NOT import or use: ``experiment_runner``, ``LocalRemoteInvoker``,
+    Does NOT import or use: ``experiment_runner``, any legacy invoker,
     scheduler, leases, journals, or worker pool.
     """
     return await asyncio.to_thread(
@@ -650,6 +729,7 @@ class PlaygroundService:
         execute_plan_fn: Callable[..., Any] | None = None,
         materialize_fn: Callable[..., Any] | None = None,
         save_history_fn: Callable[..., Any] | None = None,
+        plan_observer_fn: Callable[[ExecutionPlan], Any] | None = None,
     ) -> None:
         self._load_preset = load_preset_fn or _default_load_preset
         self._validate = validate_fn or _default_validate
@@ -657,6 +737,7 @@ class PlaygroundService:
         self._execute_plan = execute_plan_fn or _default_execute_plan
         self._materialize = materialize_fn or _default_materialize
         self._save_history = save_history_fn or _default_save_history
+        self._plan_observer = plan_observer_fn
 
     # ── Public entrypoint ──────────────────────────────────────────────
 
@@ -678,9 +759,9 @@ class PlaygroundService:
     ) -> dict[str, Any]:
         """Execute a single playground run.
 
-        Returns a dict with the same shape as
-        ``direct_studio_run_completion`` for adapter compatibility:
-        ``status``, ``runId``, ``experimentId``, ``output_paths``,
+        Returns the canonical single-run response shape (kept stable for
+        adapter compatibility after H19 removed the retired V1 completion
+        helper): ``status``, ``runId``, ``experimentId``, ``output_paths``,
         ``timings``, ``meta``, ``production_plan_used``, ``direct_run``.
         On error returns ``{"status": "error", "message": ...}``.
 
@@ -709,10 +790,21 @@ class PlaygroundService:
             return {"status": "error", "message": validate_err}
 
         # ── Stage 3: Build frozen ExecutionPlan ───────────────────────
+        # F8: forward the captured GPU to builders that accept it so the
+        # plan freezes ``selected_gpu`` at creation.  Injected legacy fakes
+        # with the pre-F8 signature keep working unchanged.
+        _build_kwargs: dict[str, Any] = {"modal_options": modal_options}
+        if gpu:
+            try:
+                import inspect as _inspect
+                if "gpu" in _inspect.signature(self._build_plan).parameters:
+                    _build_kwargs["gpu"] = gpu
+            except (TypeError, ValueError):
+                pass
         plan, build_err = await _offload_or_await(
             self._build_plan,
             preset, snapshot, feature_id, controls,
-            modal_options=modal_options,
+            **_build_kwargs,
         )
         if plan is None:
             _log.warning("Playground plan build failed: %s", build_err)
@@ -721,6 +813,12 @@ class PlaygroundService:
         # ── Safe check: plan must have a workflow ─────────────────────
         if not plan.workflow:
             return {"status": "error", "message": "ExecutionPlan has no workflow"}
+
+        if self._plan_observer is not None:
+            try:
+                self._plan_observer(plan)
+            except Exception as exc:
+                _log.warning("Playground plan observer failed: %s", exc)
 
         # ── Stage 4: Execute ─────────────────────────────────────────
         exp_id = preset.get("id", preset_id) + "_" + uuid.uuid4().hex[:8]
@@ -857,10 +955,23 @@ class PlaygroundService:
         meta["requested_controls"] = dict(plan.prompt_bundle)
         meta["experiment_id"] = exp_id
         meta["workflow_hash"] = plan.workflow_hash
+        # History V2: persist the exact executable workflow at completion so a
+        # future Generate-Original can replay it without mutable UI state.
+        try:
+            if isinstance(plan.workflow, dict):
+                meta["workflow_json"] = _jsonable_workflow(plan.workflow)
+            elif hasattr(plan.workflow, "items"):
+                meta["workflow_json"] = _jsonable_workflow(plan.workflow)
+        except Exception:
+            pass
         meta["output_count"] = len(output_paths)
         meta["production_plan_used"] = "yes" if plan.execution_options.production_enabled else "no"
         if isinstance(result, dict) and result.get("primary_asset_id"):
             meta["primary_asset_id"] = result["primary_asset_id"]
+        if isinstance(result, dict):
+            raw_derivatives = result.get("derivative_asset_ids")
+            if isinstance(raw_derivatives, (list, tuple)) and raw_derivatives:
+                meta["derivative_asset_ids"] = [str(v) for v in raw_derivatives if str(v)]
         if output_paths:
             meta["output_paths"] = list(output_paths)
 

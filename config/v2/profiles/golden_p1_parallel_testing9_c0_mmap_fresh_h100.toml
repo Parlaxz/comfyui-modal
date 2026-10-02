@@ -1,0 +1,13 @@
+schema_version = 1
+name = "golden_p1_parallel_testing9_c0_mmap_fresh_h100"
+extends = "golden_p1_parallel_m2clip_h100"
+owner = "testing9-c0-mmap"
+
+[target]
+app = "testing9-c0-mmap-fresh"
+
+[environment]
+COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY = "qd4_128"
+COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY = "qd4_128"
+COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE = "fresh"
+COMFYMODAL_GOLDEN_C0_WINDOW_TRACE = "1"

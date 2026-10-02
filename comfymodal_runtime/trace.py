@@ -456,7 +456,7 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
     # Handle resolution booleans
     ("created_modal_client",          "created_modal_client"),
     ("performed_cls_from_name",       "performed_cls_from_name"),
-    ("constructed_class_instance",    "constructed_class_instance"),
+    ("constructed_instance",          "constructed_instance"),
     # Payload / workflow metadata
     ("input_image_count",             "input_image_count"),
     ("workflow_node_count",           "workflow_node_count"),
@@ -465,6 +465,19 @@ LOCAL_SUBMISSION_FIELD_KEYS: tuple[tuple[str, str], ...] = (
 )
 """Canonical ordered field list for [v2.local_submission_breakdown].
 Each entry is (dict_key, fmt_key) where fmt_key is the printed field name."""
+
+# Compact breakdown mode.  Set COMFYMODAL_V2_COMPACT_BREAKDOWN=1 to print only
+# the present (non-None) fields plus absent_count=N instead of every field with
+# "absent".  Default off keeps the historical all-fields-with-absent rendering
+# that the pinned tests rely on.
+_COMPACT_BREAKDOWN: bool = (
+    os.environ.get("COMFYMODAL_V2_COMPACT_BREAKDOWN", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+# Sane one-line cap for compact breakdown output (safety net for very wide
+# breakdown dicts such as the host-side final line with ~63 fields).
+_COMPACT_BREAKDOWN_MAX_LINE_CHARS = 4096
 
 
 def _fmt_or_absent(v: Any) -> str:
@@ -484,17 +497,29 @@ def _emit_breakdown_line(prefix: str, breakdown: dict[str, Any],
     """Print one canonical breakdown line using *prefix* and *field_keys*.
 
     When *field_keys* is None, uses LOCAL_SUBMISSION_FIELD_KEYS.
-    Only fields present in the breakdown dict are printed.
+    Default (COMFYMODAL_V2_COMPACT_BREAKDOWN unset) prints every field with
+    ``absent`` for missing values, exactly one line.  In compact mode only
+    present (non-None) fields are printed plus ``absent_count=N``; the line
+    still starts with the same prefix, keeps field ordering (request_id
+    first), is exactly one line, and is capped at a sane length.
     """
     keys = field_keys if field_keys is not None else LOCAL_SUBMISSION_FIELD_KEYS
     parts = [f"{prefix}"]
+    absent_count = 0
     for dk, fk in keys:
         v = breakdown.get(dk)
         if v is not None:
             parts.append(f"{fk}={_fmt_or_absent(v)}")
-        else:
+        elif not _COMPACT_BREAKDOWN:
             parts.append(f"{fk}={_ABSENT_STR}")
-    print(" ".join(parts), flush=True)
+        else:
+            absent_count += 1
+    if _COMPACT_BREAKDOWN:
+        parts.append(f"absent_count={absent_count}")
+    _line = " ".join(parts)
+    if _COMPACT_BREAKDOWN and len(_line) > _COMPACT_BREAKDOWN_MAX_LINE_CHARS:
+        _line = _line[:_COMPACT_BREAKDOWN_MAX_LINE_CHARS - 3] + "..."
+    print(_line, flush=True)
 
 
 def _build_local_submission_breakdown(
@@ -689,8 +714,21 @@ def _build_local_submission_breakdown(
         ("plan_materialization_to_active_profile_ms", _plan_mat_to_active_profile_ms),
         ("active_profile_ms", _active_profile_ms),
         ("restore_plan_build_ms", _restore_plan_build_ms),
-        ("restore_publish_ms", _restore_publish_ms),
-        ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
+    ])
+    # The restore-publish span is part of the sequential child accounting ONLY
+    # when a publish was actually attempted (its start/end events exist).  On
+    # the default no-publish path (COMFYMODAL_V2_PUBLISH_RESTORE_PLAN disabled)
+    # execute_plan emits ``restore_publish_skipped`` and no
+    # ``restore_plan_publish_start/end`` events, so ``restore_publish_ms`` and
+    # ``restore_publish_to_transport_entry_ms`` render absent and are excluded
+    # from the measured-children sum — the (zero) publish gap lands in the
+    # residual and reconciliation stays complete.
+    if _event_mono_ns(trace, "restore_plan_publish_start") is not None:
+        _child_keys.extend([
+            ("restore_publish_ms", _restore_publish_ms),
+            ("restore_publish_to_transport_entry_ms", _restore_pub_to_transport_entry_ms),
+        ])
+    _child_keys.extend([
         ("transport_entry_to_handle_lookup_ms", _transport_entry_to_handle_lookup_ms),
         ("handle_lookup_ms", _handle_lookup_ms),
         ("payload_materialization_ms", _payload_materialization_prep_ms),
@@ -864,7 +902,129 @@ def _build_local_submission_breakdown(
         # Handle resolution booleans
         "created_modal_client": _created_client,
         "performed_cls_from_name": _performed_cls,
-        "constructed_class_instance": _constructed_instance,
+        "constructed_instance": _constructed_instance,
         # Large-residual diagnostic
         "unmeasured_boundary": _unmeasured_boundary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Forensic interval registry (module-level, thread-safe)
+# ---------------------------------------------------------------------------
+# Shared cross-lane registry of named wall-clock intervals (JSON-safe values
+# only).  Concurrent worker lanes (e.g. input-types warming, fastsafe UNET
+# workers) register their scheduling/duration intervals here under a single
+# module-level lock so other lanes can compute cross-thread overlap.
+
+_FORENSIC_LOCK = threading.Lock()
+_forensic_intervals: dict[str, dict[str, Any]] = {}
+
+
+def register_forensic_interval(
+    name: str,
+    *,
+    start_mono_ns: int,
+    end_mono_ns: int,
+    cpu_ms: float | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Store or replace one forensic interval entry under *name*.
+
+    ``start_mono_ns``/``end_mono_ns`` are ``time.monotonic_ns()`` stamps;
+    ``cpu_ms`` is the optional thread-CPU duration; ``metadata`` is copied so
+    later caller-side mutations cannot corrupt the stored record.  All values
+    are JSON-safe.
+    """
+    with _FORENSIC_LOCK:
+        _forensic_intervals[name] = {
+            "start_mono_ns": int(start_mono_ns),
+            "end_mono_ns": int(end_mono_ns),
+            "cpu_ms": cpu_ms,
+            "metadata": dict(metadata or {}),
+        }
+
+
+def forensic_intervals() -> dict[str, dict[str, Any]]:
+    """Return a deep-enough copy (dict + inner dict) of all entries."""
+    with _FORENSIC_LOCK:
+        return {
+            _name: {
+                "start_mono_ns": _record["start_mono_ns"],
+                "end_mono_ns": _record["end_mono_ns"],
+                "cpu_ms": _record.get("cpu_ms"),
+                "metadata": dict(_record.get("metadata") or {}),
+            }
+            for _name, _record in _forensic_intervals.items()
+        }
+
+
+def forensic_overlap_ms(
+    a_start_mono_ns: int,
+    a_end_mono_ns: int,
+    b_start_mono_ns: int,
+    b_end_mono_ns: int,
+) -> float:
+    """Overlap in milliseconds of two monotonic-ns intervals (0.0 when
+    disjoint): ``max(0, min(a_end,b_end) - max(a_start,b_start)) / 1e6``."""
+    _overlap_ns = max(
+        0,
+        min(a_end_mono_ns, b_end_mono_ns)
+        - max(a_start_mono_ns, b_start_mono_ns),
+    )
+    return _overlap_ns / 1_000_000
+
+
+def cpu_affinity_count() -> int:
+    """Number of CPUs the current process may run on.
+
+    Prefers ``os.sched_getaffinity(0)`` (mask size, Linux); falls back to
+    ``os.cpu_count()`` (0 when unknown).  Never raises.  Stdlib-only.
+    """
+    try:
+        return int(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    try:
+        return int(os.cpu_count() or 0)
+    except Exception:
+        return 0
+
+
+def effective_cores_from(cpu_ms, wall_ms) -> float | None:
+    """Ratio of thread-CPU ms to wall ms (``round(cpu_ms / wall_ms, 4)``).
+
+    None-safe: returns None when either input is None or wall_ms <= 0.  This
+    is a utilization ratio — it does NOT imply scheduling-wait attribution.
+    """
+    if cpu_ms is None or wall_ms is None:
+        return None
+    try:
+        _wall = float(wall_ms)
+        if _wall <= 0:
+            return None
+        return round(float(cpu_ms) / _wall, 4)
+    except Exception:
+        return None
+
+
+def forensic_intervals_disjoint(intervals) -> tuple[bool, str | None]:
+    """Check a list of ``(name, start_mono_ns, end_mono_ns)`` intervals for
+    strict non-overlap (touching allowed: ``prev_end <= next_start``).
+
+    Returns ``(True, None)`` when disjoint, or ``(False, "<name_a> overlaps
+    <name_b>")`` naming the first violating adjacent pair.  Never raises.
+    """
+    try:
+        _sorted_iv = sorted(
+            (iv for iv in (intervals or [])
+             if isinstance(iv, (list, tuple)) and len(iv) >= 3),
+            key=lambda iv: int(iv[1]),
+        )
+        for _a, _b in zip(_sorted_iv, _sorted_iv[1:]):
+            _a_name, _a_end = str(_a[0]), int(_a[2])
+            _b_name, _b_start = str(_b[0]), int(_b[1])
+            if _a_end > _b_start:
+                return (False, f"{_a_name} overlaps {_b_name}")
+        return (True, None)
+    except Exception:
+        return (True, None)

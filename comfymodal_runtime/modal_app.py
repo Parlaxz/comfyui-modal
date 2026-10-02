@@ -10,18 +10,21 @@ import hashlib
 import importlib
 import inspect
 import json
+import math
 import os
 import platform
 import posixpath
+import stat
 import sys
 import threading
 import time
 import uuid
 import copy
+import shutil
 from types import MappingProxyType
 
 import dataclasses
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,15 +33,29 @@ from typing import Any, AsyncIterator, Callable, ContextManager, Iterator, Mappi
 from gpu_catalog import parse_gpu_request, normalize_gpu_value, GPU_CATALOG, GPU_BY_VALUE
 
 from .contracts import (
+    DEPLOYMENT_PROOF_SCHEMA_VERSION,
+    VALIDATION_PROOF_SCHEMA_VERSION,
     DeploymentIdentity,
     ExecutionPlan,
     ModelRestoreKey,
     RestorePlan,
     SnapshotExecutionSeed,
     _thaw,
+    apply_repair_invalidation,
+    compute_registry_fingerprint,
+    evaluate_plan_snapshot_parity,
+    evaluate_plan_validation_consumption,
+    should_write_validation_cert,
     stable_hash,
 )
-from .deployment_spec import build_deployment_identity
+from . import contracts as _contracts_mod
+from .deployment_spec import (
+    DEPLOYMENT_HASH_NAMESPACE,
+    build_deployment_identity,  # compatibility export for legacy test doubles
+    validate_persisted_identity_pair,
+    validate_canonical_boundary_identity,
+)
+from .publication_policy import resolve_custom_nodes_root
 from .env import (
     env_flag,
     observability_allows,
@@ -59,8 +76,13 @@ from .restore_plan import (
 from .runtime_bootstrap import BootstrapConfig, BootstrapState, RuntimeBootstrap
 from .runtime_executor import (
     ExecutionContext,
+    RemoteCancellationError,
+    RemoteCancelWatcher,
     RuntimeExecutor,
     apply_snapshot_seed_to_executor,
+    build_remote_cancel_terminal_event,
+    combine_cancel_predicate,
+    guard_remote_cancel_stream,
     pre_sampler_instrumentation_scope,
     set_lock_wait_ms,
     _attach_structured_report,
@@ -111,6 +133,7 @@ from .output_delivery import (
     build_default_chain,
     run_strategy_chain,
 )
+from .output_durability import resolve_output_durability
 from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall, waterfall_to_dict, attach_waterfall, mark_waterfall_non_applicable, is_graph_result, graph_result_from_event
@@ -183,6 +206,17 @@ def _critical_path_delta_ms(start_ns: Any, end_ns: Any) -> float | None:
     return round((end_ns - start_ns) / 1_000_000, 3)
 
 
+def _get_plan_proof_decision_reason(
+    consumed: bool,
+    reason: str,
+    ineligible_reason: str,
+) -> str:
+    """Report no ineligibility reason after a plan proof is consumed."""
+    if consumed:
+        return ""
+    return reason or ineligible_reason or "not_eligible"
+
+
 def _format_v2_critical_path(values: Mapping[str, Any]) -> str:
     return " ".join(
         ["[v2.critical_path]"]
@@ -252,11 +286,277 @@ except Exception:
 
 APP_NAME = os.environ.get("COMFYMODAL_V2_APP_NAME", "stable-modal-comfy-v2-shadow").strip() or "stable-modal-comfy-v2-shadow"
 MODELS_VOLUME_NAME = os.environ.get("COMFYMODAL_MODELS_VOLUME", "comfyui-models")
-CUSTOM_NODES_VOLUME_NAME = os.environ.get("COMFYMODAL_CUSTOM_NODES_VOLUME", "comfyui-custom-nodes")
+from comfymodal_runtime.publication_policy import CUSTOM_NODES_VOLUME_NAME as _DEFAULT_CUSTOM_NODES_VOLUME_NAME
+
+CUSTOM_NODES_VOLUME_NAME = os.environ.get(
+    "COMFYMODAL_CUSTOM_NODES_VOLUME", _DEFAULT_CUSTOM_NODES_VOLUME_NAME
+)
 RUNTIME_STATE_VOLUME_NAME = os.environ.get("COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")
 MODELS_PATH = "/root/models"
 CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
+CUSTOM_NODES_IMPORT_PATH = "/root/comfy/ComfyUI/custom_nodes"
+CUSTOM_NODE_DELIVERY = os.environ.get("COMFYMODAL_CUSTOM_NODE_DELIVERY", "image").strip().lower()
+if CUSTOM_NODE_DELIVERY not in ("image", "volume"):
+    print(
+        f"[modal_app] WARNING: invalid COMFYMODAL_CUSTOM_NODE_DELIVERY={CUSTOM_NODE_DELIVERY!r}, "
+        "falling back to 'image'"
+    )
+    CUSTOM_NODE_DELIVERY = "image"
 RUNTIME_STATE_PATH = "/mnt/comfymodal_runtime_state"
+
+
+def _ensure_custom_nodes_compat_symlink() -> None:
+    """Verify the image-baked import symlink reaches the mounted Volume.
+
+    Modal rejects a Volume mount whose target already contains files.  The
+    image therefore mounts the Volume at ``CUSTOM_NODES_PATH`` (an empty
+    target) and bakes the symlink in the opposite direction: ComfyUI's
+    discovery path points at that mount.  This check is deliberately
+    read-only at runtime; creating the link here would be too late to avoid
+    Modal's mount validation.
+    """
+    if CUSTOM_NODE_DELIVERY != "volume":
+        return
+
+    target = CUSTOM_NODES_PATH
+    link = CUSTOM_NODES_IMPORT_PATH
+    try:
+        if not os.path.isdir(target):
+            raise RuntimeError(
+                f"mounted custom-node Volume path is missing or not a directory: {target}"
+            )
+        if not os.path.islink(link) or os.path.realpath(link) != os.path.realpath(target):
+            raise RuntimeError(
+                f"ComfyUI custom-node import path is not the image-baked compatibility "
+                f"symlink to the mounted Volume: "
+                f"{link} -> {target}"
+            )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            detail = str(exc)
+        else:
+            detail = f"{type(exc).__name__}: {exc}"
+        raise RuntimeError(
+            "custom-node Volume compatibility symlink setup failed; refusing to "
+            f"start with an unresolved {CUSTOM_NODES_PATH}: {detail}"
+        ) from exc
+
+
+_RESTORE_CLIP_PROBE_SOURCE_ENV = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
+_RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH = os.path.join(
+    "text_encoders", "qwen_3_4b.safetensors"
+)
+_RESTORE_CLIP_PROBE_LOCAL_PATH = "/tmp/comfymodal_restore_clip_probe/qwen_3_4b.safetensors"
+_RESTORE_CLIP_PROBE_SOURCE_MODES = frozenset({"models_volume", "local_cache"})
+
+
+def _restore_clip_probe_source_mode(value: str | None = None) -> str:
+    mode = str(
+        os.environ.get(_RESTORE_CLIP_PROBE_SOURCE_ENV, "models_volume")
+        if value is None else value
+    ).strip().lower()
+    if mode not in _RESTORE_CLIP_PROBE_SOURCE_MODES:
+        raise RuntimeError(
+            f"invalid restore CLIP probe source mode: {mode or '<empty>'}"
+        )
+    return mode
+
+
+def _restore_clip_probe_volume_path() -> str:
+    return os.path.join(MODELS_PATH, _RESTORE_CLIP_PROBE_SOURCE_RELATIVE_PATH)
+
+
+def _prepare_restore_clip_probe_source(
+    source_mode: str | None = None,
+    *,
+    source_path: str | None = None,
+    staged_path: str | None = None,
+) -> dict[str, Any]:
+    mode = _restore_clip_probe_source_mode(source_mode)
+    source_path = source_path or _restore_clip_probe_volume_path()
+    if mode == "models_volume":
+        return {
+            "source_mode": mode,
+            "source_path": source_path,
+            "path": source_path,
+            "staging_status": "not_required",
+            "staged": False,
+        }
+
+    staged_path = staged_path or _RESTORE_CLIP_PROBE_LOCAL_PATH
+    evidence: dict[str, Any] = {
+        "source_mode": mode,
+        "source_path": source_path,
+        "staged_path": staged_path,
+        "path": staged_path,
+        "staging_status": "error",
+        "staged": False,
+    }
+    temp_path = f"{staged_path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        source_stat = os.stat(source_path)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError("source is not a regular file")
+        expected_bytes = int(source_stat.st_size)
+        parent = os.path.dirname(staged_path)
+        if not parent:
+            raise RuntimeError("staged path has no parent")
+        os.makedirs(parent, exist_ok=True)
+        shutil.copyfile(source_path, temp_path)
+        if int(os.stat(source_path).st_size) != expected_bytes:
+            raise RuntimeError("source size changed during staging")
+        os.replace(temp_path, staged_path)
+        staged_bytes = int(os.stat(staged_path).st_size)
+        if staged_bytes != expected_bytes:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"staged size mismatch: expected={expected_bytes} actual={staged_bytes}"
+            )
+        evidence.update({
+            "source_size_bytes": expected_bytes,
+            "staged_size_bytes": staged_bytes,
+            "staging_status": "ready",
+            "staged": True,
+        })
+        return evidence
+    except Exception as exc:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        evidence["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        raise RuntimeError(
+            f"restore CLIP probe local source staging failed: {evidence['error']}"
+        ) from exc
+
+
+def _validate_restore_clip_probe_staging(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(evidence, Mapping) or evidence.get("source_mode") != "local_cache":
+        raise RuntimeError("restore CLIP probe local staging evidence is missing")
+    staged_path = str(evidence.get("staged_path") or evidence.get("path") or "")
+    expected_bytes = evidence.get("source_size_bytes")
+    if evidence.get("staging_status") != "ready" or not staged_path:
+        raise RuntimeError("restore CLIP probe local staging is not ready")
+    if not isinstance(expected_bytes, int) or expected_bytes < 0:
+        raise RuntimeError("restore CLIP probe local staging size evidence is missing")
+    try:
+        staged_stat = os.stat(staged_path)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            raise RuntimeError("staged source is not a regular file")
+        staged_bytes = int(staged_stat.st_size)
+    except Exception as exc:
+        raise RuntimeError(
+            f"restore CLIP probe staged source is unavailable: {type(exc).__name__}"
+        ) from exc
+    if staged_bytes != expected_bytes:
+        raise RuntimeError(
+            f"restore CLIP probe staged size mismatch: expected={expected_bytes} actual={staged_bytes}"
+        )
+    validated = dict(evidence)
+    validated.update({
+        "staged_size_bytes": staged_bytes,
+        "staging_validation": "ready",
+    })
+    return validated
+
+
+def _resolve_restore_clip_probe_source(
+    source_mode: str | None = None,
+    staging_evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    mode = _restore_clip_probe_source_mode(source_mode)
+    if mode == "models_volume":
+        return _prepare_restore_clip_probe_source(mode)
+    if staging_evidence is None:
+        raise RuntimeError("restore CLIP probe local source was not staged during startup")
+    return _validate_restore_clip_probe_staging(staging_evidence)
+
+
+def _run_restore_clip_qd2_probe(path: str, state: dict[str, Any]) -> None:
+    block_size = 128 * 1024 * 1024
+    workers = 2
+    ready = threading.Barrier(workers + 1)
+    go = threading.Barrier(workers + 1)
+    results = [{"bytes": 0, "error": None} for _ in range(workers)]
+    fd: int | None = None
+    try:
+        expected = os.stat(path).st_size
+        fd = os.open(path, os.O_RDONLY)
+        state.update({"status": "starting", "path": path, "expected_bytes": expected})
+
+        def worker(index: int, offset: int, count: int) -> None:
+            try:
+                buffer = bytearray(min(block_size, count))
+                ready.wait()
+                go.wait()
+                remaining, position, total = count, offset, 0
+                view = memoryview(buffer)
+                while remaining:
+                    request = min(remaining, block_size)
+                    amount = os.preadv(fd, [view[:request]], position)
+                    if amount <= 0:
+                        raise OSError("short positioned read")
+                    remaining -= amount
+                    position += amount
+                    total += amount
+                results[index]["bytes"] = total
+            except Exception as exc:
+                results[index]["error"] = repr(exc)
+
+        base, remainder = divmod(expected, workers)
+        threads = []
+        offset = 0
+        for index in range(workers):
+            count = base + (1 if index < remainder else 0)
+            thread = threading.Thread(
+                target=worker,
+                args=(index, offset, count),
+                daemon=False,
+                name="restore_clip_qd2_worker",
+            )
+            thread.start()
+            threads.append(thread)
+            offset += count
+        ready.wait()
+        start_ns = time.monotonic_ns()
+        state.update({
+            "status": "running",
+            "probe_start_mono_ns": start_ns,
+            "probe_start_unix_s": time.time(),
+            "qd": workers,
+            "block_size_mib": 128,
+            "fd_policy": "shared",
+            "read_mode": "positioned",
+        })
+        go.wait()
+        for thread in threads:
+            thread.join()
+        end_ns = time.monotonic_ns()
+        total = sum(item["bytes"] for item in results)
+        errors = [item["error"] for item in results if item["error"]]
+        state.update({
+            "status": "error" if errors else "complete",
+            "probe_end_mono_ns": end_ns,
+            "probe_end_unix_s": time.time(),
+            "wall_ms": (end_ns - start_ns) / 1_000_000,
+            "bytes": total,
+            "byte_reconciled": total == expected and not errors,
+            "errors": errors,
+        })
+    except Exception as exc:
+        state.update({"status": "error", "error": repr(exc),
+                      "probe_end_unix_s": time.time()})
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 # Deployment-scoped runtime-state file that carries the authoritative
 # RestorePlan plus the atomically-written schema-v2 ``snapshot_seed`` payload
 # (written together by ``RestorePlanPublisher.publish_with_metrics*`` on the
@@ -338,6 +638,46 @@ _V2_IMPORT_START_WALL_NS: int = time.time_ns()
 _V2_IMPORT_START_MONO_NS: int = time.monotonic_ns()
 _V2_STARTUP_CALLBACK_RETURN: dict[str, Any] = {}
 
+# ── Conditioning-prefetch launch evidence (RUN-1 gate remediation) ──────
+# Request-scoped evidence of whether the plan-time conditioning prefetch was
+# SCHEDULED, stamped by modal_app at the launch site in
+# _run_plan_stream_impl (after ExecutionPlan.from_dict).  The model_preload
+# lane reads this dict (see the demand-time lookup diagnostics in
+# model_preload.maybe_prefetch_conditioning / the
+# [v2.conditioning_exact_hit_breakdown] emission) so `prefetch_requested` /
+# `prefetch_source` are TRUTHFUL even when the prefetch was skipped
+# (unavailable / env-off).  Key layout per request_id:
+#   _CONDITIONING_PREFETCH_EVIDENCE[request_id] = {
+#       "requested": int,   # 1 = this request asked for a prefetch attempt
+#       "env": str,         # COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH value
+#       "scheduled": int,   # 1 = daemon thread actually started
+#       "reason": str,      # "thread_started" | "unavailable"
+#   }
+# Bounded: keyed by request_id, newest entry wins, and the oldest entry is
+# evicted past _CONDITIONING_PREFETCH_EVIDENCE_MAX (LRU-ish).  All access is
+# serialized through _CONDITIONING_PREFETCH_EVIDENCE_LOCK.
+_CONDITIONING_PREFETCH_EVIDENCE: dict[str, dict[str, Any]] = {}
+_CONDITIONING_PREFETCH_EVIDENCE_LOCK = threading.Lock()
+_CONDITIONING_PREFETCH_EVIDENCE_MAX = 256
+
+
+def _set_conditioning_prefetch_evidence(request_id: str, **fields: Any) -> None:
+    """Record bounded launch-site evidence for the conditioning prefetch.
+
+    Never raises.  No-op when the request id is empty.  Evicts the oldest
+    entry (insertion order) when the dict exceeds the max bound.
+    """
+    try:
+        _rid = str(request_id or "")
+        if not _rid:
+            return
+        with _CONDITIONING_PREFETCH_EVIDENCE_LOCK:
+            _CONDITIONING_PREFETCH_EVIDENCE[_rid] = dict(fields)
+            while len(_CONDITIONING_PREFETCH_EVIDENCE) > _CONDITIONING_PREFETCH_EVIDENCE_MAX:
+                _CONDITIONING_PREFETCH_EVIDENCE.pop(next(iter(_CONDITIONING_PREFETCH_EVIDENCE)))
+    except Exception:
+        pass
+
 
 def _v2_startup_stage(
     stage: str,
@@ -390,6 +730,7 @@ V2_SOURCE_MODULES = (
     "canonical_execution",
     "comfyapp",
     "comfymodal_runtime",
+    "comfymodal_runtime.registry_proof_store",
     "failure_summary",
     "gpu_catalog",
     "modal_client",
@@ -410,6 +751,13 @@ V2_SOURCE_MODULES = (
 _V2_VALIDATION_CERT_ENABLED: bool = env_flag("COMFYMODAL_V2_VALIDATION_CERT", default=True)
 _V2_CERT_SCHEMA_VERSION: int = 2
 _V2_CERT_FILENAME_PREFIX: str = "v2_cert_"
+
+# Quiet console mode.  Set COMFYMODAL_V2_QUIET=1 to suppress the per-request
+# repeat diagnostic one-liners ([v2.method_entry_gap], per-request
+# [v2.host_memory]/[v2.gpu_allocation] repeats, unavailable fallbacks, ...).
+# Artifacts/trace writes are never suppressed; when unset every line prints
+# exactly as before.
+_QUIET: bool = env_flag("COMFYMODAL_V2_QUIET", default=False)
 
 # Pre-computed deployment identity hash for certificate identity.
 # Populated at module level once during import.
@@ -450,23 +798,28 @@ _RESIDENCY_DIAGNOSTICS_ENABLED: bool = observability_gate(
 )
 
 # ── V2 full-trace lifecycle gate ──────────────────────────────────────
-# Inert when COMFYMODAL_V2_FULL_TRACE != '1'.  The full-trace session
-# is created at restore entry and finalized after the first request.
+# Capability gate for request-only deep tracing.  Restore never creates the
+# session; a Golden request creates and finalizes it within its own run.
 _V2_FULL_TRACE_ENABLED: bool = observability_gate(
     "COMFYMODAL_V2_FULL_TRACE", "full_trace",
 )
+# Image dependencies are owned by comfyapp's canonical image plan.  Keep this
+# module free of package-install policy; optional diagnostics belong in that
+# explicitly gated builder and never in runtime construction.
 # Process-local set of trace IDs that have been finalized.  Guards against
 # duplicate finalization under repeated result/error paths.
 _FULL_TRACE_FINALIZED_IDS: set[str] = set()
 _FULL_TRACE_FINALIZED_LOCK = threading.Lock()
 
+_GOLDEN_TRACE_PROFILE_CONTRACT = "direct_golden_serial"
+
 
 def sync_observability_gates() -> None:
     """Re-resolve import-time observability gates from the current env.
 
-    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here)
-    plus ``_PAGEFAULT_TRACKING`` and ``_DIAGNOSTIC_FLAG`` (model_preload) are
-    frozen at import time.  When ``run_plan_stream`` applies a request
+    ``_RESIDENCY_DIAGNOSTICS_ENABLED`` and ``_V2_FULL_TRACE_ENABLED`` (here),
+    ``_PAGEFAULT_TRACKING``/``_DIAGNOSTIC_FLAG`` (model_preload), and E31's
+    forensics/profile gates are frozen at import time.  When ``run_plan_stream`` applies a request
     env-profile override the effective observability mode changes; recompute
     the module-level gates so they agree with call-time
     ``observability_allows`` checks for that request.  Recomputing an
@@ -481,6 +834,20 @@ def sync_observability_gates() -> None:
     )
     from .model_preload import sync_observability_gates as _sync_model_preload_gates
     _sync_model_preload_gates()
+    # E31's forensics/profile gates are also import-time values.  Request
+    # profiles are applied immediately before this lifecycle point, so refresh
+    # them here, before model_preload installs the CLIP/cast wrappers.  Keep
+    # this optional and fail-closed for lightweight/probe imports.
+    try:
+        from .clip_forward_forensics import sync_e31_gates
+        sync_e31_gates()
+    except Exception:
+        pass
+    try:
+        from .e27_forensics import sync_e27_gate
+        sync_e27_gate()
+    except Exception:
+        pass
 
 # ── Request-carried diagnostic env allowlist ─────────────────────────────
 # The variance benchmark runner may carry bounded diagnostic toggles in
@@ -502,11 +869,48 @@ _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("minimal_teardown", "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN"),
     ("pin_unet_transfer", "COMFYMODAL_V2_PIN_UNET_TRANSFER"),
     ("unet_quiesced_transfer", "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER"),
+    ("png_compress_level", "COMFYMODAL_V2_PNG_COMPRESS_LEVEL"),
+    ("vae_early_start_ms", "COMFYMODAL_V2_VAE_EARLY_START_MS"),
+    ("unet_pinned_staging", "COMFYMODAL_V2_UNET_PINNED_STAGING"),
+    ("conditioning_async_lru", "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU"),
+    ("prompt_signature_cache", "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE"),
+    ("conditioning_cache_prefetch", "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH"),
+    # E37's restore mode is deployment/profile controlled, but the request
+    # origin channel is also allowlisted so a resolved profile cannot be
+    # silently dropped by the runtime environment boundary.
+    ("minimal_restore", "COMFYMODAL_MINIMAL_RESTORE"),
+    ("COMFYMODAL_MINIMAL_RESTORE", "COMFYMODAL_MINIMAL_RESTORE"),
+    # E28 per-run loader/cast tuning (Targets B/C): allowlisted so the
+    # integrated campaign can tune threads/blocks/cast-once per request
+    # without a redeploy.  The runtime parsers bound the values again.
+    ("clip_fastsafe_threads", "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"),
+    ("clip_fastsafe_block_bytes", "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"),
+    ("clip_fastsafe_bbuf_kb", "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB"),
+    ("unet_fastsafe_threads", "COMFYMODAL_V2_UNET_FASTSAFE_THREADS"),
+    ("unet_fastsafe_block_bytes", "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES"),
+    ("unet_fastsafe_bbuf_kb", "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB"),
+    ("clip_fp32_cast_once", "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"),
 )
 _REQUEST_DIAG_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _REQUEST_DIAG_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
 _REQUEST_OBSERVABILITY_MODES = frozenset({"full", "production", "off"})
 _REQUEST_DIAG_STRING_MAX = 64
+# Integer-typed request-carried diagnostic env keys and their bounded value
+# ranges.  Values within a range are normalized to int-strings and applied;
+# everything else is skipped.  The restored env value is re-validated by the
+# v2_experiments parsers against the experiment's allowed arm set when it is
+# consumed, so an in-range-but-unarmed value (e.g. PNG level 3) still falls
+# back to the experiment default with a logged error.
+_REQUEST_DIAG_INT_RANGES: dict[str, tuple[int, int]] = {
+    "COMFYMODAL_V2_PNG_COMPRESS_LEVEL": (1, 6),
+    "COMFYMODAL_V2_VAE_EARLY_START_MS": (0, 1000),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": (1, 32),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": (1024 * 1024, 2 * 1024 * 1024 * 1024),
+    "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": (16 * 1024, 4 * 1024 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": (1, 32),
+    "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": (1024 * 1024, 2 * 1024 * 1024 * 1024),
+    "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": (16 * 1024, 4 * 1024 * 1024),
+}
 
 
 def _normalize_request_diag_env_value(value: Any) -> str | None:
@@ -532,6 +936,36 @@ def _normalize_request_diag_env_value(value: Any) -> str | None:
     return None
 
 
+def _normalize_request_diag_int_value(
+    value: Any,
+    int_range: tuple[int, int],
+) -> str | None:
+    """Return a bounded int-string for an integer-typed request-carried
+    diagnostic value, or ``None`` when the value is not an int (or digit-only
+    string) within ``int_range``.
+
+    Booleans are rejected so int-typed env keys cannot be smuggled as truth
+    tokens.  The restored env value is re-validated by the v2_experiments
+    parsers against the experiment's allowed arm set when consumed.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if int_range[0] <= value <= int_range[1]:
+            return str(value)
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or len(raw) > _REQUEST_DIAG_STRING_MAX:
+            return None
+        if not raw.isdigit():
+            return None
+        parsed = int(raw)
+        if int_range[0] <= parsed <= int_range[1]:
+            return str(parsed)
+    return None
+
+
 def _apply_request_variance_diagnostics(
     request_origin_info: Mapping[str, Any],
 ) -> dict[str, str]:
@@ -539,7 +973,9 @@ def _apply_request_variance_diagnostics(
 
     Returns a dict mapping env-var name -> normalized applied value for the
     keys that were present and valid.  Boolean-typed keys accept only the
-    standard truth/false tokens; the observability mode accepts only the
+    standard truth/false tokens; integer-typed keys (see
+    ``_REQUEST_DIAG_INT_RANGES``) accept int values and digit-only strings
+    within their bounded range; the observability mode accepts only the
     bounded mode set.  Unknown keys, non-scalars, and out-of-allowlist values
     are never applied.  Never touches model/restore-plan identity or workflow.
     """
@@ -547,16 +983,21 @@ def _apply_request_variance_diagnostics(
     for origin_key, env_name in _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST:
         if origin_key not in request_origin_info:
             continue
-        normalized = _normalize_request_diag_env_value(
-            request_origin_info.get(origin_key)
-        )
-        if normalized is None:
-            continue
-        if env_name == "COMFYMODAL_V2_OBSERVABILITY_MODE":
-            if normalized not in _REQUEST_OBSERVABILITY_MODES:
+        raw_value = request_origin_info.get(origin_key)
+        int_range = _REQUEST_DIAG_INT_RANGES.get(env_name)
+        if int_range is not None:
+            normalized = _normalize_request_diag_int_value(raw_value, int_range)
+            if normalized is None:
                 continue
-        elif normalized not in (_REQUEST_DIAG_BOOL_TRUE | _REQUEST_DIAG_BOOL_FALSE):
-            continue
+        else:
+            normalized = _normalize_request_diag_env_value(raw_value)
+            if normalized is None:
+                continue
+            if env_name == "COMFYMODAL_V2_OBSERVABILITY_MODE":
+                if normalized not in _REQUEST_OBSERVABILITY_MODES:
+                    continue
+            elif normalized not in (_REQUEST_DIAG_BOOL_TRUE | _REQUEST_DIAG_BOOL_FALSE):
+                continue
         os.environ[env_name] = normalized
         applied[env_name] = normalized
     return applied
@@ -1061,12 +1502,480 @@ def _cpu_model_snapshot_enabled() -> bool:
     return enabled
 
 
+def _golden_serial_profile_active() -> bool:
+    """Return whether this container is the dedicated Golden serial profile.
+
+    The deploy-baked DynamicVRAM flag is the normal selector, while the
+    profile name is also authoritative so a profile-only environment cannot
+    accidentally construct the legacy CPU snapshot models.
+    """
+    return env_flag("COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM") or (
+        os.environ.get("COMFYMODAL_V2CTL_PROFILE", "").strip().lower()
+        == "golden_p1"
+    )
+
+
+def _validate_golden_restore_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Accept only the completed, runtime-owned restore timing record."""
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("golden_restore_metadata_missing")
+    if metadata.get("restore_method_status") != "success":
+        raise RuntimeError("golden_restore_metadata_restore_not_successful")
+
+    required = (
+        "remote_python_resume_wall_unix_ns",
+        "remote_python_resume_mono_ns",
+        "restore_method_start_wall_unix_ns",
+        "restore_method_start_mono_ns",
+        "restore_method_end_wall_unix_ns",
+        "restore_method_end_mono_ns",
+    )
+    values: dict[str, int] = {}
+    for key in required:
+        value = metadata.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"golden_restore_metadata_invalid:{key}")
+        values[key] = value
+
+    if values["remote_python_resume_wall_unix_ns"] > values["restore_method_start_wall_unix_ns"]:
+        raise RuntimeError("golden_restore_metadata_wall_order_invalid")
+    if values["restore_method_start_wall_unix_ns"] > values["restore_method_end_wall_unix_ns"]:
+        raise RuntimeError("golden_restore_metadata_wall_order_invalid")
+    if values["remote_python_resume_mono_ns"] > values["restore_method_start_mono_ns"]:
+        raise RuntimeError("golden_restore_metadata_mono_order_invalid")
+    if values["restore_method_start_mono_ns"] > values["restore_method_end_mono_ns"]:
+        raise RuntimeError("golden_restore_metadata_mono_order_invalid")
+    return dict(metadata)
+
+
+def _validate_golden_runtime_mount_root(volume: Any) -> str:
+    """Validate the already-declared runtime-state mount used by Golden.
+
+    Golden has one runtime-state mount; the adapter must not derive or accept a
+    request-owned alternative.  Modal's raw Volume handle does not expose its
+    filesystem mount, but wrapped handles and test/runtime resource records may
+    expose one.  When they do, it must identify the same root.  The returned
+    root is the configured ``RUNTIME_STATE_PATH`` itself, never a replacement.
+    """
+    root_raw = RUNTIME_STATE_PATH
+    if not isinstance(root_raw, (str, os.PathLike)) or not os.path.isabs(os.fspath(root_raw)):
+        raise RuntimeError("golden_runtime_mount_root_invalid")
+    root = os.path.abspath(os.fspath(root_raw))
+    root_real = os.path.realpath(root)
+    if not os.path.isdir(root_real):
+        raise RuntimeError(f"golden_runtime_mount_root_missing:{root_real}")
+
+    resources = globals().get("_MODAL_RESOURCES", {})
+    candidates = [
+        getattr(volume, "volume_mount_root", None),
+        getattr(volume, "mount_root", None),
+    ]
+    if isinstance(resources, Mapping):
+        candidates.append(resources.get("runtime_state_mount_root"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if not isinstance(candidate, (str, os.PathLike)):
+            raise RuntimeError("golden_runtime_mount_root_identity_invalid")
+        candidate_real = os.path.realpath(os.fspath(candidate))
+        if candidate_real != root_real:
+            raise RuntimeError(
+                "golden_runtime_mount_root_identity_mismatch:"
+                f"{candidate_real}!={root_real}"
+            )
+
+    return root
+
+
+def _golden_path_contained(path: str | os.PathLike, root: str) -> bool:
+    """Return whether a resolved path is contained by the Golden mount root."""
+    try:
+        path_real = os.path.realpath(os.fspath(path))
+        return os.path.commonpath((path_real, os.path.realpath(root))) == os.path.realpath(root)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+_GOLDEN_LOG_VALUE_LIMIT = 240
+_GOLDEN_LOG_COLLECTION_LIMIT = 64
+_GOLDEN_LOG_DEPTH_LIMIT = 5
+_GOLDEN_LOG_SENSITIVE_PARTS = (
+    "prompt", "text", "secret", "token", "password", "credential",
+    "authorization", "api_key", "access_key", "cookie",
+)
+
+
+def _golden_log_sanitize(value: Any, key: str = "", depth: int = 0) -> Any:
+    """Return a bounded JSON-safe value suitable for container logs."""
+    lowered = str(key).lower().replace("-", "_")
+    if any(part in lowered for part in _GOLDEN_LOG_SENSITIVE_PARTS):
+        return "<redacted>"
+    if depth >= _GOLDEN_LOG_DEPTH_LIMIT:
+        return "<depth-limited>"
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        result = {
+            str(k): _golden_log_sanitize(v, str(k), depth + 1)
+            for k, v in items[:_GOLDEN_LOG_COLLECTION_LIMIT]
+        }
+        if len(items) > _GOLDEN_LOG_COLLECTION_LIMIT:
+            result["__omitted_keys__"] = len(items) - _GOLDEN_LOG_COLLECTION_LIMIT
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [
+            _golden_log_sanitize(item, key, depth + 1)
+            for item in value[:_GOLDEN_LOG_COLLECTION_LIMIT]
+        ]
+        if len(value) > _GOLDEN_LOG_COLLECTION_LIMIT:
+            result.append(f"<omitted {len(value) - _GOLDEN_LOG_COLLECTION_LIMIT} items>")
+        return result
+    if isinstance(value, str):
+        clean = " ".join(value.split())
+        if len(clean) > _GOLDEN_LOG_VALUE_LIMIT:
+            return clean[:_GOLDEN_LOG_VALUE_LIMIT] + "..."
+        return clean
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _golden_log_sanitize(str(value), key, depth + 1)
+
+
+def _golden_log_json(value: Any) -> str:
+    rendered = json.dumps(
+        _golden_log_sanitize(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return rendered if len(rendered) <= _GOLDEN_LOG_VALUE_LIMIT * 4 else (
+        rendered[: _GOLDEN_LOG_VALUE_LIMIT * 4] + "..."
+    )
+
+
+def _is_golden_result(value: Any) -> bool:
+    """Recognize transported Golden results without depending on their class."""
+    if not isinstance(value, Mapping):
+        return False
+    return isinstance(value.get("golden_identity"), Mapping) or isinstance(
+        value.get("golden_telemetry"), Mapping
+    )
+
+
+def _golden_telemetry_stage_duration_ms(stage: Mapping[str, Any]) -> float | None:
+    started = stage.get("entry_monotonic_ns")
+    ended = stage.get("end_monotonic_ns")
+    if isinstance(started, int) and isinstance(ended, int) and ended >= started:
+        return round((ended - started) / 1_000_000, 3)
+    started = stage.get("entry_wall_ns")
+    ended = stage.get("end_wall_ns")
+    if isinstance(started, int) and isinstance(ended, int) and ended >= started:
+        return round((ended - started) / 1_000_000, 3)
+    return None
+
+
+_GOLDEN_WATERFALL_STAGE_LIMIT = _GOLDEN_LOG_COLLECTION_LIMIT
+_GOLDEN_WATERFALL_STAGE_WIDTH = 42
+_GOLDEN_WATERFALL_VALUE_WIDTH = 10
+_GOLDEN_WATERFALL_STATUS_WIDTH = 10
+
+
+def _golden_waterfall_ms(value: Any) -> str:
+    """Format a measured millisecond value without filling in missing data."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "N/A"
+    try:
+        if not math.isfinite(float(value)):
+            return "N/A"
+    except (OverflowError, TypeError, ValueError):
+        return "N/A"
+    return f"{float(value):.3f} ms"
+
+
+def _golden_waterfall_cell(value: Any, width: int) -> str:
+    """Make a bounded, single-line table cell using the existing log sanitizer."""
+    text = str(_golden_log_sanitize(value)).replace("|", "/")
+    text = " ".join(text.split())
+    if len(text) > width:
+        text = text[: max(width - 3, 0)] + "..."
+    return text.ljust(width)
+
+
+def _format_golden_waterfall(
+    telemetry: Mapping[str, Any], *, timing: Mapping[str, Any] | None = None
+) -> str:
+    """Render bounded persisted Golden timings for plain Modal/container logs.
+
+    Restore and adapter rows are boundaries, not Golden model-execution stages.
+    Missing interval endpoints remain ``N/A`` rather than being inferred from
+    aggregate timings.
+    """
+    raw_stages = telemetry.get("stages")
+    stages = raw_stages if isinstance(raw_stages, list) else []
+    external_restore = telemetry.get("external_restore")
+    external_restore = external_restore if isinstance(external_restore, Mapping) else {}
+
+    stage_border = (
+        "+-----+"
+        + "-" * (_GOLDEN_WATERFALL_STAGE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_VALUE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_VALUE_WIDTH + 2)
+        + "+"
+        + "-" * (_GOLDEN_WATERFALL_STATUS_WIDTH + 2)
+        + "+"
+    )
+
+    def row(number: Any, stage: Any, duration: Any, cumulative: Any, status: Any) -> str:
+        number_text = str(number).rjust(3)
+        return (
+            f"| {number_text} | {_golden_waterfall_cell(stage, _GOLDEN_WATERFALL_STAGE_WIDTH)}"
+            f" | {_golden_waterfall_cell(duration, _GOLDEN_WATERFALL_VALUE_WIDTH)}"
+            f" | {_golden_waterfall_cell(cumulative, _GOLDEN_WATERFALL_VALUE_WIDTH)}"
+            f" | {_golden_waterfall_cell(status, _GOLDEN_WATERFALL_STATUS_WIDTH)} |"
+        )
+
+    lines = [
+        "V2 GOLDEN WATERFALL - REMOTE",
+        stage_border,
+        row("#", "Stage", "Duration", "Cum.", "Status"),
+        stage_border,
+    ]
+
+    if "restore_total_ms" in external_restore:
+        lines.append(
+            row(
+                "",
+                "External restore [ADAPTER BOUNDARY]",
+                _golden_waterfall_ms(external_restore.get("restore_total_ms")),
+                "N/A",
+                "ADAPTER",
+            )
+        )
+
+    cumulative_ms = 0.0
+    cumulative_known = True
+    for index, raw_stage in enumerate(stages[:_GOLDEN_WATERFALL_STAGE_LIMIT], 1):
+        stage = raw_stage if isinstance(raw_stage, Mapping) else {"value": raw_stage}
+        duration = _golden_telemetry_stage_duration_ms(stage)
+        duration_text = _golden_waterfall_ms(duration)
+        if duration is None:
+            cumulative_known = False
+        elif cumulative_known:
+            cumulative_ms = round(cumulative_ms + duration, 3)
+        cumulative_text = _golden_waterfall_ms(cumulative_ms) if cumulative_known else "N/A"
+        if stage.get("ok") is False:
+            status = "FAILED"
+        elif stage.get("ok") is True and duration is not None:
+            status = "OK"
+        elif duration is None:
+            status = "INCOMPLETE"
+        else:
+            status = "UNKNOWN"
+        safe_stage_name = _golden_log_sanitize(
+            stage.get("name", f"stage_{index - 1}"), "name"
+        )
+        stage_name = f"{safe_stage_name} [GOLDEN STAGE]"
+        lines.append(row(index, stage_name, duration_text, cumulative_text, status))
+
+    if len(stages) > _GOLDEN_WATERFALL_STAGE_LIMIT:
+        lines.append(
+            row(
+                "",
+                f"... {_golden_log_sanitize(len(stages) - _GOLDEN_WATERFALL_STAGE_LIMIT)} stages omitted",
+                "N/A",
+                "N/A",
+                "BOUNDED",
+            )
+        )
+    lines.append(stage_border)
+    lines.append("V2 GOLDEN BOUNDARIES / TIMING")
+
+    timing = timing if isinstance(timing, Mapping) else {}
+    timing_labels = (
+        ("Golden call wall [ADAPTER CALL]", "golden_call_wall_ms"),
+        ("Golden stage span [GOLDEN STAGES]", "golden_stage_span_ms"),
+        ("Golden stage sum [GOLDEN STAGES]", "golden_stage_sum_ms"),
+        ("Pre-stage overhead [ADAPTER]", "golden_pre_stage_overhead_ms"),
+        ("Post-stage overhead [ADAPTER]", "golden_post_stage_overhead_ms"),
+        ("Telemetry persistence [ADAPTER]", "golden_telemetry_persist_ms"),
+    )
+    for label, key in timing_labels:
+        value = _golden_waterfall_ms(timing.get(key))
+        if key == "golden_telemetry_persist_ms" and value == "N/A":
+            persistence = telemetry.get("telemetry_persistence")
+            if isinstance(persistence, Mapping) and persistence.get("telemetry_persisted") is True:
+                value = "persisted (duration N/A)"
+        lines.append(f"  {label}: {value}")
+    return "\n".join(lines)
+
+
+def _emit_golden_telemetry(
+    telemetry: Any, *, timing: Mapping[str, Any] | None = None
+) -> None:
+    """Print persisted Golden telemetry as readable, flushed, safe lines."""
+    if not isinstance(telemetry, Mapping):
+        print(
+            f"[v2.golden_telemetry] unavailable reason={_golden_log_json(telemetry)}",
+            flush=True,
+        )
+        return
+    print(_format_golden_waterfall(telemetry, timing=timing), flush=True)
+    stages = telemetry.get("stages")
+    events = telemetry.get("events")
+    stages = stages if isinstance(stages, list) else []
+    events = events if isinstance(events, list) else []
+    print(
+        f"[v2.golden_telemetry] schema={_golden_log_json(telemetry.get('schema'))} "
+        f"stages={len(stages)} events={len(events)} "
+        f"seriality={_golden_log_json(telemetry.get('seriality'))} "
+        f"true_durable={_golden_log_json(telemetry.get('true_durable_marked'))} "
+        f"persistence={_golden_log_json(telemetry.get('telemetry_persistence', {}))}",
+        flush=True,
+    )
+    if timing:
+        print(f"[v2.golden_telemetry] timing={_golden_log_json(timing)}", flush=True)
+    print(
+        f"[v2.golden_telemetry] external_restore="
+        f"{_golden_log_json(telemetry.get('external_restore', {}))}",
+        flush=True,
+    )
+    for index, raw_stage in enumerate(stages):
+        stage = raw_stage if isinstance(raw_stage, Mapping) else {"value": raw_stage}
+        duration = _golden_telemetry_stage_duration_ms(stage)
+        duration_text = str(duration) if duration is not None else "incomplete"
+        name = _golden_log_sanitize(stage.get("name", f"stage_{index}"))
+        print(
+            f"[v2.golden_telemetry] stage={name} duration_ms={duration_text} "
+            f"ok={_golden_log_json(stage.get('ok', 'unknown'))} "
+            f"details={_golden_log_json(stage.get('details', {}))}",
+            flush=True,
+        )
+    for index, raw_event in enumerate(events):
+        event = raw_event if isinstance(raw_event, Mapping) else {"value": raw_event}
+        name = _golden_log_sanitize(event.get("name", f"event_{index}"))
+        print(
+            f"[v2.golden_telemetry] event={name} "
+            f"fields={_golden_log_json(event.get('fields', {}))}",
+            flush=True,
+        )
+
+
+def _emit_golden_waterfall(
+    telemetry: Any, *, timing: Mapping[str, Any] | None = None
+) -> None:
+    """Print only the bounded Golden waterfall, never the raw telemetry dump."""
+    if isinstance(telemetry, Mapping):
+        print(_format_golden_waterfall(telemetry, timing=timing), flush=True)
+
+
+def _read_golden_telemetry(
+    path: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the already-persisted telemetry document without changing errors."""
+    if path is None:
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            document = json.load(fh)
+        if not isinstance(document, dict):
+            return None, "golden_telemetry_document_not_mapping"
+        return document, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"[:500]
+
+
+def _golden_adapter_timing(
+    telemetry: Mapping[str, Any] | None,
+    *,
+    call_start_wall_ns: int | None,
+    call_start_mono_ns: int | None,
+    call_end_wall_ns: int | None,
+    call_end_mono_ns: int | None,
+    telemetry_persist_ms: Any = None,
+) -> dict[str, Any]:
+    """Build explicit adapter-call, stage-span/sum, and outside-stage bounds."""
+    timing: dict[str, Any] = {
+        "golden_call_start_wall_unix_ns": call_start_wall_ns,
+        "golden_call_start_mono_ns": call_start_mono_ns,
+        "golden_call_end_wall_unix_ns": call_end_wall_ns,
+        "golden_call_end_mono_ns": call_end_mono_ns,
+        "golden_call_wall_ms": None,
+        "golden_stage_span_ms": None,
+        "golden_stage_sum_ms": None,
+        "golden_pre_stage_overhead_ms": None,
+        "golden_post_stage_overhead_ms": None,
+        "golden_telemetry_persist_ms": telemetry_persist_ms,
+    }
+    if (
+        isinstance(call_start_mono_ns, int)
+        and isinstance(call_end_mono_ns, int)
+        and call_end_mono_ns >= call_start_mono_ns
+    ):
+        timing["golden_call_wall_ms"] = round(
+            (call_end_mono_ns - call_start_mono_ns) / 1_000_000, 3
+        )
+    raw_stages = telemetry.get("stages") if isinstance(telemetry, Mapping) else None
+    stages = [s for s in (raw_stages or []) if isinstance(s, Mapping)]
+    spans = [
+        (int(s["entry_monotonic_ns"]), int(s["end_monotonic_ns"]))
+        for s in stages
+        if isinstance(s.get("entry_monotonic_ns"), int)
+        and isinstance(s.get("end_monotonic_ns"), int)
+        and s["end_monotonic_ns"] >= s["entry_monotonic_ns"]
+    ]
+    if spans:
+        first_entry = min(start for start, _end in spans)
+        last_end = max(end for _start, end in spans)
+        timing["golden_stage_span_ms"] = round((last_end - first_entry) / 1_000_000, 3)
+        timing["golden_stage_sum_ms"] = round(
+            sum(end - start for start, end in spans) / 1_000_000, 3
+        )
+        if isinstance(call_start_mono_ns, int):
+            timing["golden_pre_stage_overhead_ms"] = round(
+                max(first_entry - call_start_mono_ns, 0) / 1_000_000, 3
+            )
+        if isinstance(call_end_mono_ns, int):
+            timing["golden_post_stage_overhead_ms"] = round(
+                max(call_end_mono_ns - last_end, 0) / 1_000_000, 3
+            )
+    return timing
+
+
 def _is_production_profile() -> bool:
     return os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit").strip().lower() == "production"
 
 
 def _vae_snapshot_enabled() -> bool:
     return env_flag("COMFYMODAL_V2_VAE_SNAPSHOT")
+
+
+def _snapshot_exclude_unet_enabled() -> bool:
+    """Return True when ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET == '1'``.
+
+    Identity/reporting gate ONLY — it never controls construction, load,
+    or dtype validation and never weakens the production invariant.
+    Startup always builds the full CLIP/UNET/VAE CPU snapshot; the
+    UNET-absent snapshot is produced by the strict ``clip_vae`` eviction
+    retain role which evicts the UNET (proving it dead) while keeping
+    fresh CLIP/VAE in the retained container.  Never treated as on for any
+    other value (only ``1``/``true``/``yes``/``on``).
+    """
+    return env_flag("COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET")
+
+
+def _snapshot_is_clip_vae_unet_absent(models: Any) -> bool:
+    """True when *models* is the strict UNET-absent ``clip_vae`` retained CPU
+    snapshot: exclude-UNET identity gate active, retain role ``clip_vae``,
+    retained CLIP + VAE present, UNET absent."""
+    if models is None:
+        return False
+    return (
+        getattr(models, "unet", None) is None
+        and getattr(models, "clip", None) is not None
+        and getattr(models, "vae", None) is not None
+        and _snapshot_exclude_unet_enabled()
+        and _parse_evict_retain_role() == "clip_vae"
+    )
 
 
 def _safe_snapshot_identity(value: Any, role: str) -> str:
@@ -1082,7 +1991,16 @@ def production_snapshot_invariant(
     phase: str,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and report the production CLIP/UNET/VAE snapshot contract."""
+    """Validate and report the production CLIP/UNET/VAE snapshot contract.
+
+    The production expectation is unconditional: CLIP and UNET must always
+    be present, and VAE presence must match the model key's declared
+    ``vae_identity``.  ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET`` is an
+    experiment identity/reporting gate only — it never weakens this
+    invariant.  The restore-only deployment uses the ``inherit`` profile,
+    which skips the production gate entirely (status ``pass`` without
+    raising), so a UNET-absent container after eviction never trips it.
+    """
     profile_name = (profile or os.environ.get("COMFYMODAL_V2_ENV_PROFILE", "inherit")).strip().lower()
     clip = getattr(models, "clip", None) if models is not None else None
     unet = getattr(models, "unet", None) if models is not None else None
@@ -1093,9 +2011,11 @@ def production_snapshot_invariant(
     actual_vae = int(vae is not None)
     if profile_name == "production":
         vae_ok = actual_vae == expected_vae
-        status = "pass" if (actual_clip and actual_unet and vae_ok) else "fail"
+        unet_ok = actual_unet == 1
+        status = "pass" if (actual_clip and unet_ok and vae_ok) else "fail"
         reason = "models_present" if status == "pass" else (
-            f"missing_clip={1 - actual_clip};missing_unet={1 - actual_unet};"
+            f"missing_clip={1 - actual_clip};"
+            f"unet_present={actual_unet};expected_unet=1;"
             f"expected_vae={expected_vae};actual_vae={actual_vae}"
         )
     else:
@@ -1125,7 +2045,8 @@ def production_snapshot_invariant(
     if profile_name == "production":
         print(
             f"[v2.production_snapshot_invariant] "
-            f"expected_vae={expected_vae} actual_vae={actual_vae} status={status} "
+            f"expected_vae={expected_vae} actual_vae={actual_vae} "
+            f"expected_unet=1 actual_unet={actual_unet} status={status} "
             f"phase={phase}",
             flush=True,
         )
@@ -1628,6 +2549,13 @@ async def _read_v2_validation_certificate_async(
         return None, timings
 
 
+# Monotonic timestamp of the last runtime-state Volume reload during this
+# container session.  Snapshot-startup certificate retention skips its own
+# redundant Volume reload when the shared runtime-config Volume was already
+# reloaded moments earlier by bootstrap's reload_runtime_state stage.
+_RUNTIME_STATE_VOLUME_RELOADED_MONO: float = 0.0
+
+
 def _read_v2_validation_certificate_for_snapshot(
     cert_identity: str,
     *,
@@ -1666,8 +2594,22 @@ def _read_v2_validation_certificate_for_snapshot(
         volume = ModalMountedStateVolume(RUNTIME_STATE_PATH, modal_volume)
 
         _t0 = time.perf_counter()
-        volume.reload()
+        # The runtime-config Volume was already reloaded by bootstrap's
+        # reload_runtime_state stage earlier in this same startup.  A second
+        # Volume reload here costs ~10s on snapshot startup (remote metadata
+        # refresh) and adds no freshness within one container session, so skip
+        # it when the shared volume was reloaded recently.  Fall back to the
+        # explicit reload whenever the marker is missing or stale.
+        _cert_volume_reload_skipped = False
+        if _RUNTIME_STATE_VOLUME_RELOADED_MONO and (
+            time.monotonic() - _RUNTIME_STATE_VOLUME_RELOADED_MONO
+        ) < 900.0:
+            _cert_volume_reload_skipped = True
+        else:
+            volume.reload()
         timings["cert_volume_reload_ms"] = round((time.perf_counter() - _t0) * 1000, 3)
+        if _cert_volume_reload_skipped:
+            timings["cert_volume_reload_skipped"] = 1.0
 
         filename = _v2_cert_filename(cert_identity)
         _t1 = time.perf_counter()
@@ -1734,6 +2676,191 @@ def _capture_remote_identity() -> dict[str, Any]:
     if runtime_mode:
         identity["runtime_mode"] = runtime_mode
     return identity
+
+
+# Direct Golden does not pass through the restore/model-plan path, so the
+# request adapter must carry the stable fields needed by RA9G.  These values
+# are intentionally limited to canonical model/runtime sources; in
+# particular, no filesystem metadata, object identity, or tensor data is used.
+_GOLDEN_RA9G_SELECTED_TENSOR_SCOPE = "qwen3_4b.transformer.model"
+_GOLDEN_RA9G_MODEL_PATCH_IDENTITY = "golden-native-model-options-v1"
+_GOLDEN_RA9G_IDENTITY_ALIASES = {
+    "checkpoint_identity": (
+        "checkpoint_identity", "checkpoint_id", "source_identity",
+        "checkpoint_hash", "stable_hash",
+    ),
+    "manifest_generation": (
+        "manifest_generation", "content_generation", "manifest_digest",
+        "generation", "digest",
+    ),
+    "selected_tensor_scope": (
+        "selected_tensor_scope", "tensor_scope", "selected_scope", "scope",
+    ),
+    "target_device": ("target_device", "device"),
+    "model_patch_identity": (
+        "model_patch_identity", "patch_identity", "model_identity",
+    ),
+}
+
+
+def _golden_runtime_target_device() -> str:
+    """Return the explicit CUDA device selected for this request."""
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("missing stable identity field: target_device")
+    try:
+        device = str(torch.device("cuda", int(torch.cuda.current_device())))
+    except Exception as exc:
+        raise RuntimeError("missing stable identity field: target_device") from exc
+    if not device.startswith("cuda:"):
+        raise RuntimeError("missing stable identity field: target_device")
+    return device
+
+
+def _golden_ra9g_identity(
+    prompt: Mapping[str, Any], extra_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the request-bound RA9G identity from authoritative sources.
+
+    The fixed Golden contract supplies the selected scope and native
+    model-options identity.  The workflow supplies checkpoint identity,
+    ``comfyapp`` supplies the authoritative models generation, and CUDA
+    supplies the explicit target device.  Any identity supplied by the caller
+    is only accepted when it agrees with every value derived here.
+    """
+    model_key = derive_model_key(dict(prompt))
+    checkpoint_identity = str(getattr(model_key, "clip_identity", "") or "")
+    if not checkpoint_identity:
+        raise RuntimeError("missing stable identity field: checkpoint_identity")
+
+    try:
+        comfyapp = sys.modules.get("comfyapp")
+        reader = getattr(comfyapp, "_read_models_generation_record", None)
+        record = reader() if callable(reader) else None
+    except Exception:
+        record = None
+    manifest_generation = (
+        record.get("generation", "")
+        if isinstance(record, Mapping) else ""
+    )
+    if not isinstance(manifest_generation, str):
+        manifest_generation = ""
+    if not manifest_generation:
+        raise RuntimeError("missing stable identity field: manifest_generation")
+
+    authoritative = {
+        "checkpoint_identity": checkpoint_identity,
+        "manifest_generation": manifest_generation,
+        "selected_tensor_scope": _GOLDEN_RA9G_SELECTED_TENSOR_SCOPE,
+        "target_device": _golden_runtime_target_device(),
+        "model_patch_identity": _GOLDEN_RA9G_MODEL_PATCH_IDENTITY,
+    }
+
+    # Existing Golden accepts these two request-bound identity containers.
+    # Validate all recognized aliases before replacing the boundary value so a
+    # caller cannot smuggle a conflicting alias past the canonical fields.
+    supplied: list[Mapping[str, Any]] = []
+    for name in ("clip_source_identity", "source_identity"):
+        candidate = extra_data.get(name)
+        if isinstance(candidate, Mapping):
+            supplied.append(candidate)
+    for candidate in supplied:
+        for field, aliases in _GOLDEN_RA9G_IDENTITY_ALIASES.items():
+            values = [candidate[key] for key in aliases if key in candidate]
+            if any(value not in (None, "", [], {}) and str(value) != authoritative[field]
+                   for value in values):
+                raise RuntimeError(f"golden_identity_conflict:{field}")
+
+    return authoritative
+
+
+def _post_restore_identity_telemetry(
+    runtime: Any,
+    *,
+    request_id: str = "",
+    remote_identity: Mapping[str, Any] | None = None,
+    host_info: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the runtime-owned identity onto one request-scoped document.
+
+    The nonce is deliberately read from the instance, rather than generated by
+    this helper.  ``restore()`` is the only place that creates it, after the
+    restore lifecycle has completed; consequently neither import, snapshot
+    capture, nor identity capture can copy a nonce into a new container.
+    """
+    remote = dict(remote_identity or {})
+    host = dict(host_info or {})
+    spec = _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
+    restore_timing = getattr(runtime, "_restore_timing", None)
+    restore_timing = restore_timing if isinstance(restore_timing, Mapping) else {}
+    restored_instance_id = str(
+        getattr(runtime, "_restored_instance_id", "")
+        or restore_timing.get("restored_instance_id", "")
+        or ""
+    )
+    restore_session_id = str(
+        getattr(runtime, "_restore_session_id", "")
+        or restore_timing.get("restore_session_id", "")
+        or ""
+    )
+    deployment_identity = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
+    try:
+        snapshot_identity = _snapshot_target_fingerprint(spec)
+    except Exception:
+        snapshot_identity = ""
+    try:
+        runtime_shape = runtime_shape_config(
+            cpu_request=spec.cpu, memory_request=spec.memory,
+        ).identity_payload()
+        config_identity = stable_hash({
+            "runtime_env": _runtime_env(spec),
+            "runtime_shape": runtime_shape,
+            "min_containers": spec.min_containers,
+            "single_use_containers": spec.single_use_containers,
+        })
+    except Exception:
+        runtime_shape = {}
+        config_identity = ""
+    modal_task_id = str(remote.get("container_task_id", "") or "")
+    modal_container_id = str(remote.get("modal_container_id", "") or "")
+    pid = host.get("pid")
+    return {
+        "request_id": str(request_id or ""),
+        "post_restore_nonce": str(getattr(runtime, "_post_restore_nonce", "") or ""),
+        "restore_session_id": restore_session_id,
+        "restored_instance_id": restored_instance_id,
+        "container_session_id": str(
+            getattr(runtime, "container_session_id", "") or _V2_CONTAINER_SESSION_ID
+        ),
+        "container_task_id": modal_task_id,
+        "modal_task_id": modal_task_id,
+        "modal_container_id": modal_container_id,
+        "container_id": modal_container_id,
+        "pid": pid,
+        "process_id": pid,
+        "boot_id": host.get("boot_id"),
+        "restore_count": getattr(runtime, "_restore_count", None),
+        "request_count": getattr(runtime, "_request_count", None),
+        "min_containers": spec.min_containers,
+        "single_use_containers": spec.single_use_containers,
+        "single_use_enabled": spec.single_use_containers,
+        "deployment_identity": deployment_identity,
+        "deployment_combined_hash": deployment_identity,
+        "deployment_fingerprint": deployment_identity,
+        "snapshot_identity": snapshot_identity,
+        "snapshot_target_fingerprint": snapshot_identity,
+        "config_identity": config_identity,
+        "runtime_shape": runtime_shape,
+        "runtime_shape_fingerprint": runtime_shape.get("runtime_shape_fingerprint", ""),
+        "profile_config_fingerprint": os.environ.get(
+            "COMFYMODAL_V2CTL_PROFILE_CONFIG_FINGERPRINT", ""
+        ),
+        "image_id": remote.get("image_id", ""),
+        "cloud": remote.get("cloud", ""),
+        "region": remote.get("region", ""),
+        "modal_input_id": remote.get("modal_input_id", ""),
+    }
 
 
 # ── Host diagnostics (diagnostic only; default off) ──────────────────────
@@ -1945,6 +3072,13 @@ def _capture_host_diagnostics() -> dict[str, Any] | None:
     Never raises; every capture is best-effort and wrapped.
     """
     global _HOST_DIAGNOSTICS_CACHE
+    try:
+        from . import clean_lane as _clean_lane
+        if _clean_lane.enabled():
+            _clean_lane.forbidden_activity("background_host_diagnostics")
+            return None
+    except Exception:
+        pass
     if not _host_diagnostics_enabled():
         return None
     if _HOST_DIAGNOSTICS_CACHE is not None:
@@ -1979,6 +3113,126 @@ def _capture_host_diagnostics() -> dict[str, Any] | None:
 
 
 # ── Full-trace packaging helpers (inert when disabled) ────────────────
+
+
+def _persist_child_viztracer_manifest(session: Any, result: dict[str, Any]) -> str:
+    """Write the child-trace manifest and log the outcome. Returns "" on success.
+
+    A write failure used to be swallowed entirely, which made a vanished manifest
+    impossible to diagnose: a bundle with no manifest looked exactly like a run
+    where the flag was off. Only the error reporting changed; the manifest is
+    still written on the same paths as before.
+    """
+    error_name = ""
+    try:
+        (session.base_dir / "raw" / "trace_child_viztracer_manifest.json").write_text(
+            json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        error_name = type(exc).__name__
+    print(
+        f"[v2.full_trace] stage=child_viztracer "
+        f"status={result.get('status')} "
+        f"enabled={bool(result.get('enabled'))} "
+        f"trace_present={bool(result.get('trace_present'))} "
+        f"child_ran={result.get('child_ran')} "
+        f"state_unknown={bool(result.get('state_unknown'))} "
+        f"error={result.get('error') or 'none'} "
+        f"manifest_write_error={error_name or 'none'} "
+        f"trace_id={getattr(session, 'trace_id', '')}",
+        flush=True,
+    )
+    return error_name
+
+
+def _attach_child_viztracer_trace(session: Any) -> dict[str, Any]:
+    """Copy the C0 child trace into the session ``raw/`` dir before bundling.
+
+    The C0 child process traces itself to a deterministic path when
+    ``COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER`` is ON, but the child cannot add
+    itself to the parent's bundle.  Without this copy the bundle ships
+    parent-only, and the whole request reads as a single traced process even
+    though the child recorded thousands of intervals.
+
+    Uses the deterministic child output path only, never a newest-file
+    heuristic.  When the flag is ON but the artifact is missing or failed, an
+    explicit ``missing_child_trace`` status is preserved so the run is never
+    counted as complete parent+child capture.  Never raises.
+    """
+    result: dict[str, Any] = {
+        "enabled": False,
+        "status": "disabled",
+        "source_path": "",
+        "raw_path": None,
+        "trace_present": False,
+        "sha256": "",
+        "size_bytes": 0,
+    }
+    try:
+        from .golden_io_process_v2 import child_viztracer_artifact
+        artifact = child_viztracer_artifact()
+    except Exception as _artifact_exc:
+        # We could not determine whether the child tracer was on. That is not the
+        # same as proven-off, so record it: previously this returned before both
+        # the manifest write and the log line, leaving a bundle with no manifest
+        # that was indistinguishable from a run which never asked for a child
+        # trace. A clean disable still writes nothing.
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = type(_artifact_exc).__name__
+        _persist_child_viztracer_manifest(session, result)
+        return result
+    if not isinstance(artifact, dict):
+        result["status"] = "disabled"
+        result["state_unknown"] = True
+        result["error"] = "artifact_not_a_dict"
+        _persist_child_viztracer_manifest(session, result)
+        return result
+    result["enabled"] = bool(artifact.get("enabled"))
+    result["source_path"] = str(artifact.get("path") or "")
+    if not result["enabled"]:
+        # Proven off: no manifest, by contract.
+        return result
+    reason = str(artifact.get("status") or "unknown")
+    result["reason"] = reason
+    source = result["source_path"]
+    trace_ok = (
+        bool(artifact.get("trace_present"))
+        and bool(source)
+        and os.path.isfile(source)
+    )
+    if reason == "saved" and trace_ok:
+        try:
+            with open(source, "rb") as handle:
+                payload = handle.read()
+            digest = hashlib.sha256(payload).hexdigest()
+            raw_rel = "raw/trace_child_viztracer.json"
+            (session.base_dir / raw_rel).write_bytes(payload)
+            result.update({
+                "status": "captured",
+                "raw_path": raw_rel,
+                "trace_present": True,
+                "sha256": digest,
+                "size_bytes": len(payload),
+                "viztracer_version": str(artifact.get("viztracer_version") or ""),
+                "tracer_entries": int(artifact.get("tracer_entries") or 0),
+                "max_stack_depth": int(artifact.get("max_stack_depth") or 0),
+                "child_pid": int(artifact.get("pid") or 0),
+            })
+        except Exception as exc:
+            result.update({
+                "status": "missing_child_trace",
+                "trace_present": False,
+                "error": type(exc).__name__,
+            })
+    else:
+        result["status"] = "missing_child_trace"
+# The manifest is written even on failure so a missing child trace is
+    # visible in the bundle instead of being indistinguishable from a child that
+    # was never asked to trace.
+    _persist_child_viztracer_manifest(session, result)
+    return result
 
 
 def _build_full_trace_bundle(session: Any) -> tuple[str, str, bytes, str, list[dict[str, Any]]] | None:
@@ -2092,10 +3346,13 @@ def _finalize_full_trace(
       4. Stop resource sampler
       5. Stop VizTracer
       6. Write sanitized runtime summary
-      7. Generate report (not traced)
-      8. Package bundle (not traced)
-      9. Persist bundle and descriptor to profile Volume, commit once
-     10. Attach ``full_trace_artifact`` with exact descriptor fields
+      7. Package raw bundle (not traced)
+      8. Persist the raw bundle and minimal descriptor to profile Volume,
+         committing once
+      9. Attach ``full_trace_artifact`` with descriptor fields
+
+    Rich report generation and named-Volume readback are offline concerns and
+    are intentionally absent from request-critical finalization.
 
     Never captures a milestone after ``stop_tracing()``.
 
@@ -2114,10 +3371,10 @@ def _finalize_full_trace(
     _viztracer_status: str = "absent"
     _torch_profiler_status: str = "absent"
     _resource_sampler_status: str = "absent"
-    _report_status: str = "absent"
-    _trace_truncated: bool = False
-    _trace_entry_count: int = 0
-    _trace_entry_capacity: int = 0
+    _stage_timings_ms: dict[str, float] = {}
+    _trace_truncated: bool | None = None
+    _trace_entry_count: int | None = None
+    _trace_entry_capacity: int | None = None
     try:
         # Wrap raw Modal Volume for atomic write+commit persistence
         # ── 1. Final milestone (BEFORE stop_tracing) ──
@@ -2125,34 +3382,86 @@ def _finalize_full_trace(
         # ── 2. Close semantic operations ──
         _close_semantic_ops(session)
         # ── 3+4+5: stop_tracing handles Torch, resource sampler, VizTracer ──
+        _stop_started = time.perf_counter()
         _stop_result = session.stop_tracing()
+        _stage_timings_ms["stop_tracing_ms"] = round(
+            (time.perf_counter() - _stop_started) * 1000, 3
+        )
         if isinstance(_stop_result, dict):
             _v = _stop_result.get("viztracer", {})
             if isinstance(_v, dict):
                 _viztracer_status = "ok" if _v.get("saved") else "error"
-                _trace_entry_count = _v.get("entry_count", 0)
-                _trace_entry_capacity = _v.get("entry_capacity", 0)
+                _trace_entry_count = _v.get("entry_count")
+                _trace_entry_capacity = _v.get("entry_capacity")
+                for _timing_name in ("stop_ms", "save_ms", "gzip_ms", "total_ms"):
+                    _timing_value = _v.get(_timing_name)
+                    if isinstance(_timing_value, (int, float)):
+                        _stage_timings_ms[f"viztracer_{_timing_name}"] = float(
+                            _timing_value
+                        )
             _t = _stop_result.get("torch_profiler", {})
             if isinstance(_t, dict) and _t.get("exported"):
                 _torch_profiler_status = "ok"
             _r = _stop_result.get("resource_sampler", {})
             if isinstance(_r, dict) and "sample_count" in _r:
                 _resource_sampler_status = "ok"
-        # ── 6. Write sanitized runtime summary (allowlist only, write after stop) ──
-        _summary = dict(result_summary or {})
-        _allowlist = {"status", "error", "correlation_id", "request_id",
-                       "finalized_at", "trace_id", "elapsed_seconds"}
+        # ── 6. Persist request-owned rich evidence, then write the scalar summary ──
+        # The result envelope is deliberately scalar-only on the summary path,
+        # but Golden telemetry is the raw evidence consumed by the offline
+        # profiler.  Keep that evidence in its own invocation-owned artifact;
+        # never put the nested document on stdout or rely on the result
+        # envelope retaining it after finalization.
+        _summary_source = result_summary
+        if not isinstance(_summary_source, Mapping):
+            _summary_source = getattr(session, "_result_summary", {})
+        _summary = dict(_summary_source) if isinstance(_summary_source, Mapping) else {}
+        _golden_telemetry = _summary.get("golden_telemetry")
+        _golden_telemetry_path = session.base_dir / "raw" / "golden_telemetry.json"
+        _golden_telemetry_sha256 = ""
+        if isinstance(_golden_telemetry, Mapping):
+            try:
+                _telemetry_bytes = json.dumps(
+                    _golden_telemetry,
+                    sort_keys=True,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                _golden_telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+                _golden_telemetry_path.write_bytes(_telemetry_bytes)
+                _golden_telemetry_sha256 = hashlib.sha256(_telemetry_bytes).hexdigest()
+            except Exception as _telemetry_exc:
+                print(
+                    f"[v2.full_trace] stage=golden_telemetry status=error "
+                    f"error_type={type(_telemetry_exc).__name__} trace_id={_trace_id}",
+                    flush=True,
+                )
+        _allowlist = {
+            "status", "error", "correlation_id", "request_id",
+            "finalized_at", "trace_id", "elapsed_seconds",
+            # Scalar projections of the request's explicit Golden profiling
+            # contract.  The ordered stage lists remain in trace_config.json.
+            "golden_profile_contract",
+            "golden_profile_require_canonical_stages",
+            "output_durability_mode",
+            "durability_requested",
+            "golden_telemetry_artifact_path",
+            "golden_telemetry_artifact_sha256",
+        }
         _sanitized = {k: v for k, v in _summary.items() if k in _allowlist
                       and isinstance(v, (str, int, float, bool, type(None)))}
         _sanitized["finalized_at"] = time.time()
         _sanitized["request_id"] = request_id
         _sanitized["trace_id"] = _trace_id
+        if _golden_telemetry_sha256:
+            _sanitized["golden_telemetry_artifact_path"] = "raw/golden_telemetry.json"
+            _sanitized["golden_telemetry_artifact_sha256"] = _golden_telemetry_sha256
         session.set_result_summary(_sanitized)
         # Overwrite the summary file (stop_tracing wrote the pre-sanitized version)
         _summary_path = session.base_dir / "raw" / "runtime_result_summary.json"
         try:
             _summary_path.write_text(
-                json.dumps(dict(session._result_summary), indent=2, default=str),
+                json.dumps(_sanitized, indent=2, ensure_ascii=False, allow_nan=False),
                 encoding="utf-8",
             )
         except OSError as _se:
@@ -2161,30 +3470,15 @@ def _finalize_full_trace(
                 f"trace_id={_trace_id} error_type=SummaryWriteError",
                 flush=True,
             )
-        # ── 7. Generate report (not traced) ──
-        _report_ok = False
-        try:
-            from .full_trace_report import generate_full_trace_report as _gen_report
-            _report = _gen_report(session.base_dir)
-            if isinstance(_report, dict) and _report.get("status") != "error":
-                _report_ok = True
-                _report_status = "ok"
-            else:
-                _report_status = "error"
-        except Exception as _report_exc:
-            _report_status = "error"
-            print(
-                f"[v2.full_trace] stage=report status=error "
-                f"error_type={type(_report_exc).__name__} trace_id={_trace_id}",
-                flush=True,
-            )
-            print(
-                f"[v2.full_trace_artifact] status=error "
-                f"trace_id={_trace_id} error_type=ReportError",
-                flush=True,
-            )
-        # ── 8. Package bundle (not traced) ──
+        # ── 7. Package raw bundle (not traced) ──
+        # The C0 child traced itself to its own /tmp path; copy it into raw/
+        # first so the bundle is parent+child rather than parent-only.
+        _child_trace_result = _attach_child_viztracer_trace(session)
+        _bundle_started = time.perf_counter()
         _bundle = _build_full_trace_bundle(session)
+        _stage_timings_ms["bundle_ms"] = round(
+            (time.perf_counter() - _bundle_started) * 1000, 3
+        )
         if _bundle is None:
             print(
                 f"[v2.full_trace] stage=bundle status=error "
@@ -2230,9 +3524,13 @@ def _finalize_full_trace(
         _remote_dir = f"v2-full-trace/{_utc_date}/{_trace_id}"
         _remote_bundle_path = f"{_remote_dir}/bundle.tar.gz"
         _remote_descriptor_path = f"{_remote_dir}/artifact.json"
+        _upload_started = time.perf_counter()
         _uploaded = _upload_full_trace_bundle(
             profile_volume, _trace_id, _tar_bytes, _sha256,
             remote_bundle_path=_remote_bundle_path,
+        )
+        _stage_timings_ms["upload_ms"] = round(
+            (time.perf_counter() - _upload_started) * 1000, 3
         )
         if _uploaded is None:
             print(
@@ -2261,13 +3559,33 @@ def _finalize_full_trace(
             "remote_descriptor_path": _remote_descriptor_path,
             "bundle_size_bytes": _bundle_size,
             "bundle_sha256": _sha256,
-            "report_status": _report_status,
+            "report_status": "deferred_offline",
             "viztracer_status": _viztracer_status,
             "torch_profiler_status": _torch_profiler_status,
             "resource_sampler_status": _resource_sampler_status,
             "trace_truncated": _trace_truncated,
             "trace_entry_count": _trace_entry_count,
             "trace_entry_capacity": _trace_entry_capacity,
+            "request_id": request_id,
+            "request_id_hash": hashlib.sha256(request_id.encode("utf-8")).hexdigest(),
+            "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+            "deployment_hash": str(_V2_DEPLOYMENT_COMBINED_HASH or ""),
+            "identity": {
+                "container_session_id": str(
+                    getattr(session, "_container_session_id", "") or ""
+                ),
+                "restored_instance_id": str(
+                    getattr(session, "_restored_instance_id", "") or ""
+                ),
+                "restore_session_id": str(
+                    getattr(session, "_restore_session_id", "") or ""
+                ),
+                "modal_task_id": str(getattr(session, "_modal_task_id", "") or ""),
+                "image_id": str(getattr(session, "_image_id", "") or ""),
+                "cloud": str(getattr(session, "_cloud", "") or ""),
+                "region": str(getattr(session, "_region", "") or ""),
+            },
+            "finalization_timings_ms": dict(_stage_timings_ms),
             "finalize_ms": _finalize_ms,
         }
         _descriptor_bytes = json.dumps(_descriptor, separators=(",", ":")).encode("utf-8")
@@ -2325,6 +3643,7 @@ def _finalize_full_trace(
             "trace_id": _trace_id,
             "error_type": _error_type,
             "error": f"finalization failed: {_error_type}",
+            "finalization_timings_ms": dict(_stage_timings_ms),
             "finalize_ms": _finalize_ms,
         }
         print(
@@ -2354,11 +3673,26 @@ def _safe_full_trace_artifact(
     volume: Any,
     request_id: str,
     result_summary: dict[str, Any] | None = None,
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Safe wrapper: returns ``{"status": "absent"}`` when disabled, else
-    delegates to ``_finalize_full_trace``.  Returns error descriptor on
-    exception.  Never raises."""
-    if not _V2_FULL_TRACE_ENABLED or session is None:
+    """Finalize a trace, preserving disabled behavior unless explicitly forced.
+
+    A claimed restore-scoped session is an explicit request to finalize even if
+    the mutable process gate has since changed.  A missing forced session is an
+    error, not an absent artifact, so the claim failure remains observable.
+    Never raises.
+    """
+    if session is None:
+        if force:
+            return {
+                "status": "error",
+                "error_type": "FullTraceSessionUnavailable",
+                "error": "claimed full trace session unavailable",
+                "reason": "claimed_session_missing",
+            }
+        return {"status": "absent"}
+    if not _V2_FULL_TRACE_ENABLED and not force:
         return {"status": "absent"}
     try:
         return _finalize_full_trace(session, volume, request_id, result_summary=result_summary)
@@ -2378,6 +3712,859 @@ def _safe_full_trace_artifact(
         }
 
 
+def _golden_full_trace_requested() -> bool:
+    """Return the exact deploy-time profiler request, without aliases."""
+    return os.environ.get("COMFYMODAL_V2_FULL_TRACE", "").strip() == "1"
+
+
+def _golden_minimal_restore_enabled() -> bool:
+    """Return whether ModalRuntimeEntrypoint.restore() selects the minimal path.
+
+    Golden Serial selects ``_golden_minimal_restore()`` by default.  An explicit
+    ``COMFYMODAL_GOLDEN_MINIMAL_RESTORE`` always wins over the profile default:
+    a truthy value forces minimal, while ``0``/``false``/``no``/``off``
+    deliberately selects the legacy rollback/debug restore.  Non-Golden
+    containers remain on the legacy path unless explicitly enabled.  Read at
+    restore entry so the selection can be changed by deploy without touching
+    request configuration.
+    """
+    if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
+        return env_flag("COMFYMODAL_GOLDEN_MINIMAL_RESTORE", default=False)
+    return _golden_serial_profile_active()
+
+
+def _emit_golden_profiler_lifecycle(
+    lifecycle: str,
+    *,
+    request_id: str = "",
+    status: str,
+    reason: str = "",
+) -> None:
+    """Emit one bounded lifecycle record only for an explicitly armed trace."""
+    if not _golden_full_trace_requested():
+        return
+    print(
+        "[v2.golden_profiler] "
+        f"lifecycle={_golden_profiler_one_line(lifecycle)} "
+        f"request_id={_golden_profiler_one_line(request_id)} "
+        f"status={_golden_profiler_one_line(status)} "
+        f"reason={_golden_profiler_one_line(reason)}",
+        flush=True,
+    )
+
+
+def _golden_sage_provenance(api: Any) -> dict[str, str]:
+    """Project Sage policy fields plus the runtime-observed resolved mode."""
+    configured = os.environ.get("COMFYMODAL_SAGE_RUNTIME_MODE", "auto")
+    try:
+        from .sage_policy import (
+            resolve_sage_runtime_mode,
+            sage_four_field_identity,
+        )
+
+        _resolved_policy, _reason, effective_input, resolution_source = (
+            resolve_sage_runtime_mode(
+                None,
+                configured,
+                None,
+                golden_flag=True,
+            )
+        )
+        bootstrap = getattr(api, "bootstrap", None)
+        bootstrap_state = getattr(bootstrap, "state", None)
+        observed = str(
+            getattr(bootstrap_state, "sage_mode", "") or ""
+        ).strip().lower()
+        if not observed:
+            observed = str(getattr(api, "_sage_runtime_mode", "") or "").strip().lower()
+        fields = sage_four_field_identity(
+            configured=configured,
+            effective_input=effective_input,
+            resolution_source=resolution_source,
+            resolved=observed,
+        )
+        return fields
+    except Exception:
+        return {
+            "sage_runtime_mode_configured": str(configured or "auto"),
+            "sage_runtime_mode_effective_input": "auto",
+            "sage_runtime_mode_resolution_source": "unavailable",
+            "sage_runtime_mode_resolved": "missing",
+        }
+
+
+def _source_probe_diagnostics(runtime: Any) -> dict[str, Any]:
+    """Collect read-only parity evidence without starting the request runner.
+
+    This intentionally observes the already-loaded runtime.  In particular it
+    does not call the Sage smoke test (which allocates CUDA tensors) and does
+    not register a node merely because its source package is present.
+    """
+    diagnostics: dict[str, Any] = {}
+    legacy = getattr(runtime, "_legacy_module", None) or sys.modules.get("comfyapp")
+
+    # The baked manifest is read through comfyapp's existing loader.  The
+    # direct bytes read is only for path/readability and an artifact digest.
+    manifest_path = str(
+        getattr(legacy, "BAKED_CUSTOM_NODE_DEPS_MANIFEST_PATH", "")
+        or "/opt/comfymodal/custom_node_deps_baked.json"
+    )
+    manifest: dict[str, Any] = {}
+    manifest_diag: dict[str, Any] = {
+        "path": manifest_path,
+        "exists": False,
+        "readable": False,
+        "schema_version": None,
+        "manifest_sha256": "",
+        "overall_dependency_hash": "",
+        "node_count": 0,
+        "dependency_node_count": 0,
+        "dependency_file_count": 0,
+        "node_set": [],
+        "node_set_hash": "",
+        "dependency_node_set": [],
+        "dependency_node_set_hash": "",
+        "status": "unknown",
+        "reason": "comfyapp_runtime_unavailable" if legacy is None else "",
+    }
+    try:
+        manifest_file = Path(manifest_path)
+        manifest_diag["exists"] = manifest_file.is_file()
+        if manifest_diag["exists"]:
+            raw = manifest_file.read_bytes()
+            manifest_diag["readable"] = True
+            manifest_diag["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            loader = getattr(legacy, "load_baked_custom_node_dependency_manifest", None)
+            loaded = loader() if callable(loader) else json.loads(raw.decode("utf-8"))
+            if isinstance(loaded, dict):
+                manifest = loaded
+                manifest_diag["reason"] = ""
+            else:
+                manifest_diag["reason"] = "manifest_loader_returned_non_mapping"
+        else:
+            manifest_diag["status"] = "missing"
+            manifest_diag["reason"] = "manifest_missing"
+    except Exception as exc:  # noqa: BLE001
+        manifest_diag["reason"] = f"manifest_read_failed:{type(exc).__name__}"
+
+    nodes = manifest.get("nodes") if isinstance(manifest.get("nodes"), dict) else {}
+    node_set = sorted(str(name) for name in nodes)
+    dependency_nodes_value = manifest.get("dependency_nodes")
+    if isinstance(dependency_nodes_value, (list, tuple, set)):
+        dependency_nodes = sorted(str(name) for name in dependency_nodes_value)
+    else:
+        dependency_nodes = sorted(
+            str(name)
+            for name, value in nodes.items()
+            if isinstance(value, dict) and value.get("dependency_files")
+        )
+    dependency_file_count = 0
+    for value in nodes.values():
+        if not isinstance(value, dict):
+            continue
+        dependency_files = value.get("dependency_files")
+        if isinstance(dependency_files, (dict, list, tuple, set)):
+            dependency_file_count += len(dependency_files)
+
+    def _set_hash(names: list[str]) -> str:
+        return hashlib.sha256(
+            json.dumps(names, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest() if names else ""
+
+    manifest_diag.update({
+        "schema_version": manifest.get("schema_version"),
+        "overall_dependency_hash": str(manifest.get("overall_dependency_hash") or ""),
+        "node_count": len(node_set),
+        "dependency_node_count": len(dependency_nodes),
+        "dependency_file_count": dependency_file_count,
+        "node_set": node_set,
+        "node_set_hash": _set_hash(node_set),
+        "dependency_node_set": dependency_nodes,
+        "dependency_node_set_hash": _set_hash(dependency_nodes),
+    })
+    if manifest_diag["readable"] and manifest:
+        required = (
+            manifest_diag["overall_dependency_hash"],
+            manifest_diag["dependency_node_set_hash"] or manifest_diag["node_set_hash"],
+        )
+        manifest_diag["status"] = "ok" if all(required) else "incomplete"
+        if not all(required):
+            manifest_diag["reason"] = "manifest_identity_incomplete"
+    elif manifest_diag["exists"] and not manifest_diag["readable"]:
+        manifest_diag["status"] = "unreadable"
+    elif manifest_diag["exists"]:
+        manifest_diag["status"] = "invalid"
+    diagnostics["baked_dependency_manifest"] = manifest_diag
+
+    # Sage evidence is deliberately import-only.  A callable public dispatcher
+    # is reported as available, not as executed or smoke-tested.
+    sage: dict[str, Any] = {
+        "site_packages_root": str(
+            getattr(legacy, "SAGEATTENTION_SITE_PACKAGES", "")
+            or "/usr/local/lib/python3.11/site-packages"
+        ),
+        "extension_present": False,
+        "expected_native_family": "",
+        "expected_native_family_present": False,
+        "extension_files": [],
+        "imported": False,
+        "public_dispatcher": {
+            "available": None,
+            "symbol": "",
+            "status": "unknown",
+        },
+        "runtime_mode": str(getattr(runtime, "_sage_runtime_mode", "") or "") or "unknown",
+        "runtime_reason": str(getattr(runtime, "_sage_runtime_reason", "") or "") or "unknown",
+        "status": "unknown",
+        "reason": "sage_policy_unavailable",
+    }
+    try:
+        from .sage_policy import (
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY,
+            list_sageattention_extension_files,
+            sageattention_artifact_identity,
+            select_public_sageattention_callable,
+        )
+
+        sage["expected_native_family"] = SAGEATTENTION_EXPECTED_NATIVE_FAMILY
+        root = sage["site_packages_root"]
+        extension_files = list_sageattention_extension_files(root)
+        sage["extension_files"] = [str(path) for path in extension_files]
+        sage["extension_present"] = bool(extension_files)
+        sage["expected_native_family_present"] = any(
+            SAGEATTENTION_EXPECTED_NATIVE_FAMILY in path.name for path in extension_files
+        )
+        artifact = sageattention_artifact_identity(root)
+        sage["extension_manifest_hash"] = str(artifact.get("extension_manifest_hash") or "")
+        if not extension_files:
+            sage["reason"] = "compiled-extensions-missing"
+            sage["status"] = "unavailable"
+        elif not sage["expected_native_family_present"]:
+            sage["reason"] = f"expected-native-family-missing:{SAGEATTENTION_EXPECTED_NATIVE_FAMILY}"
+            sage["status"] = "unavailable"
+        else:
+            try:
+                importlib.invalidate_caches()
+                importlib.import_module("sageattention._fused")
+                sage_module = importlib.import_module("sageattention")
+                sage["imported"] = True
+                symbol, callable_obj, _ = select_public_sageattention_callable(sage_module)
+                dispatcher = sage["public_dispatcher"]
+                dispatcher.update({
+                    "available": callable(callable_obj),
+                    "symbol": str(symbol or ""),
+                    "status": "available" if callable(callable_obj) else "unavailable",
+                })
+                if callable(callable_obj):
+                    sage["status"] = "available_not_smoke_tested"
+                    sage["reason"] = "public_dispatcher_imported_only"
+                else:
+                    sage["status"] = "unavailable"
+                    sage["reason"] = "public-sageattn-callable-missing"
+            except Exception as exc:  # noqa: BLE001
+                sage["reason"] = f"native-import-failed:{type(exc).__name__}"
+                sage["status"] = "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        sage["reason"] = f"sage-diagnostic-failed:{type(exc).__name__}"
+    diagnostics["sage"] = sage
+
+    # Only the live ComfyUI registry proves registration.  Source modules and
+    # class names alone are not treated as a registration claim.
+    join: dict[str, Any] = {
+        "registered": None,
+        "owner": "unknown",
+        "source": "unknown",
+        "source_module": "",
+        "source_file": "",
+        "classification": "unknown",
+        "reason": "nodes_registry_unavailable",
+    }
+    try:
+        nodes_module = sys.modules.get("nodes")
+        if nodes_module is None:
+            # Do not import ComfyUI's node loader from this read-only probe:
+            # absence of a live registry is explicitly unknown, not a reason
+            # to initialize custom nodes just to manufacture evidence.
+            raise RuntimeError("nodes_registry_not_loaded")
+        mappings = getattr(nodes_module, "NODE_CLASS_MAPPINGS", None)
+        if not isinstance(mappings, Mapping):
+            join["reason"] = "nodes_registry_unavailable"
+        elif "JoinStrings" not in mappings or mappings.get("JoinStrings") is None:
+            join.update({"registered": False, "classification": "missing", "reason": "not_registered"})
+        else:
+            cls = mappings["JoinStrings"]
+            module_name = str(getattr(cls, "__module__", "") or "")
+            join["registered"] = True
+            join["source_module"] = module_name
+            try:
+                join["source_file"] = str(inspect.getfile(cls))
+            except Exception:  # noqa: BLE001
+                pass
+            source_blob = f"{module_name} {join['source_file']}".lower()
+            if "kjnodes" in source_blob or "kj-nodes" in source_blob:
+                join.update({
+                    "owner": "KJNodes",
+                    "source": "real_kjnodes",
+                    "classification": "real_kjnodes",
+                    "reason": "live_registry_points_to_real_kjnodes",
+                })
+            else:
+                join.update({
+                    "classification": "unknown",
+                    "reason": "live_registry_owner_unrecognized",
+                })
+    except Exception as exc:  # noqa: BLE001
+        join["reason"] = f"nodes_registry_probe_failed:{type(exc).__name__}"
+    diagnostics["join_strings"] = join
+    return diagnostics
+
+
+def _emit_golden_diagnostics_config(
+    stage: str,
+    *,
+    api: Any = None,
+    attention_configured: str = "auto",
+    attention_resolved: str = "pending",
+) -> None:
+    """Emit the canonical RX9P-M startup/restore configuration block."""
+    e27_enabled = os.environ.get("COMFYMODAL_V2_E27_FORENSICS", "").strip() == "1"
+    if not (_golden_full_trace_requested() or e27_enabled):
+        return
+    transport_configured = os.environ.get("COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy")
+    try:
+        from .golden_qd_transport import normalize_transport_arm
+
+        transport_resolved = normalize_transport_arm(transport_configured)
+    except Exception:
+        transport_resolved = "invalid"
+    decoupled_dimension_fields = []
+    for dimension_name in (
+        "COMFYMODAL_GOLDEN_SOURCE_QD",
+        "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES",
+        "COMFYMODAL_GOLDEN_H2D_COPY_BYTES",
+        "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH",
+        "COMFYMODAL_GOLDEN_SOURCE_CAPACITY",
+    ):
+        raw_dimension = os.environ.get(dimension_name, "")
+        decoupled_dimension_fields.extend((
+            f"{dimension_name.lower()}={_golden_profiler_one_line(raw_dimension or 'default')}",
+            f"{dimension_name.lower()}_provenance={'environment' if raw_dimension.strip() else 'default'}",
+        ))
+    sage = _golden_sage_provenance(api) if api is not None else {
+        "sage_runtime_mode_configured": os.environ.get(
+            "COMFYMODAL_SAGE_RUNTIME_MODE", "auto"
+        ),
+        "sage_runtime_mode_effective_input": "auto",
+        "sage_runtime_mode_resolution_source": "pending",
+        "sage_runtime_mode_resolved": "missing",
+    }
+    print(
+        f"[v2.golden_diagnostics] stage={_golden_profiler_one_line(stage)} "
+        f"full_trace_requested={int(_golden_full_trace_requested())} "
+        f"full_trace_gate={int(_V2_FULL_TRACE_ENABLED)} "
+        f"e27_forensics_requested={int(e27_enabled)} "
+        f"e27_forensics_gate={int(e27_enabled)} "
+        f"transport_configured={_golden_profiler_one_line(transport_configured)} "
+        f"transport_resolved={_golden_profiler_one_line(transport_resolved)} "
+        f"static_e27_arm={int(transport_resolved == 'static_e27')} "
+        + " ".join(decoupled_dimension_fields) + " "
+        f"attention_backend_configured={_golden_profiler_one_line(attention_configured)} "
+        f"attention_backend_resolved={_golden_profiler_one_line(attention_resolved)} "
+        + " ".join(
+            f"{key}={_golden_profiler_one_line(value)}"
+            for key, value in sage.items()
+        ),
+        flush=True,
+    )
+
+
+def _golden_profiler_one_line(value: Any) -> str:
+    """Keep scalar profiler fields on one bounded stdout line."""
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    return text if len(text) <= _GOLDEN_LOG_VALUE_LIMIT else (
+        text[: _GOLDEN_LOG_VALUE_LIMIT - 3] + "..."
+    )
+
+
+def _golden_profiler_number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _golden_profiler_summary_value(
+    span: Mapping[str, Any], *keys: str,
+) -> Any:
+    """Read a persisted span field without manufacturing a measurement."""
+    for key in keys:
+        value = span.get(key)
+        if value is not None:
+            return value
+    return "measurement_unavailable"
+
+
+def _load_modal_report_data(derived_dir: Path) -> Mapping[str, Any] | None:
+    """Load the persisted report projection used by the Modal log."""
+    try:
+        value = json.loads(
+            (derived_dir / "report_data.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _modal_report_value(value: Any) -> str:
+    """Render a report scalar without turning missing evidence into zero."""
+    if value is None:
+        value = "measurement_unavailable"
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        except Exception:
+            value = "measurement_unavailable"
+    return _golden_profiler_one_line(value)
+
+
+def _append_modal_evidence_projection(
+    lines: list[str],
+    report_data: Mapping[str, Any] | None,
+    summary: Mapping[str, Any] | None,
+) -> None:
+    """Append persisted deep-sampler and source/H2D evidence as separate domains.
+
+    These records are never converted into ``SPAN`` rows or Gantt children.
+    Host monotonic and CUDA elapsed measurements remain separate, and overlap
+    remains a union/non-additive diagnostic.
+    """
+    def report_domain(name: str, default: Mapping[str, Any]) -> Mapping[str, Any]:
+        for container in (report_data, summary):
+            if isinstance(container, Mapping):
+                value = container.get(name)
+                if isinstance(value, Mapping):
+                    return value
+        return default
+
+    deep = report_domain("sampling_deep_profile", {
+        "status": "unavailable", "record_count": 0, "duplicate_count": 0,
+        "step_breakdown": [], "model_breakdown": [],
+    })
+    profile = report_data.get("golden_profile") if isinstance(report_data, Mapping) else None
+    if not isinstance(profile, Mapping):
+        profile = summary if isinstance(summary, Mapping) else {}
+    lines.extend([
+        f"VIZTRACER_CHILD_COVERAGE={_modal_report_value(profile.get('VIZTRACER_CHILD_COVERAGE', 'measurement_unavailable'))}",
+        f"VIZTRACER_CHILD_COVERAGE_STATUS={_modal_report_value(profile.get('VIZTRACER_CHILD_COVERAGE_STATUS', 'unavailable'))}",
+        f"CROSS_EVIDENCE_DECOMPOSITION={_modal_report_value(profile.get('CROSS_EVIDENCE_DECOMPOSITION', 'NONE'))}",
+        "EVIDENCE_DOMAINS=golden_profile,sampling_deep_profile,source_h2d_transport",
+    ])
+    unresolved = profile.get("unresolved_over_50ms", [])
+    if not isinstance(unresolved, list):
+        unresolved = []
+    lines.append("UNRESOLVED >50ms AREAS")
+    if unresolved:
+        for area in unresolved:
+            if isinstance(area, Mapping):
+                lines.append(
+                    f"UNRESOLVED name={_modal_report_value(area.get('name'))} "
+                    f"wall_ms={_modal_report_value(area.get('wall_ms'))} "
+                    f"residual_ms={_modal_report_value(area.get('residual_ms'))}"
+                )
+    else:
+        lines.append("UNRESOLVED none; sampling/transport are excluded when separately explained")
+    step_rows = deep.get("step_breakdown")
+    step_rows = step_rows if isinstance(step_rows, list) else []
+    lines.extend([
+        "SAMPLING SUMMARY",
+        "STEP BREAKDOWN",
+        "EVIDENCE_DOMAIN=sampling_deep_profile",
+        f"SAMPLING_DEEP_PROFILE_STATUS={_modal_report_value(deep.get('status'))}",
+        f"SAMPLING_DEEP_PROFILE_RECORD_COUNT={_modal_report_value(deep.get('record_count'))}",
+        f"SAMPLING_DEEP_PROFILE_DUPLICATE_COUNT={_modal_report_value(deep.get('duplicate_count'))}",
+    ])
+    # Detailed rows remain in the persisted text/JSON artifacts.  Keep Modal
+    # stdout readable and bounded with aggregate values only.
+    lines.append(f"SAMPLING_STEP_ROW_COUNT={len(step_rows)}")
+
+    summary_metrics = (
+        "FIRST_PASS_WALL_MS", "SUBSEQUENT_STEPS_WALL_MS", "TOTAL_STEP_UNION_MS",
+        "SAMPLER_PARENT_WALL_MS", "UNACCOUNTED_MS",
+    )
+    for metric in summary_metrics:
+        matches = [
+            row for row in step_rows
+            if isinstance(row, Mapping) and str(row.get("label", "")) == metric
+        ]
+        if not matches:
+            lines.append(f"STEP_METRIC {metric}=measurement_unavailable SOURCE=measurement_unavailable")
+        for row in matches[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            lines.append(
+                f"STEP_METRIC {metric}={_modal_report_value(row.get('wall_ms'))} "
+                f"SOURCE={_modal_report_value(row.get('source'))}"
+            )
+    lines.append("STEP_EVIDENCE_TRACE_SPAN=NO STEP_EVIDENCE_GANTT_CHILD=NO")
+
+    model_rows = deep.get("human_model_breakdown")
+    model_rows = model_rows if isinstance(model_rows, list) else []
+    if not model_rows:
+        raw_model_rows = deep.get("model_breakdown")
+        model_rows = raw_model_rows if isinstance(raw_model_rows, list) else []
+    lines.extend([
+        "DEEP SAMPLING BREAKDOWN",
+        "DEEP MODEL BREAKDOWN",
+        "EVIDENCE_DOMAIN=sampling_deep_profile",
+        "TIMING_SEMANTICS=host_monotonic_and_cuda_device_elapsed_are_separate_non_additive_measurements",
+    ])
+    if deep.get("model_non_additive") or any(
+        isinstance(row, Mapping)
+        and (row.get("timing_domain") != "host_monotonic" or row.get("scope") not in (None, "eval"))
+        for row in model_rows
+    ):
+        lines.append("NON-ADDITIVE MODEL EVIDENCE=YES; do not sum model phases or host/device clocks")
+    lines.append(f"SAMPLING_MODEL_ROW_COUNT={len(model_rows)}")
+    host_total = 0.0
+    cuda_total = 0.0
+    host_count = 0
+    cuda_count = 0
+    for row in model_rows:
+        if not isinstance(row, Mapping):
+            continue
+        host = _golden_profiler_number(row.get("host_monotonic_ms"))
+        cuda = _golden_profiler_number(row.get("cuda_device_ms"))
+        if host is not None:
+            host_total += host
+            host_count += 1
+        if cuda is not None:
+            cuda_total += cuda
+            cuda_count += 1
+    lines.append(
+        "MODEL_SUMMARY "
+        f"COUNT={len(model_rows)} "
+        f"HOST_MONOTONIC_MS={round(host_total, 3) if host_count else 'measurement_unavailable'} "
+        f"CUDA_DEVICE_ELAPSED_MS={round(cuda_total, 3) if cuda_count else 'measurement_unavailable'}"
+    )
+    lines.append("DEEP_MODEL_EVIDENCE_TRACE_SPAN=NO DEEP_MODEL_EVIDENCE_GANTT_CHILD=NO")
+
+    transport = report_domain("source_h2d_transport", {
+        "status": "unavailable", "availability": "unavailable",
+        "reason": "persisted E27 source/H2D evidence is unavailable",
+        "reconciliation": {"state": "unavailable", "complete": "measurement_unavailable"},
+        "timing_semantics": {
+            "overlap_is_union": True, "non_additive": True,
+            "waits_or_fences_inferred": False,
+        },
+    })
+    reconciliation = transport.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, Mapping) else {}
+    semantics = transport.get("timing_semantics")
+    semantics = semantics if isinstance(semantics, Mapping) else {}
+    lines.extend([
+        "SOURCE/H2D TRANSPORT EVIDENCE",
+        "EVIDENCE_DOMAIN=source_h2d_transport",
+        f"SOURCE_H2D_STATUS={_modal_report_value(transport.get('status'))}",
+        f"SOURCE_H2D_AVAILABILITY={_modal_report_value(transport.get('availability'))}",
+        f"SOURCE_H2D_STAGE={_modal_report_value(transport.get('stage'))}",
+        f"SOURCE_H2D_ROLE={_modal_report_value(transport.get('role'))}",
+        f"SOURCE_H2D_REASON={_modal_report_value(transport.get('reason'))}",
+    ])
+    for label, key in (
+        ("SOURCE_TOTAL_WALL_MS", "SOURCE_TOTAL_WALL_MS"),
+        ("SOURCE_SYSCALL_UNION_BUSY_MS", "SOURCE_SYSCALL_UNION_BUSY_MS"),
+        ("SOURCE_READ_COUNT", "source_read_count"),
+        ("SOURCE_READ_BYTES", "source_read_bytes"),
+        ("OBSERVED_PRODUCER_COUNT", "observed_producer_count"),
+        ("PRODUCERS", "producer_ids"),
+        ("SOURCE_MAX_INFLIGHT", "max_actual_source_inflight"),
+        ("SOURCE_QD_PEAK", "qd_peak"),
+        ("SOURCE_QD_OCCUPANCY_MS", "qd_occupancy_ms"),
+        ("SOURCE_TIME_WEIGHTED_MEAN_QD", "time_weighted_mean_qd"),
+        ("H2D_TOTAL_WALL_MS", "H2D_TOTAL_WALL_MS"),
+        ("H2D_SUBMISSIONS", "h2d_submission_count"),
+        ("H2D_COMPLETIONS", "h2d_completion_count"),
+        ("H2D_SUBMITTED_BYTES", "h2d_submitted_bytes"),
+        ("H2D_COMPLETED_BYTES", "h2d_completed_bytes"),
+        ("H2D_RECONCILIATION_COMPLETE", "h2d_reconciliation_complete"),
+        ("SOURCE_H2D_OVERLAP_MS", "SOURCE_H2D_OVERLAP_MS"),
+        ("SOURCE_TO_GPU_READY_MS", "SOURCE_TO_GPU_READY_MS"),
+        ("POST_SOURCE_H2D_TAIL_MS", "POST_SOURCE_H2D_TAIL_MS"),
+        ("STARVATION_GAPS", "starvation_gaps"),
+        ("FALLBACK", "fallback"),
+        ("POISON", "poison"),
+        ("REGION_COVERAGE", "region_coverage"),
+        ("REGION_GAPS", "region_gaps"),
+        ("REGION_OVERLAPS", "region_overlaps"),
+        ("REGION_DUPLICATES", "region_duplicates"),
+    ):
+        lines.append(f"{label}={_modal_report_value(transport.get(key))}")
+    # Preserve the report schema spellings as well as the readable log labels;
+    # consumers can compare this projection directly with report_data.json.
+    for key in (
+        "read_count", "read_bytes", "max_inflight", "max_actual_source_inflight",
+        "qd_occupancy_ms", "time_weighted_mean_qd",
+    ):
+        value = transport.get(key)
+        if value is None and key == "read_count":
+            value = transport.get("source_read_count")
+        if value is None and key == "read_bytes":
+            value = transport.get("source_read_bytes")
+        lines.append(f"{key}={_modal_report_value(value)}")
+    lines.extend([
+        f"RECONCILIATION_STATE={_modal_report_value(reconciliation.get('state', transport.get('reconciliation_state')))}",
+        f"RECONCILIATION_COMPLETE={_modal_report_value(reconciliation.get('complete', transport.get('h2d_reconciliation_complete')))}",
+        f"OVERLAP_IS_UNION={_modal_report_value(semantics.get('overlap_is_union'))}",
+        f"NON_ADDITIVE={_modal_report_value(semantics.get('non_additive'))}",
+        f"WAITS_OR_FENCES_INFERRED={_modal_report_value(semantics.get('waits_or_fences_inferred'))}",
+        f"QUIESCENCE_EVIDENCE={_modal_report_value(transport.get('quiescence', transport.get('QUIESCENCE_EVIDENCE')))}",
+        f"FENCE_EVIDENCE={_modal_report_value(transport.get('fence', transport.get('FENCE_EVIDENCE')))}",
+        "SOURCE_H2D_EVIDENCE_TRACE_SPAN=NO SOURCE_H2D_EVIDENCE_GANTT_CHILD=NO",
+    ])
+    stages = transport.get("stages")
+    if isinstance(stages, list):
+        for stage in stages[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            if isinstance(stage, Mapping):
+                lines.append(
+                    f"TRANSPORT_STAGE stage={_modal_report_value(stage.get('stage'))} "
+                    f"status={_modal_report_value(stage.get('status'))} "
+                    f"reconciliation_state={_modal_report_value(stage.get('reconciliation_state'))}"
+                )
+    lines.append("E27 TRANSPORT BREAKDOWN")
+    lines.append("QD OCCUPANCY HISTOGRAM")
+    occupancy = transport.get("qd_occupancy_ms")
+    if isinstance(occupancy, Mapping):
+        for qd, value in sorted(occupancy.items(), key=lambda pair: str(pair[0])):
+            lines.append(f"QD={_modal_report_value(qd)} OCCUPANCY_MS={_modal_report_value(value)}")
+    else:
+        lines.append("QD=measurement_unavailable OCCUPANCY_MS=measurement_unavailable")
+    lanes = transport.get("timestamp_lanes")
+    if isinstance(lanes, list) and lanes:
+        lines.append("TRANSPORT TIMESTAMP LANES")
+        for lane in lanes[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+            if isinstance(lane, Mapping):
+                lines.append(
+                    f"LANE={_modal_report_value(lane.get('lane'))} "
+                    f"LABEL={_modal_report_value(lane.get('label'))} "
+                    f"START_NS={_modal_report_value(lane.get('start_ns'))} "
+                    f"END_NS={_modal_report_value(lane.get('end_ns'))} "
+                    f"DURATION_MS={_modal_report_value(lane.get('duration_ms'))}"
+                )
+    else:
+        lines.append("TRANSPORT TIMESTAMP LANES unavailable: actual start/end timestamps were not persisted")
+
+
+def _emit_golden_profiler_block(
+    session: Any,
+    artifact: Mapping[str, Any] | None,
+    request_id: str,
+) -> None:
+    """Print the persisted canonical human report without re-rendering it."""
+    if not _V2_FULL_TRACE_ENABLED or not isinstance(artifact, Mapping):
+        return
+    if artifact.get("status") != "ready":
+        return
+
+    try:
+        base_dir = Path(getattr(session, "base_dir"))
+        console_path = base_dir / "derived" / "golden_profiler_console.txt"
+        console = console_path.read_text(encoding="utf-8")
+        print("[v2.golden_profiler] BEGIN\n", end="")
+        print(console, end="")
+        print("[v2.golden_profiler] END\n", end="", flush=True)
+    except Exception as exc:
+        # Diagnostics are strictly subordinate to the request result/error.
+        try:
+            print(
+                "[v2.golden_profiler] ERROR\n"
+                f"REQUEST_ID={_golden_profiler_one_line(request_id)}\n"
+                f"GOLDEN_PROFILER_RENDER_ERROR={type(exc).__name__}: {_golden_profiler_one_line(exc)}\n"
+                "GOLDEN_PROFILER_BLOCK_READY=NO\n",
+                end="",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+
+_E27_MEASUREMENT_UNAVAILABLE = "measurement_unavailable"
+
+
+def _find_persisted_e27_evidence(
+    telemetry: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None, str]:
+    """Find only persisted physical-source/evaluator projections.
+
+    Golden stage details nest transport diagnostics differently across the
+    legacy and dispatcher arms.  Walk those JSON-shaped containers without
+    consulting live transport state or recomputing the evaluator.
+    """
+    actual: Mapping[str, Any] | None = None
+    evaluator: Mapping[str, Any] | None = None
+    raw_path = ""
+
+    def visit(value: Any, depth: int = 0) -> None:
+        nonlocal actual, evaluator, raw_path
+        if depth > 8 or not isinstance(value, Mapping):
+            return
+        candidate = value.get("actual_source")
+        if actual is None and isinstance(candidate, Mapping):
+            actual = candidate
+        candidate = value.get("actual_source_telemetry")
+        if actual is None and isinstance(candidate, Mapping):
+            actual = candidate
+        candidate = value.get("e27_source_mechanism_evaluation")
+        if evaluator is None and isinstance(candidate, Mapping):
+            evaluator = candidate
+        for key in ("RAW_EVIDENCE_PATH", "raw_evidence_path", "e27_raw_evidence_path"):
+            if not raw_path and isinstance(value.get(key), str) and value[key].strip():
+                raw_path = value[key].strip()
+        for key in (
+            "stages", "details", "dispatcher_telemetry", "transport_telemetry",
+            "transport_stats", "transport", "stats",
+            "actual_source", "actual_source_telemetry",
+        ):
+            child = value.get(key)
+            if isinstance(child, Mapping):
+                visit(child, depth + 1)
+            elif isinstance(child, list):
+                for item in child[:_GOLDEN_LOG_COLLECTION_LIMIT]:
+                    visit(item, depth + 1)
+
+    visit(telemetry)
+    return actual, evaluator, raw_path
+
+
+def _e27_projection_value(report: Mapping[str, Any] | None, key: str) -> Any:
+    if not isinstance(report, Mapping) or key not in report or report[key] is None:
+        return _E27_MEASUREMENT_UNAVAILABLE
+    return report[key]
+
+
+def _emit_e27_forensics_block(
+    telemetry: Mapping[str, Any] | None,
+    *,
+    persisted_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Print a bounded projection of persisted direct-Golden E27 evidence.
+
+    This formatter is intentionally inert unless E27 was explicitly requested.
+    Its return value is copied onto the terminal result/error so an unavailable
+    requested diagnostic remains a failure descriptor rather than a silent
+    success.
+    """
+    if os.environ.get("COMFYMODAL_V2_E27_FORENSICS", "").strip() != "1":
+        return {}
+
+    actual, evaluator, raw_path = _find_persisted_e27_evidence(telemetry)
+    if not raw_path and persisted_path is not None:
+        try:
+            candidate_path = os.fspath(persisted_path)
+        except TypeError:
+            candidate_path = ""
+        if (
+            isinstance(candidate_path, str)
+            and candidate_path.strip()
+            and not any(ord(char) < 32 or ord(char) == 127 for char in candidate_path)
+        ):
+            raw_path = candidate_path.strip()
+    events = actual.get("actual_source_events") if isinstance(actual, Mapping) else None
+    events = events if isinstance(events, list) else []
+    evidence_available = bool(actual is not None and events)
+    if not evidence_available:
+        failure_reason = (
+            "physical_actual_source_report_unavailable"
+            if actual is None
+            else "physical_actual_source_events_unavailable"
+        )
+    elif evaluator is None:
+        failure_reason = "evaluator_result_unavailable"
+    else:
+        failure_reason = ""
+
+    observed_producers = {
+        str(event.get("producer_id"))
+        for event in events
+        if isinstance(event, Mapping) and event.get("producer_id") is not None
+    }
+    def byte_total(key: str) -> int | str:
+        total = 0
+        saw_value = False
+        for event in events:
+            if not isinstance(event, Mapping) or event.get(key) is None:
+                continue
+            try:
+                total += int(event[key])
+                saw_value = True
+            except (TypeError, ValueError, OverflowError):
+                return _E27_MEASUREMENT_UNAVAILABLE
+        return total if saw_value else _E27_MEASUREMENT_UNAVAILABLE
+
+    requested_bytes = byte_total("requested_bytes")
+    returned_bytes = byte_total("returned_bytes")
+    topology = actual.get("topology") if isinstance(actual, Mapping) else None
+    topology = topology if isinstance(topology, Mapping) else {}
+    qd = actual.get("qd_occupancy_ms") if isinstance(actual, Mapping) else None
+    qd = qd if isinstance(qd, Mapping) else {}
+    h2d = actual.get("h2d_events") if isinstance(actual, Mapping) else None
+    h2d = h2d if isinstance(h2d, list) else None
+
+    proof = "NO"
+    if evidence_available and isinstance(evaluator, Mapping):
+        proof = str(evaluator.get("E27_SOURCE_MECHANISM_PROVEN", "NO")).upper()
+        if proof != "YES":
+            proof = "NO"
+    failed = evaluator.get("failed_predicates") if isinstance(evaluator, Mapping) else []
+    failed = [str(item) for item in failed] if isinstance(failed, list) else []
+    if proof == "NO" and not failure_reason and failed:
+        failure_reason = "evaluator_failed_predicates"
+    if proof == "YES" and evidence_available and isinstance(evaluator, Mapping):
+        failure_reason = "none"
+    if proof == "NO" and not failure_reason:
+        failure_reason = "evaluator_did_not_prove_source_mechanism"
+
+    lines = [
+        "[v2.e27] BEGIN",
+        f"STATIC_ARM_ACTIVE={'YES' if isinstance(actual, Mapping) and actual.get('arm') == 'static_e27' else 'NO'}",
+        f"STATIC_ARM={_golden_profiler_one_line(_e27_projection_value(actual, 'arm'))}",
+        f"EXPECTED_PRODUCER_COUNT={_golden_profiler_one_line(_e27_projection_value(actual, 'producer_count'))}",
+        f"OBSERVED_PRODUCER_COUNT={_golden_profiler_one_line(len(observed_producers) if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"PHYSICAL_READ_COUNT={_golden_profiler_one_line(len(events) if actual is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"REQUESTED_BYTES={_golden_profiler_one_line(requested_bytes if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"RETURNED_BYTES={_golden_profiler_one_line(returned_bytes if events else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"SOURCE_QD_MAX={_golden_profiler_one_line(_e27_projection_value(actual, 'max_actual_source_inflight'))}",
+        f"SOURCE_QD_MEAN={_golden_profiler_one_line(_e27_projection_value(actual, 'time_weighted_mean_qd'))}",
+        f"SOURCE_QD4_MS={_golden_profiler_one_line(qd.get('4', _E27_MEASUREMENT_UNAVAILABLE))}",
+        f"H2D_SUBMISSIONS={_golden_profiler_one_line(len(h2d) if h2d is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"H2D_COMPLETIONS={_golden_profiler_one_line(sum(isinstance(row, Mapping) and row.get('complete_ns') is not None for row in h2d) if h2d is not None else _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"H2D_SUBMITTED_BYTES={_golden_profiler_one_line(_e27_projection_value(actual, 'h2d_submitted_bytes'))}",
+        f"H2D_COMPLETED_BYTES={_golden_profiler_one_line(_e27_projection_value(actual, 'h2d_completed_bytes'))}",
+        f"H2D_TOTAL_WALL_MS={_golden_profiler_one_line(_e27_projection_value(actual, 'H2D_TOTAL_WALL_MS'))}",
+        f"FALLBACK={_golden_profiler_one_line(_e27_projection_value(actual, 'fallback'))}",
+        f"POISON={_golden_profiler_one_line(_e27_projection_value(actual, 'poison'))}",
+        f"QUIESCENCE={_golden_profiler_one_line(_e27_projection_value(actual, 'quiescence'))}",
+        f"REGION_COVERAGE={_golden_profiler_one_line(_e27_projection_value(topology, 'coverage_exact'))}",
+        f"REGION_GAPS={_golden_profiler_one_line(_e27_projection_value(topology, 'gaps'))}",
+        f"REGION_OVERLAPS={_golden_profiler_one_line(_e27_projection_value(topology, 'overlaps'))}",
+        f"REGION_DUPLICATES={_golden_profiler_one_line(_e27_projection_value(topology, 'unexpected_duplicates'))}",
+        f"E27_EVIDENCE_AVAILABLE={'YES' if evidence_available else 'NO'}",
+        f"E27_RAW_PHYSICAL_EVIDENCE_PRESENT={'YES' if evidence_available else 'NO'}",
+        f"E27_FAILURE_REASON={_golden_profiler_one_line(failure_reason or _E27_MEASUREMENT_UNAVAILABLE)}",
+        f"E27_SOURCE_MECHANISM_PROVEN={proof}",
+        f"RAW_EVIDENCE_PATH={_golden_profiler_one_line(raw_path or _E27_MEASUREMENT_UNAVAILABLE)}",
+    ]
+    if proof == "NO":
+        lines.extend(
+            f"E27_FAILED_PREDICATE={_golden_profiler_one_line(predicate)}"
+            for predicate in failed
+        )
+    lines.append("[v2.e27] END")
+    print("\n".join(lines) + "\n", end="", flush=True)
+    return {
+        "E27_EVIDENCE_AVAILABLE": "YES" if evidence_available else "NO",
+        "E27_FAILURE_REASON": failure_reason or _E27_MEASUREMENT_UNAVAILABLE,
+        "E27_SOURCE_MECHANISM_PROVEN": proof,
+    }
+
+
 def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
     """Resource, volume, and snapshot configuration for invocation metadata.
 
@@ -2390,6 +4577,7 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         cpu_request=actual.cpu,
         memory_request=actual.memory,
     )
+    canonical_identity = _MODAL_RESOURCES.get("canonical_identity")
     return {
         # â”€â”€ App / class identity (from remote-observed values) â”€â”€â”€â”€â”€â”€â”€â”€
         "app_name": actual.app_name,
@@ -2423,6 +4611,16 @@ def _resource_identity(spec: ModalRuntimeSpec | None = None) -> dict[str, Any]:
         },
         # ── Snapshot target fingerprint ──
         "fingerprint": _snapshot_target_fingerprint(actual),
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "deployment_hash": (
+            canonical_identity.deployment if canonical_identity is not None else ""
+        ),
+        "canonical_identity": (
+            canonical_identity.to_dict()
+            if canonical_identity is not None
+            and callable(getattr(canonical_identity, "to_dict", None))
+            else None
+        ),
     }
 
 
@@ -2441,7 +4639,10 @@ def _parse_evict_retain_role() -> str:
 
     Use the raw environment value exactly — no strip, no lowercasing.
     Absent or empty → ``"none"``.
-    Exact ``"none"``, ``"clip"``, or ``"unet"`` accepted (case-sensitive).
+    Exact ``"none"``, ``"clip"``, ``"unet"``, or ``"clip_vae"`` accepted
+    (case-sensitive).  ``clip_vae`` is the strict restore-only retain role:
+    the UNET payload is evicted and proven dead while fresh CLIP and VAE are
+    reloaded back into the retained ``CpuSnapshotModels`` container.
     Uppercase, whitespace-wrapped, comma-separated, ``both``, ``1``, ``true``,
     or any other nonempty value → RuntimeError.
     Error message shows the raw malformed value without normalizing it.
@@ -2451,11 +4652,11 @@ def _parse_evict_retain_role() -> str:
     raw = os.environ.get("COMFYMODAL_V2_EVICT_RETAIN_ROLE", "")
     if not raw:
         return "none"
-    if raw in ("none", "clip", "unet"):
+    if raw in ("none", "clip", "unet", "clip_vae"):
         return raw
     raise RuntimeError(
         f"COMFYMODAL_V2_EVICT_RETAIN_ROLE={raw!r} is invalid; "
-        f"expected absent, empty, 'none', 'clip', or 'unet'"
+        f"expected absent, empty, 'none', 'clip', 'unet', or 'clip_vae'"
     )
 
 
@@ -2507,8 +4708,7 @@ def _snapshot_target_fingerprint(
     startup/restore/request boundaries.
     """
     actual = spec or _MODAL_RESOURCES.get("spec", ModalRuntimeSpec())
-    _source_id = _MODAL_RESOURCES.get("source_identity")
-    _combined = _source_id.combined_hash if _source_id is not None else ""
+    _canonical = _MODAL_RESOURCES.get("canonical_identity")
 
     # Registered remote class name (decorated V2 subclass or base fallback)
     _registered_cls = globals().get("ModalRuntimeEntrypointV2", ModalRuntimeEntrypoint)
@@ -2519,6 +4719,8 @@ def _snapshot_target_fingerprint(
         "restore": {"enter": True, "snap": False},
         "run_plan_stream": {"method": True, "is_generator": True},
         "run_prompt_stream": {"method": True, "is_generator": True},
+        "run_golden_serial_stream": {"method": True, "is_generator": True},
+        "run_golden_parallel_stream": {"method": True, "is_generator": True},
         "read_output_asset": {"method": True, "is_generator": False},
         "run_checkpoint_stream": {"method": True, "is_generator": True},
     }
@@ -2559,15 +4761,16 @@ def _snapshot_target_fingerprint(
         "profile_volume_name": actual.profile_volume_name,
         "volume_mount_paths": _vol_mount_paths,
         # ── Source / env (static deployment config only) ─────────────────
-        "source_combined_hash": _combined,
+        "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+        "deployment_hash": (
+            _canonical.deployment if _canonical is not None else ""
+        ),
         "runtime_env": _env,
         "runtime_shape": runtime_shape_config(
             cpu_request=actual.cpu,
             memory_request=actual.memory,
         ).identity_payload(),
-        "effective_deployment_combined_hash": globals().get(
-            "_V2_DEPLOYMENT_COMBINED_HASH", ""
-        ),
+        "effective_deployment_hash": globals().get("_V2_DEPLOYMENT_COMBINED_HASH", ""),
         "experimental_options": {"enable_gpu_snapshot": _enable_gpu_snapshot},
         "environment": os.environ.get("MODAL_ENVIRONMENT", ""),
     }
@@ -2702,10 +4905,7 @@ class ModalRuntimeSpec:
 
 
 def _local_custom_nodes_root() -> Path:
-    explicit = os.environ.get("COMFYMODAL_LOCAL_CUSTOM_NODES", "").strip()
-    if explicit:
-        return Path(explicit).resolve()
-    return Path(__file__).resolve().parents[1]
+    return Path(resolve_custom_nodes_root(Path(__file__).resolve().parents[1]))
 
 
 def _collect_warmup_env() -> dict[str, str]:
@@ -2761,6 +4961,11 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_APP_NAME": (
             spec.app_name if spec is not None else APP_NAME
         ),
+        # Forward the requested GPU into the container env so the container-side
+        # spec rebuild (identity.gpu / gpu_requested_order) reflects the actual
+        # deploy request instead of the parse_gpu_request() default.
+        "COMFYMODAL_V2_GPU": os.environ.get("COMFYMODAL_V2_GPU", ""),
+        "COMFYMODAL_CUSTOM_NODE_DELIVERY": CUSTOM_NODE_DELIVERY,
         "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS": os.environ.get(
             "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS", "0"
         ),
@@ -2798,6 +5003,189 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_ENV_PROFILE": os.environ.get(
             "COMFYMODAL_V2_ENV_PROFILE", "inherit"
         ),
+        # Golden DynamicVRAM must be present in the Modal class environment
+        # before comfyapp imports model modules; request-time activation alone
+        # is too late for AIMDO modules that capture control.lib at import.
+        "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM", "0"
+        ),
+        # Golden workflow hash checking defaults on and must cross Modal's
+        # class-env boundary so profile values (including golden_p1's "0")
+        # reach the deployed runtime.
+        "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
+        ),
+        "COMFYMODAL_PHASE1_C0_ARENA": os.environ.get(
+            "COMFYMODAL_PHASE1_C0_ARENA", "0"
+        ),
+        # Golden attention is a request-bound selector.  The profile value is
+        # carried into the container and consumed when constructing the actual
+        # GoldenRequest; it is not evidence-only metadata.
+        "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "sage"
+        ),
+        # This is the request-arm selector consumed by the V2 harness.  Keep
+        # it distinct from the deploy gate below; the cosmetic/deploy flag
+        # must never select a Golden request arm on its own.
+        "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH", "0"
+        ),
+        "COMFYMODAL_GOLDEN_CLIP_LOADER": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_LOADER", "c0"
+        ),
+        "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_BACKING", "posix"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_GEOMETRY", "qd4_32"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_STREAMING", "0"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_PERSISTENT_FDS", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"
+        ),
+        # Reader isolation for the C0 source owner.  Without this the container
+        # always resolved "thread", which made the four-process arm silently
+        # unreachable no matter what the profile or --set selected.
+        "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND", "thread"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_SOURCE_ENGINE", "preadv"
+        ),
+        "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG": os.environ.get(
+            "COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_HOST_REGISTER": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_HOST_REGISTER", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_SHM_POPULATE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SHM_POPULATE", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_READER_GATE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_READER_GATE", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_DMA_RING": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_DMA_RING", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG", "0"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER", "overlap"
+        ),
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT", "0"
+        ),
+        "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
+            "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
+        ),
+        "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE": os.environ.get(
+            "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE", "serial"
+        ),
+        "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME": os.environ.get(
+            "COMFYMODAL_GOLDEN_COMPLETION_EVENT_LIFETIME", "one_shot_events"
+        ),
+        # C0 source/H2D scheduling geometry + per-window trace selector must
+        # cross Modal's class-env boundary; otherwise deploy-time selectors
+        # silently default in the container and geometry experiments are
+        # untestable.  Scheduling/diagnostics only; the arena is untouched.
+        "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY", "qd4_64"
+        ),
+        "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE", "0"
+        ),
+        "COMFYMODAL_GOLDEN_QD_TRANSPORT": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD_TRANSPORT", "legacy"
+        ),
+        "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH": os.environ.get(
+            "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH", "0"
+        ),
+        # Phase B3: QD2 telemetry mode must cross Modal's class-env boundary;
+        # otherwise the deploy-time selector silently defaults to light in the
+        # container and the heavy_current arm is untestable.
+        "COMFYMODAL_GOLDEN_QD2_TELEMETRY": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD2_TELEMETRY", "light"
+        ),
+        # Phase B4: deferred-H2D diagnostic gate must cross Modal's class-env
+        # boundary alongside the telemetry mode; otherwise the deploy-time
+        # selector silently defaults to NORMAL in the container and the
+        # DEFERRED-H2D arm is untestable.  Telemetry/scheduling only.
+        "COMFYMODAL_GOLDEN_QD2_DEFER_H2D": os.environ.get(
+            "COMFYMODAL_GOLDEN_QD2_DEFER_H2D", "0"
+        ),
+        "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES", "33554432"
+        ),
+        # Decoupled transport dimensions are request/deployment inputs, not
+        # derived from one another.  Forward each raw value through the same
+        # canonical class-environment bridge; an empty value intentionally
+        # preserves the reader's documented default resolution.
+        "COMFYMODAL_GOLDEN_SOURCE_QD": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_QD", ""
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES", ""
+        ),
+        "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": os.environ.get(
+            "COMFYMODAL_GOLDEN_H2D_COPY_BYTES", ""
+        ),
+        "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": os.environ.get(
+            "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH", ""
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_CAPACITY", ""
+        ),
+        # RA1 sampler decomposition diagnostics must cross Modal's class-env
+        # boundary; otherwise the profile can be correct at deploy time while
+        # the request container silently resolves the deep profile to off.
+        "COMFYMODAL_SAMPLING_DEEP_PROFILE": os.environ.get(
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE", "off"
+        ),
+        "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION": os.environ.get(
+            "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION", "0"
+        ),
+        # Preserve the v2ctl profile selector beside the Golden gate so the
+        # container can make the same profile decision as the deploy process.
+        "COMFYMODAL_V2CTL_PROFILE": os.environ.get(
+            "COMFYMODAL_V2CTL_PROFILE", ""
+        ),
+        # E37 CLEAN_LANE deployment identity and explicit no-worker tuple.
+        # These values must cross Modal's class-env boundary; otherwise the
+        # local profile can be correct while the container silently falls
+        # back to production/E19 defaults.
+        "COMFYMODAL_V2_E37_CLEAN_LANE": os.environ.get(
+            "COMFYMODAL_V2_E37_CLEAN_LANE", "0"
+        ),
+        "COMFYMODAL_V2_CLEAN_LANE": os.environ.get(
+            "COMFYMODAL_V2_CLEAN_LANE", "0"
+        ),
+        "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA": os.environ.get(
+            "COMFYMODAL_V2_E37_EXPECTED_OUTPUT_SHA", ""
+        ),
+        # E37 controlled restore mode: explicit deploy-time passthrough keeps
+        # the profile's value from being lost at Modal's class env boundary;
+        # comfyapp.py still defaults to minimal restore when this is absent.
+        "COMFYMODAL_MINIMAL_RESTORE": os.environ.get(
+            "COMFYMODAL_MINIMAL_RESTORE", "1"
+        ),
+        "COMFYMODAL_V2_ATOMIC_PROFILE": os.environ.get(
+            "COMFYMODAL_V2_ATOMIC_PROFILE", ""
+        ),
         "COMFYMODAL_V2_OBSERVABILITY_MODE": os.environ.get(
             "COMFYMODAL_V2_OBSERVABILITY_MODE", ""
         ),
@@ -2826,6 +5214,36 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_VAE_PREFETCH_MODE": os.environ.get(
             "COMFYMODAL_V2_VAE_PREFETCH_MODE", "off"
+        ),
+        # ── E25/E26 VAE early activation (sampling_end overlap) ─────────
+        # The mutation-lane-bound VAE early-start pre-copies the VAE CPU
+        # params to CUDA on a side stream while sampling runs (no lane, no
+        # model mutation) and rebinds ``.data`` strictly after the sampler
+        # releases the lane.  E26: the production default is REVERTED to the
+        # canonical late/safe mode (the E25 sampling_end/250 default produced
+        # no critical-path win — observed 874.7/964.8 ms vs 838.8 ms
+        # baseline).  The experiment remains available behind the explicit
+        # COMFYMODAL_V2_VAE_ACTIVATION_MODE=sampling_end /
+        # COMFYMODAL_V2_VAE_EARLY_START_MS flags.
+        "COMFYMODAL_V2_VAE_ACTIVATION_MODE": os.environ.get(
+            "COMFYMODAL_V2_VAE_ACTIVATION_MODE", "late"
+        ),
+        "COMFYMODAL_V2_VAE_EARLY_START_MS": os.environ.get(
+            "COMFYMODAL_V2_VAE_EARLY_START_MS", "0"
+        ),
+        # ── E25/E26 proven-ready GPU-load fast return (production default) ──
+        # When ON, a graph-thread load_models_gpu for a registered UNET that
+        # the fastsafetensors/execution lane already bound + validated on
+        # CUDA skips ComfyUI's ModelPatcher.load bookkeeping.  Fail-closed
+        # (see model_preload._all_models_proven_cuda_resident).  E26:
+        # promoted to the production default (repeat positive evidence:
+        # joint-ready → sampling-start ~124 → ~66-71 ms); scoped to the
+        # proven execution-UNET path and never monkey-patches unrelated loads.
+        "COMFYMODAL_V2_GPU_FAST_RETURN": os.environ.get(
+            "COMFYMODAL_V2_GPU_FAST_RETURN", "1"
+        ),
+        "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1"
         ),
         "COMFYMODAL_ENABLE_GPU_SNAPSHOT": os.environ.get(
             "COMFYMODAL_ENABLE_GPU_SNAPSHOT", "0"
@@ -2858,10 +5276,63 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_SNAPSHOT_MANIFEST": os.environ.get(
             "COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0"
         ),
+        # Capture-time allocator hygiene (diagnostic only; default off).
+        # Explicit passthrough so a shadow deployment baked with this flag
+        # reaches the container; without this it silently defaults to off and
+        # the pre-capture gc/malloc_trim hygiene record is never produced.
+        "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE", "0"
+        ),
         # Lean production snapshot arm (diagnostic A/B; default off).
         # Deferred in modal_app/model_preload at import time when on.
         "COMFYMODAL_V2_LEAN_SNAPSHOT": os.environ.get(
             "COMFYMODAL_V2_LEAN_SNAPSHOT", "0"
+        ),
+        # Exclude the UNET from the snapshot composition (diagnostic gate;
+        # default off).  Explicit passthrough so a deployment baked with this
+        # flag actually reaches the container; without it, `_runtime_env`
+        # silently drops the key and the real container would run with
+        # exclusion disabled and fail closed.
+        "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET", "0"
+        ),
+        # Snapshot-construction marker (deploy-time only).  Explicit
+        # passthrough so the construction container activates the
+        # content-verified custom-node generation reconciliation and emits the
+        # [v2.custom_node_generation_parity] event; without it the flag is
+        # silently dropped and parity instrumentation never fires.
+        "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION": os.environ.get(
+            "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION", "0"
+        ),
+        # Restore-memory experiment B arm (deployment-level).  Explicit
+        # passthrough so a deployment baked with this flag actually reaches
+        # the container; without it `_runtime_env` silently drops the key and
+        # the frozen-total-VRAM restore arm would silently run the baseline.
+        "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN": os.environ.get(
+            "COMFYMODAL_V2_RESTORE_TOTAL_VRAM_FROZEN", "0"
+        ),
+        # One authoritative state-root for the restore-memory arm: the runtime
+        # state volume mount path (same in construction and request containers).
+        "COMFYMODAL_V2_STATE_VOLUME_ROOT": RUNTIME_STATE_PATH,
+        # Console verbosity (host-deploy-selectable): when 1 the container
+        # suppresses repeated per-request identity/unavailable console lines
+        # (artifacts keep all data).  Default 0 = current behavior.
+        "COMFYMODAL_V2_QUIET": os.environ.get("COMFYMODAL_V2_QUIET", "0"),
+        # V2 optimization flags (measurement/behavior gates; default ON so a
+        # deployment not explicitly setting either flag arms the memo/prefetch
+        # hooks — set "0" to run the uninstrumented baseline).  Explicit
+        # passthrough so a deployment baked with either flag reaches the
+        # container; without it the container silently runs the uninstrumented
+        # baseline and the plan-time signature-memo / conditioning-prefetch
+        # hooks never arm.
+        "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE": os.environ.get(
+            "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE", "1"
+        ),
+        "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH": os.environ.get(
+            "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1"
+        ),
+        "COMFYMODAL_V2_RESOURCE_TELEMETRY": os.environ.get(
+            "COMFYMODAL_V2_RESOURCE_TELEMETRY", "0"
         ),
         "COMFYMODAL_V2_DEEP_MODEL_DIAG": os.environ.get(
             "COMFYMODAL_V2_DEEP_MODEL_DIAG", "0"
@@ -2874,6 +5345,257 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         ),
         "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET": os.environ.get(
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET", ""
+        ),
+        "COMFYMODAL_V2_EXECUTION_PREFILL": os.environ.get(
+            "COMFYMODAL_V2_EXECUTION_PREFILL", "1"
+        ),
+        "COMFYMODAL_V2_GRAPH_PRELOAD": os.environ.get(
+            "COMFYMODAL_V2_GRAPH_PRELOAD", "1"
+        ),
+        "COMFYMODAL_V2_MODEL_PRELOAD": os.environ.get(
+            "COMFYMODAL_V2_MODEL_PRELOAD", "1"
+        ),
+        "COMFYMODAL_V2_EXACT_CACHE_PERSIST": os.environ.get(
+            "COMFYMODAL_V2_EXACT_CACHE_PERSIST", "1"
+        ),
+        "COMFYMODAL_V2_ALLOCATOR_PURGE": os.environ.get(
+            "COMFYMODAL_V2_ALLOCATOR_PURGE", "1"
+        ),
+        "COMFYMODAL_V2_BACKGROUND_PERSISTENCE": os.environ.get(
+            "COMFYMODAL_V2_BACKGROUND_PERSISTENCE", "1"
+        ),
+        "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_BACKGROUND_DIAGNOSTICS", "1"
+        ),
+        # Execution-phase UNET H2D delay (experiment gate; default 0 =
+        # immediate H2D).  Explicit passthrough so a deployment baked with
+        # a delay reaches the container; without it the container silently
+        # runs the immediate baseline.
+        "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS": os.environ.get(
+            "COMFYMODAL_V2_EXECUTION_UNET_H2D_DELAY_MS", "0"
+        ),
+        # Optimization diagnostics (measurement only; default off).  Explicit
+        # passthrough so a deployment baked with the flag reaches the
+        # container; without it the container silently runs uninstrumented.
+        "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS": os.environ.get(
+            "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS", "0"
+        ),
+        # ── E25 speculative CLIP hydration (default ON when the direct-GPU
+        # fastsafetensors CLIP path is enabled; explicit passthrough so a
+        # deployment can bake it off without code changes). ──
+        "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION", "1"
+        ),
+        # ── E30 CLIP cold-I/O genuine-QD reader (default OFF; explicit
+        # passthrough so a deployment baked with the flag reaches the
+        # container; without it the reader stays disabled and the E28
+        # fastsafetensors direct-GPU path runs unchanged). ──
+        "COMFYMODAL_V2_CLIP_QD_READER": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_READER", "0"
+        ),
+        "COMFYMODAL_V2_M2_PRODUCTION_LOADER": os.environ.get(
+            "COMFYMODAL_V2_M2_PRODUCTION_LOADER", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_QD": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_QD", "4"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB", "32"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY", "restore_earliest"
+        ),
+        "COMFYMODAL_V2_CLIP_QD_ARTIFACT": os.environ.get(
+            "COMFYMODAL_V2_CLIP_QD_ARTIFACT", ""
+        ),
+        "COMFYMODAL_RESTORE_CLIP_READ_PROBE": os.environ.get(
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE", "0"
+        ),
+        _RESTORE_CLIP_PROBE_SOURCE_ENV: os.environ.get(
+            _RESTORE_CLIP_PROBE_SOURCE_ENV, "models_volume"
+        ),
+        "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
+            "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
+        ),
+        # Batch C6 read/H2D probe gate (measurement only; default off).
+        # Explicit passthrough so a deployment baked with "probe" reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE": os.environ.get(
+            "COMFYMODAL_V2_UNET_READ_H2D_PIPELINE", ""
+        ),
+        # Production pinned-ring UNET fast path (ZImage only; default off).
+        # Explicit passthrough so a deployment baked with the flag reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_PINNED_RING": os.environ.get(
+            "COMFYMODAL_V2_UNET_PINNED_RING", ""
+        ),
+        # CUDA-loader salvage mechanism probe gate (measurement only; default
+        # off).  Explicit passthrough so the probe can be invoked on a shadow
+        # deployment via the standalone run_unet_mechanism_probe function;
+        # without it the key silently drops and the probe is unreachable.
+        "COMFYMODAL_V2_UNET_SALVAGE_PROBE": os.environ.get(
+            "COMFYMODAL_V2_UNET_SALVAGE_PROBE", ""
+        ),
+        # V2 meta-direct UNET loader gate (measurement A/B; default off).
+        # Explicit passthrough so a deployment baked with the flag reaches
+        # the container; without it the container silently runs baseline.
+        "COMFYMODAL_V2_UNET_META_DIRECT": os.environ.get(
+            "COMFYMODAL_V2_UNET_META_DIRECT", ""
+        ),
+        # V2 fastsafetensors UNET loader gate (Batch C9 production
+        # integration; default off).  Explicit passthrough so a deployment
+        # baked with the flag reaches the container; without it the
+        # container silently runs the native fast-disk baseline.
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFETENSORS", ""
+        ),
+        "COMFYMODAL_V2_C9QD_EXTRAS": os.environ.get(
+            "COMFYMODAL_V2_C9QD_EXTRAS", "0"
+        ),
+        # E17 final cold-loader assembly.  Both behavior gates remain
+        # production-off; the bounded prewarm settings are forwarded so an
+        # explicitly enabled deployment uses the same limits in the remote
+        # request container.
+        "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": os.environ.get(
+            "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION", "0"
+        ),
+        "COMFYMODAL_V2_FAST_COLD_COMMIT_WAIT_MS": os.environ.get(
+            "COMFYMODAL_V2_FAST_COLD_COMMIT_WAIT_MS", "10000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MB", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_MAX_MS", "0"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_JOIN_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_JOIN_MS", "1000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS", "1000"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS", "4"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB", "8"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_SAFETY_RESERVE_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_SAFETY_RESERVE_MB", "2048"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_PINNED_RESERVE_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_PINNED_RESERVE_MB", "512"
+        ),
+        "COMFYMODAL_V2_CHECKPOINT_PREWARM_RAM_FALLBACK_MB": os.environ.get(
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RAM_FALLBACK_MB", "512"
+        ),
+        "COMFYMODAL_V2_STAGED_SAFETENSORS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_SAFETENSORS", "0"
+        ),
+        "COMFYMODAL_V2_STAGED_PRODUCERS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_PRODUCERS", "4"
+        ),
+        "COMFYMODAL_V2_STAGED_POOL_MB": os.environ.get(
+            "COMFYMODAL_V2_STAGED_POOL_MB", "1024"
+        ),
+        "COMFYMODAL_V2_STAGED_BUCKET_MB": os.environ.get(
+            "COMFYMODAL_V2_STAGED_BUCKET_MB", "256"
+        ),
+        "COMFYMODAL_V2_STAGED_CPU_CAST": os.environ.get(
+            "COMFYMODAL_V2_STAGED_CPU_CAST", "1"
+        ),
+        "COMFYMODAL_V2_STAGED_ASYNC_H2D": os.environ.get(
+            "COMFYMODAL_V2_STAGED_ASYNC_H2D", "1"
+        ),
+        "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS": os.environ.get(
+            "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS", "0"
+        ),
+        "COMFYMODAL_V2_STAGED_SOURCE_ORDER": os.environ.get(
+            "COMFYMODAL_V2_STAGED_SOURCE_ORDER", "0"
+        ),
+        # D-phase runtime flags (Phase-D integration gate).  Explicit
+        # passthrough so a deployment baked with these flags reaches the
+        # container; without them the container silently runs baseline via
+        # env_flag()/observability_gate() defaults.  Defaults below match
+        # the container-side env_flag defaults.
+        "COMFYMODAL_V2_CLIP_FAST_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FAST_HYDRATION", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA": os.environ.get(
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA", "0"
+        ),
+        "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION": os.environ.get(
+            "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION", "0"
+        ),
+        "COMFYMODAL_V2_SCOPED_CUDA_READINESS": os.environ.get(
+            "COMFYMODAL_V2_SCOPED_CUDA_READINESS", "0"
+        ),
+        "COMFYMODAL_V2_INPUT_TYPES_WARM": os.environ.get(
+            "COMFYMODAL_V2_INPUT_TYPES_WARM", "1"
+        ),
+        "COMFYMODAL_V2_UNET_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_CLIP_STAGED_HYDRATION": os.environ.get(
+            "COMFYMODAL_V2_CLIP_STAGED_HYDRATION", "0"
+        ),
+        "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS": os.environ.get(
+            "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS", "0"
+        ),
+        # E27 telemetry gates (Target E Gantt + E27 forensics).  Default 0 so
+        # production behavior is unchanged; explicitly opt-in at deploy/run.
+        "COMFYMODAL_V2_GANTT_TELEMETRY": os.environ.get(
+            "COMFYMODAL_V2_GANTT_TELEMETRY", "0"
+        ),
+        "COMFYMODAL_V2_E27_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_E27_FORENSICS", "0"
+        ),
+        # E28 loader-tuning + cast-once env keys (Targets B/C).  Defaults
+        # preserve the E28 winning production configuration; the cast-once
+        # experiment defaults OFF and is opt-in per deploy/run.
+        "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS", "8"
+        ),
+        "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES", "67108864"
+        ),
+        "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB", "524288"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_THREADS": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_THREADS", "8"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES", "268435456"
+        ),
+        "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB": os.environ.get(
+            "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB", "524288"
+        ),
+        "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": os.environ.get(
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE", "0"
+        ),
+        # E31 forward forensics is deploy-baked and must be mirrored into the
+        # request container; otherwise its import-time default silently wins.
+        "COMFYMODAL_V2_E31_FORENSICS": os.environ.get(
+            "COMFYMODAL_V2_E31_FORENSICS", "0"
+        ),
+        "COMFYMODAL_V2_E31_FORWARD_PROFILE": os.environ.get(
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE", "0"
+        ),
+        "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": os.environ.get(
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT", "1024"
         ),
         # Native page-readiness candidate — off (empty) by default so
         # current production behavior is unchanged until explicitly set to
@@ -2920,7 +5642,7 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
             "COMFYMODAL_V2_FULL_TRACE_MAX_STACK_DEPTH", "64"
         ),
         "COMFYMODAL_V2_FULL_TRACE_TORCH": os.environ.get(
-            "COMFYMODAL_V2_FULL_TRACE_TORCH", "1"
+            "COMFYMODAL_V2_FULL_TRACE_TORCH", "0"
         ),
         "COMFYMODAL_V2_PROFILE_VOLUME": os.environ.get(
             "COMFYMODAL_V2_PROFILE_VOLUME", "comfymodal-v2-profiles"
@@ -2944,6 +5666,24 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
             env[_ev_key] = os.environ[_ev_key]
     if "COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS" in os.environ:
         env["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"] = os.environ["COMFYMODAL_V2_TEARDOWN_DIAGNOSTICS"]
+    # Optional Golden stage diagnostics preserve their absent-by-default
+    # contract: an unset host flag remains unset in the container.
+    if "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS" in os.environ:
+        env["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"] = os.environ["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"]
+    # Loader-process experiment selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_LOADER_PROCESS" in os.environ:
+        env["COMFYMODAL_GOLDEN_LOADER_PROCESS"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS"]
+    # Pre-snapshot loader-worker experiment selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT" in os.environ:
+        env["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"] = os.environ["COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"]
+    # Golden minimal-restore selector (deploy-baked).  Absent preserves the
+    # profile default (Golden Serial -> minimal); an explicit value is the
+    # override, so 0 intentionally selects legacy rollback/debug.
+    if "COMFYMODAL_GOLDEN_MINIMAL_RESTORE" in os.environ:
+        env["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"] = os.environ["COMFYMODAL_GOLDEN_MINIMAL_RESTORE"]
+    # Golden strict CPU-I/O process selector (deploy-baked; OFF when unset).
+    if "COMFYMODAL_GOLDEN_IO_PROCESS" in os.environ:
+        env["COMFYMODAL_GOLDEN_IO_PROCESS"] = os.environ["COMFYMODAL_GOLDEN_IO_PROCESS"]
     # Propagate externally-supplied warmup profile env vars so startup
     # snapshot creation can read a split profile via env_default fallback.
     env.update(_collect_warmup_env())
@@ -3091,43 +5831,24 @@ def _load_cpu_snapshot_vae(
 
 
 def _reference_image() -> Any:
-    """Build the V2 shadow deployment image from the production base.
+    """Return the finished image from the canonical image-plan owner.
 
-    Uses ``_image_base`` (pre-local-sources) so that the V2 source modules
-    can be appended legally — Modal requires that all build steps
-    (``.pip_install``, ``.run_commands``, ``.env()``, ``.add_local_dir``)
-    precede ``.add_local_python_source()``, and ``_image_base`` already
-    satisfies that constraint.
-
-    When ``COMFYMODAL_V2_FULL_TRACE=1`` is set in the deploy-time environment,
-    installs ``viztracer==1.1.1`` via ``image.pip_install()`` **before** any
-    ``add_local_python_source`` calls.  Disabled (default) does not install it.
-
-    Environment variables (snapshot flags, full-trace, warmup profile, memory)
-    are **not** set here via ``image.env()`` — they are propagated at deploy
-    time via the class-level ``env=`` parameter in
-    ``_register_remote_entrypoint`` using ``_runtime_env()``.  This avoids
-    adding build steps to an image whose base may already contain
-    ``add_local_dir``/``add_local_file`` operations.
+    This compatibility name remains because the shadow deployment imports it;
+    it deliberately performs no package installation and no source mutation.
     """
     try:
         legacy = importlib.import_module("comfyapp")
-        # Use _image_base (pre-local-sources).  comfyapp.image already has
-        # add_local_python_source applied and cannot be further modified with
-        # build-step commands.
-        base = getattr(legacy, "_image_base", None)
-        if base is None:
-            # Fallback: attempt the fully-built image (risks build-order
-            # rejection, but avoids hard crash when _image_base is absent)
-            base = getattr(legacy, "image", None)
-            if base is None:
-                raise RuntimeError("comfyapp._image_base and .image are unavailable")
-        image = base
-        # Install viztracer before add_local_python_source when full-trace is enabled
-        if _V2_FULL_TRACE_ENABLED:
-            image = image.pip_install("viztracer==1.1.1")
-        for module_name in V2_SOURCE_MODULES:
-            image = image.add_local_python_source(module_name)
+        # Reuse the already-constructed plan; rebuilding equivalent descendants
+        # here would create a second image DAG and defeat cache locality.
+        plan = getattr(legacy, "CANONICAL_IMAGE_PLAN", None)
+        if plan is None:
+            plan_builder = getattr(legacy, "build_canonical_image_plan", None)
+            plan = plan_builder() if callable(plan_builder) else None
+        if plan is None:
+            raise RuntimeError("comfyapp canonical image plan is unavailable")
+        image = getattr(plan, "final_image", None) or getattr(plan, "source", None)
+        if image is None:
+            raise RuntimeError("comfyapp canonical image plan has no finished image")
         return image
     except Exception as exc:
         raise RuntimeError("unable to build v2 image from the working ComfyUI image") from exc
@@ -3140,9 +5861,40 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         cpu_request=runtime_spec.cpu,
         memory_request=runtime_spec.memory,
     )
-    runtime_root = Path(__file__).resolve().parent
-    custom_root = _local_custom_nodes_root()
-    identity = build_deployment_identity(runtime_root, custom_node_paths=[custom_root])
+    legacy = importlib.import_module("comfyapp")
+    plan = getattr(legacy, "CANONICAL_IMAGE_PLAN", None)
+    if plan is None:
+        plan_builder = getattr(legacy, "build_canonical_image_plan", None)
+        plan = plan_builder() if callable(plan_builder) else None
+    if plan is None:
+        raise RuntimeError("canonical image plan is unavailable")
+    # Preserve the legacy DeploymentIdentity field for existing callers; the
+    # canonical typed boundary identity is carried alongside it below.  Both
+    # must be present and the compatibility hash must alias the canonical
+    # deployment namespace before resources can be constructed.
+    identity = getattr(plan, "source_identity", None)
+    canonical_identity = getattr(plan, "identity", None)
+    if identity is None:
+        raise RuntimeError("canonical source identity is missing")
+    if canonical_identity is None:
+        raise RuntimeError("canonical deployment identity is missing")
+    validate_canonical_boundary_identity(canonical_identity)
+    if (
+        identity.source_bytes <= 0
+        or not identity.runtime_hash
+        or not identity.dependency_hash
+    ):
+        raise RuntimeError("canonical source identity is incomplete")
+    if identity.hash_namespace != DEPLOYMENT_HASH_NAMESPACE:
+        raise RuntimeError("canonical source identity hash namespace is unsupported")
+    if identity.combined_hash != canonical_identity.deployment:
+        raise RuntimeError(
+            "canonical source/deployment identity hash mismatch"
+        )
+    try:
+        validate_persisted_identity_pair(identity, canonical_identity)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     if _modal is None:
         return {
             "app": None,
@@ -3153,11 +5905,18 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "profile_volume": None,
             "prompt_cache_volume": None,
             "source_identity": identity,
+            "canonical_identity": canonical_identity,
             "spec": runtime_spec,
             "runtime_shape": runtime_shape.identity_payload(),
         }
 
-    image = _reference_image()
+    image = getattr(plan, "final_image", None) or _reference_image()
+    if str(os.environ.get("COMFYMODAL_PHASE1_C0_ARENA") or "").strip() == "1":
+        phase1_path = Path(__file__).resolve().parents[1] / "tools" / "phase1_c0_arena.py"
+        if phase1_path.is_file():
+            image = image.add_local_file(
+                str(phase1_path), "/opt/comfymodal/phase1_c0_arena.py", copy=True
+            )
     models_volume = _modal.Volume.from_name(runtime_spec.models_volume_name, create_if_missing=True)
     custom_nodes_volume = _modal.Volume.from_name(runtime_spec.custom_nodes_volume_name, create_if_missing=True)
     runtime_state_volume = _modal.Volume.from_name(runtime_spec.runtime_state_volume_name, create_if_missing=True)
@@ -3188,6 +5947,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "profile_volume": profile_volume,
         "prompt_cache_volume": prompt_cache_volume,
         "source_identity": identity,
+        "canonical_identity": canonical_identity,
         "spec": runtime_spec,
         "runtime_shape": runtime_shape.identity_payload(),
     }
@@ -3214,6 +5974,11 @@ def _resolve_cgroup_v2_base(
     Returns ``(resolved_cgroup_base, mount_point)`` on success, ``None`` on any
     error.  The resolved path includes the mount point and the cgroup relative
     path joined together (e.g. ``/sys/fs/cgroup/user.slice/job-123``).
+
+    The mountinfo match is lenient, aligned with the runtime's other resolvers
+    (full_execution_trace / resource_telemetry): the mount type must contain
+    ``cgroup2``, OR be a ``cgroup`` mount at ``/sys/fs/cgroup`` (hybrid v1/v2
+    systems).  The LAST ``0::`` entry of ``/proc/self/cgroup`` is used.
     """
     mount_point: str | None = None
     try:
@@ -3228,12 +5993,15 @@ def _resolve_cgroup_v2_base(
                     separator is not None
                     and separator >= 5
                     and separator + 1 < len(parts)
-                    and parts[separator + 1] == "cgroup2"
                 ):
                     candidate = _unescape_mountinfo_field(parts[4])
-                    if candidate.startswith("/"):
-                        mount_point = candidate
-                        break
+                    fstype = parts[separator + 1]
+                    if "cgroup2" in fstype or (
+                        "cgroup" in fstype and candidate == "/sys/fs/cgroup"
+                    ):
+                        if candidate.startswith("/"):
+                            mount_point = candidate
+                            break
     except Exception:
         return None
     if not mount_point:
@@ -3245,8 +6013,8 @@ def _resolve_cgroup_v2_base(
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith("0::"):
+                    # Last matching line wins (kept from the original parser).
                     cgroup_rel = stripped[3:]
-                    break
     except Exception:
         return None
     if cgroup_rel is None:
@@ -3285,6 +6053,13 @@ def _report_host_memory(stage: str) -> dict[str, Any]:
     reported as ``"absent"``.  Unlimited memory.max is reported as
     ``"unlimited"``.  Never raises.
     """
+    try:
+        from . import clean_lane as _clean_lane
+        if _clean_lane.enabled():
+            _clean_lane.forbidden_activity("background_memory_diagnostics", stage=stage)
+            return {"stage": stage, "suppressed": True}
+    except Exception:
+        pass
     info: dict[str, Any] = {
         "stage": stage,
         "memory.current": "absent",
@@ -3563,11 +6338,16 @@ def _numeric_value(value: Any, fallback: Any = "absent") -> Any:
 # ── GPU allocation reporting (remote runtime capabilities) ─────────────
 
 
-def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, Any]:
+def _detect_gpu_allocation(
+    requested_gpu_order: tuple[str, ...],
+    print_line: bool = True,
+) -> dict[str, Any]:
     """Detect actual GPU runtime capabilities and emit ``[v2.gpu_allocation]``.
 
     Uses ``torch`` and ``nvidia-smi``-equivalent introspection to report
-    the GPU that was actually allocated.  Never raises.
+    the GPU that was actually allocated.  Never raises.  ``print_line=False``
+    suppresses the console line (per-request quiet repeats) while the caller
+    still receives (and stores) the artifact.
     """
     info: dict[str, Any] = {
         "gpu_requested_order": ",".join(requested_gpu_order),
@@ -3585,12 +6365,13 @@ def _detect_gpu_allocation(requested_gpu_order: tuple[str, ...]) -> dict[str, An
             info["cuda_version"] = torch.version.cuda or ""
     except Exception:
         pass
-    # Print one-line summary
-    _fmt = {k: v for k, v in info.items() if v is not None}
-    _line = " ".join(
-        f"{k}={v}" for k, v in sorted(_fmt.items())
-    )
-    print(f"[v2.gpu_allocation] {_line}", flush=True)
+    if print_line:
+        # Print one-line summary
+        _fmt = {k: v for k, v in info.items() if v is not None}
+        _line = " ".join(
+            f"{k}={v}" for k, v in sorted(_fmt.items())
+        )
+        print(f"[v2.gpu_allocation] {_line}", flush=True)
     return info
 
 
@@ -3652,7 +6433,6 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
                 _stripped = _line.strip()
                 if _stripped.startswith("0::"):
                     _cgroup_rel = _stripped[3:]
-                    break
     except Exception as exc:
         errors.append(f"parse_proc_cgroup: {type(exc).__name__}: {exc}")
     if _cgroup_rel is None:
@@ -3669,6 +6449,20 @@ def _resolve_cgroup_cpu_stat_path() -> tuple[str | None, list[str], list[str]]:
             )
             if path is not None:
                 return path, candidates, errors
+
+    # Probe 4: lenient-resolver hybrid mount base.  The resolver now also
+    # matches a ``cgroup`` (v1) mount at /sys/fs/cgroup; when that yields a
+    # base the strict fstype=="cgroup2" match missed, probe its cpu.stat.
+    # The shared _probe helper de-duplicates paths already probed above.
+    try:
+        base4 = _resolve_cgroup_v2_base()
+    except Exception as exc:
+        errors.append(f"resolve_cgroup_v2_base_hybrid: {type(exc).__name__}: {exc}")
+        base4 = None
+    if base4 is not None:
+        path = _probe(posixpath.join(base4[0], "cpu.stat"), "probe4")
+        if path is not None:
+            return path, candidates, errors
 
     return None, candidates, errors
 
@@ -3689,8 +6483,13 @@ def _read_cgroup_cpu_usage_usec(cpu_stat_path: str) -> int | None:
     return None
 
 
-def _emit_cgroup_spike_summary(peak: float, intervals: list[dict[str, Any]]) -> None:
+def _emit_cgroup_spike_summary(
+    peak: float,
+    intervals: list[dict[str, Any]],
+    source: str = "cgroup",
+) -> None:
     parts = [
+        f"source={source}",
         f"peak_effective_cores={peak:.3f}",
         f"interval_count={len(intervals)}",
     ]
@@ -3720,6 +6519,34 @@ def _emit_cgroup_cpu_unavailable(
     print(
         f"[v2.cgroup_cpu_spike] status=unavailable "
         f"reason={reason} candidates={candidate_text} errors={error_text}",
+        flush=True,
+    )
+
+
+# Once-per-process gate: the cgroup CPU unavailable line is emitted at most
+# once per process (a Modal worker with no readable cgroup filesystem would
+# otherwise repeat the identical diagnostics on every request).  COMFYMODAL_V2_QUIET
+# suppresses it entirely.
+_CGROUP_CPU_UNAVAILABLE_EMITTED = False
+
+
+def _emit_cgroup_cpu_unavailable_once(reason: str) -> None:
+    """Emit a compact cgroup-CPU unavailable line at most once per process.
+
+    The reason is capped at 120 characters total (the long candidates/errors
+    text is dropped — it adds no per-request value on an unresolvable host).
+    """
+    global _CGROUP_CPU_UNAVAILABLE_EMITTED
+    if _CGROUP_CPU_UNAVAILABLE_EMITTED:
+        return
+    _CGROUP_CPU_UNAVAILABLE_EMITTED = True
+    if _QUIET:
+        return
+    _reason = reason or "no readable cgroup cpu.stat"
+    if len(_reason) > 120:
+        _reason = _reason[:117] + "..."
+    print(
+        f"[v2.cgroup_cpu_spike] status=unavailable reason={_reason}",
         flush=True,
     )
 
@@ -3765,10 +6592,17 @@ class _CgroupCpuSampler:
         self._failure_reason: str | None = None
         self._prev_usage_usec: int | None = None
         self._prev_mono_ns: int | None = None
+        self._prev_process_ns: int | None = None
+        # When no cgroup cpu.stat is readable (e.g. Modal/gVisor), the sampler
+        # falls back to process-CPU sampling so requests still produce
+        # measured [v2.cgroup_cpu_spike] data.
+        self._source = (
+            "cgroup" if self._cpu_stat_path is not None else "process_cpu_fallback"
+        )
         self._stop_timed_out = False
 
     def start(self) -> None:
-        if not self._cpu_stat_path or self._thread is not None:
+        if self._thread is not None:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -3791,16 +6625,20 @@ class _CgroupCpuSampler:
         return self._phase
 
     def _sample(self) -> None:
-        if not self._cpu_stat_path:
+        # Prefer the resolved cgroup cpu.stat; honor a manually assigned
+        # _cgroup_base override (kept for the sampler unit tests).
+        cpu_stat_path = self._cpu_stat_path or getattr(self, "_cgroup_base", None)
+        if not cpu_stat_path:
+            self._sample_process_fallback()
             return
         try:
-            usage_usec = _read_cgroup_cpu_usage_usec(self._cpu_stat_path)
+            usage_usec = _read_cgroup_cpu_usage_usec(cpu_stat_path)
         except Exception as exc:
             self._failure_reason = f"read_error: {type(exc).__name__}: {exc}"
             return
         if usage_usec is None:
             self._failure_reason = (
-                f"read_error: {self._cpu_stat_path}: missing usage_usec"
+                f"read_error: {cpu_stat_path}: missing usage_usec"
             )
             return
         now_mono_ns = time.monotonic_ns()
@@ -3830,6 +6668,45 @@ class _CgroupCpuSampler:
             self._prev_usage_usec = usage_usec
             self._prev_mono_ns = now_mono_ns
 
+    def _sample_process_fallback(self) -> None:
+        """Process-CPU sampling fallback (same pattern as _ProcessCpuSampler).
+
+        Used when no readable cgroup cpu.stat exists (e.g. Modal/gVisor), so
+        the request still produces measured effective-cores samples.  Falls
+        back to wall-clock vs ``time.process_time_ns()`` deltas.
+        """
+        try:
+            now_mono_ns = time.monotonic_ns()
+            now_process_ns = time.process_time_ns()
+        except Exception as exc:
+            self._failure_reason = f"sample_error: {type(exc).__name__}: {exc}"
+            return
+        now_unix_ns = time.time_ns()
+        with self._lock:
+            if self._prev_mono_ns is not None and self._prev_process_ns is not None:
+                delta_wall_ns = now_mono_ns - self._prev_mono_ns
+                delta_process_ns = now_process_ns - self._prev_process_ns
+                effective_cores = (
+                    max(0.0, delta_process_ns / delta_wall_ns)
+                    if delta_wall_ns > 0
+                    else 0.0
+                )
+            else:
+                effective_cores = 0.0
+            self._samples.append(
+                _CgroupCpuSample(
+                    timestamp_unix_ns=now_unix_ns,
+                    elapsed_request_ms=round(
+                        (now_mono_ns - self._method_entry_mono_ns) / 1_000_000.0,
+                        3,
+                    ),
+                    effective_cgroup_cores=round(effective_cores, 3),
+                    phase=self._current_phase(),
+                )
+            )
+            self._prev_mono_ns = now_mono_ns
+            self._prev_process_ns = now_process_ns
+
     def set_phase_source(self, source: Callable[[], str]) -> None:
         self._phase_source = source
 
@@ -3846,12 +6723,18 @@ class _CgroupCpuSampler:
                 reason_parts.append(self._failure_reason)
             if not reason_parts:
                 reason_parts.append("zero_samples")
-            _emit_cgroup_cpu_unavailable(
-                reason=" | ".join(reason_parts),
-                candidates=self._resolution_candidates,
-                errors=self._resolution_errors + (
-                    [self._failure_reason] if self._failure_reason else []
-                ),
+            # Compact, once-per-process unavailable line (the long
+            # candidates/errors text only adds noise on unresolvable hosts).
+            _emit_cgroup_cpu_unavailable_once(" | ".join(reason_parts))
+            return
+        if self._source == "process_cpu_fallback":
+            # Measured process-CPU fallback data: keep the same spike summary
+            # shape but mark the source so consumers know it is not cgroup
+            # accounting.
+            _emit_cgroup_spike_summary(
+                self.compute_peak_cores(),
+                self.compute_spike_intervals(),
+                source="process_cpu_fallback",
             )
             return
         _emit_cgroup_spike_summary(
@@ -4037,6 +6920,12 @@ def _summarize_cgroup_interval(
 # Calculates overlap intervals for graph CLIP, execution-prefill CLIP,
 # and request-path load_models_gpu only.
 
+# Once-per-process gate: with COMFYMODAL_V2_QUIET the insufficient-samples
+# unavailable line is emitted at most once per process instead of every
+# request.  When the flag is unset every request still prints (unchanged).
+_PROCESS_CPU_UNAVAILABLE_EMITTED = False
+
+
 class _ProcessCpuSampler:
     """Process-time-based CPU utilization sampler.
 
@@ -4111,6 +7000,11 @@ class _ProcessCpuSampler:
         samples = self._snapshot()
         if len(samples) < 2:
             _reason = "insufficient_samples" if self._failure_reason is None else self._failure_reason
+            if _QUIET:
+                global _PROCESS_CPU_UNAVAILABLE_EMITTED
+                if _PROCESS_CPU_UNAVAILABLE_EMITTED:
+                    return
+                _PROCESS_CPU_UNAVAILABLE_EMITTED = True
             print(
                 f"[v2.process_cpu_spike] status=unavailable reason={_reason} "
                 f"sample_count={len(samples)}",
@@ -4366,8 +7260,8 @@ def _persist_v2_dependency_manifest(
     if not _cn_gen:
         try:
             _rec = legacy_module._read_custom_nodes_generation_record()
-            if _rec and _rec.get("generation"):
-                _cn_gen = str(_rec["generation"])
+            if _rec and _rec.get("content_generation"):
+                _cn_gen = str(_rec["content_generation"])
         except Exception:
             pass
 
@@ -4419,6 +7313,16 @@ def _persist_v2_dependency_manifest(
     _mft_identity = _manifest.get("identity", "")
     _mft_ident_match = bool(_mft_identity)
     _manifest_ms = round((time.time() - _t0) * 1000, 1)
+    # Step-2: expose the manifest writer's identity on the bootstrap state so
+    # the snapshot proof freeze can reference the exact manifest identity.
+    # Instrumentation only — the preflight decision guard additionally checks
+    # the companion dependency_manifest_* fields (still empty here), so the
+    # request-path dependency preflight skip remains unchanged.
+    if _mft_identity:
+        try:
+            state.dependency_manifest_identity = _mft_identity
+        except Exception:
+            pass
 
     # 7. Fail closed in production if identity is missing (volume commit failure, etc.)
     if _is_production and not _mft_ident_match:
@@ -4456,6 +7360,432 @@ async def _with_cgroup_sampler_cleanup(
             sampler.stop()
 
 
+# ── Mounted-Volume raw sequential-read benchmark (diagnostic; default OFF) ──
+# Pure volume read speed of a mounted model file.  Never executes graph work,
+# model/UNET parsing, mmap/AimDO, GPU code, hashing, or /tmp writes.
+_VOLUME_READ_CHUNK_BYTES = 8 * 1024 * 1024
+_VOLUME_READ_DEFAULT_FILENAME = "z_image_turbo_bf16.safetensors"
+_VOLUME_READ_DEFAULT_FOLDER = "diffusion_models"
+
+
+def _volume_read_resolve_path(
+    filename: str,
+    *,
+    models_root: str = MODELS_PATH,
+    folder: str = _VOLUME_READ_DEFAULT_FOLDER,
+) -> str:
+    """Resolve *filename* under *models_root*'s *folder* with strict guards.
+
+    Only a bare file name is accepted (no separators, no ``..``, no absolute
+    path).  The resolved real path must stay inside the real models root, the
+    file must exist and be a regular file.  Raises ValueError/FileNotFoundError.
+    """
+    name = str(filename or "").strip()
+    if not name:
+        raise ValueError("volume-read filename is empty")
+    if name in (".", "..") or name.startswith(("/", "\\")) or "\\" in name or "/" in name:
+        raise ValueError(f"volume-read filename must be a bare file name: {name!r}")
+    root_real = os.path.realpath(models_root)
+    folder_real = os.path.realpath(os.path.join(root_real, folder))
+    candidate = os.path.realpath(os.path.join(folder_real, name))
+    if not (candidate == folder_real or candidate.startswith(folder_real + os.sep)):
+        raise ValueError(
+            f"volume-read target escapes the models root: {candidate!r}"
+        )
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(f"volume-read target is not a regular file: {candidate}")
+    return candidate
+
+
+def _volume_read_stat_size(path: str) -> int:
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"volume-read target is not a regular file: {path}")
+    return int(st.st_size)
+
+
+def _volume_read_rusage_snapshot() -> dict[str, int] | None:
+    """Best-effort rusage counters (ru_inblock/ru_oublock/ru_majflt/ru_minflt)."""
+    try:
+        import resource as _res
+
+        usage = _res.getrusage(_res.RUSAGE_SELF)
+        return {
+            "ru_inblock": int(usage.ru_inblock),
+            "ru_oublock": int(usage.ru_oublock),
+            "ru_majflt": int(usage.ru_majflt),
+            "ru_minflt": int(usage.ru_minflt),
+        }
+    except Exception:
+        return None
+
+
+def _volume_read_io_snapshot() -> dict[str, int] | None:
+    """Best-effort /proc/self/io read/write byte counters."""
+    try:
+        with open("/proc/self/io", "r", encoding="utf-8") as _fh:
+            raw = _fh.read()
+        counters: dict[str, int] = {}
+        for line in raw.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() in ("read_bytes", "write_bytes", "rchar", "wchar"):
+                counters[key.strip()] = int(value.strip())
+        return counters or None
+    except Exception:
+        return None
+
+
+def _volume_read_delta_snapshot(
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> dict[str, int] | None:
+    if not before or not after:
+        return None
+    return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in before}
+
+
+def _volume_read_rates(
+    bytes_read: int, wall_ns: int,
+) -> tuple[float | None, float | None]:
+    """decimal_GBps (bytes/1e9/s) and binary_GiBps (bytes/2**30/s)."""
+    seconds = wall_ns / 1_000_000_000.0
+    if seconds <= 0:
+        return None, None
+    return (
+        round(bytes_read / 1_000_000_000.0 / seconds, 3),
+        round(bytes_read / (2 ** 30) / seconds, 3),
+    )
+
+
+def _resolve_comfyui_root() -> str:
+    """Resolve the container ComfyUI root.
+
+    Source mirrors the deployment-proof freeze block (``bootstrap.config``
+    -> ``comfyui_root``, falling back to the canonical
+    ``/root/comfy/ComfyUI``); an explicit ``COMFYMODAL_V2_COMFYUI_ROOT`` env
+    override wins when present.
+    """
+    return str(
+        os.environ.get("COMFYMODAL_V2_COMFYUI_ROOT", "") or "/root/comfy/ComfyUI"
+    )
+
+
+def _registry_manifest_roots() -> list[str]:
+    """Roots for path-independent registry identity.
+
+    Keep the custom-nodes root in this list as well as the ComfyUI and runtime
+    roots.  The host proof builder uses the same root set; omitting it on the
+    snapshot side makes the shortest logical module path differ (for example
+    ``node.py`` versus ``custom_nodes/pkg/node.py``) and turns valid proofs
+    into false identity mismatches.
+    """
+    _roots: list[str] = []
+    try:
+        from comfymodal_runtime import contracts as _c
+        _repo = os.path.dirname(os.path.dirname(os.path.abspath(_c.__file__)))
+        if _repo:
+            _roots.append(str(_repo))
+    except Exception:
+        pass
+    _cfr = _resolve_comfyui_root()
+    if _cfr and os.path.isdir(_cfr):
+        _roots.append(_cfr)
+        _custom_nodes = os.path.join(_cfr, "custom_nodes")
+        if os.path.isdir(_custom_nodes):
+            _roots.append(_custom_nodes)
+    try:
+        import comfyapp as _ca
+        _f = getattr(_ca, "__file__", "")
+        if _f and os.path.isdir(os.path.dirname(os.path.abspath(_f))):
+            _roots.append(os.path.dirname(os.path.abspath(_f)))
+    except Exception:
+        pass
+    return [r for r in dict.fromkeys(_roots) if r]
+
+
+def _registry_manifest_publication_fields(
+    registry_manifest: Any,
+    *,
+    error: str = "",
+    root_count: int = 0,
+) -> dict[str, Any]:
+    """Return fail-closed manifest fields for proof publication points."""
+    if not isinstance(registry_manifest, dict):
+        registry_manifest = {}
+    manifest_error = str(registry_manifest.get("error") or error or "")
+    try:
+        class_count = len(registry_manifest.get("classes", {}) or {})
+    except Exception:
+        class_count = 0
+    try:
+        normalized_root_count = int(root_count)
+    except (TypeError, ValueError):
+        normalized_root_count = 0
+    return {
+        "registry_manifest": registry_manifest,
+        "registry_manifest_error": manifest_error,
+        "registry_manifest_root_count": normalized_root_count,
+        "registry_manifest_class_count": class_count,
+    }
+
+
+def _lf_sha256_bytes(data: bytes) -> str:
+    """sha256 of ``data`` with LF line-ending normalization (CRLF/CR == LF)."""
+    return hashlib.sha256(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+
+
+def _file_sha256_lf(path: str) -> str:
+    """LF-normalized sha256 of the file at ``path``, or ``""`` if unreadable."""
+    try:
+        with open(path, "rb") as fh:
+            return _lf_sha256_bytes(fh.read())
+    except Exception:
+        return ""
+
+
+def _git_rev_parse_head(repo_root: str) -> str:
+    """Best-effort ``git -C <repo_root> rev-parse HEAD`` (guarded, 10s timeout).
+
+    Subprocess is imported lazily and every failure (git missing, not a git
+    repo, timeout, error exit) yields ``""`` — diagnostics never raise.
+    """
+    if not repo_root:
+        return ""
+    try:
+        import subprocess  # noqa: PLC0415
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return str(proc.stdout or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _stamp_remote_result_emit(
+    data: dict[str, Any],
+    event: Mapping[str, Any],
+    context_trace: Any,
+    *,
+    request_id: str,
+) -> None:
+    """Capture the remote result emission boundary immediately before yield.
+
+    Pure timing-only result assembly: sets ``data["remote_result_emit_*"]`` and
+    records a ``remote_result_emit`` trace event on the live trace AND in the
+    already-serialized ``data["trace"]["events"]`` so the yielded result
+    carries it before any consumer reads it.  Never changes result content
+    semantics and never claims a caller-visible response time.
+    """
+    emit_wall_ns = time.time_ns()
+    emit_mono_ns = time.monotonic_ns()
+    data["remote_result_emit_wall_unix_ns"] = emit_wall_ns
+    data["remote_result_emit_mono_ns"] = emit_mono_ns
+    # ── E25: handoff attribution scaffolding ──
+    # The 1820 ms remote_result_emit -> local_result_received window mixes
+    # (a) application-side serialization of the result dict, (b) Modal
+    # generator-frame transport, and (c) local deserialization.  Capture the
+    # payload byte count (the descriptor-mode result carries NO raw image
+    # bytes — the 3.13 MB PNG is fetched separately through the persisted
+    # asset path) so the host can attribute the transport cost to the actual
+    # serialized payload size rather than the image bytes.
+    _handoff_payload_bytes = 0
+    try:
+        _od = data.get("output_diagnostics")
+        if isinstance(_od, Mapping):
+            _srb = _od.get("serialized_result_bytes")
+            if isinstance(_srb, (int, float)) and _srb > 0:
+                _handoff_payload_bytes = int(_srb)
+        if _handoff_payload_bytes <= 0:
+            try:
+                _measured = _measure_json_bytes(data)
+                if isinstance(_measured, (int, float)) and _measured > 0:
+                    _handoff_payload_bytes = int(_measured)
+            except Exception:
+                pass
+    except Exception:
+        _handoff_payload_bytes = 0
+    data["remote_handoff_payload_bytes"] = _handoff_payload_bytes
+    meta = {
+        "request_id": request_id,
+        "event_type": event.get("type", "") if isinstance(event, Mapping) else "",
+        "clock_scope": "cross_process",
+        "clock_precision": "wall_clock",
+        "handoff_payload_bytes": _handoff_payload_bytes,
+        "handoff_payload_has_inline_images": 0,
+    }
+    try:
+        if context_trace is not None:
+            context_trace.emit_at(
+                "remote_result_emit",
+                wall_unix_ns=emit_wall_ns,
+                monotonic_ns=emit_mono_ns,
+                process="remote",
+                phase="method",
+                metadata=meta,
+            )
+    except Exception:
+        pass
+    trace_dict = data.get("trace")
+    if isinstance(trace_dict, dict) and isinstance(trace_dict.get("events"), list):
+        trace_dict["events"].append({
+            "name": "remote_result_emit",
+            "process": "remote",
+            "phase": "method",
+            "wall_unix_ns": emit_wall_ns,
+            "monotonic_ns": emit_mono_ns,
+            "request_id": request_id,
+            "container_session_id": trace_dict.get("container_session_id", ""),
+            "trace_id": trace_dict.get("trace_id", ""),
+            "metadata": dict(meta),
+        })
+
+
+def _stamp_terminal_cleanup(
+    event: dict[str, Any],
+    *,
+    start_wall_ns: int,
+    start_mono_ns: int,
+    end_wall_ns: int,
+    end_mono_ns: int,
+    request_id: str,
+) -> None:
+    """Attach the terminal-cleanup timing window to the terminal event data.
+
+    Pure timing-only: sets ``terminal_cleanup_start/end_wall_unix_ns`` and
+    ``terminal_cleanup_start/end_mono_ns`` on ``event["data"]`` (falling back
+    to the event dict itself) so host reconciliation can derive
+    ``remote_cleanup_ms`` (same-process mono diff) and
+    ``transport_after_cleanup_ms`` (local_result_received_wall minus
+    terminal_cleanup_end_wall_unix_ns).  Never changes result semantics and
+    never adds an RPC.
+    """
+    target = event.get("data")
+    if not isinstance(target, dict):
+        target = event
+    target["terminal_cleanup_start_wall_unix_ns"] = start_wall_ns
+    target["terminal_cleanup_start_mono_ns"] = start_mono_ns
+    target["terminal_cleanup_end_wall_unix_ns"] = end_wall_ns
+    target["terminal_cleanup_end_mono_ns"] = end_mono_ns
+
+
+def _last_png_encode_info_meta() -> dict[str, Any]:
+    """Return additive, format-neutral metadata from the last output encode.
+
+    Used to enrich the existing ``output_encode_end`` trace event with PNG
+    encode info that the host reads from the trace artifact (container stdout
+    never reaches the benchmark capture).  comfyapp may not be importable on
+    every path, so every access is guarded.  Additive only — never raises.
+    """
+    try:
+        from comfyapp import get_last_output_encode_info
+    except Exception:
+        try:
+            from comfyapp import get_last_png_encode_info as get_last_output_encode_info
+        except Exception:
+            return {}
+    try:
+        info = get_last_output_encode_info()
+    except Exception:
+        return {}
+    if not isinstance(info, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    _cl = info.get("compress_level")
+    _ms = info.get("png_compress_ms")
+    if isinstance(_cl, int):
+        meta["compress_level"] = _cl
+    if isinstance(_ms, (int, float)):
+        meta["png_compress_ms"] = round(float(_ms), 3)
+    for _key in ("codec", "format", "quality", "encoded_bytes", "conversion_fallback"):
+        if _key in info and info[_key] is not None:
+            meta[_key] = info[_key]
+    _codec_ms = info.get("output_codec_ms")
+    if isinstance(_codec_ms, (int, float)):
+        meta["output_codec_ms"] = round(float(_codec_ms), 3)
+    return meta
+
+
+def _should_run_posthoc_output_conversion(attempt: Any, output_format: str) -> bool:
+    """Return whether a collected result still needs byte conversion."""
+    return bool(
+        getattr(attempt, "success", False)
+        and getattr(attempt, "strategy", "") != "direct_output_sink"
+        and output_format != "original"
+    )
+
+
+def _e19_atomic_profile_active() -> bool:
+    return (
+        os.environ.get("COMFYMODAL_V2_ATOMIC_PROFILE", "").strip()
+        == "E19_FINAL_COLD_LOADER"
+    )
+
+
+def unet_snapshot_execution_contract(
+    models: Any,
+    *,
+    fastsafetensors_enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Describe the post-restore UNET state that E19 can actually exercise."""
+    container_present = models is not None
+    unet_present = bool(container_present and getattr(models, "unet", None) is not None)
+    fastsafe = (
+        env_flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS")
+        if fastsafetensors_enabled is None
+        else bool(fastsafetensors_enabled)
+    )
+    return {
+        "snapshot_container_present": container_present,
+        "snapshot_unet_weights_present": unet_present,
+        "snapshot_unet_weights_absent": bool(container_present and not unet_present),
+        "meta_skeleton_present": bool(
+            container_present and getattr(models, "unet_meta", None) is not None
+        ),
+        "fastsafe_first_demand_eligible": bool(
+            container_present and not unet_present and fastsafe
+        ),
+        "expected_unet_execution_identity": (
+            "fastsafetensors"
+            if container_present and not unet_present and fastsafe
+            else "cpu_snapshot"
+            if unet_present
+            else "unavailable"
+        ),
+        "cpu_snapshot_execution_allowed_for_e19": bool(unet_present),
+    }
+
+
+def resolve_post_executor_cancel(
+    cancelled: Callable[[], bool] | None,
+    executor_success: bool,
+) -> str | None:
+    """Completion-first verdict checked after PromptExecutor returns.
+
+    Returns the error message to raise when a confirmed remote cancel should
+    reclassify a NON-successful execution, or ``None`` when execution should
+    proceed to output collection.  A SUCCESSFUL PromptExecutor completion
+    always wins over a late watcher cancel: once the executor finished
+    successfully, a cancel message arriving afterwards must never discard the
+    produced outputs.  Only a non-successful execution may be reclassified as
+    cancelled, so the normal no-cancel path (successful completion) is
+    unchanged.
+    """
+    if executor_success:
+        return None
+    try:
+        if cancelled is not None and cancelled():
+            return "execution cancelled after PromptExecutor completion"
+    except Exception:
+        # A raising cancel callback must never mask the completion path.
+        pass
+    return None
+
+
 class ModalRuntimeEntrypoint:
     """Real v2 runtime facade backed by the existing ComfyUI executor."""
 
@@ -4476,6 +7806,12 @@ class ModalRuntimeEntrypoint:
         self._legacy_module: Any | None = None
         self._legacy_api: Any | None = None
         self._runtime_configured = False
+        # Restore-only handoff between the authoritative custom-node identity
+        # read and its possible fallback sync.  These markers are deliberately
+        # not useful during construction or ordinary request execution.
+        self._restore_custom_node_identity_scope_active = False
+        self._restore_custom_node_identity_epoch = 0
+        self._restore_custom_node_identity_cache: dict[str, Any] | None = None
         self._restore_plan: RestorePlan | None = None
         self._preload_bridge = V2LoaderBridge()
         self._lifecycle_trace: RuntimeTrace | None = None
@@ -4485,13 +7821,29 @@ class ModalRuntimeEntrypoint:
         os.environ["COMFYMODAL_CONTAINER_SESSION_ID"] = self.container_session_id
         self._restore_count: int = 0
         self._request_count: int = 0
+        # Created only by restore() after the restore lifecycle completes.
+        # Keep the pre-restore value empty so snapshot state cannot carry a
+        # prior lifecycle's nonce into the restored instance.
+        self._post_restore_nonce: str = ""
+        self._restore_session_id: str = ""
         self._restore_timing: dict[str, Any] | None = None
         self._cgroup_sampler: _CgroupCpuSampler | None = None
         self._process_cpu_sampler: _ProcessCpuSampler | None = None
         self._request_gpu_release_lock = threading.Lock()
         self._request_gpu_release_done = False
         self._request_gpu_release_request_id = ""
+        self._deferred_commit_task = None
+        self._deferred_commit_diag = None
+        self._deferred_commit_pending = False
         self._terminal_response_delivered = False
+        # Guard used only while the explicit Golden adapter owns execution.
+        # Lifecycle startup remains compatible with the legacy runtime, but a
+        # Golden stage can never silently fall back into it.
+        self._golden_execution_active = False
+        # Startup-only status for the Golden models-generation control record.
+        # The record is established before snapshot construction and is never
+        # synthesized at request time.
+        self._golden_models_generation_startup_status = "not_run"
         # CPU snapshot model state (Plan C lifecycle)
         self._cpu_snapshot_models: CpuSnapshotModels | None = None
         self._cpu_snapshot_models_active: bool = False
@@ -4717,6 +8069,22 @@ class ModalRuntimeEntrypoint:
                 )
 
             self._run_teardown_stage("legacy_request_workers", stop_legacy_workers)
+
+            # Exact-conditioning cache flush: signal the background
+            # persistence worker, join within the standard budget, drain any
+            # queue remnant, and issue one final explicit commit when the
+            # mounted volume is still dirty.  Modal's shutdown snapshot +
+            # commit remains the durability backstop.
+            def flush_conditioning_cache() -> None:
+                try:
+                    from .clip_conditioning_cache import peek_exact_conditioning_cache
+                    _svc = peek_exact_conditioning_cache()
+                    if _svc is not None and hasattr(_svc, "flush"):
+                        _svc.flush(timeout=_PRELOAD_WORKER_JOIN_BUDGET_S)
+                except Exception:
+                    pass
+
+            self._run_teardown_stage("conditioning_cache_flush", flush_conditioning_cache)
 
             # Shutdown-hook fallback: flush any production cleanup that was
             # deferred for a stream cancelled before its terminal event.  This
@@ -4999,6 +8367,18 @@ class ModalRuntimeEntrypoint:
                         callback()
                     except Exception as exc:
                         errors.append(type(exc).__name__)
+                # ── E25: close an unconsumed speculative CLIP hydration lane
+                # so a request that never demanded the CLIP never leaks GPU
+                # tensors (owners closed + empty_cache).  Idempotent; a lane
+                # already consumed at demand time is gone from the store.
+                try:
+                    from comfymodal_runtime.speculative_clip_hydration import (
+                        close_speculative_clip_lane,
+                    )
+
+                    close_speculative_clip_lane(request_key)
+                except Exception:
+                    pass
                 if errors:
                     raise RuntimeError(",".join(errors))
 
@@ -5320,6 +8700,12 @@ class ModalRuntimeEntrypoint:
             self._request_gpu_release_done = False
         if not hasattr(self, "_request_gpu_release_request_id"):
             self._request_gpu_release_request_id = ""
+        if not hasattr(self, "_deferred_commit_task"):
+            self._deferred_commit_task = None
+        if not hasattr(self, "_deferred_commit_diag"):
+            self._deferred_commit_diag = None
+        if not hasattr(self, "_deferred_commit_pending"):
+            self._deferred_commit_pending = False
         if not hasattr(self, "_terminal_response_delivered"):
             self._terminal_response_delivered = False
         if not hasattr(self, "_unet_backing_evidence"):
@@ -5332,16 +8718,23 @@ class ModalRuntimeEntrypoint:
         *,
         reload_unet_fn: Callable | None = None,
         reload_clip_fn: Callable | None = None,
+        reload_vae_fn: Callable | None = None,
         snap_ctx_cm: Callable | None = None,
         target_gpus: tuple[str, ...] | None = None,
+        trace: Any = None,
     ) -> dict[str, Any]:
         """Evict BOTH CPU snapshot models unconditionally, then reload
-        the selected role (clip/unet/none) via stored loader closures.
+        the selected role (clip/unet/clip_vae/none) via stored loader
+        closures.
 
         Before eviction copies primitive metadata from the models.
         After full eviction succeeds, reloads exactly the selected role
         and stores the fresh object on ``_snapshot_eviction_retained_model``.
-        Normal snapshot model state/bridge/loader outputs/seed remain absent.
+        The strict ``clip_vae`` role instead keeps the ``CpuSnapshotModels``
+        metadata container: UNET is evicted and proven dead while fresh
+        CLIP and VAE are reloaded back onto the container (``unet`` stays
+        ``None``, no retained eviction slot, activation stays off).  Normal
+        snapshot model state/bridge/loader outputs/seed remain absent.
 
         Returns primitive metadata dict (no live objects).  Raises
         RuntimeError on any validation failure.
@@ -5379,17 +8772,36 @@ class ModalRuntimeEntrypoint:
         _retained_role = _parse_evict_retain_role()
         self._snapshot_eviction_retained_role = _retained_role
 
+        # Strict restore-only retain role: the VAE is also evicted/reloaded
+        # so the retained container carries fresh CLIP + VAE with unet=None.
+        _evict_vae = _retained_role == "clip_vae"
+        if _evict_vae:
+            _vae_obj = getattr(cpu_models, "vae", None)
+            _vae_id = str(id(_vae_obj)) if _vae_obj is not None else "none"
+            _vae_type = type(_vae_obj).__name__ if _vae_obj is not None else "none"
+            _vae_present = int(_vae_obj is not None)
+            _vae_ident = getattr(_model_key, "vae_identity", "absent")
+        else:
+            _vae_obj = None
+            _vae_id = "none"
+            _vae_type = "none"
+            _vae_present = 0
+            _vae_ident = "absent"
+
         # Primitive metadata dict for return (no live objects)
         _eviction_metadata: dict[str, Any] = {
             "model_key_unet_identity": _unet_ident,
             "model_key_clip_identity": _clip_ident,
             "model_key_clip_type": _clip_type_model,
+            "model_key_vae_identity": _vae_ident,
             "model_key_hash": _key_hash,
             "compute_policy": _compute_policy,
             "policy_version": _policy_version,
             "weight_dtype": _weight_dtype,
+            "retained_role": _retained_role,
             "unet_present": _unet_present,
             "clip_present": _clip_present,
+            "vae_present": _vae_present,
         }
         _effective_target_gpus = _model_target_gpus or target_gpus or ()
         if isinstance(_effective_target_gpus, (tuple, list)):
@@ -5403,10 +8815,14 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_metadata = {
             "clip_present": _clip_present,
             "unet_present": _unet_present,
+            "vae_present": _vae_present,
             "clip_type": _clip_type_name,
             "unet_type": _unet_type,
+            "vae_type": _vae_type,
             "clip_object_id": _clip_id,
             "unet_object_id": _unet_id,
+            "vae_object_id": _vae_id,
+            "model_key_vae_identity": _vae_ident,
             "cpu_snapshot_model_key_hash": _key_hash,
             "cpu_snapshot_compute_policy": _compute_policy,
             "cpu_snapshot_policy_version": _policy_version,
@@ -5491,6 +8907,15 @@ class ModalRuntimeEntrypoint:
                 )
         else:
             _clip_wr = None
+        if _evict_vae and _vae_obj is not None:
+            try:
+                _vae_wr = _wr.ref(_vae_obj)
+            except TypeError:
+                raise RuntimeError(
+                    f"weakref.ref unsupported for VAE object (type={_vae_type})"
+                )
+        else:
+            _vae_wr = None
 
         # ── 3. Capture bridge state, then clear it ──
         _diag = getattr(self._preload_bridge, "diagnostic_snapshot", lambda: {})()
@@ -5554,13 +8979,17 @@ class ModalRuntimeEntrypoint:
             import torch
             _loaded_records = getattr(_mm, "current_loaded_models", None)
             _free_memory = getattr(_mm, "free_memory", None)
+            _targets = tuple(o for o in (_unet_obj, _clip_obj) if o is not None)
+            if _evict_vae and _vae_obj is not None:
+                _targets = _targets + (_vae_obj,)
             if isinstance(_loaded_records, list) and callable(_free_memory):
                 _records = list(_loaded_records)
-                _targets = (_unet_obj, _clip_obj)
                 _comfy_owned_before = sum(
                     1 for _record in _records
-                    if getattr(_record, "model", None) is _unet_obj
-                    or getattr(_record, "model", None) is _clip_obj
+                    if any(
+                        getattr(_record, "model", None) is _target
+                        for _target in _targets
+                    )
                 )
                 _keep_loaded = [
                     _record for _record in _records
@@ -5575,8 +9004,10 @@ class ModalRuntimeEntrypoint:
                     _cleanup_models()
                 _comfy_owned_after = sum(
                     1 for _record in list(_loaded_records)
-                    if getattr(_record, "model", None) is _unet_obj
-                    or getattr(_record, "model", None) is _clip_obj
+                    if any(
+                        getattr(_record, "model", None) is _target
+                        for _target in _targets
+                    )
                 )
                 del _records, _targets, _keep_loaded
             else:
@@ -5587,7 +9018,7 @@ class ModalRuntimeEntrypoint:
                 _unload_model = getattr(_mm, "unload_model_and_clones", None)
                 if callable(_unload_model):
                     for _loaded_model in list(_loaded_models):
-                        if _loaded_model is _unet_obj or _loaded_model is _clip_obj:
+                        if any(_loaded_model is t for t in _targets):
                             _unload_model(
                                 _loaded_model,
                                 unload_additional_models=False,
@@ -5610,8 +9041,10 @@ class ModalRuntimeEntrypoint:
         _patcher_cleanup_errors = 0
         _patcher_tmp: Any = None
         _p: Any = None
-        for _model_obj in (_unet_obj, _clip_obj):
+        for _model_obj in (_unet_obj, _clip_obj, _vae_obj):
             if _model_obj is None:
+                continue
+            if not _evict_vae and _model_obj is _vae_obj:
                 continue
             # cleanup() on the model object itself (ModelPatcher instances)
             _patcher_tmp = getattr(_model_obj, "cleanup", None)
@@ -5651,6 +9084,31 @@ class ModalRuntimeEntrypoint:
         self._snapshot_eviction_metadata["patcher_detach_count"] = _patcher_detach_count
         self._snapshot_eviction_metadata["patcher_cleanup_errors"] = _patcher_cleanup_errors
 
+        # ── 7.75. Freeze D3 clip manifest before eviction ──
+        # Capture a deep-copied plain-data copy of the frozen fast-hydration
+        # manifest (plus the excluded-marker state) from the ORIGINAL clip so
+        # the clip_vae retain reload can re-apply the D3 exclusion to the fresh
+        # full-weight CLIP before the memory-snapshot fork.  The deep copy
+        # keeps no reference to the clip object or its tensors, so the weakref
+        # death checks below still prove the original object is gone.
+        _frozen_clip_manifest: Any = None
+        _frozen_clip_manifest_eligible = False
+        _frozen_clip_excluded = False
+        try:
+            from . import clip_fast_hydration as _cfh
+            _frozen_clip_manifest_raw = _cfh.get_clip_manifest(_clip_obj)
+            if _frozen_clip_manifest_raw is not None:
+                _frozen_clip_manifest = copy.deepcopy(_frozen_clip_manifest_raw)
+                _frozen_clip_manifest_eligible = bool(
+                    _frozen_clip_manifest.get("eligible")
+                )
+            _frozen_clip_excluded = bool(_cfh.clip_weights_excluded(_clip_obj))
+            del _frozen_clip_manifest_raw, _cfh
+        except Exception:
+            _frozen_clip_manifest = None
+            _frozen_clip_manifest_eligible = False
+            _frozen_clip_excluded = False
+
         # ── 8. Clear runtime/storage registries and self attrs ──
         self._cpu_snapshot_unet_runtime_state = None
         self._cpu_snapshot_unet_storage_registry = None
@@ -5659,8 +9117,20 @@ class ModalRuntimeEntrypoint:
         if cpu_models is not None:
             cpu_models.unet = None
             cpu_models.clip = None
-        self._cpu_snapshot_models = None
-        del cpu_models, _unet_obj, _clip_obj
+            if _evict_vae:
+                cpu_models.vae = None
+        if _retained_role == "clip_vae":
+            # Strict restore-only role: keep the CpuSnapshotModels metadata
+            # container (identity / policy / registries).  Model fields were
+            # nulled above; fresh CLIP/VAE are reloaded onto it in step 16.
+            _container_retained = cpu_models
+        else:
+            self._cpu_snapshot_models = None
+            _container_retained = None
+        del _unet_obj, _clip_obj
+        if _evict_vae:
+            del _vae_obj
+        del cpu_models
 
         # ── 9. gc.collect() x2 + memory ──
         _gc.collect()
@@ -5717,14 +9187,18 @@ class ModalRuntimeEntrypoint:
         # ── 12. Verify BOTH original weakrefs dead ──
         _unet_alive = _unet_wr() is not None if _unet_wr is not None else False
         _clip_alive = _clip_wr() is not None if _clip_wr is not None else False
+        _vae_alive = _vae_wr() is not None if _vae_wr is not None else False
         _original_unet_alive_flag = 1 if _unet_alive else 0
         _original_clip_alive_flag = 1 if _clip_alive else 0
-        if _unet_alive or _clip_alive:
+        _original_vae_alive_flag = 1 if _vae_alive else 0
+        if _unet_alive or _clip_alive or _vae_alive:
             _alive_parts = []
             if _unet_alive:
                 _alive_parts.append(f"UNET(id={_unet_id})")
             if _clip_alive:
                 _alive_parts.append(f"CLIP(id={_clip_id})")
+            if _vae_alive:
+                _alive_parts.append(f"VAE(id={_vae_id})")
             _alive_msg = "; ".join(_alive_parts)
             _known_ref_state = {
                 "bridge_active_preparation": _bridge_active_prep,
@@ -5850,16 +9324,21 @@ class ModalRuntimeEntrypoint:
         _floor_failures_flat: str = ""
 
         if _retained_role != "none":
-            if not all(c is not None for c in (reload_unet_fn, reload_clip_fn, snap_ctx_cm)):
+            _required_closures = (reload_unet_fn, reload_clip_fn, snap_ctx_cm)
+            if _retained_role == "clip_vae":
+                _required_closures = _required_closures + (reload_vae_fn,)
+            if not all(c is not None for c in _required_closures):
                 raise RuntimeError(
                     f"Eviction retain role is {_retained_role!r} but reload "
                     f"closures are missing (reload_unet_fn={reload_unet_fn is not None}, "
                     f"reload_clip_fn={reload_clip_fn is not None}, "
+                    f"reload_vae_fn={reload_vae_fn is not None}, "
                     f"snap_ctx_cm={snap_ctx_cm is not None})"
                 )
             import comfy.utils as _cu
             _MISSING = object()
             _mmap_orig = getattr(_cu, "DISABLE_MMAP", _MISSING)
+            _reloaded_vae: Any = None
             try:
                 with cast(ContextManager[Any], snap_ctx_cm()):
                     _cu.DISABLE_MMAP = True
@@ -5892,6 +9371,36 @@ class ModalRuntimeEntrypoint:
                             _reloaded_model = reload_clip_fn(
                                 _clip_name, _clip_type_str, "default"
                             )
+                    if _retained_role == "clip_vae":
+                        # Strict restore-only role: also reload a fresh VAE
+                        # under the same snapshot context + DISABLE_MMAP.
+                        if reload_vae_fn is None:
+                            raise RuntimeError(
+                                "clip_vae retention requires a reload_vae_fn closure"
+                            )
+                        if _vae_present == 0:
+                            raise RuntimeError(
+                                "clip_vae retention requires an original VAE but "
+                                "the snapshot container had none"
+                            )
+                        _vae_name = ""
+                        if isinstance(_normalized_profile, dict):
+                            _vae_name = _normalized_profile.get("vae", "")
+                        if not _vae_name:
+                            raise RuntimeError(
+                                f"reload VAE: normalized_profile has no 'vae' field"
+                            )
+                        _reloaded_vae = reload_vae_fn(_vae_name)
+                        if _reloaded_vae is None:
+                            raise RuntimeError(
+                                "Reloaded VAE is None after full eviction"
+                            )
+                        _original_vae_id = int(_vae_id) if _vae_id != "none" else 0
+                        if id(_reloaded_vae) == _original_vae_id:
+                            raise RuntimeError(
+                                f"Reloaded VAE has same id() as original "
+                                f"(id={_original_vae_id}) – not a fresh load"
+                            )
             finally:
                 if _mmap_orig is _MISSING:
                     delattr(_cu, "DISABLE_MMAP")
@@ -5911,26 +9420,170 @@ class ModalRuntimeEntrypoint:
                     f"(id={_original_selected_id}) – not a fresh load"
                 )
 
-            self._snapshot_eviction_retained_model = _reloaded_model
-            self._snapshot_eviction_retained_model_id = _reloaded_id
             _reloaded_type = type(_reloaded_model).__name__
-            self._snapshot_eviction_retained_model_type = _reloaded_type
-            _reload_ok = True
-
-            # Build storage registry on reloaded payload
-            try:
-                _reg = build_unique_storage_registry(_reloaded_model)
-                if _reg is not None:
-                    _ranges = getattr(_reg, "ranges", ()) or ()
-                    _storage_count = len(_ranges)
-                    _storage_total_bytes = getattr(_reg, "total_bytes", 0) or 0
+            if _retained_role == "clip_vae":
+                # Restore-only retain: keep the metadata container, assign the
+                # fresh CLIP/VAE back, keep unet=None and no retained slot.
+                _container_retained.clip = _reloaded_model
+                _container_retained.vae = _reloaded_vae
+                _container_retained.unet = None
+                self._snapshot_eviction_retained_model = None
+                self._snapshot_eviction_retained_model_id = 0
+                self._snapshot_eviction_retained_model_type = ""
+                self._cpu_snapshot_models_active = False
+                self._cpu_snapshot_unet_runtime_state = None
+                # ── Recompute CLIP/VAE storage registries + VAE policy metadata
+                #    using the current helpers (fail closed on failure) ──
+                try:
+                    _reg_clip = build_unique_storage_registry(_reloaded_model)
+                    self._cpu_snapshot_clip_storage_registry = _reg_clip
+                    _storage_count = len(getattr(_reg_clip, "ranges", ()) or ())
+                    _storage_total_bytes = getattr(_reg_clip, "total_bytes", 0) or 0
+                    _reg_vae = build_unique_storage_registry(_reloaded_vae)
+                    _storage_total_bytes += getattr(_reg_vae, "total_bytes", 0) or 0
                     _storage_total_mib = round(
                         float(_storage_total_bytes) / (1024.0 * 1024.0), 3
                     )
-            except Exception:
-                _storage_count = 0
-                _storage_total_bytes = 0
-                _storage_total_mib = 0.0
+                except Exception:
+                    self._cpu_snapshot_clip_storage_registry = None
+                    _storage_count = 0
+                    _storage_total_bytes = 0
+                    _storage_total_mib = 0.0
+                # ── D3 eviction reconcile: re-apply the frozen snapshot
+                #    exclusion to the fresh reloaded CLIP so the memory-snapshot
+                #    fork carries the same excluded/manifest/demand-wrapper state
+                #    the ORIGINAL clip had at capture (the fresh full-weight
+                #    CLIP above has no manifest and no wrapper).  Only active
+                #    when a frozen eligible manifest existed AND a D3 flag is
+                #    on; otherwise the full-weight CLIP is retained untouched
+                #    (native encode path).  The existing full-model storage
+                #    registry above stays as the eviction experiment's metrics;
+                #    a post-strip registry is recomputed below to match the
+                #    final snapshot payload.
+                _reconcile_status = "skipped"
+                _reconcile_params = 0
+                _reconcile_bytes = 0
+                _reconcile_wrapper = "not_attempted"
+                try:
+                    from .clip_fast_hydration_wiring import (  # noqa: PLC0415
+                        _emit,
+                        clip_fast_hydration_enabled,
+                        clip_snapshot_exclude_weights_enabled,
+                        maybe_install_clip_fh_demand,
+                    )
+                    if (
+                        _frozen_clip_manifest_eligible
+                        and _frozen_clip_manifest is not None
+                        and (
+                            clip_fast_hydration_enabled()
+                            or clip_snapshot_exclude_weights_enabled()
+                        )
+                    ):
+                        from . import clip_fast_hydration as _cfh
+                        _cfh.attach_clip_manifest(_reloaded_model, _frozen_clip_manifest)
+                        _reconcile_strip = bool(
+                            _frozen_clip_excluded
+                            or clip_snapshot_exclude_weights_enabled()
+                        )
+                        if _reconcile_strip:
+                            _reconcile_stats = _cfh.strip_clip_weights(_reloaded_model)
+                            _reconcile_params = int(
+                                _reconcile_stats.get("params_replaced", 0) or 0
+                            )
+                            _reconcile_bytes = int(
+                                _reconcile_stats.get("payload_bytes_removed", 0) or 0
+                            )
+                            # Post-strip CLIP storage registry so the stored
+                            # registry matches the final (stripped) payload.
+                            try:
+                                _reg_clip_post = build_unique_storage_registry(
+                                    _reloaded_model
+                                )
+                                self._cpu_snapshot_clip_storage_registry = _reg_clip_post
+                            except Exception:
+                                self._cpu_snapshot_clip_storage_registry = None
+                        _install_ret = maybe_install_clip_fh_demand(
+                            _container_retained, trace=trace
+                        )
+                        _reconcile_wrapper = str(
+                            _install_ret.get("status", "unknown")
+                            if isinstance(_install_ret, dict)
+                            else _install_ret
+                        )
+                        _reconcile_status = (
+                            "excluded_after_eviction_reload"
+                            if _reconcile_strip
+                            else "manifest_reattached"
+                        )
+                        _emit(
+                            trace,
+                            "clip_fh_eviction_reconcile",
+                            {
+                                "status": _reconcile_status,
+                                "params_replaced": _reconcile_params,
+                                "payload_bytes_removed": _reconcile_bytes,
+                                "manifest_eligible": int(_frozen_clip_manifest_eligible),
+                                "wrapper_installed": _reconcile_wrapper,
+                                "clip_reloaded_fresh": 1,
+                            },
+                        )
+                        print(
+                            f"[v2.clip_fh] eviction_reconcile status={_reconcile_status} "
+                            f"wrapper_installed={_reconcile_wrapper} "
+                            f"manifest_eligible={int(_frozen_clip_manifest_eligible)} "
+                            f"params_replaced={_reconcile_params} "
+                            f"payload_bytes_removed={_reconcile_bytes} "
+                            f"clip_reloaded_fresh=1",
+                            flush=True,
+                        )
+                except Exception as _reconcile_exc:
+                    self._cpu_snapshot_clip_storage_registry = None
+                    print(
+                        f"[v2.clip_fh] eviction reconcile skipped: "
+                        f"{type(_reconcile_exc).__name__}: {str(_reconcile_exc)[:160]}",
+                        flush=True,
+                    )
+                from .cpu_snapshot_models import (  # noqa: PLC0415
+                    _validate_vae_policy_metadata,
+                )
+                _vae_policy_rebuilt = {
+                    "vae_policy_mode": getattr(_container_retained, "vae_policy_mode", "v1"),
+                    "vae_policy_version": getattr(_container_retained, "vae_policy_version", 0),
+                    "vae_weight_dtype": getattr(_container_retained, "vae_weight_dtype", "bfloat16"),
+                    "vae_compute_dtype": getattr(_container_retained, "vae_compute_dtype", "bfloat16_native"),
+                    "vae_memory_format": getattr(_container_retained, "vae_memory_format", "contiguous"),
+                }
+                _vae_revalidation, _vae_re_registry = _validate_vae_policy_metadata(
+                    _reloaded_vae,
+                    _vae_policy_rebuilt,
+                    context="clip_vae eviction reload: ",
+                )
+                _container_retained.vae_validation_metadata = _vae_revalidation
+                _container_retained.vae_storage_registry = _vae_re_registry
+                _reload_ok = True
+            else:
+                self._snapshot_eviction_retained_model = _reloaded_model
+                self._snapshot_eviction_retained_model_id = _reloaded_id
+                self._snapshot_eviction_retained_model_type = _reloaded_type
+                _reload_ok = True
+
+            # Build storage registry on reloaded payload.  For clip_vae the
+            # combined CLIP+VAE storage was already computed above; skip the
+            # clip-only overwrite so the marker keeps the combined evidence.
+            if _retained_role != "clip_vae":
+                try:
+                    _reg = build_unique_storage_registry(_reloaded_model)
+                    if _reg is not None:
+                        _ranges = getattr(_reg, "ranges", ()) or ()
+                        _storage_count = len(_ranges)
+                        _storage_total_bytes = getattr(_reg, "total_bytes", 0) or 0
+                        _storage_total_mib = round(
+                            float(_storage_total_bytes) / (1024.0 * 1024.0), 3
+                        )
+                except Exception:
+                    _storage_count = 0
+                    _storage_total_bytes = 0
+                    _storage_total_mib = 0.0
 
             # RSS after reload
             _after_reload_mem = _collect_process_memory(fields=(
@@ -5961,7 +9614,7 @@ class ModalRuntimeEntrypoint:
             # Process RSS/smaps floors are noisy and must not abort startup.
             # Structural safety checks (missing closures, None reload, same id)
             # remain fatal above.
-            if _retained_role == "clip":
+            if _retained_role in ("clip", "clip_vae"):
                 if not (isinstance(_selected_reload_rss_rise_mib, (int, float)) and _selected_reload_rss_rise_mib >= 2048.0):
                     _floor_failures.append({
                         "floor": "rss_rise",
@@ -6056,6 +9709,20 @@ class ModalRuntimeEntrypoint:
             del _rw
         _floor_failures_count = len(_floor_failures)
         _rss_drop_str_ready = f"{_full_eviction_rss_drop_mib:.1f}" if isinstance(_full_eviction_rss_drop_mib, (int, float)) else "absent"
+        # clip_vae telemetry: the retained CpuSnapshotModels container carries
+        # fresh CLIP+VAE with unet=None; no retained eviction slot is used.
+        _clip_vae_retained = int(
+            _retained_role == "clip_vae"
+            and _reload_ok
+            and self._cpu_snapshot_models is not None
+            and getattr(self._cpu_snapshot_models, "unet", None) is None
+            and getattr(self._cpu_snapshot_models, "clip", None) is not None
+            and getattr(self._cpu_snapshot_models, "vae", None) is not None
+        )
+        _ready_clip_present = _clip_vae_retained
+        _ready_vae_present = _clip_vae_retained
+        _ready_unet_present = 0
+        _ready_container_present = _clip_vae_retained
         print(
             f"[v2.snapshot_model_eviction] stage=snapshot_pre_capture "
             f"enabled=1 status=ready "
@@ -6068,12 +9735,14 @@ class ModalRuntimeEntrypoint:
             f"retained_weakref_alive={_retained_weakref_alive} "
             f"original_clip_alive_after_full_eviction=0 "
             f"original_unet_alive_after_full_eviction=0 "
+            f"original_vae_alive_after_full_eviction={_original_vae_alive_flag} "
             f"reloaded_model_present={_retained_model_present} "
             f"reloaded_model_id={_reloaded_id} "
             f"reloaded_model_is_new_object={int(_reload_ok)} "
-            f"clip_original_id={_clip_id} unet_original_id={_unet_id} "
-            f"normal_cpu_snapshot_models_present=0 "
-            f"clip_present=0 unet_present=0 "
+            f"clip_original_id={_clip_id} unet_original_id={_unet_id} vae_original_id={_vae_id} "
+            f"container_retained={_ready_container_present} "
+            f"normal_cpu_snapshot_models_present={_ready_container_present} "
+            f"clip_present={_ready_clip_present} vae_present={_ready_vae_present} unet_present={_ready_unet_present} "
             f"full_eviction_rss_drop_mib={_rss_drop_str_ready} "
             f"selected_reload_rss_rise_mib={_selected_reload_rss_rise_mib} "
             f"final_reduction_from_full_mib={_final_reduction_from_full_mib} "
@@ -6104,12 +9773,19 @@ class ModalRuntimeEntrypoint:
             "retained_model_present": _retained_model_present,
             "retained_model_id": _reloaded_id,
             "retained_model_type": _reloaded_type,
-            "retained_model_present": _retained_model_present,
             "reloaded_model_is_new_object": int(_reload_ok),
             "original_clip_alive_after_full_eviction": 0,
             "original_unet_alive_after_full_eviction": 0,
+            "original_vae_alive_after_full_eviction": _original_vae_alive_flag,
             "clip_original_id": _clip_id,
             "unet_original_id": _unet_id,
+            "vae_original_id": _vae_id,
+            # clip_vae restore-boundary evidence: container retained with
+            # fresh CLIP=1 VAE=1 and UNET=0 (no retained eviction slot).
+            "container_retained": _ready_container_present,
+            "retained_clip_present": _ready_clip_present,
+            "retained_vae_present": _ready_vae_present,
+            "retained_unet_present": _ready_unet_present,
             "full_eviction_rss_drop_mib": _full_eviction_rss_drop_mib,
             "selected_reload_rss_rise_mib": _selected_reload_rss_rise_mib,
             "final_reduction_from_full_mib": _final_reduction_from_full_mib,
@@ -6237,6 +9913,46 @@ class ModalRuntimeEntrypoint:
                 f"[v2.snapshot_model_eviction] stage=restore_release_retained "
                 f"retain_role=none "
                 f"status=not_present "
+                f"retained_model_id=0 "
+                f"retained_alive_after_release=0 "
+                f"rss_before_release_mib=absent "
+                f"rss_after_gc_mib=absent "
+                f"rss_after_trim_mib=absent "
+                f"rss_drop_mib=absent "
+                f"malloc_trim_status=absent "
+                f"malloc_trim_result=absent "
+                f"restore_release_start_wall_unix_ns={_release_start_ns} "
+                f"restore_release_end_wall_unix_ns={_release_end_ns} "
+                f"wall_unix_ns={_release_end_ns}",
+                flush=True,
+            )
+        elif _retained_role == "clip_vae":
+            # Strict restore-only retain: the CpuSnapshotModels container is
+            # the retained payload.  CLIP/VAE stay available in the container
+            # (unet=None) — no retained-slot release, no gc/trim, no raise.
+            # Emit restore-boundary evidence and return.
+            _retained_release_status = "container_retained"
+            _release_start_ns = time.time_ns()
+            _release_end_ns = _release_start_ns
+            _clip_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "clip", None) is not None
+            )
+            _vae_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "vae", None) is not None
+            )
+            _unet_avail = int(
+                _cpu_snap_models is not None
+                and getattr(_cpu_snap_models, "unet", None) is not None
+            )
+            print(
+                f"[v2.snapshot_model_eviction] stage=restore_release_retained "
+                f"retain_role=clip_vae "
+                f"status=container_retained "
+                f"container_present={_cpu_snap_models_present} "
+                f"clip_present={_clip_avail} vae_present={_vae_avail} unet_present={_unet_avail} "
+                f"retained_slot_release=0 "
                 f"retained_model_id=0 "
                 f"retained_alive_after_release=0 "
                 f"rss_before_release_mib=absent "
@@ -6436,6 +10152,16 @@ class ModalRuntimeEntrypoint:
             profile["vae"] = ""
         return profile
 
+    # NOTE: the failed writer's skip-UNET snapshot-construction helper
+    # (``_build_unet_excluded_*``) was removed during reconciliation.
+    # ``COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET`` is an experiment identity /
+    # reporting gate ONLY: startup unconditionally builds the full
+    # CLIP/UNET/VAE CPU snapshot via ``load_cpu_snapshot_models`` and runs
+    # the normal BF16/diffusion-model dtype validation.  The restore-only
+    # UNET-absent snapshot is produced by the strict ``clip_vae`` eviction
+    # retain role in ``_evict_snapshot_models``, which evicts the UNET and
+    # proves it dead while keeping fresh CLIP/VAE in the retained container.
+
     def _use_cpu_snapshot_models_on_bridge(
         self,
         model_key: Any,
@@ -6509,7 +10235,385 @@ class ModalRuntimeEntrypoint:
                 metadata={"stage": "request_time", "reason": _reason},
             )
 
+    def _retarget_cpu_snapshot_clip_vae_for_request(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        model_management: Any = None,
+    ) -> None:
+        """Retarget retained CLIP + VAE patcher devices for the UNET-absent
+        ``clip_vae`` container using the same model_management policy as normal
+        retargeting, without any UNET-dependent retargeting."""
+        models = self._cpu_snapshot_models
+        if models is None:
+            return
+        if model_management is None:
+            import comfy.model_management as model_management
+        _clip = getattr(models, "clip", None)
+        if _clip is None:
+            raise RuntimeError("clip_vae request-time activation requires a retained CLIP")
+        _clip_patcher = getattr(_clip, "patcher", None)
+        if _clip_patcher is None or not hasattr(_clip_patcher, "load_device"):
+            raise RuntimeError("retained CLIP patcher shape is unsupported")
+        _clip_patcher.load_device = model_management.text_encoder_device()
+        _clip_patcher.offload_device = model_management.text_encoder_offload_device()
+        _vae = getattr(models, "vae", None)
+        if _vae is not None:
+            _vae_patcher = getattr(_vae, "patcher", None)
+            if _vae_patcher is not None and hasattr(_vae_patcher, "load_device"):
+                _vae_patcher.load_device = model_management.vae_device()
+                _vae_patcher.offload_device = model_management.vae_offload_device()
+                if hasattr(_vae, "device"):
+                    try:
+                        _vae.device = _vae_patcher.load_device
+                    except Exception:
+                        pass
+        if trace is not None:
+            trace.emit(
+                "cpu_snapshot_models_retargeted",
+                phase="execution",
+                metadata={"stage": "request_time_clip_vae_only", "unet_present": 0},
+            )
+
+    def _activate_clip_vae_only_request_binding(
+        self,
+        *,
+        request_model_key: Any,
+        request_prefill_key: Any,
+        request_model_spec: Any,
+        trace: RuntimeTrace | None = None,
+    ) -> None:
+        """Request-time clip-only bridge activation for the UNET-absent
+        ``clip_vae`` CPU snapshot (CPU snapshot configured, exclude-UNET gate
+        active, retain role ``clip_vae``, retained CLIP + VAE present, UNET
+        absent).
+
+        Retargets the retained CLIP/VAE patcher devices (same policy as normal
+        retargeting, never UNET-dependent), publishes the exact retained CLIP
+        on the bridge via ``use_ready_clip`` (completed ``clip_future``, no
+        ``unet_future`` / no UNET lane), binds the exact retained VAE via
+        ``set_exact_vae``, and only then marks the snapshot active.  The graph
+        UNETLoader continues through the existing original-loader /
+        native-fast-disk fallback.  Raises on any failure (fail closed).
+        """
+        models = self._cpu_snapshot_models
+        if models is None or not _snapshot_is_clip_vae_unet_absent(models):
+            raise RuntimeError(
+                "clip_vae request-time activation requires the UNET-absent "
+                "clip_vae CPU snapshot container"
+            )
+        self._retarget_cpu_snapshot_clip_vae_for_request(trace=trace)
+        self._preload_bridge.use_ready_clip(
+            model_key=request_model_key,
+            prefill_key=request_prefill_key,
+            model_spec=request_model_spec,
+            clip=models.clip,
+            trace=trace,
+        )
+        try:
+            self._preload_bridge.set_exact_vae(getattr(models, "vae", None))
+        except Exception:
+            pass
+        # Activation is marked only AFTER the exact CLIP binding and exact VAE
+        # binding succeeded — any failure above raises before this line.
+        self._cpu_snapshot_models_active = True
+        print(
+            "[v2.cpu_snapshot_request] status=clip_vae_only_bind "
+            "clip_source=cpu_snapshot vae_source=cpu_snapshot unet_source=normal_loader "
+            f"clip_object_id={id(models.clip)} vae_object_id={id(getattr(models, 'vae', None))}",
+            flush=True,
+        )
+        if trace is not None:
+            trace.emit(
+                "cpu_snapshot_clip_vae_bind",
+                phase="execution",
+                metadata={
+                    "status": "ok",
+                    "clip_source": "cpu_snapshot",
+                    "vae_source": "cpu_snapshot",
+                    "unet_source": "normal_loader",
+                    "clip_object_id": str(id(models.clip)),
+                    "vae_object_id": str(id(getattr(models, "vae", None))),
+                    "unet_present": 0,
+                },
+            )
+
+    # ── E25 pre-graph exact-identity cache ───────────────────────────────
+    # Reuses the pure plan-receipt derivations (model key / prefill key /
+    # model spec / invocation-seed payload) across requests with identical
+    # workflow/model/runtime identity.  The identity key contains every
+    # input that can affect the derived values; request-specific inputs
+    # (seed, prompt text, conditioning, request IDs) are never part of the
+    # key.  Fail-closed: any cache miss/exception falls back to the exact
+    # original derivation path.  The cache is bounded and cleared whenever
+    # the request identity differs from the cached identity.
+    def _pre_graph_cache_identity_key(
+        self,
+        plan: Any,
+        *,
+        include_workflow_hash: bool = True,
+    ) -> str:
+        try:
+            wf_hash = str(getattr(plan, "workflow_hash", "") or "")
+            src_wf_hash = str(getattr(plan, "source_workflow_hash", "") or "")
+            model_stack_hash = ""
+            try:
+                _stack = getattr(plan, "model_stack", None)
+                if _stack:
+                    import json as _json
+
+                    model_stack_hash = _json.dumps(
+                        dict(_stack), sort_keys=True, default=str
+                    )
+            except Exception:
+                model_stack_hash = ""
+            deploy_hash = str(
+                _V2_DEPLOYMENT_COMBINED_HASH
+                or getattr(getattr(getattr(self, "bootstrap", None), "state", None), "deployment_combined_hash", "")
+                or ""
+            )
+            node_gen = str(
+                getattr(getattr(getattr(self, "bootstrap", None), "state", None), "snapshot_custom_node_generation", "")
+                or getattr(getattr(getattr(self, "bootstrap", None), "state", None), "custom_node_generation", "")
+                or ""
+            )
+            parts = [
+                ("wf", wf_hash if include_workflow_hash else ""),
+                ("src", src_wf_hash if include_workflow_hash else ""),
+                ("stack", model_stack_hash),
+                ("deploy", deploy_hash),
+                ("nodegen", node_gen),
+            ]
+            raw = "\x1f".join(f"{k}={v}" for k, v in parts)
+            try:
+                import hashlib as _hashlib
+
+                return "e25pg:" + _hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            except Exception:
+                return "e25pg:raw:" + raw
+        except Exception:
+            return ""
+
+    def _cached_pre_graph_derivations(
+        self,
+        plan: Any,
+        *,
+        workflow: Any,
+        model_stack: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Compute-or-reuse the plan-receipt derivations under the exact
+        identity key.  Returns (request_model_key, request_prefill_key,
+        request_model_spec); on any cache/identity failure the ORIGINAL
+        derivation path runs (fail-closed)."""
+        try:
+            from comfymodal_runtime.pre_graph_cache import (
+                get_pre_graph_cache,
+                with_cache,
+            )
+
+            _identity = self._pre_graph_cache_identity_key(plan)
+            if not _identity:
+                # Identity unavailable — derive directly.
+                return (
+                    derive_model_key(workflow),
+                    derive_prefill_key(derive_model_key(workflow), workflow),
+                    build_restore_model_spec(workflow, model_stack),
+                )
+            _cached = get_pre_graph_cache()
+
+            def _compute_key() -> Any:
+                return derive_model_key(workflow)
+
+            def _compute_prefill(_key: Any) -> Any:
+                return derive_prefill_key(_key, workflow)
+
+            def _compute_spec(_key: Any) -> Any:
+                return build_restore_model_spec(workflow, model_stack)
+
+            request_model_key = with_cache(_cached, _identity + ":key", _compute_key)
+            request_prefill_key = with_cache(
+                _cached, _identity + ":prefill", lambda: _compute_prefill(request_model_key)
+            )
+            request_model_spec = with_cache(
+                _cached, _identity + ":spec", lambda: _compute_spec(request_model_key)
+            )
+            return request_model_key, request_prefill_key, request_model_spec
+        except Exception:
+            # Fail-closed: original derivation path.
+            return (
+                derive_model_key(workflow),
+                derive_prefill_key(derive_model_key(workflow), workflow),
+                build_restore_model_spec(workflow, model_stack),
+            )
+
+    def _maybe_schedule_execution_unet_at_plan_receipt(
+        self,
+        plan: Any,
+        *,
+        request_id: str = "",
+    ) -> bool:
+        """Batch-A G1: start the execution-phase fast-disk UNET lane at plan receipt.
+
+        Hoists the existing ``schedule_execution_unet`` submit from
+        ``_run_in_process`` (after graph start + CPU-snapshot binding block)
+        to immediately after ``ExecutionPlan.from_dict`` so the checkpoint
+        read/construct/bind/H2D chain starts ~70-110 ms earlier on healthy
+        runs.  Uses the SAME identity derivation (``derive_model_key`` /
+        ``derive_prefill_key`` / ``build_restore_model_spec``) and the SAME
+        snapshot-unet-absent container predicate as the binding block, and
+        submits through the existing single-flight bridge scheduler — no new
+        threads, pools, H2D paths, or futures.
+
+        Hard gate: runs ONLY when the container definitively has no retained
+        snapshot UNET (``_cpu_snapshot_models.unet is None``), the request
+        identity is role-compatible with the snapshot spec, and a
+        present-but-inactive container has a retained CLIP to activate.
+        Retained-UNET, legacy, ambiguous, or mismatched configurations skip
+        early and behave exactly as before.
+
+        The derived identity is stashed on the instance so the binding block
+        REUSES it (single source of truth); the binding block's cheap
+        re-derivation check only diagnoses divergence (the downstream
+        sampler verification stays authoritative).
+
+        Failure semantics: every failure path here is best-effort and returns
+        False without raising; the later ``_run_in_process`` schedule remains
+        as the safety path and any early worker failure still surfaces at
+        graph demand exactly as today.
+        """
+        # Reset request-scoped stash first: never reuse a previous request's
+        # derivation even when this request is not eligible.
+        self._plan_receipt_request_model_key = None
+        self._plan_receipt_request_prefill_key = None
+        self._plan_receipt_request_model_spec = None
+        self._plan_receipt_trace = None
+        try:
+            self._lazy_init_snapshot_state()
+            models = self._cpu_snapshot_models
+            if models is None:
+                # Legacy / no-snapshot container: the existing legacy
+                # background UNET defer owns UNET.  Never schedule early.
+                return False
+            if getattr(models, "unet", None) is not None:
+                # Retained CPU-snapshot UNET: the binding block serves it.
+                # Later scheduling / early-activation behavior unchanged.
+                return False
+            # Present-but-inactive containers are activated at request time
+            # ONLY when a retained CLIP can be published; a partial container
+            # with no retained CLIP hits the never-serve path (bridge clear).
+            if not self._cpu_snapshot_models_active and getattr(models, "clip", None) is None:
+                return False
+            workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
+            model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
+            # ── E25: exact-identity cached derivation ──
+            request_model_key, request_prefill_key, request_model_spec = (
+                self._cached_pre_graph_derivations(
+                    plan, workflow=workflow, model_stack=model_stack
+                )
+            )
+            if not request_model_key.unet_identity:
+                return False
+            # Role-match gate mirrors the binding block: when incompatible the
+            # binding block clears the bridge / raises in production — an early
+            # read would be wasted there.
+            role_report = _canonical_role_match_report(
+                request_model_spec=request_model_spec,
+                snapshot_model_spec=getattr(models, "model_spec", None),
+            )
+            if not role_report.get("compatible"):
+                return False
+            self._plan_receipt_request_model_key = request_model_key
+            self._plan_receipt_request_prefill_key = request_prefill_key
+            self._plan_receipt_request_model_spec = request_model_spec
+            bridge = self._preload_bridge
+            _prev = bridge._preparation
+            _prev_inflight = bool(
+                _prev is not None
+                and _prev.unet_future is not None
+                and not _prev.unet_future.done()
+            )
+            if _prev is None or bridge._model_key is None or not _prev_inflight:
+                # Publish the minimum bridge state needed by the existing
+                # execution-UNET lane: a clip-less preparation with the
+                # plan-derived identity.  This also drops any stale
+                # previous-request (done) future so every request gets its
+                # own lane.  The binding block later reuses this identity and
+                # replaces the preparation with the retained CLIP published;
+                # the in-flight UNET future is carried over there.
+                bridge._init_ready_preparation(
+                    model_key=request_model_key,
+                    prefill_key=request_prefill_key,
+                    model_spec=request_model_spec,
+                    trace=None,
+                )
+            else:
+                # An in-flight UNET lane already exists (another scheduler);
+                # respect single-flight and never replace it.
+                return False
+            # Create the request trace here (before any lane submit) so the
+            # lane's worker events land in the request trace; the context
+            # created later reuses it via _plan_receipt_trace.
+            self._plan_receipt_trace = RuntimeTrace(
+                request_id=str(request_id or ""),
+                process="remote",
+            )
+            self._plan_receipt_trace.emit(
+                "unet_execution_plan_receipt_schedule",
+                phase="execution",
+                metadata={
+                    "request_id": str(request_id or ""),
+                    "unet_identity_hash": request_model_key.stable_hash[:16],
+                    "snapshot_unet_absent": 1,
+                    "snapshot_active": int(bool(self._cpu_snapshot_models_active)),
+                    "role_compatible": 1,
+                },
+            )
+            scheduled = bool(
+                bridge.schedule_execution_unet(
+                    trace=self._plan_receipt_trace,
+                    request_id=str(request_id or ""),
+                )
+            )
+            if scheduled:
+                print(
+                    "[v2.execution_unet] scheduled=1 via=plan_receipt "
+                    f"request_id={request_id}",
+                    flush=True,
+                )
+                # ── E29: canonical ledger UNET lane-submit event ─────────
+                # The execution-UNET lane submit boundary on the canonical
+                # axis (Phase 8: real UNET pipeline vs the misleading
+                # 0.2 ms "H2D" marker).
+                try:
+                    from .critical_path_ledger import record_event as _ledger_event
+                    _ledger_event(
+                        "unet_lane_submitted",
+                        mono_ns=time.monotonic_ns(),
+                        metadata={
+                            "request_id": str(request_id or ""),
+                            "unet_identity_hash": request_model_key.stable_hash[:16],
+                            "via": "plan_receipt",
+                        },
+                    )
+                except Exception:
+                    pass
+            return scheduled
+        except Exception as _g1_exc:
+            # Best-effort: never raise at plan receipt.  Any failure falls
+            # back to the existing _run_in_process scheduling path.
+            try:
+                print(
+                    "[v2.execution_unet] plan_receipt_schedule_skipped "
+                    f"reason=error:{type(_g1_exc).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return False
+
     def _load_legacy_runtime(self) -> Any:
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_legacy_runtime_forbidden")
         if self._legacy_api is not None:
             return self._legacy_api
         module = self._legacy_module or importlib.import_module("comfyapp")
@@ -6540,9 +10644,8 @@ class ModalRuntimeEntrypoint:
         api = self._load_legacy_runtime()
         module = self._legacy_module
 
-        # Make the canonical deployment combined hash available to the loaded
-        # comfyapp module so that ``_resolve_deployment_combined_hash()``
-        # returns the builder-computed value on first priority.
+        # Make the canonical image-plan deployment hash available to the
+        # loaded comfyapp module for its compatibility resolver.
         module._CANONICAL_DEPLOYMENT_COMBINED_HASH = _V2_DEPLOYMENT_COMBINED_HASH
 
         # ── Restore-accounting timer wrappers ──
@@ -6570,72 +10673,12 @@ class ModalRuntimeEntrypoint:
             volume = getattr(module, "runtime_config_vol", None)
             if volume is not None:
                 volume.reload()
+            global _RUNTIME_STATE_VOLUME_RELOADED_MONO
+            _RUNTIME_STATE_VOLUME_RELOADED_MONO = time.monotonic()
 
-        def sync_custom_nodes() -> Any:
-            # The image already contains the production custom nodes.  Avoid
-            # copying the volume over them when the persisted generation is an
-            # exact match for the image-baked source.  This decision is
-            # intentionally O(1): it reads only the baked manifest and the
-            # existing generation record, never walks or hashes node files.
-            _baked_generation = ""
-            _current_generation = ""
-            _current_source = "unavailable"
-            _fallback_reason = "identity_unavailable"
-            try:
-                _baked_manifest = module.load_baked_custom_node_dependency_manifest()
-                _baked_generation = str(
-                    (_baked_manifest or {}).get(
-                        "production_custom_node_generation", ""
-                    )
-                    or ""
-                )
-                _custom_nodes_volume = getattr(module, "custom_nodes_vol", None)
-                if _custom_nodes_volume is not None:
-                    _reload = getattr(_custom_nodes_volume, "reload", None)
-                    if callable(_reload):
-                        _reload()
-                _current_generation, _current_source = (
-                    module._resolve_custom_nodes_generation(
-                        api=api, authoritative_only=True
-                    )
-                )
-                _current_generation = str(_current_generation or "")
-                if _baked_generation and _current_generation:
-                    if _baked_generation == _current_generation:
-                        print(
-                            "[v2.custom_node_startup] "
-                            "decision=snapshot_exact_skip callback_called=0 "
-                            f"source={_current_source} "
-                            f"generation={_current_generation[:16]}",
-                            flush=True,
-                        )
-                        return (
-                            {
-                                "created": [],
-                                "removed": [],
-                                "kept": [],
-                                "blocked": [],
-                                "skipped": True,
-                                "skip_reason": "snapshot_exact_generation",
-                            },
-                            getattr(api, "_custom_nodes_state", ()),
-                        )
-                    _fallback_reason = "generation_mismatch"
-                elif not _baked_generation:
-                    _fallback_reason = "baked_generation_missing"
-                elif not _current_generation:
-                    _fallback_reason = "current_generation_missing"
-            except Exception as _startup_identity_exc:
-                _fallback_reason = type(_startup_identity_exc).__name__
-            print(
-                "[v2.custom_node_startup] decision=fallback_full_sync "
-                "callback_called=1 "
-                f"reason={_fallback_reason} "
-                f"baked_generation={_baked_generation[:16]} "
-                f"current_generation={_current_generation[:16]}",
-                flush=True,
-            )
-            return api._sync_custom_nodes_from_volume()
+        # Custom-node publication is manual: normal startup, restore, and
+        # request execution use the image-baked/snapshotted custom nodes and
+        # must not sync from the Volume (no reload, no auto-publish/repair).
 
         def install_requirements() -> Any:
             return api._install_custom_node_requirements()
@@ -6644,16 +10687,29 @@ class ModalRuntimeEntrypoint:
             snapshot_context = getattr(api, "_force_cpu_during_snapshot", None)
             if callable(snapshot_context):
                 with cast(ContextManager[Any], snapshot_context()):
+                    api._snapshot_backend_init = True
                     api._start_in_process_backend()
             else:
                 api._start_in_process_backend()
             return "in_process"
 
+        def golden_model_transport_enabled() -> bool:
+            selected = os.environ.get("COMFYMODAL_GOLDEN_MODEL_TRANSPORT", "").strip().lower()
+            return os.environ.get("COMFYMODAL_GOLDEN_CLIP_LOADER", "").strip().lower() == "m2" or selected in {
+                "1", "true", "yes", "on", "m2", "persistent",
+            }
+
         def restore_gpu_state() -> Any:
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().prepare_cpu()
             return api._restore_in_process_gpu_state()
 
         def initialize_cuda() -> dict[str, Any]:
             value = api._initialize_cuda_context()
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().initialize_cuda()
             if isinstance(value, tuple) and len(value) == 2:
                 return {"device": str(value[0]), "diagnostics": value[1]}
             return {"result": value}
@@ -6666,45 +10722,55 @@ class ModalRuntimeEntrypoint:
         restore_gpu_state = _wrap_restore_stage("restore_gpu_state", restore_gpu_state)
         initialize_cuda = _wrap_restore_stage("initialize_cuda", initialize_cuda)
 
+        def select_sage_runtime_mode() -> dict[str, Any]:
+            """Use the normal permissive Sage selector after CUDA restore.
+
+            Strict/native-only Sage validation belongs to the explicit Golden
+            request scope in ``golden_serial.py``; it must not become a
+            restore-wide policy for ordinary V2 requests.
+            """
+            mode, reason = api._select_sage_runtime_mode()
+            identity = getattr(api, "_sage_probe_identity", None)
+            if not isinstance(identity, dict):
+                identity = {}
+            return {
+                "mode": str(mode),
+                "reason": str(reason),
+                "identity": dict(identity),
+                "selection": "normal_restore",
+            }
+
+        def select_golden_sage_runtime_mode() -> dict[str, Any]:
+            """Select Golden's baked mode without probing after CUDA restore."""
+            # A Golden snapshot can carry the CPU-snapshot fallback in the API
+            # instance.  Clear only that sticky value at this callback boundary
+            # so the existing env-override path selects the baked runtime
+            # without entering the native smoke probe.
+            api._sage_runtime_mode = None
+            api._sage_runtime_reason = ""
+            return select_sage_runtime_mode()
+
         def apply_sage_policy() -> Any:
+            # Keep the historical permissive policy.  Explicit Golden Sage
+            # strictness is installed only around that request's active UNET
+            # in golden_serial.py.
             return api._apply_sage_attention_policy()
 
         def observe_generations() -> dict[str, str]:
             _cn_val, _cn_src = module._resolve_custom_nodes_generation(api=api)
+            model_generation = str(module._current_models_generation_id() or "")
+            if _golden_serial_profile_active() and golden_model_transport_enabled():
+                from .golden_model_transport import get_golden_model_transport
+                get_golden_model_transport().update_models_generation(model_generation)
             return {
                 "runtime_state": str(getattr(api, "_runtime_generation_seen", "") or ""),
+                "models": model_generation,
                 "custom_nodes": _cn_val,
                 "custom_nodes_source": _cn_src,
             }
 
-        def read_current_custom_node_identity() -> dict[str, str]:
-            """Authoritative-only current identity read via API token API."""
-            result: dict[str, str] = {
-                "custom_node_generation": "",
-                "generation_source": "unavailable",
-                "schema_version": "0",
-                "deployment_combined_hash": "",
-                "token": "",
-            }
-            try:
-                # Use the module's _resolve_custom_nodes_generation with
-                # API token only — no directory scan, no hash.
-                cn_gen, cn_src = module._resolve_custom_nodes_generation(
-                    api=api,
-                    authoritative_only=True,
-                )
-                if cn_gen:
-                    result["custom_node_generation"] = str(cn_gen)
-                    result["generation_source"] = str(cn_src)
-                    result["schema_version"] = "1"
-                    result["deployment_combined_hash"] = _V2_DEPLOYMENT_COMBINED_HASH
-                # Capture API token
-                token = getattr(api, "_runtime_generation_seen", "")
-                if token:
-                    result["token"] = str(token)
-            except Exception:
-                pass
-            return result
+        # Custom-node identity reads from the Volume are disabled on the
+        # normal path (publication is manual); RuntimeBootstrap receives None.
 
         config = self._config or BootstrapConfig(
             comfyui_root="/root/comfy/ComfyUI",
@@ -6715,24 +10781,191 @@ class ModalRuntimeEntrypoint:
             min_containers=MIN_CONTAINERS,
             scaledown_window=SCALEDOWN_WINDOW,
         )
+        restore_wide_sage_policy = not _golden_serial_profile_active()
         self.bootstrap = RuntimeBootstrap(
             config,
             reload_models=reload_models,
             reload_runtime_state=reload_runtime_state,
-            sync_custom_nodes=sync_custom_nodes,
+            # Custom-node publication is manual: never sync from the Volume
+            # on the normal path; use image-baked/snapshotted nodes as-is.
+            sync_custom_nodes=None,
             install_requirements=install_requirements,
             start_backend=start_backend,
             restore_gpu_state=restore_gpu_state,
             initialize_cuda=initialize_cuda,
+            # Ordinary restores retain the normal wide Sage policy.  Golden
+            # uses its stale-mode-clearing selector instead; the selector's
+            # presence forces Golden selection without enabling the ordinary
+            # restore-wide force flag.  This is lifecycle policy, not sampler
+            # or request attention_backend routing.
+            select_sage_runtime_mode=(
+                select_sage_runtime_mode
+                if restore_wide_sage_policy
+                else select_golden_sage_runtime_mode
+            ),
             apply_sage_policy=apply_sage_policy,
+            force_sage_selection_after_restore=restore_wide_sage_policy,
             observe_generations=observe_generations,
-            read_current_custom_node_identity=read_current_custom_node_identity,
+            read_current_custom_node_identity=None,
             deployment_combined_hash=_V2_DEPLOYMENT_COMBINED_HASH,
         )
         self.bootstrap._sage_baked_cuda_available = (
             getattr(api, "_sage_runtime_mode", "triton_fallback") == "baked_cuda"
         )
         self._runtime_configured = True
+
+    def _verify_custom_node_volume_before_startup(self) -> None:
+        """Refuse to start ComfyUI when the published Volume is not exact."""
+        module = self._legacy_module
+        if module is None or CUSTOM_NODE_DELIVERY != "volume":
+            return
+        manifest = module.load_baked_custom_node_dependency_manifest()
+        expected_generation = str(
+            manifest.get("production_custom_node_generation", "") or ""
+        ) if isinstance(manifest, Mapping) else ""
+        decision = module.verify_custom_node_volume_gate(
+            CUSTOM_NODES_IMPORT_PATH,
+            module.CUSTOM_NODES_GENERATION_CONTROL_PATH,
+            expected_generation,
+        )
+        if not decision.get("ok"):
+            print(
+                "[comfyapp] custom_node_volume_gate FAILED "
+                f"path={CUSTOM_NODES_IMPORT_PATH} reasons={','.join(decision['reasons'])} "
+                f"actual_generation={decision.get('actual_generation') or '<missing>'} "
+                f"expected_generation={decision.get('expected_generation') or '<missing>'}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "custom-node Volume gate failed before ComfyUI node discovery: "
+                + ",".join(decision["reasons"])
+            )
+        print(
+            "[comfyapp] custom_node_volume_gate PASSED "
+            f"nodes={decision['importable_node_count']} "
+            f"generation={decision['actual_generation'][:16]}",
+            flush=True,
+        )
+
+    def _ensure_golden_models_generation_record(self) -> dict[str, Any]:
+        """Establish the canonical models-generation record for Golden.
+
+        Direct Golden bypasses the legacy ``ComfyAPI.startup`` path, which is
+        normally responsible for creating this control record.  Reuse the
+        canonical reader and writer from the configured runtime module instead
+        of deriving identity from custom nodes or model filesystem metadata.
+
+        The canonical reader already treats missing, malformed, and
+        unsupported records as invalid.  A successful writer result is
+        validated before startup continues; there is no retry or request-time
+        fallback because RA9G identity must fail closed.
+        """
+        module = self._legacy_module
+        if module is None:
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_module_unavailable")
+
+        reader = getattr(module, "_read_models_generation_record", None)
+        writer = getattr(module, "_write_models_generation_record", None)
+        if not callable(reader):
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_reader_unavailable")
+
+        try:
+            record = reader()
+        except Exception as exc:
+            # The canonical reader normally converts read/parse failures to
+            # None.  Treat a legacy/test double that raises the same way: the
+            # record is invalid and the canonical writer gets one chance to
+            # repair it at startup.
+            record = None
+            read_error = type(exc).__name__
+        else:
+            read_error = ""
+
+        if (
+            isinstance(record, Mapping)
+            and isinstance(record.get("generation"), str)
+            and bool(record.get("generation", "").strip())
+        ):
+            self._golden_models_generation_startup_status = "existing"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                "status=existing source=canonical_record",
+                flush=True,
+            )
+            return dict(record)
+
+        reason = "golden_serial_startup_models_generation_missing_or_invalid"
+        if read_error:
+            reason += f":reader_error={read_error}"
+        if not callable(writer):
+            self._golden_models_generation_startup_status = "failed"
+            raise RuntimeError("golden_serial_models_generation_writer_unavailable")
+        try:
+            written = writer(reason)
+        except Exception as exc:
+            self._golden_models_generation_startup_status = "failed"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                f"status=failed reason={reason} "
+                f"error_type={type(exc).__name__}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "golden_serial_models_generation_initialization_failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not (
+            isinstance(written, Mapping)
+            and isinstance(written.get("generation"), str)
+            and bool(written.get("generation", "").strip())
+        ):
+            self._golden_models_generation_startup_status = "failed"
+            print(
+                "[v2.models_generation] profile=golden_serial "
+                "status=failed reason=writer_returned_invalid_record",
+                flush=True,
+            )
+            raise RuntimeError(
+                "golden_serial_models_generation_writer_returned_invalid_record"
+            )
+
+        self._golden_models_generation_startup_status = "initialized"
+        print(
+            "[v2.models_generation] profile=golden_serial "
+            f"status=initialized reason={reason}",
+            flush=True,
+        )
+        return dict(written)
+
+    def _maybe_initialize_golden_models_generation(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        profile_active: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Initialize the model identity record only for Golden Serial."""
+        active = (
+            _golden_serial_profile_active()
+            if profile_active is None
+            else bool(profile_active)
+        )
+        if not active:
+            return None
+        record = self._ensure_golden_models_generation_record()
+        if trace is not None:
+            trace.emit(
+                "golden_models_generation_ready",
+                phase="lifecycle",
+                metadata={
+                    "status": self._golden_models_generation_startup_status,
+                    "source": "canonical_record",
+                    "generation": str(record["generation"])[:16],
+                },
+            )
+        return record
 
     def _capture_coordinator_state(self) -> dict[str, Any]:
         """Capture coordinator state from the bridge's coordinator (best-effort)."""
@@ -6795,8 +11028,257 @@ class ModalRuntimeEntrypoint:
             pass
         return state
 
+    def _golden_snapshot_proof_surfaces(self) -> dict[str, list[Any]]:
+        """Return the real, currently reachable surfaces for Golden proof.
+
+        This is deliberately a passive inventory.  The Golden proof function
+        owns traversal and validation; this method only supplies objects that
+        already belong to this runtime instance.
+        """
+        roots: list[Any] = []
+        registries: list[Any] = []
+        coordinators: list[Any] = []
+
+        for surface in (
+            getattr(self, "_legacy_api", None),
+            getattr(self, "_preload_bridge", None),
+            getattr(self, "bootstrap", None),
+            getattr(self, "_cpu_snapshot_models", None),
+            getattr(self, "_snapshot_eviction_retained_model", None),
+        ):
+            if surface is not None:
+                roots.append(surface)
+
+        for name in (
+            "_cpu_snapshot_unet_storage_registry",
+            "_cpu_snapshot_clip_storage_registry",
+        ):
+            registry = getattr(self, name, None)
+            if registry is not None:
+                registries.append(registry)
+
+        bridge = getattr(self, "_preload_bridge", None)
+        for coordinator in (
+            getattr(bridge, "coordinator", None),
+            getattr(self, "_runtime_state_coordinator", None),
+        ):
+            if coordinator is not None:
+                coordinators.append(coordinator)
+
+        if not roots and not registries and not coordinators:
+            raise RuntimeError("golden_snapshot_proof_no_surfaces_available")
+        return {
+            "roots": roots,
+            "registries": registries,
+            "coordinators": coordinators,
+        }
+
+    def _clear_cpu_snapshot_state_for_golden(self) -> None:
+        """Drop all CPU snapshot model references before Golden capture."""
+        self._cpu_snapshot_models = None
+        self._cpu_snapshot_models_active = False
+        self._cpu_snapshot_unet_runtime_state = None
+        self._cpu_snapshot_unet_storage_registry = None
+        self._cpu_snapshot_clip_storage_registry = None
+        self._snapshot_eviction_retained_model = None
+        self._snapshot_eviction_retained_model_id = 0
+        self._snapshot_eviction_retained_model_type = ""
+        self._snapshot_eviction_retained_role = "none"
+        self._snapshot_models_evicted_before_capture = False
+        self._snapshot_eviction_metadata = {}
+        self._eviction_marker = None
+
+    def _assert_golden_restore_model_free(self) -> None:
+        """Reject a restore that carries any legacy model-snapshot residue."""
+        def has_residue(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, Mapping):
+                return bool(value)
+            return True
+
+        residue = {
+            name: getattr(self, name, None)
+            for name in (
+                "_cpu_snapshot_models",
+                "_cpu_snapshot_unet_runtime_state",
+                "_cpu_snapshot_unet_storage_registry",
+                "_cpu_snapshot_clip_storage_registry",
+                "_snapshot_eviction_retained_model",
+                "_eviction_marker",
+            )
+        }
+        if any(has_residue(value) for value in residue.values()) or any(
+            bool(getattr(self, name, False))
+            for name in ("_cpu_snapshot_models_active", "_snapshot_models_evicted_before_capture")
+        ):
+            present = sorted(name for name, value in residue.items() if has_residue(value))
+            raise RuntimeError(
+                "golden_restore_model_residue:" + ",".join(present or ["snapshot_state"])
+            )
+
+    def _assert_golden_execution_isolated(self) -> None:
+        """Reject legacy model/preload state before entering Golden stages."""
+        self._assert_golden_restore_model_free()
+        bridge = getattr(self, "_preload_bridge", None)
+        if getattr(bridge, "_preparation", None) is not None:
+            raise RuntimeError("golden_preload_state_forbidden")
+
+    def _run_golden_snapshot_content_proof(
+        self,
+        *,
+        trace: RuntimeTrace | None = None,
+        surfaces: Mapping[str, list[Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Run the passive Golden pre-capture proof and fail closed."""
+        from .golden_serial import (
+            GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES,
+            SNAPSHOT_SIZE_SOURCE,
+            golden_snapshot_content_proof,
+        )
+
+        # This is intentionally initialized before the measurement so failure
+        # records identify the value's provenance even when RSS is unavailable.
+        proof_candidate: Mapping[str, Any] | None = {
+            "snapshot_size_source": SNAPSHOT_SIZE_SOURCE,
+            "snapshot_size_is_serialized": False,
+        }
+        persist_path: str | None = None
+        try:
+            state_root = Path(RUNTIME_STATE_PATH)
+            if state_root.is_dir():
+                persist_path = str(state_root / "golden_snapshot_content_proof.json")
+        except OSError:
+            persist_path = None
+
+        try:
+            # Modal does not expose serialized snapshot bytes in this callback.
+            # Measure RSS at the actual pre-capture boundary and pass it as a
+            # conservative resident-memory proxy.  Never substitute cgroup
+            # usage, Python object sizes, or a fabricated serialized size.
+            from .snapshot_capture_hygiene import read_process_status_fields
+
+            process_status = read_process_status_fields()
+            rss_kb = (
+                process_status.get("rss_kb")
+                if isinstance(process_status, Mapping)
+                else None
+            )
+            if (
+                isinstance(rss_kb, bool)
+                or not isinstance(rss_kb, int)
+                or rss_kb <= 0
+            ):
+                raise RuntimeError("golden_snapshot_process_rss_unavailable")
+            snapshot_size_bytes = int(rss_kb) * 1024
+            if snapshot_size_bytes >= GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES:
+                raise RuntimeError(
+                    "golden_snapshot_process_rss_limit:"
+                    f"{snapshot_size_bytes}:{GOLDEN_SNAPSHOT_SIZE_LIMIT_BYTES}"
+                )
+
+            proof = golden_snapshot_content_proof(
+                **(dict(surfaces) if surfaces is not None else self._golden_snapshot_proof_surfaces()),
+                persist_path=persist_path,
+                snapshot_size_bytes=snapshot_size_bytes,
+                snapshot_size_source=SNAPSHOT_SIZE_SOURCE,
+                snapshot_size_is_serialized=False,
+            )
+            if not isinstance(proof, Mapping):
+                raise RuntimeError("golden_snapshot_content_proof_invalid_result")
+            proof_candidate = proof
+            if proof.get("schema") != "golden_snapshot_content_proof_v1":
+                raise RuntimeError("golden_snapshot_content_proof_schema_invalid")
+            if proof.get("passive") is not True:
+                raise RuntimeError("golden_snapshot_content_proof_not_passive")
+            if proof.get("snapshot_size_bytes") != snapshot_size_bytes:
+                raise RuntimeError("golden_snapshot_content_proof_size_mismatch")
+            if proof.get("snapshot_size_source") != SNAPSHOT_SIZE_SOURCE:
+                raise RuntimeError("golden_snapshot_content_proof_size_source_invalid")
+            if proof.get("snapshot_size_is_serialized") is not False:
+                raise RuntimeError("golden_snapshot_content_proof_serialized_size_invalid")
+            surface_count = proof.get("surface_count")
+            if isinstance(surface_count, bool) or not isinstance(surface_count, int) or surface_count <= 0:
+                raise RuntimeError("golden_snapshot_content_proof_surface_count_invalid")
+            count_keys = (
+                "tensor_count",
+                "parameter_bytes",
+                "model_patcher_count",
+                "qd_owner_count",
+                "open_payload_reader_count",
+                "preload_worker_count",
+                "future_count",
+            )
+            nonzero = {
+                key: proof.get(key)
+                for key in count_keys
+                if isinstance(proof.get(key), bool)
+                or not isinstance(proof.get(key), int)
+                or proof.get(key) != 0
+            }
+            nonzero_roles = {
+                key: proof.get(key)
+                for key in ("nonzero", "nonzero_roles")
+                if key in proof and proof.get(key) not in ({}, [])
+            }
+            if nonzero or nonzero_roles:
+                raise RuntimeError(
+                    "golden_snapshot_content_proof_nonzero:" 
+                    f"{json.dumps(nonzero or nonzero_roles, default=str)[:500]}"
+                )
+            proof_record = dict(proof)
+            proof_record["proven"] = True
+            if persist_path:
+                proof_record["persist_path"] = persist_path
+        except BaseException as exc:
+            failure: dict[str, Any] = dict(proof_candidate or {})
+            failure.update({
+                "schema": failure.get(
+                    "schema", "golden_snapshot_content_proof_v1"
+                ),
+                "passive": True,
+                "proven": False,
+                "snapshot_size_source": SNAPSHOT_SIZE_SOURCE,
+                "snapshot_size_is_serialized": False,
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            })
+            timing = self._restore_timing
+            if not isinstance(timing, dict):
+                timing = {}
+                self._restore_timing = timing
+            timing["golden_snapshot_content_proof"] = failure
+            if trace is not None:
+                try:
+                    trace.set_metadata(golden_snapshot_content_proof=failure)
+                    trace.emit(
+                        "golden_snapshot_content_proof",
+                        phase="lifecycle",
+                        metadata=failure,
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError(
+                "golden snapshot content proof failed: "
+                f"{failure['error']}"
+            ) from exc
+
+        timing = self._restore_timing
+        if not isinstance(timing, dict):
+            timing = {}
+            self._restore_timing = timing
+        timing["golden_snapshot_content_proof"] = proof_record
+        if trace is not None:
+            trace.set_metadata(golden_snapshot_content_proof=proof_record)
+            trace.emit(
+                "golden_snapshot_content_proof",
+                phase="lifecycle",
+                metadata=proof_record,
+            )
+        return proof_record
+
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
+        _ensure_custom_nodes_compat_symlink()
         _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
         _v2_startup_stage(
             "container_python_import",
@@ -6825,6 +11307,14 @@ class ModalRuntimeEntrypoint:
         self._restore_torch_thread_limit_status = _thread_shape.get("status", "applied")
         identity = _capture_remote_identity()
         self._configure_runtime()
+        # This must precede bootstrap.startup(), whose start_backend callback
+        # imports ComfyUI/nodes and discovers custom nodes.
+        self._verify_custom_node_volume_before_startup()
+        # Direct Golden bypasses ComfyAPI.startup, so establish the canonical
+        # models-generation control record before bootstrap/snapshot work can
+        # complete.  The profile gate keeps every non-Golden lifecycle path
+        # unchanged.
+        _golden_serial_active = _golden_serial_profile_active()
         trace.set_metadata(**identity)
         trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
         startup_session_id = uuid.uuid4().hex
@@ -6877,7 +11367,12 @@ class ModalRuntimeEntrypoint:
         )
         _lifecycle_error: str | None = None
         try:
+            self._maybe_initialize_golden_models_generation(
+                trace=trace,
+                profile_active=_golden_serial_active,
+            )
             state = self.bootstrap.startup(snapshot=True, trace=trace)
+            self._restore_clip_probe_staging = _prepare_restore_clip_probe_source()
 
             # [v2.generation_identity] bootstrap diagnostic
             _boot_cn_gen = str(state.custom_node_generation or "")
@@ -7051,12 +11546,172 @@ class ModalRuntimeEntrypoint:
                         trace=trace,
                     )
 
+            # ── Step-2 canonical deployment-static proof (frozen at snapshot) ──
+            # Freeze a deployment-static validation proof into BootstrapState so
+            # the restore-time custom-node fast path and request-time diagnostics
+            # can prove host↔snapshot parity.  Instrumentation only — never
+            # consumed by certificate/preflight/validation decisions.
+            try:
+                _dp_module = self._legacy_module
+                if _dp_module is not None:
+                    try:
+                        _dp_baked_mft = _dp_module.load_baked_custom_node_dependency_manifest() or {}
+                    except Exception:
+                        _dp_baked_mft = {}
+                    if not isinstance(_dp_baked_mft, dict):
+                        _dp_baked_mft = {}
+                    _dp_baked_gen = str(_dp_baked_mft.get("production_custom_node_generation", "") or "")
+                    _dp_observed_gen = str(getattr(state, "custom_node_generation", "") or "")
+                    _dp_gen_ok = bool(_dp_baked_gen and _dp_observed_gen and _dp_baked_gen == _dp_observed_gen)
+                    _dp_dep_hash = str(_V2_DEPLOYMENT_COMBINED_HASH or "")
+                    if not _dp_dep_hash:
+                        _dp_dep_hash = str(getattr(state, "deployment_combined_hash", "") or "")
+                    try:
+                        _dp_boot_cfg = getattr(self.bootstrap, "config", None)
+                        _dp_comfyui_root = str(getattr(_dp_boot_cfg, "comfyui_root", "") or "")
+                    except Exception:
+                        _dp_comfyui_root = ""
+                    if not _dp_comfyui_root:
+                        _dp_comfyui_root = "/root/comfy/ComfyUI"
+                    try:
+                        _dp_custom_nodes_root = str(
+                            getattr(_dp_module, "CUSTOM_NODES_PATH", "") or CUSTOM_NODES_PATH
+                        )
+                    except Exception:
+                        _dp_custom_nodes_root = CUSTOM_NODES_PATH
+                    try:
+                        _dp_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(_contracts_mod.__file__)))
+                    except Exception:
+                        _dp_repo_root = ""
+                    try:
+                        _dp_reg_fp = compute_registry_fingerprint(
+                            roots=[_dp_comfyui_root, _dp_custom_nodes_root, _dp_repo_root],
+                        )
+                    except Exception:
+                        _dp_reg_fp = ""
+                    # Workflow-relevant registry manifest (per-class canonical
+                    # identity over ALL registered classes).  Diagnostic only —
+                    # per-class misses matter only for workflow-relevant
+                    # classes at request time, so manifest completeness is NOT
+                    # required for the snapshot proof itself.
+                    _dp_reg_manifest = {}
+                    _dp_reg_manifest_error = ""
+                    _dp_reg_manifest_root_count = 0
+                    try:
+                        from comfymodal_runtime.registry_proof import build_registry_manifest
+                        _dp_manifest_roots = _registry_manifest_roots()
+                        _dp_reg_manifest_root_count = len(_dp_manifest_roots or [])
+                        _dp_reg_manifest = build_registry_manifest(
+                            roots=_dp_manifest_roots,
+                        )
+                    except Exception as _dp_manifest_exc:
+                        _dp_reg_manifest = {}
+                        _dp_reg_manifest_error = (
+                            f"{type(_dp_manifest_exc).__name__}: "
+                            f"{str(_dp_manifest_exc)[:300]}"
+                        )
+                    _dp_manifest_fields = _registry_manifest_publication_fields(
+                        _dp_reg_manifest,
+                        error=_dp_reg_manifest_error,
+                        root_count=_dp_reg_manifest_root_count,
+                    )
+                    _dp_reg_manifest = _dp_manifest_fields["registry_manifest"]
+                    _dp_reg_manifest_error = _dp_manifest_fields["registry_manifest_error"]
+                    _dp_reg_manifest_root_count = _dp_manifest_fields["registry_manifest_root_count"]
+                    try:
+                        _dp_repair_mode = str(_dp_module._resolve_requirements_repair_mode() or "")
+                    except Exception:
+                        _dp_repair_mode = ""
+                    _dp_dep_identity = str(getattr(state, "dependency_manifest_identity", "") or "")
+                    _dp_missing = []
+                    if not _dp_dep_hash:
+                        _dp_missing.append("deployment_hash_unavailable")
+                    if not _dp_baked_gen:
+                        _dp_missing.append("baked_generation_unavailable")
+                    if not _dp_gen_ok:
+                        _dp_missing.append("generation_mismatch")
+                    if not _dp_reg_fp:
+                        _dp_missing.append("registry_fingerprint_unavailable")
+                    _dp_manifest_classes = (
+                        (_dp_reg_manifest or {}).get("classes", {})
+                        if isinstance(_dp_reg_manifest, dict) else {}
+                    )
+                    _dp_manifest_complete = bool(
+                        isinstance(_dp_reg_manifest, dict)
+                        and _dp_manifest_classes
+                        and not (_dp_reg_manifest.get("incomplete_classes") or [])
+                        and not _dp_reg_manifest.get("error")
+                    )
+                    if not _dp_manifest_complete:
+                        _dp_missing.append("registry_manifest_incomplete")
+                    if not _dp_dep_identity:
+                        _dp_missing.append("dependency_identity_unavailable")
+                    _dp_complete = bool(
+                        _dp_dep_hash and _dp_baked_gen and _dp_gen_ok and _dp_reg_fp
+                        and _dp_manifest_complete and _dp_dep_identity
+                    )
+                    _dp_proof = {
+                        "schema_version": DEPLOYMENT_PROOF_SCHEMA_VERSION,
+                        "deployment_combined_hash": _dp_dep_hash,
+                        "custom_nodes_generation": _dp_baked_gen,
+                        "generation_matches_observed": _dp_gen_ok,
+                        "registry_fingerprint": _dp_reg_fp,
+                        "registry_manifest": _dp_reg_manifest,
+                        "registry_manifest_error": _dp_reg_manifest_error,
+                        "registry_manifest_root_count": _dp_reg_manifest_root_count,
+                        "registry_manifest_class_count": _dp_manifest_fields["registry_manifest_class_count"],
+                        "dependency_manifest_identity": _dp_dep_identity,
+                        "repair_mode": _dp_repair_mode,
+                        "complete": _dp_complete,
+                        "valid": _dp_complete,
+                        "invalid_reason": ",".join(_dp_missing) if _dp_missing else "",
+                        "source": "snapshot_startup",
+                    }
+                    state.freeze_validation_proof(_dp_proof)
+                    _dp_manifest_error_diag = _dp_reg_manifest_error.replace(
+                        "\r", "\\r"
+                    ).replace("\n", "\\n")[:300]
+                    print(
+                        f"[v2.deployment_proof] schema={DEPLOYMENT_PROOF_SCHEMA_VERSION} "
+                        f"complete={_dp_complete} reason={_dp_proof['invalid_reason'] or 'ok'} "
+                        f"dep_hash={_dp_dep_hash[:16] if _dp_dep_hash else '<empty>'} "
+                        f"baked_gen={_dp_baked_gen[:16] if _dp_baked_gen else '<empty>'} "
+                        f"gen_ok={int(_dp_gen_ok)} reg_fp={bool(_dp_reg_fp)} "
+                        f"dep_identity={bool(_dp_dep_identity)} repair_mode={_dp_repair_mode or 'n/a'} "
+                        f"manifest_error={_dp_manifest_error_diag or 'none'}",
+                        flush=True,
+                    )
+            except Exception as _dp_exc:
+                # Non-fatal: proof freeze must never break startup.
+                print(f"[v2.deployment_proof] status=failed error={_dp_exc}", flush=True)
+
             # Request-specific startup certificates are no longer built from a
             # shared current plan.  The actual request validates its workflow
             # inside run_plan_stream with the submitted ExecutionPlan.
 
-            # Plan C: CPU model snapshot construction
-            if _cpu_model_snapshot_enabled():
+            # Plan C: CPU model snapshot construction.  Golden is a separate
+            # serial profile: it must not even evaluate the legacy CPU-snapshot
+            # gate, since that gate can require the production snapshot setup.
+            _golden_pre_capture_surfaces: dict[str, list[Any]] | None = None
+            if _golden_serial_active:
+                self._clear_cpu_snapshot_state_for_golden()
+                # Inventory only after the clear: the proof must describe the
+                # actual capture boundary, not stale model-bearing surfaces.
+                _golden_pre_capture_surfaces = self._golden_snapshot_proof_surfaces()
+                trace.emit(
+                    "cpu_snapshot_models_created",
+                    phase="lifecycle",
+                    metadata={
+                        "status": "skipped",
+                        "reason": "golden_serial_profile",
+                    },
+                )
+                print(
+                    "[v2.cpu_snapshot] status=skipped "
+                    "reason=golden_serial_profile action=skip_model_build",
+                    flush=True,
+                )
+            elif _cpu_model_snapshot_enabled():
                 self._lazy_init_snapshot_state()
                 _cpu_snap_ok = False
                 api: Any | None = None
@@ -7231,6 +11886,12 @@ class ModalRuntimeEntrypoint:
                         try:
                             with cast(ContextManager[Any], _snap_ctx()):
                                 _comfy_utils.DISABLE_MMAP = True
+                                # Startup ALWAYS builds the full CLIP/UNET/VAE
+                                # snapshot.  COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET
+                                # is identity/reporting only and never skips
+                                # construction: the restore-only UNET-absent
+                                # snapshot is produced by the clip_vae eviction
+                                # retain role AFTER this normal build.
                                 _cpu_models = load_cpu_snapshot_models(
                                     cpu_profile,
                                     load_unet=_cpu_load_unet,
@@ -7292,7 +11953,8 @@ class ModalRuntimeEntrypoint:
                             # After snapshot UNET construction, verify ALL floating-
                             # point parameters have the expected effective dtype and
                             # are on CPU.  Rejects stale FP32 snapshots with a clear
-                            # RuntimeError — does not catch and suppress.
+                            # RuntimeError — does not catch and suppress.  This is
+                            # unconditional: the identity flag never disables it.
                             _snap_param_dist = {}
                             try:
                                 _unet_module = getattr(_cpu_models.unet, "model", None)
@@ -7415,6 +12077,13 @@ class ModalRuntimeEntrypoint:
 
                         self._cpu_snapshot_models = _cpu_models
                         self._cpu_snapshot_models_active = False
+                        try:
+                            from .clip_fast_hydration_wiring import maybe_install_clip_fh_demand
+                            from .clip_fast_hydration_wiring import maybe_prepare_clip_snapshot_exclusion
+                            maybe_prepare_clip_snapshot_exclusion(_cpu_models, trace=trace)
+                            maybe_install_clip_fh_demand(_cpu_models, trace=trace)
+                        except Exception as _clip_fh_exc:
+                            print(f"[v2.clip_fh] startup prepare skipped: {type(_clip_fh_exc).__name__}", flush=True)
                         _cpu_snap_ok = True
                         _created_duration_ms = round((time.perf_counter() - _cpu_snapshot_perf_start) * 1000.0, 2)
                         trace.emit(
@@ -7466,9 +12135,6 @@ class ModalRuntimeEntrypoint:
             self._restore_timing = err_timing
             _LATEST_LIFECYCLE_TIMING = err_timing
             raise
-        trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
-        self._remember_lifecycle_trace(trace)
-
         startup_total_ms = round((time.perf_counter() - _startup_perf) * 1000.0, 3)
         _restore_timing: dict[str, Any] = {
             "restore_total_ms": startup_total_ms,
@@ -7484,6 +12150,10 @@ class ModalRuntimeEntrypoint:
                     _restore_timing[f"{_stage}_ms"] = round(float(_dur_ms), 3)
         self._restore_timing = _restore_timing
         _LATEST_LIFECYCLE_TIMING = _restore_timing
+
+        if not _golden_serial_active:
+            trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
+            self._remember_lifecycle_trace(trace)
 
         _report_host_memory("restore_complete")
 
@@ -7531,8 +12201,10 @@ class ModalRuntimeEntrypoint:
                         _cpu_models, state,
                         reload_unet_fn=_cpu_load_unet,
                         reload_clip_fn=_cpu_load_clip,
+                        reload_vae_fn=_cpu_load_vae,
                         snap_ctx_cm=_snap_ctx,
                         target_gpus=_target_gpus,
+                        trace=trace,
                     )
                     # _evict_snapshot_models already clears self._cpu_snapshot_models.
                     # Delete any local alias to assist gc:
@@ -7569,21 +12241,126 @@ class ModalRuntimeEntrypoint:
             metadata={"status": "skipped", "reason": "vae_not_part_of_cpu_snapshot", "duration_ms": 0.0},
         )
 
+        # ── Restore-memory experiment: freeze snapshot GPU capacity ────────
+        # The restore_memory_arm lane (parallel change) may freeze the
+        # GPU-capacity snapshot at build time so restore-time VRAM accounting
+        # stays consistent.  Optional and non-fatal: if the module is absent
+        # or raises, snapshot startup must still proceed.
+        try:
+            from comfymodal_runtime.restore_memory_arm import maybe_freeze_snapshot_gpu_capacity
+            maybe_freeze_snapshot_gpu_capacity()
+        except Exception:
+            pass
+
+        # ── Pre-snapshot persistent loader worker (experimental) ──────────
+        # Spawn the CPU-only loader worker BEFORE Modal captures the snapshot
+        # so worker spawn/import cost is removed from request time.  Fail
+        # closed when the switch is ON: a failed spawn must never silently
+        # degrade to request-time spawning.
+        if _golden_serial_active:
+            from .golden_loader_process import maybe_spawn_pre_snapshot_worker
+            _presnapshot_loader_record = maybe_spawn_pre_snapshot_worker()
+            if _presnapshot_loader_record:
+                _restore_timing["presnapshot_loader_process"] = _presnapshot_loader_record
+
+        # ── Pre-snapshot persistent CPU-I/O worker (experimental) ─────────
+        # Strictly storage-only child: spawned before capture so it survives
+        # restore with no request-time spawn cost.  It is CUDA-sterile; the
+        # parent retains CUDA, H2D, and model construction.  Fail closed when
+        # the switch is ON (a failed spawn must not degrade silently).
+        if _golden_serial_active:
+            from .golden_io_process import io_process_enabled, maybe_spawn_io_worker
+            if io_process_enabled():
+                _io_process_record = maybe_spawn_io_worker()
+                if _io_process_record:
+                    _restore_timing["golden_io_process"] = _io_process_record
+
+        # ── Snapshot quiescence proof (fail closed) ───────────────────────
+        # Golden must prove quiescence before capture, but this proof must be
+        # read-only: stopping a cache worker or flushing it here changes the
+        # process state serialized into the snapshot.  The default
+        # prove_snapshot_quiescence() contract remains mutating for callers
+        # outside the Golden path.
+        from .snapshot_capture_hygiene import prove_snapshot_quiescence
+        if _golden_serial_active:
+            _snapshot_quiescence = prove_snapshot_quiescence(passive=True)
+        else:
+            _snapshot_quiescence = {
+                "proven": True,
+                "skipped": True,
+                "reason": "non_golden_profile",
+            }
+        _restore_timing["snapshot_quiescence"] = _snapshot_quiescence
+        if not _snapshot_quiescence.get("proven", False):
+            raise RuntimeError(
+                "snapshot capture quiescence could not be proven: "
+                f"{_snapshot_quiescence}"
+            )
+
+        # ── Runtime-state construction baseline (Batch B) ────────────────
+        # Freeze generation + content manifest AFTER every correctness-
+        # relevant runtime-state write (prescan_custom_nodes.json,
+        # gpu_capacity_frozen.json) and BEFORE snapshot capture, so the
+        # restore-time guard can skip the remote Volume reload on an exact
+        # match.  Fail-closed: any write error leaves the baseline empty
+        # and the restore performs the reload as before.
+        try:
+            _rs_baseline = self.bootstrap.finalize_runtime_state_generation(
+                trace=trace, reason="construction"
+            )
+            if _rs_baseline:
+                _restore_timing["runtime_state_generation_baseline"] = _rs_baseline
+        except Exception:
+            pass
+
         # ── Snapshot-build manifest (diagnostic only; default off) ────────
         # Record the full process state Modal is about to serialize into the
         # memory snapshot: RSS/mappings/modules/threads/fds/GC/retained
-        # models/executors + image identity.  Never enabled on measured
-        # latency runs; only shadow diagnostic deployments set the gate.
+        # models/executors + image identity + the quiescence proof.  Never
+        # enabled on measured latency runs; only shadow diagnostic deployments
+        # set the gate.
         try:
             if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
                 from .snapshot_build_manifest import capture_snapshot_manifest
-                capture_snapshot_manifest(
+                _manifest_record = capture_snapshot_manifest(
                     "before_capture",
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "startup", "snap": "True"},
+                    quiescence=_snapshot_quiescence,
+                    selected_roots=_golden_pre_capture_surfaces,
                 )
+                if isinstance(_manifest_record, dict):
+                    _restore_timing["snapshot_manifest"] = _manifest_record
         except Exception:
             pass
+
+        # ── Capture-time allocator hygiene (diagnostic; default off) ──────
+        # R2a: gc.collect() + malloc_trim(0) immediately before the snapshot
+        # capture boundary so freed anonymous heap is returned to the OS
+        # before Modal serializes the process.  Shadow-validation only:
+        # never enabled on default production runs
+        # (COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE).
+        try:
+            if os.environ.get("COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+                from .snapshot_capture_hygiene import run_capture_hygiene
+                _hygiene_event = run_capture_hygiene(
+                    manifest_captured=(
+                        os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower()
+                        in {"1", "true", "yes", "on"}
+                    ),
+                )
+                if isinstance(_hygiene_event, dict):
+                    _restore_timing["snapshot_capture_hygiene"] = _hygiene_event
+        except Exception:
+            pass
+
+        # Golden's actual pre-capture boundary: all cleanup, quiescence, and
+        # content proof must complete before any ready/return marker.
+        if _golden_serial_active:
+            self._run_golden_snapshot_content_proof(
+                trace=trace,
+                surfaces=_golden_pre_capture_surfaces,
+            )
 
         _startup_return_wall_ns = time.time_ns()
         _startup_return_mono_ns = time.monotonic_ns()
@@ -7598,6 +12375,23 @@ class ModalRuntimeEntrypoint:
         )
         _restore_timing["snapshot_startup_callback_return_wall_unix_ns"] = _startup_return_wall_ns
         _restore_timing["snapshot_startup_callback_return_mono_ns"] = _startup_return_mono_ns
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # Snapshot-capture ready-return boundary: record the container clip
+        # state just before the startup callback returns ready.  After model
+        # eviction the clip may be the fresh reloaded instance — this captures
+        # whichever object is live at the boundary.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                trace,
+                "capture_pre_snapshot_return",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
+        if _golden_serial_active:
+            trace.emit("remote_lifecycle_end", phase="lifecycle", metadata={"status": "ready"})
+            self._remember_lifecycle_trace(trace)
         print(
             f"[v2.lifecycle] method=startup snap=True "
             f"container_session={_V2_CONTAINER_SESSION_ID} "
@@ -7834,8 +12628,293 @@ class ModalRuntimeEntrypoint:
         self._restore_torch_interop_threads = _after_interop
         self._restore_torch_thread_limit_status = _status
 
+    def _golden_minimal_reset_container_state(self) -> str:
+        """Reset only per-container state that cannot survive a snapshot.
+
+        Each reset exists because the value captured at snap=True is runtime
+        progress, not immutable configuration; reusing it after restore would
+        mis-identify this restore or skip work this container never did.
+
+        Returns a status string so a partial legacy-barrier reset is visible
+        as restore evidence instead of being silently swallowed.
+        """
+        # First request after every restore must be request 1.  The counter is
+        # runtime progress and is snapshotted holding the previous container's
+        # value, which would misnumber the first restored request.
+        self._request_count = 0
+        # Post-restore nonce/session ids are runtime-owned evidence of THIS
+        # restore; a snapshotted value would falsely identify a prior restore.
+        self._post_restore_nonce = ""
+        self._restore_session_id = ""
+        # Prepared-state maps are keyed by workflow hash and record work done
+        # in this container.  A snapshotted entry would suppress preparation
+        # for a workflow that was never actually prepared here.
+        _RES4LYF_PREPARED.clear()
+        _CACHEDIT_PREPARED.clear()
+        # Process-global restore-stage timers accumulate per restore; stale
+        # values would be attributed to this restore.
+        _RESTORE_STAGE_TIMERS.clear()
+        # Legacy backend boundary/barrier events are per-restore synchronization
+        # primitives.  A snapshotted *set* event would let a boundary worker
+        # wake immediately as if a previous restore's boundary had been crossed.
+        legacy_api = getattr(self, "_legacy_api", None)
+        if legacy_api is None:
+            return "no_legacy_api"
+        try:
+            _init_registry = getattr(legacy_api, "_init_actual_load_registry", None)
+            if callable(_init_registry):
+                _init_registry()
+            for _barrier_name in (
+                "_production_unet_barrier_event",
+                "_production_unet_encode_barrier_event",
+            ):
+                _barrier = getattr(legacy_api, _barrier_name, None)
+                if _barrier is not None:
+                    _barrier.clear()
+            if hasattr(legacy_api, "_production_unet_boundary_anchor_unix_s"):
+                legacy_api._production_unet_boundary_anchor_unix_s = time.time()
+            if hasattr(legacy_api, "_rbg_unet_done_events"):
+                legacy_api._rbg_unet_done_events = {}
+            if hasattr(legacy_api, "_active_next_read_dedup"):
+                legacy_api._active_next_read_dedup = set()
+                if hasattr(legacy_api, "_active_next_read_call_count"):
+                    legacy_api._active_next_read_call_count = 0
+                if hasattr(legacy_api, "_active_next_bundle_observation_count"):
+                    legacy_api._active_next_bundle_observation_count = 0
+                if hasattr(legacy_api, "_active_next_bundle_diagnostic_emission_count"):
+                    legacy_api._active_next_bundle_diagnostic_emission_count = 0
+        except Exception as _reset_exc:
+            # Surfaced as evidence (not swallowed); the fail-closed guards
+            # below still own the minimal contract.
+            return f"error:{type(_reset_exc).__name__}"
+        return "ok"
+
+    def _golden_minimal_restore_logical_gpu_state(self) -> None:
+        """Flip only ComfyUI's logical model-placement state back to GPU.
+
+        snap=True forced ComfyUI into CPU mode so the snapshot carries no CUDA
+        driver handles; model placement and CUDA-only attention paths need GPU
+        state before the first execution.  Deliberately performs NO CUDA probe,
+        synchronize, or memory query: the first genuine GPU use pays the driver
+        cost, which is exactly what the remote A/B must measure.
+        """
+        import comfy.cli_args
+        import comfy.model_management as _mm
+
+        comfy.cli_args.args.cpu = False
+        _mm.cpu_state = _mm.CPUState.GPU
+        _mm.DISABLE_SMART_MEMORY = False
+        _vram_state = getattr(_mm, "VRAMState", None)
+        if _vram_state is not None and hasattr(_vram_state, "HIGH_VRAM"):
+            _mm.vram_state = _vram_state.HIGH_VRAM
+
+    def _golden_minimal_assert_models_generation(self) -> dict[str, Any]:
+        """Prove the mounted models generation matches the snapshot baseline.
+
+        Reuses the existing O(1) RuntimeBootstrap decision (one small
+        models_generation.json read + isdir; no Volume RPC, no tree walk, no
+        hashing).  Fail closed: any decision other than an exact match raises,
+        so the A/B observes a real failure instead of silently loading a wrong
+        or missing model under the same logical name.
+        """
+        bootstrap = getattr(self, "bootstrap", None)
+        decide = getattr(bootstrap, "_decide_models_reload", None)
+        if not callable(decide):
+            raise RuntimeError("golden_minimal_restore_models_guard_unavailable")
+        decision = decide()
+        if str(decision.get("decision", "")) != "skipped_generation_match":
+            raise RuntimeError(
+                "golden_minimal_restore_models_generation_check_failed:"
+                f"{decision.get('reason', 'unknown')}"
+            )
+        return decision
+
+    def _golden_minimal_restore(
+        self,
+        *,
+        remote_python_resume_wall_ns: int,
+        remote_python_resume_mono_ns: int,
+        restore_method_start_wall_ns: int,
+        restore_method_start_mono_ns: int,
+        restore_perf_start: float,
+    ) -> dict[str, Any]:
+        """Minimal Golden Parallel post-snapshot restore (Golden Serial default).
+
+        Contract: reset container-local state, repair only logical GPU state,
+        prove the models-generation guard, emit minimal telemetry, READY.
+        A failure raises and never falls back to the heavyweight legacy restore,
+        so the remote A/B observes the true minimal-restore outcome.
+        """
+        global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count
+
+        _t_start = time.perf_counter()
+        # Project the genuine pre-capture snapshot content proof captured at the
+        # snap=True boundary.  It is stored on the snapshotted self._restore_timing
+        # and survives restore, so the minimal path only exposes the existing
+        # immutable proof record; it never fabricates a proof, never re-runs the
+        # legacy restore, and never performs new snapshot/Volume/GPU work.
+        _prior_timing = getattr(self, "_restore_timing", None)
+        _preserved_snapshot_proof = (
+            _prior_timing.get("golden_snapshot_content_proof")
+            if isinstance(_prior_timing, Mapping)
+            else None
+        )
+        telemetry: dict[str, Any] = {
+            "minimal_restore_start": time.monotonic_ns(),
+        }
+        if isinstance(_preserved_snapshot_proof, Mapping):
+            telemetry["golden_snapshot_content_proof"] = dict(_preserved_snapshot_proof)
+
+        def _mark(_name: str, _started_at: float) -> None:
+            telemetry[_name] = round((time.perf_counter() - _started_at) * 1000.0, 3)
+
+        try:
+            _t = time.perf_counter()
+            telemetry["legacy_api_reset"] = self._golden_minimal_reset_container_state()
+            _mark("mutable_state_reset_ms", _t)
+
+            _t = time.perf_counter()
+            self._golden_minimal_restore_logical_gpu_state()
+            _mark("logical_gpu_repair_ms", _t)
+
+            # The experimental source-thread arm deliberately establishes its
+            # one-time CUDA/arena/source-process/dispatcher resources during
+            # restore.  The ordinary minimal-restore path remains CUDA-lazy;
+            # only the explicitly deploy-owned arm pays this cost here so it
+            # cannot reappear in CLIP model-load pre-source.
+            _source_threads_enabled = str(
+                os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS") or ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if _source_threads_enabled:
+                _t = time.perf_counter()
+                from .golden_model_transport import get_golden_model_transport
+
+                get_golden_model_transport().initialize_cuda()
+                _mark("source_thread_restore_setup_ms", _t)
+                telemetry["source_thread_restore_setup"] = "initialized"
+
+            _t = time.perf_counter()
+            _models_decision = self._golden_minimal_assert_models_generation()
+            _mark("models_generation_check_ms", _t)
+            telemetry["models_generation_decision"] = str(
+                _models_decision.get("decision", "")
+            )
+        except Exception as _minimal_exc:
+            telemetry["minimal_restore_end"] = time.monotonic_ns()
+            telemetry["minimal_restore_total_ms"] = round(
+                (time.perf_counter() - _t_start) * 1000.0, 3
+            )
+            telemetry["minimal_restore_status"] = "failed"
+            telemetry["minimal_restore_failure_reason"] = (
+                f"{type(_minimal_exc).__name__}:{_minimal_exc}"
+            )
+            self._restore_timing = telemetry
+            _LATEST_LIFECYCLE_TIMING = telemetry
+            print(
+                "[v2.golden_minimal_restore] "
+                f"status=failed reason={type(_minimal_exc).__name__} "
+                f"detail={_minimal_exc} "
+                f"minimal_restore_total_ms={telemetry['minimal_restore_total_ms']}",
+                flush=True,
+            )
+            # Fail closed: never silently fall back to the legacy restore.
+            raise
+
+        _v2_container_restore_count += 1
+        self._restore_count = _v2_container_restore_count
+        restore_session_id = uuid.uuid4().hex
+        restored_instance_id = uuid.uuid4().hex
+        post_restore_nonce = uuid.uuid4().hex
+        self._restored_instance_id = restored_instance_id
+        _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
+        self._restore_session_id = restore_session_id
+        self._post_restore_nonce = post_restore_nonce
+        os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
+        set_model_load_identity(restored_instance_id, restore_session_id)
+
+        restore_end_mono_ns = time.monotonic_ns()
+        restore_end_wall_ns = int(time.time() * 1_000_000_000)
+        restore_total_ms = round((time.perf_counter() - restore_perf_start) * 1000.0, 3)
+        telemetry["minimal_restore_end"] = restore_end_mono_ns
+        telemetry["minimal_restore_total_ms"] = restore_total_ms
+        telemetry["minimal_restore_status"] = "ok"
+
+        restore_timing = dict(telemetry)
+        restore_timing.update({
+            "restore_total_ms": restore_total_ms,
+            "restore_wall_ms_excluding_scheduling": round(
+                (restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000, 3
+            ),
+            "restore_timing_boundary": "restore_method_entry_to_restore_return",
+            "restore_session_id": restore_session_id,
+            "restored_instance_id": restored_instance_id,
+            "post_restore_nonce": post_restore_nonce,
+            "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "container_session_id": self.container_session_id,
+            "restore_count": self._restore_count,
+            "lifecycle_status": "ok",
+            "lifecycle_method": "restore",
+            "remote_python_resume_wall_unix_ns": remote_python_resume_wall_ns,
+            "remote_python_resume_mono_ns": remote_python_resume_mono_ns,
+            "restore_method_start_wall_unix_ns": restore_method_start_wall_ns,
+            "restore_method_start_mono_ns": restore_method_start_mono_ns,
+            "restore_method_end_wall_unix_ns": restore_end_wall_ns,
+            "restore_method_end_mono_ns": restore_end_mono_ns,
+            "restore_method_status": "success",
+        })
+        self._restore_timing = restore_timing
+        _LATEST_LIFECYCLE_TIMING = restore_timing
+        # Required for the resume -> FIRST_RESULT_READY boundary: a dropped
+        # marker would silently make the A/B window unmeasurable, so it is not
+        # swallowed here (matches the legacy call site).
+        set_restore_return_marker(
+            restored_instance_id=restored_instance_id,
+            restore_session_id=restore_session_id,
+            legacy_container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            modal_task_id=str(os.environ.get("MODAL_TASK_ID", "") or ""),
+            pid=os.getpid(),
+            # The minimal restore deliberately opts out of the host probe
+            # (which reads /proc boot_id on Linux).
+            include_host_info=False,
+        )
+
+        _state = getattr(getattr(self, "bootstrap", None), "state", None)
+        print(
+            "[v2.golden_minimal_restore] "
+            f"status=ok minimal_restore_total_ms={restore_total_ms} "
+            f"mutable_state_reset_ms={telemetry.get('mutable_state_reset_ms')} "
+            f"logical_gpu_repair_ms={telemetry.get('logical_gpu_repair_ms')} "
+            f"models_generation_check_ms={telemetry.get('models_generation_check_ms')}",
+            flush=True,
+        )
+        return {
+            "backend": getattr(_state, "backend", "") or "",
+            "cuda": dict(getattr(_state, "cuda", {}) or {}),
+            "runtime_generation": getattr(_state, "runtime_generation", "") or "",
+            "status": "restored",
+            "_restore_timing": restore_timing,
+            "restored_instance_id": restored_instance_id,
+            "restore_session_id": restore_session_id,
+            "post_restore_nonce": post_restore_nonce,
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "minimal_restore": True,
+            "trace": {},
+            "phase_durations_ms": {},
+        }
+
     def restore(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING, _LATEST_RESTORED_INSTANCE_ID, _v2_container_restore_count, _RESTORE_STAGE_TIMERS
+        _ensure_custom_nodes_compat_symlink()
+        # Deep profiling is request-only.  Restore deliberately creates no
+        # FullExecutionTraceSession, resource sampler, VizTracer, or torch
+        # profiler; a deep request starts those lazily at its own boundary.
+        _full_trace_requested_at_restore = False
+        self._full_trace_requested_at_restore = False
+        self._full_trace_session = None
+        self._full_trace_activation_status = "disabled"
+        self._full_trace_activation_reason = "request_only_not_started"
+        _full_trace_started = False
+        _full_trace_error: str | None = None
         # ── Remote resume / restore method boundary timestamps ──────────
         # Captured at the TRUE first executable line of restore() so the
         # Modal-scheduling-before-Python-resumes gap (submission → this
@@ -7845,18 +12924,201 @@ class ModalRuntimeEntrypoint:
         remote_python_resume_mono_ns: int = time.monotonic_ns()
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
+        _restore_perf_start = time.perf_counter()
+        if _golden_minimal_restore_enabled():
+            # ── Golden Parallel minimal restore (Golden Serial default) ──
+            # A new from-first-principles post-snapshot contract that runs
+            # beside the legacy restore below instead of stripping it.  This
+            # branch returns before any probe, observability, ledger, span,
+            # manifest, host, warm, identity, bootstrap, or preload work.
+            # A failure inside the minimal path raises and never falls back to
+            # the legacy restore, so the remote A/B observes the real minimal
+            # outcome.  Set COMFYMODAL_GOLDEN_MINIMAL_RESTORE=0 and redeploy to
+            # explicitly select the legacy rollback/debug path.
+            return self._golden_minimal_restore(
+                remote_python_resume_wall_ns=remote_python_resume_wall_ns,
+                remote_python_resume_mono_ns=remote_python_resume_mono_ns,
+                restore_method_start_wall_ns=restore_method_start_wall_ns,
+                restore_method_start_mono_ns=restore_method_start_mono_ns,
+                restore_perf_start=_restore_perf_start,
+            )
+        _restore_clip_probe_source_info = _resolve_restore_clip_probe_source(
+            staging_evidence=getattr(self, "_restore_clip_probe_staging", None),
+        )
+        _restore_clip_probe_state: dict[str, Any] = {
+            "enabled": env_flag("COMFYMODAL_RESTORE_CLIP_READ_PROBE"),
+            "status": "disabled",
+            "launch_boundary": "inside_modal_runtime_restore_after_resume",
+            "joined_by_restore": False,
+            "source_mode": _restore_clip_probe_source_info["source_mode"],
+            "source_path": _restore_clip_probe_source_info["source_path"],
+            "path": _restore_clip_probe_source_info["path"],
+            "staging": _restore_clip_probe_source_info,
+            "staging_status": _restore_clip_probe_source_info.get("staging_status"),
+            "staged_path": _restore_clip_probe_source_info.get("staged_path"),
+            "source_size_bytes": _restore_clip_probe_source_info.get("source_size_bytes"),
+            "staged_size_bytes": _restore_clip_probe_source_info.get("staged_size_bytes"),
+            "staging_validation": _restore_clip_probe_source_info.get("staging_validation"),
+        }
+        self._restore_clip_probe_state = _restore_clip_probe_state
+        # Golden Serial forbids restore-time probe pollution even on an explicit
+        # legacy escape (COMFYMODAL_GOLDEN_MINIMAL_RESTORE=0); the probe is a
+        # non-Golden diagnostic only.
+        if _restore_clip_probe_state["enabled"] and not _golden_serial_profile_active():
+            _restore_clip_probe_path = _restore_clip_probe_source_info["path"]
+            _restore_clip_probe_thread = threading.Thread(
+                target=_run_restore_clip_qd2_probe,
+                args=(_restore_clip_probe_path, _restore_clip_probe_state),
+                daemon=False,
+                name="restore_clip_qd2_probe",
+            )
+            _restore_clip_probe_thread.start()
+            _restore_clip_probe_state["thread_started"] = True
+        # Diagnostic modules can be imported while the image is built, before
+        # Diagnostic modules can be imported while the image is built, before
+        # Modal applies the deployed runtime environment.  Keep this after the
+        # authoritative resume boundary so it cannot contaminate scheduling
+        # measurements.
+        sync_observability_gates()
+        _emit_golden_diagnostics_config("restore", api=self)
+        # ── E29: canonical ledger restore boundary ──────────────────────────
+        # Record the modal_app restore() entry on the canonical axis (the
+        # true first executable line of the remote restore lifecycle), and
+        # carry the restore identities into the ledger for cross-request
+        # isolation of every later span.  The entry event is stamped at the
+        # authoritative start boundary (remote_python_resume) so it always
+        # sits inside the zero-gap window.
+        try:
+            from .critical_path_ledger import (
+                begin_restore as _ledger_begin_restore,
+                record_event as _ledger_event,
+                set_request_identity as _ledger_identity,
+            )
+            _restore_ledger_rid = str(os.environ.get("COMFYMODAL_V2_BENCHMARK_REQUEST_ID", "") or "")
+            _ledger_begin_restore(_restore_ledger_rid)
+            _ledger_identity(
+                request_id=_restore_ledger_rid,
+                restored_instance_id=getattr(self, "_restored_instance_id", "") or "",
+                restore_session_id=getattr(self, "_restore_session_id", "") or "",
+                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            )
+            _ledger_event("modal_restore_entry", mono_ns=remote_python_resume_mono_ns)
+        except Exception:
+            pass
+        # ── E29: restore-decomposition span holders (always defined) ─────
+        # Initialized to None so every early close-site is safe even before
+        # the creation block below (which opens the actual spans) runs.
+        _span_restore_early: Any = None
+        _span_restore_eviction: Any = None
+        _span_restore_snapshot: Any = None
+        _span_restore_preamble: Any = None
+        _span_bootstrap: Any = None
+        _span_preload: Any = None
+        _span_finalize: Any = None
+        # ── E29: canonical ledger restore-decomposition spans ─────────────
+        # Each restore phase becomes a real ledger span (restore phase store)
+        # so the serial ledger decomposes restore() from first principles.
+        # Brackets are monotonic-stamped at the exact code site; a missing
+        # site leaves that span absent — never a guessed owner.
+        #
+        # CRITICAL lifecycle rule: every phase span is CREATED at its true
+        # start site (perf axis starts there, so duration_ms matches the
+        # mono window) and CLOSED at the next boundary.  The v38 code
+        # created ALL spans at restore entry and re-stamped start_mono_ns
+        # later — duration_ms then measured from restore entry and the
+        # per-span accounting (work/wait/sync/residual) was corrupted even
+        # though the serial ledger (mono axis) stayed honest.  Only the
+        # first phase (restore:early) is created here at the resume
+        # boundary; every later phase is created at its own site below.
+        try:
+            from .critical_path_ledger import begin_span as _ledger_begin_span
+        except Exception:
+            _ledger_begin_span = None
+
+        def _restore_phase_span(_name: str) -> Any:
+            if _ledger_begin_span is None:
+                return None
+            try:
+                return _ledger_begin_span(_name, lane="RESTORE")
+            except Exception:
+                return None
+
+        _span_restore_early = _restore_phase_span("restore:early")
+        _span_restore_eviction: Any = None
+        _span_restore_snapshot: Any = None
+        _span_restore_preamble: Any = None
+        _span_bootstrap: Any = None
+        _span_preload: Any = None
+        _span_finalize: Any = None
+        # ── E29: restore:early starts at the exact resume boundary ──────
+        # The first phase span opens AT the canonical start stamp so the
+        # restore section tiles the authoritative window from the first
+        # nanosecond (no pre-restore hole).
+        if _span_restore_early is not None:
+            try:
+                _span_restore_early.start_mono_ns = remote_python_resume_mono_ns
+            except Exception:
+                pass
+        # ── E29: authoritative serial-ledger START endpoint ───────────────
+        # remote_python_resume (the first executable restore line) is the
+        # canonical start of the E29 zero-gap window; record it on the
+        # ledger's endpoint store so request_ledger_report cannot substitute
+        # min(existing events) and shrink the measured interval.
+        try:
+            from .critical_path_ledger import set_authoritative_endpoints
+            set_authoritative_endpoints(
+                remote_python_resume_mono_ns=remote_python_resume_mono_ns
+            )
+        except Exception:
+            pass
+        # ── E27 Follow-Up A: restore-timeline boundary markers ──────────
+        # Captured on the shared remote monotonic axis (gated on the Gantt
+        # telemetry flag so the normal path is unchanged).  These answer the
+        # "earliest CLIP timeline" target on the real restored container:
+        #   first executable restore line, frozen-manifest availability,
+        #   CUDA init start/ready, restore reconcile, demand.
+        try:
+            from .gantt_telemetry import gantt_enabled, register_gantt_span
+
+            if gantt_enabled():
+                register_gantt_span(
+                    "restore_first_line",
+                    start_mono_ns=remote_python_resume_mono_ns,
+                    end_mono_ns=remote_python_resume_mono_ns,
+                    lane="RESTORE",
+                    metadata={"kind": "point"},
+                )
+                register_gantt_span(
+                    "restore_reconcile_start",
+                    start_mono_ns=remote_python_resume_mono_ns,
+                    end_mono_ns=remote_python_resume_mono_ns,
+                    lane="RESTORE",
+                    metadata={"kind": "point"},
+                )
+        except Exception:
+            pass
         # ── Snapshot-build manifest at the FIRST restored Python line ─────
         # (diagnostic only; default off — never enabled on measured runs).
         # Same capture as startup's ``before_capture`` so the two manifests
         # can be diffed to see exactly what the restore changed.
+        _restore_snapshot_manifest: dict[str, Any] | None = None
         try:
             if os.environ.get("COMFYMODAL_V2_SNAPSHOT_MANIFEST", "0").strip().lower() in {"1", "true", "yes", "on"}:
                 from .snapshot_build_manifest import capture_snapshot_manifest
-                capture_snapshot_manifest(
+                _restore_manifest_surfaces: dict[str, list[Any]] | None = None
+                if _golden_serial_profile_active():
+                    try:
+                        _restore_manifest_surfaces = self._golden_snapshot_proof_surfaces()
+                    except Exception:
+                        _restore_manifest_surfaces = None
+                _restore_snapshot_manifest = capture_snapshot_manifest(
                     "first_restored_line",
                     model_ctx=getattr(self, "_cpu_snapshot_models", None),
                     extra={"lifecycle": "restore", "snap": "False"},
+                    selected_roots=_restore_manifest_surfaces,
                 )
+                if isinstance(self._restore_timing, dict):
+                    self._restore_timing["snapshot_manifest_restore"] = _restore_snapshot_manifest
         except Exception:
             pass
         _restore_stage_started = _v2_startup_stage("post_snapshot_restore", "start")
@@ -7892,75 +13154,157 @@ class ModalRuntimeEntrypoint:
         # identity/config/plan/bootstrap/GPU.
         # _restore_eviction_boundary uses getattr defaults so is safe
         # before lazy_init on older unpickled instances.
+        # ── E29: restore:early closes at the eviction boundary ──────────
+        # Sequential phase spans: each phase opens at its true code site and
+        # closes at the next boundary, so the early restore window decomposes
+        # without fabricated overlap.
+        if _span_restore_early is not None:
+            try:
+                _span_restore_early.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        _span_restore_eviction = _restore_phase_span("restore:eviction")
+        if _golden_serial_profile_active():
+            self._assert_golden_restore_model_free()
         self._restore_eviction_boundary()
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # Retained-model handling (eviction boundary restore) completed; the
+        # clip below is the retained snapshot clip at this early restore point.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                getattr(self, "_lifecycle_trace", None),
+                "restore_after_retained_model_handling",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
         self._lazy_init_snapshot_state()
-        if _is_production_profile():
+        # ── E29: close restore:eviction / open restore:snapshot ─────────
+        # Sequential phase transitions: eviction ends after
+        # _restore_eviction_boundary + lazy snapshot state; the snapshot
+        # phase (snapshot-state init through manifest availability) opens
+        # at the lazy_init boundary.
+        if _span_restore_eviction is not None:
+            try:
+                _span_restore_eviction.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        _span_restore_snapshot = _restore_phase_span("restore:snapshot")
+        # ── E27 Follow-Up A: frozen-manifest-available marker ─────────────
+        # Records the exact restore-time instant the CLIP fast-hydration
+        # manifest becomes observable on the real restored container (the
+        # "earliest source I/O legal" boundary on the shared mono axis).
+        try:
+            from .gantt_telemetry import gantt_enabled, register_gantt_span
+
+            if gantt_enabled():
+                _manifest_ok = False
+                try:
+                    from .clip_fast_hydration_wiring import (
+                        cfh,
+                        resolve_capture_clip,
+                    )
+                    _clip, _src = resolve_capture_clip(
+                        getattr(self, "_cpu_snapshot_models", None)
+                    )
+                    if _clip is not None:
+                        _state = cfh.clip_hydration_state(_clip)
+                        _manifest_ok = bool(
+                            (_state or {}).get("manifest_present", False)
+                        )
+                except Exception:
+                    _manifest_ok = False
+                register_gantt_span(
+                    "clip_manifest_available",
+                    start_mono_ns=time.monotonic_ns(),
+                    end_mono_ns=time.monotonic_ns(),
+                    lane="RESTORE",
+                    metadata={"kind": "point", "manifest_present": int(_manifest_ok)},
+                )
+        except Exception:
+            pass
+        # ── D6 restore-side lifecycle checkpoint (default-OFF diagnostics) ──
+        # First restore instruction boundary: the snapshot models object that
+        # is about to be handed to the CLIP fast-hydration demand install.
+        try:
+            from .clip_fast_hydration_wiring import clip_state_checkpoint
+            clip_state_checkpoint(
+                getattr(self, "_lifecycle_trace", None),
+                "restore_first_instruction",
+                getattr(self, "_cpu_snapshot_models", None),
+            )
+        except Exception:
+            pass
+        # ── E29: close restore:snapshot / open restore:preamble ──────────
+        # The snapshot phase ends at the frozen-manifest availability marker;
+        # the preamble phase (identity/config/trace setup) opens here.
+        if _span_restore_snapshot is not None:
+            try:
+                _span_restore_snapshot.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
+        _span_restore_preamble = _restore_phase_span("restore:preamble")
+        try:
+            from .clip_fast_hydration_wiring import maybe_install_clip_fh_demand
+            maybe_install_clip_fh_demand(
+                getattr(self, "_cpu_snapshot_models", None),
+                trace=getattr(self, "_lifecycle_trace", None),
+            )
+        except Exception as _clip_fh_exc:
+            print(f"[v2.clip_fh] restore install skipped: {type(_clip_fh_exc).__name__}", flush=True)
+        if _is_production_profile() and not _golden_serial_profile_active():
             production_snapshot_invariant(
                 getattr(self, "_cpu_snapshot_models", None),
                 phase="restore",
             )
 
-        # ── Full-trace session: FIRST executable operation (before timestamp
-        #    capture, residency log, sampler, memory report, _configure_runtime,
-        #    identity capture, reload, GPU state, CUDA work).  Start with only
-        #    container identity; update_identity is called after restore_session_id
-        #    exists. ──
-        if _V2_FULL_TRACE_ENABLED:
-            try:
-                from .full_execution_trace import FullExecutionTraceSession as _FT
-                _ft = self._full_trace_session
-                if _ft is not None:
-                    try:
-                        if _ft.state not in ("trace_stopped", "failed"):
-                            _ft.stop_tracing()
-                    except Exception:
-                        pass
-                _FT.reset_instance()
-                _ft = _FT.create_if_enabled(
-                    container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
-                )
-                self._full_trace_session = _ft
-                if _ft is not None:
-                    try:
-                        _ft.start_restore()
-                        print(
-                            f"[v2.full_trace] stage=restore_entry "
-                            f"status=started trace_id={_ft.trace_id}",
-                            flush=True,
-                        )
-                    except Exception as _ft_start_exc:
-                        print(
-                            f"[v2.full_trace] stage=restore_entry "
-                            f"status=error error_type={type(_ft_start_exc).__name__}",
-                            flush=True,
-                        )
-                        self._full_trace_session = None
-            except Exception as _ft_exc:
-                print(
-                    f"[v2.full_trace] stage=restore_entry "
-                    f"status=error error_type={type(_ft_exc).__name__}",
-                    flush=True,
-                )
-                self._full_trace_session = None
-        _full_trace_started = False
-        _full_trace_error: str | None = None
         _restore_status: str = "unknown"
         _restore_end_wall_ns: int | None = None
         _restore_end_mono_ns: int | None = None
-        _restore_perf_start = time.perf_counter()
+        # [v2.restore_deep] leaf-segment stamp store (bounded, additive) ──
+        # Captures monotonic_ns stamps around the currently-unattributed leaf
+        # segments of the restore critical path; consumed once at the
+        # [v2.restore_deep] emission near the tail of restore().  Every stamp
+        # capture is individually guarded and must never raise.
+        _rd_deep: dict[str, Any] = {}
         # Continue with standard restore preamble
         print(
             "[v2.residency_config] "
             f"enabled={int(_RESIDENCY_DIAGNOSTICS_ENABLED)}",
             flush=True,
         )
+        try:
+            _rd_deep["host_memory_probe_start_ns"] = time.monotonic_ns()
+        except Exception:
+            pass
         self._cgroup_sampler = _CgroupCpuSampler(time.monotonic_ns())
         self._cgroup_sampler.set_phase("restore")
         self._cgroup_sampler.start()
         _report_host_memory("restore_start")
+        try:
+            _rd_deep["host_memory_probe_end_ns"] = time.monotonic_ns()
+        except Exception:
+            pass
         # Reset per-request counter so first request after every fresh restore
         # is exactly 1.  Snapshotted state cannot carry request count.
         self._request_count = 0
+        # The nonce is runtime-owned post-restore evidence, never snapshot
+        # state.  Clear any pre-existing value before this lifecycle starts;
+        # restore finalization creates the new value after all restore work.
+        self._post_restore_nonce = ""
+        self._restore_session_id = ""
+        # Start a fresh, restore-only handoff window.  The identity callback
+        # may populate this cache and the fallback sync consumes it once;
+        # construction and ordinary requests never enter this scope.
+        try:
+            self._restore_custom_node_identity_epoch = int(
+                getattr(self, "_restore_custom_node_identity_epoch", 0)
+            ) + 1
+        except Exception:
+            self._restore_custom_node_identity_epoch = 1
+        self._restore_custom_node_identity_cache = None
+        self._restore_custom_node_identity_scope_active = True
         # Reset process-global restore-stage timers at entry to prevent
         # stale accumulation across restores.  Each restore gets its own
         # timing state.
@@ -7968,13 +13312,90 @@ class ModalRuntimeEntrypoint:
         _RESTORE_STAGE_TIMERS["snapshot_identity_checks"] = 0.0
         _RESTORE_STAGE_TIMERS["cpu_snapshot_retargeting"] = 0.0
         try:
+            try:
+                _rd_deep["identity_capture_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             identity = _capture_remote_identity()
+            try:
+                _rd_deep["identity_capture_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
+            try:
+                _rd_deep["configure_runtime_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             self._configure_runtime()
+            try:
+                _rd_deep["configure_runtime_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             trace = RuntimeTrace(process="remote")
             trace.container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
             trace.set_metadata(**identity)
             trace.set_metadata(container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID)
+            # ── Advisory folder-listing warm (off the critical path) ───────
+            # The first request's cached→first-node topo walk pays a cold
+            # Modal-volume recursive_search per registered folder whenever the
+            # prompt-signature memo skips the normal add_keys warm-up.  Warm
+            # those listings in a daemon thread here so the first request's
+            # topo walk starts warm.  Best-effort and NEVER raises: if the
+            # warm is incomplete the request simply pays the original cost.
+            # On completion the evidence is attached to the restore trace
+            # metadata (host-visible) and to the restore timing dict.
+            try:
+                from comfymodal_runtime.execution_warm import (
+                    warm_registered_folders as _warm_registered_folders,
+                )
+
+                def _run_folder_warm():
+                    try:
+                        _fw_count, _fw_ms = _warm_registered_folders()
+                    except Exception:
+                        return
+                    try:
+                        trace.set_metadata(
+                            folder_warm_ms=_fw_ms,
+                            folder_warm_folders=_fw_count,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._restore_folder_warm_evidence = {
+                            "folder_warm_ms": _fw_ms,
+                            "folder_warm_folders": _fw_count,
+                        }
+                    except Exception:
+                        pass
+                    try:
+                        _rt = self._restore_timing
+                        if isinstance(_rt, dict):
+                            _rt["folder_warm_ms"] = _fw_ms
+                            _rt["folder_warm_folders"] = _fw_count
+                    except Exception:
+                        pass
+
+                # Golden Serial forbids restore-time folder warming even on an
+                # explicit legacy escape; it is a non-Golden diagnostic only.
+                if not _golden_serial_profile_active():
+                    threading.Thread(
+                        target=_run_folder_warm,
+                        daemon=True,
+                        name="comfymodal-folder-warm",
+                    ).start()
+            except Exception:
+                # Unimportable / thread-start failure — advisory only; the
+                # request pays the original cold lookup cost (no impact).
+                pass
+            try:
+                _rd_deep["torch_thread_apply_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             _thread_shape = self._apply_torch_thread_limit(trace=trace)
+            try:
+                _rd_deep["torch_thread_apply_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             _v2_container_restore_count += 1
             self._restore_count = _v2_container_restore_count
             restore_session_id = uuid.uuid4().hex
@@ -7984,6 +13405,28 @@ class ModalRuntimeEntrypoint:
             _LATEST_RESTORED_INSTANCE_ID = restored_instance_id
             os.environ["COMFYMODAL_RESTORED_INSTANCE_ID"] = restored_instance_id
             set_model_load_identity(restored_instance_id, restore_session_id)
+            # ── E29: refresh the canonical ledger restore identity ────────
+            # The restore-entry identity block was set BEFORE these IDs
+            # existed; refresh it now so every restore-session span/event
+            # carries the real restored_instance_id / restore_session_id
+            # (the v38 artifact had empty identities everywhere for exactly
+            # this reason).
+            try:
+                from .critical_path_ledger import set_request_identity as _ledger_identity2
+                _ledger_identity2(
+                    request_id=str(
+                        os.environ.get("COMFYMODAL_V2_BENCHMARK_REQUEST_ID", "") or ""
+                    ),
+                    restored_instance_id=restored_instance_id,
+                    restore_session_id=restore_session_id,
+                    container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+                )
+            except Exception:
+                pass
+            try:
+                _rd_deep["teardown_diag_setup_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             self._teardown_diagnostics.set_identity(
                 container_session_id=self.container_session_id,
                 restored_instance_id=restored_instance_id,
@@ -7991,6 +13434,10 @@ class ModalRuntimeEntrypoint:
                 modal_task_id=identity.get("container_task_id", ""),
                 modal_container_id=identity.get("modal_container_id", ""),
             )
+            try:
+                _rd_deep["teardown_diag_setup_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             if identity.get("modal_input_id"):
                 os.environ["COMFYMODAL_INPUT_ID"] = str(identity["modal_input_id"])
             if identity.get("modal_container_id"):
@@ -8021,12 +13468,28 @@ class ModalRuntimeEntrypoint:
                     _full_trace_started = False
             # Legacy identity: rename old container_session_id internally
             legacy_container_session_id = self.container_session_id or _V2_CONTAINER_SESSION_ID
+            _resource_id_dict = _resource_identity()
+            # Surface explicit CPU-request / GPU-type aliases (additive; reuse
+            # the values _resource_identity already computes — no new
+            # computation).  "memory_mb" already carries the RAM request;
+            # "cpu" / "gpu" exist, and "cpu_request" / "gpu_type" are the
+            # request-shaped alias keys surfaced for consumers that read them.
+            if "cpu_request" not in _resource_id_dict:
+                _cpu_val = _resource_id_dict.get("cpu")
+                if isinstance(_cpu_val, (int, float)) or (
+                    isinstance(_cpu_val, str) and _cpu_val
+                ):
+                    _resource_id_dict["cpu_request"] = _cpu_val
+            if "gpu_type" not in _resource_id_dict:
+                _gpu_list = _resource_id_dict.get("gpu")
+                if isinstance(_gpu_list, (list, tuple)) and _gpu_list:
+                    _resource_id_dict["gpu_type"] = str(_gpu_list[0])
             trace.set_metadata(
                 trace_id=trace.trace_id,
                 restored_instance_id=restored_instance_id,
                 restore_session_id=restore_session_id,
                 legacy_container_session_id=legacy_container_session_id,
-                **_resource_identity(),
+                **_resource_id_dict,
             )
             trace.emit(
                 "remote_method_entry",
@@ -8056,6 +13519,11 @@ class ModalRuntimeEntrypoint:
                 metadata=_resource_identity(),
             )
             trace.emit("remote_lifecycle_start", phase="restore", metadata={"snapshot": "False"})
+            try:
+                from . import clean_lane as _clean_lane
+                _clean_lane.begin_request(trace)
+            except Exception:
+                pass
             # Request-specific model, workflow, prefill, and output decisions
             # arrive with run_plan_stream.  Restore is snapshot/lifecycle-only;
             # it never reads a globally shared current plan.
@@ -8065,34 +13533,83 @@ class ModalRuntimeEntrypoint:
                 # Clear process-local caches from previous restore cycle
                 _RES4LYF_PREPARED.clear()
                 _CACHEDIT_PREPARED.clear()
-                trace.emit("v2_bootstrap_restore_start", phase="restore")
-                state = self.bootstrap.restore(trace=trace)
-                trace.emit("v2_bootstrap_restore_end", phase="restore")
-
-                # [v2.generation_identity] bootstrap diagnostic
-                _boot_cn_gen = str(state.custom_node_generation or "")
-                _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
-                _boot_rs_gen = str(state.runtime_generation or "")
-                _boot_cn_src = "missing"
-                _boot_api_id = str(id(self._legacy_api))
                 try:
-                    _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
-                        api=self._legacy_api
-                    )
-                    _boot_cn_src = _boot_src
+                    _rd_deep["bootstrap_restore_start_ns"] = time.monotonic_ns()
                 except Exception:
                     pass
-                print(
-                    f"[v2.generation_identity] "
-                    f"method=restore "
-                    f"custom_nodes_generation={_boot_cn_short!r} "
-                    f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
-                    f"source={_boot_cn_src} "
-                    f"runtime_state_generation={_boot_rs_gen!r} "
-                    f"api_object_id={_boot_api_id} "
-                    f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
-                    flush=True,
-                )
+                trace.emit("v2_bootstrap_restore_start", phase="restore")
+                # ── E29: close restore:preamble / open restore:bootstrap ──
+                # The preamble phase (identity/config/trace setup) ends at
+                # the bootstrap call; the bootstrap phase opens here.
+                if _span_restore_preamble is not None:
+                    try:
+                        _span_restore_preamble.finish(mono_ns=time.monotonic_ns())
+                    except Exception:
+                        pass
+                _span_bootstrap = _restore_phase_span("restore:bootstrap")
+                state = self.bootstrap.restore(trace=trace)
+                trace.emit("v2_bootstrap_restore_end", phase="restore")
+                try:
+                    from . import clean_lane as _clean_lane
+                    _clean_lane.restore_child_classifications(trace)
+                except Exception:
+                    pass
+                # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
+                # gpu-state/bootstrap restore completed: record the retained
+                # snapshot clip state at this restore point.
+                try:
+                    from .clip_fast_hydration_wiring import clip_state_checkpoint
+                    clip_state_checkpoint(
+                        trace,
+                        "restore_after_gpu_state",
+                        getattr(self, "_cpu_snapshot_models", None),
+                    )
+                except Exception:
+                    pass
+                try:
+                    _rd_deep["bootstrap_restore_end_ns"] = time.monotonic_ns()
+                except Exception:
+                    pass
+                # ── E29: close bootstrap span at the exact return site ────
+                if _span_bootstrap is not None:
+                    try:
+                        _span_bootstrap.finish(mono_ns=time.monotonic_ns())
+                    except Exception:
+                        pass
+                try:
+                    _rd_deep["preload_bridge_prep_start_ns"] = time.monotonic_ns()
+                except Exception:
+                    pass
+                _span_preload = _restore_phase_span("restore:preload")
+
+                # [v2.generation_identity] bootstrap diagnostic.  Under Golden
+                # Serial this resolver call and verbose identity print are
+                # restore-time pollution, so they are gated even on an explicit
+                # legacy escape; non-Golden restores keep the diagnostic.
+                if not _golden_serial_profile_active():
+                    _boot_cn_gen = str(state.custom_node_generation or "")
+                    _boot_cn_short = (_boot_cn_gen[:24] + "…") if len(_boot_cn_gen) > 24 else _boot_cn_gen
+                    _boot_rs_gen = str(state.runtime_generation or "")
+                    _boot_cn_src = "missing"
+                    _boot_api_id = str(id(self._legacy_api))
+                    try:
+                        _boot_r, _boot_src = self._legacy_module._resolve_custom_nodes_generation(
+                            api=self._legacy_api
+                        )
+                        _boot_cn_src = _boot_src
+                    except Exception:
+                        pass
+                    print(
+                        f"[v2.generation_identity] "
+                        f"method=restore "
+                        f"custom_nodes_generation={_boot_cn_short!r} "
+                        f"raw_empty={str(not bool(_boot_cn_gen)).lower()} "
+                        f"source={_boot_cn_src} "
+                        f"runtime_state_generation={_boot_rs_gen!r} "
+                        f"api_object_id={_boot_api_id} "
+                        f"deployment_combined_hash={_V2_DEPLOYMENT_COMBINED_HASH[:16] if _V2_DEPLOYMENT_COMBINED_HASH else '<empty>'}",
+                        flush=True,
+                    )
             except Exception as exc:
                 _lifecycle_error = str(exc)[:200]
                 trace.emit("v2_bootstrap_restore_end", phase="restore", metadata={"status": "error", "error": _lifecycle_error})
@@ -8105,6 +13622,11 @@ class ModalRuntimeEntrypoint:
                 _restore_end_mono_ns = time.monotonic_ns()
                 err_timing: dict[str, Any] = {
                     "restore_total_ms": restore_total_ms,
+                    "restore_wall_ms_excluding_scheduling": round(
+                        (_restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000,
+                        3,
+                    ),
+                    "restore_timing_boundary": "restore_method_entry_to_restore_return",
                     "restore_session_id": restore_session_id,
                     "restored_instance_id": restored_instance_id,
                     "container_session_id": self.container_session_id,
@@ -8119,7 +13641,30 @@ class ModalRuntimeEntrypoint:
                     "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
                     "restore_method_end_mono_ns": _restore_end_mono_ns,
                     "restore_method_status": "error",
+                    "restore_clip_probe": _restore_clip_probe_state,
                 }
+                # Bootstrap records these maps as it reaches each existing
+                # restore boundary. Keep partial results when a later
+                # callback raises so error timing remains authoritative.
+                _bootstrap_state = getattr(self.bootstrap, "state", None)
+                _stage_classifications = getattr(
+                    _bootstrap_state, "restore_stage_classifications", {}
+                )
+                _guard_decisions = getattr(
+                    _bootstrap_state, "restore_generation_guard_decisions", {}
+                )
+                err_timing["restore_stage_classifications"] = (
+                    dict(_stage_classifications)
+                    if isinstance(_stage_classifications, dict) else {}
+                )
+                err_timing["restore_generation_guard_decisions"] = (
+                    {
+                        str(key): dict(value)
+                        for key, value in _guard_decisions.items()
+                        if isinstance(value, Mapping)
+                    }
+                    if isinstance(_guard_decisions, dict) else {}
+                )
                 self._restore_timing = err_timing
                 _LATEST_LIFECYCLE_TIMING = err_timing
                 print(
@@ -8223,6 +13768,15 @@ class ModalRuntimeEntrypoint:
                         _rt["restore_method_start_wall_unix_ns"] = restore_method_start_wall_ns
                     if _rt.get("restore_method_start_mono_ns") is None:
                         _rt["restore_method_start_mono_ns"] = restore_method_start_mono_ns
+                    _rt.setdefault("restore_clip_probe", _restore_clip_probe_state)
+                    _rt.setdefault(
+                        "restore_wall_ms_excluding_scheduling",
+                        round((_restore_end_mono_ns - restore_method_start_mono_ns) / 1_000_000, 3),
+                    )
+                    _rt.setdefault(
+                        "restore_timing_boundary",
+                        "restore_method_entry_to_restore_return",
+                    )
                     _LATEST_LIFECYCLE_TIMING = _rt
             raise
         # Plan C: CPU snapshot model activation (Variant C)
@@ -8235,9 +13789,15 @@ class ModalRuntimeEntrypoint:
         # and skips bridge.prepare/background UNET submission.
         _cpu_snapshot_activated: bool = False
         self._lazy_init_snapshot_state()
+        # State guard (not the identity flag): activation requires a live
+        # UNET object in the CPU snapshot container.  After a clip_vae
+        # eviction the container carries CLIP/VAE only (unet=None), so this
+        # gate stays closed and never activates or reconstructs the UNET.
         if (
-            _cpu_model_snapshot_enabled()
+            not _golden_serial_profile_active()
+            and _cpu_model_snapshot_enabled()
             and self._cpu_snapshot_models is not None
+            and getattr(self._cpu_snapshot_models, "unet", None) is not None
             and self._restore_plan is not None
         ):
             _cpu_snapshot_activate_error: str | None = None
@@ -8691,7 +14251,15 @@ class ModalRuntimeEntrypoint:
                     # This redundancy ensures the wrapper is installed regardless
                     # of which code path activates the UNET.
                     from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
-                    ensure_sampling_timing_wrapper(models.unet)
+                    _sampling_wrapper_installed = ensure_sampling_timing_wrapper(models.unet)
+                    trace.emit(
+                        "sampling_wrapper_install",
+                        phase="diagnostics",
+                        metadata={
+                            "installed": bool(_sampling_wrapper_installed),
+                            "source": "snapshot_unet",
+                        },
+                    )
                     install_registered_unet_forward_hooks()
                     # ── 10. cachedit_restore_prepare ──
                     _cd_restore_node_ids: list[str] = []
@@ -8730,7 +14298,15 @@ class ModalRuntimeEntrypoint:
                                         )
                                         register_unet_forward_probe(_patched_model, source="cachedit_restore")
                                         from comfymodal_runtime.runtime_executor import ensure_sampling_timing_wrapper
-                                        ensure_sampling_timing_wrapper(_patched_model)
+                                        _sampling_wrapper_installed = ensure_sampling_timing_wrapper(_patched_model)
+                                        trace.emit(
+                                            "sampling_wrapper_install",
+                                            phase="diagnostics",
+                                            metadata={
+                                                "installed": bool(_sampling_wrapper_installed),
+                                                "source": "cachedit_patched_unet",
+                                            },
+                                        )
                                     _CACHEDIT_PREPARED[str(getattr(plan, "workflow_hash", ""))] = {
                                         "unet_id": id(_patched_model) if _patched_model is not None else id(models.unet),
                                         "workflow_hash": str(getattr(plan, "workflow_hash", "")),
@@ -8963,9 +14539,17 @@ class ModalRuntimeEntrypoint:
                 # Fall through to the existing preload branch.
         # ── Prefill-configuration diagnostic (after CPU snapshot state is final) ──
         _prefill_env_raw = os.environ.get("COMFYMODAL_V2_PREFILL_LANES", "critical")
+        # Container-level snapshot flag (cpu_snapshot_container_active) is
+        # distinct from the native fast-disk UNET execution lane: that lane is
+        # scheduled per request in _run_in_process (see _execution_unet_scheduled),
+        # so it is never active at restore time and reports 0 here.
+        _native_fast_disk_unet_execution_active = int(
+            bool(locals().get("_execution_unet_scheduled", 0))
+        )
         print(
             f"[v2.prefill_config] env={_prefill_env_raw} parsed={_PREFILL_LANE_MODE} "
-            f"cpu_snapshot_active={int(bool(_cpu_snapshot_activated))}",
+            f"cpu_snapshot_container_active={int(bool(_cpu_snapshot_activated))} "
+            f"native_fast_disk_unet_execution_active={_native_fast_disk_unet_execution_active}",
             flush=True,
         )
         try:
@@ -8975,6 +14559,10 @@ class ModalRuntimeEntrypoint:
             _unet_deferred_meta: dict[str, Any] = {}
             _defer_api = None if _cpu_snapshot_activated else (self._load_legacy_runtime() if self._restore_plan else None)
 
+            try:
+                _rd_deep["preload_bridge_prep_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
             if self._restore_plan is not None:
                 trace.emit("preload_submission_start", phase="restore", metadata={
                     "restore_plan_generation": str(self._restore_plan.generation),
@@ -9191,13 +14779,54 @@ class ModalRuntimeEntrypoint:
                     ),
                 },
             )
+            try:
+                _rd_deep["preload_bridge_prep_end_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
+            # ── E29: close preload span / open finalize span ─────────────
+            if _span_preload is not None:
+                try:
+                    _span_preload.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
+            _span_finalize = _restore_phase_span("restore:finalize")
             # â”€â”€ v2 restore finalize â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # ── 12. restore_finalization ──
             def _do_restore_finalization():
                 global _LATEST_LIFECYCLE_TIMING
 
                 trace_local = trace
+                # This is intentionally the first nonce generation site.  It
+                # is after restore work and before request dispatch, never at
+                # import, snapshot capture, or identity capture.
+                post_restore_nonce = uuid.uuid4().hex
+                self._post_restore_nonce = post_restore_nonce
+                self._restore_session_id = restore_session_id
+                trace_local.set_metadata(
+                    post_restore_nonce=post_restore_nonce,
+                    restore_session_id=restore_session_id,
+                    restored_instance_id=restored_instance_id,
+                )
+                trace_local.emit(
+                    "post_restore_identity",
+                    phase="restore",
+                    metadata={
+                        "post_restore_nonce": post_restore_nonce,
+                        "restore_session_id": restore_session_id,
+                        "restored_instance_id": restored_instance_id,
+                    },
+                )
                 trace_local.emit("v2_restore_finalize_start", phase="restore")
+                trace_local.emit(
+                    "restore_stage_classification",
+                    phase="restore",
+                    metadata={
+                        "stage": "restore_finalization",
+                        "classification": "restored",
+                        "decision": "lifecycle_complete",
+                        "reason": "restore_work_completed",
+                    },
+                )
                 trace_local.emit(
                     "remote_lifecycle_end",
                     phase="restore",
@@ -9212,10 +14841,19 @@ class ModalRuntimeEntrypoint:
                 )
                 restore_end_wall_ns_local = int(time.time() * 1_000_000_000)
                 restore_end_mono_ns_local = time.monotonic_ns()
-                restore_timing_local: dict[str, Any] = {
+                restore_timing_local: dict[str, Any] = dict(
+                    getattr(self, "_restore_timing", None) or {}
+                )
+                restore_timing_local.update({
                     "restore_total_ms": restore_total_ms_local,
+                    "restore_wall_ms_excluding_scheduling": round(
+                        (restore_end_mono_ns_local - restore_method_start_mono_ns) / 1_000_000,
+                        3,
+                    ),
+                    "restore_timing_boundary": "restore_method_entry_to_restore_return",
                     "restore_session_id": restore_session_id,
                     "restored_instance_id": restored_instance_id,
+                    "post_restore_nonce": post_restore_nonce,
                     "legacy_container_session_id": legacy_container_session_id,
                     "container_session_id": self.container_session_id,
                     "restore_count": self._restore_count,
@@ -9231,11 +14869,25 @@ class ModalRuntimeEntrypoint:
                     "snapshot_callback_age_at_restore_ms": _snapshot_callback_age_at_restore_ms,
                     "snapshot_startup_callback_return_wall_unix_ns": _callback_return.get("wall_unix_ns"),
                     "snapshot_startup_callback_return_mono_ns": _callback_return.get("monotonic_ns"),
-                }
+                    "restore_clip_probe": _restore_clip_probe_state,
+                })
                 if state.stage_durations:
                     for _stage, _dur_ms in state.stage_durations.items():
                         if _dur_ms is not None and _dur_ms > 0:
                             restore_timing_local[f"{_stage}_ms"] = round(float(_dur_ms), 3)
+                # Bootstrap owns these existing restore boundaries.  Preserve
+                # their classifications beside the timing record so a later
+                # report can distinguish carried, validated, reloaded, and
+                # reconstructed state without inferring from duration.
+                if getattr(state, "restore_stage_classifications", None):
+                    restore_timing_local["restore_stage_classifications"] = dict(
+                        state.restore_stage_classifications
+                    )
+                if getattr(state, "restore_generation_guard_decisions", None):
+                    restore_timing_local["restore_generation_guard_decisions"] = {
+                        str(key): dict(value)
+                        for key, value in state.restore_generation_guard_decisions.items()
+                    }
                 _REQUIRED_RESTORE_STAGES = (
                     "reload_runtime_state", "reload_models", "restore_gpu_state",
                     "initialize_cuda", "snapshot_identity_checks", "cpu_snapshot_retargeting",
@@ -9251,6 +14903,15 @@ class ModalRuntimeEntrypoint:
                     for _stage, _dur_ms in _RESTORE_STAGE_TIMERS.items():
                         if _stage not in _REQUIRED_RESTORE_STAGES and _dur_ms > 0:
                             restore_timing_local[f"{_stage}_ms"] = round(_dur_ms, 3)
+                # Merge the advisory folder-warm evidence (recorded by the
+                # background daemon thread when it completed) into the final
+                # timing dict so the keys reach the host even when the thread
+                # finished after the trace serialization boundary.
+                _fw_ev = getattr(self, "_restore_folder_warm_evidence", None)
+                if isinstance(_fw_ev, dict):
+                    for _fw_key in ("folder_warm_ms", "folder_warm_folders"):
+                        if _fw_key in _fw_ev and _fw_key not in restore_timing_local:
+                            restore_timing_local[_fw_key] = _fw_ev[_fw_key]
                 self._restore_timing = restore_timing_local
                 _LATEST_LIFECYCLE_TIMING = restore_timing_local
                 trace_local.emit("v2_restore_finalize_end", phase="restore")
@@ -9262,6 +14923,57 @@ class ModalRuntimeEntrypoint:
                     restore_end_mono_ns_local,
                 )
 
+            try:
+                _rd_deep["restore_finalize_start_ns"] = time.monotonic_ns()
+            except Exception:
+                pass
+            # ── E29: canonical ledger restore completion ─────────────────
+            # Record the modal_app restore() completion boundary so the
+            # serial ledger spans restore-entry .. restore-exit explicitly.
+            try:
+                from .critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "modal_restore_exit",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={"status": "restored"},
+                )
+            except Exception:
+                pass
+            # E37: the speculative CLIP lane is a post-restore operation.
+            # Keep manifest/identity reconciliation and the original lane
+            # arguments intact, but make modal_restore_exit the hard ordering
+            # boundary so no speculative source read can begin during restore.
+            try:
+                from .speculative_clip_hydration import (
+                    start_restore_time_clip_lane,
+                    speculative_clip_hydration_enabled,
+                )
+                from . import clean_lane as _clean_lane
+
+                if speculative_clip_hydration_enabled() and not _clean_lane.enabled():
+                    _restore_clip_holder = getattr(self, "_cpu_snapshot_models", None)
+                    _restore_clip_obj = (
+                        getattr(_restore_clip_holder, "clip", None)
+                        if _restore_clip_holder is not None
+                        else None
+                    )
+                    start_restore_time_clip_lane(
+                        clip=_restore_clip_obj,
+                        cpu_models=_restore_clip_holder,
+                        trace=getattr(self, "_lifecycle_trace", None),
+                        release_callback=None,
+                    )
+            except Exception as _e37_lane_exc:
+                print(
+                    f"[v2.clip_fh] post-restore lane skipped: {type(_e37_lane_exc).__name__}",
+                    flush=True,
+                )
+            # ── E29: close the finalize span at the restore exit ─────────
+            if _span_finalize is not None:
+                try:
+                    _span_finalize.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
             (
                 trace,
                 restore_total_ms,
@@ -9278,6 +14990,7 @@ class ModalRuntimeEntrypoint:
                 "_restore_timing": _restore_timing,
                 "restored_instance_id": restored_instance_id,
                 "restore_session_id": restore_session_id,
+                "post_restore_nonce": getattr(self, "_post_restore_nonce", ""),
                 "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
                 "trace": trace.to_dict(),
                 "phase_durations_ms": trace.export_phase_durations(),
@@ -9296,6 +15009,70 @@ class ModalRuntimeEntrypoint:
                 f"restore_finalize_ms={_brk.get('restore_finalize_ms')}",
                 flush=True,
             )
+            # ── [v2.restore_deep] leaf-segment attribution (additive) ──
+            # Emitted ONCE per restore, right after restore_breakdown.  Measures
+            # the currently-unattributed leaf segments of the restore critical
+            # path from _rd_deep monotonic stamps.  Each value is in ms, rounded
+            # to 3; a leaf without a valid stamp pair is reported as "absent"
+            # (never faked as 0).  residual_ms (present only when
+            # restore_total_ms is available) = restore_total − sum(present
+            # children).  Bounded: never raises, single line, flush=True.
+            try:
+                _rd_emit_ns = time.monotonic_ns()
+                _rd_values: dict[str, Any] = {}
+                _rd_pairs = (
+                    ("identity_capture_ms", "identity_capture_start_ns", "identity_capture_end_ns"),
+                    ("configure_runtime_ms", "configure_runtime_start_ns", "configure_runtime_end_ns"),
+                    ("torch_thread_apply_ms", "torch_thread_apply_start_ns", "torch_thread_apply_end_ns"),
+                    ("host_memory_probe_ms", "host_memory_probe_start_ns", "host_memory_probe_end_ns"),
+                    ("teardown_diag_setup_ms", "teardown_diag_setup_start_ns", "teardown_diag_setup_end_ns"),
+                    ("bootstrap_restore_ms", "bootstrap_restore_start_ns", "bootstrap_restore_end_ns"),
+                    ("preload_bridge_prep_ms", "preload_bridge_prep_start_ns", "preload_bridge_prep_end_ns"),
+                    ("restore_finalize_ms", "restore_finalize_start_ns", "_rd_emit_ns"),
+                )
+                for _rd_key, _rd_s_key, _rd_e_key in _rd_pairs:
+                    _rd_s_v = _rd_deep.get(_rd_s_key)
+                    _rd_e_v = _rd_deep.get(_rd_e_key)
+                    if _rd_e_key == "_rd_emit_ns":
+                        _rd_e_v = _rd_emit_ns
+                    if isinstance(_rd_s_v, int) and isinstance(_rd_e_v, int) and _rd_e_v >= _rd_s_v:
+                        _rd_values[_rd_key] = round((_rd_e_v - _rd_s_v) / 1_000_000, 3)
+                    else:
+                        _rd_values[_rd_key] = None
+                _rd_parts: list[str] = []
+                _rd_children_sum = 0.0
+                for _rd_key in (
+                    "identity_capture_ms", "configure_runtime_ms", "torch_thread_apply_ms",
+                    "host_memory_probe_ms", "teardown_diag_setup_ms", "bootstrap_restore_ms",
+                    "preload_bridge_prep_ms", "restore_finalize_ms",
+                ):
+                    _rd_v = _rd_values.get(_rd_key)
+                    if isinstance(_rd_v, (int, float)):
+                        _rd_parts.append(f"{_rd_key}={_rd_v}")
+                        _rd_children_sum += _rd_v
+                    else:
+                        _rd_parts.append(f"{_rd_key}=absent")
+                if isinstance(restore_total_ms, (int, float)):
+                    _rd_residual = round(float(restore_total_ms) - round(_rd_children_sum, 3), 3)
+                    _rd_parts.append(f"residual_ms={_rd_residual}")
+                print(f"[v2.restore_deep] " + " ".join(_rd_parts), flush=True)
+            except Exception:
+                pass
+            # Attach the advisory folder-warm evidence to the restore trace
+            # metadata when the background thread completed after the final
+            # serialization boundary (belt-and-braces for the host channel;
+            # the thread itself normally sets these keys at completion).
+            try:
+                _fw_ev = getattr(self, "_restore_folder_warm_evidence", None)
+                if isinstance(_fw_ev, dict):
+                    _fw_missing = {
+                        k: v for k, v in _fw_ev.items()
+                        if k in ("folder_warm_ms", "folder_warm_folders")
+                    }
+                    if _fw_missing:
+                        trace.set_metadata(**_fw_missing)
+            except Exception:
+                pass
             print(
                 f"[v2.clip_stages] "
                 f"worker_queue_ms={_clip.get('worker_queue_ms')} "
@@ -9377,6 +15154,11 @@ class ModalRuntimeEntrypoint:
             )
 
             trace.emit("v2_restore_return", phase="restore")
+            try:
+                from . import clean_lane as _clean_lane
+                _clean_lane.mark_restore_return(trace)
+            except Exception:
+                pass
             _restore_result["trace"] = trace.to_dict()
             set_restore_return_marker(
                 restored_instance_id=restored_instance_id,
@@ -9397,6 +15179,10 @@ class ModalRuntimeEntrypoint:
             # accumulation on the next restore.  This finally runs regardless
             # of success or cancellation.
             _RESTORE_STAGE_TIMERS.clear()
+            # The identity handoff is valid only until this restore exits;
+            # never let a later request or callback reuse it.
+            self._restore_custom_node_identity_cache = None
+            self._restore_custom_node_identity_scope_active = False
             if _restore_end_wall_ns is None:
                 _restore_end_wall_ns = int(time.time() * 1_000_000_000)
                 _restore_end_mono_ns = time.monotonic_ns()
@@ -9438,8 +15224,14 @@ class ModalRuntimeEntrypoint:
                     _LATEST_LIFECYCLE_TIMING = _rt
 
     async def _run_in_process(self, plan: ExecutionPlan, context: ExecutionContext) -> dict[str, Any]:
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_prompt_executor_forbidden")
         if context.cancelled and context.cancelled():
             raise RuntimeError("execution cancelled before PromptExecutor start")
+        try:
+            from . import clean_lane as _clean_lane
+        except Exception:
+            _clean_lane = None
         # Start process CPU sampler at method entry
         self._process_cpu_sampler = None
         if observability_allows("cpu_sampler"):
@@ -9447,7 +15239,24 @@ class ModalRuntimeEntrypoint:
             self._process_cpu_sampler.start()
         _report_host_memory("prompt_executor_start")
         trace = context.trace or RuntimeTrace(request_id=context.request_id, process="remote")
+        _orchestration_request_id = str(
+            getattr(trace, "request_id", "") or context.request_id or ""
+        )
         trace.set_metadata(observability_mode=observability_mode())
+        try:
+            from comfymodal_runtime.fast_cold_orchestration import (
+                attach_trace,
+                begin_request,
+            )
+
+            begin_request(
+                _orchestration_request_id,
+                model_spec=getattr(plan, "model_spec", None),
+                trace=trace,
+            )
+            attach_trace(_orchestration_request_id, trace)
+        except Exception:
+            pass
         trace.emit("runtime_config_start", phase="execution")
         self._configure_runtime()
         trace.emit("runtime_config_end", phase="execution")
@@ -9461,6 +15270,16 @@ class ModalRuntimeEntrypoint:
         if _RESIDENCY_DIAGNOSTICS_ENABLED:
             self._sample_snapshot_residency(stage="request_entry", trace=trace)
         trace.emit("graph_execution_start", phase="execution")
+        # ── E29: canonical ledger graph-execution span ────────────────────
+        # The graph/prefill/sampling/VAE decode window becomes one ledger
+        # span (children reconcile inside it via the trace-event bridge).
+        try:
+            from .critical_path_ledger import TraceSpanBridge
+            TraceSpanBridge(
+                "executor:graph-execution", lane="EXECUTOR",
+            ).start(mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
         # Stash the execution trace on the legacy API so the patched UNET
         # loader (_cached_unet_load) can emit V2 cache-hit events even
         # when current_v2_loader_bridge() returns None.
@@ -9484,6 +15303,19 @@ class ModalRuntimeEntrypoint:
             f"cpu_snapshot_active={int(bool(self._cpu_snapshot_models_active))}",
             flush=True,
         )
+        if _e19_atomic_profile_active():
+            _e19_snapshot_contract = unet_snapshot_execution_contract(
+                _snapshot_models_for_request
+            )
+            trace.emit(
+                "e19_unet_snapshot_contract",
+                phase="execution",
+                metadata=dict(_e19_snapshot_contract),
+            )
+            if not _e19_snapshot_contract["snapshot_unet_weights_absent"]:
+                raise RuntimeError(
+                    "E19 requires snapshot UNET weights absent before request demand"
+                )
         # ── Present-but-inactive → request-time activation ──────────────
         # On a cold run, restore() executes without a plan, so the
         # restore-time activation (validate + retarget + publish the retained
@@ -9512,6 +15344,14 @@ class ModalRuntimeEntrypoint:
                     "action=request_time_activation",
                     flush=True,
                 )
+            elif _snapshot_is_clip_vae_unet_absent(_inactive_models):
+                _request_time_activation_required = True
+                print(
+                    "[v2.cpu_snapshot_request] status=present_but_inactive "
+                    f"clip_present={int(_inactive_clip)} unet_present={int(_inactive_unet)} "
+                    "action=clip_vae_only_request_activation",
+                    flush=True,
+                )
             else:
                 print(
                     "[v2.cpu_snapshot_request] status=present_but_inactive "
@@ -9532,9 +15372,38 @@ class ModalRuntimeEntrypoint:
             try:
                 workflow = _thaw(plan.workflow) if hasattr(plan, "workflow") else {}
                 model_stack = dict(plan.model_stack) if hasattr(plan, "model_stack") else {}
-                request_model_key = derive_model_key(workflow)
-                request_prefill_key = derive_prefill_key(request_model_key, workflow)
-                request_model_spec = build_restore_model_spec(workflow, model_stack)
+                # ── Single source of truth (Batch-A G1) ──
+                # Reuse the plan-receipt derivation when available (the G1
+                # early-schedule path derives the same key/spec from the same
+                # plan); otherwise derive here exactly as before.  The cheap
+                # re-derivation below only diagnoses divergence — the
+                # downstream sampler identity verification stays the
+                # authoritative runtime check.
+                request_model_key = getattr(self, "_plan_receipt_request_model_key", None)
+                if request_model_key is None:
+                    # ── E25: exact-identity cached derivation (falls back to
+                    # the original inline derivation on any cache failure) ──
+                    (
+                        request_model_key,
+                        request_prefill_key,
+                        request_model_spec,
+                    ) = self._cached_pre_graph_derivations(
+                        plan, workflow=workflow, model_stack=model_stack
+                    )
+                else:
+                    request_prefill_key = getattr(self, "_plan_receipt_request_prefill_key", None)
+                    request_model_spec = getattr(self, "_plan_receipt_request_model_spec", None)
+                    try:
+                        _recheck_key = derive_model_key(workflow)
+                        if _recheck_key != request_model_key:
+                            print(
+                                "[v2.g1_identity_guard] plan_receipt_key!=binding_key "
+                                f"plan_hash={request_model_key.stable_hash[:16]} "
+                                f"binding_hash={_recheck_key.stable_hash[:16]}",
+                                flush=True,
+                            )
+                    except Exception:
+                        pass
                 snapshot_key = self._cpu_snapshot_models.model_key
                 snapshot_spec = self._cpu_snapshot_models.model_spec
                 _role_report = _canonical_role_match_report(
@@ -9544,6 +15413,9 @@ class ModalRuntimeEntrypoint:
                 if _role_report["compatible"]:
                     _flags = plan.execution_options.compatibility_flags
                     _bypass_snapshot_unet = isinstance(_flags, Mapping) and _flags.get("diagnostic_bypass_cpu_snapshot_unet") is True
+                    _clip_vae_only_bind = _snapshot_is_clip_vae_unet_absent(
+                        self._cpu_snapshot_models
+                    )
                     if _bypass_snapshot_unet:
                         if _request_time_activation_required:
                             self._retarget_cpu_snapshot_models_for_request(trace=trace)
@@ -9565,6 +15437,18 @@ class ModalRuntimeEntrypoint:
                             # the snapshot is now usable by this and later
                             # requests (UNET comes from the normal loader).
                             self._cpu_snapshot_models_active = True
+                    elif _clip_vae_only_bind:
+                        # UNET-absent clip_vae architecture: request-time
+                        # clip-only bridge activation (no UNET lane).
+                        self._activate_clip_vae_only_request_binding(
+                            request_model_key=request_model_key,
+                            request_prefill_key=request_prefill_key,
+                            request_model_spec=request_model_spec,
+                            trace=trace,
+                        )
+                        _unet_source = "normal_loader"
+                        _clip_source = "cpu_snapshot"
+                        _reason = "clip_vae_only"
                     else:
                         if _request_time_activation_required:
                             self._retarget_cpu_snapshot_models_for_request(trace=trace)
@@ -9652,6 +15536,19 @@ class ModalRuntimeEntrypoint:
                                     )
                                 except Exception:
                                     pass
+                                # ── D6 restore-side lifecycle checkpoint ──
+                                # (default-OFF diagnostics) bridge binding
+                                # completed on the request-time activation path:
+                                # record the served snapshot clip state.
+                                try:
+                                    from .clip_fast_hydration_wiring import clip_state_checkpoint
+                                    clip_state_checkpoint(
+                                        trace,
+                                        "restore_after_cpu_snapshot_bridge",
+                                        self._cpu_snapshot_models,
+                                    )
+                                except Exception:
+                                    pass
                                 _rt_state.snapshot_model_identities = {
                                     "unet": str(
                                         getattr(request_model_key, "unet_identity", "") or ""
@@ -9731,7 +15628,8 @@ class ModalRuntimeEntrypoint:
                         )
                     else:
                         print(
-                            "[v2.cpu_snapshot_request] status=reused reason=ok",
+                            "[v2.cpu_snapshot_request] status=reused "
+                            f"reason={_reason}",
                             flush=True,
                         )
                     trace.emit(
@@ -9742,8 +15640,13 @@ class ModalRuntimeEntrypoint:
                             "reason": _reason,
                             "diagnostic_bypass_cpu_snapshot_unet": 1 if _bypass_snapshot_unet else 0,
                             "cpu_snapshot_clip_reused": 1,
-                            "cpu_snapshot_unet_reused": 0 if _bypass_snapshot_unet else 1,
+                            "cpu_snapshot_unet_reused": 0 if (_bypass_snapshot_unet or _clip_vae_only_bind) else 1,
                             "unet_source": _unet_source,
+                            "unet_loader_execution_identity": (
+                                "cpu_snapshot"
+                                if _unet_source == "cpu_snapshot"
+                                else "normal_loader"
+                            ),
                             "clip_source": _clip_source,
                             "model_key_hash": snapshot_key.stable_hash[:16] if snapshot_key else "",
                             "clip_object_type": type(self._cpu_snapshot_models.clip).__name__,
@@ -9751,6 +15654,18 @@ class ModalRuntimeEntrypoint:
                             "duration_ms": round((time.perf_counter() - _bind_perf) * 1000.0, 3),
                         },
                     )
+                    # ── D6 restore-side lifecycle checkpoint (default-OFF) ──
+                    # Request-time activation completed: the snapshot models
+                    # are validated + bound.  Record the served clip state.
+                    try:
+                        from .clip_fast_hydration_wiring import clip_state_checkpoint
+                        clip_state_checkpoint(
+                            trace,
+                            "restore_after_snapshot_model_validation",
+                            self._cpu_snapshot_models,
+                        )
+                    except Exception:
+                        pass
                 else:
                     # Model identity differs — clear bridge and deactivate.
                     if _is_production_profile():
@@ -9900,14 +15815,54 @@ class ModalRuntimeEntrypoint:
         # falling back to the original loader.  schedule_execution_prefill
         # is idempotent (a second call is a no-op), so no duplicate
         # construction happens when a restore already scheduled prefill.
-        _execution_prefill_scheduled = bool(
-            self._preload_bridge.schedule_execution_prefill(
-                trace=trace,
-                request_id=str(context.request_id),
-                activation_diagnostic_state=_activation_diagnostic_state,
+        trace.emit("execution_prefill_schedule_start", phase="execution")
+        if _clean_lane is not None and _clean_lane.enabled():
+            _clean_lane.forbidden_activity("execution_prefill", trace)
+            _execution_prefill_scheduled = False
+        else:
+            _execution_prefill_scheduled = bool(
+                self._preload_bridge.schedule_execution_prefill(
+                    trace=trace,
+                    request_id=str(context.request_id),
+                    activation_diagnostic_state=_activation_diagnostic_state,
+                )
             )
-        )
+        trace.emit("execution_prefill_schedule_end", phase="execution")
 
+        # ── Execution-phase native fast-disk UNET preparation ──────────
+        # Schedule immediately after the CLIP prefill so the native
+        # fast-disk UNET construction (file read + bind + single H2D
+        # pass) overlaps the prefill encode instead of running on the
+        # graph thread when the graph reaches UNETLoader.  The graph
+        # consumer joins exactly this prepared future through the
+        # existing bridge wait_unet path (one construction/read/H2D per
+        # request).  Idempotent: when the preparation already has a UNET
+        # future (restore-time UNET lane or retained CPU-snapshot UNET)
+        # the bridge method is a no-op.  Gate: only for the integrated
+        # configuration (active CPU snapshot WITHOUT a retained UNET —
+        # the graph would otherwise fast-disk load it at UNETLoader).
+        # In every other configuration the bridge keeps its existing
+        # ownership: retained-snapshot UNET (future present), full
+        # restore-time UNET lane (future present), or the legacy
+        # background UNET defer (no snapshot — never touched here, so
+        # exactly one UNET construction/load per request is preserved).
+        _snapshot_models = self._cpu_snapshot_models
+        _snapshot_unet_absent = bool(
+            _cpu_snapshot_active
+            and _snapshot_models is not None
+            and getattr(_snapshot_models, "unet", None) is None
+        )
+        _execution_unet_scheduled = False
+        if _snapshot_unet_absent and not (_clean_lane is not None and _clean_lane.enabled()):
+            _execution_unet_scheduled = bool(
+                self._preload_bridge.schedule_execution_unet(
+                    trace=trace,
+                    request_id=str(context.request_id),
+                )
+            )
+
+        if _clean_lane is not None and _clean_lane.enabled() and _snapshot_unet_absent:
+            _clean_lane.forbidden_activity("execution_unet_source_h2d", trace)
         print(
             "[v2.execution_prefill] "
             f"snapshot_active={int(_cpu_snapshot_active)} "
@@ -9915,10 +15870,22 @@ class ModalRuntimeEntrypoint:
             f"scheduled={int(_execution_prefill_scheduled)}",
             flush=True,
         )
+        print(
+            "[v2.execution_unet] "
+            f"scheduled={int(_execution_unet_scheduled)} "
+            f"snapshot_unet_absent={int(_snapshot_unet_absent)} "
+            f"request_id={context.request_id}",
+            flush=True,
+        )
         # Carry prefill booleans on trace metadata for _execute_v2_prompt_executor
+        # NOTE: _cpu_snapshot_active below is the container-level snapshot flag;
+        # it is distinct from the native fast-disk UNET execution lane
+        # (see _execution_unet_scheduled).
         trace.set_metadata(
             _cpu_snapshot_active=_cpu_snapshot_active,
             _execution_prefill_scheduled=_execution_prefill_scheduled,
+            _execution_unet_scheduled=_execution_unet_scheduled,
+            _execution_unet_gate=_snapshot_unet_absent,
         )
         try:
             with request_execution_trace_scope(trace):
@@ -9953,10 +15920,24 @@ class ModalRuntimeEntrypoint:
                 }
                 trace.set_metadata(gpu_observation_classification=_gpu_obs_classification)
             trace.emit("graph_execution_end", phase="execution")
+            # ── E29: close the canonical ledger graph-execution span ─────
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("executor:graph-execution", lane="EXECUTOR").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
             # Drain late worker events (read/cpu/gpu/ready) from bridge
             # preparation into the execution trace so they are not lost.
             self._preload_bridge.drain_worker_events(trace)
             self._preload_bridge.close_workers()
+            try:
+                from comfymodal_runtime.fast_cold_orchestration import finalize_request
+
+                finalize_request(_orchestration_request_id, trace)
+            except Exception:
+                pass
             _completed_diagnosis = (
                 result.get("trace", {}).get("activation_diagnosis")
                 if isinstance(result.get("trace"), dict)
@@ -10023,13 +16004,14 @@ class ModalRuntimeEntrypoint:
                 result["_restore_timing"] = dict(_rt)
             result["_snapshot_target_fingerprint"] = _snapshot_target_fingerprint()
             result["phase_durations_ms"] = trace.export_phase_durations()
-            _report_host_memory("result_complete")
+            if not _QUIET:
+                _report_host_memory("result_complete")
             # ── Activation diagnosis: read from result (assembled by _execute_v2_prompt_executor) ──
             _ad_from_result = result.get("trace", {}).get("activation_diagnosis") if isinstance(result.get("trace"), dict) else None
             if isinstance(_ad_from_result, dict):
                 _ad_fields: list[str] = []
                 _AD_FIELD_SPEC = (
-                    "request_id", "cpu_snapshot_active", "execution_prefill_scheduled",
+                    "request_id", "cpu_snapshot_container_active", "execution_prefill_scheduled",
                     "residency_diagnostics_enabled",
                     "clip_encode_calls", "clip_encode_graph_calls", "clip_encode_prefill_calls",
                     "clip_encode_wall_ms", "clip_encode_graph_wall_ms",
@@ -10049,8 +16031,17 @@ class ModalRuntimeEntrypoint:
                     "restore_torch_interop_threads",
                     "restore_torch_thread_limit_status",
                 )
+                # The activation-diagnosis state dict is built by model_preload
+                # (container-level snapshot flag), which still writes the legacy
+                # key cpu_snapshot_active; read it as fallback so the renamed
+                # print field keeps the identical value.
+                _AD_FIELD_LEGACY_KEYS = {
+                    "cpu_snapshot_container_active": "cpu_snapshot_active",
+                }
                 for _f in _AD_FIELD_SPEC:
                     _v = _ad_from_result.get(_f)
+                    if _v is None and _f in _AD_FIELD_LEGACY_KEYS:
+                        _v = _ad_from_result.get(_AD_FIELD_LEGACY_KEYS[_f])
                     _ad_fields.append(f"{_f}={_v if _v is not None else 'absent'}")
                 print(f"[v2.activation_diagnosis] {' '.join(_ad_fields)}", flush=True)
             # Stop process CPU sampler at result completion
@@ -10069,6 +16060,14 @@ class ModalRuntimeEntrypoint:
             return result
         except Exception as exc:
             trace.emit("graph_execution_end", phase="execution", metadata={"status": "error", "error": str(exc)[:200]})
+            # ── E29: close the canonical ledger graph-execution span ─────
+            try:
+                from .critical_path_ledger import TraceSpanBridge
+                TraceSpanBridge("executor:graph-execution", lane="EXECUTOR").end(
+                    mono_ns=time.monotonic_ns()
+                )
+            except Exception:
+                pass
             # Capture GPU observation summary/classification on exception path too.
             # Safe after request_execution_trace_scope exit â€” reads from module-level state.
             try:
@@ -10098,6 +16097,12 @@ class ModalRuntimeEntrypoint:
             # are terminal before draining diagnostics (same ordering as
             # success path: join first, then drain).
             self._preload_bridge.close_workers()
+            try:
+                from comfymodal_runtime.fast_cold_orchestration import finalize_request
+
+                finalize_request(_orchestration_request_id, trace)
+            except Exception:
+                pass
             self._join_legacy_background_threads(api)
             # Drain bg diagnostics on exception path too
             try:
@@ -10129,7 +16134,7 @@ class ModalRuntimeEntrypoint:
 
         Emits exactly one ``[v2.snapshot_activation_invariant]`` line with the
         fields: profile, models_container_present, clip_present, unet_present,
-        snapshot_enabled_by_config, cpu_snapshot_active, loader_bridge_active,
+        snapshot_enabled_by_config, cpu_snapshot_container_active, loader_bridge_active,
         execution_prefill_allowed, status, reason.
 
         Fails clearly (RuntimeError) when the production profile has BOTH
@@ -10148,13 +16153,13 @@ class ModalRuntimeEntrypoint:
             snapshot_enabled_by_config = _cpu_model_snapshot_enabled()
         except Exception:
             snapshot_enabled_by_config = False
-        cpu_snapshot_active = bool(getattr(self, "_cpu_snapshot_models_active", False))
+        cpu_snapshot_container_active = bool(getattr(self, "_cpu_snapshot_models_active", False))
         _bridge = getattr(self, "_preload_bridge", None)
         loader_bridge_active = bool(
             _bridge is not None
             and getattr(_bridge, "_preparation", None) is not None
         )
-        execution_prefill_allowed = not cpu_snapshot_active
+        execution_prefill_allowed = not cpu_snapshot_container_active
         status = "pass"
         reason = "ok"
         if (
@@ -10162,7 +16167,7 @@ class ModalRuntimeEntrypoint:
             and models_container_present
             and clip_present
             and unet_present
-            and not cpu_snapshot_active
+            and not cpu_snapshot_container_active
         ):
             status = "fail"
             reason = "production_models_present_but_inactive"
@@ -10172,7 +16177,7 @@ class ModalRuntimeEntrypoint:
                 f"clip_present={int(clip_present)} "
                 f"unet_present={int(unet_present)} "
                 f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
-                f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+                f"cpu_snapshot_container_active={int(cpu_snapshot_container_active)} "
                 f"loader_bridge_active={int(loader_bridge_active)} "
                 f"execution_prefill_allowed={int(execution_prefill_allowed)} "
                 f"status={status} "
@@ -10190,7 +16195,7 @@ class ModalRuntimeEntrypoint:
             f"clip_present={int(clip_present)} "
             f"unet_present={int(unet_present)} "
             f"snapshot_enabled_by_config={int(snapshot_enabled_by_config)} "
-            f"cpu_snapshot_active={int(cpu_snapshot_active)} "
+            f"cpu_snapshot_container_active={int(cpu_snapshot_container_active)} "
             f"loader_bridge_active={int(loader_bridge_active)} "
             f"execution_prefill_allowed={int(execution_prefill_allowed)} "
             f"status={status} "
@@ -10204,7 +16209,7 @@ class ModalRuntimeEntrypoint:
                 "clip_present": int(clip_present),
                 "unet_present": int(unet_present),
                 "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
-                "cpu_snapshot_active": int(cpu_snapshot_active),
+                "cpu_snapshot_container_active": int(cpu_snapshot_container_active),
                 "loader_bridge_active": int(loader_bridge_active),
                 "execution_prefill_allowed": int(execution_prefill_allowed),
                 "status": status,
@@ -10216,7 +16221,7 @@ class ModalRuntimeEntrypoint:
             "clip_present": int(clip_present),
             "unet_present": int(unet_present),
             "snapshot_enabled_by_config": int(snapshot_enabled_by_config),
-            "cpu_snapshot_active": int(cpu_snapshot_active),
+            "cpu_snapshot_container_active": int(cpu_snapshot_container_active),
             "loader_bridge_active": int(loader_bridge_active),
             "execution_prefill_allowed": int(execution_prefill_allowed),
             "status": status,
@@ -10373,6 +16378,8 @@ class ModalRuntimeEntrypoint:
         authorization, output collection, and result packaging. ComfyUI still
         owns its actual PromptExecutor and node execution semantics.
         """
+        if getattr(self, "_golden_execution_active", False):
+            raise RuntimeError("golden_prompt_executor_forbidden")
         # Reset the per-request unet_first_cuda_op dedup so the first forward
         # pass of this request emits the event.  Must fire before any CUDA op.
         reset_first_cuda_dedup()
@@ -10389,6 +16396,112 @@ class ModalRuntimeEntrypoint:
             raise RuntimeError("execution cancelled before PromptExecutor start")
 
         workflow = _thaw(plan.workflow)
+        # ── Step-1 plan-carried validation proof: instrumentation only, never consumed ──
+        # Batch-D5: plan-proof computation start.
+        trace.emit("plan_proof_start", phase="setup")
+        _pp = plan.validation if isinstance(plan.validation, Mapping) else {}
+        _pp_schema = _pp.get("schema_version", 0) if _pp else 0
+        _pp_validated = bool(_pp.get("validated", False))
+        _pp_outputs = list(_pp.get("outputs_to_execute", []) or [])
+        _pp_out_ids = ",".join(str(o) for o in _pp_outputs[:4])
+        _pp_dep = plan.deployment_identity if isinstance(plan.deployment_identity, Mapping) else {}
+        _pp_dep_complete = bool(_pp_dep.get("complete", False))
+        _pp_recomputed = ""
+        _pp_hash_match = False
+        try:
+            from workflow_metadata import prompt_sha256 as _pp_sha
+            _pp_recomputed = _pp_sha(_thaw(plan.workflow))
+            _pp_hash_match = bool(_pp_recomputed) and _pp_recomputed == plan.workflow_hash
+        except Exception:
+            pass
+        print(
+            f"[v2.plan_proof] schema={_pp_schema} payload={'yes' if _pp else 'no'} "
+            f"validated={_pp_validated} outputs={len(_pp_outputs)} out_ids={_pp_out_ids} "
+            f"wf_hash={str(plan.workflow_hash)[:16]} recomputed={str(_pp_recomputed)[:16] or 'n/a'} "
+            f"match={_pp_hash_match} dep_complete={_pp_dep_complete} consumed=False "
+            f"cert_decision=legacy",
+            flush=True,
+        )
+        trace.emit("plan_validation_payload", phase="setup", metadata={
+            "schema_version": _pp_schema, "payload_present": bool(_pp),
+            "validated": _pp_validated, "outputs_count": len(_pp_outputs),
+            "outputs_ids": _pp_out_ids, "workflow_hash": plan.workflow_hash,
+            "recomputed_hash": _pp_recomputed, "hash_match": _pp_hash_match,
+            "deployment_complete": _pp_dep_complete, "consumed": False,
+        })
+        # ── Step-2 canonical deployment-static parity (instrumentation only) ──
+        _pp_proof: dict = {}
+        _pp_bs_state = getattr(getattr(self, "bootstrap", None), "state", None)
+        if _pp_bs_state is not None:
+            _pp_proof = dict(getattr(_pp_bs_state, "snapshot_validation_proof", {}) or {})
+        _pp_parity = evaluate_plan_snapshot_parity(plan.deployment_identity, _pp_proof)
+        # ── Workflow-relevant registry parity line (diagnostic) ──
+        # Rebuild the full parity result for the workflow's own class set
+        # (the plan's registry_proof vs the snapshot's registry_manifest).
+        _pp_reg_parity = _pp_parity.get("registry_parity_counts", {})
+        _pp_reg_full: dict = {}
+        try:
+            from comfymodal_runtime.registry_proof import (
+                evaluate_workflow_registry_parity,
+                format_registry_parity_line,
+            )
+            _pp_reg_full = evaluate_workflow_registry_parity(
+                (plan.deployment_identity or {}).get("registry_proof"),
+                (_pp_proof or {}).get("registry_manifest"),
+            )
+            print(format_registry_parity_line(_pp_reg_full), flush=True)
+        except Exception:
+            if not _QUIET:
+                print("[v2.plan_proof.registry] unavailable", flush=True)
+        print(
+            f"[v2.plan_proof] parity proof_present={int(_pp_parity['snapshot_proof_present'])} "
+            f"proof_complete={int(_pp_parity['snapshot_proof_complete'])} "
+            f"proof_valid={int(_pp_parity['snapshot_proof_valid'])} "
+            f"dep_match={int(_pp_parity['deployment_hash_match'])} "
+            f"gen_match={int(_pp_parity['custom_nodes_generation_match'])} "
+            f"wf_reg_match={int(_pp_parity['workflow_registry_match'])} "
+            f"reg_full_match={int(_pp_parity['registry_fingerprint_match'])} "
+            f"dep_proof_match={int(_pp_parity['dependency_proof_match'])} "
+            f"eligible={int(_pp_parity['future_fast_path_eligible'])} "
+            f"reason={_pp_parity['future_fast_path_ineligible_reason'] or 'ok'} "
+            f"consumed=False",
+            flush=True,
+        )
+        _pp_parity_trace_meta = dict(_pp_parity)
+        _pp_parity_trace_meta["workflow_registry_match"] = bool(_pp_parity.get("workflow_registry_match", False))
+        _pp_parity_trace_meta["registry_fingerprint_match"] = bool(_pp_parity.get("registry_fingerprint_match", False))
+        _pp_parity_trace_meta["registry_parity_reason"] = str(_pp_parity.get("registry_parity_reason", "") or "")[:120]
+        trace.emit("plan_snapshot_parity", phase="setup", metadata=_pp_parity_trace_meta)
+        # ── Step-3 plan-proof trust gate (decision recorded, applied below) ──
+        _plan_proof_consumed = False
+        _plan_proof_reason = ""
+        _plan_proof_outputs: list[str] = []
+        _plan_proof_node_errors: dict = {}
+        _pp_validation = plan.validation if isinstance(plan.validation, Mapping) else {}
+        _pp_schema_ok = bool(_pp_validation.get("schema_version") == VALIDATION_PROOF_SCHEMA_VERSION)
+        _pp_validated_ok = bool(_pp_validation.get("validated", False))
+        _pp_vh_match = bool(
+            _pp_validation.get("validated_workflow_hash")
+            and _pp_validation.get("validated_workflow_hash") == plan.workflow_hash
+        )
+        _pp_outputs_raw = list(_pp_validation.get("outputs_to_execute", []) or [])
+        _pp_outputs_nonempty = bool(_pp_outputs_raw)
+        _pp_structure_ok = False
+        try:
+            _pp_structure_fn = getattr(self._legacy_module, "assert_valid_api_prompt_structure", None)
+            if callable(_pp_structure_fn):
+                _pp_structure_fn(workflow)
+                _pp_structure_ok = True
+        except Exception:
+            _pp_structure_ok = False
+        _pp_gate = evaluate_plan_validation_consumption(
+            _pp_parity, _pp_validation,
+            workflow_hash_match=_pp_hash_match,
+            validation_hash_match=_pp_vh_match,
+            structure_ok=_pp_structure_ok,
+            outputs_nonempty=_pp_outputs_nonempty,
+        )
+        _pp_eligible = bool(_pp_gate["eligible"])
         _res4lyf_reported = int(plan.production_report.get("res4lyf_options_injected_count", 0) or 0)
         _res4lyf_injected_ids = [
             str(node_id)
@@ -10450,6 +16563,24 @@ class ModalRuntimeEntrypoint:
         outputs_to_execute: list[str] = []
         node_errors: dict[str, Any] = {}
 
+        # ── Step-3 plan-proof trust gate: apply on exact eligibility ──
+        # Skip certificate lookup/Volume RPC, deployment-static preflight,
+        # remote execution.validate_prompt, and certificate writeback.  The
+        # complete legacy path remains the fallback (gate ineligible -> the
+        # existing branches below run unchanged).  Gate 2 / missing-node
+        # repair still run and clear the consumed proof if repair changes
+        # node availability.
+        if _pp_eligible:
+            _plan_proof_consumed = True
+            _v2_cert_preflight_skip = True
+            _v2_cert_hit = True
+            outputs_to_execute = list(_pp_outputs_raw)
+            node_errors = dict(_pp_validation.get("node_errors", {}) or {})
+            trace.emit("certificate_read_outcome", phase="setup", metadata={
+                "cert_source": "plan_validation", "cert_decision": "plan_validation_fast_path",
+                "hit": True, "preflight_skip": True, "consumed": True,
+            })
+
         # Diagnostic timing fields for certificate, preflight, and validation.
         _diag_cert_identity_build_ms: float = 0.0
         _diag_cert_cache_hit: bool = False
@@ -10491,8 +16622,9 @@ class ModalRuntimeEntrypoint:
 
             # Try cert lookup before preflight -- only eligible when the
             # deployment identity, repair mode, and custom-nodes generation
-            # are all complete and recognised.
-            if _V2_VALIDATION_CERT_ENABLED:
+            # are all complete and recognised.  Step-3: the plan-proof fast
+            # path (fully eligible) skips the certificate subsystem entirely.
+            if _V2_VALIDATION_CERT_ENABLED and not _pp_eligible:
                 _cert_wf_hash = plan.workflow_hash or ""
                 if _cert_wf_hash:
                     _v2_dep_hash = _V2_DEPLOYMENT_COMBINED_HASH
@@ -10840,9 +16972,14 @@ class ModalRuntimeEntrypoint:
                 and repair_summary.get("blocked_by_mode")
                 and repair_summary.get("missing_before")
             ):
+                # Custom-node publication is manual: fail closed with guidance;
+                # never auto-publish/sync/repair missing node types here.
                 raise RuntimeError(
-                    "Workflow references missing custom node class(es): "
-                    f"{repair_summary['missing_before']}. Runtime repair is disabled."
+                    "Required ComfyUI custom node type is unavailable in this deployed snapshot.\n"
+                    "\n"
+                    "Custom-node publishing is manual.\n"
+                    "Run the canonical custom-node publisher, then perform a fresh deploy/snapshot if required.\n"
+                    f"Missing: {repair_summary['missing_before']}"
                 )
 
             # Oracle Gate 2: if a cert skip occurred but the repair reports
@@ -10864,6 +17001,12 @@ class ModalRuntimeEntrypoint:
                 _v2_cert_preflight_skip = False
                 outputs_to_execute = []
                 node_errors = {}
+                # Step-3: a missing-node repair invalidates any consumed
+                # plan-proof — the plan-carried validation is stale after node
+                # availability changed (Oracle Gate 2).
+                _plan_proof_consumed, _plan_proof_reason = apply_repair_invalidation(
+                    _plan_proof_consumed, "repair_changed"
+                )
                 _cache_key_inval = (self.container_session_id or _V2_CONTAINER_SESSION_ID, _v2_cert_identity)
                 _V2_CERT_PROCESS_CACHE.pop(_cache_key_inval, None)
                 _bs_gate2 = getattr(getattr(self, "bootstrap", None), "state", None)
@@ -10967,6 +17110,37 @@ class ModalRuntimeEntrypoint:
         if not valid:
             detail = error.get("message", str(error)) if isinstance(error, dict) else str(error)
             raise RuntimeError(f"Workflow validation failed: {detail}")
+        # ── Step-3 plan-proof decision instrumentation ──
+        _plan_proof_decision_reason = _get_plan_proof_decision_reason(
+            _plan_proof_consumed,
+            _plan_proof_reason,
+            _pp_gate["ineligible_reason"],
+        )
+        if _plan_proof_consumed:
+            print(
+                f"[v2.plan_proof] decision=plan_validation_fast_path consumed=1 "
+                f"workflow_hash_match={int(_pp_hash_match)} validation_hash_match={int(_pp_vh_match)} "
+                f"plan_complete={int(_pp_parity['plan_deployment_complete'])} "
+                f"snapshot_complete={int(_pp_parity['snapshot_proof_complete'])} "
+                f"snapshot_valid={int(_pp_parity['snapshot_proof_valid'])} "
+                f"dep_match={int(_pp_parity['deployment_hash_match'])} "
+                f"gen_match={int(_pp_parity['custom_nodes_generation_match'])} "
+                f"wf_reg_match={int(_pp_parity['workflow_registry_match'])} "
+                f"dependency_match={int(_pp_parity['dependency_proof_match'])} "
+                f"repair_changed=0 outputs_nonempty={int(_pp_outputs_nonempty)} "
+                f"eligible=1", flush=True,
+            )
+        else:
+            print(
+                f"[v2.plan_proof] decision=legacy_validation_fallback consumed=0 "
+                f"reason={_plan_proof_decision_reason}",
+                flush=True,
+            )
+        trace.emit("plan_proof_decision", phase="setup", metadata={
+            "consumed": _plan_proof_consumed,
+            "decision": "plan_validation_fast_path" if _plan_proof_consumed else "legacy_validation_fallback",
+            "reason": _plan_proof_decision_reason,
+        })
         trace.emit("pregraph_setup_start", phase="execution", metadata={
             "prompt_id": prompt_id,
         })
@@ -11011,6 +17185,7 @@ class ModalRuntimeEntrypoint:
                         "enabled": True,
                         "prompt_id": prompt_id,
                         "output_format": legacy_options.get("output_format", "original"),
+                        "output_mode": legacy_options.get("output_mode", "original"),
                         "quality": legacy_options.get("quality", 75),
                         "webp_lossless_compression": legacy_options.get(
                             "webp_lossless_compression", "balanced"
@@ -11244,6 +17419,7 @@ class ModalRuntimeEntrypoint:
                                         )
                                         trace.emit("output_encode_end", phase="execution", metadata={
                                             "duration_ms": _enc_dur,
+                                            **_last_png_encode_info_meta(),
                                         })
                                 # First sampler-related node
                                 if ("first_sampler_node" not in _milestones
@@ -11345,7 +17521,8 @@ class ModalRuntimeEntrypoint:
                            metadata={"reason": "send_sync_unavailable"})
 
             # T5: immediately before prompt executor invocation
-            _report_host_memory("peak_execution")
+            if not _QUIET:
+                _report_host_memory("peak_execution")
             _t5_wall_ns = int(time.time() * 1_000_000_000)
             _t5_mono_ns = time.monotonic_ns()
             _t5_perf_ns = time.perf_counter_ns()
@@ -11432,6 +17609,21 @@ class ModalRuntimeEntrypoint:
                     pass
             try:
                 with pre_sampler_instrumentation_scope() as _pre_sampler_state:
+                    # ── Task-1 opt-signature memo identity stash ──
+                    # Stash the plan identity BEFORE execution so the
+                    # executor's memo lookup can correlate this request with
+                    # any persisted prompt-signature memo entries.  Pure
+                    # instrumentation; never raises on the execution path.
+                    try:
+                        _pre_sampler_state["opt_exec_signature_memo_identity"] = {
+                            "workflow_hash": plan.workflow_hash,
+                            "source_workflow_hash": plan.source_workflow_hash,
+                            "deployment_combined_hash": (plan.deployment_identity or {}).get("deployment_combined_hash", ""),
+                            "custom_node_generation": (plan.deployment_identity or {}).get("custom_nodes_generation", ""),
+                            "registry_proof": (plan.deployment_identity or {}).get("registry_proof") or {},
+                        }
+                    except Exception:
+                        pass
                     if callable(execute_async):
                         execute_result = execute_async(**execute_kwargs)
                         if inspect.isawaitable(execute_result):
@@ -11524,6 +17716,22 @@ class ModalRuntimeEntrypoint:
                         "invoke_elapsed_ms": _invoke_elapsed_ms,
                     })
 
+            # ── E29: canonical ledger graph-resume marker ───────────────
+            # The executor.execute() call has returned control (all graph
+            # nodes including the sampler have been dispatched); the serial
+            # ledger can now close the sampling_end -> graph-resume window.
+            try:
+                from .critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "graph_next_node_after_sampler",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={
+                        "request_id": str(context.request_id) or "",
+                    },
+                )
+            except Exception:
+                pass
+
             # â”€â”€ Compute derived milestone intervals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _exec_st_ns = _milestones.get("execution_start") if _milestones else None
             _cached_ns = _milestones.get("execution_cached") if _milestones else None
@@ -11587,6 +17795,116 @@ class ModalRuntimeEntrypoint:
             if _first_sampler_ns is not None and _sampling_start_ns is not None:
                 _sampler_node_to_sampler_start_ms = round((_sampling_start_ns - _first_sampler_ns) / 1_000_000, 3)
                 _pre_sampler_state["sampler_node_to_sampler_start_ms"] = _sampler_node_to_sampler_start_ms
+            # ── Prompt-executor breakdown enrichment (additive) ──
+            # Remote stdout never reaches the benchmark capture, so the same
+            # opt_exec_* sub-spans the stdout breakdown line renders are also
+            # attached to this event's metadata.  Only real (non-None) values
+            # are emitted; missing keys are omitted.  The event name and all
+            # existing metadata keys are unchanged.
+            _breakdown: dict[str, Any] = {}
+            try:
+                _bd_state = _pre_sampler_state if isinstance(_pre_sampler_state, dict) else {}
+                _bd_spec = (
+                    ("dynamic_prompt_ms", "opt_exec_dynamic_prompt_ms"),
+                    ("is_changed_ms", "opt_exec_is_changed_ms"),
+                    ("signature_keys_total_ms", "opt_exec_signature_keys_total_ms"),
+                    ("seed_apply_ms", "opt_exec_seed_apply_ms"),
+                    ("clean_unused_ms", "opt_exec_clean_unused_ms"),
+                    ("cache_gather_ms", "opt_exec_cache_gather_ms"),
+                    ("cleanup_gc_ms", "opt_exec_cleanup_gc_ms"),
+                    ("c2f_topo_walk_ms", "opt_exec_topo_walk_ms"),
+                    ("c2f_topo_input_info_ms", "opt_exec_topo_input_info_ms"),
+                    ("c2f_stage_ms", "opt_exec_stage_ms"),
+                )
+                for _bd_key, _bd_state_key in _bd_spec:
+                    _bd_val = _bd_state.get(_bd_state_key)
+                    if _bd_val is None:
+                        continue
+                    try:
+                        _breakdown[_bd_key] = round(float(_bd_val), 3)
+                    except (TypeError, ValueError):
+                        continue
+                # c2f_topo_other_ms: sub-split residual of the topo walk
+                # (topo_walk − topo_input_info).  Diagnostic decomposition only;
+                # never joins the c2f children reconciliation (which the host
+                # formatter keeps as topo, stage, prefix).
+                _bd_topo = _bd_state.get("opt_exec_topo_walk_ms")
+                _bd_topo_input = _bd_state.get("opt_exec_topo_input_info_ms")
+                if _bd_topo is not None and _bd_topo_input is not None:
+                    try:
+                        _breakdown["c2f_topo_other_ms"] = round(
+                            max(0.0, float(_bd_topo) - float(_bd_topo_input)), 3
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                # c2f_first_node_prefix_ms is the REAL post-staging remainder:
+                # first-executing-node minus the first stage_node_execution
+                # COMPLETION stamp (opt_exec_stage_end_mono_ns, recorded by
+                # runtime_executor).  The old full-window form
+                # (first_executing_node_monotonic_ns − execution_cached) was
+                # the entire cached→first-node parent, double-counting
+                # topo_walk + stage (RUN-1 emitted c2f_residual_ms=-138.269).
+                # Omitted entirely when the stage-end stamp is unavailable.
+                _bd_stage_end_mono = _bd_state.get("opt_exec_stage_end_mono_ns")
+                if _first_exec_node_ns is not None and _bd_stage_end_mono is not None:
+                    try:
+                        _breakdown["c2f_first_node_prefix_ms"] = round(
+                            max(0, int(_first_exec_node_ns) - int(_bd_stage_end_mono))
+                            / 1_000_000,
+                            3,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                # Task-1 opt-signature memo evidence (additive; same source as
+                # the [v2.prompt_executor_breakdown] stdout line).  The
+                # executor patch records these under opt_exec_signature_memo_*;
+                # breakdown-line names are signature_cache_*.  Each field is
+                # emitted only when its state key is present — absent keys are
+                # never fabricated (the host formatter reads this metadata
+                # dict, so the host-visible line now carries the Task-1 fields
+                # whenever the container line does).
+                _bd_sig_spec = (
+                    ("signature_cache_requested", "opt_exec_signature_memo_requested"),
+                    ("signature_cache_eligible", "opt_exec_signature_memo_eligible"),
+                    ("signature_cache_hit", "opt_exec_signature_memo_hit"),
+                    ("signature_cache_source", "opt_exec_signature_memo_source"),
+                    ("signature_cache_key_hash", "opt_exec_signature_memo_key_hash"),
+                    ("signature_cache_fallback", "opt_exec_signature_memo_fallback"),
+                    ("signature_reuse_ms", "opt_exec_signature_reuse_ms"),
+                )
+                for _bd_sig_key, _bd_sig_state_key in _bd_sig_spec:
+                    if _bd_sig_state_key not in _bd_state:
+                        continue
+                    _bd_sig_val = _bd_state.get(_bd_sig_state_key)
+                    if _bd_sig_val is None:
+                        continue
+                    if _bd_sig_key == "signature_reuse_ms":
+                        try:
+                            _breakdown[_bd_sig_key] = round(float(_bd_sig_val), 3)
+                        except (TypeError, ValueError):
+                            continue
+                    else:
+                        # Keep native types (bool/str/int) so the host sees the
+                        # same truthy/string values as the stdout breakdown line.
+                        _breakdown[_bd_sig_key] = _bd_sig_val
+                # Topo-lazy deterministic fast path (cached→first-node fix) —
+                # additive evidence mirroring the [v2.prompt_executor_breakdown]
+                # stdout line (topo_lazy_hits = memoized get_input_info calls,
+                # topo_lazy_pending = persisted entries this request).  Each
+                # field is emitted only when its state key is present.
+                _bd_topo_lazy_spec = (
+                    ("topo_lazy_hits", "opt_exec_topo_lazy_hit_count"),
+                    ("topo_lazy_pending", "opt_exec_topo_lazy_saved_count"),
+                )
+                for _bd_tl_key, _bd_tl_state_key in _bd_topo_lazy_spec:
+                    if _bd_tl_state_key not in _bd_state:
+                        continue
+                    _bd_tl_val = _bd_state.get(_bd_tl_state_key)
+                    if _bd_tl_val is None:
+                        continue
+                    _breakdown[_bd_tl_key] = _bd_tl_val
+            except Exception:
+                _breakdown = {}
             if _milestones:
                 trace.emit("prompt_executor_milestones", phase="execution", metadata={
                     "executor_call_to_execution_start_ms": _exec_st_val,
@@ -11616,7 +17934,34 @@ class ModalRuntimeEntrypoint:
                     "first_clip_encode_node_monotonic_ns": _first_clip_ns,
                     "first_sampler_node_monotonic_ns": _first_sampler_ns,
                     "sampling_start_monotonic_ns": _sampling_start_ns,
+                    # Additive breakdown: opt_exec_* sub-spans from the
+                    # per-request instrumentation state (only real values).
+                    "breakdown": _breakdown,
                 })
+
+            # ── Bounded instrumentation: prompt-executor breakdown ─────────
+            # One stdout-only line decomposing execution_start→cached and
+            # cached→first-node into the captured opt_exec_* sub-spans.
+            # No trace event is emitted here (trace-whitelist unchanged);
+            # values missing from state render "absent" and residuals
+            # reconcile exactly as parent − sum(children).  Bounded: never
+            # raises and adds no new whitelisted trace events.
+            try:
+                from comfymodal_runtime.runtime_executor import (
+                    build_prompt_executor_breakdown_line,
+                )
+                print(
+                    build_prompt_executor_breakdown_line(
+                        request_id=str(context.request_id),
+                        exec_to_cached_ms=_exec_to_cache,
+                        cached_to_first_node_ms=_cache_to_node,
+                        state=_pre_sampler_state,
+                        executing_mono_ns=_first_ns,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
 
             # â”€â”€ Classify sampler stage from authoritative sampler evidence â”€â”€
             _sampler_stage_status: str = "awaiting_classification"
@@ -11633,6 +17978,10 @@ class ModalRuntimeEntrypoint:
             _cert_ms = self._interval_from_trace(trace, "certificate_reload_start", "certificate_reload_end")
             _preflight_ms = self._interval_from_trace(trace, "preflight_start", "preflight_end")
             _validation_ms = self._interval_from_trace(trace, "prompt_validation_start", "prompt_validation_end")
+            # Step-3: on the plan-proof fast path there are no certificate /
+            # preflight / validation intervals — report 0.0 rather than None.
+            if _plan_proof_consumed:
+                _cert_ms = _preflight_ms = _validation_ms = 0.0
             _pregraph_ms = self._interval_from_trace(trace, "pregraph_setup_start", "pregraph_setup_end")
             _exec_reset_ms = self._interval_from_trace(trace, "executor_reset_start", "executor_reset_end")
             _sampler_lane_ms = self._interval_from_trace(trace, "sampler_lane_wait_start", "sampler_lane_wait_end")
@@ -11889,11 +18238,21 @@ class ModalRuntimeEntrypoint:
                 phase="execution",
                 metadata={"elapsed_ms": round((time.time() - started) * 1000.0, 3)},
             )
-            if context.cancelled and context.cancelled():
-                raise RuntimeError("execution cancelled after PromptExecutor completion")
-            if getattr(executor, "success", True) is False:
+            # Completion-first post-executor gate: a SUCCESSFUL PromptExecutor
+            # completion always wins over a late watcher cancel (a cancel
+            # message arriving after completion must never discard the produced
+            # outputs).  Only a non-successful execution may be reclassified as
+            # cancelled by a confirmed remote cancel.
+            _executor_success = getattr(executor, "success", True) is not False
+            _post_executor_cancel_msg = resolve_post_executor_cancel(
+                context.cancelled, _executor_success,
+            )
+            if _post_executor_cancel_msg is not None:
+                raise RuntimeError(_post_executor_cancel_msg)
+            if not _executor_success:
                 raise RuntimeError(self._executor_error_message(executor))
 
+            _stage13_output_collect_start_mono_ns = time.monotonic_ns()
             trace.emit("output_collect_start", phase="output")
             registry = pop_outputs(prompt_id) if production_enabled and callable(pop_outputs) else {}
             if not isinstance(registry, Mapping):
@@ -11943,8 +18302,20 @@ class ModalRuntimeEntrypoint:
                 if production_enabled:
                     raise RuntimeError("v2 production execution produced no materializable output")
                 selected = Attempt(strategy="none", success=False, error="no output")
-            output_format = str(legacy_options.get("output_format", "original") or "original")
-            if selected.success and selected.strategy != "direct_output_sink" and output_format != "original":
+            _raw_output_format = legacy_options.get("output_format", "original")
+            output_format = _contracts_mod.normalize_output_format(_raw_output_format)
+            _quality_default = (
+                _contracts_mod.DEFAULT_PREVIEW_QUALITY
+                if str(_raw_output_format or "").strip().lower() == "webp"
+                else _contracts_mod.DEFAULT_OUTPUT_QUALITY
+            )
+            _output_quality = _contracts_mod.normalize_quality(
+                legacy_options.get("quality"), default=_quality_default
+            )
+            _lossless_method = _contracts_mod.normalize_webp_lossless_compression(
+                legacy_options.get("webp_lossless_compression", "balanced")
+            )
+            if _should_run_posthoc_output_conversion(selected, output_format):
                 trace.emit(
                     "output_conversion_start",
                     phase="output",
@@ -11957,10 +18328,8 @@ class ModalRuntimeEntrypoint:
                     converted = convert_output_items(
                         list(selected.items),
                         output_format=output_format,
-                        quality=int(legacy_options.get("quality", 75) or 75),
-                        webp_lossless_compression=str(
-                            legacy_options.get("webp_lossless_compression", "balanced")
-                        ),
+                        quality=_output_quality,
+                        webp_lossless_compression=_lossless_method,
                     )
                 except ConversionFailedError as exc:
                     # The registry path is already encoded by the production
@@ -11993,7 +18362,7 @@ class ModalRuntimeEntrypoint:
                     )
                 if selected_index is not None:
                     attempts[selected_index] = selected
-                _conv_ok = selected.success and selected.strategy != "direct_output_sink" and output_format != "original"
+                _conv_ok = _should_run_posthoc_output_conversion(selected, output_format)
                 trace.emit(
                     "output_conversion_end",
                     phase="output",
@@ -12016,42 +18385,129 @@ class ModalRuntimeEntrypoint:
                 ) if _milestones.get("output_encode_started") else 0.0
                 trace.emit("output_encode_end", phase="execution", metadata={
                     "duration_ms": _enc_dur,
+                    **_last_png_encode_info_meta(),
                 })
             # output_persist_start/end: wraps actual volume persistence + descriptor
             # construction.  Distinguished from output_encode_start/end which wrap
             # the actual image encoding inside the executor (ComfyModalProductionOutput).
+            _stage13_persist_start_mono_ns = time.monotonic_ns()
             trace.emit("output_persist_start", phase="output", metadata={
                 "prompt_id": prompt_id,
                 "strategy": selected.strategy,
                 "items": selected.total_items,
             })
+            # ── E29: close post-VAE graph-tail span ────────────────────
+            # The remaining graph work after VAE decode ends at result
+            # assembly; closes the span opened at the post-VAE-decode
+            # boundary in the loader bridge.  Never raises.
+            try:
+                from comfymodal_runtime.model_preload import _POST_VAE_GRAPH_TAIL
+                _span_graph_tail = _POST_VAE_GRAPH_TAIL.get("span")
+                if _span_graph_tail is not None:
+                    _span_graph_tail.finish(mono_ns=time.monotonic_ns())
+                _POST_VAE_GRAPH_TAIL["span"] = None
+            except Exception:
+                pass
+            # ── E29: canonical ledger result-assembly span ──────────────
+            # Opens at the start of asset persistence/descriptor assembly
+            # and closes at the first_durable_result emission (remote
+            # handler).  Carried on the instance because the close site lives
+            # in a different method (run_plan_stream).
+            self._e29_result_assembly_span = None
+            try:
+                from .critical_path_ledger import begin_span as _ledger_begin_span
+                self._e29_result_assembly_span = _ledger_begin_span(
+                    "result:assembly", lane="EXECUTOR",
+                    start_mono_ns=time.monotonic_ns(),
+                    metadata={"prompt_id": prompt_id},
+                )
+            except Exception:
+                self._e29_result_assembly_span = None
+            # ── E29: canonical ledger result-assembly start ──────────────
+            try:
+                from .critical_path_ledger import record_event as _ledger_event
+                _ledger_event(
+                    "result_assembly_start",
+                    mono_ns=time.monotonic_ns(),
+                    metadata={
+                        "prompt_id": prompt_id,
+                        "strategy": selected.strategy,
+                        "items": selected.total_items,
+                    },
+                )
+            except Exception:
+                pass
             _descriptor_start_mono_ns = time.monotonic_ns()
-            selected, _asset_commit_task, _asset_diag = await self._persist_output_assets(selected)
+            selected, _asset_commit_task, _asset_diag = await self._persist_output_assets_for_policy(
+                selected, _output_durability_policy,
+            )
+            _stage13_asset_write_end_mono_ns = time.monotonic_ns()
             if selected_index is not None:
                 attempts[selected_index] = selected
             if _asset_commit_task is not None:
                 await asyncio.sleep(0)
             with base64_counting_scope(selected):
                 result = attempt_to_descriptor_result(
-                selected,
-                generation=_snapshot_target_fingerprint(),
-                legacy_data=False,
-            )
+                    selected,
+                    generation=_snapshot_target_fingerprint(),
+                    legacy_data=_output_durability_policy.mode == "off",
+                    output_mode=getattr(plan.execution_options, "output_mode", "original"),
+                    variant=getattr(plan.execution_options, "output_mode", "original"),
+                )
             _descriptor_end_mono_ns = time.monotonic_ns()
+            if _output_durability_policy.mode == "off":
+                _result_ready = bool(selected.success and selected.items)
+                _result_byte_count = sum(len(item.raw_bytes) for item in selected.items)
+                _result_shas = [
+                    item.content_sha256 or hashlib.sha256(item.raw_bytes).hexdigest()
+                    for item in selected.items
+                    if item.raw_bytes
+                ]
+                result.update({
+                    "output_durability_mode": "off",
+                    "durability_requested": False,
+                    "result_durable": False,
+                    "result_ready": _result_ready,
+                    "result_ready_evidence": {
+                        "status": "ready" if _result_ready else "not_ready",
+                        "event": "FIRST_RESULT_READY" if _result_ready else "",
+                        "inline_bytes": True,
+                        "byte_count": _result_byte_count,
+                        "sha256": _result_shas,
+                    },
+                })
             trace.emit("output_persist_end", phase="output", metadata={
                 "duration_ms": round((_descriptor_end_mono_ns - _descriptor_start_mono_ns) / 1_000_000, 3),
                 "items": selected.total_items,
                 "hashes": selected.output_hash_count,
                 "serialized_bytes": result.get("output_diagnostics", {}).get("serialized_result_bytes", 0),
+                "output_durability_mode": _output_durability_policy.mode,
+                "persistence_status": _asset_diag.get("persistence_status"),
             })
+            # Variant A: do NOT await the commit here — the result event must
+            # be yielded first.  Stash the commit task + diag per-request; the
+            # generator tail (_finalize_deferred_commit) awaits it and yields
+            # a definitive persistence event.
             if _asset_commit_task is not None:
-                _asset_commit_diag = await _asset_commit_task
-                _asset_diag.update(_asset_commit_diag)
+                self._deferred_commit_task = _asset_commit_task
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = True
+            elif _output_durability_policy.mode == "off":
+                # Off mode has no persistence operation to finalize.  Do not
+                # manufacture a deferred event for a zero-duration commit.
+                self._deferred_commit_task = None
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = False
+            else:
+                self._deferred_commit_task = None
+                self._deferred_commit_diag = _asset_diag
+                self._deferred_commit_pending = True
             if not getattr(self, "_v2_first_durable_result_seen", False):
                 self._v2_first_durable_result_seen = True
                 _v2_startup_stage(
-                    "first_durable_result", "ready", phase="request",
-                    metadata={"output_persisted": 1},
+                    "first_result_ready" if _output_durability_policy.mode == "off" else "first_durable_result",
+                    "ready", phase="request",
+                    metadata={"output_persisted": int(_output_durability_policy.mode != "off")},
                 )
             # Compute overlap between commit and descriptor build intervals
             _commit_start = _asset_diag.get("commit_start_mono_ns", 0)
@@ -12060,10 +18516,43 @@ class ModalRuntimeEntrypoint:
                 min(_commit_end, _descriptor_end_mono_ns) -
                 max(_commit_start, _descriptor_start_mono_ns)
             ) if _commit_start and _commit_end else 0
+            _codec_meta = [
+                item.conversion_meta
+                for item in selected.items
+                if item.conversion_meta is not None
+            ]
+            _codec_names = sorted({meta.codec for meta in _codec_meta if meta.codec})
+            _codec_quality = sorted({meta.quality for meta in _codec_meta if meta.quality is not None})
+            _codec_methods = sorted({
+                meta.webp_lossless_compression
+                for meta in _codec_meta
+                if meta.webp_lossless_compression
+            })
             result["output_diagnostics"] = {
-                "output_asset_write_ms": _asset_diag.get("write_ms", 0.0),
-                "output_volume_commit_ms": _asset_diag.get("commit_ms", 0.0),
-                "output_commit_overlap_ms": round(_overlap_ns / 1_000_000, 3),
+                "codec": _codec_names[0] if len(_codec_names) == 1 else _codec_names,
+                "quality": _codec_quality[0] if len(_codec_quality) == 1 else _codec_quality,
+                "webp_lossless_compression": (
+                    _codec_methods[0] if len(_codec_methods) == 1 else _codec_methods
+                ),
+                "output_codec_ms": round(
+                    sum(meta.output_codec_ms for meta in _codec_meta), 3
+                ),
+                "encoded_bytes": sum(meta.encoded_bytes for meta in _codec_meta),
+                "source_bytes": sum(meta.source_bytes for meta in _codec_meta),
+                "conversion_fallback": any(
+                    meta.conversion_fallback for meta in _codec_meta
+                ),
+                "output_asset_write_ms": _asset_diag.get("write_ms"),
+                "output_volume_commit_ms": _asset_diag.get("commit_ms"),
+                "output_commit_overlap_ms": (
+                    None if _output_durability_policy.mode == "off"
+                    else round(_overlap_ns / 1_000_000, 3)
+                ),
+                "commit_status": _asset_diag.get(
+                    "commit_status",
+                    "pending" if _asset_commit_task is not None else "skipped",
+                ),
+                "persistence_status": _asset_diag.get("persistence_status"),
                 "output_hash_count": selected.output_hash_count,
                 "base64_encode_count": selected.base64_encode_count,
                 "base64_decode_count": selected.base64_decode_count,
@@ -12076,6 +18565,7 @@ class ModalRuntimeEntrypoint:
                     "total_items": attempt.total_items,
                     "total_raw_bytes": attempt.total_raw_bytes,
                     "total_base64_bytes": attempt.total_base64_bytes,
+                    "total_conversion_time_ms": attempt.total_conversion_time_ms,
                     "error": attempt.error,
                     "metrics": dict(attempt.metrics),
                 }
@@ -12102,6 +18592,7 @@ class ModalRuntimeEntrypoint:
                 f"base64_encode={result['output_diagnostics']['base64_encode_count']} "
                 f"base64_decode={result['output_diagnostics']['base64_decode_count']} "
                 f"commit_ms={result['output_diagnostics']['output_volume_commit_ms']} "
+                f"commit_status={result['output_diagnostics'].get('commit_status', 'none')} "
                 f"overlap_ms={result['output_diagnostics']['output_commit_overlap_ms']} "
                 f"serialized_bytes={result['output_diagnostics']['serialized_result_bytes']}",
                 flush=True,
@@ -12153,7 +18644,7 @@ class ModalRuntimeEntrypoint:
             # Schema v2 certs include preflight_ok=True to attest that
             # deterministic preflight completed successfully for this identity.
             # Only write when preflight actually ran (not on cert skip).
-            if _v2_schedule_cert_write and _v2_preflight_ran:
+            if should_write_validation_cert(_v2_schedule_cert_write, _v2_preflight_ran):
                 _cert_write_ok = await _write_v2_validation_certificate(
                     _v2_cert_identity,
                     outputs_to_execute,
@@ -12276,6 +18767,17 @@ class ModalRuntimeEntrypoint:
                 if isinstance(result["trace"], dict):
                     result["trace"]["activation_diagnosis"] = _ad
 
+            # ── Stage-13 decomposition boundaries (diagnostics; additive) ──
+            # Raw same-process monotonic stamps consumed by
+            # _run_plan_stream_impl to build output_stage13_breakdown.
+            # _descriptor_end_mono_ns was captured at the persist block above.
+            result["_stage13_boundaries"] = {
+                "output_collect_start_mono_ns": _stage13_output_collect_start_mono_ns,
+                "persist_start_mono_ns": _stage13_persist_start_mono_ns,
+                "asset_write_end_mono_ns": _stage13_asset_write_end_mono_ns,
+                "descriptor_end_mono_ns": _descriptor_end_mono_ns,
+                "exec_result_ready_mono_ns": time.monotonic_ns(),
+            }
             return result
         finally:
             if _seed_hook_restore is not None:
@@ -12505,6 +19007,18 @@ class ModalRuntimeEntrypoint:
                     f"fallback_reason=apply_error:{type(_seed_apply_exc).__name__}",
                     flush=True,
                 )
+            # ── Prompt-executor breakdown: capture seed-apply total into the
+            # per-request instrumentation state so the exec→cached window
+            # decomposition can include it.  Measurement-only; no-op when no
+            # instrumentation scope is active or total_ms is unavailable.
+            try:
+                from comfymodal_runtime.runtime_executor import _inst_state as _peb_inst_state
+                _peb_state = _peb_inst_state()
+                _peb_total = _seed_apply.get("total_ms")
+                if _peb_state is not None and _peb_total is not None:
+                    _peb_state["opt_exec_seed_apply_ms"] = float(_peb_total)
+            except Exception:
+                pass
             trace.emit(
                 "executor_seed_apply_end",
                 phase="execution",
@@ -12553,6 +19067,28 @@ class ModalRuntimeEntrypoint:
                 images.append(entry)
         return {"images": images, "videos": videos, "outputs": outputs}
 
+    async def _persist_output_assets_for_policy(
+        self,
+        attempt: Attempt,
+        policy: Any,
+    ) -> tuple[Attempt, asyncio.Task[Any] | None, dict[str, Any]]:
+        """Persist generated output only for an explicit strict request."""
+        if getattr(policy, "mode", "off") == "off":
+            return attempt, None, {
+                "write_ms": None,
+                "write_end_mono_ns": 0,
+                "commit_start_mono_ns": 0,
+                "commit_end_mono_ns": 0,
+                "commit_ms": None,
+                "overlap_ms": None,
+                "files_written": 0,
+                "thumbnail_files_written": 0,
+                "commit_error": "",
+                "commit_status": "NOT RUN",
+                "persistence_status": "NOT RUN",
+            }
+        return await self._persist_output_assets(attempt)
+
     async def _persist_output_assets(
         self,
         attempt: Attempt,
@@ -12561,6 +19097,7 @@ class ModalRuntimeEntrypoint:
         root.mkdir(parents=True, exist_ok=True)
         persisted = []
         wrote = False
+        thumb_wrote = False
         write_start = time.monotonic()
         for item in attempt.items:
             raw = item.raw_bytes
@@ -12592,6 +19129,44 @@ class ModalRuntimeEntrypoint:
                         temp.unlink(missing_ok=True)
                     except OSError:
                         pass
+            # ── E2C: persist the producer-side Thumbnail derivative from the
+            # already-local encoded bytes (content-addressed).  A Thumbnail
+            # write failure is graceful and never invalidates the required
+            # primary output.
+            if item.thumbnail_bytes:
+                try:
+                    thumb_digest = hashlib.sha256(item.thumbnail_bytes).hexdigest()
+                    thumb_ext = (
+                        item.thumbnail_file_ext
+                        if item.thumbnail_file_ext in {".webp", ".png", ".jpg", ".jpeg"}
+                        else ".webp"
+                    )
+                    thumb_relative = f"output_assets/{thumb_digest}{thumb_ext}"
+                    thumb_target = Path(RUNTIME_STATE_PATH, thumb_relative)
+                    if not thumb_target.exists():
+                        thumb_temp = thumb_target.with_name(
+                            f".{thumb_target.name}.{uuid.uuid4().hex}.tmp"
+                        )
+                        try:
+                            thumb_temp.write_bytes(item.thumbnail_bytes)
+                            os.replace(thumb_temp, thumb_target)
+                            thumb_wrote = True
+                            if hasattr(self, "_teardown_diagnostics"):
+                                self._teardown_diagnostics.record_file_write(
+                                    thumb_target, volume=RUNTIME_STATE_PATH,
+                                )
+                        finally:
+                            try:
+                                thumb_temp.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                    item = dataclasses.replace(item, thumbnail_path=thumb_relative)
+                except Exception as exc:
+                    print(
+                        f"[output_delivery] thumbnail persistence failed "
+                        f"(non-fatal): {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
             persisted.append(dataclasses.replace(item, path=relative_path))
         write_end_ns = time.monotonic_ns()
         diag: dict[str, Any] = {
@@ -12602,9 +19177,10 @@ class ModalRuntimeEntrypoint:
             "commit_ms": 0.0,
             "overlap_ms": 0.0,
             "files_written": int(wrote),
+            "thumbnail_files_written": int(thumb_wrote),
             "commit_error": "",
         }
-        if not wrote:
+        if not wrote and not thumb_wrote:
             return dataclasses.replace(attempt, items=tuple(persisted)), None, diag
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
         commit = getattr(volume, "commit", None)
@@ -12645,6 +19221,144 @@ class ModalRuntimeEntrypoint:
 
         commit_task = asyncio.create_task(commit_volume())
         return dataclasses.replace(attempt, items=tuple(persisted)), commit_task, diag
+
+    async def _finalize_deferred_commit(self, *, request_id: str = "") -> dict | None:
+        """Variant A finalizer: await the stashed asset commit AFTER the result
+        event was already yielded, then emit the definitive persistence event.
+
+        Idempotent (consumes the stash on first call) and MUST never raise —
+        a failure here must not mask the terminal result or an in-flight
+        exception.  Returns a ``{"type": "persistence", ...}`` event for the
+        local drain, or ``None`` when nothing was pending (already finalized).
+        """
+        if not getattr(self, "_deferred_commit_pending", False):
+            return None
+        task = getattr(self, "_deferred_commit_task", None)
+        self._deferred_commit_task = None
+        self._deferred_commit_pending = False
+        _diag_holder = getattr(self, "_deferred_commit_diag", None)
+        _td = getattr(self, "_teardown_diagnostics", None)
+        _dc_trace = getattr(self, "_lifecycle_trace", None)
+        # Internal deferred-commit trace events are carried separately (never
+        # on the public persistence event dict) to keep the user-visible event
+        # shape stable; the yield site reads this stash for the trace merge.
+        self._deferred_commit_trace_events: list[dict] = []
+
+        def _dc_trace_event(name: str, *, wall_ns: int, mono_ns: int,
+                            status: str, commit_ms: float, detail: str) -> dict:
+            """Build one waterfall-visible trace event (deferred_commit_*).
+
+            Emitted onto the live lifecycle trace when available so the event
+            also lands in the next trace merge, and always returned as a plain
+            serializable dict for post-hoc attachment to the already-yielded
+            result trace (the v2_waterfall ``output_deferred_commit`` row reads
+            result["trace"]["events"] by these names).
+            """
+            _meta = {
+                "status": status,
+                "commit_ms": commit_ms,
+                "detail": detail,
+                "request_id": request_id,
+            }
+            if _dc_trace is not None:
+                _evt = _dc_trace.emit_at(
+                    name,
+                    process="remote",
+                    phase="output",
+                    wall_unix_ns=wall_ns,
+                    monotonic_ns=mono_ns,
+                    metadata=_meta,
+                )
+                return _evt.to_dict()
+            return {
+                "name": name,
+                "process": "remote",
+                "phase": "output",
+                "wall_unix_ns": wall_ns,
+                "monotonic_ns": mono_ns,
+                "request_id": request_id,
+                "metadata": _meta,
+            }
+
+        _dc_trace_events: list[dict] = []
+        if task is None:
+            # Cache-hit / no commit needed: nothing to await, definitive event.
+            if _td is not None:
+                _td.emit(
+                    "deferred_commit_end",
+                    status="ok",
+                    commit_ms=0.0,
+                    detail="no commit needed",
+                    request_id=request_id,
+                )
+            _dc_skip_wall_ns = time.time_ns()
+            _dc_skip_mono_ns = time.monotonic_ns()
+            _dc_trace_events.append(_dc_trace_event(
+                "deferred_commit_start",
+                wall_ns=_dc_skip_wall_ns, mono_ns=_dc_skip_mono_ns,
+                status="ok", commit_ms=0.0, detail="no commit needed",
+            ))
+            _dc_trace_events.append(_dc_trace_event(
+                "deferred_commit_end",
+                wall_ns=_dc_skip_wall_ns, mono_ns=_dc_skip_mono_ns,
+                status="ok", commit_ms=0.0, detail="no commit needed",
+            ))
+            self._deferred_commit_trace_events = list(_dc_trace_events)
+            return {
+                "type": "persistence",
+                "status": "ok",
+                "commit_ms": 0.0,
+                "detail": "no commit needed",
+                "skipped": True,
+            }
+        if _td is not None:
+            _td.emit("deferred_commit_start", request_id=request_id)
+        _dc_start_wall_ns = time.time_ns()
+        _dc_start_mono_ns = time.monotonic_ns()
+        status = "ok"
+        commit_ms = 0.0
+        detail = ""
+        try:
+            _diag = await task
+            commit_ms = float((_diag or {}).get("commit_ms", 0.0) or 0.0)
+            if isinstance(_diag_holder, dict) and isinstance(_diag, dict):
+                _diag_holder.update(_diag)
+        except asyncio.CancelledError as exc:
+            status = "failed"
+            detail = str(exc)[:200]
+            print(f"[output_delivery] deferred commit failed: {detail}", flush=True)
+        except Exception as exc:
+            status = "failed"
+            detail = str(exc)[:200]
+            print(f"[output_delivery] deferred commit failed: {detail}", flush=True)
+        _dc_end_wall_ns = time.time_ns()
+        _dc_end_mono_ns = time.monotonic_ns()
+        if _td is not None:
+            _td.emit(
+                "deferred_commit_end",
+                status=status,
+                commit_ms=commit_ms,
+                detail=detail,
+                request_id=request_id,
+            )
+        _dc_trace_events.append(_dc_trace_event(
+            "deferred_commit_start",
+            wall_ns=_dc_start_wall_ns, mono_ns=_dc_start_mono_ns,
+            status=status, commit_ms=commit_ms, detail=detail,
+        ))
+        _dc_trace_events.append(_dc_trace_event(
+            "deferred_commit_end",
+            wall_ns=_dc_end_wall_ns, mono_ns=_dc_end_mono_ns,
+            status=status, commit_ms=commit_ms, detail=detail,
+        ))
+        self._deferred_commit_trace_events = list(_dc_trace_events)
+        return {
+            "type": "persistence",
+            "status": status,
+            "commit_ms": commit_ms,
+            "detail": detail,
+            "skipped": False,
+        }
 
     def read_output_asset(self, backend_path: str, expected_sha256: str = "") -> dict[str, Any]:
         volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
@@ -12695,6 +19409,33 @@ class ModalRuntimeEntrypoint:
             self, order=str(order or "original_first"), request_id=str(request_id or ""),
         )
 
+    def run_numa_experiment(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: one NUMA causality cascade on a restored container.
+
+        On a restored single-use container: captures topology (CPU model,
+        affinity, NUMA nodes/distances, GPU PCI bus + GPU NUMA node), the
+        actual NUMA distribution of the restored UNET pages (numa_maps +
+        exact move_pages status), baseline synchronized H2D of those exact
+        restored storages, then — if permitted — physically migrates the
+        same pages to the GPU-local NUMA node (verified, not inferred) and
+        repeats the identical H2D, then migrates to a remote node and
+        repeats again; finally runs fresh node-bound buffers (mbind) with
+        identical H2D as the locality-only control.  Byte equality of the
+        transferred data is proven after all timing.  Never runs graph
+        execution; never mutates the CPU model.  Every failure is captured
+        in the returned record; never raises.
+        """
+        from comfymodal_runtime.numa_experiment import (
+            run_numa_experiment_impl,
+        )
+        return run_numa_experiment_impl(
+            self, request_id=str(request_id or ""),
+        )
+
     def run_env_probe(
         self,
         *,
@@ -12726,7 +19467,12 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_REGION",
             "COMFYMODAL_V2_SNAPSHOT_MANIFEST",
             "COMFYMODAL_V2_LEAN_SNAPSHOT",
+            "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET",
+            "COMFYMODAL_V2_RESOURCE_TELEMETRY",
             "COMFYMODAL_V2_ENV_PROFILE",
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM",
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE",
+            "COMFYMODAL_V2_ATOMIC_PROFILE",
             "COMFYMODAL_V2_UNET_ACTIVATION_MODE",
             "COMFYMODAL_V2_VAE_ACTIVATION_MODE",
             "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE",
@@ -12745,12 +19491,71 @@ class ModalRuntimeEntrypoint:
             "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST",
             "COMFYMODAL_V2_PREFILL_LANES",
             "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET",
+            "COMFYMODAL_V2_UNET_FASTSAFETENSORS",
+            "COMFYMODAL_V2_CLIP_FAST_HYDRATION",
+            "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST",
+            "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA",
+            "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION",
+            "COMFYMODAL_V2_SCOPED_CUDA_READINESS",
+            "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB",
+            "COMFYMODAL_V2_CHECKPOINT_PREWARM_RETIRE_MS",
+            "COMFYMODAL_V2_INPUT_TYPES_WARM",
+            "COMFYMODAL_V2_UNET_FORENSICS",
+            "COMFYMODAL_V2_STAGED_SAFETENSORS",
+            "COMFYMODAL_V2_STAGED_SOURCE_ORDER",
+            "COMFYMODAL_V2_STAGED_PRODUCERS",
+            "COMFYMODAL_V2_STAGED_POOL_MB",
+            "COMFYMODAL_V2_STAGED_BUCKET_MB",
+            "COMFYMODAL_V2_STAGED_CPU_CAST",
+            "COMFYMODAL_V2_STAGED_ASYNC_H2D",
+            "COMFYMODAL_V2_STAGED_CONTIGUOUS_GPU_BUCKETS",
+            "COMFYMODAL_V2_CLIP_STAGED_HYDRATION",
+            "COMFYMODAL_V2_C9QD_EXTRAS",
+            "COMFYMODAL_V2_HIGH_HEADROOM_EMPTY_CACHE_BYPASS",
+            "COMFYMODAL_V2_GANTT_TELEMETRY",
+            "COMFYMODAL_V2_E27_FORENSICS",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES",
+            "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB",
+            "COMFYMODAL_V2_UNET_FASTSAFE_THREADS",
+            "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES",
+            "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB",
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE",
+            "COMFYMODAL_V2_E31_FORENSICS",
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE",
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT",
+            # E29 canonical critical-path ledger gate (baked; deploy-only).
+            "COMFYMODAL_V2_CRITICAL_PATH_LEDGER",
+            # E30 CLIP cold-I/O genuine-QD reader gates (default OFF).
+            "COMFYMODAL_V2_CLIP_QD_READER",
+            "COMFYMODAL_V2_CLIP_QD_QD",
+            "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB",
+            "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY",
+            "COMFYMODAL_V2_CLIP_QD_ARTIFACT",
+            "COMFYMODAL_V2_M2_PRODUCTION_LOADER",
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE",
+            "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE",
         )
         env = {key: os.environ.get(key, "") for key in keys}
         env["MODAL_CLOUD_PROVIDER"] = os.environ.get("MODAL_CLOUD_PROVIDER", "")
         env["MODAL_REGION"] = os.environ.get("MODAL_REGION", "")
         env["MODAL_IMAGE_ID"] = os.environ.get("MODAL_IMAGE_ID", "")
         env["COMFYMODAL_V2_APP_NAME"] = os.environ.get("COMFYMODAL_V2_APP_NAME", "")
+        # Capability read: does the deployed code carry the fastsafetensors
+        # loader gate AND is it enabled?  Proves both env delivery and that
+        # the branch exists in the deployed source.
+        try:
+            from comfymodal_runtime.model_preload import _fs_flag_value, _fs_pipeline_enabled
+            env["_comfymodal_fs_flag_value"] = str(_fs_flag_value())
+            env["_comfymodal_fs_pipeline_enabled"] = "1" if _fs_pipeline_enabled() else "0"
+        except Exception as _exc_fs_probe:
+            env["_comfymodal_fs_capability_error"] = (
+                f"{type(_exc_fs_probe).__name__}: {str(_exc_fs_probe)[:120]}")
         result: dict[str, Any] = {
             "status": "ok",
             "request_id": str(request_id or ""),
@@ -12773,21 +19578,180 @@ class ModalRuntimeEntrypoint:
             pass
         return result
 
+    def source_identity_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY no-generation method: prove EXACTLY which Python source
+        bytes this deployed class imports.
+
+        Read-only: no model init, no PromptExecutor, no sampling/decoding, no
+        image generation, no flag mutation.  Computes SHA-256 of the actual
+        bytes at each module's ``__file__`` (the module the remote process
+        actually imported) and returns structured identity so v2ctl's
+        ``source-probe`` command can compare against EXPECTED_LOCAL hashes.
+
+        This is the E29 source-identity stop-gate: it deterministically
+        answers CASE A (deployment source packaging), CASE B (import path
+        shadowing), CASE C (ledger flag not enabled), or CASE D (all match).
+        Never raises; never touches GPU state.
+        """
+        import hashlib
+        import inspect
+        import sys
+        import time as _time
+
+        modules = (
+            "comfymodal_runtime.modal_app",
+            "comfymodal_runtime.config_authority",
+            "comfymodal_runtime.deployment_spec",
+            "comfymodal_runtime.critical_path_ledger",
+            "comfymodal_runtime.runtime_bootstrap",
+            "comfymodal_runtime.runtime_executor",
+            "comfymodal_runtime.gantt_telemetry",
+            "comfymodal_runtime.model_preload",
+            "comfymodal_runtime.clip_fast_hydration_wiring",
+            "comfymodal_runtime.registry_proof_store",
+            "comfymodal_runtime.golden_serial",
+            "comfymodal_runtime.golden_io_process_v2",
+            "comfymodal_runtime.golden_model_transport",
+            "comfymodal_runtime.golden_qd_transport",
+            "comfymodal_runtime.golden_source_threads",
+            "comfymodal_runtime.output_durability",
+        )
+
+        def _sha256_bytes(path: str) -> str:
+            try:
+                h = hashlib.sha256()
+                with open(path, "rb") as _f:
+                    for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                        h.update(_chunk)
+                return h.hexdigest()
+            except Exception:  # noqa: BLE001
+                return ""
+
+        module_info: dict[str, Any] = {}
+        for mod_name in modules:
+            info: dict[str, Any] = {"name": mod_name}
+            try:
+                mod = sys.modules.get(mod_name) or __import__(mod_name, fromlist=["*"])
+                file_attr = str(getattr(mod, "__file__", "") or "")
+                info["file"] = file_attr
+                info["realpath"] = str(
+                    inspect.getfile(mod) if file_attr else ""
+                ) or file_attr
+                try:
+                    st = __import__("os").stat(info["realpath"])
+                    info["size"] = int(st.st_size)
+                    info["mtime_ns"] = int(st.st_mtime_ns)
+                except Exception:  # noqa: BLE001
+                    info["size"] = -1
+                    info["mtime_ns"] = -1
+                info["sha256"] = (
+                    _sha256_bytes(info["realpath"]) if info["realpath"] else ""
+                )
+                pkg = getattr(mod, "__path__", None)
+                info["package_path"] = (
+                    [str(p) for p in pkg] if pkg is not None else []
+                )
+            except Exception as exc:  # noqa: BLE001
+                info["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            module_info[mod_name] = info
+
+        ledger_state: dict[str, Any] = {"flag": "", "enabled": None, "record_event": False}
+        try:
+            from . import critical_path_ledger as _cpl
+
+            ledger_state["flag"] = str(getattr(_cpl, "_LEDGER_FLAG", ""))
+            ledger_state["enabled"] = bool(getattr(_cpl, "_ENABLED", None))
+            ledger_state["record_event"] = callable(getattr(_cpl, "record_event", None))
+        except Exception as exc:  # noqa: BLE001
+            ledger_state["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        identity: dict[str, Any] = {}
+        try:
+            from comfymodal_runtime import modal_app as _mod
+
+            identity["deployment_combined_hash"] = str(
+                getattr(_mod, "_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        identity["app_name"] = os.environ.get("COMFYMODAL_V2_APP_NAME", "")
+        identity["class_name"] = type(self).__name__
+        identity["probe_name"] = "source_identity_probe"
+        identity["image_id"] = os.environ.get("MODAL_IMAGE_ID", "")
+        identity["container_session_id"] = str(
+            getattr(self, "container_session_id", "") or ""
+        )
+        identity["pid"] = int(__import__("os").getpid())
+
+        py: dict[str, Any] = {
+            "executable": str(sys.executable),
+            "version": sys.version,
+            "cwd": __import__("os").getcwd(),
+            "sys_path": [str(p) for p in sys.path],
+        }
+
+        safe_env_keys = (
+            "COMFYMODAL_V2_APP_NAME",
+            "COMFYMODAL_V2_CLASS_NAME",
+            "COMFYMODAL_V2_CRITICAL_PATH_LEDGER",
+            "COMFYMODAL_V2_FULL_TRACE",
+            "COMFYMODAL_V2_BENCHMARK_MODE",
+            "COMFYMODAL_V2_DEPLOYMENT_COMBINED_HASH",
+        )
+        safe_env = {k: os.environ.get(k, "") for k in safe_env_keys}
+
+        pkg_info: dict[str, Any] = {}
+        try:
+            from comfymodal_runtime import modal_app as _mod  # noqa: F811
+
+            pkg_info["comfymodal_runtime_file"] = str(getattr(_mod, "__file__", "") or "")
+            pkg_info["comfymodal_runtime_path"] = [str(p) for p in _mod.__path__]
+        except Exception as exc:  # noqa: BLE001
+            pkg_info["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        try:
+            _probe_diagnostics = _source_probe_diagnostics(self)
+        except Exception as exc:  # noqa: BLE001
+            _probe_diagnostics = {
+                "status": "unknown",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+
+        return {
+            "status": "ok",
+            "request_id": str(request_id or ""),
+            "identity": identity,
+            "python": py,
+            "modules": module_info,
+            "ledger": ledger_state,
+            "safe_env": safe_env,
+            "diagnostics": _probe_diagnostics,
+            "package": pkg_info,
+            "probe_taken_at": int(_time.time()),
+        }
+
     def run_entry_probe(
         self,
         *,
         request_id: str = "",
     ) -> dict[str, Any]:
         """SHADOW-ONLY method: timestamp the literal first Python line.
-
-        Returns immediately.  This isolates ``submission → Python resume``
-        (the pre-Python scheduling stage) without any graph execution or
         model work, so an A/B can compare two snapshot compositions using
         the exact same boundary as the historical metric.  The first
         executable line of this method is the first Python code the
         restored process runs for the request; the wall timestamp is
         returned so the local runner can compute the delta against its own
-        submission wall clock.  Never raises.
+        submission wall clock.  Also returns the literal-first-line wall
+        timestamp of ``restore()`` (``remote_python_resume_wall_unix_ns``
+        captured by the restore lifecycle into ``_LATEST_LIFECYCLE_TIMING``)
+        so the runner can measure the historical boundary
+        (submission → restore() first line) exactly.  On a warm container
+        without a fresh restore the value may be stale — warm requests are
+        not valid probes.  Never raises.
         """
         entry_wall_ns: int = time.time_ns()
         entry_mono_ns: int = time.monotonic_ns()
@@ -12816,6 +19780,895 @@ class ModalRuntimeEntrypoint:
         except Exception:
             pass
         return result
+
+    def run_volume_read_benchmark(
+        self,
+        *,
+        request_id: str = "",
+        filename: str = _VOLUME_READ_DEFAULT_FILENAME,
+        chunk_bytes: int = _VOLUME_READ_CHUNK_BYTES,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY method: raw mounted-models-Volume sequential-read speed.
+
+        Reads the target model file twice in this container with plain
+        buffered ``os.open``/``os.read`` (8 MiB chunks) until EOF, discarding
+        every buffer.  The first pass is the primary mounted-volume result;
+        the immediate second pass is the warm-cache ceiling.  Only the read
+        loops are timed (``time.monotonic_ns``).  No graph execution, no
+        UNET/model parsing or loading, no mmap/AimDO, no O_DIRECT, no
+        posix_fadvise, no hashing, no GPU work, no /tmp writes.
+
+        The path is resolved strictly under the mounted models root
+        (``diffusion_models/<filename>``); traversal, missing and non-regular
+        files are rejected.  Never raises — errors are recorded in the result.
+        """
+        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._request_count = getattr(self, "_request_count", 0) + 1
+        identity = {
+            "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+            "restore_count": int(getattr(self, "_restore_count", 0) or 0),
+            "request_count": int(getattr(self, "_request_count", 0) or 0),
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "app_name": APP_NAME,
+            "class_name": CLASS_NAME,
+            **_capture_remote_identity(),
+        }
+        result: dict[str, Any] = {
+            "status": "ok",
+            "mode": "volume_read",
+            "request_id": str(request_id or ""),
+            "graph_executed": False,
+            "model_loaded": False,
+            "gpu_touched": False,
+            "read_method": "os.read",
+            "destination": "discarded_userspace_buffer",
+            "start_ts": start_iso,
+            "identity": identity,
+            "passes": [],
+        }
+        try:
+            path = _volume_read_resolve_path(
+                str(filename or _VOLUME_READ_DEFAULT_FILENAME)
+            )
+            size_bytes = _volume_read_stat_size(path)
+            result["models_root"] = MODELS_PATH
+            result["models_volume"] = MODELS_VOLUME_NAME
+            result["folder"] = _VOLUME_READ_DEFAULT_FOLDER
+            result["filename"] = str(filename or _VOLUME_READ_DEFAULT_FILENAME)
+            result["resolved_path"] = path
+            result["stat_size_bytes"] = size_bytes
+            result["chunk_bytes"] = int(chunk_bytes)
+
+            rusage_before = _volume_read_rusage_snapshot()
+            io_before = _volume_read_io_snapshot()
+            for pass_index, label in enumerate(("primary_mounted_volume", "warm_cache")):
+                start_wall_ns = time.time_ns()
+                start_mono_ns = time.monotonic_ns()
+                fd = os.open(
+                    path,
+                    os.O_RDONLY | getattr(os, "O_BINARY", 0),
+                )
+                try:
+                    bytes_read = 0
+                    chunk_count = 0
+                    while True:
+                        buf = os.read(fd, int(chunk_bytes))
+                        if not buf:
+                            break
+                        bytes_read += len(buf)
+                        chunk_count += 1
+                finally:
+                    os.close(fd)
+                end_mono_ns = time.monotonic_ns()
+                end_wall_ns = time.time_ns()
+                wall_ns = end_mono_ns - start_mono_ns
+                decimal_GBps, binary_GiBps = _volume_read_rates(bytes_read, wall_ns)
+                result["passes"].append({
+                    "pass_index": pass_index,
+                    "label": label,
+                    "stat_size_bytes": size_bytes,
+                    "bytes_read": bytes_read,
+                    "chunk_count": chunk_count,
+                    "wall_ns": wall_ns,
+                    "wall_ms": round(wall_ns / 1_000_000.0, 3),
+                    "decimal_GBps": decimal_GBps,
+                    "binary_GiBps": binary_GiBps,
+                    "start_wall_unix_ns": start_wall_ns,
+                    "end_wall_unix_ns": end_wall_ns,
+                    "start_mono_ns": start_mono_ns,
+                    "end_mono_ns": end_mono_ns,
+                })
+            rusage_after = _volume_read_rusage_snapshot()
+            io_after = _volume_read_io_snapshot()
+            result["rusage_deltas"] = _volume_read_delta_snapshot(
+                rusage_before, rusage_after
+            )
+            result["io_deltas"] = _volume_read_delta_snapshot(io_before, io_after)
+            result["end_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        except Exception as exc:  # noqa: BLE001
+            result["status"] = "error"
+            result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            result["end_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return result
+
+    @(_modal.method() if _modal is not None else (lambda f: f))
+    def get_deployment_identity_static(self) -> dict[str, Any]:
+        """O(1) static deployment identity readback used by the deploy-time
+        identity record tool.  Never touches GPU state; runs after container
+        enter."""
+        try:
+            from comfymodal_runtime import modal_app as _mod
+
+            _deployment_combined_hash = str(
+                getattr(_mod, "_V2_DEPLOYMENT_COMBINED_HASH", "") or ""
+            )
+            custom_nodes_generation = ""
+            overall_dependency_hash = ""
+            _legacy = getattr(self, "_legacy_module", None)
+            if _legacy is not None:
+                try:
+                    _mft = _legacy.load_baked_custom_node_dependency_manifest() or {}
+                    custom_nodes_generation = str(
+                        _mft.get("production_custom_node_generation", "") or ""
+                    )
+                    overall_dependency_hash = str(
+                        _mft.get("overall_dependency_hash", "") or ""
+                    )
+                except Exception:  # noqa: BLE001
+                    custom_nodes_generation = ""
+                    overall_dependency_hash = ""
+            comfyui_version = ""
+            try:
+                import comfyui_version as _cv  # noqa: PLC0415
+                comfyui_version = str(getattr(_cv, "__version__", "") or "")
+            except Exception:  # noqa: BLE001
+                comfyui_version = ""
+            if not comfyui_version:
+                try:
+                    import comfy as _comfy  # noqa: PLC0415
+                    comfyui_version = str(getattr(_comfy, "__version__", "") or "")
+                except Exception:  # noqa: BLE001
+                    comfyui_version = ""
+            registry_manifest: dict[str, Any] = {}
+            registry_manifest_error = ""
+            registry_manifest_root_count = 0
+            try:
+                from comfymodal_runtime.registry_proof import (  # noqa: PLC0415
+                    build_registry_manifest,
+                )
+                _manifest_roots = _registry_manifest_roots()
+                registry_manifest_root_count = len(_manifest_roots or [])
+                registry_manifest = build_registry_manifest(
+                    roots=_manifest_roots,
+                ) or {}
+            except Exception as exc:  # noqa: BLE001
+                registry_manifest = {}
+                registry_manifest_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            _manifest_fields = _registry_manifest_publication_fields(
+                registry_manifest,
+                error=registry_manifest_error,
+                root_count=registry_manifest_root_count,
+            )
+            registry_manifest = _manifest_fields["registry_manifest"]
+            registry_manifest_error = _manifest_fields["registry_manifest_error"]
+            registry_manifest_root_count = _manifest_fields["registry_manifest_root_count"]
+            # Diagnostics: container ComfyUI git commit and LF-normalized
+            # core-module content hashes (host tool compares these).
+            _diag_cfr = _resolve_comfyui_root()
+            _diag_commit = _git_rev_parse_head(_diag_cfr) if _diag_cfr else ""
+            _diag_core_sha: dict[str, str] = {}
+            for _name in ("nodes.py", "execution.py"):
+                _diag_core_sha[_name] = (
+                    _file_sha256_lf(os.path.join(_diag_cfr, _name)) if _diag_cfr else ""
+                )
+            return {
+                "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+                "deployment_combined_hash": _deployment_combined_hash,
+                "custom_nodes_generation": custom_nodes_generation,
+                "overall_dependency_hash": overall_dependency_hash,
+                "comfyui_version": comfyui_version,
+                "registry_manifest": registry_manifest,
+                "registry_manifest_error": registry_manifest_error,
+                "registry_manifest_root_count": registry_manifest_root_count,
+                "registry_manifest_class_count": _manifest_fields[
+                    "registry_manifest_class_count"
+                ],
+                "comfyui_commit": _diag_commit,
+                "core_module_sha256s": _diag_core_sha,
+                "atomic_profile": os.environ.get(
+                    "COMFYMODAL_V2_ATOMIC_PROFILE", ""
+                ),
+                "source": "container_readback",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "deployment_hash_namespace": DEPLOYMENT_HASH_NAMESPACE,
+                "deployment_combined_hash": "",
+                "custom_nodes_generation": "",
+                "overall_dependency_hash": "",
+                "comfyui_version": "",
+                "registry_manifest": {},
+                "registry_manifest_error": "",
+                "registry_manifest_root_count": 0,
+                "registry_manifest_class_count": 0,
+                "comfyui_commit": "",
+                "core_module_sha256s": {"nodes.py": "", "execution.py": ""},
+                "atomic_profile": "",
+                "source": "container_readback",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
+
+    def run_snapshot_restore_only_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY no-op restore probe for the UNET-absent snapshot arm.
+
+        Performs essentially nothing after method entry: it collects and
+        emits placement, identity, the exclusion-mode invariant, restore
+        timing, method-entry timestamps and RSS, then returns.  It never
+        loads or touches a UNET, never samples, never decodes the VAE, never
+        reads a Volume, and never triggers graph execution.  The returned
+        dict is the raw evidence the local harness validates for the
+        ``snapshot_restore_only`` benchmark (six valid reused-snapshot
+        probes).
+
+        The UNET-absence proof is fail-closed: every ``unet_*`` field is
+        reported only after reading the live container state
+        (``self._cpu_snapshot_models``, activation flag, retained runtime
+        state, retained eviction slot); a value can never be inferred.
+        The retained-container evidence (``clip_present`` / ``vae_present`` /
+        ``container_retained``) is read the same way, so the CLIP+VAE
+        presence of the clip_vae eviction retain role is directly observed.
+        ``restore_timing`` mirrors the container's own restore() record
+        (``self._restore_timing`` / ``_LATEST_LIFECYCLE_TIMING``), which
+        carries ``remote_python_resume_wall_unix_ns`` — the wall timestamp
+        of the literal first restored Python instruction.  Never raises.
+        """
+        entry_wall_ns: int = time.time_ns()
+        entry_mono_ns: int = time.monotonic_ns()
+        start_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._request_count = getattr(self, "_request_count", 0) + 1
+        identity = {
+            "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+            "restore_count": int(getattr(self, "_restore_count", 0) or 0),
+            "request_count": int(getattr(self, "_request_count", 0) or 0),
+            "container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "app_name": APP_NAME,
+            "class_name": CLASS_NAME,
+            **_capture_remote_identity(),
+        }
+        _models = getattr(self, "_cpu_snapshot_models", None)
+        _model_key = getattr(_models, "model_key", None) if _models is not None else None
+        _snapshot_identity = ""
+        if _model_key is not None:
+            try:
+                _snapshot_identity = str(getattr(_model_key, "stable_hash", "") or "")
+            except Exception:  # noqa: BLE001
+                _snapshot_identity = ""
+        _unet_obj = getattr(_models, "unet", None) if _models is not None else None
+        _clip_obj = getattr(_models, "clip", None) if _models is not None else None
+        _vae_obj = getattr(_models, "vae", None) if _models is not None else None
+        _retained_model = getattr(self, "_snapshot_eviction_retained_model", None)
+        _retained_unet_payload = int(
+            _unet_obj is not None
+            or _retained_model is not None
+            or getattr(self, "_cpu_snapshot_unet_runtime_state", None) is not None
+        )
+        _reconstructed_unet_present = int(
+            _unet_obj is not None
+            or bool(getattr(self, "_cpu_snapshot_models_active", False))
+            or _retained_model is not None
+        )
+        _container_retained = int(
+            _models is not None and _unet_obj is None
+        )
+        _clip_present = int(_clip_obj is not None)
+        _vae_present = int(_vae_obj is not None)
+        _eviction_retained_role = str(
+            getattr(self, "_snapshot_eviction_retained_role", "none") or "none"
+        )
+        _latest = _LATEST_LIFECYCLE_TIMING or {}
+        _rt = dict(self._restore_timing or {}) if self._restore_timing else _latest
+        _remote_resume_wall_ns = int(_rt.get("remote_python_resume_wall_unix_ns") or 0)
+        _restore_start_wall_ns = int(_rt.get("restore_method_start_wall_unix_ns") or 0)
+        _restore_end_wall_ns = int(_rt.get("restore_method_end_wall_unix_ns") or 0)
+        _restore_total_ms = _rt.get("restore_total_ms")
+        _restore_status = str(_rt.get("lifecycle_status") or "unknown")
+        _restore_session_id = str(_rt.get("restore_session_id") or "")
+        _restore_count = int(_rt.get("restore_count") or getattr(self, "_restore_count", 0) or 0)
+        _restored_instance_id = str(
+            _rt.get("restored_instance_id") or getattr(self, "_restored_instance_id", "") or ""
+        )
+        _container_session_id = str(
+            _rt.get("container_session_id") or self.container_session_id or _V2_CONTAINER_SESSION_ID
+        )
+        _rss: dict[str, Any] = {}
+        try:
+            from comfymodal_runtime.restore_state_probe import probe_process_memory  # noqa: PLC0415
+            _rss = probe_process_memory()
+        except Exception:  # noqa: BLE001
+            _rss = {"source": "unavailable"}
+        _placement = {
+            "cloud": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+            "region": os.environ.get("MODAL_REGION", ""),
+            "gpu": os.environ.get("COMFYMODAL_V2_GPU", ""),
+            "cpu_request": os.environ.get("COMFYMODAL_V2_CPU_REQUEST", ""),
+            "memory_request_mb": os.environ.get("COMFYMODAL_V2_MEMORY_MB", ""),
+        }
+        _result: dict[str, Any] = {
+            "status": "ok",
+            "mode": "snapshot_restore_only",
+            "request_id": str(request_id or ""),
+            "start_ts": start_iso,
+            "entry_wall_unix_ns": entry_wall_ns,
+            "entry_mono_ns": entry_mono_ns,
+            "end_wall_unix_ns": time.time_ns(),
+            "end_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "graph_executed": False,
+            "unet_loaded": False,
+            "vae_decoded": False,
+            "volume_read": False,
+            "placement": _placement,
+            "identity": identity,
+            "snapshot_identity": _snapshot_identity,
+            "snapshot_identity_source": "cpu_snapshot_models.model_key.stable_hash",
+            "invariant": {
+                "unet_present": int(_unet_obj is not None),
+                "retained_unet_payload": _retained_unet_payload,
+                "reconstructed_unet_present": _reconstructed_unet_present,
+                "cpu_snapshot_models_present": int(_models is not None),
+                "container_retained": _container_retained,
+                "clip_present": _clip_present,
+                "vae_present": _vae_present,
+                "cpu_snapshot_models_active": int(bool(getattr(self, "_cpu_snapshot_models_active", False))),
+                "snapshot_exclude_unet_gate": int(_snapshot_exclude_unet_enabled()),
+                "eviction_retained_role": _eviction_retained_role,
+                "retained_unet_runtime_state_present": int(
+                    getattr(self, "_cpu_snapshot_unet_runtime_state", None) is not None
+                ),
+                "retained_eviction_model_present": int(_retained_model is not None),
+                "model_key_unet_identity": str(getattr(_model_key, "unet_identity", "") or "") if _model_key is not None else "",
+            },
+            "restore_timing": {
+                "remote_python_resume_wall_unix_ns": _remote_resume_wall_ns,
+                "restore_method_start_wall_unix_ns": _restore_start_wall_ns,
+                "restore_method_end_wall_unix_ns": _restore_end_wall_ns,
+                "restore_total_ms": _restore_total_ms,
+                "restore_session_id": _restore_session_id,
+                "restore_count": _restore_count,
+                "restored_instance_id": _restored_instance_id,
+                "container_session_id": _container_session_id,
+                "lifecycle_status": _restore_status,
+                "lifecycle_method": str(_rt.get("lifecycle_method") or ""),
+            },
+            "rss": _rss,
+        }
+        print(
+            f"[v2.restore_only_probe] request_method_entry request_id={request_id} "
+            f"restored_instance_id={_restored_instance_id[:16]} "
+            f"restore_count={_restore_count} "
+            f"unet_present={_result['invariant']['unet_present']} "
+            f"clip_present={_result['invariant']['clip_present']} "
+            f"vae_present={_result['invariant']['vae_present']} "
+            f"container_retained={_result['invariant']['container_retained']} "
+            f"entry_wall_unix_ns={entry_wall_ns}",
+            flush=True,
+        )
+        return _result
+
+    def run_unet_mechanism_probe(
+        self,
+        model_name: str,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement probe for the V2 CUDA-loader salvage
+        experiment (``comfymodal_runtime.unet_salvage_probe``).
+
+        Resolves *model_name* under ``diffusion_models`` via the top-level
+        ``folder_paths`` (``get_full_path_or_raise`` with a
+        ``get_full_path`` fallback) and runs the full measurement-only
+        mechanism battery (``run_unet_mechanism_probes``) against the
+        resolved path.  The probe never loads a live model, never mutates
+        production loader state, and always returns a JSON-safe dict (never
+        raises).  Invoked from a shadow deployment as::
+
+            modal.Function.lookup(APP, "run_unet_mechanism_probe").remote(unet_name)
+
+        Every OS/Linux-only capability (os.preadv / os.posix_fadvise / GDS /
+        cudaHostRegister) degrades to a named ``skipped``/``error`` entry.
+        """
+        _model_name = str(model_name or "")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_usp
+            _resolver = getattr(_fp_usp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_usp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("diffusion_models", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_salvage_probe import (  # noqa: PLC0415
+                run_unet_mechanism_probes,
+            )
+            _result = run_unet_mechanism_probes(str(_resolved))
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_unet_qd_probe(
+        self,
+        model_name: str,
+        mode: str = "evidence",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement battery for the C9 Modal Volume
+        queue-depth shootout (``comfymodal_runtime.unet_qd_probe``).
+
+        Resolves *model_name* under ``diffusion_models`` (same resolver as
+        ``run_unet_mechanism_probe``) and runs the measurement-only battery:
+
+          mode="structural": env + file + header reconcile + one QD1 256 MiB
+              preadv config + external-loader import checks (cheap paid gate);
+          mode="evidence": native mmap baseline, sequential preadv full-file,
+              the bounded QD x block screen, full-file QD2/4/8 (+QD16 when
+              still scaling), warm-QD1 cache control, one storage->pinned->
+              async-GPU transfer phase, and the external loader battery
+              (Run:ai Model Streamer / fastsafetensors, when installed in the
+              image) with full validity checking.
+
+        The probe never loads a live model, never mutates production loader
+        state, and always returns a JSON-safe dict (never raises).  Invoked
+        from a shadow deployment as::
+
+            modal.Function.lookup(APP, "run_unet_qd_probe").remote(
+                unet_name, "evidence")
+
+        Every OS/Linux-only capability (os.preadv / /proc / resource /
+        pin_memory) degrades to a named ``skipped``/``error`` entry.
+        """
+        _model_name = str(model_name or "")
+        _mode = str(mode or "evidence")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_qdp
+            _resolver = getattr(_fp_qdp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_qdp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("diffusion_models", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_qd_probe import (  # noqa: PLC0415
+                run_unet_qd_probe_battery,
+            )
+            _result = run_unet_qd_probe_battery(str(_resolved), mode=_mode)
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["mode"] = _mode
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_clip_qd_probe(
+        self,
+        model_name: str,
+        mode: str = "evidence",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY measurement battery for the C9 queue-depth shootout
+        applied to a CLIP/text-encoder file (Batch E27 Target A).
+
+        Resolves *model_name* under ``text_encoders`` and runs the same
+        measurement-only QD battery as ``run_unet_qd_probe`` (the battery is
+        file-generic: mmap baseline, sequential preadv, QD x block screen,
+        full-file QD2/4/8, warm control, GPU transfer phase, external loaders).
+        Never loads a live model, never mutates production state, always
+        returns a JSON-safe dict.
+        """
+        _model_name = str(model_name or "")
+        _mode = str(mode or "evidence")
+        _resolved = ""
+        try:
+            import folder_paths as _fp_qdp
+            _resolver = getattr(_fp_qdp, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_qdp, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _resolved = _resolver("text_encoders", _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.unet_qd_probe import (  # noqa: PLC0415
+                run_unet_qd_probe_battery,
+            )
+            _result = run_unet_qd_probe_battery(str(_resolved), mode=_mode)
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+            _result["probe"] = "clip_qd"
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["model_name"] = _model_name
+        _result["mode"] = _mode
+        _result["resolved_path"] = str(_resolved)
+        return _result
+
+    def run_source_race_oracle(
+        self,
+        role: str = "clip",
+        model_name: str = "qwen_3_4b.safetensors",
+        race_width: int = 1,
+        logical_qd: int = 2,
+        read_bytes: int = 134217728,
+        max_blocks: int = 0,
+        fd_mode: str = "independent",
+        hash_mode: str = "winners_in_order",
+        attempt_id: str = "",
+    ) -> dict[str, Any]:
+        """Raw-data collector returning descriptive statistics only.
+
+        This probe performs no classification or causal inference; it returns
+        only the collector's descriptive statistics and observed evidence.
+        """
+        _role = str(role or "clip").strip().lower()
+        _model_name = str(model_name or "").strip()
+        _attempt_id = str(attempt_id or "")
+        _requested_gpu = str(os.environ.get("COMFYMODAL_V2_GPU", "") or "").strip()
+        _observed_gpu = ""
+        try:
+            import subprocess as _subprocess
+
+            _completed = _subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            _observed_gpu = next(
+                (line.strip() for line in _completed.stdout.splitlines() if line.strip()),
+                "",
+            )
+        except Exception:
+            _observed_gpu = ""
+        _provider = str(os.environ.get("MODAL_CLOUD_PROVIDER", "") or "")
+        _region = str(os.environ.get("MODAL_REGION", "") or "")
+        _resolved = ""
+        _result: dict[str, Any]
+        try:
+            if _role not in {"clip", "unet"}:
+                raise ValueError(f"unsupported_role:{_role}")
+            if (
+                not _model_name
+                or Path(_model_name).name != _model_name
+                or "/" in _model_name
+                or "\\" in _model_name
+            ):
+                raise ValueError("model_name_must_be_a_basename")
+
+            import folder_paths as _fp_source_race
+
+            _resolver = getattr(_fp_source_race, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_source_race, "get_full_path", None)
+            if not callable(_resolver):
+                raise RuntimeError(
+                    "folder_paths has neither get_full_path_or_raise nor get_full_path"
+                )
+            _folder = "text_encoders" if _role == "clip" else "diffusion_models"
+            _resolved = _resolver(_folder, _model_name) or ""
+            if not _resolved:
+                raise FileNotFoundError("model_path_unresolved")
+
+            from comfymodal_runtime.source_race_oracle import (  # noqa: PLC0415
+                run_race_oracle,
+            )
+
+            _result = run_race_oracle(
+                file_path=str(_resolved),
+                race_width=int(race_width),
+                logical_qd=int(logical_qd),
+                read_bytes=int(read_bytes),
+                fd_mode=str(fd_mode),
+                max_blocks=None if int(max_blocks) == 0 else int(max_blocks),
+                offset_start=0,
+                expected_sha256=None,
+                hash_mode=str(hash_mode),
+                clock_ns=None,
+                read_syscall=None,
+                fd_opener=None,
+                fd_closer=None,
+                requested_gpu=_requested_gpu,
+                observed_gpu=_observed_gpu,
+            )
+            if not isinstance(_result, dict):
+                _result = {"status": "error", "error": "probe returned non-dict"}
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+        _result["role"] = _role
+        _result["model_name"] = _model_name
+        _result["attempt_id"] = _attempt_id
+        _result["resolved_path"] = str(_resolved)
+        _result["requested_gpu"] = _requested_gpu
+        _result["observed_gpu"] = _observed_gpu
+        _result["provider"] = _provider
+        _result["region"] = _region
+        _result.setdefault("status", "ok")
+        return _result
+
+    def run_registration_probe(
+        self,
+        mapping_kind: str = "posix_shm",
+        size_mib: int = 320,
+        device_index: int = 0,
+    ) -> dict[str, Any]:
+        """One-shot host-registration mechanism probe; never used by Golden."""
+        from comfymodal_runtime.registration_probe import run_registration_probe as _run
+
+        try:
+            return _run(
+                mapping_kind=str(mapping_kind),
+                size_mib=int(size_mib),
+                device_index=int(device_index),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "mapping_kind": str(mapping_kind),
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
+    def run_phase1_c0_arena(
+        self,
+        size_mib: float = 128.0,
+        copies: int = 8,
+        warmups: int = 5,
+        samples: int = 30,
+        seed: int = 20260928,
+    ) -> dict[str, Any]:
+        """Run the isolated TESTING9 process/thread arena benchmark."""
+        path = "/opt/comfymodal/phase1_c0_arena.py"
+        try:
+            spec = importlib.util.spec_from_file_location("testing9_phase1_c0_arena", path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("phase1_harness_import_spec_unavailable")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            config = module.BenchmarkConfig(
+                size=int(float(size_mib) * 1024 * 1024),
+                copies=int(copies),
+                warmups=int(warmups),
+                samples=int(samples),
+                arms=list(module.DEFAULT_ARMS),
+                workers=[1, 4],
+                seed=int(seed),
+                start_method="fork" if "fork" in module.mp.get_all_start_methods() else module.mp.get_start_method(),
+                barrier_timeout=120.0,
+                percentiles=[10.0, 50.0, 90.0, 95.0],
+                stall_ms=25.0,
+                stall_ratio=2.0,
+            )
+            result = module.run_benchmark(config, module.Path("/tmp/phase1_c0_arena"))
+            result["remote_identity"] = {
+                "provider": os.environ.get("MODAL_CLOUD_PROVIDER", ""),
+                "region": os.environ.get("MODAL_REGION", ""),
+                "gpu": os.environ.get("COMFYMODAL_V2_GPU", ""),
+                "platform": platform.platform(),
+                "kernel": platform.release(),
+            }
+            return result
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
+    def run_testing8_gds_instanttensor_probe(
+        self,
+        operation: str = "gds",
+        model_path: str = "",
+        backend: str = "",
+        copy_mode: bool = False,
+        validate: bool = False,
+    ) -> dict[str, Any]:
+        """TESTING8-only strict GDS/InstantTensor probe; never used by Golden."""
+        from comfymodal_runtime.testing8_gds_instanttensor_probe import run_probe
+
+        try:
+            return run_probe(
+                operation=str(operation),
+                model_path=str(model_path),
+                backend=str(backend),
+                copy_mode=bool(copy_mode),
+                validate=bool(validate),
+            )
+        except Exception as exc:
+            return {
+                "status": "error",
+                "operation": str(operation),
+                "error": f"{type(exc).__name__}:{str(exc)[:500]}",
+            }
+
+    def run_e27_followup_probe(
+        self,
+        kind: str,
+        model_name: str = "",
+        *,
+        device: str = "cuda:0",
+        cells: list[dict[str, Any]] | None = None,
+        control_first: bool = True,
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY E27 Follow-Up A probe battery (measurement only).
+
+        ``kind`` selects the battery:
+
+        * ``enumerate_dtypes`` — exact per-dtype tensor/byte enumeration of
+          a real safetensors header (model_name under ``text_encoders``).
+        * ``fastsafe_screen`` — the fastsafetensors threads x max_copy_block
+          screening matrix against a real model file (model_name under
+          ``diffusion_models`` or ``text_encoders``; ``device`` default
+          ``cuda:0``).  Cell 0 is the first model-payload access in this
+          container; every buffer is closed at cell end (probe-only).
+        * ``resident_clip_dtypes`` — inspect the hydrated snapshot CLIP
+          model's resident dtype distribution (no model_name needed).
+
+        Never loads a live production model, never mutates production loader
+        state, always returns a JSON-safe dict (never raises).
+        """
+        _kind = str(kind or "")
+        _model_name = str(model_name or "")
+        if _kind == "resident_clip_dtypes":
+            try:
+                from comfymodal_runtime.e27_followup_probe import (  # noqa: PLC0415
+                    inspect_resident_clip_dtypes,
+                )
+                return {
+                    "status": "ok",
+                    "probe": "resident_clip_dtypes",
+                    **inspect_resident_clip_dtypes(
+                        getattr(self, "_cpu_snapshot_models", None)
+                    ),
+                }
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "probe": "resident_clip_dtypes",
+                    "error": f"{type(exc).__name__}:{str(exc)[:200]}",
+                }
+        _resolved = ""
+        try:
+            import folder_paths as _fp_e27
+
+            _resolver = getattr(_fp_e27, "get_full_path_or_raise", None)
+            if not callable(_resolver):
+                _resolver = getattr(_fp_e27, "get_full_path", None)
+            if not callable(_resolver):
+                return {
+                    "status": "error",
+                    "kind": _kind,
+                    "error": "folder_paths has neither get_full_path_or_raise nor get_full_path",
+                }
+            _folder = (
+                "diffusion_models"
+                if _kind == "fastsafe_screen" and _model_name.startswith("z_image")
+                else "text_encoders"
+            )
+            _resolved = _resolver(_folder, _model_name) or ""
+            if not _resolved:
+                return {
+                    "status": "error",
+                    "kind": _kind,
+                    "model_name": _model_name,
+                    "error": "model_path_unresolved",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "kind": _kind,
+                "model_name": _model_name,
+                "error": f"resolve: {type(exc).__name__}: {str(exc)[:200]}",
+            }
+        try:
+            from comfymodal_runtime.e27_followup_probe import (  # noqa: PLC0415
+                enumerate_safetensors_dtypes,
+                run_fastsafe_firsttouch_screen,
+            )
+
+            if _kind == "enumerate_dtypes":
+                _result = enumerate_safetensors_dtypes(str(_resolved))
+                _result["probe"] = "enumerate_dtypes"
+            elif _kind == "fastsafe_screen":
+                _result = run_fastsafe_firsttouch_screen(
+                    str(_resolved),
+                    device=str(device),
+                    cells=cells,
+                    control_first=control_first,
+                )
+                _result["probe"] = "fastsafe_screen"
+            else:
+                _result = {
+                    "status": "error",
+                    "kind": _kind,
+                    "error": f"unknown_kind:{_kind}",
+                }
+        except Exception as exc:
+            _result = {
+                "status": "error",
+                "kind": _kind,
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        _result.setdefault("status", "ok")
+        _result["kind"] = _kind
+        _result["model_name"] = _model_name
+        _result["resolved_path"] = str(_resolved)
+        return _result
 
     def publish_restore_plan(
         self,
@@ -12958,6 +20811,164 @@ class ModalRuntimeEntrypoint:
         context.metadata["deployment_combined_hash"] = deployment_hash
         context.metadata["custom_node_generation"] = custom_node_generation
 
+    def _derive_request_snapshot_seed(self, plan: ExecutionPlan) -> dict[str, Any] | None:
+        """Derive a schema-v2 snapshot seed from the REQUEST's own plan.
+
+        Runs on the no-publish path (``COMFYMODAL_V2_PUBLISH_RESTORE_PLAN``
+        disabled — the default).  The container restored with an honest
+        ``startup_minimal`` seed (the volume ``snapshot_seed.json`` read is
+        skipped when publication is disabled), so this request derives its own
+        seed from the invocation plan payload using the pure graph-analysis
+        builder (``build_invocation_seed_payload``) and hydrates it into
+        ``BootstrapState``.  ``_attach_snapshot_seed_metadata`` then attaches
+        the derived seed so ``_consume_seed_for_request`` / the executor seed
+        hook still receive a seed (preserving loader/sampler cache seeding).
+
+        This is a pure WARM-START ENRICHMENT, never a correctness requirement:
+        every consumer fails closed when the seed is absent or minimal.  When
+        the flag is enabled (legacy publisher path), when the container
+        already holds a topology-available seed matching this request's
+        workflow hash, or when derivation fails, no request seed is derived —
+        ``seed_source`` stays ``startup_minimal`` (never faked
+        ``publisher_plan``).
+
+        Returns observability metadata for the ``snapshot_seed_request_derived``
+        trace event, or ``None`` when no derivation was attempted/needed.
+        """
+        from .execution_seed import (
+            SEED_SOURCE_INVOCATION_PLAN,
+            SEED_SOURCE_STARTUP_MINIMAL,
+            build_invocation_seed_payload,
+            publish_restore_plan_enabled,
+            snapshot_seed_observability,
+        )
+
+        if publish_restore_plan_enabled():
+            # Legacy publisher path: the seed arrives via restore-time
+            # hydration or in-container publisher hydration.  Never derive
+            # from the request on this path.
+            return None
+        bootstrap = getattr(self, "bootstrap", None)
+        state = getattr(bootstrap, "state", None)
+        if state is None:
+            return None
+        workflow = getattr(plan, "workflow", None) or {}
+        if not isinstance(workflow, Mapping) or not workflow:
+            return {
+                "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                "topology_available": 0,
+                "reason": "empty_workflow",
+            }
+        try:
+            # A container that already holds a topology-available seed
+            # matching this request's workflow hash keeps it (a previous
+            # request derived it) — never rebuild/overwrite per request.
+            _existing = state.snapshot_execution_seed
+            _existing_hashes = {
+                h for h in (
+                    str(getattr(_existing, "workflow_hash", "") or ""),
+                    str(getattr(_existing, "source_workflow_hash", "") or ""),
+                ) if h
+            }
+            _req_hashes = {
+                h for h in (str(plan.workflow_hash or ""), str(plan.source_workflow_hash or "")) if h
+            }
+            if (
+                _existing is not None
+                and bool(state.snapshot_seed_topology_available)
+                and bool(_req_hashes & _existing_hashes)
+            ):
+                _obs = snapshot_seed_observability(_existing)
+                return {
+                    "topology_available": 1,
+                    "reused_existing": True,
+                    **_obs,
+                    # After **_obs: that helper hardcodes seed_source="".
+                    "seed_source": state.snapshot_seed_source or SEED_SOURCE_INVOCATION_PLAN,
+                }
+            deployment_hash = str(
+                _V2_DEPLOYMENT_COMBINED_HASH
+                or getattr(state, "deployment_combined_hash", "") or ""
+            )
+            custom_node_generation = str(
+                getattr(state, "snapshot_custom_node_generation", "")
+                or getattr(state, "custom_node_generation", "") or ""
+            )
+            # ── E25: exact-identity cache for the pure seed payload builder.
+            # The payload is a pure function of (workflow, output_node_ids,
+            # workflow_hash, source_workflow_hash, custom_node_generation,
+            # deployment_combined_hash) — all captured in the identity key.
+            # Only the PAYLOAD is cached; hydration of mutable container state
+            # (``state.hydrate_snapshot_seed_payload``) always runs on the
+            # caller thread, exactly as before.  Fail-closed: any cache
+            # failure falls back to the original inline build.
+            _seed_cache_identity = self._pre_graph_cache_identity_key(
+                plan, include_workflow_hash=True
+            )
+            _seed_cache_key = f"{_seed_cache_identity}:seed_payload:{str(plan.output_node_ids or ())}"
+            try:
+                from comfymodal_runtime.pre_graph_cache import (
+                    get_pre_graph_cache,
+                    with_cache,
+                )
+
+                payload = with_cache(
+                    get_pre_graph_cache(),
+                    _seed_cache_key,
+                    lambda: build_invocation_seed_payload(
+                        workflow,
+                        output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
+                        workflow_hash=str(plan.workflow_hash or ""),
+                        source_workflow_hash=str(plan.source_workflow_hash or ""),
+                        custom_node_generation=custom_node_generation,
+                        deployment_combined_hash=deployment_hash,
+                    ),
+                )
+            except Exception:
+                payload = build_invocation_seed_payload(
+                    workflow,
+                    output_node_ids=tuple(getattr(plan, "output_node_ids", ()) or ()),
+                    workflow_hash=str(plan.workflow_hash or ""),
+                    source_workflow_hash=str(plan.source_workflow_hash or ""),
+                    custom_node_generation=custom_node_generation,
+                    deployment_combined_hash=deployment_hash,
+                )
+            if payload is None:
+                return {
+                    "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                    "topology_available": 0,
+                    "reason": "empty_workflow",
+                }
+            if not state.hydrate_snapshot_seed_payload(payload):
+                return {
+                    "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                    "topology_available": 0,
+                    "reason": "hydration_failed",
+                }
+            _obs = snapshot_seed_observability(state.snapshot_execution_seed)
+            print(
+                f"[v2.seed_restore] source=invocation_plan schema=2 "
+                f"topology_available=1 "
+                f"workflow_hash={state.snapshot_seed_workflow_hash[:16]} "
+                f"loader_nodes={_obs['loader_node_count']} "
+                f"sampler_nodes={_obs['sampler_node_count']} "
+                f"reachable_nodes={_obs['reachable_node_count']} "
+                f"static_signatures={_obs['static_signature_count']}",
+                flush=True,
+            )
+            return {
+                "topology_available": 1,
+                **_obs,
+                # After **_obs: that helper hardcodes seed_source="".
+                "seed_source": SEED_SOURCE_INVOCATION_PLAN,
+            }
+        except Exception:
+            return {
+                "seed_source": SEED_SOURCE_STARTUP_MINIMAL,
+                "topology_available": 0,
+                "reason": "derive_error",
+            }
+
     def _run_terminal_cleanup_sync(
         self,
         *,
@@ -13035,14 +21046,103 @@ class ModalRuntimeEntrypoint:
         except Exception:
             return {"status": "error"}
 
+    async def _run_m2_clip_stream(
+        self,
+        *,
+        request_id: str,
+    ) -> AsyncIterator[dict[str, Any]]:
+        started = time.perf_counter()
+        try:
+            models = getattr(self, "_cpu_snapshot_models", None)
+            clip = getattr(models, "clip", None) if models is not None else None
+            if clip is None:
+                raise RuntimeError("m2_clip_snapshot_model_unavailable")
+            from . import clip_fast_hydration_wiring as _cfhw
+            from . import production_m2_loader as _m2
+
+            paths = _cfhw._clip_file_paths(models)
+            if not paths:
+                raise RuntimeError("m2_clip_checkpoint_path_unavailable")
+            loaded = []
+            load_started = time.perf_counter()
+            for path in paths:
+                loaded.append(_m2.load_m2_safetensors(path))
+            load_wall_ms = (time.perf_counter() - load_started) * 1000.0
+            if len(loaded) != 1:
+                raise RuntimeError("m2_direct_clip_requires_single_safetensors_file")
+            bind = _m2.bind_m2_clip(clip, loaded[0])
+            forward_started = time.perf_counter()
+            tokens = clip.tokenize("a photo of a cat")
+            output = clip.encode_from_tokens(
+                tokens, return_pooled=True, return_dict=True
+            )
+            forward_wall_ms = (time.perf_counter() - forward_started) * 1000.0
+            output_summary = {
+                "type": type(output).__name__,
+                "keys": sorted(output.keys()) if isinstance(output, dict) else [],
+            }
+            yield {
+                "type": "result",
+                "request_id": request_id,
+                "m2_production": {
+                    "status": "ok",
+                    "loader_wall_ms": load_wall_ms,
+                    "source_wall_ms": loaded[0]["timing"].get("source_wall_ms"),
+                    "gpu_ready_wall_ms": loaded[0]["timing"].get("gpu_ready_wall_ms"),
+                    "exposed_h2d_tail_ms": loaded[0]["timing"].get("exposed_h2d_tail_ms"),
+                    "tensor_view_ms": bind.get("tensor_view_ms"),
+                    "comfy_bind_ms": bind.get("comfy_bind_ms"),
+                    "forward_wall_ms": forward_wall_ms,
+                    "output": output_summary,
+                    "timing": loaded[0].get("timing"),
+                    "ownership": loaded[0].get("ownership"),
+                    "source_coverage": loaded[0]["source"].get("coverage"),
+                    "staging": loaded[0].get("staging"),
+                    "restore_timing": dict(getattr(self, "_restore_timing", {}) or {}),
+                    "function_wall_ms": (time.perf_counter() - started) * 1000.0,
+                },
+            }
+        except Exception as exc:
+            yield {
+                "type": "error",
+                "request_id": request_id,
+                "message": f"m2_clip_failed: {type(exc).__name__}: {str(exc)[:500]}",
+            }
+
     async def run_plan_stream(
         self,
         plan_payload: Mapping[str, Any],
         *,
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
+        control_queue: Any = None,
+        control_partition: Any = None,
     ) -> AsyncIterator[dict[str, Any]]:
         self._lazy_init_snapshot_state()
+        # ── E40 Lane B/A: per-run authority seeding ──────────────────────
+        # One resolved-config truth per run; loader-selection registry is
+        # reset and seeded with requested==effective from that authority.
+        try:
+            from .config_authority import resolve as _ca_resolve
+            from .config_authority import requested_loader as _ca_requested
+            from . import loader_selection as _loader_sel
+            _loader_sel.reset_for_run()
+            _e40_rc = _ca_resolve()
+            self._e40_resolved_config = _e40_rc
+            _loader_sel.seed_from_resolved({
+                _role: _ca_requested(_role, _e40_rc)
+                for _role in ("clip", "unet", "vae")
+            })
+        except Exception:
+            self._e40_resolved_config = None
+        self._resource_tel = None
+        if os.environ.get("COMFYMODAL_V2_RESOURCE_TELEMETRY", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                from .resource_telemetry import ResourceTelemetry
+                self._resource_tel = ResourceTelemetry()
+                self._resource_tel.start()
+            except Exception:
+                self._resource_tel = None
         diagnostics = getattr(self, "_teardown_diagnostics", None)
         identity = _capture_remote_identity()
         if diagnostics is not None:
@@ -13065,12 +21165,36 @@ class ModalRuntimeEntrypoint:
             self._terminal_response_delivered = False
             self._terminal_cleanup_done = False
             self._post_stream_release_done = False
+            self._deferred_commit_task = None
+            self._deferred_commit_diag = None
+            self._deferred_commit_pending = False
+        # ── Cooperative remote-cancel bridge (per-invocation watcher) ─────
+        # One daemon watcher per invocation polls the hydrated control Queue
+        # partition while execution is busy.  It is stopped/joined boundedly in
+        # the finally below (and again by the executor-stream guard inside the
+        # impl), so it can never outlive the invocation.  Only started when a
+        # control queue is supplied — the no-cancel path is unchanged.
+        _remote_watcher: RemoteCancelWatcher | None = None
+        if control_queue is not None:
+            _remote_watcher = RemoteCancelWatcher(
+                control_queue,
+                control_partition,
+                request_id=request_id,
+            )
+            _remote_watcher.start()
         terminal_started = False
         try:
-            async for event in self._run_plan_stream_impl(
-                plan_payload, request_id=request_id, cancelled=cancelled,
-            ):
-                if not terminal_started and event.get("type") in {"result", "error"}:
+            if os.environ.get("COMFYMODAL_V2_M2_PRODUCTION_LOADER", "").strip().lower() in {"1", "true", "yes", "on"}:
+                _stream = self._run_m2_clip_stream(request_id=request_id)
+            else:
+                _stream = self._run_plan_stream_impl(
+                    plan_payload, request_id=request_id, cancelled=cancelled,
+                    control_queue=control_queue,
+                    control_partition=control_partition,
+                    _remote_cancel_watcher=_remote_watcher,
+                )
+            async for event in _stream:
+                if not terminal_started and event.get("type") in {"result", "error", "cancelled"}:
                     terminal_started = True
                     self._terminal_response_delivered = True
                     if diagnostics is not None:
@@ -13079,9 +21203,26 @@ class ModalRuntimeEntrypoint:
                             "request_terminal_start",
                             terminal_status=str(event.get("type", "unknown")),
                         )
+                    # ── Terminal cleanup window stamps (Batch-A B) ──
+                    # Start immediately before the synchronous cleanup so the
+                    # host can separate app-side cleanup from platform result
+                    # transport (remote_cleanup_ms / transport_after_cleanup_ms).
+                    # Pure timing, rides the existing result data.
+                    _cleanup_start_wall_ns = time.time_ns()
+                    _cleanup_start_mono_ns = time.monotonic_ns()
                     self._run_terminal_cleanup_sync(
                         diagnostics=diagnostics,
                         request_id=request_id,
+                    )
+                    _cleanup_end_wall_ns = time.time_ns()
+                    _cleanup_end_mono_ns = time.monotonic_ns()
+                    _stamp_terminal_cleanup(
+                        event,
+                        start_wall_ns=_cleanup_start_wall_ns,
+                        start_mono_ns=_cleanup_start_mono_ns,
+                        end_wall_ns=_cleanup_end_wall_ns,
+                        end_mono_ns=_cleanup_end_mono_ns,
+                        request_id=str(request_id or ""),
                     )
                 yield event
         except Exception as exc:
@@ -13089,22 +21230,40 @@ class ModalRuntimeEntrypoint:
                 terminal_started = True
                 if diagnostics is not None:
                     diagnostics.emit("request_terminal_start", terminal_status="exception")
+                _cleanup_start_wall_ns = time.time_ns()
+                _cleanup_start_mono_ns = time.monotonic_ns()
                 self._run_terminal_cleanup_sync(
                     diagnostics=diagnostics,
                     request_id=request_id,
                 )
-            yield {
-                "type": "error",
-                "phase": "setup_failed",
-                "message": (
-                    f"run_plan_stream failed: {type(exc).__name__}: {exc}"
-                ),
-                "request_id": request_id or "",
-            }
+                _cleanup_end_wall_ns = time.time_ns()
+                _cleanup_end_mono_ns = time.monotonic_ns()
+                _err_event = {
+                    "type": "error",
+                    "phase": "setup_failed",
+                    "message": (
+                        f"run_plan_stream failed: {type(exc).__name__}: {exc}"
+                    ),
+                    "request_id": request_id or "",
+                }
+                _stamp_terminal_cleanup(
+                    _err_event,
+                    start_wall_ns=_cleanup_start_wall_ns,
+                    start_mono_ns=_cleanup_start_mono_ns,
+                    end_wall_ns=_cleanup_end_wall_ns,
+                    end_mono_ns=_cleanup_end_mono_ns,
+                    request_id=str(request_id or ""),
+                )
+                yield _err_event
         finally:
             # Capture whether a real terminal result/error event was produced
             # BEFORE the forced generator_closed fallback below mutates the flag.
             _terminal_was_yielded = terminal_started
+            # Stop the remote-cancel watcher (idempotent: the executor-stream
+            # guard already joined it; this covers early setup failures and
+            # streams closed before the executor ran).
+            if _remote_watcher is not None:
+                _remote_watcher.stop_and_join()
             if not getattr(self, "_terminal_cleanup_done", False):
                 # Cleanup did not run synchronously at terminal identification
                 # (e.g. the stream was cancelled/closed before any terminal
@@ -13132,6 +21291,10 @@ class ModalRuntimeEntrypoint:
                         )
                     except Exception:
                         pass
+            try:
+                await self._finalize_deferred_commit(request_id=request_id)
+            except Exception:
+                pass
             if diagnostics is not None:
                 diagnostics.emit("request_terminal_end")
 
@@ -13141,7 +21304,21 @@ class ModalRuntimeEntrypoint:
         *,
         request_id: str = "",
         cancelled: Callable[[], bool] | None = None,
+        control_queue: Any = None,
+        control_partition: Any = None,
+        _remote_cancel_watcher: RemoteCancelWatcher | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Generated-output durability is request policy, not source-publication
+        # policy. Resolve it before graph execution so an invalid explicit
+        # value fails through the normal request error path.
+        _output_durability_policy = resolve_output_durability()
+        # ── E29: durable-result span holder ──────────────────────────────
+        # Opened at plan receipt (see below) and closed at the first durable
+        # result emit boundary.  MUST be initialized before any branch can
+        # reference it — a use-before-assignment here raised UnboundLocalError
+        # inside the (previously silent) finalization try block and made the
+        # whole canonical ledger silently vanish from every remote run.
+        _span_durable_result: Any = None
         # ── TRUE METHOD FIRST LINE (before any identity or trace exists) ──
         _method_first_line_ns = time.monotonic_ns()
         _method_first_line_wall_ns = int(time.time() * 1_000_000_000)
@@ -13258,7 +21435,9 @@ class ModalRuntimeEntrypoint:
         if _command_start_ms_for_age is None:
             _command_start_ms_for_age = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
         _snapshot_callback_to_command_start_ms: float | None = None
+        # legacy name; semantics = command_start to python resume (post_snapshot_restore start)
         _command_start_to_restore_start_ms: float | None = None
+        _command_start_to_restore_end_ms: float | None = None
         if isinstance(_callback_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
             _value = float(_command_start_ms_for_age) * 1_000_000.0 - float(_callback_wall_for_age)
             if _value >= 0:
@@ -13267,11 +21446,19 @@ class ModalRuntimeEntrypoint:
             _value = float(_restore_start_wall_for_age) - float(_command_start_ms_for_age) * 1_000_000.0
             if _value >= 0:
                 _command_start_to_restore_start_ms = round(_value / 1_000_000.0, 3)
+        _restore_end_wall_for_age = _restore_timing_for_age.get("restore_method_end_wall_unix_ns")
+        if isinstance(_restore_end_wall_for_age, (int, float)) and isinstance(_command_start_ms_for_age, (int, float)):
+            _value = float(_restore_end_wall_for_age) - float(_command_start_ms_for_age) * 1_000_000.0
+            if _value >= 0:
+                _command_start_to_restore_end_ms = round(_value / 1_000_000.0, 3)
         _snapshot_age_at_restore = _restore_timing_for_age.get("snapshot_callback_age_at_restore_ms")
         context_snapshot_age = {
             "snapshot_callback_age_at_restore_ms": _snapshot_age_at_restore,
             "snapshot_callback_to_command_start_ms": _snapshot_callback_to_command_start_ms,
             "command_start_to_restore_start_ms": _command_start_to_restore_start_ms,
+            # Truthful name for the legacy field above (same value).
+            "command_start_to_python_resume_ms": _command_start_to_restore_start_ms,
+            "command_start_to_restore_end_ms": _command_start_to_restore_end_ms,
         }
 
         # â”€â”€ Re-emit local submission breakdown from client â”€â”€â”€â”€â”€â”€
@@ -13281,8 +21468,713 @@ class ModalRuntimeEntrypoint:
                 "[v2.local_submission_breakdown.remote]", _local_submission_breakdown,
             )
 
+        # ── E29: canonical ledger request identity + method-entry markers ──
+        # Bind the ledger to the exact request (request_id + trace_id +
+        # restored/container identities) so every span is strictly
+        # request-scoped, then stamp the true method-entry boundary.
+        # ``begin_request`` preserves the restore-session spans (same process,
+        # same monotonic axis) and clears only previous-REQUEST spans.
+        try:
+            from .critical_path_ledger import (
+                begin_request as _ledger_begin,
+                record_event as _ledger_event,
+                set_request_identity as _ledger_identity,
+            )
+            _ledger_begin(_t4_request_id or request_id)
+            _ledger_identity(
+                request_id=_t4_request_id or request_id,
+                trace_id=str(
+                    getattr(
+                        getattr(getattr(self, "_plan_receipt_trace", None), "trace_id", ""),
+                        "trace_id", "",
+                    )
+                    or ""
+                ),
+                restored_instance_id=str(getattr(self, "_restored_instance_id", "") or ""),
+                restore_session_id=str(
+                    (self._restore_timing or {}).get("restore_session_id", "") or ""
+                ),
+                container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            )
+            _ledger_event("modal_method_entry", mono_ns=_method_first_line_ns)
+            _ledger_event(
+                "plan_deserialize_start",
+                mono_ns=_deserialize_start_ns if "_deserialize_start_ns" in dir() else None,
+            )
+            _ledger_event("plan_deserialize_end", mono_ns=_deserialize_end_ns)
+            _ledger_event("plan_accepted", mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
+        # ── E29: canonical ledger request-setup spans ─────────────────────
+        # These decompose the old coarse 263 ms / 872 ms buckets into real
+        # boundaries: identity capture, plan deserialize, setup/schedule
+        # (thread submits + worker-first-instruction stamps), and the
+        # plan-received yield.  Request-scoped spans (the restore store was
+        # already frozen by begin_request above).
+        try:
+            from .critical_path_ledger import begin_span as _ledger_begin_span
+        except Exception:
+            _ledger_begin_span = None
+        _span_identity_capture: Any = (
+            _ledger_begin_span("request:identity-capture", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_deserialize: Any = (
+            _ledger_begin_span("request:plan-deserialize", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_schedule_setup: Any = (
+            _ledger_begin_span("request:setup-schedule", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_cc_prefetch: Any = (
+            _ledger_begin_span("request:cc-prefetch-submit", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        _span_itw: Any = (
+            _ledger_begin_span("request:input-types-warm", lane="REQUEST-SETUP")
+            if _ledger_begin_span is not None else None
+        )
+        if _span_identity_capture is not None:
+            try:
+                _span_identity_capture.start_mono_ns = _method_first_line_ns
+                _span_identity_capture.finish(mono_ns=_identity_capture_end_ns)
+            except Exception:
+                pass
+        # ── E29: plan deserialize boundary (declared BEFORE use) ──────────
+        # ``_deserialize_start_ns``/``_deserialize_end_ns`` are captured
+        # immediately before/after the ExecutionPlan.from_dict call below.
+        # Previously the event/span emission block referenced
+        # ``_deserialize_end_ns`` BEFORE it was assigned (the assignment came
+        # after ``ExecutionPlan.from_dict``), so the whole method-entry
+        # block died with a swallowed NameError and NO method-entry events
+        # ever reached the ledger.
+        try:
+            from . import clean_lane as _clean_lane
+            _clean_lane.phase_start("plan_identity", getattr(self, "_plan_receipt_trace", None))
+        except Exception:
+            _clean_lane = None
+        _deserialize_start_ns = time.monotonic_ns()
         plan = ExecutionPlan.from_dict(_safe_payload if isinstance(_safe_payload, dict) else plan_payload)
         _deserialize_end_ns = time.monotonic_ns()
+        if _span_deserialize is not None:
+            try:
+                _span_deserialize.start_mono_ns = _deserialize_start_ns
+                _span_deserialize.finish(mono_ns=_deserialize_end_ns)
+            except Exception:
+                pass
+
+        try:
+            from comfymodal_runtime.fast_cold_orchestration import begin_request
+
+            begin_request(
+                str(getattr(plan, "request_id", "") or _t4_request_id or request_id),
+                model_spec=getattr(plan, "model_spec", None),
+            )
+        except Exception:
+            pass
+        try:
+            from . import clean_lane as _clean_lane
+            _clean_lane.mark_plan_identity_complete(getattr(self, "_plan_receipt_trace", None))
+        except Exception:
+            _clean_lane = None
+
+        # ── Batch-A G1: start the execution-phase fast-disk UNET lane at
+        # plan receipt ──
+        # The model identity and the snapshot-unet-absent decision are both
+        # derivable the moment the plan exists; submitting the EXISTING
+        # single-flight execution-UNET lane here (instead of later in
+        # _run_in_process) starts the checkpoint read ~70-110 ms earlier on
+        # healthy runs.  Hard-gated (snapshot UNET definitively absent +
+        # role-match compatible) and fully idempotent: the later schedule
+        # call in _run_in_process becomes a no-op.  Best-effort: never raises.
+        # Batch-D5 request-schedule bracket start.
+        _setup_schedule_start_ns = time.monotonic_ns()
+        # ── E29: re-stamp request:setup-schedule at its true bracket ────
+        # The span was opened at the setup block entry; its real start is
+        # the schedule bracket start (UNET lane submit).
+        if _span_schedule_setup is not None:
+            try:
+                _span_schedule_setup.start_mono_ns = _setup_schedule_start_ns
+            except Exception:
+                pass
+        if _clean_lane is not None and _clean_lane.enabled():
+            _clean_lane.forbidden_activity(
+                "plan_time_unet_source_h2d", getattr(self, "_plan_receipt_trace", None)
+            )
+        else:
+            self._maybe_schedule_execution_unet_at_plan_receipt(
+                plan,
+                request_id=str(_t4_request_id or request_id),
+            )
+
+        # ── E25/E26/E28: speculative CLIP hydration lane at plan receipt ──
+        # The exact model identity (model key + loader spec + workflow/
+        # deployment identity) is known as soon as the plan is deserialized.
+        # E28: the lane was ALREADY started at restore-time (frozen manifest);
+        # this site RECONCILES its identity to the request and re-keys it.
+        # When no restore-time lane exists (gate/legacy), this starts the
+        # direct-GPU fastsafetensors CLIP file read now so the hydration is
+        # hidden under the pre-graph setup window.  The BIND stays at demand
+        # time in the authoritative hydrator; the lane is fail-closed and
+        # single-flight, and any unconsumed lane is closed at request end.
+        #
+        # E26: the lane resolves its absolute CLIP source paths from the
+        # FROZEN MANIFEST attached to the retained CLIP object (the same
+        # manifest the demand hydrator verifies against) — never a
+        # folder_paths scan on the fast path.  The lane also carries a
+        # release callback: when the speculative CLIP source read finishes
+        # (success OR failure) the CLIP-first/UNET-second coordinator is
+        # notified to release UNET source prefetch, so a failed speculative
+        # read can never delay UNET.
+        _speculative_clip_request_id = str(_t4_request_id or request_id)
+        try:
+            from comfymodal_runtime.speculative_clip_hydration import (
+                reconcile_restore_time_lane,
+                join_speculative_clip_lane,
+            )
+
+            _spec_model_key = getattr(self, "_plan_receipt_request_model_key", None)
+            _spec_model_spec = getattr(self, "_plan_receipt_request_model_spec", None)
+            if _spec_model_key is not None and _spec_model_spec is not None:
+                _spec_wf_hash = str(getattr(plan, "workflow_hash", "") or "")
+                _spec_deploy_hash = str(
+                    _V2_DEPLOYMENT_COMBINED_HASH
+                    or getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "deployment_combined_hash", "",
+                    )
+                    or ""
+                )
+                _spec_node_gen = str(
+                    getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "snapshot_custom_node_generation", "",
+                    )
+                    or getattr(
+                        getattr(getattr(self, "bootstrap", None), "state", None),
+                        "custom_node_generation", "",
+                    )
+                    or ""
+                )
+                # The retained CPU-snapshot CLIP object carries the frozen
+                # manifest (absolute capture-time source paths + size/mtime +
+                # key_shapes + pipeline).  ``_lazy_init_snapshot_state`` has
+                # already run inside the G1 schedule above.
+                _spec_cpu_models = getattr(self, "_cpu_snapshot_models", None)
+                _spec_clip_obj = getattr(_spec_cpu_models, "clip", None) if _spec_cpu_models is not None else None
+
+                def _release_unet_prefetch() -> None:
+                    """CLIP-first/UNET-second release: start UNET source
+                    prefetch once the speculative CLIP source read has
+                    definitively finished (success or failure).  Idempotent;
+                    never raises."""
+                    try:
+                        from comfymodal_runtime.fast_cold_orchestration import (
+                            get_controller,
+                        )
+
+                        _ctrl = get_controller(_speculative_clip_request_id)
+                        if _ctrl is not None:
+                            _ctrl.on_speculative_clip_done()
+                    except Exception:
+                        pass
+
+                _started_lane = reconcile_restore_time_lane(
+                    request_id=_speculative_clip_request_id,
+                    model_key=_spec_model_key,
+                    model_spec=_spec_model_spec,
+                    workflow_hash=_spec_wf_hash,
+                    deployment_hash=_spec_deploy_hash,
+                    custom_node_generation=_spec_node_gen,
+                    trace=getattr(self, "_plan_receipt_trace", None),
+                    clip=_spec_clip_obj,
+                    cpu_models=_spec_cpu_models,
+                    release_callback=_release_unet_prefetch,
+                )
+                if _clean_lane is not None and _clean_lane.enabled():
+                    _clean_lane.phase_start("post_restore_clip_qd", getattr(self, "_plan_receipt_trace", None))
+                    _joined = join_speculative_clip_lane(_speculative_clip_request_id, timeout_s=60.0)
+                    if not isinstance(_joined, dict) or not (_joined.get("result") or {}).get("ok"):
+                        raise RuntimeError("CLEAN_LANE_QD_SOURCE_NOT_COMPLETE")
+                    _clean_lane.phase_end("post_restore_clip_qd", getattr(self, "_plan_receipt_trace", None))
+                if _started_lane is None:
+                    # Fail-open: the lane could not start (e.g. no frozen
+                    # manifest).  Ownership was claimed by the controller;
+                    # release it so the normal checkpoint-prewarm /
+                    # demand path is unchanged and UNET is never gated.
+                    _release_unet_prefetch()
+        except Exception:
+            # Best-effort: never raise at plan receipt.
+            pass
+
+        # ── Task-1 prompt-signature memo: early priming at plan receipt ──
+        # Module-guarded, idempotent: load_store_from_disk loads exactly once
+        # (the executor patch also lazy-loads on demand).  This is purely an
+        # early priming step off the critical path.
+        try:
+            from comfymodal_runtime.prompt_signature_cache import load_store_from_disk
+            load_store_from_disk()
+        except Exception:
+            pass
+
+        # ── Task-2 conditioning prefetch: launch off the critical path ──
+        # Best-effort, never raises, never on the coordinator pool.  The
+        # function internally gates on COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH
+        # and fails closed when disabled.
+        _cc_prefetch_req_id = str(getattr(plan, "request_id", "") or "") or str(request_id or "")
+        _cc_prefetch_env = os.environ.get("COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH", "1")
+        _cc_prefetch_scheduled = 0
+        _cc_prefetch_reason = "unavailable"
+        try:
+            from comfymodal_runtime.model_preload import maybe_prefetch_conditioning as _maybe_prefetch
+            if callable(_maybe_prefetch) and not (_clean_lane is not None and _clean_lane.enabled()):
+                _cc_prefetch_scheduled = 1
+                _cc_prefetch_reason = "thread_started"
+                # ── E29: close request:cc-prefetch-submit at the submit ──
+                if _span_cc_prefetch is not None:
+                    try:
+                        _span_cc_prefetch.finish(mono_ns=time.monotonic_ns())
+                    except Exception:
+                        pass
+                threading.Thread(
+                    target=_maybe_prefetch, args=(plan,),
+                    kwargs={"request_id": _cc_prefetch_req_id},
+                    daemon=True, name="comfymodal-conditioning-prefetch",
+                ).start()
+        except Exception:
+            # Unimportable / not callable / thread start failed — keep the
+            # truthful "unavailable" evidence below (never fabricate).
+            _cc_prefetch_scheduled = 0
+            _cc_prefetch_reason = "unavailable"
+            # ── E29: close the cc-prefetch span on the failure path too ──
+            if _span_cc_prefetch is not None:
+                try:
+                    _span_cc_prefetch.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
+        # Truthful request-scoped evidence for the demand-time lookup diag.
+        # model_preload reads _CONDITIONING_PREFETCH_EVIDENCE (keyed by
+        # request_id → {requested, env, scheduled, reason}) so
+        # prefetch_requested/prefetch_source are observable even when the
+        # prefetch was skipped.
+        try:
+            _set_conditioning_prefetch_evidence(
+                _cc_prefetch_req_id,
+                requested=1,
+                env=_cc_prefetch_env,
+                scheduled=_cc_prefetch_scheduled,
+                reason=_cc_prefetch_reason,
+            )
+        except Exception:
+            pass
+        try:
+            if _cc_prefetch_scheduled:
+                print(
+                    f"[v2.conditioning_prefetch] "
+                    f"request_id={_cc_prefetch_req_id} "
+                    f"requested=1 env={_cc_prefetch_env} "
+                    f"scheduled=1 thread=started",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[v2.conditioning_prefetch] "
+                    f"request_id={_cc_prefetch_req_id} "
+                    f"requested=1 scheduled=0 reason={_cc_prefetch_reason}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+        # ── Task-1 input-types warm: launch off the critical path ───────
+        # Advisory INPUT_TYPES() pre-warm for the classes in THIS plan.  When
+        # the prompt-signature memo skips the normal add_keys warm-up, the
+        # first topo walk pays cold class_def.INPUT_TYPES() (+ cold folder
+        # listings for loader inputs).  Warming them here — before execution —
+        # lets the request-scoped get_input_info memo in runtime_executor
+        # serve warm values for every link.  Best-effort, never raises; if
+        # the warm is incomplete the request pays the original cost.  The
+        # daemon thread's completion evidence is printed (container stdout)
+        # and attached to the request trace metadata for host re-emission.
+        _itw_req_id = str(getattr(plan, "request_id", "") or "") or str(request_id or "")
+        _itw_scheduled = 0
+        _itw_reason = "unavailable"
+        _itw_disabled_by_env = False
+        try:
+            from comfymodal_runtime.execution_warm import (
+                warm_classes_input_types as _warm_classes_input_types,
+            )
+            _itw_prompt = getattr(plan, "prompt", None)
+            if not isinstance(_itw_prompt, dict):
+                # ExecutionPlan carries the node dict as ``workflow`` (frozen);
+                # plan_payload is the raw request payload fallback.
+                _itw_prompt = _thaw(getattr(plan, "workflow", None)) if hasattr(plan, "workflow") else {}
+            if isinstance(_itw_prompt, dict) and callable(_warm_classes_input_types):
+                # ── Task B diagnostic toggle ─────────────────────────────
+                # Env absent/unset → warm stays enabled (prior behavior
+                # unchanged).  Explicit 0/false/off disables the warm thread
+                # and records truthful disabled evidence instead.
+                _itw_enabled = env_flag(
+                    "COMFYMODAL_V2_INPUT_TYPES_WARM", default=True
+                ) and not (_clean_lane is not None and _clean_lane.enabled())
+                if not _itw_enabled:
+                    _itw_disabled_by_env = True
+                    _itw_reason = "COMFYMODAL_V2_INPUT_TYPES_WARM=0"
+                    try:
+                        _itw_disabled_trace = getattr(
+                            self, "_plan_receipt_trace", None
+                        )
+                    except Exception:
+                        _itw_disabled_trace = None
+                    try:
+                        if _itw_disabled_trace is not None:
+                            _itw_disabled_trace.set_metadata(
+                                input_types_warm_enabled=False,
+                                input_types_warm_reason="COMFYMODAL_V2_INPUT_TYPES_WARM=0",
+                            )
+                    except Exception:
+                        pass
+                    if _itw_disabled_trace is None:
+                        # Fallback to the closure-style guard (context is not
+                        # yet bound at the scheduling site — best-effort).
+                        try:
+                            _it_trace = context.trace
+                            if _it_trace is not None:
+                                _it_trace.set_metadata(
+                                    input_types_warm_enabled=False,
+                                    input_types_warm_reason="COMFYMODAL_V2_INPUT_TYPES_WARM=0",
+                                )
+                        except Exception:
+                            pass
+                else:
+                    # Forensics: scheduling-site stamps (same clock domains as
+                    # the worker stamps inside the thread below).
+                    _itw_scheduled_mono_ns = time.monotonic_ns()
+                    _itw_scheduled_wall_unix_ns = time.time_ns()
+
+                    def _run_input_types_warm():
+                        # Worker start stamp (first instruction).
+                        _itw_worker_start_mono_ns = time.monotonic_ns()
+                        _itw_worker_start_cpu = None
+                        try:
+                            _itw_worker_start_cpu = time.thread_time()
+                        except Exception:
+                            _itw_worker_start_cpu = None
+                        try:
+                            _itc_count, _itc_ms = _warm_classes_input_types(_itw_prompt)
+                        except Exception:
+                            return
+                        # Worker end stamp.
+                        _itw_worker_end_mono_ns = time.monotonic_ns()
+                        _itw_worker_end_cpu = None
+                        try:
+                            _itw_worker_end_cpu = time.thread_time()
+                        except Exception:
+                            _itw_worker_end_cpu = None
+                        # CPU time over the warm call (None on any failure).
+                        _itw_cpu_ms = None
+                        try:
+                            if (
+                                _itw_worker_start_cpu is not None
+                                and _itw_worker_end_cpu is not None
+                            ):
+                                _itw_cpu_ms = round(
+                                    max(0.0, _itw_worker_end_cpu - _itw_worker_start_cpu)
+                                    * 1000.0,
+                                    3,
+                                )
+                        except Exception:
+                            _itw_cpu_ms = None
+                        # wall_ms = the existing warm wall duration under a
+                        # clearer name (same number as input_types_warm_ms).
+                        _itw_wall_ms = _itc_ms
+                        # cpu_affinity_count: CPUs this process may run on.
+                        # effective_cores: cpu_ms/wall_ms-derived utilization.
+                        # Prefer the shared trace helpers when available;
+                        # otherwise fall back to the local inline computation.
+                        _itw_cpu_affinity_count = 0
+                        _itw_effective_cores = None
+                        try:
+                            from comfymodal_runtime.trace import (
+                                cpu_affinity_count as _cpu_affinity_count,
+                                effective_cores_from as _effective_cores_from,
+                            )
+                            _itw_cpu_affinity_count = _cpu_affinity_count()
+                            _itw_effective_cores = _effective_cores_from(
+                                _itw_cpu_ms, _itw_wall_ms
+                            )
+                        except Exception:
+                            # Shared helper unavailable — inline fallbacks.
+                            try:
+                                _itw_cpu_affinity_count = len(os.sched_getaffinity(0))
+                            except Exception:
+                                try:
+                                    _itw_cpu_affinity_count = os.cpu_count() or 0
+                                except Exception:
+                                    _itw_cpu_affinity_count = 0
+                            try:
+                                if (
+                                    _itw_cpu_ms is not None
+                                    and _itw_wall_ms is not None
+                                    and _itw_wall_ms > 0
+                                ):
+                                    _itw_effective_cores = round(
+                                        _itw_cpu_ms / _itw_wall_ms, 3
+                                    )
+                                else:
+                                    _itw_effective_cores = None
+                            except Exception:
+                                _itw_effective_cores = None
+
+                        # Cross-thread forensic registry (guarded; the registry
+                        # is being added concurrently — degrade gracefully when
+                        # not importable or on any failure).
+                        _itw_overlap_meta_ms = None
+                        _itw_overlap_fastsafe_ms = None
+                        _itw_worker_started_observed = False
+                        _itw_overlap_scope = "unavailable"
+                        _itw_registry_request_id = None
+                        try:
+                            _itw_trace = context.trace
+                        except Exception:
+                            _itw_trace = None
+                        try:
+                            if _itw_trace is not None:
+                                _itw_registry_request_id = getattr(
+                                    _itw_trace, "request_id", None
+                                )
+                            else:
+                                _itw_plan_trace = getattr(
+                                    self, "_plan_receipt_trace", None
+                                )
+                                if _itw_plan_trace is not None:
+                                    _itw_registry_request_id = getattr(
+                                        _itw_plan_trace, "request_id", None
+                                    )
+                        except Exception:
+                            _itw_registry_request_id = None
+                        try:
+                            from comfymodal_runtime.trace import (
+                                register_forensic_interval as _register_forensic_interval,
+                                forensic_intervals as _forensic_intervals,
+                                forensic_overlap_ms as _forensic_overlap_ms,
+                            )
+
+                            _register_forensic_interval(
+                                "input_types_warm",
+                                start_mono_ns=_itw_worker_start_mono_ns,
+                                end_mono_ns=_itw_worker_end_mono_ns,
+                                cpu_ms=_itw_cpu_ms,
+                                metadata={
+                                    "request_id": _itw_registry_request_id,
+                                    "warm_ms": _itw_wall_ms,
+                                    "classes": _itc_count,
+                                    "cpu_affinity_count": _itw_cpu_affinity_count,
+                                    "effective_cores": _itw_effective_cores,
+                                },
+                            )
+                            try:
+                                _itw_all_intervals = _forensic_intervals()
+                            except Exception:
+                                _itw_all_intervals = None
+
+                            def _itw_lookup_interval(name):
+                                try:
+                                    if isinstance(_itw_all_intervals, dict):
+                                        return _itw_all_intervals.get(name)
+                                    if isinstance(
+                                        _itw_all_intervals, (list, tuple)
+                                    ):
+                                        for _item in _itw_all_intervals:
+                                            if (
+                                                isinstance(_item, dict)
+                                                and _item.get("name") == name
+                                            ):
+                                                return _item
+                                except Exception:
+                                    return None
+                                return None
+
+                            def _itw_overlap_with(name):
+                                # (overlap_ms, started_observed, scope).
+                                try:
+                                    _worker = _itw_lookup_interval(name)
+                                    if not isinstance(_worker, dict):
+                                        return None, False, "unavailable"
+                                    _worker_meta = _worker.get("metadata") or {}
+                                    _worker_req = _worker_meta.get("request_id")
+                                    _worker_end = _worker.get("end_mono_ns")
+                                    if (
+                                        _itw_registry_request_id is not None
+                                        and _worker_req is not None
+                                        and _worker_req == _itw_registry_request_id
+                                    ):
+                                        if _worker_end is None:
+                                            # Exists but still running.
+                                            return None, True, "partial"
+                                        _worker_start = _worker.get("start_mono_ns")
+                                        if (
+                                            isinstance(_worker_start, int)
+                                            and isinstance(_worker_end, int)
+                                        ):
+                                            return (
+                                                _forensic_overlap_ms(
+                                                    _itw_worker_start_mono_ns,
+                                                    _itw_worker_end_mono_ns,
+                                                    _worker_start,
+                                                    _worker_end,
+                                                ),
+                                                True,
+                                                "complete",
+                                            )
+                                        return None, True, "complete"
+                                    # Missing interval or request mismatch.
+                                    return None, True, "unavailable"
+                                except Exception:
+                                    return None, True, "unavailable"
+
+                            _itw_oa_ms, _itw_worker_a_started, _itw_scope_a = (
+                                _itw_overlap_with("fastsafe_worker_a")
+                            )
+                            _itw_of_ms, _itw_worker_b_started, _itw_scope_b = (
+                                _itw_overlap_with("fastsafe_worker_b")
+                            )
+                            _itw_overlap_meta_ms = _itw_oa_ms
+                            _itw_overlap_fastsafe_ms = _itw_of_ms
+                            _itw_worker_started_observed = (
+                                _itw_worker_a_started or _itw_worker_b_started
+                            )
+                            if (
+                                _itw_scope_a == "partial"
+                                or _itw_scope_b == "partial"
+                            ):
+                                _itw_overlap_scope = "partial"
+                            elif (
+                                _itw_scope_a == "complete"
+                                and _itw_scope_b == "complete"
+                            ):
+                                _itw_overlap_scope = "complete"
+                            elif (
+                                _itw_scope_a == "unavailable"
+                                and _itw_scope_b == "unavailable"
+                            ):
+                                _itw_overlap_scope = "unavailable"
+                            else:
+                                # Mixed complete/unavailable picture.
+                                _itw_overlap_scope = "partial"
+                        except Exception:
+                            # Registry unavailable/failed — degrade gracefully;
+                            # overlap keys stay None.
+                            _itw_overlap_scope = "unavailable"
+
+                        try:
+                            print(
+                                f"[v2.input_types_warm] "
+                                f"request_id={_itw_req_id} "
+                                f"classes={_itc_count} wall_ms={_itc_ms} "
+                                f"cpu_ms={_itw_cpu_ms} "
+                                f"eff_cores={_itw_effective_cores} "
+                                f"aff_cpus={_itw_cpu_affinity_count} "
+                                f"overlap_meta_ms={_itw_overlap_meta_ms} "
+                                f"overlap_fastsafe_ms={_itw_overlap_fastsafe_ms}",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            _it_trace = context.trace
+                            if _it_trace is not None:
+                                _it_trace.set_metadata(
+                                    input_types_warm_ms=_itc_ms,
+                                    input_types_warm_classes=_itc_count,
+                                    input_types_warm_cpu_ms=_itw_cpu_ms,
+                                    input_types_warm_wall_ms=_itw_wall_ms,
+                                    input_types_warm_effective_cores=(
+                                        _itw_effective_cores
+                                    ),
+                                    input_types_warm_cpu_affinity_count=(
+                                        _itw_cpu_affinity_count
+                                    ),
+                                    input_types_warm_scheduled_mono_ns=(
+                                        _itw_scheduled_mono_ns
+                                    ),
+                                    input_types_warm_scheduled_wall_unix_ns=(
+                                        _itw_scheduled_wall_unix_ns
+                                    ),
+                                    input_types_warm_worker_started_observed=(
+                                        _itw_worker_started_observed
+                                    ),
+                                    input_types_warm_overlap_meta_ms=(
+                                        _itw_overlap_meta_ms
+                                    ),
+                                    input_types_warm_overlap_fastsafe_ms=(
+                                        _itw_overlap_fastsafe_ms
+                                    ),
+                                    input_types_warm_overlap_scope=(
+                                        _itw_overlap_scope
+                                    ),
+                                )
+                        except Exception:
+                            pass
+
+                    threading.Thread(
+                        target=_run_input_types_warm,
+                        daemon=True,
+                        name="comfymodal-input-types-warm",
+                    ).start()
+                    _itw_scheduled = 1
+                    _itw_reason = "thread_started"
+                    # ── E29: close request:input-types-warm at the submit ──
+                    if _span_itw is not None:
+                        try:
+                            _span_itw.finish(mono_ns=time.monotonic_ns())
+                        except Exception:
+                            pass
+        except Exception:
+            # Unimportable / not callable / thread-start failure — keep the
+            # truthful "unavailable" evidence below (never fabricate).
+            _itw_scheduled = 0
+            _itw_reason = "unavailable"
+            # ── E29: close the input-types-warm span on the failure path ──
+            if _span_itw is not None:
+                try:
+                    _span_itw.finish(mono_ns=time.monotonic_ns())
+                except Exception:
+                    pass
+        try:
+            if _itw_scheduled:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} scheduled=1 thread=started",
+                    flush=True,
+                )
+            elif _itw_disabled_by_env:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} disabled reason={_itw_reason}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[v2.input_types_warm] "
+                    f"request_id={_itw_req_id} scheduled=0 reason={_itw_reason}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+        # ── Request-owned snapshot seed (no-publish path) ──
+        # When COMFYMODAL_V2_PUBLISH_RESTORE_PLAN is disabled (the default),
+        # the request derives its own schema-v2 seed from the invocation plan
+        # (seed_source=invocation_plan) so loader/sampler cache seeding and
+        # topology enrichment still work without any remote restore-plan
+        # publication.  Fail-closed: any derivation failure leaves the
+        # container on the honest startup_minimal seed.  The observability
+        # result is emitted as a trace event once context.trace exists.
+        _request_seed_obs = self._derive_request_snapshot_seed(plan)
+        # Batch-D5 request-schedule bracket end.
+        _setup_schedule_end_ns = time.monotonic_ns()
 
         # â”€â”€ Compute method entry gap before any trace output â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _method_entry_gap_results: dict[str, Any] = {}
@@ -13342,29 +22234,67 @@ class ModalRuntimeEntrypoint:
                           "modal_method_entry_mono_ns": _method_first_line_ns}}
         ]
 
+        # ── Cooperative remote-cancel bridge: per-invocation watcher ───────
+        # run_plan_stream owns the watcher lifecycle (started before this impl,
+        # stopped in its finally).  A direct impl caller may still supply a
+        # control_queue without a watcher; in that case create one here — the
+        # executor-stream guard (guard_remote_cancel_stream) stops it in its
+        # finally when the stream ends for any reason.
+        _remote_watcher = _remote_cancel_watcher
+        if _remote_watcher is None and control_queue is not None:
+            _remote_watcher = RemoteCancelWatcher(
+                control_queue,
+                control_partition,
+                request_id=request_id,
+            )
+            _remote_watcher.start()
+        _remote_cancel_event = (
+            _remote_watcher.cancel_event if _remote_watcher is not None else None
+        )
+
         context = ExecutionContext(
             request_id=_t4_request_id or request_id,
-            cancelled=cancelled,
-            trace=RuntimeTrace(request_id=_t4_request_id or request_id, process="remote"),
+            # Combine the host `cancelled` callback with the watcher event so
+            # every existing boundary check observes a confirmed remote cancel
+            # too.  The no-cancel path (both absent) returns the original value.
+            cancelled=combine_cancel_predicate(cancelled, _remote_cancel_event),
+            remote_cancel_event=_remote_cancel_event,
+            # Batch-A G1: reuse the plan-receipt trace (created when the early
+            # UNET lane was scheduled) so lane worker events share one request
+            # trace; otherwise create the trace here as before.
+            trace=(
+                getattr(self, "_plan_receipt_trace", None)
+                or RuntimeTrace(request_id=_t4_request_id or request_id, process="remote")
+            ),
         )
         # Step 3: attach frozen restore-time snapshot-seed metadata per request.
         # Defensive getattr — cold-unpickled instances may lack bootstrap state.
         self._attach_snapshot_seed_metadata(context)
-        context.trace.set_metadata(
-            **identity,
-            trace_id=context.trace.trace_id,
-            restored_instance_id=getattr(self, "_restored_instance_id", ""),
-            restore_session_id=(self._restore_timing or {}).get("restore_session_id", ""),
-            legacy_container_session_id=self.container_session_id or _V2_CONTAINER_SESSION_ID,
-            request_origin_info=_request_origin_info,
-            **_entry_host,
-            **_resource_identity(),
-            stored_snapshot_model_order=getattr(
-                getattr(self, "_cpu_snapshot_models", None),
-                "construction_order",
-                None,
-            ),
+        # Emit the request-derived seed observability (no-publish path) so the
+        # artifact proves the request owned its own seed (invocation_plan) or
+        # honestly fell back to startup_minimal.
+        if isinstance(_request_seed_obs, dict):
+            context.trace.emit(
+                "snapshot_seed_request_derived",
+                phase="request",
+                metadata=dict(_request_seed_obs),
+            )
+        trace_identity_metadata = dict(identity)
+        trace_identity_metadata.update({
+            "trace_id": context.trace.trace_id,
+            "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+            "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
+            "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
+            "request_origin_info": _request_origin_info,
+        })
+        trace_identity_metadata.update(_entry_host)
+        trace_identity_metadata.update(_resource_identity())
+        trace_identity_metadata["stored_snapshot_model_order"] = getattr(
+            getattr(self, "_cpu_snapshot_models", None),
+            "construction_order",
+            None,
         )
+        context.trace.set_metadata(**trace_identity_metadata)
         context.trace.set_metadata(**context_snapshot_age)
         validate_torch_thread_policy(
             stage="request_entry",
@@ -13463,28 +22393,36 @@ class ModalRuntimeEntrypoint:
                 _restore_end_to_modal_ms = str(round(
                     (_method_first_line_ns - _rt_end_mono) / 1_000_000, 3
                 ))
-        print(
-            f"[v2.method_entry_gap] "
-            f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
-            f"first_line_to_running_log_ms={_first_line_to_now_ms} "
-            f"same_process={_method_entry_gap_results.get('same_process')} "
-            f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'} "
-            f"remote_python_resume_wall_unix_ns={_resume_wall_from_timing} "
-            f"restore_method_start_wall_unix_ns={_restore_start_wall_from_timing} "
-            f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
-            f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
-            f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
-            flush=True,
-        )
-        print(
-            "[v2.snapshot_timing] "
-            + " ".join(f"{key}={value if value is not None else 'unavailable'}" for key, value in context_snapshot_age.items())
-            + " request_latency_included=0_for_callback_age",
-            flush=True,
-        )
+        if not _QUIET:
+            print(
+                f"[v2.method_entry_gap] "
+                f"restore_to_method_ms={_method_entry_gap_results.get('restore_return_to_method_first_line_ms')} "
+                f"first_line_to_running_log_ms={_first_line_to_now_ms} "
+                f"same_process={_method_entry_gap_results.get('same_process')} "
+                f"identity_mismatch_reasons={','.join(_method_entry_gap_results.get('identity_mismatch_reasons', [])) or 'none'} "
+                f"remote_python_resume_wall_unix_ns={_resume_wall_from_timing} "
+                f"restore_method_start_wall_unix_ns={_restore_start_wall_from_timing} "
+                f"restore_method_end_wall_unix_ns={_restore_end_wall_from_timing} "
+                f"modal_method_entry_wall_unix_ns={_method_first_line_wall_ns} "
+                f"restore_end_to_modal_method_ms={_restore_end_to_modal_ms}",
+                flush=True,
+            )
+        if not _QUIET or any(v is not None for v in context_snapshot_age.values()):
+            print(
+                "[v2.snapshot_timing] "
+                + " ".join(f"{key}={value if value is not None else 'unavailable'}" for key, value in context_snapshot_age.items())
+                + " request_latency_included=0_for_callback_age",
+                flush=True,
+            )
 
         # â”€â”€ Normal trace setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._request_count = getattr(self, "_request_count", 0) + 1
+        _request_identity_telemetry = _post_restore_identity_telemetry(
+            self,
+            request_id=_t4_request_id or request_id,
+            remote_identity=identity,
+            host_info=_entry_host,
+        )
 
         # â”€â”€ Full-trace: claim first request exactly once â”€â”€
         _full_trace_claimed = False
@@ -13520,15 +22458,28 @@ class ModalRuntimeEntrypoint:
         if context.trace is not None:
             _auth_cid = self.container_session_id or _V2_CONTAINER_SESSION_ID
             context.trace.container_session_id = _auth_cid
-            context.trace.set_metadata(
-                **identity,
-                trace_id=context.trace.trace_id,
-                restored_instance_id=getattr(self, "_restored_instance_id", ""),
-                restore_session_id=(self._restore_timing or {}).get("restore_session_id", ""),
-                legacy_container_session_id=_auth_cid,
-                request_origin_info=_request_origin_info,
-                **_resource_identity(),
-            )
+            trace_request_metadata = dict(identity)
+            trace_request_metadata.update({
+                "trace_id": context.trace.trace_id,
+                "restored_instance_id": getattr(self, "_restored_instance_id", ""),
+                "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
+                "legacy_container_session_id": _auth_cid,
+                "request_origin_info": _request_origin_info,
+                # ── E27 Gantt axis origin (same-process monotonic clock) ──
+                "remote_python_resume_mono_ns": (self._restore_timing or {}).get(
+                    "remote_python_resume_mono_ns"
+                ),
+                "restore_method_start_mono_ns": (self._restore_timing or {}).get(
+                    "restore_method_start_mono_ns"
+                ),
+                "restore_method_end_mono_ns": (self._restore_timing or {}).get(
+                    "restore_method_end_mono_ns"
+                ),
+                "modal_method_entry_mono_ns": _method_first_line_ns,
+            })
+            trace_request_metadata.update(_request_identity_telemetry)
+            trace_request_metadata.update(_resource_identity())
+            context.trace.set_metadata(**trace_request_metadata)
             if _cgroup_sampler is not None and _method_entry_gap_results.get("same_process", False):
                 _cgroup_sampler.set_phase_source(
                     lambda: (
@@ -13564,6 +22515,7 @@ class ModalRuntimeEntrypoint:
                     # â”€â”€ Correlation identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     "restored_instance_id": getattr(self, "_restored_instance_id", ""),
                     "restore_session_id": (self._restore_timing or {}).get("restore_session_id", ""),
+                    "post_restore_nonce": getattr(self, "_post_restore_nonce", ""),
                     "restore_count": getattr(self, "_restore_count", 0),
                     "request_count": getattr(self, "_request_count", 0),
                     "legacy_container_session_id": self.container_session_id or _V2_CONTAINER_SESSION_ID,
@@ -13575,6 +22527,7 @@ class ModalRuntimeEntrypoint:
                     "trigger_source": _request_origin_info.get("trigger_source", ""),
                     # â”€â”€ Remote-observed identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     **identity,
+                    **_request_identity_telemetry,
                     **_resource_identity(),
                     "stored_snapshot_model_order": getattr(
                         getattr(self, "_cpu_snapshot_models", None),
@@ -13591,10 +22544,77 @@ class ModalRuntimeEntrypoint:
                     "workflow_hash": plan.workflow_hash,
                 },
             )
+            # ── E27: method-setup span + earliest memory boundary (gated) ──
+            # Captures the request-accept memory state and a method-setup
+            # span that the Gantt renderer consumes.  No-op unless
+            # COMFYMODAL_V2_E27_FORENSICS is set.
+            try:
+                from .e27_forensics import (
+                    e27_forensics_enabled,
+                    snapshot_e27_memory,
+                )
+                from .gantt_telemetry import register_gantt_span
+
+                if e27_forensics_enabled():
+                    snapshot_e27_memory(
+                        context.trace,
+                        "request_accept",
+                        request_id=_t4_request_id or request_id,
+                    )
+                    register_gantt_span(
+                        "method_setup",
+                        start_mono_ns=_method_first_line_ns,
+                        end_mono_ns=time.monotonic_ns(),
+                        lane="MAIN",
+                        metadata={"request_id": _t4_request_id or request_id},
+                    )
+            except Exception:
+                pass
             context.trace.emit("run_plan_trace_setup_end", phase="method")
+            context.trace.emit(
+                "remote_setup_schedule",
+                phase="method",
+                metadata={
+                    "schedule_start_mono_ns": int(_setup_schedule_start_ns),
+                    "schedule_end_mono_ns": int(_setup_schedule_end_ns),
+                    "schedule_ms": round((_setup_schedule_end_ns - _setup_schedule_start_ns) / 1_000_000, 3),
+                    "cc_prefetch_scheduled": int(_cc_prefetch_scheduled),
+                    "input_types_warm_scheduled": int(_itw_scheduled),
+                    "seed_derived": int(bool(_request_seed_obs)),
+                },
+            )
 
         # â”€â”€ First status yield â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── E29: canonical ledger plan-receipt boundary ────────────────────
+        # The first status yield is the authoritative "plan received" point;
+        # stamp it on the canonical axis.
+        try:
+            from .critical_path_ledger import record_event as _ledger_event
+            _ledger_event("plan_received", mono_ns=time.monotonic_ns())
+        except Exception:
+            pass
+        # ── E29: close the setup-schedule span at plan receipt ───────────
+        # The coarse 263 ms / 872 ms buckets now have real owners: identity
+        # capture, plan deserialize, setup/schedule submits, and the
+        # plan-received yield (each an explicit ledger span/event).
+        if _span_schedule_setup is not None:
+            try:
+                _span_schedule_setup.finish(mono_ns=time.monotonic_ns())
+            except Exception:
+                pass
         _plan_received_mono_ns = time.monotonic_ns()
+        # ── E29: open request:executor-run at plan receipt ───────────────
+        # The span represents plan_received -> first_durable_result on the
+        # serial axis; opening it HERE (not after the durable result) makes
+        # the whole executor run reconcile inside it.
+        try:
+            from .critical_path_ledger import begin_span as _ledger_begin_span
+            _span_durable_result = _ledger_begin_span(
+                "request:executor-run", lane="EXECUTOR",
+                start_mono_ns=_plan_received_mono_ns,
+            )
+        except Exception:
+            _span_durable_result = None
         context.trace.emit("run_plan_first_status_yield", phase="method")
         yield {
             "type": "status",
@@ -13602,7 +22622,11 @@ class ModalRuntimeEntrypoint:
             "request_id": request_id,
             "trace_id": context.trace.trace_id if context.trace else "",
         }
-        _execution_stream = self.executor.stream(plan, context=context)
+        _execution_stream = guard_remote_cancel_stream(
+            self.executor.stream(plan, context=context),
+            watcher=_remote_watcher,
+            request_id=request_id,
+        )
         async for event in _execution_stream:
             if event.get("type") == "error" and _full_trace_claimed:
                 try:
@@ -13693,7 +22717,22 @@ class ModalRuntimeEntrypoint:
                 data.update(context_snapshot_age)
                 _legacy_read_drain = getattr(self._legacy_module, "_drain_completed_active_read_diagnostics", None)
                 if callable(_legacy_read_drain):
-                    _active_read_records = _legacy_read_drain(_t4_request_id or request_id)
+                    # Pass exact restore identities alongside the request_id so
+                    # records without a request_id (lifecycle/preload reads)
+                    # still associate via restored_instance_id +
+                    # restore_session_id, while request-tagged records are
+                    # consumed only by their exact request.
+                    _drain_restored_instance_id = str(
+                        getattr(self, "_restored_instance_id", "") or ""
+                    )
+                    _drain_restore_session_id = str(
+                        (self._restore_timing or {}).get("restore_session_id", "") or ""
+                    )
+                    _active_read_records = _legacy_read_drain(
+                        _t4_request_id or request_id,
+                        restored_instance_id=_drain_restored_instance_id,
+                        restore_session_id=_drain_restore_session_id,
+                    )
                     if _active_read_records:
                         _structured_report = data.get("pre_sampler_structured_report")
                         _structured_report = dict(_structured_report) if isinstance(_structured_report, Mapping) else {}
@@ -13702,6 +22741,7 @@ class ModalRuntimeEntrypoint:
                 _rt = self._restore_timing or _LATEST_LIFECYCLE_TIMING
                 if _rt is not None and "_restore_timing" not in data:
                     data["_restore_timing"] = dict(_rt)
+                _stage13_interval_start_mono_ns = time.monotonic_ns()
                 # â”€â”€ Request-origin summary (T0â€“T5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Gather raw wall timestamps from origin info + local captures
                 _t4_wall = _method_first_line_wall_ns
@@ -13804,6 +22844,10 @@ class ModalRuntimeEntrypoint:
                 # Embed raw timestamps + intervals + clock scope in result data
                 data["request_id"] = _t4_request
                 data["trigger_source"] = _trig_src
+                # Legitimate input ID for the host transport: learned from the
+                # yielded result event metadata (Modal SDK 1.4.3 exposes no
+                # generator input_id attribute).
+                data["modal_input_id"] = str(identity.get("modal_input_id", ""))
                 data["raw_timestamps"] = {
                     "t0_ui_trigger_wall_unix_ns": _t0_wall_ns,
                     "t1_local_receive_wall_unix_ns": _t1_wall_ns,
@@ -13814,6 +22858,20 @@ class ModalRuntimeEntrypoint:
                     "modal_first_remote_event_wall_unix_ns": _first_remote_event_wall_ns,
                     "t4_modal_method_entry_wall_unix_ns": _t4_wall,
                     "t5_prompt_executor_invoke_start_wall_unix_ns": _t5_wall_ns,
+                    # Request-scoped restore raw fields for host reconcile:
+                    # submission -> python resume stays a combined interval
+                    # (no fabricated platform split), and these raw fields let
+                    # the host compute it against THIS request's session rather
+                    # than any stale global fallback.
+                    "remote_python_resume_wall_unix_ns": (
+                        _rt.get("remote_python_resume_wall_unix_ns") if isinstance(_rt, dict) else None
+                    ),
+                    "restored_instance_id": (
+                        _rt.get("restored_instance_id", "") if isinstance(_rt, dict) else ""
+                    ),
+                    "restore_session_id": (
+                        _rt.get("restore_session_id", "") if isinstance(_rt, dict) else ""
+                    ),
                 }
                 data["intervals_ms"] = {
                     "run_trigger_to_local_receive_ms": _t0_t1_ms,
@@ -13835,6 +22893,7 @@ class ModalRuntimeEntrypoint:
                     "run_trigger_to_modal_entry": _t0_t4_scope,
                     "run_trigger_to_prompt_executor": _t0_t5_scope,
                 }
+                _stage13_interval_end_mono_ns = time.monotonic_ns()
 
                 _modal_input_id = identity.get("modal_input_id", "")
                 _modal_task_id = identity.get("container_task_id", "")
@@ -13844,27 +22903,28 @@ class ModalRuntimeEntrypoint:
                 _dispatch_to_entry = _t2_t4_ms
                 _entry_to_exec = _t4_t5_ms       # same as method_entry_to_prompt_executor
                 _trig_to_exec = _t0_t5_ms        # same as run_trigger_to_prompt_executor
-                print(
-                    f"[v2.remote_request_origin.remote] "
-                    f"request_id={_t4_request} "
-                    f"trigger_source={_trig_src} "
-                    f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
-                    f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
-                    f"modal_generator_create_start_unix_ns={self._fmt_or_absent(_gen_create_start_wall_ns)} "
-                    f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
-                    f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
-                    f"modal_first_iteration_start_unix_ns={self._fmt_or_absent(_first_iter_start_wall_ns)} "
-                    f"modal_first_remote_event_unix_ns={self._fmt_or_absent(_first_remote_event_wall_ns)} "
-                    f"modal_method_entry_unix_ns={_t4_wall} "
-                    f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
-                    f"trigger_to_dispatch_ms={_trig_to_dispatch} "
-                    f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
-                    f"modal_entry_to_executor_ms={_entry_to_exec} "
-                    f"trigger_to_executor_ms={_trig_to_exec} "
-                    f"modal_input_id={_modal_input_id} "
-                    f"modal_task_id={_modal_task_id}",
-                    flush=True,
-                )
+                if not _QUIET:
+                    print(
+                        f"[v2.remote_request_origin.remote] "
+                        f"request_id={_t4_request} "
+                        f"trigger_source={_trig_src} "
+                        f"ui_trigger_unix_ms={self._fmt_or_absent(_t0_wall)} "
+                        f"local_receive_unix_ns={self._fmt_or_absent(_t1_wall_ns)} "
+                        f"modal_generator_create_start_unix_ns={self._fmt_or_absent(_gen_create_start_wall_ns)} "
+                        f"modal_submission_attempt_unix_ns={self._fmt_or_absent(_t2_wall_ns)} "
+                        f"modal_generator_created_unix_ns={self._fmt_or_absent(_t3_wall_ns)} "
+                        f"modal_first_iteration_start_unix_ns={self._fmt_or_absent(_first_iter_start_wall_ns)} "
+                        f"modal_first_remote_event_unix_ns={self._fmt_or_absent(_first_remote_event_wall_ns)} "
+                        f"modal_method_entry_unix_ns={_t4_wall} "
+                        f"prompt_executor_invoke_start_unix_ns={self._fmt_or_absent(_t5_wall_ns)} "
+                        f"trigger_to_dispatch_ms={_trig_to_dispatch} "
+                        f"dispatch_to_modal_entry_ms={_dispatch_to_entry} "
+                        f"modal_entry_to_executor_ms={_entry_to_exec} "
+                        f"trigger_to_executor_ms={_trig_to_exec} "
+                        f"modal_input_id={_modal_input_id} "
+                        f"modal_task_id={_modal_task_id}",
+                        flush=True,
+                    )
                 _critical_path_data = data.pop("_v2_critical_path_data", {})
                 if not isinstance(_critical_path_data, Mapping):
                     _critical_path_data = {}
@@ -13907,6 +22967,29 @@ class ModalRuntimeEntrypoint:
                     _cgroup_sampler.report()
                     self._cgroup_sampler = None
                     _cgroup_sampler = None
+                _stage13_resource_start_mono_ns = time.monotonic_ns()
+                if getattr(self, "_resource_tel", None) is not None:
+                    try:
+                        from .resource_telemetry import build_stage_boundaries
+                        _tel_events = (data.get("trace") or {}).get("events") or []
+                        _tel_bounds = build_stage_boundaries(
+                            _tel_events, data.get("_restore_timing") or {},
+                        )
+                        data["resource_telemetry"] = self._resource_tel.summarize(_tel_bounds)
+                    except Exception:
+                        pass
+                    self._resource_tel = None
+                # Fail-closed GPU provenance: requested spec vs actual allocated
+                # hardware (torch device properties) on every result payload.
+                try:
+                    data["gpu_allocation"] = _detect_gpu_allocation(
+                        _MODAL_RESOURCES.get("spec", ModalRuntimeSpec()).gpu,
+                        print_line=not _QUIET,
+                    )
+                except Exception:
+                    pass
+                _stage13_resource_end_mono_ns = time.monotonic_ns()
+                _stage13_waterfall_start_mono_ns = time.monotonic_ns()
                 _is_benchmark = str(_request_origin_info.get("trigger_source", "")).lower() in {"benchmark", "acceptance_benchmark"}
                 try:
                     _command_start_ms = _request_origin_info.get("ui_run_triggered_wall_unix_ms")
@@ -13941,7 +23024,1210 @@ class ModalRuntimeEntrypoint:
                         f"[v2.waterfall] status=error error_type={type(_waterfall_exc).__name__}",
                         flush=True,
                     )
+                _stage13_waterfall_end_mono_ns = time.monotonic_ns()
+                # ── E27 ASCII Gantt telemetry (Target E; gated, additive) ──
+                # Renders the FULL REQUEST + MODEL-READY ZOOM views from the
+                # same remote monotonic axis as the structured trace.  No-op
+                # unless COMFYMODAL_V2_GANTT_TELEMETRY is set; never alters
+                # the result payload or the generation path.
+                try:
+                    from .gantt_telemetry import (
+                        emit_gantt_records,
+                        collect_gantt_report,
+                    )
+                    from .gantt_canonical import emit_canonical_gantt
+                    from .e27_forensics import (
+                        cast_account_summary,
+                        e27_forensics_enabled,
+                        forward_cast_account_summary,
+                        clip_forward_decomposition,
+                    )
+
+                    _gantt_trace = getattr(context, "trace", None) or (
+                        data.get("trace") if isinstance(data, dict) else None
+                    )
+                    if _gantt_trace is not None:
+                        emit_gantt_records(
+                            _gantt_trace,
+                            request_id=_t4_request_id or request_id,
+                        )
+                        # ── E29: canonical-ledger Gantt (request-scoped) ──
+                        # Renders ONLY from the canonical ledger store, which
+                        # begin_request() reset at method entry — a reused
+                        # container can never append previous-request spans.
+                        try:
+                            from . import critical_path_ledger as _cpl
+                            emit_canonical_gantt(
+                                _cpl,
+                                request_id=_t4_request_id or request_id,
+                            )
+                        except Exception:
+                            pass
+                        _gantt_report = collect_gantt_report(_gantt_trace)
+                        if isinstance(data, dict) and _gantt_report.get("spans"):
+                            data["gantt_telemetry"] = _gantt_report
+                        # E27: cast-account summary (Target D evidence).
+                        if e27_forensics_enabled():
+                            _casts = cast_account_summary()
+                            if isinstance(data, dict) and _casts.get("operations"):
+                                data["e27_cast_account"] = _casts
+                            # E27 Follow-Up A: forward-cast (real cast path)
+                            # summary + CLIP-forward decomposition.
+                            _fwd = forward_cast_account_summary()
+                            if isinstance(data, dict) and (
+                                _fwd.get("weight_casts")
+                                or _fwd.get("bias_casts")
+                                or _fwd.get("other_casts")
+                            ):
+                                data["e27_forward_cast_account"] = _fwd
+                            _fwd_decomp = clip_forward_decomposition(_gantt_trace)
+                            if isinstance(data, dict) and _fwd_decomp.get(
+                                "clip_forward_ms"
+                            ) is not None:
+                                data["e27_clip_forward_decomposition"] = _fwd_decomp
+                except Exception:
+                    pass
+                # ── Remote result emission boundary ─────────────────
+                # Captured as close as possible to the actual result yield so
+                # the host can measure the true remote emit -> local receipt
+                # interval (instead of inferring a multi-second output tail).
+                # Additive only: no yielded-data semantics change.
+                _stamp_remote_result_emit(
+                    data,
+                    event,
+                    getattr(context, "trace", None),
+                    request_id=_t4_request_id or request_id,
+                )
+                # ── E29: durable-result span + canonical ledger emission ──
+                # The result event is the first durable result boundary: close
+                # the durable-result span at the exact emit stamp, then emit
+                # the complete canonical ledger report (serial zero-gap
+                # reconciliation + Gantt) and persist the full report into the
+                # run artifact for offline validation.
+                #
+                # NEVER silently swallow a ledger finalization failure on an
+                # E29 tracer-enabled run: the generation result and the tracer
+                # verdict are separate concerns, so a finalization exception
+                # becomes explicit structured evidence
+                # (canonical_ledger_status="error" + canonical_ledger_error).
+                _ledger_finalize_error: dict[str, Any] | None = None
+                try:
+                    from .critical_path_ledger import (
+                        capture_ledger_report_for_artifact,
+                        emit_ledger_report,
+                        record_event as _ledger_event,
+                    )
+                    _emit_mono = int(data.get("remote_result_emit_mono_ns") or 0)
+                    # ── E29: canonical ledger output-persist done ─────────
+                    # The final persistence/descriptor assembly marker just
+                    # before the first durable result boundary.
+                    try:
+                        _ledger_event(
+                            "output_persist_done",
+                            mono_ns=_emit_mono or time.monotonic_ns(),
+                            metadata={"request_id": _t4_request_id or request_id},
+                        )
+                    except Exception:
+                        pass
+                    _ledger_event(
+                        "first_result_ready"
+                        if isinstance(data, dict)
+                        and data.get("output_durability_mode") == "off"
+                        else "first_durable_result",
+                        mono_ns=_emit_mono or time.monotonic_ns(),
+                    )
+                    # ── E29: close the result-assembly span ───────────────
+                    # The span opened at output_persist_start (inside
+                    # _execute_v2_prompt_executor) closes at this exact
+                    # first-durable-result stamp.
+                    try:
+                        _e29_ras = getattr(self, "_e29_result_assembly_span", None)
+                        if _e29_ras is not None:
+                            _e29_ras.finish(
+                                end_mono_ns=_emit_mono or time.monotonic_ns()
+                            )
+                            self._e29_result_assembly_span = None
+                    except Exception:
+                        pass
+                    # ── E29: authoritative serial-ledger END endpoint ──────
+                    # first_durable_result is the canonical end of the E29
+                    # zero-gap window; record it so the acceptance report
+                    # bounds by this exact boundary, never max(existing).
+                    try:
+                        from .critical_path_ledger import set_authoritative_endpoints
+                        set_authoritative_endpoints(
+                            first_durable_result_mono_ns=_emit_mono or time.monotonic_ns()
+                        )
+                    except Exception:
+                        pass
+                    if _span_durable_result is not None:
+                        try:
+                            _span_durable_result.finish(
+                                mono_ns=_emit_mono or time.monotonic_ns()
+                            )
+                        except Exception as _span_finish_exc:
+                            _ledger_finalize_error = {
+                                "stage": "span_finish",
+                                "error_type": type(_span_finish_exc).__name__,
+                                "message": str(_span_finish_exc)[:300],
+                            }
+                    emit_ledger_report(request_id=_t4_request_id or request_id)
+                    _ledger_artifact_report = capture_ledger_report_for_artifact()
+                    if _ledger_artifact_report is not None and isinstance(data, dict):
+                        data["canonical_ledger"] = _ledger_artifact_report
+                        # ── E29: a span-finish failure must NOT be masked ──
+                        # The generation result and the tracer verdict are
+                        # separate concerns: if the durable-result span
+                        # failed to close, the ledger is incomplete and the
+                        # artifact must say so (never a silent "ok").
+                        if _ledger_finalize_error is not None:
+                            data["canonical_ledger_status"] = "error"
+                            data["canonical_ledger_error"] = _ledger_finalize_error
+                        else:
+                            data["canonical_ledger_status"] = "ok"
+                    elif isinstance(data, dict):
+                        data["canonical_ledger_status"] = "error"
+                        data["canonical_ledger_error"] = {
+                            "stage": "capture",
+                            "error_type": "EmptyReport",
+                            "message": "capture_ledger_report_for_artifact returned None",
+                        }
+                except Exception as _ledger_finalize_exc:
+                    _ledger_finalize_error = {
+                        "stage": "finalize",
+                        "error_type": type(_ledger_finalize_exc).__name__,
+                        "message": str(_ledger_finalize_exc)[:300],
+                    }
+                    if isinstance(data, dict):
+                        data["canonical_ledger_status"] = "error"
+                        data["canonical_ledger_error"] = _ledger_finalize_error
+                # ── E40: single acceptance-authority telemetry blocks ────
+                # loader_selection / runtime_status / resolved_config are
+                # emitted exactly once per run, here at result assembly.
+                # The v2ctl StructuralValidator enforces them when present.
+                if isinstance(data, dict):
+                    try:
+                        from . import loader_selection as _ls_emit
+                        from .runtime_status import build_runtime_status as _brs
+                        _sel_snapshot = _ls_emit.snapshot()
+                        # Snapshot-resident arms are realized BY the restore
+                        # itself (no tracked disk read occurs), so an absent
+                        # observation for those arms means the snapshot
+                        # delivery was the observed arm — record it as such.
+                        for _role, _entry in _sel_snapshot.items():
+                            if not _entry.get("observed") and _entry.get("requested") in (
+                                "cpu_snapshot_native", "policy_v1",
+                            ):
+                                _ls_emit.record_observed(_role, _entry["requested"])
+                        _sel_snapshot = _ls_emit.snapshot()
+                        if _sel_snapshot:
+                            data["loader_selection"] = _sel_snapshot
+                        _e40_reasons = list(_ls_emit.mismatches())
+                        try:
+                            _ledger_ok = data.get("canonical_ledger_status") == "ok"
+                        except Exception:
+                            _ledger_ok = False
+                        if not _ledger_ok:
+                            _e40_reasons.append("canonical_ledger_not_ok")
+                        data["runtime_status"] = _brs(
+                            loader_selection=_sel_snapshot or None,
+                            reasons=_e40_reasons,
+                        )
+                        _e40_rc = getattr(self, "_e40_resolved_config", None)
+                        if _e40_rc is not None:
+                            data["resolved_config"] = {
+                                "fingerprint": _e40_rc.fingerprint(),
+                                "controls": _e40_rc.as_dict(),
+                            }
+                    except Exception as _e40_emit_exc:
+                        try:
+                            data.setdefault("e40_telemetry_error", str(_e40_emit_exc)[:300])
+                        except Exception:
+                            pass
+                # ── E29: durable-result span opened at plan receipt ──────
+                # NOTE: the span is opened at plan receipt (see the
+                # plan-receipt section above); the block below is REMOVED —
+                # opening it here would be a use-after-close / wrong-lifetime
+                # (the span must already exist when the durable result closes
+                # it).  This comment keeps the intent explicit.
+                # ── Stage-13 decomposition (diagnostics; additive only) ──
+                # Fine-grained "Output encode / descriptor" children so the
+                # integrated run can prove whether any child exceeds the
+                # >50 ms effort threshold.  Parent window = output_collect_start
+                # -> remote_result_emit; children tile it; reconciliation is
+                # reported, never enforced.
+                try:
+                    from .stage13_breakdown import build_stage13_breakdown
+                    _s13_boundaries = data.pop("_stage13_boundaries", None) or {}
+                    if isinstance(_s13_boundaries, dict):
+                        _s13_boundaries.setdefault("emit_mono_ns", data.get("remote_result_emit_mono_ns"))
+                        _s13_boundaries["interval_start_mono_ns"] = _stage13_interval_start_mono_ns
+                        _s13_boundaries["interval_end_mono_ns"] = _stage13_interval_end_mono_ns
+                        _s13_boundaries["resource_start_mono_ns"] = _stage13_resource_start_mono_ns
+                        _s13_boundaries["resource_end_mono_ns"] = _stage13_resource_end_mono_ns
+                        _s13_boundaries["waterfall_start_mono_ns"] = _stage13_waterfall_start_mono_ns
+                        _s13_boundaries["waterfall_end_mono_ns"] = _stage13_waterfall_end_mono_ns
+                        data["output_stage13_breakdown"] = build_stage13_breakdown(_s13_boundaries)
+                except Exception:
+                    pass
             yield event
+
+        # Variant A: the asset commit completes after the result event was
+        # already delivered.  Yield a definitive persistence event so the
+        # local drain can record the final state.  The Modal container
+        # entrypoint drives this generator to exhaustion even when the client
+        # closed the stream, so this tail WILL run.
+        _deferred_commit_event = await self._finalize_deferred_commit(request_id=request_id)
+        if _deferred_commit_event is not None:
+            # The deferred commit runs AFTER the result event was already
+            # yielded, so its trace events cannot be part of the result trace
+            # that the waterfall builder read at build time.  Attach them
+            # post-hoc to the same channel the builder consumes
+            # (result["trace"]["events"]) so any downstream rebuild
+            # (e.g. benchmark host reconciliation) sees the real span for the
+            # "Deferred persistence after yield" row.  The events are carried
+            # separately (instance stash) — never on the public event dict.
+            _dc_trace_events = getattr(self, "_deferred_commit_trace_events", None) or []
+            _result_data = locals().get("data")
+            if _dc_trace_events and isinstance(_result_data, dict):
+                _result_trace = _result_data.get("trace")
+                if isinstance(_result_trace, dict) and isinstance(_result_trace.get("events"), list):
+                    _result_trace["events"].extend(
+                        evt for evt in _dc_trace_events if isinstance(evt, dict)
+                    )
+            yield _deferred_commit_event
+
+    async def run_golden_parallel_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run the distinct Golden parallel control path.
+
+        Adapter validation, volume handling, identity projection, and terminal
+        result shaping stay shared with the frozen serial adapter.  The mode
+        marker selects ``golden_parallel_execute`` at the final orchestration
+        seam; no serial loader or sampler implementation is duplicated.
+        """
+        outer_mark_lifetime = __import__(
+            "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
+        )._OuterLifetime
+        outer = outer_mark_lifetime()
+        outer.mark("remote_method_entry")
+        if not isinstance(request, Mapping):
+            outer.mark("remote_method_return")
+            yield {
+                "type": "error",
+                "request_id": "",
+                "message": "golden_request_must_be_mapping",
+            }
+            return
+        parallel_request = dict(request)
+        parallel_request["golden_mode"] = "parallel"
+        async for event in self._run_golden_stream_impl(parallel_request):
+            # pre-yield / post-yield-resume are the seam that decides whether a
+            # Modal-reported execution time includes caller-side suspension.
+            outer.mark("pre_yield", detail=str(event.get("type", "")))
+            yield event
+            outer.mark("post_yield_resume")
+        outer.mark("remote_method_return")
+        outer.report()
+        # Container stdout is not captured into run artifacts, so the marks must
+        # be persisted into the Golden telemetry JSON, which v2ctl does collect.
+        _telemetry_path = getattr(self, "_golden_telemetry_path", None)
+        if _telemetry_path:
+            _inject = __import__(
+                "comfymodal_runtime.golden_parallel",
+                fromlist=["inject_outer_marks_into_telemetry"],
+            ).inject_outer_marks_into_telemetry
+            outer.marks.insert(
+                0, ("golden_call_telemetry_path", time.monotonic_ns(), 0, "")
+            )
+            _inject(_telemetry_path, outer.marks)
+
+    async def run_golden_serial_stream(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run the frozen serial Golden adapter through the shared Python seam."""
+        async for event in self._run_golden_stream_impl(request):
+            yield event
+
+    async def _run_golden_stream_impl(
+        self,
+        request: Mapping[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Thin Golden Modal adapter: validate/normalize the request, then hand
+        off to ``golden_serial_execute`` exactly once.
+
+        This adapter deliberately does NOT construct an ExecutionPlan and does
+        NOT touch run_plan_stream/run_prompt_stream/executor machinery — Golden
+        owns its own stage ordering, teardown, and durability.  The Modal
+        runtime-state Volume handle is passed through unwrapped (no
+        ``GoldenVolumeHandle``) because ``golden_durable_commit`` needs the
+        real ``.commit`` API.
+        """
+        # Lazy Golden imports: keep module import cost zero when unused.
+        from .golden_serial import (
+            GoldenRequest,
+            STAGE_ORDER,
+            golden_serial_execute,
+            normalize_attention_backend,
+            normalize_deep_trace_level,
+            resolve_clip_residency,
+            prepare_cpu_clip_prefetch,
+        )
+        from .golden_parallel import golden_parallel_execute
+        from .output_durability import resolve_output_durability
+
+        # Direct Golden bypasses run_plan_stream, where this synchronization
+        # normally occurs.  Refresh before claiming the restore-scoped trace.
+        sync_observability_gates()
+
+        # Golden is a direct adapter and does not pass through
+        # run_plan_stream's request counter.  Count it at this request entry,
+        # after restore has produced the nonce but before any graph work.
+        self._request_count = getattr(self, "_request_count", 0) + 1
+        request_id_raw: Any = ""
+        identity_telemetry: dict[str, Any] = {}
+        telemetry_path: Path | None = None
+        golden_call_start_wall_ns: int | None = None
+        golden_call_start_mono_ns: int | None = None
+        golden_call_end_wall_ns: int | None = None
+        golden_call_end_mono_ns: int | None = None
+        golden_trace_config: dict[str, Any] = {}
+        golden_trace_summary: dict[str, Any] = {}
+        cpu_prefetch_ticket = None
+        _full_trace_claimed = False
+        _full_trace_op_id = ""
+        _full_trace_request_requested = False
+        # Restore is never a deep-trace boundary.  Keep this field for result
+        # schema compatibility, but it is always false for a request-owned
+        # session.
+        _full_trace_requested_at_restore = False
+        _full_trace_session_available = bool(
+            _full_trace_requested_at_restore
+            and getattr(self, "_full_trace_session", None) is not None
+        )
+        _full_trace_failure_reason = str(
+            getattr(self, "_full_trace_activation_reason", "") or ""
+        )
+        try:
+            if not isinstance(request, Mapping):
+                raise ValueError("golden_request_must_be_mapping")
+            request_id_raw = request.get("request_id")
+            if not isinstance(request_id_raw, str) or not request_id_raw.strip():
+                raise ValueError("golden_request_id_required_nonempty_string")
+            output_policy = resolve_output_durability()
+            requested_mode = str(request.get("golden_mode", "serial")).strip().lower()
+            if requested_mode not in {"serial", "parallel"}:
+                raise ValueError("golden_mode_invalid")
+            c0_mmap_lifecycle = str(
+                request.get(
+                    "c0_mmap_lifecycle",
+                    os.environ.get("COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE", "fresh"),
+                )
+                or "fresh"
+            ).strip().lower()
+            if c0_mmap_lifecycle not in {"fresh", "whole", "epoch"}:
+                raise ValueError("golden_c0_mmap_lifecycle_invalid")
+            source_threads_deployed = str(
+                os.environ.get("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            source_threads_requested = request.get("c0_source_threads", False)
+            if not isinstance(source_threads_requested, bool):
+                raise ValueError("golden_c0_source_threads_must_be_bool")
+            if source_threads_requested != source_threads_deployed:
+                raise ValueError("golden_c0_source_threads_deployment_mismatch")
+            if source_threads_deployed and c0_mmap_lifecycle not in {
+                "fresh", "whole",
+            }:
+                # The C0 source owner implements both exact-window (fresh) and
+                # one-whole-file-mapping (whole) lifecycles behind the same
+                # selector, so both are valid arms of the source architecture
+                # comparison.  Only lifecycles it does not implement are
+                # refused.  This gate used to hard-require "whole", which
+                # pinned the architecture to one lifecycle and made the
+                # fresh/whole comparison impossible.
+                raise ValueError("golden_c0_source_threads_unsupported_lifecycle")
+            # The source-thread arm is restore/deploy-owned.  Never mutate the
+            # process environment per request; a mismatch fails closed above.
+            if not source_threads_deployed:
+                os.environ["COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"] = c0_mmap_lifecycle
+            # The resolved value is placed on GoldenRequest below.  This is a
+            # real request selector, not an evidence-only environment marker.
+            attention_backend = normalize_attention_backend(
+                request.get(
+                    "attention_backend",
+                    os.environ.get("COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND", "sage"),
+                )
+            )
+            _deep_trace_level = normalize_deep_trace_level(request.get("deep_trace", False))
+            _full_trace_request_requested = _deep_trace_level != "off"
+            prompt = request.get("prompt")
+            if not isinstance(prompt, Mapping) or not prompt:
+                raise ValueError("golden_prompt_mapping_required")
+            extra_data_raw = request.get("extra_data")
+            if extra_data_raw is None:
+                extra_data_raw = {}
+            if not isinstance(extra_data_raw, Mapping):
+                raise ValueError("golden_extra_data_must_be_mapping")
+            restore_metadata = _validate_golden_restore_metadata(
+                getattr(self, "_restore_timing", None)
+            )
+            identity_telemetry = _post_restore_identity_telemetry(
+                self,
+                request_id=request_id_raw.strip(),
+                remote_identity=_capture_remote_identity(),
+                host_info=_capture_host_info(),
+            )
+            identity_telemetry["attention_backend"] = attention_backend
+            identity_telemetry["attention_backend_configured"] = (
+                attention_backend or "auto"
+            )
+            identity_telemetry["golden_mode"] = requested_mode
+            identity_telemetry["c0_mmap_lifecycle"] = c0_mmap_lifecycle
+            identity_telemetry["c0_source_threads"] = source_threads_deployed
+            identity_telemetry["deep_trace_level_requested"] = _deep_trace_level
+            identity_telemetry["deep_trace_level_effective"] = "off"
+            identity_telemetry["output_durability_mode"] = output_policy.mode
+            identity_telemetry["durability_requested"] = output_policy.durability_requested
+            identity_telemetry.update(
+                _golden_sage_provenance(self)
+            )
+            _emit_golden_diagnostics_config(
+                "request",
+                api=getattr(self, "_legacy_api", self),
+                attention_configured=attention_backend or "auto",
+                attention_resolved="pending",
+            )
+
+            # Sanitized request id for the local telemetry path: keep only
+            # path-safe characters and refuse traversal outside the golden dir.
+            sanitized = "".join(
+                ch for ch in request_id_raw.strip()
+                if ch.isalnum() or ch in "-_."
+            ).strip(".")
+            if not sanitized:
+                raise ValueError("golden_request_id_unsanitizable")
+            golden_dir = Path(RUNTIME_STATE_PATH, "golden")
+            telemetry_path = golden_dir / f"{sanitized}.json"
+            # Published for the outer-lifetime instrumentation in the streaming
+            # wrapper, which flushes its marks into this file once the method
+            # has returned; stdout alone is not captured into run artifacts.
+            self._golden_telemetry_path = str(telemetry_path)
+            if telemetry_path.resolve().parent != golden_dir.resolve():
+                raise ValueError("golden_telemetry_path_traversal_blocked")
+            golden_dir.mkdir(parents=True, exist_ok=True)
+
+            # Request-only deep capability.  No trace session or profiler is
+            # created by restore; this is the earliest validated Golden
+            # boundary, before readiness and model work.
+            if _full_trace_request_requested:
+                try:
+                    from .full_execution_trace import FullExecutionTraceSession as _FT
+                    _FT.reset_instance()
+                    _ft = _FT.create_if_enabled(
+                        container_session_id=(getattr(self, "container_session_id", "") or _V2_CONTAINER_SESSION_ID),
+                    )
+                    self._full_trace_session = _ft
+                    if _ft is None or not _ft.start_request_only(request_id_raw.strip()):
+                        _full_trace_failure_reason = "deep_trace_capability_unavailable"
+                        self._full_trace_session = None
+                    else:
+                        self._full_trace_activation_status = "request_created"
+                        _full_trace_session_available = True
+                        identity_telemetry["deep_trace_level_effective"] = "full"
+                        _emit_golden_profiler_lifecycle(
+                            "session_create", request_id=request_id_raw.strip(),
+                            status="ok", reason="request_boundary",
+                        )
+                        _full_trace_claimed = True
+                        _full_trace_op_id = _ft.operation_start(
+                            "golden_request_execution",
+                            semantic_key=request_id_raw.strip(),
+                            request_id=request_id_raw.strip(),
+                        ) or ""
+                        _emit_golden_profiler_lifecycle(
+                            "request_trace_start", request_id=request_id_raw.strip(),
+                            status="ok" if _full_trace_op_id else "error",
+                            reason="request_boundary",
+                        )
+                except BaseException as _ft_request_exc:
+                    _full_trace_failure_reason = type(_ft_request_exc).__name__
+                    self._full_trace_session = None
+
+            contract_raw = request.get("contract")
+            if contract_raw is not None:
+                raise ValueError("golden_contract_override_not_allowed")
+
+            # Persist the direct adapter's profiling contract before any
+            # readiness, activation, or model work.  The report generator
+            # consumes these top-level config fields to distinguish an
+            # explicit Golden claim from a merely observed function name.
+            _canonical_stage_order = [str(stage) for stage in STAGE_ORDER]
+            _required_canonical_stages = [
+                stage for stage in _canonical_stage_order
+                if output_policy.mode == "strict"
+                or stage != "golden_durable_commit"
+            ]
+            golden_trace_config = {
+                "golden_profile_contract": (
+                    _GOLDEN_TRACE_PROFILE_CONTRACT
+                    if requested_mode == "serial"
+                    else "direct_golden_parallel"
+                ),
+                "golden_mode": requested_mode,
+                "golden_profile_require_canonical_stages": True,
+                "output_durability_mode": output_policy.mode,
+                "required_canonical_stages": _required_canonical_stages,
+                "canonical_stage_order": _canonical_stage_order,
+                "deep_trace_requested": bool(_full_trace_request_requested),
+                "deep_trace_level_requested": _deep_trace_level,
+                "deep_trace_level_effective": "full" if _full_trace_claimed else "off",
+            }
+            golden_trace_summary = {
+                key: value for key, value in golden_trace_config.items()
+                if isinstance(value, (str, int, float, bool, type(None)))
+            }
+            golden_trace_summary["durability_requested"] = bool(
+                output_policy.durability_requested
+            )
+
+            volume = globals().get("_MODAL_RESOURCES", {}).get("runtime_state_volume")
+            if volume is None:
+                # The volume is mounted via the function's ``volumes={...}``
+                # declaration, but the module-level resource fallback may not
+                # carry the live handle in the remote container.
+                try:
+                    import modal as _modal_fallback
+                    volume = _modal_fallback.Volume.from_name(
+                        RUNTIME_STATE_VOLUME_NAME, create_if_missing=False,
+                    )
+                except Exception:
+                    volume = None
+            if volume is None:
+                raise RuntimeError("golden_runtime_state_volume_unavailable")
+            volume_mount_root = _validate_golden_runtime_mount_root(volume)
+            if not _golden_path_contained(golden_dir, volume_mount_root):
+                raise RuntimeError("golden_telemetry_path_outside_runtime_mount")
+            output_root = Path(volume_mount_root, "output_assets")
+            if not _golden_path_contained(output_root, volume_mount_root):
+                raise RuntimeError("golden_output_path_outside_runtime_mount")
+
+            # Resolve the mapping that is actually installed in this runtime.
+            # Passing it explicitly prevents Golden from silently importing a
+            # different registry or falling back to legacy executor state.
+            import nodes as _installed_nodes
+            node_classes = getattr(_installed_nodes, "NODE_CLASS_MAPPINGS", None)
+            if not isinstance(node_classes, Mapping):
+                raise RuntimeError("golden_node_class_mappings_invalid")
+            self._assert_golden_execution_isolated()
+
+            # The experiment arm is explicit at both request and deployment
+            # boundaries.  Its plan is frozen here, after request/path/
+            # isolation validation, and before any GPU/DynamicVRAM work.
+            cpu_prefetch_raw = request.get("cpu_qd2_prefetch", False)
+            if not isinstance(cpu_prefetch_raw, bool):
+                raise ValueError("golden_cpu_qd2_prefetch_must_be_bool")
+            if cpu_prefetch_raw and request.get("instant_tensor"):
+                raise ValueError("golden_cpu_qd2_prefetch_instant_tensor_conflict")
+
+            def _golden_snapshot_proof_supplier() -> dict[str, list[Any]]:
+                """Passive snapshot-proof supplier built ONLY from real,
+                currently-present instance surfaces.  Never mutates anything
+                and never calls teardown/quiescence helpers; fails closed when
+                no surface exists at all."""
+                return self._golden_snapshot_proof_surfaces()
+
+            # Fail-closed request-id containment: never delegate a raw id that
+            # could carry path separators or traversal sequences into Golden.
+            normalized_request_id = request_id_raw.strip()
+            if (
+                not normalized_request_id
+                or "/" in normalized_request_id
+                or "\\" in normalized_request_id
+                or ".." in normalized_request_id
+            ):
+                yield {
+                    "type": "error",
+                    "request_id": request_id_raw,
+                    "message": "golden_request_id_invalid"[:2000],
+                }
+                return
+
+            if _full_trace_request_requested and _full_trace_session_available:
+                _ft_config = getattr(self, "_full_trace_session", None)
+                _update_trace_config = getattr(
+                    _ft_config, "update_trace_config", None
+                )
+                if _ft_config is not None and callable(_update_trace_config):
+                    try:
+                        _update_trace_config(golden_trace_config)
+                    except BaseException as _ft_config_exc:
+                        print(
+                            f"[v2.full_trace] stage=golden_profile_contract "
+                            f"status=error error_type={type(_ft_config_exc).__name__}",
+                            flush=True,
+                        )
+
+            # Direct Golden owns its request lifecycle, so claim the full trace
+            # only after the request id has passed containment validation and
+            # immediately before any readiness or model work.
+            if _full_trace_requested_at_restore:
+                _ft = getattr(self, "_full_trace_session", None)
+                if _ft is not None and _full_trace_session_available:
+                    try:
+                        if _ft.claim_first_request(normalized_request_id):
+                            _full_trace_claimed = True
+                            _emit_golden_profiler_lifecycle(
+                                "request_claim", request_id=normalized_request_id,
+                                status="claimed", reason="first_request",
+                            )
+                            try:
+                                _ft.capture_milestone("golden_request_entry")
+                            except BaseException as _ft_entry_exc:
+                                print(
+                                    f"[v2.full_trace] stage=golden_request_entry "
+                                    f"status=error error_type={type(_ft_entry_exc).__name__}",
+                                    flush=True,
+                                )
+                            try:
+                                _full_trace_op_id = _ft.operation_start(
+                                    "golden_request_execution",
+                                    semantic_key=normalized_request_id,
+                                    request_id=normalized_request_id,
+                                ) or ""
+                            except BaseException as _ft_op_exc:
+                                print(
+                                    f"[v2.full_trace] stage=golden_request_execution "
+                                    f"status=error error_type={type(_ft_op_exc).__name__}",
+                                    flush=True,
+                                )
+                            if _full_trace_op_id:
+                                _emit_golden_profiler_lifecycle(
+                                    "request_trace_start",
+                                    request_id=normalized_request_id,
+                                    status="ok", reason="request_claimed",
+                                )
+                            else:
+                                _full_trace_failure_reason = "operation_not_started"
+                                _emit_golden_profiler_lifecycle(
+                                    "request_trace_start",
+                                    request_id=normalized_request_id,
+                                    status="error", reason="operation_not_started",
+                                )
+                        else:
+                            _full_trace_failure_reason = "claim_rejected"
+                            _emit_golden_profiler_lifecycle(
+                                "request_claim", request_id=normalized_request_id,
+                                status="rejected", reason="claim_rejected",
+                            )
+                    except BaseException as _ft_claim_exc:
+                        _full_trace_failure_reason = type(_ft_claim_exc).__name__
+                        _emit_golden_profiler_lifecycle(
+                            "request_claim", request_id=normalized_request_id,
+                            status="error", reason=_full_trace_failure_reason,
+                        )
+                        print(
+                            f"[v2.full_trace] stage=claim_first_request "
+                            f"status=error error_type={type(_ft_claim_exc).__name__}",
+                            flush=True,
+                        )
+                else:
+                    _full_trace_failure_reason = (
+                        _full_trace_failure_reason or "restore_session_unavailable"
+                    )
+                    _emit_golden_profiler_lifecycle(
+                        "request_claim", request_id=normalized_request_id,
+                        status="error", reason=_full_trace_failure_reason,
+                    )
+
+            golden_extra_data = dict(extra_data_raw)
+            golden_extra_data.update(
+                {
+                    key: value
+                    for key, value in identity_telemetry.items()
+                    if key.startswith("sage_runtime_mode_")
+                    or key in {"attention_backend_configured", "golden_mode"}
+                }
+            )
+            if resolve_clip_residency() == "fp32_cast_once":
+                golden_extra_data["clip_source_identity"] = _golden_ra9g_identity(
+                    prompt, extra_data_raw,
+                )
+            golden_request = GoldenRequest(
+                request_id=normalized_request_id,
+                prompt=dict(prompt),
+                extra_data=golden_extra_data,
+                attention_backend=attention_backend,
+                cpu_qd2_prefetch=cpu_prefetch_raw,
+                deep_trace=_full_trace_request_requested,
+            )
+            # ── Golden DynamicVRAM activation seam (official-equivalent) ──
+            # Exactly one call per request; the callee is idempotent per
+            # process (a repeat returns already_activated=True).  When the
+            # gate env is unset this honestly reports activated=False /
+            # reason="gate_not_set".  Fail closed: an activation failure
+            # emits exactly one bounded error event and never delegates to
+            # golden_serial_execute.
+            from .golden_aimdo_activation import activate_golden_dynamic_vram
+            try:
+                activation_evidence = activate_golden_dynamic_vram()
+            except Exception as exc:
+                if _full_trace_claimed:
+                    raise RuntimeError(f"golden_activation_failed:{exc}") from exc
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.close(cancel=True)
+                yield {
+                    "type": "error",
+                    "request_id": normalized_request_id,
+                    "message": f"golden_activation_failed:{exc}"[:2000],
+                }
+                return
+
+            # Golden's CLIP/VAE loaders require DynamicVRAM before any model
+            # transport.  Reject a missing gate here, before graph execution
+            # or model-sized I/O, rather than discovering it after QD reads.
+            if not (
+                activation_evidence.get("activated")
+                or activation_evidence.get("already_activated")
+            ):
+                if _full_trace_claimed:
+                    raise RuntimeError("golden_dynamic_vram_gate_required")
+                if cpu_prefetch_ticket is not None:
+                    cpu_prefetch_ticket.close(cancel=True)
+                yield {
+                    "type": "error",
+                    "request_id": normalized_request_id,
+                    "message": "golden_dynamic_vram_gate_required"[:2000],
+                    "golden_activation": activation_evidence,
+                }
+                return
+
+            if cpu_prefetch_raw:
+                cpu_prefetch_ticket = prepare_cpu_clip_prefetch(golden_request)
+
+            # Golden bypasses the normal ComfyUI request entrypoints, so it
+            # must perform the deferred GPU reattachment check itself.  Use
+            # only the API restored for this runtime; silently loading another
+            # API here could execute against an unprepared CPU-mode runtime.
+            legacy_api = getattr(self, "_legacy_api", None)
+            if legacy_api is None:
+                raise RuntimeError("golden_legacy_api_unavailable")
+            ensure_gpu_ready = getattr(
+                legacy_api, "_ensure_gpu_ready_for_request", None
+            )
+            if not callable(ensure_gpu_ready):
+                raise RuntimeError("golden_legacy_api_gpu_readiness_unavailable")
+            ensure_gpu_ready()
+            if cpu_prefetch_ticket is not None:
+                cpu_prefetch_ticket.event(
+                    "GPU_READINESS_COMPLETE",
+                    bytes_prefetched_at_gpu_ready=cpu_prefetch_ticket.bytes_available,
+                )
+
+            if cpu_prefetch_ticket is not None:
+                cpu_prefetch_ticket.event(
+                    "DYNAMICVRAM_ACCEPTED",
+                    activation=dict(activation_evidence),
+                    bytes_prefetched_at_dynamic_vram_ready=cpu_prefetch_ticket.bytes_available,
+                    bytes_read_at_dynamic_vram_ready=cpu_prefetch_ticket.telemetry().get("total_bytes", 0),
+                )
+            self._golden_execution_active = True
+            golden_call_start_wall_ns = time.time_ns()
+            golden_call_start_mono_ns = time.monotonic_ns()
+            try:
+                # VizTracer/Kineto must begin and end on this same async
+                # caller thread.  This boundary intentionally surrounds only
+                # the actual Golden await; finalization below is not profiled.
+                if _full_trace_claimed:
+                    try:
+                        _ft.start_torch_profiler()
+                    except BaseException as _ft_torch_start_exc:
+                        print(
+                            f"[v2.full_trace] stage=start_torch_profiler "
+                            f"status=error error_type={type(_ft_torch_start_exc).__name__}",
+                            flush=True,
+                        )
+                # Bind the actual request-local Golden await to the tracer
+                # owned by this restore-scoped session.  ContextVar state is
+                # preserved across coroutine suspension and reset by the
+                # context manager on success, failure, or cancellation.
+                _golden_trace_scope = (
+                    _ft.golden_trace_scope()
+                    if _full_trace_claimed
+                    else nullcontext()
+                )
+                with _golden_trace_scope:
+                    execute_golden = (
+                        golden_parallel_execute
+                        if requested_mode == "parallel"
+                        else golden_serial_execute
+                    )
+                    result = await execute_golden(
+                        golden_request,
+                        volume=volume,
+                        volume_mount_root=volume_mount_root,
+                        output_root=str(output_root),
+                        telemetry_path=str(telemetry_path),
+                        node_classes=node_classes,
+                        snapshot_proof=_golden_snapshot_proof_supplier,
+                        restore_metadata=restore_metadata,
+                        cpu_prefetch_ticket=cpu_prefetch_ticket,
+                    )
+            finally:
+                golden_call_end_wall_ns = time.time_ns()
+                golden_call_end_mono_ns = time.monotonic_ns()
+                if _full_trace_claimed:
+                    try:
+                        _ft.stop_torch_profiler()
+                    except BaseException as _ft_torch_stop_exc:
+                        print(
+                            f"[v2.full_trace] stage=stop_torch_profiler "
+                            f"status=error error_type={type(_ft_torch_stop_exc).__name__}",
+                            flush=True,
+                        )
+                self._golden_execution_active = False
+        except BaseException as exc:
+            if cpu_prefetch_ticket is not None:
+                try:
+                    cpu_prefetch_ticket.close(cancel=True)
+                except BaseException:
+                    pass
+            rid = request_id_raw if isinstance(request_id_raw, str) else ""
+            error_event: dict[str, Any] = {
+                "type": "error",
+                "request_id": rid,
+                "message": f"{type(exc).__name__}: {exc}"[:2000],
+            }
+            if _full_trace_claimed:
+                _error_artifact: dict[str, Any] = {"status": "absent"}
+                try:
+                    _ft_error = getattr(self, "_full_trace_session", None)
+                    if _ft_error is not None:
+                        try:
+                            _ft_error.capture_milestone(
+                                "golden_request_error",
+                                extra={"error_type": type(exc).__name__},
+                            )
+                        except BaseException:
+                            pass
+                        try:
+                            _ft_error.capture_milestone("trace_stop_boundary")
+                        except BaseException:
+                            pass
+                        if _full_trace_op_id:
+                            try:
+                                _ft_error.operation_end(
+                                    _full_trace_op_id,
+                                    status="error",
+                                    error_type=type(exc).__name__,
+                                )
+                            except BaseException:
+                                pass
+                        _emit_golden_profiler_lifecycle(
+                            "request_trace_stop", request_id=rid,
+                            status="error", reason=type(exc).__name__,
+                        )
+                    _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                        "profile_volume"
+                    )
+                    _error_artifact = await asyncio.to_thread(
+                        _safe_full_trace_artifact,
+                        _ft_error,
+                        _profile_volume,
+                        rid.strip() if isinstance(rid, str) else rid,
+                        {
+                            "status": "error",
+                            "error": type(exc).__name__,
+                            **golden_trace_summary,
+                        },
+                        force=True,
+                    )
+                    if _error_artifact.get("status") == "ready" and _ft_error is not None:
+                        try:
+                            _emit_golden_profiler_block(
+                                _ft_error,
+                                _error_artifact,
+                                rid.strip() if isinstance(rid, str) else rid,
+                            )
+                        except BaseException:
+                            pass
+                    _emit_golden_profiler_lifecycle(
+                        "finalize", request_id=rid,
+                        status=str(_error_artifact.get("status", "error")),
+                        reason=(
+                            "artifact_ready"
+                            if _error_artifact.get("status") == "ready"
+                            else str(
+                                _error_artifact.get("reason")
+                                or _error_artifact.get("error", "artifact_unavailable")
+                            )
+                        ),
+                    )
+                except BaseException as _ft_error_exc:
+                    _error_artifact = {
+                        "status": "error",
+                        "trace_id": getattr(
+                            locals().get("_ft_error", None), "trace_id", ""
+                        ),
+                        "error_type": type(_ft_error_exc).__name__,
+                        "error": "full trace finalization failed",
+                    }
+                error_event["full_trace_artifact"] = _error_artifact
+                _full_trace_claimed = False
+            elif _full_trace_request_requested:
+                error_event["full_trace_diagnostic"] = {
+                    "requested": True,
+                    "requested_at_restore": _full_trace_requested_at_restore,
+                    "session_created": _full_trace_session_available,
+                    "claimed": False,
+                    "status": "unavailable",
+                    "reason": (
+                        _full_trace_failure_reason
+                        or "trace_not_enabled_at_restore"
+                    ),
+                }
+                error_event["full_trace_requested"] = True
+                error_event["full_trace_failure_reason"] = (
+                    error_event["full_trace_diagnostic"]["reason"]
+                )
+            if isinstance(locals().get("activation_evidence"), dict):
+                error_event["golden_activation"] = locals()["activation_evidence"]
+            if identity_telemetry:
+                error_event["identity"] = identity_telemetry
+                error_event["golden_identity"] = dict(identity_telemetry)
+            telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
+            timing = _golden_adapter_timing(
+                telemetry,
+                call_start_wall_ns=golden_call_start_wall_ns,
+                call_start_mono_ns=golden_call_start_mono_ns,
+                call_end_wall_ns=golden_call_end_wall_ns,
+                call_end_mono_ns=golden_call_end_mono_ns,
+            )
+            error_event["golden_adapter_timing"] = timing
+            error_event.update(
+                _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
+            )
+            if telemetry is not None:
+                error_event["golden_telemetry"] = telemetry
+                _emit_golden_waterfall(telemetry, timing=timing)
+            elif telemetry_error:
+                error_event["golden_telemetry_error"] = telemetry_error
+            yield error_event
+            return
+
+        # These are captured after Golden returns and immediately before the
+        # adapter yields its one terminal event.  They are not derived from
+        # stage telemetry, so they retain the real adapter return/yield wall
+        # and monotonic boundaries.
+        _return_wall_unix_ns = time.time_ns()
+        _return_mono_ns = time.monotonic_ns()
+        result_data = dataclasses.asdict(result)
+        # Off-mode Golden owns no output file, so project its validated
+        # in-memory bytes through the existing legacy ``images[].data``
+        # transport.  The metadata stays explicit and distinguishes ready from
+        # durable; strict results retain their historical path descriptor.
+        if (
+            result_data.get("output_durability_mode") == "off"
+            and result_data.get("image_data")
+        ):
+            image_sha = str(result_data.get("image_sha256", ""))
+            image_filename = str(result_data.get("filename") or f"{image_sha}.png")
+            image_entry = {
+                "filename": image_filename,
+                "node_id": result_data.get("output_node_id", ""),
+                "output_key": "images",
+                "mime_type": result_data.get("mime_type", "image/png"),
+                "file_ext": ".png",
+                "width": result_data.get("width", 0),
+                "height": result_data.get("height", 0),
+                "byte_count": result_data.get("byte_count", 0),
+                "asset_id": image_sha,
+                "identity": f"sha256:{image_sha}" if image_sha else "",
+                "data": result_data["image_data"],
+                "output_durability_mode": "off",
+                "durability_requested": False,
+                "result_durable": False,
+            }
+            result_data["images"] = [image_entry]
+            result_data["include_base64"] = True
+            # The PNG now lives in images[0].data.  Leaving the flat
+            # image_data key in place duplicated the full 3 MB payload, which
+            # base64-encodes to ~4 MB and is serialized onto the Modal wire
+            # between yield and method return.
+            result_data.pop("image_data", None)
+        # The adapter result is the authoritative request-scoped Golden
+        # identity surface.  Keep a named copy as well as the conventional
+        # result identity key so host projection can consume either terminal
+        # result or error documents without relying on stdout.
+        result_data["identity"] = dict(identity_telemetry)
+        result_data["golden_identity"] = dict(identity_telemetry)
+        result_data.update(
+            {
+                key: value
+                for key, value in identity_telemetry.items()
+                if key.startswith("sage_runtime_mode_")
+                or key in {"attention_backend_configured", "golden_mode"}
+            }
+        )
+        result_data["full_trace_diagnostic"] = {
+            "requested": bool(_full_trace_request_requested),
+            "requested_at_restore": _full_trace_requested_at_restore,
+            "session_created": _full_trace_session_available,
+            "claimed": _full_trace_claimed,
+            "status": "claimed" if _full_trace_claimed else (
+                "unavailable" if _full_trace_request_requested else "disabled"
+            ),
+            "reason": "" if _full_trace_claimed else (
+                _full_trace_failure_reason
+                or ("request_trace_not_started" if _full_trace_request_requested else "gate_not_set")
+            ),
+        }
+        result_data["full_trace_requested"] = result_data["full_trace_diagnostic"]["requested"]
+        result_data["full_trace_failure_reason"] = result_data["full_trace_diagnostic"]["reason"]
+        if _full_trace_claimed:
+            result_data.update(golden_trace_summary)
+        _terminal_timing = {
+            "return_wall_unix_ns": _return_wall_unix_ns,
+            "return_mono_ns": _return_mono_ns,
+            "return_monotonic_ns": _return_mono_ns,
+            "teardown_complete": True,
+            "terminal_complete": True,
+        }
+        # Golden activation evidence + observed flags.  Honest absence: when
+        # the gate was unset the evidence carries activated=False /
+        # reason="gate_not_set" and flags_observed shows false — never
+        # fabricated.
+        result_data["golden_activation"] = activation_evidence
+        result_data["golden_flags_observed"] = {
+            "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM": bool(
+                activation_evidence.get("activated")
+                or activation_evidence.get("already_activated")
+            ),
+            "core_model_patcher_is_dynamic": bool(
+                activation_evidence.get("is_dynamic_alias")
+            ),
+        }
+        # Evidence, never fabrication: attach the telemetry document Golden
+        # actually persisted at the known local path.  Host artifacts retain
+        # the raw canonical document without duplicating it in container logs.
+        telemetry, telemetry_error = _read_golden_telemetry(telemetry_path)
+        timing = _golden_adapter_timing(
+            telemetry,
+            call_start_wall_ns=golden_call_start_wall_ns,
+            call_start_mono_ns=golden_call_start_mono_ns,
+            call_end_wall_ns=golden_call_end_wall_ns,
+            call_end_mono_ns=golden_call_end_mono_ns,
+            telemetry_persist_ms=getattr(result, "telemetry_persist_ms", None),
+        )
+        result_data["golden_adapter_timing"] = timing
+        result_data.update(
+            _emit_e27_forensics_block(telemetry, persisted_path=telemetry_path)
+        )
+        if telemetry is not None:
+            # The result carries the byte-identical persisted telemetry document.
+            # That equality is a deliberate contract (asserted by
+            # test_p2_golden_snapshot_adapter), not incidental structure: the
+            # terminal result must be self-describing and independently
+            # verifiable without re-reading the volume.  Trimming the ~99 KB
+            # event stream here to save wire time would break it, so it stays.
+            result_data["golden_telemetry"] = telemetry
+            observed_attention = str(
+                telemetry.get("attention_backend_resolved", "missing")
+            )
+            result_data["attention_backend_resolved"] = observed_attention
+            result_data["identity"]["attention_backend_resolved"] = observed_attention
+            result_data["golden_identity"]["attention_backend_resolved"] = observed_attention
+            _emit_golden_waterfall(telemetry, timing=timing)
+        if _full_trace_claimed:
+            _artifact_fin: dict[str, Any] = {"status": "absent"}
+            try:
+                _ft_fin = getattr(self, "_full_trace_session", None)
+                if _ft_fin is not None:
+                    try:
+                        _ft_fin.capture_milestone("golden_request_return")
+                    except BaseException:
+                        pass
+                    try:
+                        _ft_fin.capture_milestone("trace_stop_boundary")
+                    except BaseException:
+                        pass
+                    if _full_trace_op_id:
+                        try:
+                            _ft_fin.operation_end(_full_trace_op_id, status="ok")
+                        except BaseException:
+                            pass
+                    _emit_golden_profiler_lifecycle(
+                        "request_trace_stop", request_id=normalized_request_id,
+                        status="ok", reason="golden_return",
+                    )
+                _profile_volume = globals().get("_MODAL_RESOURCES", {}).get(
+                    "profile_volume"
+                )
+                _artifact_fin = await asyncio.to_thread(
+                    _safe_full_trace_artifact,
+                    _ft_fin,
+                    _profile_volume,
+                    normalized_request_id,
+                    result_data,
+                    force=True,
+                )
+                if _artifact_fin.get("status") == "ready" and _ft_fin is not None:
+                    try:
+                        _emit_golden_profiler_block(
+                            _ft_fin,
+                            _artifact_fin,
+                            normalized_request_id,
+                        )
+                    except BaseException:
+                        pass
+            except BaseException as _ft_fin_exc:
+                _artifact_fin = {
+                    "status": "error",
+                    "trace_id": getattr(
+                        locals().get("_ft_fin", None), "trace_id", ""
+                    ),
+                    "error_type": type(_ft_fin_exc).__name__,
+                    "error": "full trace finalization failed",
+                }
+            _emit_golden_profiler_lifecycle(
+                "finalize", request_id=normalized_request_id,
+                status=str(_artifact_fin.get("status", "error")),
+                reason=(
+                    "artifact_ready"
+                    if _artifact_fin.get("status") == "ready"
+                    else str(
+                        _artifact_fin.get("reason")
+                        or _artifact_fin.get("error", "artifact_unavailable")
+                    )
+                ),
+            )
+            result_data["full_trace_artifact"] = _artifact_fin
+            _full_trace_claimed = False
+            result_data["full_trace_diagnostic"]["status"] = str(
+                _artifact_fin.get("status", "error")
+            )
+            result_data["full_trace_diagnostic"]["reason"] = (
+                "artifact_ready"
+                if _artifact_fin.get("status") == "ready"
+                else str(
+                    _artifact_fin.get("reason")
+                    or _artifact_fin.get("error", "artifact_unavailable")
+                )
+            )
+        if telemetry is None and telemetry_error:
+            result_data["golden_telemetry_error"] = telemetry_error
+        _yield_wall_unix_ns = time.time_ns()
+        _yield_mono_ns = time.monotonic_ns()
+        _terminal_timing.update({
+            "yield_wall_unix_ns": _yield_wall_unix_ns,
+            "yield_mono_ns": _yield_mono_ns,
+            "yield_monotonic_ns": _yield_mono_ns,
+        })
+        result_data["terminal"] = dict(_terminal_timing)
+        result_data["terminal_timing"] = dict(_terminal_timing)
+        yield {"type": "result", "data": result_data}
 
     async def run_prompt_stream(
         self,
@@ -14035,6 +24321,9 @@ def _build_decorated_v2_class() -> type:
         self._lifecycle_trace = None
         self.container_session_id = _V2_CONTAINER_SESSION_ID
         self._restore_count = 0
+        self._request_count = 0
+        self._post_restore_nonce = ""
+        self._restore_session_id = ""
         self._restore_timing = None
         self._cgroup_sampler = None
         self._cpu_snapshot_unet_runtime_state = None
@@ -14050,6 +24339,10 @@ def _build_decorated_v2_class() -> type:
         self._snapshot_eviction_retained_model_type = ""
         self._snapshot_eviction_retained_release_status = "not_run"
         self._v2_pending_production_cleanup: dict[str, Any] | None = None
+        self._deferred_commit_task = None
+        self._deferred_commit_diag = None
+        self._deferred_commit_pending = False
+        self._golden_execution_active = False
         self._init_teardown_diagnostics()
         self._v2_initialized = True
 
@@ -14057,9 +24350,23 @@ def _build_decorated_v2_class() -> type:
     _METHODS_TO_WRAP = (
         "startup", "restore",
         "run_plan_stream", "run_prompt_stream",
+        "run_golden_serial_stream",
+        "run_golden_parallel_stream",
         "read_output_asset", "run_checkpoint_stream",
         "publish_restore_plan", "run_rehoming_experiment",
+        "run_numa_experiment",
         "run_env_probe", "run_entry_probe", "exit",
+        "run_volume_read_benchmark",
+        "run_snapshot_restore_only_probe",
+        "run_unet_mechanism_probe",
+        "run_unet_qd_probe",
+        "run_clip_qd_probe",
+        "run_source_race_oracle",
+        "run_registration_probe",
+        "run_phase1_c0_arena",
+        "run_testing8_gds_instanttensor_probe",
+        "run_e27_followup_probe",
+        "source_identity_probe",
     )
     # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
     # results must NOT receive a fabricated graph waterfall.  Any future Modal
@@ -14068,9 +24375,22 @@ def _build_decorated_v2_class() -> type:
     _NON_WORKFLOW_METHODS = frozenset({
         "startup", "restore", "exit",
         "read_output_asset",
+        "run_golden_serial_stream",
+        "run_golden_parallel_stream",
         "run_env_probe", "run_entry_probe",
-        "run_rehoming_experiment",
+        "run_numa_experiment", "run_rehoming_experiment",
         "publish_restore_plan",
+        "run_volume_read_benchmark",
+        "run_snapshot_restore_only_probe",
+        "run_unet_mechanism_probe",
+        "run_unet_qd_probe",
+        "run_clip_qd_probe",
+        "run_source_race_oracle",
+        "run_registration_probe",
+        "run_phase1_c0_arena",
+        "run_testing8_gds_instanttensor_probe",
+        "run_e27_followup_probe",
+        "source_identity_probe",
     })
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -14104,6 +24424,7 @@ def _build_decorated_v2_class() -> type:
                                     attach_waterfall(
                                         _gres,
                                         run_label=f"modal {orig_method.__name__} stream",
+                                        print_render=not _is_golden_result(_gres),
                                     )
                             yield item
                     finally:
@@ -14157,12 +24478,79 @@ def _build_decorated_v2_class() -> type:
         setattr(cls, "exit", _exit_decorator()(cls.exit))
     setattr(cls, "run_plan_stream", _modal.method(is_generator=True)(cls.run_plan_stream))
     setattr(cls, "run_prompt_stream", _modal.method(is_generator=True)(cls.run_prompt_stream))
+    # Golden adapter: generator method, but NOT in the normal stream
+    # release/cleanup machinery — Golden owns its own teardown.
+    setattr(
+        cls,
+        "run_golden_serial_stream",
+        _modal.method(is_generator=True)(cls.run_golden_serial_stream),
+    )
+    setattr(
+        cls,
+        "run_golden_parallel_stream",
+        _modal.method(is_generator=True)(cls.run_golden_parallel_stream),
+    )
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
     setattr(cls, "run_rehoming_experiment", _modal.method()(cls.run_rehoming_experiment))
+    setattr(cls, "run_numa_experiment", _modal.method()(cls.run_numa_experiment))
     setattr(cls, "run_env_probe", _modal.method()(cls.run_env_probe))
     setattr(cls, "run_entry_probe", _modal.method()(cls.run_entry_probe))
+    setattr(
+        cls,
+        "run_volume_read_benchmark",
+        _modal.method()(cls.run_volume_read_benchmark),
+    )
+    setattr(
+        cls,
+        "run_snapshot_restore_only_probe",
+        _modal.method()(cls.run_snapshot_restore_only_probe),
+    )
+    setattr(
+        cls,
+        "run_unet_mechanism_probe",
+        _modal.method()(cls.run_unet_mechanism_probe),
+    )
+    setattr(
+        cls,
+        "run_unet_qd_probe",
+        _modal.method()(cls.run_unet_qd_probe),
+    )
+    setattr(
+        cls,
+        "run_clip_qd_probe",
+        _modal.method()(cls.run_clip_qd_probe),
+    )
+    setattr(
+        cls,
+        "run_source_race_oracle",
+        _modal.method()(cls.run_source_race_oracle),
+    )
+    setattr(
+        cls,
+        "run_registration_probe",
+        _modal.method()(cls.run_registration_probe),
+    )
+    setattr(
+        cls,
+        "run_testing8_gds_instanttensor_probe",
+        _modal.method()(cls.run_testing8_gds_instanttensor_probe),
+    )
+    setattr(
+        cls,
+        "run_e27_followup_probe",
+        _modal.method()(cls.run_e27_followup_probe),
+    )
+    # E29 source-identity probe: MUST be a registered Modal method or the
+    # deployed class never exposes it (Modal method_loader only surfaces
+    # _modal.method()-decorated functions).  This is the no-generation
+    # source-identity stop-gate used by `v2ctl source-probe`.
+    setattr(
+        cls,
+        "source_identity_probe",
+        _modal.method()(cls.source_identity_probe),
+    )
     return cls
 
 
@@ -14193,9 +24581,14 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     _gpu_arg: str | list[str] = list(spec.gpu) if len(spec.gpu) > 1 else spec.gpu[0]
     _volumes: dict[str, Any] = {
         spec.models_path: resources["models_volume"],
-        spec.custom_nodes_path: resources["custom_nodes_volume"],
-        spec.runtime_state_path: resources["runtime_state_volume"],
     }
+    if CUSTOM_NODE_DELIVERY == "volume":
+        # Mount only at the empty image compatibility path.  The image-baked
+        # symlink makes ComfyUI's discovery root resolve to this Volume.
+        _volumes[CUSTOM_NODES_PATH] = resources["custom_nodes_volume"]
+    else:
+        _volumes[spec.custom_nodes_path] = resources["custom_nodes_volume"]
+    _volumes[spec.runtime_state_path] = resources["runtime_state_volume"]
     # Add profile volume mount when full-trace is enabled
     if _V2_FULL_TRACE_ENABLED:
         _pv = resources.get("profile_volume")
@@ -14217,6 +24610,7 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
         "cpu": spec.cpu,
         "memory": spec.memory,
         "timeout": spec.timeout,
+        "retries": 0,
         "min_containers": spec.min_containers,
         "scaledown_window": spec.scaledown_window,
         "volumes": _volumes,
@@ -14458,34 +24852,12 @@ globals()["ModalRuntimeEntrypointV2"] = (
     _v2_decorated_class if _v2_decorated_class is not None else ModalRuntimeEntrypoint
 )
 
-try:
-    _MODAL_RESOURCES = build_modal_resources()
-except Exception:
-    _MODAL_RESOURCES = {
-        "app": None,
-        "image": None,
-        "models_volume": None,
-        "custom_nodes_volume": None,
-        "runtime_state_volume": None,
-        "profile_volume": None,
-        "source_identity": None,
-        "spec": ModalRuntimeSpec(),
-        "runtime_shape": runtime_shape_config().identity_payload(),
-    }
-# Phase 1: Pre-compute deployment combined hash from the canonical
-# DeploymentIdentity / source_identity used by V2 resources.  This
-# stable nonempty value is what startup/restore/request consumers and
-# certificate / manifest expected identity paths all reference — never
-# an ad-hoc env hash or Modal image ID.
-_V2_DEPLOYMENT_COMBINED_HASH = (
-    _MODAL_RESOURCES.get("source_identity").combined_hash
-    if _MODAL_RESOURCES.get("source_identity") is not None
-    else ""
-)
-_V2_DEPLOYMENT_COMBINED_HASH = stable_hash({
-    "source_combined_hash": _V2_DEPLOYMENT_COMBINED_HASH,
-    "runtime_shape": runtime_shape_config().identity_payload(),
-})
+_MODAL_RESOURCES = build_modal_resources()
+# ``deployment`` is the sole current deployment-hash authority.  The longer
+# compatibility name remains because existing request/manifest contracts use
+# it, but it is an alias—not a second hash over source identity/runtime shape.
+_V2_DEPLOYMENT_HASH_NAMESPACE = DEPLOYMENT_HASH_NAMESPACE
+_V2_DEPLOYMENT_COMBINED_HASH = _MODAL_RESOURCES["canonical_identity"].deployment
 # Modal CLI discovers the application through a module-level ``app`` object.
 # Keep the resource construction above as the single source of truth while
 # exposing the registered shadow app for ``modal deploy -m``.

@@ -1,0 +1,656 @@
+ M .gitignore
+ M __init__.py
+ M canonical_execution.py
+ M comfyapp.py
+ M comfymodal_runtime/clip_conditioning_cache.py
+ M comfymodal_runtime/contracts.py
+ M comfymodal_runtime/cpu_snapshot_models.py
+ M comfymodal_runtime/full_execution_trace.py
+ M comfymodal_runtime/local_handle_client.py
+ M comfymodal_runtime/local_handle_owner.py
+ M comfymodal_runtime/modal_app.py
+ M comfymodal_runtime/modal_transport.py
+ M comfymodal_runtime/model_preload.py
+ M comfymodal_runtime/output_delivery.py
+ M comfymodal_runtime/playground_service.py
+ M comfymodal_runtime/result_delivery.py
+ M comfymodal_runtime/runtime_bootstrap.py
+ M comfymodal_runtime/runtime_executor.py
+ M comfymodal_runtime/snapshot_build_manifest.py
+ M comfymodal_runtime/trace.py
+ M comfymodal_runtime/unet_backing.py
+ M comfymodal_runtime/v2_experiments.py
+ M comfymodal_runtime/v2_waterfall.py
+ M deploy_and_run_v2_single.bat
+ M deploy_v2_full_trace_only.bat
+ M experiment_runner.py
+ M experiment_service.py
+ M output_converter.py
+ M package.json
+ M playwright.config.mjs
+ M run_v2_single.bat
+ M studio_run_adapter.py
+ M studio_store.py
+ M tests/browser/modal_testing_suite_smoke.mjs
+ M tests/browser/studio-mock-api.mjs
+ M tests/test_benchmark_v2_proof_collection.py
+ M tests/test_cpu_snapshot_models.py
+ M tests/test_deployment_proof.py
+ M tests/test_local_submission_critical_path.py
+ M tests/test_milestone1_v2_runtime.py
+ M tests/test_model_preload_attribution.py
+ M tests/test_persistent_handle_transport.py
+ M tests/test_plan_validation_proof.py
+ M tests/test_runtime_canonical_v2.py
+ M tests/test_runtime_contracts.py
+ M tests/test_runtime_playground_v2.py
+ M tests/test_step3_fast_path.py
+ M tests/test_studio_backend.py
+ M tests/test_studio_direct_run.py
+ M tests/test_studio_progress_tracker.py
+ M tests/test_testing_results_js.py
+ M tests/test_testing_settings_js.py
+ M tests/test_testing_shell_integration.py
+ M tests/test_testing_ui_wired.py
+ M tests/test_v2_ab_experiments.py
+ M tests/test_v2_active_profile_inherit_noop.py
+ M tests/test_v2_benchmark_trace_handoff.py
+ M tests/test_v2_cold_warm_parity.py
+ M tests/test_v2_cpu_snapshot_lifecycle.py
+ M tests/test_v2_direct_execution_boundary.py
+ M tests/test_v2_final_observability.py
+ M tests/test_v2_full_execution_trace.py
+ M tests/test_v2_full_trace_lifecycle.py
+ M tests/test_v2_lane_a_disk_persistence.py
+ M tests/test_v2_local_pre_submit_optimization.py
+ M tests/test_v2_local_submission_timing.py
+ M tests/test_v2_preload_bridge.py
+ M tests/test_v2_snapshot_restore_only.py
+ M tests/test_v2_waterfall.py
+ M tests/test_warmup_profile_dedup.py
+ M tests/test_waterfall_attach_central.py
+ M tests/test_waterfall_reconciliation.py
+ M tests/test_waterfall_scheduling_denominator.py
+ M tests/v2_waterfall_reconciliation_fixtures.py
+ M tools/benchmark_v2_direct.py
+ M tools/record_deployment_identity.py
+ M web/studio-backend-api.js
+ M web/studio-experiment-mode.js
+ M web/studio-output-preferences.js
+ M web/studio-playground-state.js
+ M web/studio-playground.js
+ M web/studio-settings.js
+ M web/studio-shell.js
+ M web/studio-styles.js
+?? '
+?? .commandcode/
+?? PHASE_D_FOLLOWUP_2_REPORT_2026-08-16.md
+?? PHASE_D_FOLLOWUP_RECONCILIATION_2026-08-15.md
+?? PHASE_D_INTERFACE_FREEZE.md
+?? PHASE_E1_HISTORY_ASSET_SEMANTICS_AUDIT_2026-08-17.md
+?? PHASE_E2_PREVIEW_CODEC_LOCAL_BENCHMARK_2026-08-17.md
+?? PHASE_E2_PREVIEW_PIPELINE_COMPRESSION_AUDIT_2026-08-17.md
+?? PHASE_E3_GENERATE_ORIGINAL_REPLAY_BACKEND_AUDIT_2026-08-17.md
+?? PHASE_E4_FRONTEND_SETTINGS_EXPERIMENT_AUDIT_2026-08-17.md
+?? PHASE_E5_TEST_REGRESSION_GATE_AUDIT_2026-08-17.md
+?? STUDIO_MODERN_EXPERIMENT_MIGRATION_PLAN.md
+?? STUDIO_TEST_GATE.md
+?? V2_10_COLD_RUNS_35S_COOLDOWN.md
+?? V2_BATCH_A_ACCEPTANCE_HARNESS_REPORT.md
+?? V2_BATCH_A_G1_AND_TERMINAL_STAMPS_REPORT.md
+?? V2_BATCH_A_HOST_TELEMETRY_SHIPPING_AUDIT.md
+?? V2_BATCH_A_INTEGRATED_ACCEPTANCE.md
+?? V2_BATCH_A_MODELS_VOLUME_RELOAD_GUARD_REPORT.md
+?? V2_BATCH_A_PER_NODE_TIMELINE_REPORT.md
+?? V2_BATCH_B_ACCEPTANCE_HARNESS_REPORT.md
+?? V2_BATCH_B_CACHE_DEPLOYMENT_HANDOFF_RESEARCH.md
+?? V2_BATCH_B_INTEGRATED_ACCEPTANCE_AND_COHORT.md
+?? V2_BATCH_B_RUNTIME_STATE_RELOAD_GUARD_REPORT.md
+?? V2_BATCH_B_SNAPSHOT_HYGIENE_AND_STAGE13_REPORT.md
+?? V2_BATCH_C10_EXTERNAL_CONCURRENT_LOADERS_REPORT.md
+?? V2_BATCH_C10_EXTERNAL_LOADER_SURVEY.md
+?? V2_BATCH_C11_MODAL_STORAGE_AUDIT.md
+?? V2_BATCH_C12_SAFETENSORS_LAYOUT_SHARDING_REPORT.md
+?? V2_BATCH_C13_NATIVE_FAST_DISK_FORENSIC_AUDIT.md
+?? V2_BATCH_C1_IMMUTABLE_PLAN_IDENTITY_REPORT.md
+?? V2_BATCH_C2_ACCEPTANCE_FAST_PATH_REPORT.md
+?? V2_BATCH_C3_WATERFALL_CONTRACT_REPORT.md
+?? V2_BATCH_C4_HYGIENE_AB_REPORT.md
+?? V2_BATCH_C4_HYGIENE_ANALYZER_SEMANTIC_FIX_REPORT.md
+?? V2_BATCH_C4_HYGIENE_OPERATIONAL_PREFLIGHT.md
+?? V2_BATCH_C4_SNAPSHOT_HYGIENE_AB_PREP_REPORT.md
+?? V2_BATCH_C4_SNAPSHOT_HYGIENE_RECOVERY_REPORT.md
+?? V2_BATCH_C5_VAE_FIRST_STEP_AB_REPORT.md
+?? V2_BATCH_C5_VAE_SAMPLING_OVERLAP_REPORT.md
+?? V2_BATCH_C6_I3_CONFIG_AND_OVERLAP_GATE_REPORT.md
+?? V2_BATCH_C6_PINNED_RING_FEASIBILITY_REPORT.md
+?? V2_BATCH_C6_PINNED_RING_IMPLEMENTATION_REPORT.md
+?? V2_BATCH_C6_PINNED_RING_PRODUCTION_DESIGN.md
+?? V2_BATCH_C6_SALVAGE_V2_FEASIBILITY_AND_IMPLEMENTATION_REPORT.md
+?? V2_BATCH_C6_UNET_READ_H2D_PIPELINE_FEASIBILITY.md
+?? V2_BATCH_C6_UNET_READ_H2D_PROBE_REPORT.md
+?? V2_BATCH_C7_ACCEPTANCE_HIERARCHY_FIX_REPORT.md
+?? V2_BATCH_C8_META_NATIVE_HYBRID_FEASIBILITY.md
+?? V2_BATCH_C9_FASTSAFETENSORS_INTEGRATION_REPORT.md
+?? V2_BATCH_C9_MODAL_VOLUME_QUEUE_DEPTH_REPORT.md
+?? V2_BATCH_C_INTEGRATED_VALIDATION_REPORT.md
+?? V2_BATCH_D10_PHASE_D_INTEGRATION_VALIDATION.md
+?? V2_BATCH_D12_CLIP_CRITICAL_PATH_FORENSICS.md
+?? V2_BATCH_D13_REQUEST_ENTRY_SETUP_FORENSICS.md
+?? V2_BATCH_D14_POST_SAMPLING_FORENSICS.md
+?? V2_BATCH_D15_CRITICAL_GPU_LANE_COORDINATION.md
+?? V2_BATCH_D16_REQUEST_ENTRY_CRITICAL_PATH_COMPRESSION.md
+?? V2_BATCH_D17_SINGLE_USE_POST_SAMPLING_CLIP_LIFECYCLE.md
+?? V2_BATCH_D18_VAE_SOFT_EMPTY_CACHE_GATE.md
+?? V2_BATCH_D1_LOCAL_DISPATCH_REPORT.md
+?? V2_BATCH_D2_GENERIC_CLIP_COLD_FORENSICS_REPORT.md
+?? V2_BATCH_D3_GENERIC_CLIP_FAST_HYDRATION_REPORT.md
+?? V2_BATCH_D4_META_AND_PIPELINE_FORENSICS_REPORT.md
+?? V2_BATCH_D5_RUNTIME_WAIT_ATTRIBUTION_REPORT.md
+?? V2_BATCH_D6_CLIP_RESTORE_LIFECYCLE_ROOT_CAUSE.md
+?? V2_BATCH_D6_PHASE_D_INTEGRATION_PREFLIGHT.md
+?? V2_BATCH_D6_REMOTE_VALIDATION_REPORT.md
+?? V2_BATCH_D7_GENERIC_TEXT_ENCODER_ENCODE_LAB.md
+?? V2_BATCH_D8_UNET_META_GET_MODEL_ROOT_CAUSE.md
+?? V2_BATCH_D8_get_model_bench.json
+?? V2_BATCH_D9_INPUT_TYPES_WARM_FORENSICS.md
+?? V2_BATCH_E10_PHASE_E_INTEGRATION_AB.md
+?? V2_BATCH_E11_SOURCE_ORDER_STREAMING.md
+?? V2_BATCH_E12_CHECKPOINT_PREWARM.md
+?? V2_BATCH_E13_MODAL_STORAGE_AUDIT.md
+?? V2_BATCH_E14_SOURCE_IO_BENCHMARK.md
+?? V2_BATCH_E15_EXTERNAL_LOADER_FEASIBILITY.md
+?? V2_BATCH_E16_REMOTE_SOURCE_IO_PREFLIGHT.md
+?? V2_BATCH_E16_RUN1.json
+?? V2_BATCH_E16_RUN2.json
+?? V2_BATCH_E17_FINAL_COLD_LOADER_ASSEMBLY.md
+?? V2_BATCH_E18_FINAL_LOADER_HARDENING.md
+?? V2_BATCH_E19_SINGLE_DEPLOYED_COLD_VALIDATION.md
+?? V2_BATCH_E1_STAGED_CORE.md
+?? V2_BATCH_E20_CLEAN_FINAL_LOADER_VALIDATION.md
+?? V2_BATCH_E21_CRITICAL_PATH_RECONCILIATION.md
+?? V2_BATCH_E22_ADDITIONAL_RUNS.md
+?? V2_BATCH_E22_CAUSAL_AB_PREFLIGHT.md
+?? V2_BATCH_E22_REMOTE_CAUSAL_AB.md
+?? V2_BATCH_E23_CRITICAL_PATH_FORENSICS.md
+?? V2_BATCH_E24_CRITICAL_PATH_CLOSURE.md
+?? V2_BATCH_E25_WHOLE_CRITICAL_PATH_COMPRESSION.md
+?? V2_BATCH_E26_CONCRETE_COLD_WINS.md
+?? V2_BATCH_E27_FIVE_TARGET_CRITICAL_PATH_FORENSICS.md
+?? V2_BATCH_E2_CLIP_STAGED_HYDRATION.md
+?? V2_BATCH_E3_UNET_STAGED_TRANSPORT.md
+?? V2_BATCH_E4_STAGED_TRANSPORT_BENCHMARK.md
+?? V2_BATCH_E5_EMPTY_CACHE_BYPASS_AUDIT.md
+?? V2_BATCH_E6_POST_RESPONSE_GPU_CLEANUP.md
+?? V2_BATCH_E7_CUDA_ALLOCATOR_POLICY.md
+?? V2_BATCH_E8_COMFY_NATIVE_TRANSPORT_REUSE.md
+?? V2_BATCH_E9_TWO_APP_AB_PLAN.md
+?? V2_CACHED_FIRST_NODE_PRODUCTION_DEFAULTS_AND_RESTORE_CHARACTERIZATION.md
+?? V2_D11_3_RUN_PERFORMANCE_2026-08-16.md
+?? V2_D11_PERFORMANCE_2026-08-16.md
+?? V2_GENERIC_FIRST_NODE_PRESAMPLER_DELAY_RESEARCH.md
+?? V2_HOST_HARDWARE_AND_PRESSURE_TELEMETRY.md
+?? V2_PNG_PRESAMPLER_INVESTIGATION_AND_REAL_CAPTURE.md
+?? V2_PRODUCTION_DEFAULTS_2026-08-13.md
+?? V2_PROMPT_CACHE_CONDITIONING_PREFETCH_AND_STARTUP_REPORT.md
+?? V2_PROMPT_CACHE_PREFETCH_STARTUP_FREEZE.md
+?? V2_RESULT_HANDOFF_RESTORE_AND_SETUP_RESEARCH.md
+?? V2_RUN4_BAD_HOST_FORENSICS.md
+?? V2_SNAPSHOT_ARCHITECTURE_AND_WORKING_SET_RESEARCH.md
+?? V2_UNET_READ_H2D_OVERLAP_RESEARCH.md
+?? V2_WATERFALL_FINAL_CORRECTNESS_REPORT.md
+?? WORKFLOW_MANIFEST_FORMAT.md
+?? WS_FILE
+?? _e27_clip_qd_evidence.json
+?? _e27_deploy_wrapper.bat
+?? _e27_direct_probe.py
+?? _e27_dtypes_err.txt
+?? _e27_dtypes_out.txt
+?? _e27_env_probe.py
+?? _e27_env_probe_result.txt
+?? _e27_fastsafe_clip_err.txt
+?? _e27_fastsafe_clip_out.txt
+?? _e27_fastsafe_unet_err.txt
+?? _e27_fastsafe_unet_out.txt
+?? _e27_final_status.txt
+?? _e27_followup_deploy.log
+?? _e27_followup_deploy2.log
+?? _e27_followup_deploy3.log
+?? _e27_followup_deploy4.log
+?? _e27_followup_deploy5.log
+?? _e27_followup_probe.py
+?? _e27_gantt_render.txt
+?? _e27_overhead_out.txt
+?? _e27_probe.py
+?? _e27_probe_b1.txt
+?? _e27_render_gantt.py
+?? _e27_resident2_out.txt
+?? _e27_ro_env.txt
+?? _e27_ro_probe.txt
+?? _e27_ro_probe2.txt
+?? _e27_ro_probe3.txt
+?? _e27_run1_out.txt
+?? _e27_run2_out.txt
+?? _e27_run_single.bat
+?? _e27_snapshot_probe.py
+?? _e27_snapshot_probe_result.json
+?? _e27_unet_qd_evidence.json
+?? _e28_start_status.txt
+?? _test_clip_fast_hydration.py
+?? arm_a_config.txt
+?? arm_b_config.txt
+?? batch-c11-ready-state.png
+?? batch-c5-failed-state.png
+?? batch-c5-handoff-selection-only.png
+?? batch-c5-playground-ready-state.png
+?? batch-c5-ready-state.png
+?? c13-console-errors.txt
+?? c13-followup-live-console-errors.txt
+?? c13-followup-preflight-network.txt
+?? c13-followup-ready-state.png
+?? c13-followup-run-preflight.txt
+?? c13-followup-run-request-body.json
+?? c13-followup-run-response-body.json
+?? c13-ready-state.png
+?? c15-history-ui-state.png
+?? c15-ready-state.png
+?? c16-history-c15-detail.png
+?? c16-history-c15.png
+?? c4_armA_console.log
+?? c4_armA_deploy2.log
+?? c4_armA_retry1.log
+?? c4_armA_retry2.log
+?? c4_armA_retry3.log
+?? c4_armA_retry4.log
+?? c4_armA_retry5.log
+?? c4_armA_retry6.log
+?? c4_armA_retry7.log
+?? c4_armA_retry8.log
+?? c5-studio-network.txt
+?? cancel-proof-modal-follow-2.err.log
+?? cancel-proof-modal-follow-2.log
+?? cancel-proof-modal-follow.err.log
+?? cancel-proof-modal-follow.log
+?? cancel-proof-server-2.stderr.log
+?? cancel-proof-server-2.stdout.log
+?? cancel-proof-server-3.stderr.log
+?? cancel-proof-server-3.stdout.log
+?? cancel-proof-server-4.stderr.log
+?? cancel-proof-server-4.stdout.log
+?? cancel-proof-server-5.stderr.log
+?? cancel-proof-server-5.stdout.log
+?? cancel-proof-server.stderr.log
+?? cancel-proof-server.stdout.log
+?? comfymodal_runtime/checkpoint_prewarm.py
+?? comfymodal_runtime/clip_cold_path_forensics.py
+?? comfymodal_runtime/clip_fast_hydration.py
+?? comfymodal_runtime/clip_fast_hydration_wiring.py
+?? comfymodal_runtime/e27_followup_probe.py
+?? comfymodal_runtime/e27_forensics.py
+?? comfymodal_runtime/empty_cache_bypass.py
+?? comfymodal_runtime/execution_warm.py
+?? comfymodal_runtime/fast_cold_orchestration.py
+?? comfymodal_runtime/gantt_telemetry.py
+?? comfymodal_runtime/gpu_lane_coordination.py
+?? comfymodal_runtime/host_hardware_telemetry.py
+?? comfymodal_runtime/pre_graph_cache.py
+?? comfymodal_runtime/prompt_signature_cache.py
+?? comfymodal_runtime/registry_proof_store.py
+?? comfymodal_runtime/runtime_generation.py
+?? comfymodal_runtime/snapshot_capture_hygiene.py
+?? comfymodal_runtime/source_order_safetensors.py
+?? comfymodal_runtime/speculative_clip_hydration.py
+?? comfymodal_runtime/stage13_breakdown.py
+?? comfymodal_runtime/staged_safetensors.py
+?? comfymodal_runtime/unet_fastsafetensors.py
+?? comfymodal_runtime/unet_meta_direct.py
+?? comfymodal_runtime/unet_qd_probe.py
+?? comfymodal_runtime/unet_salvage_probe.py
+?? comfymodal_runtime/wait_attribution.py
+?? console-after-reload.log
+?? custom_node_registry.py
+?? d18_remote_deploy.log
+?? d18_run1.log
+?? d18_run2.log
+?? d18_run3.log
+?? d7-network-after-40s.txt
+?? d7-network-after-run.txt
+?? d7-preflight-ready.png
+?? d7-status-100s.txt
+?? d7-status-220s.txt
+?? d7-status-310s.txt
+?? d7-status-430s.txt
+?? d7r-experiment-actual.har
+?? d7r-experiment.har
+?? d7r-generation-detail-empty.png
+?? d7r-history-feed-card.png
+?? d7r2-original-0.png
+?? d7r2-original-1.png
+?? dependency_resolver.py
+?? deploy_e16_source_benchmark.bat
+?? e16_source_io.py
+?? e16_source_io_modal.py
+?? e25_preflight.log
+?? experiment_modern_plan.py
+?? experiment_modern_routes.py
+?? experiment_modern_scheduler.py
+?? history_v2_migration.py
+?? history_v2_models.py
+?? history_v2_replay.py
+?? history_v2_repository.py
+?? history_v2_routes.py
+?? history_v2_store.py
+?? history_v2_writer.py
+?? model_library.py
+?? model_library_routes.py
+?? playwright.fake.config.mjs
+?? run_e14_source_io.bat
+?? run_e16_source_benchmark.bat
+?? studio-api-after-failure.json
+?? studio-handoff-selection.png
+?? studio-history-summary-after-failure.json
+?? studio-initial.png
+?? studio-live-blocked-remote-404.png
+?? studio-modern-failed.png
+?? studio-modern-payload-probe.json
+?? studio-modern-playground-ready.png
+?? studio-modern-running.png
+?? studio-ready-to-run.png
+?? studio-second-console.log
+?? studio-second-failed.png
+?? studio-second-health.json
+?? studio-second-history-summary.json
+?? studio-second-network.txt
+?? studio-second-ready-state.json
+?? studio-second-ready.png
+?? studio-workflows-tab.png
+?? studio_domain/
+?? studio_workflow_manifest.py
+?? studio_workflow_routes.py
+?? studio_workflow_run.py
+?? tests/_test_env.py
+?? tests/browser/fake/
+?? tests/browser/studio-history-v2.spec.mjs
+?? tests/browser/studio-settings.spec.mjs
+?? tests/browser/studio-workflows-mock.mjs
+?? tests/browser/studio-workflows.spec.mjs
+?? tests/d1_store_isolation.py
+?? tests/phase_e_fixtures.py
+?? tests/phase_e_wave2_fixtures.py
+?? tests/run_studio_tests.py
+?? tests/studio_experiment_v2_frontend_unit.mjs
+?? tests/studio_experiment_v2_unit.mjs
+?? tests/studio_history_v2_experiment_unit.mjs
+?? tests/studio_history_v2_persisted_status_unit.mjs
+?? tests/studio_phase_e_contract_unit.mjs
+?? tests/studio_phase_e_history_presentation_unit.mjs
+?? tests/studio_phase_e_preview_settings_unit.mjs
+?? tests/studio_phase_e_wave2_unit.mjs
+?? tests/studio_playground_run_unit.mjs
+?? tests/studio_run_model_unit.mjs
+?? tests/studio_workflow_run_unit.mjs
+?? tests/test_batch_a_acceptance.py
+?? tests/test_batch_acceptance_ordering.py
+?? tests/test_batch_b_acceptance.py
+?? tests/test_batch_c1_immutable_plan_identity.py
+?? tests/test_batch_c_acceptance.py
+?? tests/test_benchmark_source_io_e14.py
+?? tests/test_benchmark_source_io_e16.py
+?? tests/test_benchmark_v2_snapshot_hygiene_ab.py
+?? tests/test_c6_meta_direct.py
+?? tests/test_c6_read_h2d_probe.py
+?? tests/test_c6_salvage_probe.py
+?? tests/test_c8_meta_native.py
+?? tests/test_c9_fastsafetensors_integration.py
+?? tests/test_c9_qd_probe.py
+?? tests/test_d4_forensics_reconciliation.py
+?? tests/test_d6a_backend_integration.py
+?? tests/test_dependency_resolver.py
+?? tests/test_e27_followup_probe.py
+?? tests/test_e27_forensics.py
+?? tests/test_e27_gantt_telemetry.py
+?? tests/test_e2_preview_codec.py
+?? tests/test_e2_preview_mode.py
+?? tests/test_experiment_modern_binding.py
+?? tests/test_experiment_modern_plan.py
+?? tests/test_history_v2_api.py
+?? tests/test_history_v2_migration.py
+?? tests/test_history_v2_mixed_pagination.py
+?? tests/test_history_v2_modern_experiment.py
+?? tests/test_history_v2_production_writer.py
+?? tests/test_history_v2_replay_core.py
+?? tests/test_history_v2_repository.py
+?? tests/test_host_hardware_telemetry.py
+?? tests/test_model_library.py
+?? tests/test_model_library_routes.py
+?? tests/test_models_volume_reload_guard.py
+?? tests/test_modern_experiment_scheduler.py
+?? tests/test_phase_e_contract.py
+?? tests/test_phase_e_fake_parity.py
+?? tests/test_phase_e_history_projection.py
+?? tests/test_phase_e_logical_outputs.py
+?? tests/test_phase_e_single_snapshot_replay.py
+?? tests/test_phase_e_wave2_contract.py
+?? tests/test_remote_cancel_bridge.py
+?? tests/test_runtime_state_reload_guard.py
+?? tests/test_studio_history_v2_js.py
+?? tests/test_studio_workflow_manifest.py
+?? tests/test_studio_workflow_run_plan_identity.py
+?? tests/test_transport_cancellation.py
+?? tests/test_v2_batch_a_g1_terminal_stamps.py
+?? tests/test_v2_batch_d15_critical_gpu_lane_coordination.py
+?? tests/test_v2_batch_d1_local_dispatch.py
+?? tests/test_v2_batch_d1_registry_proof_store.py
+?? tests/test_v2_batch_d5_wait_attribution.py
+?? tests/test_v2_batch_e15_external_loader_feasibility.py
+?? tests/test_v2_batch_e5_empty_cache_bypass.py
+?? tests/test_v2_clip_cold_forensics.py
+?? tests/test_v2_clip_eviction_lifecycle.py
+?? tests/test_v2_clip_eviction_reconcile.py
+?? tests/test_v2_clip_fast_hydration_production.py
+?? tests/test_v2_clip_hydration_states.py
+?? tests/test_v2_clip_restore_lifecycle.py
+?? tests/test_v2_conditioning_cache_nonce.py
+?? tests/test_v2_conditioning_exact_hit_breakdown.py
+?? tests/test_v2_conditioning_prefetch.py
+?? tests/test_v2_d1_dispatch_hash.py
+?? tests/test_v2_d1_stale_identity.py
+?? tests/test_v2_d1_store_isolation.py
+?? tests/test_v2_d6_deploy_profile.py
+?? tests/test_v2_d7_text_encoder_encode_lab.py
+?? tests/test_v2_d8_get_model_forensics.py
+?? tests/test_v2_d9_input_types_warm.py
+?? tests/test_v2_e11_source_order_streaming.py
+?? tests/test_v2_e12_checkpoint_prewarm.py
+?? tests/test_v2_e17_final_cold_loader.py
+?? tests/test_v2_e18_final_loader_hardening.py
+?? tests/test_v2_e19_atomic_profile.py
+?? tests/test_v2_e25_pre_graph_and_speculative.py
+?? tests/test_v2_e26_concrete_cold_wins.py
+?? tests/test_v2_e2_clip_staged_hydration.py
+?? tests/test_v2_e3_unet_staged_transport.py
+?? tests/test_v2_host_breakdown_lines.py
+?? tests/test_v2_host_submission_breakdown.py
+?? tests/test_v2_per_node_timeline.py
+?? tests/test_v2_phase_d_telemetry_integration.py
+?? tests/test_v2_prompt_executor_breakdown.py
+?? tests/test_v2_prompt_signature_cache.py
+?? tests/test_v2_snapshot_capture_hygiene.py
+?? tests/test_v2_snapshot_manifest_hygiene_extensions.py
+?? tests/test_v2_stage13_breakdown.py
+?? tests/test_v2_staged_safetensors_core.py
+?? tests/test_v2_transport_boundaries.py
+?? tests/test_v2_unique_prompt_suffix.py
+?? tests/test_v2_vae_sampling_first_step.py
+?? tests/test_v2_waterfall_contract.py
+?? tests/test_v2_waterfall_scheduling_contract.py
+?? tests/test_workflow_domain.py
+?? tests/test_workflow_routes.py
+?? tests/test_workflow_run_integration.py
+?? tools/batch_a_acceptance.py
+?? tools/batch_b_acceptance.py
+?? tools/batch_c_acceptance.py
+?? tools/benchmark_source_io_e14.py
+?? tools/benchmark_staged_safetensors_local.py
+?? tools/benchmark_text_encoder_encode.py
+?? tools/benchmark_v2_snapshot_hygiene_ab.py
+?? tools/c10_loader_api_probe.py
+?? tools/c12_plan_safetensors_shards.py
+?? tools/d7_deep_profile.json
+?? tools/d7_lp_deep.json
+?? tools/d7_lp_results.json
+?? tools/d7_results_full.json
+?? tools/d9_input_types_warm_forensics.py
+?? tools/d9_measurements.json
+?? tools/inspect_modal_model_storage.py
+?? tools/run_c9_qd_probe.py
+?? tools/v2_d8_get_model_forensics.py
+?? v2_batchb_cohort2_console.log
+?? v2_batchb_cohort_console.log
+?? v2_batchb_data2_console.log
+?? v2_batchb_probe_console.log
+?? v2_batchb_run1_console.log
+?? v2_batchb_run1b_console.log
+?? v2_batchb_run1c_console.log
+?? v2_batchc_integrated_deploy.log
+?? v2_batchc_integrated_validation.log
+?? v2_batchc_integrated_validation2.log
+?? v2_batchc_integrated_validation3.log
+?? v2_c2f_10cold_35gap.log
+?? v2_c2f_8cold_20gap.log
+?? v2_c2f_deploy_1.log
+?? v2_c2f_deploy_2.log
+?? v2_c2f_deploy_3.log
+?? v2_c2f_deploy_4.log
+?? v2_c2f_deploy_5.log
+?? v2_c2f_restore_char_1.log
+?? v2_c2f_restore_char_2.log
+?? v2_c2f_restore_char_3.log
+?? v2_c2f_restore_char_4.log
+?? v2_c2f_restore_char_5.log
+?? v2_c2f_run_1_validation.log
+?? v2_c2f_run_2_post_snapshot.log
+?? v2_c2f_run_3_final_capture.log
+?? v2_c5_armA_validation.log
+?? v2_c5_armB_deploy.log
+?? v2_c5_armB_deploy2.log
+?? v2_c5_armB_validation.log
+?? v2_c5_armB_validation2.log
+?? v2_d10_applist.txt
+?? v2_d10_applist_full.json
+?? v2_d10_applogs_1.txt
+?? v2_d10_applogs_all_stdout.txt
+?? v2_d10_applogs_full.txt
+?? v2_d10_applogs_info_snapshot.txt
+?? v2_d10_applogs_info_v2.txt
+?? v2_d10_applogs_stdout_v2.txt
+?? v2_d10_applogs_v41_deploy3.txt
+?? v2_d10_applogs_v42_deploy4.txt
+?? v2_d10_corrected_identity.err.txt
+?? v2_d10_corrected_identity.out.txt
+?? v2_d10_corrected_prime.out.txt
+?? v2_d10_corrected_request.out.txt
+?? v2_d10_corrected_request_applogs.txt
+?? v2_d10_corrected_request_run1.out.txt
+?? v2_d10_deploy_1.err.log
+?? v2_d10_deploy_1.log
+?? v2_d10_deploy_corrected_1.log
+?? v2_d10_final_request.out.txt
+?? v2_d10_identity_record.err.txt
+?? v2_d10_identity_record.out.txt
+?? v2_d11_deploy_1.log
+?? v2_d11_request_1.log
+?? v2_d11_request_2.log
+?? v2_d11_request_3.log
+?? v2_d11_request_4.log
+?? v2_d11_request_5.log
+?? v2_d11_request_6.log
+?? v2_hosttelemetry_deploy_1.log
+?? v2_hosttelemetry_deploy_2.log
+?? v2_hosttelemetry_deploy_3.log
+?? v2_hosttelemetry_deploy_4.log
+?? v2_hosttelemetry_deploy_5.log
+?? v2_hosttelemetry_deploy_6.log
+?? v2_hosttelemetry_deploy_6b.log
+?? v2_hosttelemetry_deploy_6c.log
+?? v2_hosttelemetry_deploy_6d.log
+?? v2_hosttelemetry_run_1.log
+?? v2_hosttelemetry_run_2.log
+?? v2_hosttelemetry_run_3.log
+?? v2_hosttelemetry_run_4.log
+?? v2_hosttelemetry_run_5.log
+?? v2_hosttelemetry_run_6.log
+?? v2_pcc_construction.log
+?? v2_pcc_deploy2_construction.log
+?? v2_pcc_deploy3_construction.log
+?? v2_pcc_deploy4_construction.log
+?? v2_pcc_deploy5_construction.log
+?? v2_pcc_deploy6_construction.log
+?? v2_pcc_deploy7_construction.log
+?? v2_pcc_deploy8_construction.log
+?? v2_pcc_deploy_1.log
+?? v2_pcc_deploy_2.log
+?? v2_pcc_deploy_2b.log
+?? v2_pcc_deploy_2c.log
+?? v2_pcc_deploy_3.log
+?? v2_pcc_deploy_4.log
+?? v2_pcc_deploy_4b.log
+?? v2_pcc_deploy_5.log
+?? v2_pcc_deploy_6.log
+?? v2_pcc_deploy_7.log
+?? v2_pcc_deploy_8.log
+?? v2_pcc_run1_container.log
+?? v2_pcc_run1b_container.log
+?? v2_pcc_run1c_container.log
+?? v2_pcc_run1d_container.log
+?? v2_pcc_run1e_container.log
+?? v2_pcc_run1f_container.log
+?? v2_pcc_run1h_container.log
+?? v2_pcc_run2_container.log
+?? v2_pcc_run_1_validation.log
+?? v2_pcc_run_1b_validation.log
+?? v2_pcc_run_1c_validation.log
+?? v2_pcc_run_1d_validation.log
+?? v2_pcc_run_1e_validation.log
+?? v2_pcc_run_1f_validation.log
+?? v2_pcc_run_1g_validation.log
+?? v2_pcc_run_1h_validation.log
+?? v2_pcc_run_2_post_snapshot.log
+?? v2_pcc_run_2b_post_snapshot.log
+?? v2_pcc_run_2c_post_snapshot.log
+?? v2_pcc_run_3_final_capture.log
+?? v2_png_deploy_1.log
+?? v2_png_deploy_2.log
+?? v2_png_deploy_3.log
+?? v2_png_run_1_validation.log
+?? v2_png_run_1b_validation.log
+?? v2_png_run_1c_validation.log
+?? v2_png_run_1d_validation.log
+?? v2_png_run_2_post_snapshot.log
+?? v2_png_run_2b_post_snapshot.log
+?? v2_png_run_3_final_capture.log
+?? v2_waterfall_deploy_1.log
+?? v2_waterfall_deploy_2.log
+?? v2_waterfall_deploy_3.log
+?? v2_waterfall_deploy_4.log
+?? v2_waterfall_deploy_5.log
+?? v2_waterfall_run_1_validation.log
+?? v2_waterfall_run_2_validation.log
+?? v2_waterfall_run_3_validation.log
+?? v2_waterfall_run_4_final_acceptance.log
+?? v2_waterfall_run_5_validation.log
+?? v2_waterfall_run_6_final_acceptance.log
+?? v2_waterfall_run_7_validation.log
+?? v2_waterfall_run_8_final_acceptance.log
+?? web/history-v2-fixtures.js
+?? web/history-v2-repository.js
+?? web/history-v2-view-state.js
+?? web/studio-history-v2-detail.js
+?? web/studio-history-v2-experiment.js
+?? web/studio-history-v2.js
+?? web/studio-model-library.js
+?? web/studio-playground-run.js
+?? web/studio-run-adapters.js
+?? web/studio-run-model.js
+?? web/studio-workflow-run.js
+?? web/studio-workflows.js

@@ -267,26 +267,26 @@ class PlaygroundOutputAndHistoryWiringTests(unittest.TestCase):
         """Playground canvas should use the stable /assets route for completed runs."""
         self.assertIn('"/assets/"', self.text)
 
-    def test_filmstrip_recognizes_nested_studio_meta(self):
-        """Recent runs filter must accept run-history entries with extra.studio_meta."""
-        self.assertIn("extra.studio_meta", self.text)
+    def test_filmstrip_hydrates_from_history_v2_repository(self):
+        """H-WAVE D: recent runs hydrate ONLY from the History V2 repository."""
+        self.assertIn('import { createHistoryRepository } from "./history-v2-repository.js";', self.text)
+        self.assertIn('createHistoryRepository({ mode: "v2", apiBase: apiBase })', self.text)
 
-    def test_filmstrip_fetches_broader_history_window(self):
-        """Filmstrip should not miss studio runs due to a tiny history limit."""
-        self.assertIn('"/run-history?limit=50"', self.text)
+    def test_filmstrip_uses_v2_list_feed_window(self):
+        """Filmstrip should not miss studio runs due to a tiny feed limit."""
+        self.assertIn('repo.listFeed({ limit: 50, sort: "newest" })', self.text)
 
+    def test_filmstrip_legacy_hydration_fetches_retired(self):
+        """H-WAVE D: the legacy three-feed hydration is retired — no direct
+        /run-history, /history, or /experiments fetches remain in the
+        playground recent-runs path."""
+        self.assertNotIn('"/run-history?limit=50"', self.text)
+        self.assertNotIn("page_size=50", self.text)
+        self.assertNotIn('fetch(`${apiBase}/experiments`)', self.text)
 
-class HistoryFlatStudioMetaTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-
-    def test_history_uses_normalized_studio_fields(self):
-        """History must read feature fields from normalized records (featureId, presetId)."""
-        self.assertIn("featureId", self.text)
-        self.assertIn("presetId", self.text)
-
-    def test_history_accepts_output_path_as_output_evidence(self):
-        self.assertIn("normalizeStudioRun", self.text)
+    def test_filmstrip_recognizes_v2_experiment_records(self):
+        """Recent runs filter must accept History V2 records with kind === "experiment"."""
+        self.assertIn('rec.kind === "experiment"', self.text)
 
 
 # ---------------------------------------------------------------------------
@@ -361,59 +361,89 @@ class SettingsContentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
 
-    def test_settings_studio_section_default_page(self):
-        """Studio section must display 'Default page: Playground'."""
-        self.assertIn("Default page", self.text)
+    def test_settings_general_info_playground_is_first_page(self):
+        """General section navigation info must list Playground as the first/default page."""
+        self.assertIn("Primary navigation", self.text)
+        self.assertIn("Playground / History", self.text)
 
-    def test_settings_studio_topnav_pages(self):
-        """Studio section must display top nav pages."""
-        self.assertIn("Top nav pages", self.text)
-        self.assertIn("Playground | History | Backend | Settings", self.text)
+    def test_settings_general_info_navigation_lists_all_five_pages(self):
+        """I7 frozen wording: the navigation row truthfully lists all five pages."""
+        self.assertIn(
+            "Primary navigation: Playground / History / Workflows / Backend / Settings.",
+            self.text,
+        )
+        # The apologetic pre-I7 phrasing must stay gone.
+        self.assertNotIn("Backend remains available in navigation", self.text)
 
-    def test_settings_studio_theme(self):
-        """Studio section must display theme info."""
-        self.assertIn("Nexus-inspired", self.text)
+    def test_settings_general_run_mode_retired(self):
+        """H12: the Cloud/Local Run mode control is retired from modern
+        Settings (zero modern consumers; canvas keeps its own key)."""
+        self.assertNotIn('"data-testid": "settings-run-mode"', self.text)
+        self.assertNotIn('"data-testid": "settings-run-mode-cloud"', self.text)
+        self.assertNotIn('"data-testid": "settings-run-mode-local"', self.text)
+        # H12: comfymodal_enabled may only appear in the explanatory retirement
+        # comment — never as a quoted key reference or functional read/write.
+        self.assertNotIn('"comfymodal_enabled"', self.text)
 
-    def test_settings_studio_modal_size(self):
-        """Studio section must display modal size."""
-        self.assertIn("Modal size", self.text)
+    def test_settings_general_info_mentions_navigation(self):
+        """General section must mention the primary navigation with Playground default page."""
+        self.assertIn("Primary navigation: Playground / History / Workflows / Backend / Settings", self.text)
 
-    def test_settings_studio_reset_button(self):
-        """Studio section must have a reset UI preferences button."""
-        self.assertIn("Reset UI preferences", self.text)
+    def test_settings_interface_panel_layout_reset(self):
+        """Interface section must have a 'Reset panel layout' button."""
+        self.assertIn('"data-testid": "settings-reset-panel-layout"', self.text)
+        self.assertIn('text: "Reset panel layout"', self.text)
 
-    def test_settings_backends_section(self):
-        """Settings must have Backends/Presets section with stats."""
-        self.assertIn("Backends / Presets", self.text)
+    def test_settings_advanced_runtime_backend_group(self):
+        """Advanced section must have a 'Runtime & Backend' group with deploy
+        state and inventory testids; H16 Wave F retires the Backends count row."""
+        self.assertIn("Runtime & Backend", self.text)
+        self.assertIn('"data-testid": "settings-deploy-state"', self.text)
+        self.assertIn('"data-testid": "settings-runtime-snapshots"', self.text)
+        self.assertIn('"data-testid": "settings-runtime-presets"', self.text)
+        # H16 Wave F (FD-8): the legacy-compatibility Backends count row is gone.
+        self.assertNotIn('"data-testid": "settings-runtime-backends"', self.text)
         self.assertIn("Open Backend tab", self.text)
 
-    def test_settings_runtime_section(self):
-        """Settings must have Modal/Runtime section with deploy/token/gpu info."""
-        self.assertIn("Modal / Runtime", self.text)
+    def test_settings_runtime_group_inventory_rows(self):
+        """Runtime & Backend group must show deploy state plus snapshots/presets
+        count rows; the Backends compatibility count label is retired (H16)."""
+        self.assertIn("Runtime & Backend", self.text)
         self.assertIn("Deploy state", self.text)
-        self.assertIn("Modal token", self.text)
-        self.assertIn("GPU", self.text)
+        self.assertIn("Snapshots", self.text)
+        self.assertIn("Presets", self.text)
+        self.assertNotIn("Backends", self.text)
 
-    def test_settings_runtime_legacy_link(self):
-        """Runtime section must link to Legacy Settings."""
-        self.assertIn("Open Legacy Settings", self.text)
+    def test_settings_runtime_legacy_link_retired(self):
+        """H14 Wave E: the Runtime section no longer links to Legacy Settings."""
+        self.assertNotIn("Open Legacy Settings", self.text)
 
-    def test_settings_features_section(self):
-        """Settings must have Features section with statuses."""
-        self.assertIn("Txt2Img", self.text)
-        self.assertIn("Enabled", self.text)
-        self.assertIn("Object Remove", self.text)
-        self.assertIn("Future: image-edit tooling", self.text)
-        self.assertIn("Object Replace", self.text)
+    def test_settings_generation_execution_engine_selector_retired(self):
+        """H12: the V1/V2 Execution Engine selector is retired — Modal V2 is
+        the only public engine, so no engine select/status/readiness rows
+        remain and no copy advertises a V1 fallback."""
+        self.assertNotIn('"data-testid": "settings-execution-engine"', self.text)
+        self.assertNotIn('"data-testid": "settings-execution-engine-status"', self.text)
+        self.assertNotIn('"data-testid": "settings-execution-engine-readiness"', self.text)
+        self.assertNotIn("V1 engine remains available", self.text)
 
-    def test_settings_legacy_section(self):
-        """Settings must have Legacy section with links."""
-        self.assertIn("Legacy Dashboard", self.text)
-        self.assertIn("Legacy Setup", self.text)
-        self.assertIn("Legacy Profiles", self.text)
-        self.assertIn("Legacy Results", self.text)
-        self.assertIn("Legacy History", self.text)
-        self.assertIn("Legacy Settings", self.text)
+    def test_settings_generation_gpu_and_preview_remain(self):
+        """GPU stays the sole execution-affecting preference; Preview default remains."""
+        self.assertIn('"data-testid": "settings-gpu"', self.text)
+        self.assertIn('"settings-preview-default"', self.text)
+
+    def test_settings_legacy_section_retired(self):
+        """H14 Wave E: the whole Settings Legacy section is retired.
+
+        (Legacy Dashboard / Legacy History retired in Phase H9; the remaining
+        Setup/Profiles/Results/Settings group + opener retired in Wave E.)
+        """
+        self.assertNotIn("Legacy Dashboard", self.text)
+        self.assertNotIn("Legacy History", self.text)
+        self.assertNotIn("Legacy Setup", self.text)
+        self.assertNotIn("Legacy Profiles", self.text)
+        self.assertNotIn("Legacy Results", self.text)
+        self.assertNotIn("Legacy Settings", self.text)
 
     def test_settings_row_class(self):
         """Settings must use comfymodal-studio-settings-row class."""
@@ -427,15 +457,112 @@ class SettingsContentTests(unittest.TestCase):
 
 
 class SettingsCountsTests(unittest.TestCase):
-    """Settings must show backend/preset/snapshot counts."""
+    """Settings must show preset/snapshot counts; the Backends count fetch is retired."""
 
-    def test_settings_counts_referenced(self):
-        """Settings must reference snapshots, presets, and backends for counts."""
+    def test_settings_runtime_counts_referenced(self):
+        """refreshRuntimeCounts must fetch snapshots and presets for the count
+        rows; H16 Wave F removes the Settings-side /studio/backends fetch."""
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        self.assertIn("snapshots", text)
-        self.assertIn("runnable", text)
-        self.assertIn("presets", text)
-        self.assertIn("need binding", text)
+        self.assertIn("refreshRuntimeCounts", text)
+        self.assertIn('"/studio/snapshots"', text)
+        self.assertIn('"/studio/presets"', text)
+        self.assertNotIn('"/studio/backends"', text)
+
+
+# ---------------------------------------------------------------------------
+# Phase I7 — Backend & Settings accessibility / loading / copy polish
+# ---------------------------------------------------------------------------
+
+class PhaseI7BackendSettingsPolishTests(unittest.TestCase):
+    """I7: truthful page h2s, loading-primitive migration, tab selection
+    state, unique reset accessible names, and the frozen Settings copy."""
+
+    def setUp(self) -> None:
+        self.backend = (WEB / "studio-backend.js").read_text(encoding="utf-8")
+        self.presets = (WEB / "studio-backend-presets.js").read_text(encoding="utf-8")
+        self.snapshots = (WEB / "studio-backend-snapshots.js").read_text(encoding="utf-8")
+        self.workspaces = (WEB / "studio-backend-workspaces.js").read_text(encoding="utf-8")
+        self.settings = (WEB / "studio-settings.js").read_text(encoding="utf-8")
+
+    def test_backend_page_has_truthful_h2(self):
+        """Backend carries one visually-hidden page h2 (clip pattern)."""
+        self.assertIn('"data-testid": "backend-page-title"', self.backend)
+        self.assertIn('text: "Backend"', self.backend)
+        self.assertIn("el(\"h2\"", self.backend.replace("'h2'", "\"h2\""))
+        # Never display:none / visibility:hidden for the heading.
+        self.assertNotIn('style: "display:none', self.backend)
+
+    def test_settings_page_has_truthful_h2(self):
+        """Settings carries one visually-hidden page h2; sections stay h3."""
+        self.assertIn('"data-testid": "settings-page-title"', self.settings)
+        self.assertIn('text: "Settings"', self.settings)
+        self.assertIn('el("h2"', self.settings)
+        self.assertIn("clip:rect(0 0 0 0)", self.settings)
+
+    def test_backend_loading_sites_use_shared_primitive(self):
+        """The three Backend loading sites consume renderLoadingState."""
+        loading = (WEB / "studio-loading.js").read_text(encoding="utf-8")
+        self.assertIn("export function renderLoadingState", loading)
+        for src, name in [
+            (self.presets, "presets"),
+            (self.snapshots, "snapshots"),
+            (self.workspaces, "workspaces"),
+        ]:
+            with self.subTest(module=name):
+                self.assertIn('./studio-loading.js', src)
+                self.assertIn("renderLoadingState(", src)
+        # Plain-text loading lines must be gone.
+        self.assertNotIn('textContent = "Loading presets..."', self.presets)
+        self.assertNotIn('textContent = "Loading snapshots..."', self.snapshots)
+        self.assertNotIn('text: "Loading workspaces', self.workspaces)
+
+    def test_backend_tabs_expose_truthful_selection(self):
+        """Backend tabs set aria-current on the active tab and drop it elsewhere."""
+        self.assertIn('setAttribute("aria-current", "true")', self.backend)
+        self.assertIn('removeAttribute("aria-current")', self.backend)
+        self.assertIn('if (id === activeTab) btn.setAttribute("aria-current", "true")', self.backend)
+
+    def test_feature_chips_keep_filter_semantics_with_chip_geometry(self):
+        """Feature chips stay aria-pressed FILTER toggles on the cm-chip base."""
+        self.assertIn('class: "comfymodal-studio-feature-chip cm-chip"', self.backend)
+        self.assertIn('"aria-pressed": "false"', self.backend)
+        # No compatibility-family mislabel: feature filters carry no family
+        # marker and no tone attribute.
+        self.assertNotIn("cm-chip--compatibility", self.backend)
+        self.assertNotIn('"data-tone"', self.backend)
+
+    def test_settings_reset_controls_name_their_section(self):
+        """Each section reset control exposes a unique accessible name."""
+        self.assertIn('"aria-label": "Reset " + title + " section"', self.settings)
+        for section_name in ["Generation", "Outputs", "History", "Interface", "Advanced"]:
+            with self.subTest(section=section_name):
+                self.assertIn(f'"{section_name}"', self.settings)
+
+    def test_settings_frozen_wording_rows(self):
+        """I1 §3.6 frozen rows: navigation list, run-history retention,
+        experiment concurrency copy (value 6 preserved)."""
+        self.assertIn(
+            "Primary navigation: Playground / History / Workflows / Backend / Settings.",
+            self.settings,
+        )
+        self.assertIn(
+            "Run history is stored locally and is kept until you delete it.",
+            self.settings,
+        )
+        self.assertIn(
+            "Experiments run up to 6 cells concurrently. Per-experiment overrides are not available.",
+            self.settings,
+        )
+        self.assertNotIn("no retention limit setting exists today", self.settings)
+        self.assertNotIn("fixed global backend width of 6", self.settings)
+
+    def test_settings_authority_untouched_by_polish(self):
+        """I7 adds no operational authority to Settings and no new fetches."""
+        self.assertNotIn('"/studio/backends"', self.settings)
+        self.assertNotIn('"settings-run-mode"', self.settings)
+        self.assertNotIn('"settings-execution-engine"', self.settings)
+        self.assertNotIn("Providers", self.settings)
+        self.assertIn('"data-testid": "settings-reset-all"', self.settings)
 
 
 # ---------------------------------------------------------------------------
@@ -542,29 +669,29 @@ class AxisEditorTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class HistorySafeRenderingTests(unittest.TestCase):
-    """History must use safe DOM rendering, no innerHTML."""
-
-    def test_history_no_inner_html(self):
-        """History must not use template literal innerHTML for run data."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
-        self.assertFalse(has_dangerous)
+    """History V2 must use safe DOM rendering, no innerHTML."""
 
     def test_history_uses_safe_el_factory(self):
-        """History uses safe el() from studio-ui.js (wraps createElement) with no innerHTML."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        # Imports the canonical safe factory (which wraps document.createElement)
-        self.assertIn('import { el } from', text,
-                       "Expected el() import from studio-ui.js — el() wraps createElement safely")
-        # Must not use template-literal innerHTML for run data
-        has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
-        self.assertFalse(has_dangerous,
-                         "History must not use template-literal innerHTML for dynamic run data")
-
-    def test_history_failed_state(self):
-        """History must show error state on failure."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn("Failed", text)
+        """History V2 feed and detail import el() from studio-ui.js and avoid innerHTML for dynamic data."""
+        v2_text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
+        detail_text = (WEB / "studio-history-v2-detail.js").read_text(encoding="utf-8")
+        # Both modules import the canonical safe factory (which wraps
+        # document.createElement).  Re-pointed by I4 (documented drift): the
+        # feed module now also consumes the shared renderEmptyState primitive,
+        # so the import carries named extras — the contract is that el()
+        # comes from studio-ui.js, not that it is the only name.
+        self.assertIn('from "./studio-ui.js"', v2_text,
+                       "Expected el() import from studio-ui.js in studio-history-v2.js")
+        self.assertRegex(v2_text, r'import\s*\{[^}]*\bel\b[^}]*\}\s*from "\./studio-ui\.js"',
+                         "studio-history-v2.js must keep importing el() by name")
+        self.assertIn('from "./studio-ui.js"', detail_text,
+                       "Expected el() import from studio-ui.js in studio-history-v2-detail.js")
+        # Neither module may use template-literal innerHTML for dynamic data
+        for name, text in (("studio-history-v2.js", v2_text),
+                           ("studio-history-v2-detail.js", detail_text)):
+            has_dangerous = ('innerHTML = `' in text or 'innerHTML += `' in text)
+            self.assertFalse(has_dangerous,
+                             name + " must not use template-literal innerHTML for dynamic data")
 
 
 # ---------------------------------------------------------------------------
@@ -572,28 +699,28 @@ class HistorySafeRenderingTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class LegacyRoutingTests(unittest.TestCase):
-    """open_testing_modal must route correctly to legacy tabs."""
+    """H10: open_testing_modal aliases land on modern owners."""
 
-    def test_open_testing_modal_routes_setup(self):
-        """open_testing_modal('setup') must navigate to Settings > Legacy Setup."""
+    def test_open_testing_modal_routes_setup_to_playground(self):
+        """open_testing_modal('setup') must land on Playground, never Legacy Setup."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        self.assertIn("activeLegacyTab", text)
-        self.assertIn("setup", text)
+        self.assertIn('setup: "playground"', text)
+        self.assertNotIn("activeLegacyTab", text)
 
-    def test_open_testing_modal_routes_profiles(self):
-        """open_testing_modal('profiles') must navigate to Settings > Legacy Profiles."""
+    def test_open_testing_modal_routes_profiles_to_playground(self):
+        """open_testing_modal('profiles') must land on Playground (no Comparison editor)."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        self.assertIn("profiles", text)
+        self.assertIn('profiles: "playground"', text)
 
-    def test_open_testing_modal_routes_results(self):
-        """open_testing_modal('results') must navigate to Settings > Legacy Results."""
+    def test_open_testing_modal_routes_results_to_history(self):
+        """open_testing_modal('results') must land on History V2."""
         text = (WEB / "modal-testing.js").read_text(encoding="utf-8")
-        self.assertIn("results", text)
+        self.assertIn('results: "history"', text)
 
-    def test_legacy_modules_referenced(self):
-        """Legacy modules must still be reachable from settings."""
+    def test_legacy_modules_unreachable_from_settings(self):
+        """H14 Wave E: legacy modules are no longer reachable from settings."""
         text = (WEB / "studio-settings.js").read_text(encoding="utf-8")
-        self.assertIn("mountLegacyTab", text)
+        self.assertNotIn("mountLegacyTab", text)
 
 
 # ---------------------------------------------------------------------------
@@ -921,54 +1048,20 @@ class StudioRunNormalizerTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class HistoryGalleryTests(unittest.TestCase):
-    """History must show an image grid/gallery with clickable cards and preview overlay."""
+    """History V2 must render runs in a grid with a modal detail overlay."""
 
-    def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+    def test_history_v2_detail_overlay_is_modal_dialog(self):
+        """history V2 detail must open a full-screen overlay with role=dialog and aria-modal."""
+        detail_text = (WEB / "studio-history-v2-detail.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-history-v2-overlay", detail_text)
+        self.assertIn('role: "dialog"', detail_text)
+        self.assertIn('"aria-modal": "true"', detail_text)
 
-    def test_history_uses_gallery_grid_class(self):
-        """history must use a gallery grid container class."""
-        self.assertIn("comfymodal-studio-history-gallery", self.text)
-
-    def test_history_has_preview_overlay(self):
-        """history must have a preview overlay class."""
-        self.assertIn("comfymodal-studio-history-preview", self.text)
-
-    def test_history_overlay_has_close_button(self):
-        """history preview must have a close button."""
-        self.assertIn("close", self.text.lower())
-
-    def test_history_creates_img_in_cards(self):
-        """history cards must create img elements for image runs."""
-        self.assertTrue(
-            '"img"' in self.text or 'el("img"' in self.text,
-            "Expected img creation in history gallery cards",
-        )
-
-    def test_history_card_click_opens_preview(self):
-        """history gallery cards must have click handlers that set preview state."""
-        self.assertTrue(
-            "onclick" in self.text or "click" in self.text.lower(),
-            "Expected onclick or click handler in history gallery",
-        )
-
-    def test_history_shows_non_image_fallback(self):
-        """history must show fallback tile for non-image runs (not broken img)."""
-        self.assertTrue(
-            "fallback" in self.text.lower() or "no image" in self.text.lower(),
-            "Expected fallback tile for non-image runs",
-        )
-
-    def test_history_preserves_experiment_grouping(self):
-        """history gallery must preserve experiment_id grouping."""
-        self.assertIn("experiment_id", self.text)
-
-    def test_history_ungrouped_runs_use_gallery_grid(self):
-        """ungrouped history must still render inside the gallery grid wrapper."""
-        self.assertIn(
-            'container.appendChild(renderHistoryGallery(normalizedRuns, apiBase, openPreview));',
-            self.text,
-        )
+    def test_history_v2_runs_render_in_results_grid(self):
+        """history V2 must render runs inside the results wrapper as a grid."""
+        v2_text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
+        self.assertIn("comfymodal-studio-history-v2-results", v2_text)
+        self.assertIn("comfymodal-studio-history-v2-grid", v2_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1105,7 @@ class PlaygroundCarouselTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class GalleryCarouselStylesTests(unittest.TestCase):
-    """studio-styles.js must define gallery, carousel, and preview overlay styles."""
+    """studio-styles.js must define history-v2 grid/overlay, gallery, and carousel styles."""
 
     def setUp(self) -> None:
         self.text = (WEB / "studio-styles.js").read_text(encoding="utf-8")
@@ -1021,9 +1114,10 @@ class GalleryCarouselStylesTests(unittest.TestCase):
         """styles must define .comfymodal-studio-history-gallery."""
         self.assertIn("comfymodal-studio-history-gallery", self.text)
 
-    def test_styles_have_history_preview_class(self):
-        """styles must define .comfymodal-studio-history-preview."""
-        self.assertIn("comfymodal-studio-history-preview", self.text)
+    def test_styles_have_history_v2_grid_and_overlay_classes(self):
+        """styles must define the history-v2 grid and full-screen overlay rules."""
+        self.assertIn("comfymodal-studio-history-v2-grid", self.text)
+        self.assertIn("comfymodal-studio-history-v2-overlay", self.text)
 
     def test_styles_have_carousel_class(self):
         """styles must define .comfymodal-studio-carousel."""
@@ -1112,26 +1206,16 @@ class NormalizeStudioRunTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class SharedNormalizerConsumptionTests(unittest.TestCase):
-    """Both History and Playground must consume the shared normalizer."""
-
-    def test_history_imports_normalize_studio_run(self):
-        """studio-history.js must import normalizeStudioRun."""
-        text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        self.assertIn("normalizeStudioRun", text)
+    """Playground must consume the shared normalizer."""
 
     def test_playground_imports_normalize_studio_run(self):
         """studio-playground.js must import normalizeStudioRun."""
         text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
         self.assertIn("normalizeStudioRun", text)
 
-    def test_history_uses_normalized_fields_not_raw_parsing(self):
-        """History must use normalized fields instead of duplicating parsing."""
-        h_text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-        # History should not duplicate prompt/status/image/timestamp parsing
-        # Check it uses normalized record fields
+    def test_playground_uses_normalized_fields_not_raw_parsing(self):
+        """Playground must use normalized fields instead of duplicating parsing."""
         p_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
-        # Both files import from normalizer
-        self.assertIn("./studio-run-normalizer.js", h_text)
         self.assertIn("./studio-run-normalizer.js", p_text)
 
 
@@ -1181,14 +1265,15 @@ class RunButtonLabelTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class BackendTabOrderTests(unittest.TestCase):
-    """Backend page default tab must be presets; tab order must render Backend Presets before Snapshots."""
+    """H6: Backend default tab is the operational Overview; Backend Presets still renders before Snapshots."""
 
     def setUp(self) -> None:
         self.text = (WEB / "studio-backend.js").read_text(encoding="utf-8")
 
     def test_default_tab_is_presets(self):
-        """Default activeTab must be 'presets' (not 'snapshots')."""
-        self.assertIn('activeTab = "presets"', self.text)
+        """Default activeTab must be an operational overview (H6), never 'snapshots'."""
+        self.assertIn('activeTab = "overview"', self.text)
+        self.assertNotIn('activeTab = "snapshots"', self.text)
 
     def test_presets_tab_before_snapshots_in_dom(self):
         """Tab creation must add Backend Presets tab before Snapshots tab."""
@@ -1424,11 +1509,10 @@ class MetadataUxTests(unittest.TestCase):
 
 
 class NullishChecksTests(unittest.TestCase):
-    """Metadata and history rendering must preserve falsy values (0, 0.0, '') using nullish checks."""
+    """Metadata rendering must preserve falsy values (0, 0.0, '') using nullish checks."""
 
     def setUp(self) -> None:
         self.pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
-        self.h_text = (WEB / "studio-history.js").read_text(encoding="utf-8")
 
     def test_playground_uses_nullish_for_prompt(self):
         """Playground metadata must check prompt with != null not truthy."""
@@ -1437,10 +1521,6 @@ class NullishChecksTests(unittest.TestCase):
     def test_playground_uses_nullish_for_duration(self):
         """Playground metadata must check durationMs with != null not truthy."""
         self.assertIn("!= null", self.pg_text)
-
-    def test_history_uses_nullish_for_metadata(self):
-        """History preview must use nullish checks for metadata fields."""
-        self.assertIn("!= null", self.h_text)
 
 
 class PresetDeletionClearsSelectionTests(unittest.TestCase):
@@ -1523,30 +1603,14 @@ class ControlDefsSamplerSchedulerTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# History must use presetLabel for display
+# Filmstrip must use presetLabel for display
 # ---------------------------------------------------------------------------
 
 class HistoryPresetLabelTests(unittest.TestCase):
-    """History rendering must use presetLabel instead of presetId for display."""
-
-    def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-
-    def test_history_group_header_uses_preset_label(self):
-        """Group header must use firstRun.presetLabel with fallback to firstRun.presetId."""
-        # The group header should reference presetLabel as the primary label source
-        self.assertIn("firstRun.presetLabel", self.text)
-        # Should still fall back to presetId when presetLabel is empty
-        self.assertIn("firstRun.presetId", self.text)
-
-    def test_history_preview_shows_preset_label(self):
-        """Preview overlay must show presetLabel in metadata."""
-        # Line 96 currently shows nr.presetId — should show nr.presetLabel
-        self.assertIn("nr.presetLabel", self.text)
+    """Playground filmstrip must use presetLabel instead of presetId for display."""
 
     def test_history_carousel_label_uses_preset_label(self):
         """Filmstrip carousel should use presetLabel for label display."""
-        # Check line 1562: nr.presetLabel || nr.presetId || nr.featureId
         pg_text = (WEB / "studio-playground.js").read_text(encoding="utf-8")
         # Should reference presetLabel as first choice for label
         self.assertIn("presetLabel || nr.presetId", pg_text)
@@ -1681,8 +1745,10 @@ class ExperimentCanonicalPresetIdTests(unittest.TestCase):
         """getExperimentPresetIds must be exported."""
         self.assertIn("getExperimentPresetIds", self.text)
 
-    def test_canonical_preset_ids_in_execute(self):
-        """executeExperimentRun must use canonical preset ID set."""
+    def test_canonical_preset_ids_in_eligibility_helpers(self):
+        """H-WAVE D: legacy executeExperimentRun is retired; the retained
+        canRunExperiment/getExperimentDisabledReason helpers still use the
+        canonical preset ID set."""
         self.assertIn("canonicalPresetIds", self.text)
 
     def test_canonical_preset_ids_includes_base(self):
@@ -2365,45 +2431,28 @@ class ExperimentMockCellCountTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Defect 1: History type filter must expose/query studio_run
-# ---------------------------------------------------------------------------
-
-class HistoryTypeFilterStudioRunTests(unittest.TestCase):
-    """History type filter dropdown must include 'studio_run' option."""
-
-    def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
-
-    def test_type_filter_includes_studio_run(self):
-        """Type filter dropdown must include 'studio_run' so Studio records are reachable."""
-        self.assertIn('"studio_run"', self.text,
-                      "studio_run must be in type filter options")
-        # The type options array should contain studio_run alongside legacy kinds
-        type_opts_start = self.text.find('"studio_run"')
-        self.assertGreater(type_opts_start, 0,
-                           "studio_run not found in type filter options")
-
-
-# ---------------------------------------------------------------------------
 # Defect 3: Pagination must guard boundaries
 # ---------------------------------------------------------------------------
 
 class HistoryPaginationBoundaryTests(unittest.TestCase):
-    """Next/Prev pagination must never produce invalid offsets."""
+    """Cursor-based pagination must reset nextCursor and gate 'Load more' on hasMore."""
 
     def setUp(self) -> None:
-        self.text = (WEB / "studio-history.js").read_text(encoding="utf-8")
+        self.text = (WEB / "studio-history-v2.js").read_text(encoding="utf-8")
 
-    def test_prev_disabled_at_offset_zero(self):
-        """Prev button must be disabled when offset <= 0."""
-        # Look for the prev button disabled attribute guard
-        self.assertIn("disabled: queryParams.offset <= 0", self.text,
-                      "Prev button must have disabled: offset <= 0 guard")
+    def test_load_more_disabled_while_loading(self):
+        """'Load more' button must be disabled while a page is loading."""
+        self.assertIn('"data-testid": "history-v2-load-more"', self.text,
+                      "Load more button must expose the history-v2-load-more testid")
+        self.assertIn("disabled: loading", self.text,
+                      "Load more button must be disabled: loading")
 
-    def test_next_disabled_at_last_page(self):
-        """Next button must be disabled when offset + limit >= totalCount."""
-        self.assertIn("disabled: queryParams.offset + queryParams.limit >= totalCount", self.text,
-                      "Next button must have disabled: offset+limit >= totalCount guard")
+    def test_has_more_false_at_end_of_pages(self):
+        """Pagination must reset nextCursor on refresh and stop when hasMore is false."""
+        self.assertIn("cursor: reset ? null : nextCursor", self.text,
+                      "Refresh must reset nextCursor to null")
+        self.assertIn("hasMore = page.hasMore", self.text,
+                      "hasMore must be derived from the page response")
 
 
 # ---------------------------------------------------------------------------

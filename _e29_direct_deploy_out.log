@@ -1,0 +1,9 @@
+exit: 0
+stdout tail:
+Traceback (most recent call last):
+  File "C:\Users\parla\AppData\Local\Temp\commandcode\C--Users-parla-OneDrive-Documents-AI-HUB-ComfyUI-June-Install-ComfyUI-custom-nodes-comfyui-modal\23b2bc9a-d4a3-413d-85ef-546c4b2aa42f\scratchpad\e29_modal_deploy_direct.py", line 23, in <module>
+    print(out[-2500:])
+  File "C:\Program Files\Python311\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 583-622: character maps to <undefined>

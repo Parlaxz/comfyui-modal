@@ -1,1315 +1,375 @@
-// Modal Studio — Playground E2E Tests
+// Modal Studio — Shelf Playground E2E Tests (Studio Workflow effort, leaf 1.2.2)
 //
-// Tests Playground behavior using the mock API.
-// Mock is installed BEFORE navigation per isolation contract.
-// Uses fresh Playwright Test page/context (never MCP/shared session).
+// Drives the Shelf single-run flow against the mocked backend:
+// installStudioMockApi FIRST, then installWorkflowsMock (later routes take
+// precedence for /comfymodal/studio/workflows*). Uses fresh Playwright Test
+// page/context (never MCP/shared session).
+//
+// Covered contracts:
+//   1. Shelf renders bound field cards (catalog names, block inputs) with
+//      Prompt fixed at top; output is the right-side result panel.
+//   2. No Backend/Preset UI anywhere in the Shelf flow.
+//   3. Field edits autosave durably with a subtle autosaved indicator and
+//      no Save button; reload restores values.
+//   4. Drag reorder, Advanced placement, and same-row grouping persist as
+//      workflow-type layout; reload restores it.
+//   5. Single run completes into the right-side output panel.
+//   6. Workflow switching via the shared picker prompts for value reuse and
+//      marks old output stale until a new run completes.
+//   7. Experiment-only draft state never overwrites Workflow values.
 
 import { test, expect } from "@playwright/test";
 import {
   installConsoleGuard,
-  createOwnerPrefix,
-  createOwnedRecords,
-  createOwnedSnapshotAndPresets,
   openStudio,
 } from "./studio-fixtures.mjs";
 import { installStudioMockApi } from "./studio-mock-api.mjs";
+import { installWorkflowsMock } from "./studio-workflows-mock.mjs";
 
 const COMFYUI_URL = process.env.COMFYUI_URL || "http://127.0.0.1:8188";
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
-async function waitVisible(locator, timeout = 15000) {
-  await locator.waitFor({ state: "visible", timeout });
-  return locator;
-}
-
-async function selectBackendPreset(page, presetLabel) {
-  const select = page.locator('[data-testid="backend-select"]');
-  await select.waitFor({ state: "visible", timeout: 15000 });
-  await select.selectOption(presetLabel);
-  await page.waitForTimeout(300);
-}
-
-// ── Tests ──────────────────────────────────────────────────────────────────
-
-test.describe("Studio Playground", () => {
-  let api;
-
-  test.beforeEach(async ({ page }) => {
-    api = await installStudioMockApi(page);
+// ── Primary-extension pin ───────────────────────────────────────────────
+// Mirrors studio-workflows.spec.mjs: the mocked suite has no Playwright
+// webServer and navigates to the shared ComfyUI instance at 127.0.0.1:8188,
+// letting that server's extension registry resolve /extensions/.... Sibling
+// lanes register the same extension name, so without pinning the page can
+// load stale sibling code instead of this repo's primary copy at
+// /extensions/comfyui-modal/.
+async function pinPrimaryExtensionRequests(page) {
+  // NOTE: regex, not a "**/extensions/*" glob — in Playwright glob syntax
+  // "*" does not cross "/", so that glob never matches nested module URLs
+  // like /extensions/<dir>/studio-shell.js and the pin would be a no-op.
+  await page.route(/\/extensions\//, async (route) => {
+    const reqUrl = new URL(route.request().url());
+    const match = reqUrl.pathname.match(/^\/extensions\/([^/]+)\/(.*)$/);
+    if (match && match[1] !== "comfyui-modal" && /modal/i.test(match[1])) {
+      reqUrl.pathname = `/extensions/comfyui-modal/${match[2]}`;
+      await route.continue({ url: reqUrl.toString() });
+      return;
+    }
+    await route.continue();
   });
+}
 
-  // ── Test 1: Full run lifecycle ──────────────────────────────────────────
+async function installMocks(page) {
+  const api = await installStudioMockApi(page);
+  const wfMock = await installWorkflowsMock(page);
+  // Mount-pinning: rewrite sibling-lane extension requests to the primary
+  // copy BEFORE the app loads (see pinPrimaryExtensionRequests).
+  await pinPrimaryExtensionRequests(page);
+  // The Shelf loads the model library on Workflow selection; the shared
+  // mock has no /studio/models handler, so stub it here (registered last,
+  // takes precedence, never recorded as unhandled).
+  await page.route("**/comfymodal/studio/models**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "ok", models: [] }),
+    });
+  });
+  return { api, wfMock };
+}
 
-  test("1. full run lifecycle with snapshot, preset, run, and completion", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    let guard;
+function portraitIds(wfMock) {
+  const wf = wfMock.getWorkflow("Portrait Pro");
+  expect(wf).toBeTruthy();
+  const versions = wfMock.getVersions(wf.workflow_id);
+  const v1 = versions.find((v) => v.version_number === 1);
+  const v2 = versions.find((v) => v.version_number === 2);
+  expect(v1).toBeTruthy();
+  expect(v2).toBeTruthy();
+  return { workflowId: wf.workflow_id, v1: v1.workflow_version_id, v2: v2.workflow_version_id };
+}
+
+async function selectPortraitV1(page, wfMock) {
+  const ids = portraitIds(wfMock);
+  const wfSelect = page.locator('[data-testid="workflow-selector"]');
+  await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
+  await wfSelect.selectOption(ids.workflowId);
+  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
+  const verSelect = page.locator('[data-testid="workflow-version-selector"]');
+  await verSelect.selectOption(ids.v1);
+  await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
+  return ids;
+}
+
+async function shelfValue(page, role) {
+  return page.locator(`[data-testid="shelf-input-${role}"]`).inputValue();
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+test.describe("Studio Shelf Playground", () => {
+  test("1. shelf renders bound field cards with catalog names, prompt fixed top, output on right", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+    const guard = installConsoleGuard(page);
 
     try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      expect(owned.snapshotIds).toHaveLength(1);
-      expect(owned.presetIds).toHaveLength(1);
-      const presetId = owned.presetIds[0];
+      await selectPortraitV1(page, wfMock);
 
-      // Open Studio first, THEN install guard — excludes ComfyUI startup noise
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      guard = installConsoleGuard(page);
+      // Shelf section with the workflow name + switcher + autosaved note.
+      await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible();
+      await expect(page.locator('[data-testid="shelf-workflow-name"]')).toContainText("Portrait Pro");
+      await expect(page.locator('[data-testid="shelf-workflow-switch"]')).toBeVisible();
+      await expect(page.locator('[data-testid="shelf-autosaved"]')).toContainText("Autosaved");
 
-      // Perform all Playground interactions under guard
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-      await page.locator('[data-testid="input-prompt"]').fill("a majestic cat in space");
+      // Prompt card is fixed at top: first card in the shelf, no drag handle.
+      const promptCard = page.locator('[data-testid="shelf-prompt-card"]');
+      await expect(promptCard).toBeVisible();
+      const firstCard = page.locator('[data-testid="shelf-section"] > div:nth-child(2)');
+      expect(await firstCard.getAttribute("data-testid")).toBe("shelf-prompt-card");
+      expect(await promptCard.locator('[data-testid^="shelf-drag-"]').count()).toBe(0);
 
-      // Assert no unhandled mock calls before run
+      // Catalog role names (no duplicated catalog): Seed/Sampler from
+      // web/studio-bindable-inputs.js; other roles from mapping display names.
+      expect(await page.locator('[data-testid="shelf-field-seed"] .comfymodal-studio-shelf-card-label').textContent()).toBe("Seed");
+      expect(await page.locator('[data-testid="shelf-field-sampler"] .comfymodal-studio-shelf-card-label').textContent()).toBe("Sampler");
+      expect(await page.locator('[data-testid="shelf-field-steps"] .comfymodal-studio-shelf-card-label').textContent()).toBe("Steps");
+
+      // Block inputs: integer seed is a number input; every other bound
+      // field carries a drag handle.
+      expect(await page.locator('[data-testid="shelf-input-seed"]').getAttribute("type")).toBe("number");
+      await expect(page.locator('[data-testid="shelf-drag-seed"]')).toBeVisible();
+      await expect(page.locator('[data-testid="shelf-drag-steps"]')).toBeVisible();
+
+      // No Backend/Preset UI anywhere in the Shelf flow.
+      expect(await page.locator('[data-testid="backend-select"]').count()).toBe(0);
+      expect(await page.locator('[data-testid="controls-container"]').count()).toBe(0);
+
+      // Output is the right-side result panel (canvas + progress + metadata
+      // + filmstrip), never a movable card.
+      const workspace = page.locator('[data-testid="workspace"]');
+      await expect(workspace).toBeVisible();
+      expect(await workspace.getAttribute("data-shelf-output-panel")).toBe("true");
+      await expect(page.locator('[data-testid="canvas-area"]')).toBeVisible();
+      expect(await page.locator('[data-testid^="shelf-field-"]').count()).toBeGreaterThan(3);
+
+      guard.assertNoErrors();
       api.assertNoUnhandledCalls();
+      wfMock.assertNoUnhandledWorkflowCalls();
+    } finally {
+      guard.dispose();
+    }
+  });
+
+  test("2. field edits autosave durably with no save button; reload restores values", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+
+    await selectPortraitV1(page, wfMock);
+
+    // Edit the seed through the Shelf card (debounced durable autosave).
+    await page.locator('[data-testid="shelf-input-seed"]').fill("123");
+    await page.waitForTimeout(700);
+    const saved = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem("comfymodal.studio.shelf.values.v1") || "{}"); } catch { return {}; }
+    });
+    const keys = Object.keys(saved);
+    expect(keys.length).toBeGreaterThanOrEqual(1);
+    const entry = saved[keys.find((k) => saved[k] && saved[k].seed === 123)];
+    expect(entry).toBeTruthy();
+    expect(entry.seed).toBe(123);
+
+    // Subtle autosaved indicator, and no Save button anywhere in the Shelf.
+    await expect(page.locator('[data-testid="shelf-autosaved"]')).toContainText("Autosaved");
+    expect(await page.locator('[data-testid="shelf-section"] button', { hasText: /^Save$/ }).count()).toBe(0);
+
+    // Reload: the persisted Workflow selection restores and the Shelf shows
+    // the saved value without any manual selection.
+    await page.reload();
+    await openStudio(page, COMFYUI_URL);
+    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("123", { timeout: 20000 });
+
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
+  });
+
+  test("3. drag reorder, advanced placement, and same-row grouping persist as layout", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+
+    await selectPortraitV1(page, wfMock);
+
+    // Deterministic synthetic HTML5 drag-and-drop: seed before steps.
+    await page.evaluate(() => {
+      const grip = document.querySelector('[data-testid="shelf-drag-seed"]');
+      const target = document.querySelector('[data-testid="shelf-field-steps"]');
+      if (!grip || !target) throw new Error("shelf drag fixtures missing");
+      const dt = new DataTransfer();
+      dt.setData("text/shelf-role", "seed");
+      grip.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      grip.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    });
+    await page.waitForTimeout(300);
+
+    // Advanced placement: cfg moves into the Advanced section.
+    await page.locator('[data-testid="shelf-advanced-cfg"]').click();
+    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-cfg"]')).toBeVisible({ timeout: 5000 });
+
+    // Same-row grouping: height joins width's row.
+    await page.locator('[data-testid="shelf-group-height"]').click();
+    const sharedRow = page.locator('[data-testid^="shelf-row-"]', { has: page.locator('[data-testid="shelf-field-width"]') });
+    await expect(sharedRow.locator('[data-testid="shelf-field-height"]')).toBeVisible({ timeout: 5000 });
+
+    // Layout autosaved under the workflow-type key.
+    const layout = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem("comfymodal.studio.shelf.layout.v1") || "{}"); } catch { return {}; }
+    });
+    const t2i = layout.t2i;
+    expect(t2i).toBeTruthy();
+    expect(t2i.order.indexOf("seed")).toBeLessThan(t2i.order.indexOf("steps"));
+    expect(t2i.advanced).toContain("cfg");
+    expect(t2i.rows.height).toBe(t2i.rows.width);
+
+    // Reload: layout restored (seed still before steps, cfg still Advanced).
+    await page.reload();
+    await openStudio(page, COMFYUI_URL);
+    await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 20000 });
+    const order = await page.locator('[data-testid="shelf-fields"] [data-testid^="shelf-field-"]').evaluateAll((els) =>
+      els.map((node) => node.getAttribute("data-testid"))
+    );
+    expect(order.indexOf("shelf-field-seed")).toBeLessThan(order.indexOf("shelf-field-steps"));
+    await page.locator('[data-testid="shelf-advanced-toggle"]').click();
+    await expect(page.locator('[data-testid="shelf-advanced-section"] [data-testid="shelf-field-cfg"]')).toBeVisible({ timeout: 5000 });
+
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
+  });
+
+  test("4. single run completes into the right-side output panel", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
+    const guard = installConsoleGuard(page);
+
+    try {
+      await selectPortraitV1(page, wfMock);
+      await page.locator('[data-testid="shelf-input-positive_prompt"]').fill("shelf test cat");
 
       const runBtn = page.locator('[data-testid="run-btn"]');
-      await runBtn.waitFor({ state: "visible", timeout: 10000 });
       await expect(runBtn).toBeEnabled({ timeout: 10000 });
       await runBtn.click();
 
+      // Output lands in the right-side canvas (never a movable card).
       const canvasOutput = page.locator('[data-testid="canvas-output"]');
-      await expect(canvasOutput).toBeVisible({ timeout: 30000 });
-
+      await expect(canvasOutput).toBeVisible({ timeout: 45000 });
       const src = await canvasOutput.getAttribute("src");
       expect(src).toBeTruthy();
       expect(src).toContain("/comfymodal/");
 
-      await expect(runBtn).toBeEnabled({ timeout: 5000 });
+      // Run button re-enables; submission carried the Shelf field values.
+      await expect(runBtn).toBeEnabled({ timeout: 10000 });
       expect((await runBtn.textContent()).trim()).toBe("Run");
-
       const submitted = api.lastRunRequest;
       expect(submitted).toBeTruthy();
-      expect(submitted.controls).toBeTruthy();
-      expect(submitted.controls.prompt).toBe("a majestic cat in space");
-      expect(submitted.presetId).toBe(presetId);
+      expect(submitted.workflow_id).toBe(portraitIds(wfMock).workflowId);
+      expect(submitted.controls.positive_prompt).toBe("shelf test cat");
 
-      // Timing card with End-to-End Total and Sampling
-      const timingCard = page.locator('[data-testid="timing-card"]');
-      await expect(timingCard).toBeVisible({ timeout: 10000 });
-      await expect(timingCard.locator(".comfymodal-studio-timing-e2e")).toBeVisible({ timeout: 5000 });
+      // Metadata + timing surfaces stay on the right-side panel.
+      await expect(page.locator('[data-testid="timing-card"]')).toBeVisible({ timeout: 10000 });
 
-      const stageTags = timingCard.locator(".comfymodal-studio-timing-tag");
-      const allTagTexts = await stageTags.allTextContents();
-      expect(allTagTexts.some((t) => t.includes("Sampling"))).toBeTruthy();
-
-      // Expand Advanced diagnostics
-      await page.locator('[data-testid="advanced-toggle"]').click();
-      const advancedPanel = page.locator(".comfymodal-studio-metadata-advanced");
-      await expect(advancedPanel).toBeVisible({ timeout: 5000 });
-      expect((await advancedPanel.textContent()).length).toBeGreaterThan(0);
-
-      // Assert pipeline under test emitted no errors
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();
+      wfMock.assertNoUnhandledWorkflowCalls();
     } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 2: Direct run displays the wall-clock end-to-end total ──────────
-  test("2. direct run displays the client-to-materialized end-to-end total", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    const expectedTotalMs = 5380;
-    let directRequest = null;
-
-    await page.route("**/comfymodal/studio/run", async (route) => {
-      directRequest = route.request().postDataJSON();
-      const now = new Date().toISOString();
-      const timings = {
-        end_to_end_total_ms: expectedTotalMs,
-        sampling_ms: 3200,
-        vae_decode_ms: 280,
-        restore_total_ms: 120,
-        timing_sources: {
-          end_to_end_total_ms: "local_server_observed",
-          sampling_ms: "remote_trace",
-        },
-      };
-      const presetId = directRequest?.presetId || "";
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          status: "ok",
-          direct_run: true,
-          runId: "run_direct_playwright",
-          runHistoryId: "run_direct_playwright",
-          experimentId: "exp_direct_playwright",
-          output_paths: ["direct_playwright.png"],
-          output_path: "direct_playwright.png",
-          completed_at: now,
-          timings,
-          meta: {
-            experiment_id: "exp_direct_playwright",
-            studio_preset_id: presetId,
-            studio_feature_id: "txt2img",
-            preset_label: "Direct Playwright",
-            output_count: 1,
-          },
-        }),
-      });
-    });
-
-    await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-    await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-    const presetId = owned.presetIds[0];
-
-    await openStudio(page, COMFYUI_URL);
-    await waitVisible(page.locator('[data-testid="control-panel"]'));
-    await selectBackendPreset(page, presetId);
-    await waitVisible(page.locator('[data-testid="input-prompt"]'));
-    await page.locator('[data-testid="input-prompt"]').fill("direct timing cat");
-
-    const runBtn = page.locator('[data-testid="run-btn"]');
-    await expect(runBtn).toBeEnabled({ timeout: 10000 });
-    await runBtn.click();
-    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
-
-    const timingCard = page.locator('[data-testid="timing-card"]');
-    await expect(timingCard).toBeVisible({ timeout: 10000 });
-    await expect(timingCard.locator(".comfymodal-studio-timing-e2e"))
-      .toHaveText("End-to-End Total: 5.4s");
-    await expect(timingCard.locator(".comfymodal-studio-timing-tag").filter({ hasText: "Sampling: 3.2s" }))
-      .toBeVisible();
-
-    expect(directRequest).toBeTruthy();
-    expect(typeof directRequest.trace?.t0_client_press_ms).toBe("number");
-  });
-
-  // ── Test 2a: Legacy direct-run timing (no top-level end_to_end_total_ms) ─
-
-  test("2a. legacy direct-run timing without end_to_end_total_ms uses trace stages", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-    const browserClickEpoch = 1000000000.0;
-    // 5.38s delta → 5380ms → renders as "5.4s"
-    const outputMaterializedEpoch = browserClickEpoch + 5.38;
-    let directRequest = null;
-
-    await page.route("**/comfymodal/studio/run", async (route) => {
-      directRequest = route.request().postDataJSON();
-      const now = new Date().toISOString();
-      const presetId = directRequest?.presetId || "";
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          status: "ok",
-          direct_run: true,
-          runId: "run_legacy_direct",
-          runHistoryId: "run_legacy_direct",
-          experimentId: "exp_legacy_direct",
-          output_paths: ["legacy_direct.png"],
-          output_path: "legacy_direct.png",
-          completed_at: now,
-          timings: {
-            // Legacy payload — no top-level end_to_end_total_ms.
-            // Individual timing values at top level (as backend normalizes):
-            sampling_ms: 3200,
-            vae_decode_ms: 280,
-            clip_encode_ms: 350,
-            model_load_ms: 450,
-            workflow_validation_ms: 50,
-            remote_inference_total_ms: 4200,
-            local_output_materialization_ms: 30,
-            // Trace stages for end-to-end derivation:
-            trace: {
-              stages: {
-                browser_run_click: browserClickEpoch,
-                output_materialized: outputMaterializedEpoch,
-              },
-              derived_ms: {
-                output_collection_total_ms: 250,
-              },
-              trace_version: 3,
-            },
-            timing_sources: {
-              sampling_ms: "remote_trace",
-              vae_decode_ms: "remote_trace",
-              clip_encode_ms: "remote_trace",
-              model_load_ms: "remote_trace",
-              workflow_validation_ms: "remote_trace",
-              remote_inference_total_ms: "remote_trace",
-              local_output_materialization_ms: "remote_trace",
-            },
-          },
-          meta: {
-            experiment_id: "exp_legacy_direct",
-            studio_preset_id: presetId,
-            studio_feature_id: "txt2img",
-            preset_label: "Legacy Direct",
-            output_count: 1,
-          },
-        }),
-      });
-    });
-
-    await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-    await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-    const presetId = owned.presetIds[0];
-
-    await openStudio(page, COMFYUI_URL);
-    await waitVisible(page.locator('[data-testid="control-panel"]'));
-    await selectBackendPreset(page, presetId);
-    await waitVisible(page.locator('[data-testid="input-prompt"]'));
-    await page.locator('[data-testid="input-prompt"]').fill("legacy timing cat");
-
-    const runBtn = page.locator('[data-testid="run-btn"]');
-    await expect(runBtn).toBeEnabled({ timeout: 10000 });
-    await runBtn.click();
-    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
-
-    // Timing card shows End-to-End Total derived from trace stages
-    const timingCard = page.locator('[data-testid="timing-card"]');
-    await expect(timingCard).toBeVisible({ timeout: 10000 });
-    await expect(timingCard.locator(".comfymodal-studio-timing-e2e"))
-      .toHaveText("End-to-End Total: 5.4s");
-
-    // Sampling stage tag is present (pulled from top-level flat keys)
-    await expect(timingCard.locator(".comfymodal-studio-timing-tag").filter({ hasText: "Sampling: 3.2s" }))
-      .toBeVisible();
-
-    // Expand Advanced diagnostics to verify timing quality
-    await page.locator('[data-testid="advanced-toggle"]').click();
-    const advancedPanel = page.locator(".comfymodal-studio-metadata-advanced");
-    await expect(advancedPanel).toBeVisible({ timeout: 5000 });
-    const advancedText = await advancedPanel.textContent();
-
-    // Timing quality is "complete" for direct-run legacy payload
-    expect(advancedText).toContain("complete");
-    // Queue and scheduler groups are excluded from applicable groups for
-    // direct-run timing and must NOT appear in missing groups
-    expect(advancedText).not.toContain("queue");
-    expect(advancedText).not.toContain("scheduler");
-
-    expect(directRequest).toBeTruthy();
-    expect(typeof directRequest.trace?.t0_client_press_ms).toBe("number");
-  });
-
-  // ── Test 3: HTTP submit error keeps Run enabled ─────────────────────────
-
-  test("3. HTTP submit error leaves Run enabled and shows error message", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-
-      api.failNext("POST", "/studio/run", 500, {
-        status: "error",
-        message: "Server overloaded, please retry",
-      });
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await runBtn.waitFor({ state: "visible", timeout: 10000 });
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await expect(page.locator(".comfymodal-studio-disabled-reason")).toBeVisible({ timeout: 5000 });
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 4: forceFailed experiment shows error ──────────────────────────
-
-  test("4. forceFailed experiment shows error state", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-
-      await expect.poll(() => api.state.experiments.size, { timeout: 5000 }).toBeGreaterThan(0);
-      // expect.poll guarantees ≥1 experiment — unconditionally set behavior
-      api.setExperimentBehavior([...api.state.experiments.keys()][0], {
-        forceFailed: true, terminalPoll: 3,
-      });
-
-      await expect(runBtn).toBeEnabled({ timeout: 45000 });
-      const text = await page.locator(".comfymodal-studio-disabled-reason").textContent();
-      expect(text.toLowerCase()).toContain("mock failure");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 5: Missing asset does not fabricate canvas image ───────────────
-
-  test("5. completed event without asset does not show canvas image", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-
-      await expect.poll(() => api.state.experiments.size, { timeout: 5000 }).toBeGreaterThan(0);
-      const expIds = [...api.state.experiments.keys()];
-      if (expIds.length > 0) {
-        api.setExperimentBehavior(expIds[0], { terminalPoll: 3, omitOutputs: true });
-      }
-
-      await expect(runBtn).toBeEnabled({ timeout: 45000 });
-      await expect(page.locator('[data-testid="canvas-output"]')).toHaveCount(0, { timeout: 5000 });
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 6: Archived preset disappears, unrelated remains ───────────────
-
-  test("6. archived test preset disappears, unrelated preset remains", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const testPresetId = owned.presetIds[0];
-
-      const snapRes = await page.evaluate(async () => {
-        const r = await fetch("/comfymodal/studio/snapshots", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: "unrelated-snapshot", compatibleFeatures: ["txt2img"],
-            graphJson: {}, apiPromptJson: {},
-            nodeBindings: {}, outputNodeId: "1", source: "manual",
-          }),
-        });
-        return (await r.json()).snapshot;
-      });
-      expect(snapRes.id).toBeTruthy();
-
-      const presRes = await page.evaluate(async (snapId) => {
-        const r = await fetch("/comfymodal/studio/presets", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            label: "unrelated-preset", snapshotId: snapId,
-            compatibleFeatures: ["txt2img"], defaults: { seed: 99, steps: 20 },
-          }),
-        });
-        return (await r.json()).preset;
-      }, snapRes.id);
-      expect(presRes.id).toBeTruthy();
-
-      const delRes = await page.evaluate(async (id) => {
-        const r = await fetch(`/comfymodal/studio/presets/${encodeURIComponent(id)}`, { method: "DELETE" });
-        return r.ok;
-      }, testPresetId);
-      expect(delRes).toBeTruthy();
-
-      await page.reload();
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      const options = await page.locator('[data-testid="backend-select"] option').allTextContents();
-      expect(options.some((t) => t.includes(prefix))).toBeFalsy();
-      expect(options.some((t) => t.includes("unrelated-preset"))).toBeTruthy();
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 7: Stalled experiment 5-minute timeout ─────────────────────────
-
-  test("7. stalled experiment reaches 5-minute timeout", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      await page.clock.install();
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-
-      const expIds = [...api.state.experiments.keys()];
-      if (expIds.length > 0) {
-        api.setExperimentBehavior(expIds[0], { terminalPoll: 999 });
-      }
-
-      await page.clock.fastForward(5 * 60 * 1000 + 4000);
-      await expect(runBtn).toBeEnabled({ timeout: 5000 });
-
-      const msgText = await page.locator(".comfymodal-studio-disabled-reason").textContent();
-      expect(msgText).toContain("timed out after 5 minutes");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 8: Navigating away stops polling ───────────────────────────────
-
-  test("8. navigating away stops polling", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      await page.clock.install();
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-
-      await page.clock.fastForward(4000);
-
-      const calls = () => api.state.calls.filter(
-        (c) => c.pathname && c.pathname.includes("/experiments/")
-      ).length;
-
-      expect(calls()).toBeGreaterThan(0);
-
-      await page.getByRole("button", { name: "History", exact: true }).click();
-
-      const afterNav = calls();
-      await page.clock.fastForward(12000);
-      await page.clock.fastForward(0);
-      expect(calls()).toBe(afterNav);
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard.assertNoErrors
-    }
-  });
-
-  // ── Test 9: Console/page errors during Playground interaction ───────────
-  //
-  // Install console guard AFTER Studio is open and the control panel is
-  // visible, so ComfyUI startup noise is excluded.  Perform a small
-  // Playground interaction, then assert no console.errors or pageerrors
-  // were emitted by the pipeline under test.
-
-  test("9. console and page errors are guarded and disposed", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      // Open Studio first — all ComfyUI startup noise happens before guard
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Install guard AFTER startup — only captures Playground interactions
-      const guard = installConsoleGuard(page);
-
-      // Perform a small Playground interaction: select preset, switch control
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      // Verify no console.error or pageerror occurred during interaction
-      guard.assertNoErrors();
-      api.assertNoUnhandledCalls();
-
       guard.dispose();
-      expect(Array.isArray(guard.pageErrors)).toBe(true);
-    } finally {
-      // guard is already disposed above
     }
   });
 
-  // ── Test 10: Reload restores last run from localStorage ─────────────────
-  //
-  // Unlike test 1 which uses server-side recent runs, this test clears the
-  // mock API's in-memory history before reload to prove the run identity is
-  // persisted client-side in localStorage and survives when server data is
-  // unavailable.
+  test("5. picker switching prompts for reuse and marks output stale until next run", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-  test("10. reload restores selection, controls, canvas image, and run metadata from localStorage", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
+    const ids = await selectPortraitV1(page, wfMock);
+    await page.locator('[data-testid="shelf-input-seed"]').fill("444");
+    await page.waitForTimeout(700);
 
-    try {
-      // Phase 1: first visit — run a preset to completion
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
+    // Complete a run so there is output to mark stale.
+    await page.locator('[data-testid="run-btn"]').click();
+    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 45000 });
 
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
+    // Switch Workflows through the shared picker.
+    await page.locator('[data-testid="shelf-workflow-switch"]').click();
+    const dialog = page.locator('[data-testid="shelf-picker-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 10000 });
+    await expect(dialog.locator('[data-testid="workflow-picker-option"]')).toHaveCount(2, { timeout: 10000 });
+    const abstract = wfMock.getWorkflow("Abstract Test");
+    await dialog.locator(`[data-testid="workflow-picker-option"][data-workflow-id="${abstract.workflow_id}"]`).click();
+    await dialog.locator('[data-testid="workflow-picker-confirm"]').click();
 
-      // Clear localStorage before starting to ensure no leftover state
-      await page.evaluate(() => localStorage.clear());
+    // Reuse prompt, then the new Workflow's fields load.
+    const reuse = page.locator('[data-testid="shelf-reuse-dialog"]');
+    await expect(reuse).toBeVisible({ timeout: 10000 });
+    await reuse.locator('[data-testid="shelf-reuse-yes"]').click();
+    await expect(page.locator('[data-testid="shelf-workflow-name"]')).toContainText("Abstract Test", { timeout: 15000 });
 
-      await selectBackendPreset(page, presetId);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-      await page.locator('[data-testid="input-prompt"]').fill("persistent cat");
+    // Old output is stale until a new run completes.
+    await expect(page.locator('[data-testid="shelf-stale-note"]')).toBeVisible({ timeout: 10000 });
 
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
+    // Switch back; stale persists; a new run clears it.
+    await page.locator('[data-testid="shelf-workflow-switch"]').click();
+    const dialog2 = page.locator('[data-testid="shelf-picker-dialog"]');
+    await expect(dialog2).toBeVisible({ timeout: 10000 });
+    await dialog2.locator(`[data-testid="workflow-picker-option"][data-workflow-id="${ids.workflowId}"]`).click();
+    await dialog2.locator('[data-testid="workflow-picker-confirm"]').click();
+    await expect(page.locator('[data-testid="shelf-reuse-dialog"]')).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-testid="shelf-reuse-no"]').click();
+    await expect(page.locator('[data-testid="shelf-workflow-name"]')).toContainText("Portrait Pro", { timeout: 15000 });
+    await page.locator('[data-testid="workflow-version-selector"]').selectOption(ids.v1);
+    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("444", { timeout: 15000 });
+    await expect(page.locator('[data-testid="shelf-stale-note"]')).toBeVisible();
+    await page.locator('[data-testid="run-btn"]').click();
+    await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 45000 });
+    await expect(page.locator('[data-testid="shelf-stale-note"]')).toHaveCount(0, { timeout: 10000 });
 
-      const canvasOutput = page.locator('[data-testid="canvas-output"]');
-      await expect(canvasOutput).toBeVisible({ timeout: 30000 });
-      const firstImageSrc = await canvasOutput.getAttribute("src");
-      expect(firstImageSrc).toBeTruthy();
-      expect(firstImageSrc).toContain("/comfymodal/");
-
-      // Verify metadata section is populated (timing card)
-      const timingCard = page.locator('[data-testid="timing-card"]');
-      await expect(timingCard).toBeVisible({ timeout: 10000 });
-
-      // Verify that run result data was written to localStorage
-      const localRunResult = await page.evaluate(() => {
-        const raw = localStorage.getItem("comfymodal.studio.playground.results.v1");
-        if (!raw) return null;
-        try { return JSON.parse(raw); } catch { return null; }
-      });
-      expect(localRunResult).toBeTruthy();
-      const resultKeys = localRunResult ? Object.keys(localRunResult) : [];
-      expect(resultKeys.length).toBeGreaterThanOrEqual(1);
-      const matchingKey = resultKeys.find(function (k) { return k.startsWith(presetId); });
-      expect(matchingKey).toBeTruthy();
-      const stored = localRunResult[matchingKey];
-      expect(stored).toBeTruthy();
-      expect(stored.imageUrl).toBe(firstImageSrc);
-
-      // Phase 2: wipe mock API history so reload cannot restore from server
-      api.state.history.length = 0;
-
-      await page.reload();
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Verify same preset is selected
-      const selectVal = await page.locator('[data-testid="backend-select"]').inputValue();
-      expect(selectVal).toBe(presetId);
-
-      // Verify canvas shows the same image (src matches what we captured)
-      const restoredCanvas = page.locator('[data-testid="canvas-output"]');
-      await expect(restoredCanvas).toBeVisible({ timeout: 15000 });
-      const restoredSrc = await restoredCanvas.getAttribute("src");
-      expect(restoredSrc).toBe(firstImageSrc);
-
-      // Verify timing/metadata section is restored
-      const restoredTiming = page.locator('[data-testid="timing-card"]');
-      await expect(restoredTiming).toBeVisible({ timeout: 10000 });
-
-      // Verify controls are populated (prompt field has the value we set)
-      const promptVal = await page.locator('[data-testid="input-prompt"]').inputValue();
-      expect(promptVal).toBe("persistent cat");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
   });
 
-  // ── Test 11: Deleted preset fallback from localStorage ─────────────────
-  //
-  // Verifies that when a persisted-and-run preset is deleted on the server,
-  // the next reload safely selects another runnable preset or shows the
-  // empty state — no dangling selection to a deleted preset.
+  test("6. experiment draft autosaves locally without overwriting workflow values", async ({ page }) => {
+    const { api, wfMock } = await installMocks(page);
+    await openStudio(page, COMFYUI_URL);
+    await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-  test("11. deleted preset falls back to another runnable preset or empty state", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
+    await selectPortraitV1(page, wfMock);
+    await page.locator('[data-testid="shelf-input-seed"]').fill("777");
+    await page.waitForTimeout(700);
 
-    try {
-      // Create TWO presets so there is a fallback
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 2, owned);
-      const presetA = owned.presetIds[0];
-      const presetB = owned.presetIds[1];
+    // Enable experiment mode and configure an axis (draft lane).
+    await page.locator('[data-testid="experiment-toggle"]').click();
+    await expect(page.locator('[data-testid="shelf-exp-panel"]')).toBeVisible({ timeout: 10000 });
+    await page.locator('[data-testid="shelf-axis-seed"]').click();
+    await expect(page.locator('[data-testid="shelf-pills-seed"]')).toBeVisible({ timeout: 5000 });
 
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Clear localStorage to start fresh
-      await page.evaluate(() => localStorage.clear());
-
-      // Select preset A, run it to persist its selection + result
-      await selectBackendPreset(page, presetA);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-      await page.locator('[data-testid="input-prompt"]').fill("test A");
-
-      const runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-      await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 30000 });
-
-      // Reload — verify preset A is restored (selection and image)
-      await page.reload();
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      let selectVal = await page.locator('[data-testid="backend-select"]').inputValue();
-      expect(selectVal).toBe(presetA);
-
-      // Verify that localStorage has the run result for preset A
-      const localBefore = await page.evaluate(() => {
-        const raw = localStorage.getItem("comfymodal.studio.playground.results.v1");
-        return raw ? Object.keys(JSON.parse(raw)) : [];
-      });
-      expect(localBefore.some(function (k) { return k.startsWith(presetA); })).toBe(true);
-
-      // Now delete preset A (archive via API)
-      await page.evaluate(async (id) => {
-        await fetch(`/comfymodal/studio/presets/${encodeURIComponent(id)}`, { method: "DELETE" });
-      }, presetA);
-
-      // Reload — should now fall back to another preset or empty state
-      await page.reload();
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      selectVal = await page.locator('[data-testid="backend-select"]').inputValue();
-
-      // Deleted preset A must NOT be selected — no dangling selection
-      expect(selectVal).not.toBe(presetA);
-
-      if (selectVal === presetB) {
-        // If auto-selected preset B, canvas should show empty (no run yet)
-        const canvasOutput = page.locator('[data-testid="canvas-output"]');
-        const hasCanvas = await canvasOutput.isVisible().catch(() => false);
-        expect(hasCanvas).toBe(false);
-      } else if (selectVal === "") {
-        // Empty state — controls area should show "select a preset" card
-        await expect(page.locator(".comfymodal-studio-card")).toBeVisible({ timeout: 5000 });
-      }
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 12: Per-preset run preview independence ─────────────────────────
-  //
-  // Verifies that when switching between presets that have both had a
-  // successful run, each preset's last run preview (image + metadata) is
-  // independently preserved and restored.  Checks metadata source text
-  // (which contains the preset ID) to distinguish which preset's run is
-  // currently displayed.
-
-  test("12. switching presets preserves independent run previews", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 2, owned);
-      const presetA = owned.presetIds[0];
-      const presetB = owned.presetIds[1];
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Clear localStorage to start fresh
-      await page.evaluate(() => localStorage.clear());
-
-      // Helper: read the metadata-source text (shows presetLabel or presetId)
-      async function getMetadataSourceText() {
-        const el = page.locator(".comfymodal-studio-metadata-source");
-        const visible = await el.isVisible().catch(() => false);
-        if (!visible) return null;
-        return (await el.textContent()).trim();
-      }
-
-      // ── Phase 1: Run with preset A ──
-      await selectBackendPreset(page, presetA);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-      await page.locator('[data-testid="input-prompt"]').fill("run A prompt");
-
-      let runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-      await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 30000 });
-
-      // Verify metadata for A shows preset A's ID
-      let sourceText = await getMetadataSourceText();
-      expect(sourceText).toBeTruthy();
-      expect(sourceText).toContain(presetA);
-
-      // ── Phase 2: Switch to preset B and run ──
-      await selectBackendPreset(page, presetB);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-      await page.locator('[data-testid="input-prompt"]').fill("run B prompt");
-
-      runBtn = page.locator('[data-testid="run-btn"]');
-      await expect(runBtn).toBeEnabled({ timeout: 10000 });
-      await runBtn.click();
-      await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 30000 });
-
-      // Verify metadata for B shows preset B's ID
-      sourceText = await getMetadataSourceText();
-      expect(sourceText).toBeTruthy();
-      expect(sourceText).toContain(presetB);
-
-      // ── Phase 3: Switch back to preset A ──
-      await selectBackendPreset(page, presetA);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      // Canvas should show an image (from A's persisted run)
-      await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
-
-      // Metadata should reflect preset A's run
-      sourceText = await getMetadataSourceText();
-      expect(sourceText).toBeTruthy();
-      expect(sourceText).toContain(presetA);
-
-      // ── Phase 4: Switch back to preset B ──
-      await selectBackendPreset(page, presetB);
-      await waitVisible(page.locator('[data-testid="input-prompt"]'));
-
-      // Canvas should show an image (from B's persisted run)
-      await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 15000 });
-
-      // Metadata should reflect preset B's run (not A's)
-      sourceText = await getMetadataSourceText();
-      expect(sourceText).toBeTruthy();
-      expect(sourceText).toContain(presetB);
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 13: Preset defaults — width/height ─────────────────────────────
-  //
-  // Verifies that width and height render as visible, enabled numeric
-  // inputs reflecting the preset's fixture defaults (width 768, height 512).
-  // After the async preset hydrates and sets _currentPreset, clicking the
-  // active feature tab triggers a re-render so the sync hydration block
-  // picks up preset defaults.
-
-  test("13. preset defaults — width and height render as visible numeric controls with saved defaults", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Create snapshot with nodeBindings for width and height so they show
-      const snapPayload = {
-        name: prefix + "-snap-wh",
-        compatibleFeatures: ["txt2img"],
-        graphJson: {},
-        apiPromptJson: { "1": { class_type: "CLIPTextEncode", inputs: { text: "" } } },
-        nodeBindings: {
-          prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-          output: { kind: "output", nodeId: "2" },
-          seed: { kind: "widget", nodeId: "3", widgetName: "seed" },
-          steps: { kind: "widget", nodeId: "3", widgetName: "steps" },
-          guidance: { kind: "widget", nodeId: "3", widgetName: "cfg" },
-          denoise: { kind: "widget", nodeId: "3", widgetName: "denoise" },
-          sampler: { kind: "widget", nodeId: "3", widgetName: "sampler_name" },
-          scheduler: { kind: "widget", nodeId: "3", widgetName: "scheduler" },
-          width: { kind: "widget", nodeId: "3", widgetName: "width" },
-          height: { kind: "widget", nodeId: "3", widgetName: "height" },
-        },
-        outputNodeId: "2",
-        source: "manual",
-      };
-
-      const snapRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/snapshots", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).snapshot;
-      }, snapPayload);
-      expect(snapRes.id).toBeTruthy();
-      owned.snapshotIds.push(snapRes.id);
-
-      const presPayload = {
-        label: prefix + "-preset-wh",
-        snapshotId: snapRes.id,
-        compatibleFeatures: ["txt2img"],
-        defaults: { width: 768, height: 512, seed: 42, steps: 20, guidance: 7, denoise: 1.0, sampler: "euler", scheduler: "normal" },
-      };
-      const presRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/presets", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).preset;
-      }, presPayload);
-      expect(presRes.id).toBeTruthy();
-      owned.presetIds.push(presRes.id);
-      const presetId = presRes.id;
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-
-      // Wait for async preset hydration to set _currentPreset, then click
-      // the active feature tab to trigger a re-render so the sync hydration
-      // block correctly merges preset defaults into _hydratedControls.
-      await page.waitForSelector('[data-testid="input-width"]', { timeout: 10000 });
-      await page.locator('[data-testid="feature-tab-txt2img"]').click();
-      await page.waitForTimeout(500);
-
-      // Width: visible, enabled, numeric input with fixture default "768"
-      const widthInput = page.locator('[data-testid="input-width"]');
-      await expect(widthInput).toBeVisible({ timeout: 10000 });
-      await expect(widthInput).toBeEnabled();
-      expect(await widthInput.evaluate((el) => el.tagName)).toBe("INPUT");
-      expect(await widthInput.getAttribute("type")).toBe("number");
-      expect(await widthInput.inputValue()).toBe("768");
-
-      // Height: visible, enabled, numeric input with fixture default "512"
-      const heightInput = page.locator('[data-testid="input-height"]');
-      await expect(heightInput).toBeVisible({ timeout: 10000 });
-      await expect(heightInput).toBeEnabled();
-      expect(await heightInput.evaluate((el) => el.tagName)).toBe("INPUT");
-      expect(await heightInput.getAttribute("type")).toBe("number");
-      expect(await heightInput.inputValue()).toBe("512");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 14: Preset defaults — enum schemas (sampler/scheduler) ─────────
-  //
-  // Verifies that sampler and scheduler render as enabled <select> elements
-  // when the preset carries an enum control schema, with the fixture
-  // defaults selected (sampler dpmpp_2m, scheduler karras, denoise 0).
-  // After the async preset hydrates and sets _currentPreset, clicking the
-  // active feature tab triggers a re-render so the sync hydration block
-  // picks up preset defaults.
-
-  test("14. preset defaults — with enum schemas, sampler and scheduler render enabled selects with saved dpmpp_2m/karras selected and options present; denoise 0 remains 0", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Snapshot with enum controlSchemas for sampler and scheduler
-      const snapPayload = {
-        name: prefix + "-snap-enum",
-        compatibleFeatures: ["txt2img"],
-        graphJson: {},
-        apiPromptJson: { "1": { class_type: "CLIPTextEncode", inputs: { text: "" } } },
-        nodeBindings: {
-          prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-          output: { kind: "output", nodeId: "2" },
-          seed: { kind: "widget", nodeId: "3", widgetName: "seed" },
-          steps: { kind: "widget", nodeId: "3", widgetName: "steps" },
-          guidance: { kind: "widget", nodeId: "3", widgetName: "cfg" },
-          denoise: { kind: "widget", nodeId: "3", widgetName: "denoise" },
-          sampler: { kind: "widget", nodeId: "3", widgetName: "sampler_name" },
-          scheduler: { kind: "widget", nodeId: "3", widgetName: "scheduler" },
-        },
-        outputNodeId: "2",
-        source: "manual",
-        controlSchemas: {
-          sampler: {
-            schemaResolved: true,
-            kind: "enum",
-            options: ["euler", "dpmpp_2m", "dpmpp_3m_sde", "ddim", "uni_pc"],
-          },
-          scheduler: {
-            schemaResolved: true,
-            kind: "enum",
-            options: ["normal", "karras", "exponential", "sgm_uniform"],
-          },
-        },
-      };
-
-      const snapRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/snapshots", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).snapshot;
-      }, snapPayload);
-      expect(snapRes.id).toBeTruthy();
-      owned.snapshotIds.push(snapRes.id);
-
-      const presPayload = {
-        label: prefix + "-preset-enum",
-        snapshotId: snapRes.id,
-        compatibleFeatures: ["txt2img"],
-        defaults: { sampler: "dpmpp_2m", scheduler: "karras", denoise: 0, seed: 42, steps: 20, guidance: 7 },
-      };
-      const presRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/presets", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).preset;
-      }, presPayload);
-      expect(presRes.id).toBeTruthy();
-      owned.presetIds.push(presRes.id);
-      const presetId = presRes.id;
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-
-      // Wait for async preset hydration to set _currentPreset, then click
-      // the active feature tab to trigger a re-render so the sync hydration
-      // block correctly merges preset defaults into _hydratedControls.
-      await page.waitForSelector('[data-testid="input-sampler"]', { timeout: 10000 });
-      await page.locator('[data-testid="feature-tab-txt2img"]').click();
-      await page.waitForTimeout(500);
-
-      // Sampler: enabled <select> with fixture default "dpmpp_2m" and options present
-      const samplerInput = page.locator('[data-testid="input-sampler"]');
-      await expect(samplerInput).toBeVisible({ timeout: 10000 });
-      await expect(samplerInput).toBeEnabled();
-      expect(await samplerInput.evaluate((el) => el.tagName)).toBe("SELECT");
-      expect(await samplerInput.inputValue()).toBe("dpmpp_2m");
-      const samplerOptions = await samplerInput.evaluate((el) => Array.from(el.options).map((o) => o.value));
-      expect(samplerOptions).toContain("euler");
-      expect(samplerOptions).toContain("dpmpp_2m");
-      expect(samplerOptions).toContain("ddim");
-
-      // Scheduler: enabled <select> with fixture default "karras" and options present
-      const schedulerInput = page.locator('[data-testid="input-scheduler"]');
-      await expect(schedulerInput).toBeVisible({ timeout: 10000 });
-      await expect(schedulerInput).toBeEnabled();
-      expect(await schedulerInput.evaluate((el) => el.tagName)).toBe("SELECT");
-      expect(await schedulerInput.inputValue()).toBe("karras");
-      const schedulerOptions = await schedulerInput.evaluate((el) => Array.from(el.options).map((o) => o.value));
-      expect(schedulerOptions).toContain("normal");
-      expect(schedulerOptions).toContain("karras");
-      expect(schedulerOptions).toContain("exponential");
-
-      // Denoise: fixture default 0 renders as "0" (zero-like value preservation)
-      const denoiseInput = page.locator('[data-testid="input-denoise"]');
-      await expect(denoiseInput).toBeVisible({ timeout: 5000 });
-      expect(await denoiseInput.inputValue()).toBe("0");
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Mock state helpers ──────────────────────────────────────────────────
-  //
-  // Injects experiment cell history entries + experiment detail into the mock
-  // API's in-memory state for testing history tiles and carousel items.
-
-  function addExperimentToMock(api, expId, presetId, cellCount) {
-    var now = new Date().toISOString();
-    for (var i = 0; i < cellCount; i++) {
-      api.state.history.push({
-        run_id: "cell_" + expId + "_" + i,
-        experiment_id: expId,
-        kind: "experiment_cell",
-        status: "completed",
-        started_at: now,
-        completed_at: now,
-        output_path: "studio_output_" + expId + "_" + i + ".png",
-        extra: {
-          studio_preset_id: presetId,
-          studio_feature_id: "txt2img",
-          primary_asset_id: "asset_" + expId + "_" + i,
-        },
-      });
-    }
-    api.state.experiments.set(expId, {
-      definition: {
-        schema_version: 1, experiment_id: expId, revision: 1,
-        name: "Test Experiment", created_at: now, updated_at: now,
-      },
-      snapshot: {
-        status: "completed", overall_status: "completed",
-        counters: { completed: cellCount, failed: 0 },
-        total_cells: cellCount,
-        cell_visible: {},
-        checkpoints: {},
-        attempts: {},
-      },
-      events: [
-        {
-          type: "experiment.created",
-          payload: {
-            compilation: {
-              cells: Array.from({ length: cellCount }, function (_, idx) {
-                return { cell_key: "cell_" + idx, axis_values: {} };
-              }),
-            },
-          },
-        },
-        { type: "experiment.completed", payload: { completed: cellCount, failed: 0, total_cells: cellCount } },
-      ].concat(
-        Array.from({ length: cellCount }, function (_, idx) {
-          return {
-            type: "cell.completed",
-            payload: {
-              cell_key: "cell_" + idx,
-              primary_asset_id: "asset_" + expId + "_" + idx,
-              output_paths: ["studio_output_" + expId + "_" + idx + ".png"],
-            },
-          };
-        })
-      ),
+    const draft = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem("comfymodal.studio.shelf.experiment.v1") || "null"); } catch { return null; }
     });
-    // Set terminalPoll=1 so the experiment detail handler returns completed
-    api.setExperimentBehavior(expId, { terminalPoll: 1 });
-  }
+    expect(draft).toBeTruthy();
+    expect(draft.axes.seed).toBeTruthy();
 
-  // ── Test 15: Preset defaults — no enum schemas ──────────────────────────
-  //
-  // Verifies that sampler and scheduler render as disabled text inputs
-  // holding the fixture default values when the preset has no enum schema
-  // for them, along with a "Schema unavailable" explanation note.
-  // After the async preset hydrates and sets _currentPreset, clicking the
-  // active feature tab triggers a re-render so the sync hydration block
-  // picks up preset defaults.
+    // Reload: Workflow values intact, experiment draft intact and separate.
+    await page.reload();
+    await openStudio(page, COMFYUI_URL);
+    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("777", { timeout: 20000 });
+    const values = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem("comfymodal.studio.shelf.values.v1") || "{}"); } catch { return {}; }
+    });
+    const flat = Object.values(values);
+    expect(flat.some((v) => v && v.seed === 777)).toBe(true);
+    await page.locator('[data-testid="experiment-toggle"]').click();
+    await expect(page.locator('[data-testid="shelf-pills-seed"]')).toBeVisible({ timeout: 10000 });
 
-  test("15. preset defaults — without enum schemas, sampler and scheduler render disabled text inputs holding saved values and a Schema unavailable explanation", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-
-      // Snapshot with empty controlSchemas — no enum info for sampler/scheduler
-      const snapPayload = {
-        name: prefix + "-snap-no-enum",
-        compatibleFeatures: ["txt2img"],
-        graphJson: {},
-        apiPromptJson: { "1": { class_type: "CLIPTextEncode", inputs: { text: "" } } },
-        nodeBindings: {
-          prompt: { kind: "widget", nodeId: "1", widgetName: "text" },
-          output: { kind: "output", nodeId: "2" },
-          seed: { kind: "widget", nodeId: "3", widgetName: "seed" },
-          steps: { kind: "widget", nodeId: "3", widgetName: "steps" },
-          guidance: { kind: "widget", nodeId: "3", widgetName: "cfg" },
-          denoise: { kind: "widget", nodeId: "3", widgetName: "denoise" },
-          sampler: { kind: "widget", nodeId: "3", widgetName: "sampler_name" },
-          scheduler: { kind: "widget", nodeId: "3", widgetName: "scheduler" },
-        },
-        outputNodeId: "2",
-        source: "manual",
-        controlSchemas: {},
-      };
-
-      const snapRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/snapshots", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).snapshot;
-      }, snapPayload);
-      expect(snapRes.id).toBeTruthy();
-      owned.snapshotIds.push(snapRes.id);
-
-      const presPayload = {
-        label: prefix + "-preset-no-enum",
-        snapshotId: snapRes.id,
-        compatibleFeatures: ["txt2img"],
-        defaults: { sampler: "dpmpp_2m", scheduler: "karras", seed: 42, steps: 20, guidance: 7, denoise: 1.0 },
-      };
-      const presRes = await page.evaluate(async (p) => {
-        const r = await fetch("/comfymodal/studio/presets", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(p),
-        });
-        return (await r.json()).preset;
-      }, presPayload);
-      expect(presRes.id).toBeTruthy();
-      owned.presetIds.push(presRes.id);
-      const presetId = presRes.id;
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-      await selectBackendPreset(page, presetId);
-
-      // Wait for async preset hydration to set _currentPreset, then click
-      // the active feature tab to trigger a re-render so the sync hydration
-      // block correctly merges preset defaults into _hydratedControls.
-      await page.waitForSelector('[data-testid="input-sampler"]', { timeout: 10000 });
-      await page.locator('[data-testid="feature-tab-txt2img"]').click();
-      await page.waitForTimeout(500);
-
-      // Sampler: disabled text input holding fixture default "dpmpp_2m", with explanation note
-      const samplerInput = page.locator('[data-testid="input-sampler"]');
-      await expect(samplerInput).toBeVisible({ timeout: 10000 });
-      await expect(samplerInput).toBeDisabled();
-      expect(await samplerInput.evaluate((el) => el.tagName)).toBe("INPUT");
-      expect(await samplerInput.getAttribute("type")).toBe("text");
-      expect(await samplerInput.inputValue()).toBe("dpmpp_2m");
-
-      // Scheduler: disabled text input holding fixture default "karras", with explanation note
-      const schedulerInput = page.locator('[data-testid="input-scheduler"]');
-      await expect(schedulerInput).toBeVisible({ timeout: 10000 });
-      await expect(schedulerInput).toBeDisabled();
-      expect(await schedulerInput.evaluate((el) => el.tagName)).toBe("INPUT");
-      expect(await schedulerInput.getAttribute("type")).toBe("text");
-      expect(await schedulerInput.inputValue()).toBe("karras");
-
-      // Verify "Schema unavailable" explanation note is present (at least
-      // one .comfymodal-studio-control-note in the control group)
-      const schemaNotes = page.locator(".comfymodal-studio-control-note");
-      await expect(schemaNotes.first()).toBeVisible({ timeout: 5000 });
-      const notesText = await schemaNotes.allTextContents();
-      const hasExplanation = notesText.some(function (t) {
-        return t.toLowerCase().includes("schema unavailable");
-      });
-      expect(hasExplanation).toBe(true);
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 16: History experiment tile loads experiment grid ──────────────
-  //
-  // Injects experiment cell history entries into the mock, navigates to
-  // History, verifies a single experiment tile (not individual cards),
-  // clicks it, and verifies the Playground shows the experiment grid.
-
-  test("16. history experiment tile loads experiment grid viewport", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      // Inject experiment cell history and experiment detail into mock
-      const expId = "exp_hist_" + Date.now().toString(36);
-      addExperimentToMock(api, expId, presetId, 3);
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Navigate to History
-      await page.getByRole("button", { name: "History", exact: true }).click();
-      await waitVisible(page.locator('[data-testid="history-page-info"]'));
-
-      // Verify experiment tile is present (not individual cards)
-      const expTile = page.locator('[data-testid="experiment-tile"]');
-      await expect(expTile).toBeVisible({ timeout: 10000 });
-      // Verify EXP badge is displayed
-      await expect(expTile.locator(".comfymodal-studio-exp-tile-badge")).toBeVisible({ timeout: 5000 });
-      // Verify status text contains cell count
-      const tileText = await expTile.textContent();
-      expect(tileText).toContain("3 cells");
-
-      // Click the experiment tile to load experiment grid in Playground
-      await expTile.click();
-
-      // Wait for experiment grid viewport to appear
-      await expect(page.locator('[data-testid="experiment-grid-viewport"]')).toBeVisible({ timeout: 15000 });
-      // Verify grid outer container is present (cells rendered)
-      await expect(page.locator('[data-testid="experiment-grid-outer"]')).toBeVisible({ timeout: 10000 });
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
-  });
-
-  // ── Test 17: Carousel experiment item has distinctive styling ──────────
-  //
-  // Verifies that experiment cell entries in the carousel have the
-  // experiment-item CSS class and EXP badge.  Also verifies clicking
-  // the experiment item navigates to the experiment grid viewport.
-
-  test("17. carousel experiment item shows EXP badge and opens experiment grid", async ({ page }) => {
-    const prefix = createOwnerPrefix();
-    const owned = createOwnedRecords();
-
-    try {
-      await page.goto(COMFYUI_URL, { waitUntil: "domcontentloaded" });
-      await createOwnedSnapshotAndPresets(page, prefix, 1, owned);
-      const presetId = owned.presetIds[0];
-
-      // Inject experiment cell history entries + experiment detail
-      const expId = "exp_car_" + Date.now().toString(36);
-      addExperimentToMock(api, expId, presetId, 2);
-
-      await openStudio(page, COMFYUI_URL);
-      await waitVisible(page.locator('[data-testid="control-panel"]'));
-
-      // Wait for carousel to load (refreshRecentRuns fetches injected history)
-      // The carousel track appears after async refresh resolves
-      const carouselItem = page.locator('.comfymodal-studio-carousel-item-experiment').first();
-      await expect(carouselItem).toBeVisible({ timeout: 15000 });
-
-      // Verify the EXP badge is present on experiment items
-      const expBadge = carouselItem.locator('.comfymodal-studio-carousel-exp-badge');
-      await expect(expBadge).toBeVisible({ timeout: 5000 });
-
-      // Verify the experiment item has data-expid attribute
-      const dataExpId = await carouselItem.getAttribute('data-expid');
-      expect(dataExpId).toBeTruthy();
-
-      // Click the experiment carousel item and verify it opens the grid
-      await carouselItem.click();
-      await expect(page.locator('[data-testid="experiment-grid-viewport"]')).toBeVisible({ timeout: 15000 });
-
-      api.assertNoUnhandledCalls();
-    } finally {
-      // no guard
-    }
+    api.assertNoUnhandledCalls();
+    wfMock.assertNoUnhandledWorkflowCalls();
   });
 });

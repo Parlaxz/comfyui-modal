@@ -1,0 +1,11 @@
+{
+  "arm": "decoupled_integrated_control",
+  "attempt_id": "unet_b256_qd2_decoupled_integrated_control_R3",
+  "block_bytes": 268435456,
+  "classification": "FAILED",
+  "error": "ExtentTransportError:source_worker_join_timeout",
+  "model_name": "z_image_turbo_bf16.safetensors",
+  "qd": 2,
+  "role": "unet",
+  "status": "error"
+}

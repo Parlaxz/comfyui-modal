@@ -26,6 +26,9 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from .local_handle_client import build_cancel_message
+from .modal_transport import validate_control_partition
+
 IPC_STREAM_LIMIT = 128 * 1024 * 1024
 
 # ── Protocol frame keys ─────────────────────────────────────────────────────
@@ -152,6 +155,7 @@ class LocalHandleOwner:
     def __init__(self) -> None:
         self._client_cache: dict[tuple[str, ...], Any] = {}
         self._handle_cache: dict[tuple[str, ...], Any] = {}
+        self._queue_cache: dict[tuple[Any, ...], Any] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -222,6 +226,71 @@ class LocalHandleOwner:
     async def _resolve_modal(self, key: Mapping[str, Any], workspace: Mapping[str, Any]) -> tuple[Any, bool]:
         return await asyncio.to_thread(self._resolve_modal_sync, key, workspace)
 
+    def _resolve_control_queue_sync(
+        self,
+        key: Mapping[str, Any],
+        workspace: Mapping[str, Any],
+        queue_name: str,
+    ) -> Any:
+        """Resolve (and cache) the named Modal control Queue for the owner's
+        cached workspace client.  Runs off the event loop (network call).
+
+        The SAME named queue is used by the local transport for cancellation,
+        so a handle resolved here receives the cancel messages the transport
+        puts through ``cancel_attempt``.
+        """
+        import modal  # the owner imports Modal only at resolution time
+
+        client_key = self._client_cache_key(key, workspace)
+        cache_key = (client_key, str(queue_name))
+        with self._lock:
+            cached = self._queue_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            client = self._client_cache.get(client_key)
+        if client is None:
+            client = self._new_client(workspace)
+            with self._lock:
+                self._client_cache.setdefault(client_key, client)
+        queue = modal.Queue.from_name(queue_name, create_if_missing=True, client=client)
+        # Force hydration (blocking form) so the handle can be passed as a
+        # remote-generator argument.  modal 1.4.3's instance ``hydrate`` is a
+        # SYNC wrapper returning the Queue (the ``.aio`` form is the coroutine);
+        # an unhydrated lazy handle fails argument serialization with
+        # ``Can't serialize object ... which hasn't been hydrated``.  Cache only
+        # after a successful hydration; on failure the caller treats the channel
+        # as truthfully unavailable (execution path unaffected).
+        queue.hydrate(client=client)
+        with self._lock:
+            self._queue_cache[cache_key] = queue
+        return queue
+
+    async def _resolve_control_queue(
+        self,
+        key: Mapping[str, Any],
+        workspace: Mapping[str, Any],
+        queue_name: str,
+    ) -> Any:
+        """Resolve the named Modal control Queue and FORCE hydration so the
+        handle can be passed as a remote-generator argument.
+
+        ``modal.Queue.from_name(...)`` returns a LAZY handle (modal SDK 1.4.3
+        defers hydration to first use); passing an unhydrated handle as a kwarg
+        to ``remote_gen.aio(...)`` fails argument serialization with
+        ``Can't serialize object ... which hasn't been hydrated`` (D10
+        corrected-request vehicle failure).  Hydrating here keeps the channel's
+        documented contract: on ANY resolution/hydration failure the channel is
+        truthfully unavailable (``None``) and the execution path is unaffected.
+        """
+        queue = await asyncio.to_thread(self._resolve_control_queue_sync, key, workspace, queue_name)
+        if queue is None:
+            return None
+        try:
+            await queue.hydrate()
+        except Exception:
+            return None
+        return queue
+
     async def _invalidate_and_reresolve(
         self,
         key: Mapping[str, Any],
@@ -249,6 +318,8 @@ class LocalHandleOwner:
         workspace = request.get("workspace") or {}
         payload = request.get("payload") or {}
         request_id = str(request.get("request_id", "") or "")
+        queue_name = str(request.get("control_queue_name", "") or "")
+        control_partition = str(request.get("control_partition", "") or "")
         secrets = _request_secrets(request, workspace)
         try:
             handle, cached = await self._resolve_modal(key, workspace)
@@ -259,12 +330,29 @@ class LocalHandleOwner:
             "frame": FRAME_DECISION,
             "decision": DECISION_PERSISTENT_HIT if cached else DECISION_MISS_RESOLVED_CACHED,
         })
+        # Cooperative cancellation channel: resolve the named control Queue
+        # through the owner's cached client and hand the hydrated handle to the
+        # remote generator.  Resolution is handle plumbing only — failure never
+        # fails the stream; cancellation is then truthfully unavailable.
+        control_queue = None
+        if queue_name:
+            try:
+                control_queue = await self._resolve_control_queue(key, workspace, queue_name)
+            except Exception as exc:
+                await _write_frame(writer, {
+                    "frame": FRAME_DECISION,
+                    "decision": f"control_queue_unavailable:{type(exc).__name__}",
+                })
         events_sent = 0
         retried = False
         while True:
             stream = None
             try:
-                stream = await self._open_plan_stream(handle, payload, request_id)
+                stream = await self._open_plan_stream(
+                    handle, payload, request_id,
+                    control_queue=control_queue,
+                    control_partition=control_partition,
+                )
                 await _write_frame(writer, {
                     "frame": FRAME_READY,
                     "input_id": str(getattr(stream, "input_id", "") or ""),
@@ -319,11 +407,76 @@ class LocalHandleOwner:
                 return
 
     @staticmethod
-    async def _open_plan_stream(handle: Any, payload: Any, request_id: str) -> Any:
-        stream = handle.run_plan_stream.remote_gen.aio(payload, request_id=request_id)
+    async def _open_plan_stream(
+        handle: Any,
+        payload: Any,
+        request_id: str,
+        *,
+        control_queue: Any = None,
+        control_partition: str = "",
+    ) -> Any:
+        kwargs: dict[str, Any] = {"request_id": str(request_id or "")}
+        if control_queue is not None:
+            # Fixed remote protocol: the remote generator accepts the hydrated
+            # ``control_queue`` handle plus ``control_partition`` and emits a
+            # ``cancelled`` event only after actual execution stop.
+            kwargs["control_queue"] = control_queue
+            kwargs["control_partition"] = str(control_partition or "")
+        stream = handle.run_plan_stream.remote_gen.aio(payload, **kwargs)
         if inspect.isawaitable(stream):
             stream = await stream
         return stream
+
+    async def handle_cancel_attempt(self, request: Mapping[str, Any], writer: asyncio.StreamWriter) -> None:
+        """Put a primitive cancel message on the named control Queue for the
+        given partition.
+
+        The transport sends cancellation through this dedicated op over its
+        OWN loopback connection — never by reusing the busy run-stream socket.
+        ``{"delivered": True}`` is PUT success only, NOT remote-execution
+        confirmation: the remote confirms separately by emitting a
+        ``cancelled`` event on the run stream.
+        """
+        key = request.get("key") or {}
+        workspace = request.get("workspace") or {}
+        queue_name = str(request.get("control_queue_name", "") or "")
+        partition = str(request.get("control_partition", "") or "")
+        reason = str(request.get("reason", "") or "")
+        secrets = _request_secrets(request, workspace)
+        if not queue_name:
+            await _write_frame(writer, _error_frame(
+                "invalid_cancel_request",
+                RuntimeError("control_queue_name is required"),
+                secrets=secrets,
+            ))
+            return
+        try:
+            # Modal rejects empty or >64-byte partition keys server-side;
+            # validate before any queue work so the client sees a truthful
+            # invalid-request verdict instead of a silent misdelivery.
+            partition = validate_control_partition(partition)
+        except ValueError as exc:
+            await _write_frame(writer, _error_frame(
+                "invalid_cancel_request", exc, secrets=secrets,
+            ))
+            return
+        try:
+            queue = await self._resolve_control_queue(key, workspace, queue_name)
+        except Exception as exc:
+            await _write_frame(writer, _error_frame("queue_resolve_failed", exc, secrets=secrets))
+            return
+        message = build_cancel_message(partition, reason)
+        try:
+            # Routed puts only: the message must land in the same partition the
+            # remote generator polls, never the queue's default partition.
+            await asyncio.to_thread(queue.put, message, partition=str(partition))
+        except Exception as exc:
+            await _write_frame(writer, _error_frame("queue_put_failed", exc, secrets=secrets))
+            return
+        await _write_frame(writer, {
+            "frame": FRAME_RESULT,
+            "result": {"delivered": True, "partition": partition},
+        })
 
     @staticmethod
     async def _publish_restore(handle: Any, payload: Any, snapshot_seed: Any) -> Any:
@@ -370,6 +523,8 @@ async def _handle_connection(
                 await owner.handle_run_plan_stream(request, writer)
             elif op == "publish_restore_plan":
                 await owner.handle_publish_restore_plan(request, writer)
+            elif op == "cancel_attempt":
+                await owner.handle_cancel_attempt(request, writer)
             else:
                 await _write_frame(
                     writer, _error_frame("unknown_op", RuntimeError(f"unknown operation: {op}"))

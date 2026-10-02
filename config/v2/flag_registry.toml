@@ -1,0 +1,1527 @@
+# v2ctl flag registry — METADATA, NOT A WHITELIST (design §7).
+#
+# This file records the real V2 flags found in the Phase-0 audit so the CLI
+# can explain them, validate their values, and reason about lifecycle.
+# Unknown flags are deliberately NOT rejected here; they flow through as
+# unregistered (unknown is allowed; unknown is not trusted).
+#
+# Lifecycle axes (design §7.1):
+#   consumed_at      where the code reads the flag
+#                    (build|module_import|restore|method_entry|request|harness)
+#   change_requires  what a changed value needs to take effect
+#                    (build|deploy|run|none|unknown)
+#
+# Sources for this phase (best-effort pending remote parity):
+#   - request-carried:  comfymodal_runtime/modal_app.py:562
+#                       _REQUEST_DIAGNOSTIC_ENV_ALLOWLIST
+#   - deploy-baked:     deploy_and_run_v2_single.bat + modal_app.py:2941
+#                       _runtime_env()
+#   - harness selectors:tools/benchmark_v2_direct.py + deploy_and_run_v2_single.bat
+
+schema_version = 1
+
+# ── Request-carried (consumed per request; a changed value only needs a run) ──
+
+[[flag]]
+name = "COMFYMODAL_V2_VARIANCE_DIAGNOSTICS"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Enable variance diagnostics for cold-start attribution (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_PRETOUCH"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Pretouch UNET weights before the request (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_OBSERVABILITY_MODE"
+type = "enum"
+default = "production"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+enum_values = ["full", "production", "off"]
+description = "Observability verbosity for a request (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Minimal GPU teardown after a request (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_PIN_UNET_TRANSFER"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Pin UNET transfer buffers (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_QUIESCED_TRANSFER"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Transfer UNET only after sampling quiesces (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_PNG_COMPRESS_LEVEL"
+type = "int"
+default = "3"
+min = 1
+max = 6
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "PNG compression level for output encoding, 1..6 (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_VAE_EARLY_START_MS"
+type = "int"
+default = "0"
+min = 0
+max = 1000
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "VAE early-start lead time in ms, 0..1000 (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_PINNED_STAGING"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Use pinned memory staging for UNET transfer (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CONDITIONING_CACHE_ASYNC_LRU"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Async LRU eviction for the conditioning cache (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_PROMPT_SIGNATURE_CACHE"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Cache conditioning by prompt signature (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CONDITIONING_CACHE_PREFETCH"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "Prefetch conditioning-cache entries (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FASTSAFE_THREADS"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "request"
+change_requires = "run"
+owner = "e31"
+description = "FastSafeTensor threads for CLIP reads, 1..32 (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FASTSAFE_BLOCK_BYTES"
+type = "int"
+default = "16777216"
+consumed_at = "request"
+change_requires = "run"
+owner = "e31"
+description = "FastSafeTensor block size in bytes for CLIP reads (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FASTSAFE_BBUF_KB"
+type = "int"
+default = "256"
+consumed_at = "request"
+change_requires = "run"
+owner = "e31"
+description = "FastSafeTensor bounce-buffer size in KiB for CLIP reads (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_FASTSAFE_THREADS"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "FastSafeTensor threads for UNET reads, 1..32 (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_FASTSAFE_BLOCK_BYTES"
+type = "int"
+default = "16777216"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "FastSafeTensor block size in bytes for UNET reads (request-carried)."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_FASTSAFE_BBUF_KB"
+type = "int"
+default = "256"
+consumed_at = "request"
+change_requires = "run"
+owner = "e29"
+description = "FastSafeTensor bounce-buffer size in KiB for UNET reads (request-carried)."
+
+# ── Deploy-baked (captured by the deployed runtime; a change needs a deploy) ──
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-ops"
+description = "Optional Golden CLIP/VAE/QD stage diagnostics, including E31 forward evidence. Default OFF; deploy-baked for structurally classified experiment requests."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Suppress the stock RES4LYF beta sampler's module-local gc.collect during Golden sampling. Default OFF; deploy-baked for the experimental request path."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_LOADER_PROCESS"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-loader-ab"
+description = "Experimental Golden loader-process A/B switch. Default OFF; when ON, golden_parallel starts one persistent spawn worker that runs the three full canonical loads and hands their CUDA storage to the parent via torch CUDA IPC (canonical preloaded re-bind; no second read/H2D; worker stopped after teardown)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_MINIMAL_RESTORE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-minimal-restore"
+description = "Experimental Golden Parallel minimal post-snapshot restore. Default OFF; when ON, restore() runs a from-first-principles contract (container-local reset + logical GPU repair + models-generation guard + minimal telemetry) instead of the legacy restore. A failure fails closed and never falls back to the legacy path."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_IO_PROCESS"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-io-process"
+description = "Experimental Golden Parallel strict CPU-I/O process. Default OFF; when ON, a pre-snapshot persistent CUDA-sterile child performs model payload storage reads into a bounded process-shared CPU ring, and the parent copies bytes into the existing pinned staging slot before the unchanged H2D/model path."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e31"
+description = "Persist compute-ready FP32 CLIP weights; cast once at module import. Also allowlisted for request override; lifecycle per design doc (design §7 example)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_CHILD_VIZTRACER"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "golden-profiler"
+description = "Process-boundary VizTracer for the Golden C0 child process. Default OFF; when ON the child records its own function-level trace plus a metadata sidecar (trace_id, request_id, pid, parent_pid, role, clock origin, entry count/capacity, truncation) so the exhaustive profiler can merge it. Diagnostic only."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_EXHAUSTIVE_PROFILE"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "none"
+owner = "golden-profiler"
+description = "Report-rendering selector for the Golden exhaustive execution profiler. Read only by the offline reporter over already-captured artifacts; it cannot enable capture, so it is never deploy-baked and never changes container execution."
+
+[[flag]]
+name = "COMFYMODAL_V2_E31_FORENSICS"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e31"
+description = "E31 CLIP-forward forensics: synchronized whole-forward CUDA timing, corrected per-cast classification, E29-ledger events. Default OFF; when ON adds one post-forward sync plus per-cast event pairs (measurement only, never mutates forward semantics)."
+
+[[flag]]
+name = "COMFYMODAL_V2_E31_FORWARD_PROFILE"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e31"
+description = "E31 one-shot torch.profiler pass over one CLIP forward (CPU+CUDA activities). Default OFF; explicit opt-in only, never enabled in production."
+
+[[flag]]
+name = "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT"
+type = "int"
+default = "1024"
+min = 1
+max = 4096
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e31"
+description = "Bounded per-call E31 cast-evidence ring size (and per-cast deferred-event queue cap). Default 1024."
+
+[[flag]]
+name = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
+type = "enum"
+default = "off"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "ra1"
+enum_values = ["off", "steps", "blocks"]
+description = "RA1 gated sampler decomposition level. Default OFF; blocks adds reversible NextDiT category and attention-backend diagnostics."
+
+[[flag]]
+name = "COMFYMODAL_V2_ENV_PROFILE"
+type = "enum"
+default = "production"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["production", "diagnostic", "inherit"]
+description = "Runtime environment profile baked at deploy time."
+
+[[flag]]
+name = "COMFYMODAL_MINIMAL_RESTORE"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Use the E37 minimal restore path; absent means minimal restore remains ON."
+
+[[flag]]
+name = "COMFYMODAL_V2_E37_STRICT_PROOF"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e37"
+description = "Enable the E37 fail-closed plan/cache/ledger/source proof validator."
+
+[[flag]]
+name = "COMFYMODAL_V2_E37_CLEAN_LANE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Enable the diagnostic E37 CLEAN_LANE coordinator and fail-closed proof."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLEAN_LANE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e37"
+description = "Compatibility alias for the explicit E37 CLEAN_LANE runtime mode."
+
+[[flag]]
+name = "COMFYMODAL_V2_BATCH_C_EXPECT_PLAN_FAST_PATH"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e37"
+description = "Require Batch-C plan-validation fast-path proof instead of report-only mode."
+
+[[flag]]
+name = "COMFYMODAL_V2_ATOMIC_PROFILE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Atomic profile switch (set to empty by the canonical BAT)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CPU_MODEL_SNAPSHOT"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Snapshot CPU-resident model weights for fast restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_VAE_SNAPSHOT"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Include VAE in the snapshot payload."
+
+[[flag]]
+name = "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Use the native fast-disk loader for UNET."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_CONDITIONING_CACHE"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Persist CLIP conditioning across cold requests."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_ACTIVATION_MODE"
+type = "enum"
+default = "late"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["late", "sampling_end"]
+description = "When the UNET is activated relative to the request."
+
+[[flag]]
+name = "COMFYMODAL_V2_VAE_ACTIVATION_MODE"
+type = "enum"
+default = "late"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["late", "sampling_end"]
+description = "When the VAE is activated relative to the request."
+
+[[flag]]
+name = "COMFYMODAL_V2_PERSISTENT_LOCAL_HANDLE"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Keep a persistent local handle to the snapshot volume."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_EXCLUDE_UNET"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Exclude UNET payload from the snapshot (restore-only shadow)."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_CONSTRUCTION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Construct the snapshot at deploy time."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_MANIFEST"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29/ra2b"
+description = "Capture diagnostic snapshot manifests at startup and first restored line."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_ALLOCATOR_HYGIENE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29/ra2b"
+description = "Run the diagnostic allocator-hygiene pass at the snapshot capture boundary."
+
+[[flag]]
+name = "COMFYMODAL_V2_EVICT_MODELS_BEFORE_SNAPSHOT"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Evict models before snapshot capture."
+
+[[flag]]
+name = "COMFYMODAL_V2_EVICT_RETAIN_ROLE"
+type = "enum"
+default = "none"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+enum_values = ["none", "clip", "unet", "clip_vae"]
+description = "Role retained in the CPU snapshot after eviction (case-sensitive: none|clip|unet|clip_vae)."
+
+[[flag]]
+name = "COMFYMODAL_V2_EVICT_RESTORE_IDLE_SECONDS"
+type = "int"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Idle seconds before eviction during restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Fast cold-start orchestration path."
+
+[[flag]]
+name = "COMFYMODAL_V2_CHECKPOINT_PREWARM"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Prewarm checkpoint payloads during restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_CHECKPOINT_PREWARM_THREADS"
+type = "int"
+default = "4"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Threads used for checkpoint prewarm."
+
+[[flag]]
+name = "COMFYMODAL_V2_CHECKPOINT_PREWARM_CHUNK_MB"
+type = "int"
+default = "64"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Chunk size in MiB for checkpoint prewarm reads."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_FASTSAFETENSORS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Use FastSafeTensor for UNET hydration."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_FAST_HYDRATION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Fast hydration path for CLIP weights."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Exclude CLIP weights from the snapshot."
+
+[[flag]]
+name = "COMFYMODAL_V2_CRITICAL_GPU_COORDINATION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Critical-path GPU lane coordination."
+
+[[flag]]
+name = "COMFYMODAL_V2_SCOPED_CUDA_READINESS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Scope CUDA readiness checks to the request window."
+
+[[flag]]
+name = "COMFYMODAL_V2_STAGED_SAFETENSORS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Staged safetensors hydration."
+
+[[flag]]
+name = "COMFYMODAL_V2_STAGED_SOURCE_ORDER"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Respect source ordering in staged hydration."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_STAGED_HYDRATION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Staged hydration for CLIP."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_COLD_FORENSICS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "CLIP cold-path forensics instrumentation."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_COLD_FORENSICS_CAST"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Cast tracking inside CLIP cold forensics."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_COLD_FORENSICS_SYNC_CUDA"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Sync CUDA inside CLIP cold forensics. Intrusive; keep disabled in production."
+
+[[flag]]
+name = "COMFYMODAL_V2_INPUT_TYPES_WARM"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Warm input-type resolution at import."
+
+[[flag]]
+name = "COMFYMODAL_V2_UNET_FORENSICS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "UNET hydration forensics."
+
+[[flag]]
+name = "COMFYMODAL_V2_C9QD_EXTRAS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "C9 queue-depth extras."
+
+[[flag]]
+name = "COMFYMODAL_V2_SPECULATIVE_CLIP_HYDRATION"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Speculative CLIP hydration during restore."
+
+[[flag]]
+name = "COMFYMODAL_RESTORE_CLIP_READ_PROBE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "restore-contention"
+description = "Opt-in non-blocking shared-FD QD2/128 MiB CLIP read launched inside restore for contention experiments."
+
+[[flag]]
+name = "COMFYMODAL_RESTORE_CLIP_READ_PROBE_SOURCE"
+type = "enum"
+default = "models_volume"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "restore-contention"
+enum_values = ["models_volume", "local_cache"]
+description = "Source for the restore CLIP read probe; local_cache stages the exact text encoder before snapshot capture."
+
+# ── E30 CLIP genuine-QD reader (deploy-baked; consumed at restore/lane start) ──
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_QD_READER"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Enable the E30 genuine queue-depth CLIP source reader (default OFF; the E28 fastsafetensors path runs unchanged when unset)."
+
+[[flag]]
+name = "COMFYMODAL_V2_M2_PRODUCTION_LOADER"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "m2-production"
+description = "Use the M2 mmap/process CLIP loader with PyTorch-owned contiguous GPU storage (default OFF)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_LOADER"
+type = "enum"
+default = "c0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-io-process-v2"
+enum_values = ["c0", "m2"]
+description = "Select the Golden CLIP transport entry; the shared transport resolves to the C0 shared arena (C0 execution body, exact-window mmap source kernel) when C0 streaming is selected, and Golden adoption remains authoritative."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_MODEL_TRANSPORT"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-model-transport"
+description = "Enable the persistent role-neutral shared model transport for CLIP and UNET; it runs the C0 shared arena (never a standalone M2 execution arm) when C0 streaming with the exact-window engine is selected."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_TRANSPORT_GEOMETRY"
+type = "enum"
+default = "qd4_64"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-model-transport"
+enum_values = ["qd4_64", "qd2_128", "qd4_64_h2d128", "qd4_128"]
+description = "C0 source/H2D scheduling geometry (window usage only; the 512 MiB C0 arena is never resized). qd2_128 requires 128 MiB C0 slots."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_WINDOW_TRACE"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-model-transport"
+description = "Attach full per-window source records to C0 transport telemetry (diagnostic only; default OFF)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SHM_POPULATE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-experiment-1"
+description = "Experiment-1 treatment: materialize the fresh 512 MiB C0 SHM with real parallel CPU writes before cudaHostRegister (default OFF = production-005 control)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE"
+type = "enum"
+default = "fresh"
+consumed_at = "request"
+change_requires = "run"
+owner = "testing9-c0-mmap"
+enum_values = ["fresh", "whole", "epoch"]
+description = "TESTING9-only C0 mmap lifecycle diagnostic; fresh is the current exact-window control, whole keeps one mapping per model/path, and epoch uses aligned approximately 1 GiB mappings."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_THREADS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-c0-source"
+description = "C0 source owner arm: one CUDA-sterile source process owning the 512 MiB / 8 x 64 MiB shared C0 arena, with four persistent self-serve readers. Reader isolation is selected by COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND. Default OFF; no fallback is permitted when selected."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
+type = "enum"
+enum_values = ["thread", "process"]
+default = "thread"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-c0-source"
+description = "Reader isolation for the C0 source owner. 'thread' = one source process with four reader threads sharing one address space, one descriptor and at most one whole-file mapping. 'process' = one CUDA-sterile supervisor with four independent persistent reader processes, each with its own address space, descriptor and whole-file mapping. Any other value fails closed; there is no fallback between the two."
+
+[[flag]]
+name = "COMFYMODAL_PHASE1_C0_ARENA"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "testing9-c0-arena"
+description = "TESTING9-only deployment gate for the isolated process/thread/shared-arena microbenchmark endpoint."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_READER_GATE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-experiment-4"
+description = "Experiment-4 treatment: enforce the 4 ms source-launch floor inside each forked reader immediately before its expensive access (default OFF = claim-spacing only)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_DMA_RING"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-experiment-3"
+description = "Experiment-3 treatment: 5 x 64 MiB global pageable source pool plus 2 x 64 MiB pinned DMA ring (default OFF = production-005 8-slot registered arena)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-composition"
+description = "Composition treatment: 5 x 64 MiB globally shared registered-capable source slots (default OFF = production-005 8-slot geometry)."
+
+[[flag]]
+name = "COMFYMODAL_TESTING8_INSTANTTENSOR"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "testing8-gds-instanttensor"
+description = "TESTING8-only installation gate for isolated InstantTensor transport probes; never used by Golden loaders."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+description = "Observation-only deep cudaHostRegister identity, mapping, proc-state, rusage, and context diagnostics; default OFF."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER"
+type = "enum"
+default = "overlap"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+enum_values = ["overlap", "register_first"]
+description = "Diagnostic-only registration ordering arm; overlap preserves Popen-before-register and register_first registers before child startup."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "c0-registration-investigation"
+description = "Diagnostic-only primary-context preinitialization before cudaHostRegister; default OFF."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
+type = "enum"
+default = "serial"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-parallel"
+enum_values = ["serial", "overlap"]
+description = "Schedule CLIP forward and UNET load serially or in the bounded parallel overlap window."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE"
+type = "enum"
+default = "serial"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-parallel"
+enum_values = ["serial", "overlap"]
+description = "Schedule sampling and VAE load serially or in the bounded parallel overlap window."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CLIP_SKELETON_OVERLAP"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-io-process-v2"
+description = "Overlap weightless CLIP skeleton construction with the selected CLIP source/H2D transport."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_QD_QD"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "E30 CLIP reader queue depth (independent reader threads), 1..32, default 4."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_QD_BLOCK_MIB"
+type = "int"
+default = "32"
+min = 1
+max = 4096
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "E30 CLIP reader block size in MiB, 1..4096, default 32."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_QD_LAUNCH_POLICY"
+type = "enum"
+default = "restore_earliest"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+enum_values = ["restore_earliest", "after_restore_sensitive_phase", "after_cuda_restore", "method_entry", "clean_lane_post_restore"]
+description = "E30 CLIP reader launch policy (the reader never chooses; the caller passes it)."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLIP_QD_ARTIFACT"
+type = "path"
+default = ""
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e30"
+description = "Optional JSON artifact path for per-block E30 CLIP QD stats (empty = no artifact)."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
+type = "enum"
+default = "legacy"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+enum_values = ["legacy", "dispatcher", "static_e27", "decoupled"]
+description = "Golden QD4 transport arm for the isolated RA9C comparison."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_QD"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source-reader queue depth, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES"
+type = "int"
+default = "33554432"
+min = 1
+max = 1073741824
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source-read block size in bytes, 1..1073741824."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_H2D_COPY_BYTES"
+type = "int"
+default = "33554432"
+min = 1
+max = 1073741824
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden host-to-device copy extent in bytes, 1..1073741824."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH"
+type = "int"
+default = "4"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden in-flight H2D extent depth, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_CAPACITY"
+type = "int"
+default = "8"
+min = 1
+max = 32
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Independent decoupled Golden source staging capacity, 1..32."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_DIRECT_BLOCK_BYTES"
+type = "int"
+default = "33554432"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+min = 33554432
+max = 1073741824
+description = "Golden direct-source geometry; runtime accepts only 32, 64, 128, 256, 512, or 1024 MiB."
+
+[[flag]]
+name = "COMFYMODAL_V2_GPU_FAST_RETURN"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Fast GPU return after the request."
+
+[[flag]]
+name = "COMFYMODAL_V2_OPTIMIZATION_DIAGNOSTICS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Optimization diagnostics."
+
+[[flag]]
+name = "COMFYMODAL_V2_GANTT_TELEMETRY"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Gantt-chart telemetry emission."
+
+[[flag]]
+name = "COMFYMODAL_V2_CRITICAL_PATH_LEDGER"
+type = "bool"
+default = "1"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e29"
+description = "E29 canonical critical-path ledger (default ON when baked; the single authoritative timing store)."
+
+[[flag]]
+name = "COMFYMODAL_V2_E27_FORENSICS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "E27 forensics instrumentation."
+
+[[flag]]
+name = "COMFYMODAL_V2_RELEASE_GPU_AFTER_REQUEST"
+type = "bool"
+default = "1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Release GPU memory after each request."
+
+[[flag]]
+name = "COMFYMODAL_V2_VAE_POLICY"
+type = "enum"
+default = "v1"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["v0", "v1"]
+description = "VAE memory/restore policy (v1 is production)."
+
+[[flag]]
+name = "COMFYMODAL_SAGE_RUNTIME_MODE"
+type = "enum"
+default = "auto"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["auto", "baked_cuda", "triton_fallback"]
+description = "SageAttention runtime selector; production pins the baked CUDA dispatcher."
+
+[[flag]]
+name = "COMFYMODAL_V2_SINGLE_USE_CONTAINERS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Run each request in a fresh single-use container."
+
+[[flag]]
+name = "COMFYMODAL_V2_FULL_TRACE"
+type = "bool"
+default = "0"
+consumed_at = "module_import"
+change_requires = "deploy"
+owner = "e29"
+description = "Deploy-baked deep-trace capability; session/sampler/VizTracer/torch profiling is request-only and never started by restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_DEEP_TRACE"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+description = "Request-only Golden deep trace selector; default off. The deploy-baked COMFYMODAL_V2_FULL_TRACE capability is not started during restore."
+
+[[flag]]
+name = "COMFYMODAL_V2_RESIDENCY_DIAGNOSTICS"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Residency diagnostics."
+
+[[flag]]
+name = "COMFYMODAL_V2_DEEP_MODEL_DIAG"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Deep model diagnostics."
+
+[[flag]]
+name = "COMFYMODAL_V2_PAGEFAULT_TRACKING"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Page-fault tracking."
+
+[[flag]]
+name = "COMFYMODAL_V2_PREFILL_LANES"
+type = "enum"
+default = "critical"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+enum_values = ["none", "critical", "full"]
+description = "Prefill lane policy (critical is production)."
+
+[[flag]]
+name = "COMFYMODAL_V2_PREFILL_WAIT_FOR_UNET"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "e29"
+description = "Wait for UNET readiness before prefill."
+
+[[flag]]
+name = "COMFYMODAL_V2_THREAD_POLICY"
+type = "string"
+default = "TBASE"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Thread policy selector (TBASE is production)."
+
+[[flag]]
+name = "COMFYMODAL_V2_SNAPSHOT_MODEL_ORDER"
+type = "string"
+default = "O0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Snapshot model ordering (O0 is production)."
+
+[[flag]]
+name = "COMFYMODAL_V2_MEMORY_MB"
+type = "int"
+default = "8192"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Container memory request in MiB."
+
+[[flag]]
+name = "COMFYMODAL_V2_MEMORY_REQUEST"
+type = "int"
+default = "8192"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Canonical runtime-shape memory request in MiB; must agree with COMFYMODAL_V2_MEMORY_MB when both are present."
+
+[[flag]]
+name = "COMFYMODAL_V2_CPU_REQUEST"
+type = "int"
+default = "12"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Container CPU request."
+
+[[flag]]
+name = "COMFYMODAL_V2_BASELINE_CPU_REQUEST"
+type = "int"
+default = "12"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Baseline CPU request for resource comparison."
+
+[[flag]]
+name = "COMFYMODAL_V2_BASELINE_MEMORY_REQUEST"
+type = "int"
+default = "8192"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Baseline memory request in MiB for resource comparison."
+
+[[flag]]
+name = "COMFYMODAL_V2_CLOUD"
+type = "enum"
+default = ""
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+enum_values = ["aws", "gcp"]
+description = "Pin deployment to a Modal cloud provider."
+
+[[flag]]
+name = "COMFYMODAL_V2_REGION"
+type = "string"
+default = ""
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "v2-core"
+description = "Pin deployment to a single Modal region (empty = provider default)."
+
+# ── P1 serial-Golden runtime (deploy-baked; consumed during restore) ────────
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "P1 serial-Golden dynamic-VRAM path: hydrate model payloads directly into GPU memory during restore instead of the CPU-snapshot defaults. Deploy-baked via modal_app _runtime_env(); a changed value requires a redeploy."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH"
+type = "bool"
+default = "0"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "Explicit deploy gate for the opt-in request-level CPU raw full-CLIP QD2 prefetch experiment; disabled by default and never combined with InstantTensor."
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
+type = "bool"
+default = "1"
+consumed_at = "request"
+change_requires = "deploy"
+owner = "golden-p1"
+description = "P1 serial-Golden workflow SHA equality guard; hash computation and telemetry remain enabled when this guard is explicitly disabled."
+
+# ── Harness selectors (consumed by the request harness; run-only) ───────────
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_ATTENTION_BACKEND"
+type = "enum"
+default = "sage"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+enum_values = ["pytorch", "sage", "comfy_kitchen"]
+description = "Public Golden request attention backend selector; omitted Golden requests resolve explicitly to Sage."
+
+[[flag]]
+name = "COMFYMODAL_V2_GOLDEN_CPU_QD2_PREFETCH"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "golden-p1"
+description = "Explicit run-only Golden CPU QD2 request-arm selector; the deployed COMFYMODAL_GOLDEN_CPU_QD2_PREFETCH gate must already be enabled and InstantTensor is forbidden."
+
+[[flag]]
+name = "V2_BENCHMARK_RUNS"
+type = "int"
+default = "10"
+consumed_at = "harness"
+change_requires = "run"
+owner = "v2-core"
+description = "Number of benchmark runs in a campaign."
+
+[[flag]]
+name = "V2_BENCHMARK_GAP_SECONDS"
+type = "float"
+default = "35.0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "v2-core"
+description = "Gap between benchmark runs in seconds."
+
+[[flag]]
+name = "V2_RESTORE_ONLY_RUN_COUNT"
+type = "int"
+default = "6"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Valid restore-only probe target count."
+
+[[flag]]
+name = "V2_RESTORE_ONLY_MAX_ATTEMPTS"
+type = "int"
+default = "40"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Total-attempt safety cap for restore-only probes."
+
+[[flag]]
+name = "V2_RESTORE_ONLY_GAP_SECONDS"
+type = "float"
+default = "30.0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Gap between restore-only probes in seconds."
+
+[[flag]]
+name = "V2_VOLUME_READ_RUN_COUNT"
+type = "int"
+default = "3"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Volume-read benchmark run count."
+
+[[flag]]
+name = "V2_VOLUME_READ_GAP_SECONDS"
+type = "float"
+default = "25.0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Gap between volume-read runs in seconds."
+
+[[flag]]
+name = "V2_BENCHMARK_MODE"
+type = "enum"
+default = "e28_single"
+consumed_at = "harness"
+change_requires = "run"
+owner = "v2-core"
+enum_values = ["acceptance", "e22_single", "e25_single", "e26_single", "e28_single", "m2_single", "golden_p1_serial", "golden_p1_parallel", "host_ab", "provider_ab", "snapshot_restore_only", "variance_cold", "variance_matrix", "volume_read"]
+description = "Benchmark harness mode selector. Default e28_single = ONE full run_plan_stream generation (the tracer/validation path). snapshot_restore_only (the restore-only PROBE that never generates) is an explicit opt-in ONLY; v2ctl gate/run must never silently fall into it."
+
+[[flag]]
+name = "V2_E22_CONDITIONING_NONCE"
+type = "string"
+default = ""
+regex = "^[0-9A-Za-z-]+$"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Per-campaign nonce for E22 conditioning-cache identity."
+
+[[flag]]
+name = "V2_E25_CONDITIONING_NONCE"
+type = "string"
+default = ""
+regex = "^[0-9A-Za-z-]+$"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Per-campaign nonce for E25 conditioning-cache identity."
+
+[[flag]]
+name = "V2_E26_CONDITIONING_NONCE"
+type = "string"
+default = ""
+regex = "^[0-9A-Za-z-]+$"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Per-campaign nonce for E26 conditioning-cache identity."
+
+[[flag]]
+name = "V2_E28_CONDITIONING_NONCE"
+type = "string"
+default = ""
+regex = "^[0-9A-Za-z-]+$"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Per-campaign nonce for E28 conditioning-cache identity."
+
+# ── Harness selectors consumed at deploy time (deploy selectors) ─────────────
+
+[[flag]]
+name = "V2_E19_FINAL_COLD_LOADER"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "E19 final cold loader selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_D6_FASTPATH_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "D6 fast-path validation selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_D10_INTEGRATION_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "D10 integration validation selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_E10_BUCKET_FIRST_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "E10 bucket-first validation selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_E25_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "E25 validation selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_E26_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "E26 validation selector (consumed by the deploy script)."
+
+[[flag]]
+name = "V2_E28_VALIDATION"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "deploy"
+owner = "e29"
+description = "E28 validation selector (consumed by the deploy script)."
+
+# ── Plain run-side mirrors (harness-consumed; run-only) ─────────────────────
+
+[[flag]]
+name = "V2_E22_PREFETCH_OFF"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "E22 prefetch-off arm selector."
+
+[[flag]]
+name = "V2_E22_PREFETCH_ON"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "E22 prefetch-on arm selector."
+
+[[flag]]
+name = "V2_IS_VARIANCE"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Variance campaign indicator."
+
+[[flag]]
+name = "V2_VARIANCE_PRETOUCH"
+type = "bool"
+default = "0"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Variance pretouch mirror."
+
+[[flag]]
+name = "V2_VARIANCE_COLD_GAP_SECONDS"
+type = "int"
+default = "25"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Gap between variance cold runs in seconds."
+
+[[flag]]
+name = "V2_VARIANCE_RUN_COUNT"
+type = "int"
+default = "6"
+consumed_at = "harness"
+change_requires = "run"
+owner = "e29"
+description = "Variance cold run count."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_LOADER_PROCESS_PRESNAPSHOT"
+type = "bool"
+default = "0"
+consumed_at = "method_entry"
+change_requires = "deploy"
+owner = "golden-loader-ab"
+description = "Experimental: spawn the persistent CPU-only loader worker before snapshot capture so worker startup is removed from request time. On restore the same worker PID + IPC channel are verified (PING/PONG, no respawn) and then used for the three full loads. Default OFF."

@@ -1,0 +1,78 @@
+{
+  "app": "sept-unetclip-c9-recovery-source-only",
+  "arm": "source_only",
+  "attempts": [
+    {
+      "artifact": "unetClipExperimentsSeptember\\07b_c9_faithful_recovery\\smoke_a_mlock\\runs\\20260905T045259_81f99b8f_c9_o01_unet_qd8.json",
+      "attempt_id": "20260905T045259_81f99b8f_c9_o01_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 1,
+      "cell_id": "unet_qd8",
+      "error": "status_not_ok;experiment_marker_missing;arm_not_source_only;qd_mismatch;top_level_block_bytes_mismatch;fixed_config_missing;source_only_contract_failed;h2d_metric_present;coverage_failed;byte_reconciliation_failed;physical_reads_missing;source_wall_missing;effective_gbps_missing;time_weighted_qd_missing;max_achieved_qd_missing;worker_evidence_missing;filesystem_identity_missing;cpu_allocation_missing;fd_topology_evidence_failed;buffer_not_pinned_host;buffer_reuse_contract_failed;pinned_host_evidence_missing;hashing_in_timed_loop;allocation_in_timed_loop;telemetry_in_timed_loop;timing_boundary_missing",
+      "finished_at": "2026-09-05T04:53:04.155522+00:00",
+      "finished_monotonic_ns": 225809765000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 1,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T045259_81f99b8f",
+      "started_at": "2026-09-05T04:52:59.856856+00:00",
+      "started_monotonic_ns": 225805468000000,
+      "status": "INVALID",
+      "wall_ms": 4297.0
+    },
+    {
+      "artifact": "unetClipExperimentsSeptember\\07b_c9_faithful_recovery\\smoke_a_mlock\\runs\\20260905T045259_81f99b8f_c9_o02_unet_qd8.json",
+      "attempt_id": "20260905T045259_81f99b8f_c9_o02_unet_qd8",
+      "block_bytes": 33554432,
+      "block_mib": 32,
+      "campaign_index": 2,
+      "cell_id": "unet_qd8",
+      "error": "status_not_ok;experiment_marker_missing;arm_not_source_only;qd_mismatch;top_level_block_bytes_mismatch;fixed_config_missing;source_only_contract_failed;h2d_metric_present;coverage_failed;byte_reconciliation_failed;physical_reads_missing;source_wall_missing;effective_gbps_missing;time_weighted_qd_missing;max_achieved_qd_missing;worker_evidence_missing;filesystem_identity_missing;cpu_allocation_missing;fd_topology_evidence_failed;buffer_not_pinned_host;buffer_reuse_contract_failed;pinned_host_evidence_missing;hashing_in_timed_loop;allocation_in_timed_loop;telemetry_in_timed_loop;timing_boundary_missing",
+      "finished_at": "2026-09-05T04:53:14.756799+00:00",
+      "finished_monotonic_ns": 225820359000000,
+      "model_name": "z_image_turbo_bf16.safetensors",
+      "observation": 2,
+      "qd": 8,
+      "role": "unet",
+      "run_id": "20260905T045259_81f99b8f",
+      "started_at": "2026-09-05T04:53:04.159817+00:00",
+      "started_monotonic_ns": 225809765000000,
+      "status": "INVALID",
+      "wall_ms": 10594.0
+    }
+  ],
+  "experiment": "c9_recovery",
+  "geometry": {
+    "block_bytes": 33554432,
+    "expected_attempts_per_run": 2,
+    "models": {
+      "unet": "z_image_turbo_bf16.safetensors"
+    },
+    "observations_per_model_qd": 2,
+    "qd_values": [
+      8
+    ],
+    "roles": [
+      "unet"
+    ]
+  },
+  "runs": [
+    {
+      "attempt_ids": [
+        "20260905T045259_81f99b8f_c9_o01_unet_qd8",
+        "20260905T045259_81f99b8f_c9_o02_unet_qd8"
+      ],
+      "completed_attempts": 2,
+      "expected_attempts": 2,
+      "finished_at": "2026-09-05T04:53:14.759801+00:00",
+      "run_id": "20260905T045259_81f99b8f",
+      "started_at": "2026-09-05T04:52:59.319256+00:00",
+      "status": "COMPLETE_WITH_FAILURES"
+    }
+  ],
+  "status": "COMPLETE_WITH_FAILURES",
+  "updated_at": "2026-09-05T04:53:14.759801+00:00",
+  "version": 1
+}

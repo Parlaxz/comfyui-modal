@@ -1,0 +1,5204 @@
+{
+  "E27_SOURCE_MECHANISM_PROVEN": "YES",
+  "H2D_READY_MS": null,
+  "SOURCE_WALL_MS": 1708.397186,
+  "achieved_h2d_inflight_depth": 0,
+  "achieved_h2d_inflight_depth_max": 0,
+  "achieved_qd_max": 8,
+  "achieved_qd_mean": 6.331078285735895,
+  "achieved_source_qd_max": 8,
+  "achieved_source_qd_mean": 6.331078285735895,
+  "arm": "source_only_same_path",
+  "attempt_id": "clip_b128_qd8_source_only_same_path_R3",
+  "classification": "ELIGIBLE",
+  "comparison_contract": {
+    "only_intended_arm_difference": "h2d_participation",
+    "staging_buffer_allocation_identity": "one_contiguous_pinned_cpu_uint8_arena"
+  },
+  "configured_h2d_copy_bytes": 134217728,
+  "configured_h2d_inflight_depth": 8,
+  "configured_qd": 8,
+  "configured_source_block_bytes": 134217728,
+  "configured_source_capacity": 8,
+  "configured_source_qd": 8,
+  "control_operation_timeout_seconds": 300.0,
+  "cuda_used": false,
+  "data_start": 45856,
+  "execution_arm": "source_only_same_path",
+  "file_size_bytes": 8044982048,
+  "filesystem_mount_identity": {
+    "device": 31,
+    "fs_block_size": 4096,
+    "fs_name": "statvfs",
+    "inode": 4,
+    "mode": 420,
+    "mount": {
+      "filesystem_type": "9p",
+      "mountpoint": "/__modal/volumes",
+      "source": "none",
+      "super_options": "rw,trans=fd,rfdno=11,wfdno=11,aname=/,dfltuid=4294967294,dfltgid=4294967294,dcache=0,cache=remote_revalidating,disable_fifo_open,directfs"
+    },
+    "path": "/root/models/text_encoders/qwen_3_4b.safetensors"
+  },
+  "geometry": {
+    "block_bytes": 134217728,
+    "block_mib": 128,
+    "qd": 8,
+    "role": "clip"
+  },
+  "h2d_copy_bytes": 134217728,
+  "h2d_dispatcher": {
+    "events": [],
+    "participated": false,
+    "started": false
+  },
+  "h2d_inflight_depth": 8,
+  "h2d_ready_ms": null,
+  "h2d_settings": {
+    "copy_bytes": 134217728,
+    "inflight_depth": 8
+  },
+  "h2d_used": false,
+  "identity": {
+    "app": "comfy-modal-phase2-audit-control",
+    "configured_source_capacity": 8,
+    "container_session_id": "ta-01M1QRNQF6W8Q50CN1ACR7N71R",
+    "control_operation_timeout_seconds": 300.0,
+    "cpu": 4,
+    "cpu_allocation": {
+      "declared": 4,
+      "requested": 4,
+      "source": "phase2_control_identity"
+    },
+    "cpu_request": 4,
+    "gpu": "rtx-pro-6000",
+    "hostname": "modal",
+    "image_id": "im-9kD2PxYeJdKufeQ7cIglnr",
+    "memory_mb": 8192,
+    "model_path_resolution": "fixed_read_only_models_mount",
+    "models_mount": "/root/models",
+    "models_mount_read_only": true,
+    "models_volume": "comfyui-models",
+    "phase": "phase_2",
+    "phase_3_status": "stopped",
+    "producer_implementation": "preplanned_extent_source_worker",
+    "profile": "phase2-source-h2d-control",
+    "provider": "CLOUD_PROVIDER_GCP",
+    "region": "us-east1",
+    "resources": {
+      "cpu": 4,
+      "gpu": "rtx-pro-6000",
+      "memory_mb": 8192
+    },
+    "source_block_bytes": 268435456,
+    "source_capacity": 8,
+    "source_capacity_semantics": "buffering_work_capacity_only",
+    "source_worker_path": "PreplannedExtentTransport",
+    "timing_boundary": "SOURCE_WALL=source worker path entry to all source workers joined",
+    "transport_cleanup_timeout_seconds": 300.0
+  },
+  "model_name": "qwen_3_4b.safetensors",
+  "path_resolution": "fixed_read_only_models_mount",
+  "payload_bytes": 8044936192,
+  "payload_reconciliation": {
+    "ok": true,
+    "payload_bytes": 8044936192,
+    "requested_bytes": 8044936192,
+    "returned_bytes": 8044936192
+  },
+  "phase": "phase_2",
+  "phase_3_status": "stopped",
+  "physical_read_provenance": "golden_serial._read_at",
+  "physical_read_telemetry": [
+    {
+      "destination_offset": 402653184,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 402699040,
+      "syscall_enter_monotonic_ns": 2951544024,
+      "syscall_exit_monotonic_ns": 3167711703
+    },
+    {
+      "destination_offset": 939524096,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 939569952,
+      "syscall_enter_monotonic_ns": 3045275958,
+      "syscall_exit_monotonic_ns": 3199006847
+    },
+    {
+      "destination_offset": 268435456,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 268481312,
+      "syscall_enter_monotonic_ns": 2951078204,
+      "syscall_exit_monotonic_ns": 3273849972
+    },
+    {
+      "destination_offset": 536870912,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 536916768,
+      "syscall_enter_monotonic_ns": 2951942994,
+      "syscall_exit_monotonic_ns": 3274679702
+    },
+    {
+      "destination_offset": 0,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 45856,
+      "syscall_enter_monotonic_ns": 2949902404,
+      "syscall_exit_monotonic_ns": 3274959662
+    },
+    {
+      "destination_offset": 671088640,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 671134496,
+      "syscall_enter_monotonic_ns": 2952588484,
+      "syscall_exit_monotonic_ns": 3275058342
+    },
+    {
+      "destination_offset": 134217728,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 134263584,
+      "syscall_enter_monotonic_ns": 2950467014,
+      "syscall_exit_monotonic_ns": 3275254142
+    },
+    {
+      "destination_offset": 805306368,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 805352224,
+      "syscall_enter_monotonic_ns": 3043171528,
+      "syscall_exit_monotonic_ns": 3275328382
+    },
+    {
+      "destination_offset": 1610612736,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1610658592,
+      "syscall_enter_monotonic_ns": 3277084541,
+      "syscall_exit_monotonic_ns": 3413535394
+    },
+    {
+      "destination_offset": 1476395008,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1476440864,
+      "syscall_enter_monotonic_ns": 3276747031,
+      "syscall_exit_monotonic_ns": 3428165901
+    },
+    {
+      "destination_offset": 1744830464,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1744876320,
+      "syscall_enter_monotonic_ns": 3275580992,
+      "syscall_exit_monotonic_ns": 3467369973
+    },
+    {
+      "destination_offset": 2013265920,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2013311776,
+      "syscall_enter_monotonic_ns": 3276295051,
+      "syscall_exit_monotonic_ns": 3467558863
+    },
+    {
+      "destination_offset": 1073741824,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1073787680,
+      "syscall_enter_monotonic_ns": 3276690381,
+      "syscall_exit_monotonic_ns": 3467661893
+    },
+    {
+      "destination_offset": 1342177280,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1342223136,
+      "syscall_enter_monotonic_ns": 3275836822,
+      "syscall_exit_monotonic_ns": 3467783813
+    },
+    {
+      "destination_offset": 1207959552,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1208005408,
+      "syscall_enter_monotonic_ns": 3276822441,
+      "syscall_exit_monotonic_ns": 3467968423
+    },
+    {
+      "destination_offset": 1879048192,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1879094048,
+      "syscall_enter_monotonic_ns": 3276981151,
+      "syscall_exit_monotonic_ns": 3468062573
+    },
+    {
+      "destination_offset": 2550136832,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2550182688,
+      "syscall_enter_monotonic_ns": 3468226543,
+      "syscall_exit_monotonic_ns": 3539687278
+    },
+    {
+      "destination_offset": 2684354560,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2684400416,
+      "syscall_enter_monotonic_ns": 3468398453,
+      "syscall_exit_monotonic_ns": 3539815038
+    },
+    {
+      "destination_offset": 2952790016,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2952835872,
+      "syscall_enter_monotonic_ns": 3541449158,
+      "syscall_exit_monotonic_ns": 3657094065
+    },
+    {
+      "destination_offset": 2415919104,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2415964960,
+      "syscall_enter_monotonic_ns": 3540403908,
+      "syscall_exit_monotonic_ns": 3665762993
+    },
+    {
+      "destination_offset": 2281701376,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2281747232,
+      "syscall_enter_monotonic_ns": 3541235298,
+      "syscall_exit_monotonic_ns": 3693384858
+    },
+    {
+      "destination_offset": 3087007744,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3087053600,
+      "syscall_enter_monotonic_ns": 3541582238,
+      "syscall_exit_monotonic_ns": 3694257497
+    },
+    {
+      "destination_offset": 2818572288,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2818618144,
+      "syscall_enter_monotonic_ns": 3541539998,
+      "syscall_exit_monotonic_ns": 3694678577
+    },
+    {
+      "destination_offset": 3221225472,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3221271328,
+      "syscall_enter_monotonic_ns": 3540822228,
+      "syscall_exit_monotonic_ns": 3694857947
+    },
+    {
+      "destination_offset": 3355443200,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3355489056,
+      "syscall_enter_monotonic_ns": 3695035787,
+      "syscall_exit_monotonic_ns": 3769341402
+    },
+    {
+      "destination_offset": 2147483648,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2147529504,
+      "syscall_enter_monotonic_ns": 3695197317,
+      "syscall_exit_monotonic_ns": 3837646869
+    },
+    {
+      "destination_offset": 3892314112,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3892359968,
+      "syscall_enter_monotonic_ns": 3695476277,
+      "syscall_exit_monotonic_ns": 3839092468
+    },
+    {
+      "destination_offset": 4160749568,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4160795424,
+      "syscall_enter_monotonic_ns": 3695533277,
+      "syscall_exit_monotonic_ns": 3844523227
+    },
+    {
+      "destination_offset": 3489660928,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3489706784,
+      "syscall_enter_monotonic_ns": 3694027907,
+      "syscall_exit_monotonic_ns": 3878669950
+    },
+    {
+      "destination_offset": 4294967296,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4295013152,
+      "syscall_enter_monotonic_ns": 3838010898,
+      "syscall_exit_monotonic_ns": 3899645066
+    },
+    {
+      "destination_offset": 3623878656,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3623924512,
+      "syscall_enter_monotonic_ns": 3693682117,
+      "syscall_exit_monotonic_ns": 3910314064
+    },
+    {
+      "destination_offset": 4429185024,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4429230880,
+      "syscall_enter_monotonic_ns": 3837853888,
+      "syscall_exit_monotonic_ns": 3945088477
+    },
+    {
+      "destination_offset": 4026531840,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4026577696,
+      "syscall_enter_monotonic_ns": 3695339307,
+      "syscall_exit_monotonic_ns": 3990360138
+    },
+    {
+      "destination_offset": 4563402752,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4563448608,
+      "syscall_enter_monotonic_ns": 3878927770,
+      "syscall_exit_monotonic_ns": 3993418727
+    },
+    {
+      "destination_offset": 4697620480,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4697666336,
+      "syscall_enter_monotonic_ns": 3910437034,
+      "syscall_exit_monotonic_ns": 4057806907
+    },
+    {
+      "destination_offset": 5100273664,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5100319520,
+      "syscall_enter_monotonic_ns": 3990505018,
+      "syscall_exit_monotonic_ns": 4118720750
+    },
+    {
+      "destination_offset": 5502926848,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5502972704,
+      "syscall_enter_monotonic_ns": 3993535857,
+      "syscall_exit_monotonic_ns": 4135965937
+    },
+    {
+      "destination_offset": 3758096384,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3758142240,
+      "syscall_enter_monotonic_ns": 3694450367,
+      "syscall_exit_monotonic_ns": 4137046137
+    },
+    {
+      "destination_offset": 5637144576,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5637190432,
+      "syscall_enter_monotonic_ns": 4057882467,
+      "syscall_exit_monotonic_ns": 4204947519
+    },
+    {
+      "destination_offset": 5368709120,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5368754976,
+      "syscall_enter_monotonic_ns": 3990528848,
+      "syscall_exit_monotonic_ns": 4217839027
+    },
+    {
+      "destination_offset": 5234491392,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5234537248,
+      "syscall_enter_monotonic_ns": 3945299607,
+      "syscall_exit_monotonic_ns": 4238506304
+    },
+    {
+      "destination_offset": 5771362304,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5771408160,
+      "syscall_enter_monotonic_ns": 4118890680,
+      "syscall_exit_monotonic_ns": 4270473060
+    },
+    {
+      "destination_offset": 5905580032,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5905625888,
+      "syscall_enter_monotonic_ns": 4137318007,
+      "syscall_exit_monotonic_ns": 4270682140
+    },
+    {
+      "destination_offset": 4966055936,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4966101792,
+      "syscall_enter_monotonic_ns": 3899776596,
+      "syscall_exit_monotonic_ns": 4270882220
+    },
+    {
+      "destination_offset": 6174015488,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6174061344,
+      "syscall_enter_monotonic_ns": 4205135709,
+      "syscall_exit_monotonic_ns": 4270948700
+    },
+    {
+      "destination_offset": 6442450944,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6442496800,
+      "syscall_enter_monotonic_ns": 4271717840,
+      "syscall_exit_monotonic_ns": 4376158427
+    },
+    {
+      "destination_offset": 6308233216,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6308279072,
+      "syscall_enter_monotonic_ns": 4271120070,
+      "syscall_exit_monotonic_ns": 4377763816
+    },
+    {
+      "destination_offset": 6039797760,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6039843616,
+      "syscall_enter_monotonic_ns": 4272876980,
+      "syscall_exit_monotonic_ns": 4386709415
+    },
+    {
+      "destination_offset": 6845104128,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6845149984,
+      "syscall_enter_monotonic_ns": 4272721300,
+      "syscall_exit_monotonic_ns": 4430085300
+    },
+    {
+      "destination_offset": 6979321856,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6979367712,
+      "syscall_enter_monotonic_ns": 4272159780,
+      "syscall_exit_monotonic_ns": 4478474703
+    },
+    {
+      "destination_offset": 7247757312,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7247803168,
+      "syscall_enter_monotonic_ns": 4377912096,
+      "syscall_exit_monotonic_ns": 4523750968
+    },
+    {
+      "destination_offset": 7113539584,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7113585440,
+      "syscall_enter_monotonic_ns": 4386988485,
+      "syscall_exit_monotonic_ns": 4558667263
+    },
+    {
+      "destination_offset": 6576668672,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6576714528,
+      "syscall_enter_monotonic_ns": 4272418440,
+      "syscall_exit_monotonic_ns": 4559362053
+    },
+    {
+      "destination_offset": 7381975040,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7382020896,
+      "syscall_enter_monotonic_ns": 4386866715,
+      "syscall_exit_monotonic_ns": 4630159754
+    },
+    {
+      "destination_offset": 7516192768,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7516238624,
+      "syscall_enter_monotonic_ns": 4430187690,
+      "syscall_exit_monotonic_ns": 4630318494
+    },
+    {
+      "destination_offset": 4831838208,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4831884064,
+      "syscall_enter_monotonic_ns": 4478830293,
+      "syscall_exit_monotonic_ns": 4630615054
+    },
+    {
+      "destination_offset": 7918845952,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 126090240,
+      "retry_number": 0,
+      "returned_bytes": 126090240,
+      "short_read": false,
+      "source_offset": 7918891808,
+      "syscall_enter_monotonic_ns": 4558849713,
+      "syscall_exit_monotonic_ns": 4630742374
+    },
+    {
+      "destination_offset": 6710886400,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6710932256,
+      "syscall_enter_monotonic_ns": 4271560870,
+      "syscall_exit_monotonic_ns": 4631073174
+    },
+    {
+      "destination_offset": 7650410496,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7650456352,
+      "syscall_enter_monotonic_ns": 4559453683,
+      "syscall_exit_monotonic_ns": 4631511864
+    },
+    {
+      "destination_offset": 7784628224,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7784674080,
+      "syscall_enter_monotonic_ns": 4631366014,
+      "syscall_exit_monotonic_ns": 4657127041
+    }
+  ],
+  "physical_syscall_provenance": "golden_serial._read_at",
+  "physical_syscall_telemetry": [
+    {
+      "destination_offset": 402653184,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 402699040,
+      "syscall_enter_monotonic_ns": 2951544024,
+      "syscall_exit_monotonic_ns": 3167711703
+    },
+    {
+      "destination_offset": 939524096,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 939569952,
+      "syscall_enter_monotonic_ns": 3045275958,
+      "syscall_exit_monotonic_ns": 3199006847
+    },
+    {
+      "destination_offset": 268435456,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 268481312,
+      "syscall_enter_monotonic_ns": 2951078204,
+      "syscall_exit_monotonic_ns": 3273849972
+    },
+    {
+      "destination_offset": 536870912,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 536916768,
+      "syscall_enter_monotonic_ns": 2951942994,
+      "syscall_exit_monotonic_ns": 3274679702
+    },
+    {
+      "destination_offset": 0,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 45856,
+      "syscall_enter_monotonic_ns": 2949902404,
+      "syscall_exit_monotonic_ns": 3274959662
+    },
+    {
+      "destination_offset": 671088640,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 671134496,
+      "syscall_enter_monotonic_ns": 2952588484,
+      "syscall_exit_monotonic_ns": 3275058342
+    },
+    {
+      "destination_offset": 134217728,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 134263584,
+      "syscall_enter_monotonic_ns": 2950467014,
+      "syscall_exit_monotonic_ns": 3275254142
+    },
+    {
+      "destination_offset": 805306368,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 805352224,
+      "syscall_enter_monotonic_ns": 3043171528,
+      "syscall_exit_monotonic_ns": 3275328382
+    },
+    {
+      "destination_offset": 1610612736,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1610658592,
+      "syscall_enter_monotonic_ns": 3277084541,
+      "syscall_exit_monotonic_ns": 3413535394
+    },
+    {
+      "destination_offset": 1476395008,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1476440864,
+      "syscall_enter_monotonic_ns": 3276747031,
+      "syscall_exit_monotonic_ns": 3428165901
+    },
+    {
+      "destination_offset": 1744830464,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1744876320,
+      "syscall_enter_monotonic_ns": 3275580992,
+      "syscall_exit_monotonic_ns": 3467369973
+    },
+    {
+      "destination_offset": 2013265920,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2013311776,
+      "syscall_enter_monotonic_ns": 3276295051,
+      "syscall_exit_monotonic_ns": 3467558863
+    },
+    {
+      "destination_offset": 1073741824,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1073787680,
+      "syscall_enter_monotonic_ns": 3276690381,
+      "syscall_exit_monotonic_ns": 3467661893
+    },
+    {
+      "destination_offset": 1342177280,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1342223136,
+      "syscall_enter_monotonic_ns": 3275836822,
+      "syscall_exit_monotonic_ns": 3467783813
+    },
+    {
+      "destination_offset": 1207959552,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1208005408,
+      "syscall_enter_monotonic_ns": 3276822441,
+      "syscall_exit_monotonic_ns": 3467968423
+    },
+    {
+      "destination_offset": 1879048192,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 1879094048,
+      "syscall_enter_monotonic_ns": 3276981151,
+      "syscall_exit_monotonic_ns": 3468062573
+    },
+    {
+      "destination_offset": 2550136832,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2550182688,
+      "syscall_enter_monotonic_ns": 3468226543,
+      "syscall_exit_monotonic_ns": 3539687278
+    },
+    {
+      "destination_offset": 2684354560,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2684400416,
+      "syscall_enter_monotonic_ns": 3468398453,
+      "syscall_exit_monotonic_ns": 3539815038
+    },
+    {
+      "destination_offset": 2952790016,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2952835872,
+      "syscall_enter_monotonic_ns": 3541449158,
+      "syscall_exit_monotonic_ns": 3657094065
+    },
+    {
+      "destination_offset": 2415919104,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2415964960,
+      "syscall_enter_monotonic_ns": 3540403908,
+      "syscall_exit_monotonic_ns": 3665762993
+    },
+    {
+      "destination_offset": 2281701376,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2281747232,
+      "syscall_enter_monotonic_ns": 3541235298,
+      "syscall_exit_monotonic_ns": 3693384858
+    },
+    {
+      "destination_offset": 3087007744,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3087053600,
+      "syscall_enter_monotonic_ns": 3541582238,
+      "syscall_exit_monotonic_ns": 3694257497
+    },
+    {
+      "destination_offset": 2818572288,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2818618144,
+      "syscall_enter_monotonic_ns": 3541539998,
+      "syscall_exit_monotonic_ns": 3694678577
+    },
+    {
+      "destination_offset": 3221225472,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3221271328,
+      "syscall_enter_monotonic_ns": 3540822228,
+      "syscall_exit_monotonic_ns": 3694857947
+    },
+    {
+      "destination_offset": 3355443200,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3355489056,
+      "syscall_enter_monotonic_ns": 3695035787,
+      "syscall_exit_monotonic_ns": 3769341402
+    },
+    {
+      "destination_offset": 2147483648,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 2147529504,
+      "syscall_enter_monotonic_ns": 3695197317,
+      "syscall_exit_monotonic_ns": 3837646869
+    },
+    {
+      "destination_offset": 3892314112,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3892359968,
+      "syscall_enter_monotonic_ns": 3695476277,
+      "syscall_exit_monotonic_ns": 3839092468
+    },
+    {
+      "destination_offset": 4160749568,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4160795424,
+      "syscall_enter_monotonic_ns": 3695533277,
+      "syscall_exit_monotonic_ns": 3844523227
+    },
+    {
+      "destination_offset": 3489660928,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3489706784,
+      "syscall_enter_monotonic_ns": 3694027907,
+      "syscall_exit_monotonic_ns": 3878669950
+    },
+    {
+      "destination_offset": 4294967296,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4295013152,
+      "syscall_enter_monotonic_ns": 3838010898,
+      "syscall_exit_monotonic_ns": 3899645066
+    },
+    {
+      "destination_offset": 3623878656,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3623924512,
+      "syscall_enter_monotonic_ns": 3693682117,
+      "syscall_exit_monotonic_ns": 3910314064
+    },
+    {
+      "destination_offset": 4429185024,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4429230880,
+      "syscall_enter_monotonic_ns": 3837853888,
+      "syscall_exit_monotonic_ns": 3945088477
+    },
+    {
+      "destination_offset": 4026531840,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4026577696,
+      "syscall_enter_monotonic_ns": 3695339307,
+      "syscall_exit_monotonic_ns": 3990360138
+    },
+    {
+      "destination_offset": 4563402752,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4563448608,
+      "syscall_enter_monotonic_ns": 3878927770,
+      "syscall_exit_monotonic_ns": 3993418727
+    },
+    {
+      "destination_offset": 4697620480,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4697666336,
+      "syscall_enter_monotonic_ns": 3910437034,
+      "syscall_exit_monotonic_ns": 4057806907
+    },
+    {
+      "destination_offset": 5100273664,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5100319520,
+      "syscall_enter_monotonic_ns": 3990505018,
+      "syscall_exit_monotonic_ns": 4118720750
+    },
+    {
+      "destination_offset": 5502926848,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5502972704,
+      "syscall_enter_monotonic_ns": 3993535857,
+      "syscall_exit_monotonic_ns": 4135965937
+    },
+    {
+      "destination_offset": 3758096384,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 3758142240,
+      "syscall_enter_monotonic_ns": 3694450367,
+      "syscall_exit_monotonic_ns": 4137046137
+    },
+    {
+      "destination_offset": 5637144576,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5637190432,
+      "syscall_enter_monotonic_ns": 4057882467,
+      "syscall_exit_monotonic_ns": 4204947519
+    },
+    {
+      "destination_offset": 5368709120,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5368754976,
+      "syscall_enter_monotonic_ns": 3990528848,
+      "syscall_exit_monotonic_ns": 4217839027
+    },
+    {
+      "destination_offset": 5234491392,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5234537248,
+      "syscall_enter_monotonic_ns": 3945299607,
+      "syscall_exit_monotonic_ns": 4238506304
+    },
+    {
+      "destination_offset": 5771362304,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5771408160,
+      "syscall_enter_monotonic_ns": 4118890680,
+      "syscall_exit_monotonic_ns": 4270473060
+    },
+    {
+      "destination_offset": 5905580032,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 5905625888,
+      "syscall_enter_monotonic_ns": 4137318007,
+      "syscall_exit_monotonic_ns": 4270682140
+    },
+    {
+      "destination_offset": 4966055936,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4966101792,
+      "syscall_enter_monotonic_ns": 3899776596,
+      "syscall_exit_monotonic_ns": 4270882220
+    },
+    {
+      "destination_offset": 6174015488,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6174061344,
+      "syscall_enter_monotonic_ns": 4205135709,
+      "syscall_exit_monotonic_ns": 4270948700
+    },
+    {
+      "destination_offset": 6442450944,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6442496800,
+      "syscall_enter_monotonic_ns": 4271717840,
+      "syscall_exit_monotonic_ns": 4376158427
+    },
+    {
+      "destination_offset": 6308233216,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6308279072,
+      "syscall_enter_monotonic_ns": 4271120070,
+      "syscall_exit_monotonic_ns": 4377763816
+    },
+    {
+      "destination_offset": 6039797760,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6039843616,
+      "syscall_enter_monotonic_ns": 4272876980,
+      "syscall_exit_monotonic_ns": 4386709415
+    },
+    {
+      "destination_offset": 6845104128,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6845149984,
+      "syscall_enter_monotonic_ns": 4272721300,
+      "syscall_exit_monotonic_ns": 4430085300
+    },
+    {
+      "destination_offset": 6979321856,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6979367712,
+      "syscall_enter_monotonic_ns": 4272159780,
+      "syscall_exit_monotonic_ns": 4478474703
+    },
+    {
+      "destination_offset": 7247757312,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7247803168,
+      "syscall_enter_monotonic_ns": 4377912096,
+      "syscall_exit_monotonic_ns": 4523750968
+    },
+    {
+      "destination_offset": 7113539584,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7113585440,
+      "syscall_enter_monotonic_ns": 4386988485,
+      "syscall_exit_monotonic_ns": 4558667263
+    },
+    {
+      "destination_offset": 6576668672,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 5,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6576714528,
+      "syscall_enter_monotonic_ns": 4272418440,
+      "syscall_exit_monotonic_ns": 4559362053
+    },
+    {
+      "destination_offset": 7381975040,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 4,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7382020896,
+      "syscall_enter_monotonic_ns": 4386866715,
+      "syscall_exit_monotonic_ns": 4630159754
+    },
+    {
+      "destination_offset": 7516192768,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 3,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7516238624,
+      "syscall_enter_monotonic_ns": 4430187690,
+      "syscall_exit_monotonic_ns": 4630318494
+    },
+    {
+      "destination_offset": 4831838208,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 2,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 4831884064,
+      "syscall_enter_monotonic_ns": 4478830293,
+      "syscall_exit_monotonic_ns": 4630615054
+    },
+    {
+      "destination_offset": 7918845952,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 0,
+      "requested_bytes": 126090240,
+      "retry_number": 0,
+      "returned_bytes": 126090240,
+      "short_read": false,
+      "source_offset": 7918891808,
+      "syscall_enter_monotonic_ns": 4558849713,
+      "syscall_exit_monotonic_ns": 4630742374
+    },
+    {
+      "destination_offset": 6710886400,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 7,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 6710932256,
+      "syscall_enter_monotonic_ns": 4271560870,
+      "syscall_exit_monotonic_ns": 4631073174
+    },
+    {
+      "destination_offset": 7650410496,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 1,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7650456352,
+      "syscall_enter_monotonic_ns": 4559453683,
+      "syscall_exit_monotonic_ns": 4631511864
+    },
+    {
+      "destination_offset": 7784628224,
+      "error": null,
+      "physical_provenance": "golden_serial._read_at",
+      "producer_id": 6,
+      "requested_bytes": 134217728,
+      "retry_number": 0,
+      "returned_bytes": 134217728,
+      "short_read": false,
+      "source_offset": 7784674080,
+      "syscall_enter_monotonic_ns": 4631366014,
+      "syscall_exit_monotonic_ns": 4657127041
+    }
+  ],
+  "probe": "phase2_source_h2d_audit_control",
+  "qd_occupancy_ms": {
+    "0": 1.16147,
+    "1": 28.124807,
+    "2": 73.987584,
+    "3": 2.518839,
+    "4": 61.970471,
+    "5": 34.073685,
+    "6": 664.839992,
+    "7": 506.753166,
+    "8": 333.792783
+  },
+  "qd_occupancy_ns": {
+    "0": 1161470,
+    "1": 28124807,
+    "2": 73987584,
+    "3": 2518839,
+    "4": 61970471,
+    "5": 34073685,
+    "6": 664839992,
+    "7": 506753166,
+    "8": 333792783
+  },
+  "resolved_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "role": "clip",
+  "source_active_duration_ms": 1707.222797,
+  "source_active_duration_ns": 1707222797,
+  "source_active_end_ns": 4657128791,
+  "source_active_interval_end_ns": 4657128791,
+  "source_active_interval_start_ns": 2949905994,
+  "source_active_start_ns": 2949905994,
+  "source_active_wall_ms": 1707.222797,
+  "source_active_wall_ns": 1707222797,
+  "source_block_bytes": 134217728,
+  "source_capacity": 8,
+  "source_capacity_semantics": "buffering_work_capacity_only",
+  "source_only": true,
+  "source_qd": 8,
+  "source_qd_timeline": [
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 0,
+      "timestamp_ns": 2949905994
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 1,
+      "timestamp_ns": 2950467514
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 2,
+      "timestamp_ns": 2951080254
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 2951545404
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 2951943724
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 2952588994
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 6,
+      "timestamp_ns": 3043172508
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 7,
+      "timestamp_ns": 3045278958
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 3,
+      "timestamp_ns": 3167722583
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 3199016427
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 2,
+      "timestamp_ns": 3273862362
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 4,
+      "timestamp_ns": 3274690262
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 0,
+      "timestamp_ns": 3274960792
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 5,
+      "timestamp_ns": 3275058752
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 1,
+      "timestamp_ns": 3275256472
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 6,
+      "timestamp_ns": 3275334952
+    },
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 5,
+      "timestamp_ns": 3275582632
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 2,
+      "timestamp_ns": 3275840052
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 6,
+      "timestamp_ns": 3276296821
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 3276691791
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 3276747531
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 3276823181
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 1,
+      "timestamp_ns": 3276982701
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 0,
+      "timestamp_ns": 3277087421
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 0,
+      "timestamp_ns": 3413544734
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 4,
+      "timestamp_ns": 3428170681
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 5,
+      "timestamp_ns": 3467371783
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 6,
+      "timestamp_ns": 3467563573
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 3,
+      "timestamp_ns": 3467675933
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 2,
+      "timestamp_ns": 3467795703
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 7,
+      "timestamp_ns": 3467970833
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 1,
+      "timestamp_ns": 3468063173
+    },
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 6,
+      "timestamp_ns": 3468227253
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 3,
+      "timestamp_ns": 3468399263
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 6,
+      "timestamp_ns": 3539691478
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 3,
+      "timestamp_ns": 3539828418
+    },
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 5,
+      "timestamp_ns": 3540407688
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 6,
+      "timestamp_ns": 3540824828
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 4,
+      "timestamp_ns": 3541238268
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 2,
+      "timestamp_ns": 3541450728
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 1,
+      "timestamp_ns": 3541541588
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 3541583048
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 2,
+      "timestamp_ns": 3657100135
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 5,
+      "timestamp_ns": 3665765793
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 4,
+      "timestamp_ns": 3693391888
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 5,
+      "timestamp_ns": 3693686317
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 2,
+      "timestamp_ns": 3694031347
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 7,
+      "timestamp_ns": 3694262577
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 3694450907
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 1,
+      "timestamp_ns": 3694679807
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 6,
+      "timestamp_ns": 3694860797
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 3695038677
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 3695198787
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 6,
+      "timestamp_ns": 3695339997
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 7,
+      "timestamp_ns": 3695478147
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 1,
+      "timestamp_ns": 3695534847
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 3,
+      "timestamp_ns": 3769345202
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 0,
+      "timestamp_ns": 3837649959
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 0,
+      "timestamp_ns": 3837854698
+    },
+    {
+      "delta": 1,
+      "depth": 8,
+      "producer_id": 3,
+      "timestamp_ns": 3838012088
+    },
+    {
+      "delta": -1,
+      "depth": 7,
+      "producer_id": 7,
+      "timestamp_ns": 3839093578
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 3844524457
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 2,
+      "timestamp_ns": 3878672600
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 3878928750
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 3,
+      "timestamp_ns": 3899646986
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 3,
+      "timestamp_ns": 3899777176
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 5,
+      "timestamp_ns": 3910314934
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 3910437494
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 3945094067
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 0,
+      "timestamp_ns": 3945300187
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 6,
+      "timestamp_ns": 3990362038
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 3990505628
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 6,
+      "timestamp_ns": 3990529158
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 3993423267
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 7,
+      "timestamp_ns": 3993536327
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 4057808557
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 1,
+      "timestamp_ns": 4057884017
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 5,
+      "timestamp_ns": 4118725200
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 5,
+      "timestamp_ns": 4118891180
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 4135967077
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 4137047377
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 7,
+      "timestamp_ns": 4137323157
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 1,
+      "timestamp_ns": 4204953659
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 4205136219
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 6,
+      "timestamp_ns": 4217842007
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 0,
+      "timestamp_ns": 4238512544
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 5,
+      "timestamp_ns": 4270499090
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 7,
+      "timestamp_ns": 4270684900
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 3,
+      "timestamp_ns": 4270885110
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 1,
+      "timestamp_ns": 4270950330
+    },
+    {
+      "delta": 1,
+      "depth": 1,
+      "producer_id": 6,
+      "timestamp_ns": 4271120770
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 7,
+      "timestamp_ns": 4271562650
+    },
+    {
+      "delta": 1,
+      "depth": 3,
+      "producer_id": 0,
+      "timestamp_ns": 4271719650
+    },
+    {
+      "delta": 1,
+      "depth": 4,
+      "producer_id": 1,
+      "timestamp_ns": 4272161820
+    },
+    {
+      "delta": 1,
+      "depth": 5,
+      "producer_id": 5,
+      "timestamp_ns": 4272420190
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 3,
+      "timestamp_ns": 4272723270
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 4,
+      "timestamp_ns": 4272878880
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 0,
+      "timestamp_ns": 4376163287
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 6,
+      "timestamp_ns": 4377767556
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 6,
+      "timestamp_ns": 4377915206
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 4386710575
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 4,
+      "timestamp_ns": 4386868465
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 0,
+      "timestamp_ns": 4386992215
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 3,
+      "timestamp_ns": 4430086800
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 3,
+      "timestamp_ns": 4430188130
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 4478478113
+    },
+    {
+      "delta": 1,
+      "depth": 7,
+      "producer_id": 2,
+      "timestamp_ns": 4478833093
+    },
+    {
+      "delta": -1,
+      "depth": 6,
+      "producer_id": 6,
+      "timestamp_ns": 4523753178
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 0,
+      "timestamp_ns": 4558669833
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 0,
+      "timestamp_ns": 4558852263
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 5,
+      "timestamp_ns": 4559363823
+    },
+    {
+      "delta": 1,
+      "depth": 6,
+      "producer_id": 1,
+      "timestamp_ns": 4559454253
+    },
+    {
+      "delta": -1,
+      "depth": 5,
+      "producer_id": 4,
+      "timestamp_ns": 4630163494
+    },
+    {
+      "delta": -1,
+      "depth": 4,
+      "producer_id": 3,
+      "timestamp_ns": 4630319144
+    },
+    {
+      "delta": -1,
+      "depth": 3,
+      "producer_id": 2,
+      "timestamp_ns": 4630616334
+    },
+    {
+      "delta": -1,
+      "depth": 2,
+      "producer_id": 0,
+      "timestamp_ns": 4630744574
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 7,
+      "timestamp_ns": 4631081664
+    },
+    {
+      "delta": 1,
+      "depth": 2,
+      "producer_id": 6,
+      "timestamp_ns": 4631367654
+    },
+    {
+      "delta": -1,
+      "depth": 1,
+      "producer_id": 1,
+      "timestamp_ns": 4631512924
+    },
+    {
+      "delta": -1,
+      "depth": 0,
+      "producer_id": 6,
+      "timestamp_ns": 4657128791
+    }
+  ],
+  "source_read_bytes": 8044936192,
+  "source_read_count": 60,
+  "source_requested_bytes": 8044936192,
+  "source_returned_bytes": 8044936192,
+  "source_wall_ms": 1708.397186,
+  "source_worker_busy_ms": 10808.391079,
+  "source_worker_busy_ns": 10808391079,
+  "source_worker_path": "PreplannedExtentTransport",
+  "source_worker_timing": {
+    "0": {
+      "busy_ms": 1352.4109750000002,
+      "busy_ns": 1352410975,
+      "first_start_ns": 2949902404,
+      "last_end_ns": 4630742374,
+      "read_bytes": 1065614336,
+      "read_count": 8,
+      "release_reason": "source_completion",
+      "wall_ms": 1352.584865,
+      "worker_release_ns": 4630742374,
+      "worker_terminated_ns": 4657325591
+    },
+    "1": {
+      "busy_ms": 1456.618099,
+      "busy_ns": 1456618099,
+      "first_start_ns": 2950467014,
+      "last_end_ns": 4631511864,
+      "read_bytes": 1207959552,
+      "read_count": 9,
+      "release_reason": "source_completion",
+      "wall_ms": 1456.752619,
+      "worker_release_ns": 4631511864,
+      "worker_terminated_ns": 4657325591
+    },
+    "2": {
+      "busy_ms": 966.79047,
+      "busy_ns": 966790470,
+      "first_start_ns": 2951078204,
+      "last_end_ns": 4630615054,
+      "read_bytes": 671088640,
+      "read_count": 5,
+      "release_reason": "source_completion",
+      "wall_ms": 966.9213599999999,
+      "worker_release_ns": 4630615054,
+      "worker_terminated_ns": 4657325591
+    },
+    "3": {
+      "busy_ms": 1343.0959870000002,
+      "busy_ns": 1343095987,
+      "first_start_ns": 2951544024,
+      "last_end_ns": 4630318494,
+      "read_bytes": 1073741824,
+      "read_count": 8,
+      "release_reason": "source_completion",
+      "wall_ms": 1343.307907,
+      "worker_release_ns": 4630318494,
+      "worker_terminated_ns": 4657325591
+    },
+    "4": {
+      "busy_ms": 1426.026382,
+      "busy_ns": 1426026382,
+      "first_start_ns": 2951942994,
+      "last_end_ns": 4630159754,
+      "read_bytes": 805306368,
+      "read_count": 6,
+      "release_reason": "source_completion",
+      "wall_ms": 1426.1537019999998,
+      "worker_release_ns": 4630159754,
+      "worker_terminated_ns": 4657325591
+    },
+    "5": {
+      "busy_ms": 1422.9915959999998,
+      "busy_ns": 1422991596,
+      "first_start_ns": 2952588484,
+      "last_end_ns": 4559362053,
+      "read_bytes": 939524096,
+      "read_count": 7,
+      "release_reason": "source_completion",
+      "wall_ms": 1423.122936,
+      "worker_release_ns": 4559362053,
+      "worker_terminated_ns": 4657325591
+    },
+    "6": {
+      "busy_ms": 1449.491775,
+      "busy_ns": 1449491775,
+      "first_start_ns": 3043171528,
+      "last_end_ns": 4657127041,
+      "read_bytes": 1207959552,
+      "read_count": 9,
+      "release_reason": "source_completion",
+      "wall_ms": 1449.652385,
+      "worker_release_ns": 4657127041,
+      "worker_terminated_ns": 4657325591
+    },
+    "7": {
+      "busy_ms": 1390.965795,
+      "busy_ns": 1390965795,
+      "first_start_ns": 3045275958,
+      "last_end_ns": 4631073174,
+      "read_bytes": 1073741824,
+      "read_count": 8,
+      "release_reason": "source_completion",
+      "wall_ms": 1391.123815,
+      "worker_release_ns": 4631073174,
+      "worker_terminated_ns": 4657325591
+    }
+  },
+  "staging_buffer": {
+    "allocation_identity": "one_contiguous_pinned_cpu_uint8_arena",
+    "arena_bytes": 1073741824,
+    "contiguous": true,
+    "device": "cpu",
+    "dtype": "torch.uint8",
+    "extent_count": 8,
+    "extent_shape": [
+      134217728
+    ],
+    "kind": "torch_cpu_uint8_pinned_contiguous_arena",
+    "physical_allocation_count": 1,
+    "pinned": true,
+    "shape": [
+      1073741824
+    ]
+  },
+  "staging_buffer_allocation_count": 1,
+  "staging_buffer_allocation_identity": "one_contiguous_pinned_cpu_uint8_arena",
+  "staging_buffer_arena_bytes": 1073741824,
+  "staging_buffer_contiguous": true,
+  "staging_buffer_device": "cpu",
+  "staging_buffer_dtype": "torch.uint8",
+  "staging_buffer_extent_count": 8,
+  "staging_buffer_extent_shape": [
+    134217728
+  ],
+  "staging_buffer_kind": "torch_cpu_uint8_pinned_contiguous_arena",
+  "staging_buffer_physical_allocation_count": 1,
+  "staging_buffer_pinned": true,
+  "staging_buffer_shape": [
+    1073741824
+  ],
+  "status": "ok",
+  "strict_e27_proof": {
+    "E27_SOURCE_MECHANISM_PROVEN": "YES",
+    "classification": "PROVEN",
+    "failed_predicates": [],
+    "line": "E27_SOURCE_MECHANISM_PROVEN=YES",
+    "predicates": {
+      "no_h2d_dispatcher": true,
+      "no_h2d_dispatcher_participation": true,
+      "physical_syscall_bytes_retained": true,
+      "pinned_cpu_uint8_staging": true,
+      "shared_positioned_read_helper": true,
+      "source_capacity_fixed": true,
+      "source_completion_releases_workers": true,
+      "source_payload_reconciled": true,
+      "source_workers_joined": true,
+      "staging_buffer_allocation_identity": true,
+      "staging_buffer_geometry": true,
+      "staging_buffer_observed": true,
+      "writable_byte_view_contract": true,
+      "zero_h2d_bytes": true,
+      "zero_h2d_events": true
+    },
+    "proven": true,
+    "scope": "phase2_control_path_invariants",
+    "strict": true
+  },
+  "time_at_qd_ms": {
+    "0": 1.16147,
+    "1": 28.124807,
+    "2": 73.987584,
+    "3": 2.518839,
+    "4": 61.970471,
+    "5": 34.073685,
+    "6": 664.839992,
+    "7": 506.753166,
+    "8": 333.792783
+  },
+  "time_at_qd_ns": {
+    "0": 1161470,
+    "1": 28124807,
+    "2": 73987584,
+    "3": 2518839,
+    "4": 61970471,
+    "5": 34073685,
+    "6": 664839992,
+    "7": 506753166,
+    "8": 333792783
+  },
+  "timing_scopes": {
+    "H2D_READY": "first H2D submit -> final required H2D completion; integrated only",
+    "SOURCE_WALL": "source path entry -> all source workers joined"
+  },
+  "transport_cleanup_timeout_seconds": 300.0,
+  "transport_telemetry": {
+    "achieved_h2d_inflight_depth_max": 0,
+    "achieved_qd_max": 8,
+    "achieved_qd_mean": 6.331078285735895,
+    "achieved_source_qd_max": 8,
+    "achieved_source_qd_mean": 6.331078285735895,
+    "active_source_interval_end_ns": 4657128791,
+    "active_source_interval_start_ns": 2949905994,
+    "active_source_wall_ms": 1707.222797,
+    "active_source_wall_ns": 1707222797,
+    "arm": "source_only_same_path",
+    "configured_h2d_copy_bytes": 134217728,
+    "configured_h2d_inflight_depth": 8,
+    "configured_source_block_bytes": 134217728,
+    "configured_source_capacity": 8,
+    "configured_source_qd": 8,
+    "control_operation_timeout_seconds": 300.0,
+    "control_profile": "phase2-source-h2d-control",
+    "coverage_ok": true,
+    "cpu_allocation": {
+      "cpu": 4,
+      "cpu_request": 4,
+      "identity_source": "runtime_shape_config.cpu_request"
+    },
+    "cpu_request": 4,
+    "destination_base": 0,
+    "errors": [],
+    "execution_mode": "source_only",
+    "extent_count": 60,
+    "extent_slot_count": 8,
+    "h2d_capacity_wait_count": 0,
+    "h2d_capacity_wait_ms": 0.0,
+    "h2d_capacity_wait_ns": 0,
+    "h2d_completed_bytes": 0,
+    "h2d_completion_count": 0,
+    "h2d_copy_bytes": 0,
+    "h2d_copy_bytes_total": 0,
+    "h2d_copy_count": 0,
+    "h2d_dispatcher_participation": false,
+    "h2d_dispatcher_started": false,
+    "h2d_events": [],
+    "h2d_inflight_depth": 8,
+    "h2d_stream_span_ms": null,
+    "h2d_submit_count": 0,
+    "h2d_submitted_bytes": 0,
+    "milliseconds_at_qd": {
+      "0": 1.16147,
+      "1": 28.124807,
+      "2": 73.987584,
+      "3": 2.518839,
+      "4": 61.970471,
+      "5": 34.073685,
+      "6": 664.839992,
+      "7": 506.753166,
+      "8": 333.792783
+    },
+    "physical_read_provenance": "golden_serial._read_at",
+    "physical_reads": [
+      {
+        "destination_offset": 402653184,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 402699040,
+        "syscall_enter_monotonic_ns": 2951544024,
+        "syscall_exit_monotonic_ns": 3167711703
+      },
+      {
+        "destination_offset": 939524096,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 939569952,
+        "syscall_enter_monotonic_ns": 3045275958,
+        "syscall_exit_monotonic_ns": 3199006847
+      },
+      {
+        "destination_offset": 268435456,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 2,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 268481312,
+        "syscall_enter_monotonic_ns": 2951078204,
+        "syscall_exit_monotonic_ns": 3273849972
+      },
+      {
+        "destination_offset": 536870912,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 536916768,
+        "syscall_enter_monotonic_ns": 2951942994,
+        "syscall_exit_monotonic_ns": 3274679702
+      },
+      {
+        "destination_offset": 0,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 45856,
+        "syscall_enter_monotonic_ns": 2949902404,
+        "syscall_exit_monotonic_ns": 3274959662
+      },
+      {
+        "destination_offset": 671088640,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 671134496,
+        "syscall_enter_monotonic_ns": 2952588484,
+        "syscall_exit_monotonic_ns": 3275058342
+      },
+      {
+        "destination_offset": 134217728,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 134263584,
+        "syscall_enter_monotonic_ns": 2950467014,
+        "syscall_exit_monotonic_ns": 3275254142
+      },
+      {
+        "destination_offset": 805306368,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 805352224,
+        "syscall_enter_monotonic_ns": 3043171528,
+        "syscall_exit_monotonic_ns": 3275328382
+      },
+      {
+        "destination_offset": 1610612736,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1610658592,
+        "syscall_enter_monotonic_ns": 3277084541,
+        "syscall_exit_monotonic_ns": 3413535394
+      },
+      {
+        "destination_offset": 1476395008,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1476440864,
+        "syscall_enter_monotonic_ns": 3276747031,
+        "syscall_exit_monotonic_ns": 3428165901
+      },
+      {
+        "destination_offset": 1744830464,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1744876320,
+        "syscall_enter_monotonic_ns": 3275580992,
+        "syscall_exit_monotonic_ns": 3467369973
+      },
+      {
+        "destination_offset": 2013265920,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2013311776,
+        "syscall_enter_monotonic_ns": 3276295051,
+        "syscall_exit_monotonic_ns": 3467558863
+      },
+      {
+        "destination_offset": 1073741824,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1073787680,
+        "syscall_enter_monotonic_ns": 3276690381,
+        "syscall_exit_monotonic_ns": 3467661893
+      },
+      {
+        "destination_offset": 1342177280,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 2,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1342223136,
+        "syscall_enter_monotonic_ns": 3275836822,
+        "syscall_exit_monotonic_ns": 3467783813
+      },
+      {
+        "destination_offset": 1207959552,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1208005408,
+        "syscall_enter_monotonic_ns": 3276822441,
+        "syscall_exit_monotonic_ns": 3467968423
+      },
+      {
+        "destination_offset": 1879048192,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 1879094048,
+        "syscall_enter_monotonic_ns": 3276981151,
+        "syscall_exit_monotonic_ns": 3468062573
+      },
+      {
+        "destination_offset": 2550136832,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2550182688,
+        "syscall_enter_monotonic_ns": 3468226543,
+        "syscall_exit_monotonic_ns": 3539687278
+      },
+      {
+        "destination_offset": 2684354560,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2684400416,
+        "syscall_enter_monotonic_ns": 3468398453,
+        "syscall_exit_monotonic_ns": 3539815038
+      },
+      {
+        "destination_offset": 2952790016,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 2,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2952835872,
+        "syscall_enter_monotonic_ns": 3541449158,
+        "syscall_exit_monotonic_ns": 3657094065
+      },
+      {
+        "destination_offset": 2415919104,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2415964960,
+        "syscall_enter_monotonic_ns": 3540403908,
+        "syscall_exit_monotonic_ns": 3665762993
+      },
+      {
+        "destination_offset": 2281701376,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2281747232,
+        "syscall_enter_monotonic_ns": 3541235298,
+        "syscall_exit_monotonic_ns": 3693384858
+      },
+      {
+        "destination_offset": 3087007744,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3087053600,
+        "syscall_enter_monotonic_ns": 3541582238,
+        "syscall_exit_monotonic_ns": 3694257497
+      },
+      {
+        "destination_offset": 2818572288,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2818618144,
+        "syscall_enter_monotonic_ns": 3541539998,
+        "syscall_exit_monotonic_ns": 3694678577
+      },
+      {
+        "destination_offset": 3221225472,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3221271328,
+        "syscall_enter_monotonic_ns": 3540822228,
+        "syscall_exit_monotonic_ns": 3694857947
+      },
+      {
+        "destination_offset": 3355443200,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3355489056,
+        "syscall_enter_monotonic_ns": 3695035787,
+        "syscall_exit_monotonic_ns": 3769341402
+      },
+      {
+        "destination_offset": 2147483648,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 2147529504,
+        "syscall_enter_monotonic_ns": 3695197317,
+        "syscall_exit_monotonic_ns": 3837646869
+      },
+      {
+        "destination_offset": 3892314112,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3892359968,
+        "syscall_enter_monotonic_ns": 3695476277,
+        "syscall_exit_monotonic_ns": 3839092468
+      },
+      {
+        "destination_offset": 4160749568,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4160795424,
+        "syscall_enter_monotonic_ns": 3695533277,
+        "syscall_exit_monotonic_ns": 3844523227
+      },
+      {
+        "destination_offset": 3489660928,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 2,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3489706784,
+        "syscall_enter_monotonic_ns": 3694027907,
+        "syscall_exit_monotonic_ns": 3878669950
+      },
+      {
+        "destination_offset": 4294967296,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4295013152,
+        "syscall_enter_monotonic_ns": 3838010898,
+        "syscall_exit_monotonic_ns": 3899645066
+      },
+      {
+        "destination_offset": 3623878656,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3623924512,
+        "syscall_enter_monotonic_ns": 3693682117,
+        "syscall_exit_monotonic_ns": 3910314064
+      },
+      {
+        "destination_offset": 4429185024,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4429230880,
+        "syscall_enter_monotonic_ns": 3837853888,
+        "syscall_exit_monotonic_ns": 3945088477
+      },
+      {
+        "destination_offset": 4026531840,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4026577696,
+        "syscall_enter_monotonic_ns": 3695339307,
+        "syscall_exit_monotonic_ns": 3990360138
+      },
+      {
+        "destination_offset": 4563402752,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4563448608,
+        "syscall_enter_monotonic_ns": 3878927770,
+        "syscall_exit_monotonic_ns": 3993418727
+      },
+      {
+        "destination_offset": 4697620480,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4697666336,
+        "syscall_enter_monotonic_ns": 3910437034,
+        "syscall_exit_monotonic_ns": 4057806907
+      },
+      {
+        "destination_offset": 5100273664,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5100319520,
+        "syscall_enter_monotonic_ns": 3990505018,
+        "syscall_exit_monotonic_ns": 4118720750
+      },
+      {
+        "destination_offset": 5502926848,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5502972704,
+        "syscall_enter_monotonic_ns": 3993535857,
+        "syscall_exit_monotonic_ns": 4135965937
+      },
+      {
+        "destination_offset": 3758096384,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 3758142240,
+        "syscall_enter_monotonic_ns": 3694450367,
+        "syscall_exit_monotonic_ns": 4137046137
+      },
+      {
+        "destination_offset": 5637144576,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5637190432,
+        "syscall_enter_monotonic_ns": 4057882467,
+        "syscall_exit_monotonic_ns": 4204947519
+      },
+      {
+        "destination_offset": 5368709120,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5368754976,
+        "syscall_enter_monotonic_ns": 3990528848,
+        "syscall_exit_monotonic_ns": 4217839027
+      },
+      {
+        "destination_offset": 5234491392,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5234537248,
+        "syscall_enter_monotonic_ns": 3945299607,
+        "syscall_exit_monotonic_ns": 4238506304
+      },
+      {
+        "destination_offset": 5771362304,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5771408160,
+        "syscall_enter_monotonic_ns": 4118890680,
+        "syscall_exit_monotonic_ns": 4270473060
+      },
+      {
+        "destination_offset": 5905580032,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 5905625888,
+        "syscall_enter_monotonic_ns": 4137318007,
+        "syscall_exit_monotonic_ns": 4270682140
+      },
+      {
+        "destination_offset": 4966055936,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4966101792,
+        "syscall_enter_monotonic_ns": 3899776596,
+        "syscall_exit_monotonic_ns": 4270882220
+      },
+      {
+        "destination_offset": 6174015488,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6174061344,
+        "syscall_enter_monotonic_ns": 4205135709,
+        "syscall_exit_monotonic_ns": 4270948700
+      },
+      {
+        "destination_offset": 6442450944,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6442496800,
+        "syscall_enter_monotonic_ns": 4271717840,
+        "syscall_exit_monotonic_ns": 4376158427
+      },
+      {
+        "destination_offset": 6308233216,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6308279072,
+        "syscall_enter_monotonic_ns": 4271120070,
+        "syscall_exit_monotonic_ns": 4377763816
+      },
+      {
+        "destination_offset": 6039797760,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6039843616,
+        "syscall_enter_monotonic_ns": 4272876980,
+        "syscall_exit_monotonic_ns": 4386709415
+      },
+      {
+        "destination_offset": 6845104128,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6845149984,
+        "syscall_enter_monotonic_ns": 4272721300,
+        "syscall_exit_monotonic_ns": 4430085300
+      },
+      {
+        "destination_offset": 6979321856,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6979367712,
+        "syscall_enter_monotonic_ns": 4272159780,
+        "syscall_exit_monotonic_ns": 4478474703
+      },
+      {
+        "destination_offset": 7247757312,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7247803168,
+        "syscall_enter_monotonic_ns": 4377912096,
+        "syscall_exit_monotonic_ns": 4523750968
+      },
+      {
+        "destination_offset": 7113539584,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7113585440,
+        "syscall_enter_monotonic_ns": 4386988485,
+        "syscall_exit_monotonic_ns": 4558667263
+      },
+      {
+        "destination_offset": 6576668672,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 5,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6576714528,
+        "syscall_enter_monotonic_ns": 4272418440,
+        "syscall_exit_monotonic_ns": 4559362053
+      },
+      {
+        "destination_offset": 7381975040,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 4,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7382020896,
+        "syscall_enter_monotonic_ns": 4386866715,
+        "syscall_exit_monotonic_ns": 4630159754
+      },
+      {
+        "destination_offset": 7516192768,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 3,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7516238624,
+        "syscall_enter_monotonic_ns": 4430187690,
+        "syscall_exit_monotonic_ns": 4630318494
+      },
+      {
+        "destination_offset": 4831838208,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 2,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 4831884064,
+        "syscall_enter_monotonic_ns": 4478830293,
+        "syscall_exit_monotonic_ns": 4630615054
+      },
+      {
+        "destination_offset": 7918845952,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 0,
+        "requested_bytes": 126090240,
+        "retry_number": 0,
+        "returned_bytes": 126090240,
+        "short_read": false,
+        "source_offset": 7918891808,
+        "syscall_enter_monotonic_ns": 4558849713,
+        "syscall_exit_monotonic_ns": 4630742374
+      },
+      {
+        "destination_offset": 6710886400,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 7,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 6710932256,
+        "syscall_enter_monotonic_ns": 4271560870,
+        "syscall_exit_monotonic_ns": 4631073174
+      },
+      {
+        "destination_offset": 7650410496,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 1,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7650456352,
+        "syscall_enter_monotonic_ns": 4559453683,
+        "syscall_exit_monotonic_ns": 4631511864
+      },
+      {
+        "destination_offset": 7784628224,
+        "error": null,
+        "physical_provenance": "golden_serial._read_at",
+        "producer_id": 6,
+        "requested_bytes": 134217728,
+        "retry_number": 0,
+        "returned_bytes": 134217728,
+        "short_read": false,
+        "source_offset": 7784674080,
+        "syscall_enter_monotonic_ns": 4631366014,
+        "syscall_exit_monotonic_ns": 4657127041
+      }
+    ],
+    "physical_syscall_provenance": "golden_serial._read_at",
+    "post_hoc_aggregation": false,
+    "preplanned_extents": [
+      {
+        "destination_offset": 0,
+        "extent_index": 0,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 0,
+            "length": 134217728,
+            "source_offset": 45856
+          }
+        ]
+      },
+      {
+        "destination_offset": 134217728,
+        "extent_index": 1,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 134217728,
+            "length": 134217728,
+            "source_offset": 134263584
+          }
+        ]
+      },
+      {
+        "destination_offset": 268435456,
+        "extent_index": 2,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 268435456,
+            "length": 134217728,
+            "source_offset": 268481312
+          }
+        ]
+      },
+      {
+        "destination_offset": 402653184,
+        "extent_index": 3,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 402653184,
+            "length": 134217728,
+            "source_offset": 402699040
+          }
+        ]
+      },
+      {
+        "destination_offset": 536870912,
+        "extent_index": 4,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 536870912,
+            "length": 134217728,
+            "source_offset": 536916768
+          }
+        ]
+      },
+      {
+        "destination_offset": 671088640,
+        "extent_index": 5,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 671088640,
+            "length": 134217728,
+            "source_offset": 671134496
+          }
+        ]
+      },
+      {
+        "destination_offset": 805306368,
+        "extent_index": 6,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 805306368,
+            "length": 134217728,
+            "source_offset": 805352224
+          }
+        ]
+      },
+      {
+        "destination_offset": 939524096,
+        "extent_index": 7,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 939524096,
+            "length": 134217728,
+            "source_offset": 939569952
+          }
+        ]
+      },
+      {
+        "destination_offset": 1073741824,
+        "extent_index": 8,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1073741824,
+            "length": 134217728,
+            "source_offset": 1073787680
+          }
+        ]
+      },
+      {
+        "destination_offset": 1207959552,
+        "extent_index": 9,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1207959552,
+            "length": 134217728,
+            "source_offset": 1208005408
+          }
+        ]
+      },
+      {
+        "destination_offset": 1342177280,
+        "extent_index": 10,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1342177280,
+            "length": 134217728,
+            "source_offset": 1342223136
+          }
+        ]
+      },
+      {
+        "destination_offset": 1476395008,
+        "extent_index": 11,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1476395008,
+            "length": 134217728,
+            "source_offset": 1476440864
+          }
+        ]
+      },
+      {
+        "destination_offset": 1610612736,
+        "extent_index": 12,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1610612736,
+            "length": 134217728,
+            "source_offset": 1610658592
+          }
+        ]
+      },
+      {
+        "destination_offset": 1744830464,
+        "extent_index": 13,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1744830464,
+            "length": 134217728,
+            "source_offset": 1744876320
+          }
+        ]
+      },
+      {
+        "destination_offset": 1879048192,
+        "extent_index": 14,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 1879048192,
+            "length": 134217728,
+            "source_offset": 1879094048
+          }
+        ]
+      },
+      {
+        "destination_offset": 2013265920,
+        "extent_index": 15,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2013265920,
+            "length": 134217728,
+            "source_offset": 2013311776
+          }
+        ]
+      },
+      {
+        "destination_offset": 2147483648,
+        "extent_index": 16,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2147483648,
+            "length": 134217728,
+            "source_offset": 2147529504
+          }
+        ]
+      },
+      {
+        "destination_offset": 2281701376,
+        "extent_index": 17,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2281701376,
+            "length": 134217728,
+            "source_offset": 2281747232
+          }
+        ]
+      },
+      {
+        "destination_offset": 2415919104,
+        "extent_index": 18,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2415919104,
+            "length": 134217728,
+            "source_offset": 2415964960
+          }
+        ]
+      },
+      {
+        "destination_offset": 2550136832,
+        "extent_index": 19,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2550136832,
+            "length": 134217728,
+            "source_offset": 2550182688
+          }
+        ]
+      },
+      {
+        "destination_offset": 2684354560,
+        "extent_index": 20,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2684354560,
+            "length": 134217728,
+            "source_offset": 2684400416
+          }
+        ]
+      },
+      {
+        "destination_offset": 2818572288,
+        "extent_index": 21,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2818572288,
+            "length": 134217728,
+            "source_offset": 2818618144
+          }
+        ]
+      },
+      {
+        "destination_offset": 2952790016,
+        "extent_index": 22,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 2952790016,
+            "length": 134217728,
+            "source_offset": 2952835872
+          }
+        ]
+      },
+      {
+        "destination_offset": 3087007744,
+        "extent_index": 23,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3087007744,
+            "length": 134217728,
+            "source_offset": 3087053600
+          }
+        ]
+      },
+      {
+        "destination_offset": 3221225472,
+        "extent_index": 24,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3221225472,
+            "length": 134217728,
+            "source_offset": 3221271328
+          }
+        ]
+      },
+      {
+        "destination_offset": 3355443200,
+        "extent_index": 25,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3355443200,
+            "length": 134217728,
+            "source_offset": 3355489056
+          }
+        ]
+      },
+      {
+        "destination_offset": 3489660928,
+        "extent_index": 26,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3489660928,
+            "length": 134217728,
+            "source_offset": 3489706784
+          }
+        ]
+      },
+      {
+        "destination_offset": 3623878656,
+        "extent_index": 27,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3623878656,
+            "length": 134217728,
+            "source_offset": 3623924512
+          }
+        ]
+      },
+      {
+        "destination_offset": 3758096384,
+        "extent_index": 28,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3758096384,
+            "length": 134217728,
+            "source_offset": 3758142240
+          }
+        ]
+      },
+      {
+        "destination_offset": 3892314112,
+        "extent_index": 29,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 3892314112,
+            "length": 134217728,
+            "source_offset": 3892359968
+          }
+        ]
+      },
+      {
+        "destination_offset": 4026531840,
+        "extent_index": 30,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4026531840,
+            "length": 134217728,
+            "source_offset": 4026577696
+          }
+        ]
+      },
+      {
+        "destination_offset": 4160749568,
+        "extent_index": 31,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4160749568,
+            "length": 134217728,
+            "source_offset": 4160795424
+          }
+        ]
+      },
+      {
+        "destination_offset": 4294967296,
+        "extent_index": 32,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4294967296,
+            "length": 134217728,
+            "source_offset": 4295013152
+          }
+        ]
+      },
+      {
+        "destination_offset": 4429185024,
+        "extent_index": 33,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4429185024,
+            "length": 134217728,
+            "source_offset": 4429230880
+          }
+        ]
+      },
+      {
+        "destination_offset": 4563402752,
+        "extent_index": 34,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4563402752,
+            "length": 134217728,
+            "source_offset": 4563448608
+          }
+        ]
+      },
+      {
+        "destination_offset": 4697620480,
+        "extent_index": 35,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4697620480,
+            "length": 134217728,
+            "source_offset": 4697666336
+          }
+        ]
+      },
+      {
+        "destination_offset": 4831838208,
+        "extent_index": 36,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4831838208,
+            "length": 134217728,
+            "source_offset": 4831884064
+          }
+        ]
+      },
+      {
+        "destination_offset": 4966055936,
+        "extent_index": 37,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 4966055936,
+            "length": 134217728,
+            "source_offset": 4966101792
+          }
+        ]
+      },
+      {
+        "destination_offset": 5100273664,
+        "extent_index": 38,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5100273664,
+            "length": 134217728,
+            "source_offset": 5100319520
+          }
+        ]
+      },
+      {
+        "destination_offset": 5234491392,
+        "extent_index": 39,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5234491392,
+            "length": 134217728,
+            "source_offset": 5234537248
+          }
+        ]
+      },
+      {
+        "destination_offset": 5368709120,
+        "extent_index": 40,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5368709120,
+            "length": 134217728,
+            "source_offset": 5368754976
+          }
+        ]
+      },
+      {
+        "destination_offset": 5502926848,
+        "extent_index": 41,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5502926848,
+            "length": 134217728,
+            "source_offset": 5502972704
+          }
+        ]
+      },
+      {
+        "destination_offset": 5637144576,
+        "extent_index": 42,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5637144576,
+            "length": 134217728,
+            "source_offset": 5637190432
+          }
+        ]
+      },
+      {
+        "destination_offset": 5771362304,
+        "extent_index": 43,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5771362304,
+            "length": 134217728,
+            "source_offset": 5771408160
+          }
+        ]
+      },
+      {
+        "destination_offset": 5905580032,
+        "extent_index": 44,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 5905580032,
+            "length": 134217728,
+            "source_offset": 5905625888
+          }
+        ]
+      },
+      {
+        "destination_offset": 6039797760,
+        "extent_index": 45,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6039797760,
+            "length": 134217728,
+            "source_offset": 6039843616
+          }
+        ]
+      },
+      {
+        "destination_offset": 6174015488,
+        "extent_index": 46,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6174015488,
+            "length": 134217728,
+            "source_offset": 6174061344
+          }
+        ]
+      },
+      {
+        "destination_offset": 6308233216,
+        "extent_index": 47,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6308233216,
+            "length": 134217728,
+            "source_offset": 6308279072
+          }
+        ]
+      },
+      {
+        "destination_offset": 6442450944,
+        "extent_index": 48,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6442450944,
+            "length": 134217728,
+            "source_offset": 6442496800
+          }
+        ]
+      },
+      {
+        "destination_offset": 6576668672,
+        "extent_index": 49,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6576668672,
+            "length": 134217728,
+            "source_offset": 6576714528
+          }
+        ]
+      },
+      {
+        "destination_offset": 6710886400,
+        "extent_index": 50,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6710886400,
+            "length": 134217728,
+            "source_offset": 6710932256
+          }
+        ]
+      },
+      {
+        "destination_offset": 6845104128,
+        "extent_index": 51,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6845104128,
+            "length": 134217728,
+            "source_offset": 6845149984
+          }
+        ]
+      },
+      {
+        "destination_offset": 6979321856,
+        "extent_index": 52,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 6979321856,
+            "length": 134217728,
+            "source_offset": 6979367712
+          }
+        ]
+      },
+      {
+        "destination_offset": 7113539584,
+        "extent_index": 53,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7113539584,
+            "length": 134217728,
+            "source_offset": 7113585440
+          }
+        ]
+      },
+      {
+        "destination_offset": 7247757312,
+        "extent_index": 54,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7247757312,
+            "length": 134217728,
+            "source_offset": 7247803168
+          }
+        ]
+      },
+      {
+        "destination_offset": 7381975040,
+        "extent_index": 55,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7381975040,
+            "length": 134217728,
+            "source_offset": 7382020896
+          }
+        ]
+      },
+      {
+        "destination_offset": 7516192768,
+        "extent_index": 56,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7516192768,
+            "length": 134217728,
+            "source_offset": 7516238624
+          }
+        ]
+      },
+      {
+        "destination_offset": 7650410496,
+        "extent_index": 57,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7650410496,
+            "length": 134217728,
+            "source_offset": 7650456352
+          }
+        ]
+      },
+      {
+        "destination_offset": 7784628224,
+        "extent_index": 58,
+        "length": 134217728,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7784628224,
+            "length": 134217728,
+            "source_offset": 7784674080
+          }
+        ]
+      },
+      {
+        "destination_offset": 7918845952,
+        "extent_index": 59,
+        "length": 126090240,
+        "read_count": 1,
+        "reads": [
+          {
+            "destination_offset": 7918845952,
+            "length": 126090240,
+            "source_offset": 7918891808
+          }
+        ]
+      }
+    ],
+    "qd_occupancy_ms": {
+      "0": 1.16147,
+      "1": 28.124807,
+      "2": 73.987584,
+      "3": 2.518839,
+      "4": 61.970471,
+      "5": 34.073685,
+      "6": 664.839992,
+      "7": 506.753166,
+      "8": 333.792783
+    },
+    "qd_occupancy_ns": {
+      "0": 1161470,
+      "1": 28124807,
+      "2": 73987584,
+      "3": 2518839,
+      "4": 61970471,
+      "5": 34073685,
+      "6": 664839992,
+      "7": 506753166,
+      "8": 333792783
+    },
+    "ready_queue_wait_count": 60,
+    "ready_queue_wait_ms": 0.06597,
+    "ready_queue_wait_ns": 65970,
+    "ready_queue_wall_ms": null,
+    "source_active_duration_ms": 1707.222797,
+    "source_active_duration_ns": 1707222797,
+    "source_active_end_ns": 4657128791,
+    "source_active_interval_end_ns": 4657128791,
+    "source_active_interval_start_ns": 2949905994,
+    "source_active_start_ns": 2949905994,
+    "source_active_wall_ms": 1707.222797,
+    "source_active_wall_ns": 1707222797,
+    "source_base": 45856,
+    "source_block_bytes": 134217728,
+    "source_capacity": 8,
+    "source_capacity_semantics": "buffering_work_capacity_only",
+    "source_capacity_wait_count": 60,
+    "source_capacity_wait_ms": 0.18807,
+    "source_capacity_wait_ns": 188070,
+    "source_qd_integral_ns": 10808561179,
+    "source_qd_target_ns": 333792783,
+    "source_qd_time_ms": {
+      "0": 1.16147,
+      "1": 28.124807,
+      "2": 73.987584,
+      "3": 2.518839,
+      "4": 61.970471,
+      "5": 34.073685,
+      "6": 664.839992,
+      "7": 506.753166,
+      "8": 333.792783
+    },
+    "source_qd_time_ns": {
+      "0": 1161470,
+      "1": 28124807,
+      "2": 73987584,
+      "3": 2518839,
+      "4": 61970471,
+      "5": 34073685,
+      "6": 664839992,
+      "7": 506753166,
+      "8": 333792783
+    },
+    "source_qd_timeline": [
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 0,
+        "timestamp_ns": 2949905994
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 1,
+        "timestamp_ns": 2950467514
+      },
+      {
+        "delta": 1,
+        "depth": 3,
+        "producer_id": 2,
+        "timestamp_ns": 2951080254
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 3,
+        "timestamp_ns": 2951545404
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 2951943724
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 5,
+        "timestamp_ns": 2952588994
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 6,
+        "timestamp_ns": 3043172508
+      },
+      {
+        "delta": 1,
+        "depth": 8,
+        "producer_id": 7,
+        "timestamp_ns": 3045278958
+      },
+      {
+        "delta": -1,
+        "depth": 7,
+        "producer_id": 3,
+        "timestamp_ns": 3167722583
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 3199016427
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 2,
+        "timestamp_ns": 3273862362
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 4,
+        "timestamp_ns": 3274690262
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 0,
+        "timestamp_ns": 3274960792
+      },
+      {
+        "delta": -1,
+        "depth": 2,
+        "producer_id": 5,
+        "timestamp_ns": 3275058752
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 1,
+        "timestamp_ns": 3275256472
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 6,
+        "timestamp_ns": 3275334952
+      },
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 5,
+        "timestamp_ns": 3275582632
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 2,
+        "timestamp_ns": 3275840052
+      },
+      {
+        "delta": 1,
+        "depth": 3,
+        "producer_id": 6,
+        "timestamp_ns": 3276296821
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 3,
+        "timestamp_ns": 3276691791
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 3276747531
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 3276823181
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 1,
+        "timestamp_ns": 3276982701
+      },
+      {
+        "delta": 1,
+        "depth": 8,
+        "producer_id": 0,
+        "timestamp_ns": 3277087421
+      },
+      {
+        "delta": -1,
+        "depth": 7,
+        "producer_id": 0,
+        "timestamp_ns": 3413544734
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 4,
+        "timestamp_ns": 3428170681
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 5,
+        "timestamp_ns": 3467371783
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 6,
+        "timestamp_ns": 3467563573
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 3,
+        "timestamp_ns": 3467675933
+      },
+      {
+        "delta": -1,
+        "depth": 2,
+        "producer_id": 2,
+        "timestamp_ns": 3467795703
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 7,
+        "timestamp_ns": 3467970833
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 1,
+        "timestamp_ns": 3468063173
+      },
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 6,
+        "timestamp_ns": 3468227253
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 3,
+        "timestamp_ns": 3468399263
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 6,
+        "timestamp_ns": 3539691478
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 3,
+        "timestamp_ns": 3539828418
+      },
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 5,
+        "timestamp_ns": 3540407688
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 6,
+        "timestamp_ns": 3540824828
+      },
+      {
+        "delta": 1,
+        "depth": 3,
+        "producer_id": 4,
+        "timestamp_ns": 3541238268
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 2,
+        "timestamp_ns": 3541450728
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 1,
+        "timestamp_ns": 3541541588
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 3541583048
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 2,
+        "timestamp_ns": 3657100135
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 5,
+        "timestamp_ns": 3665765793
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 4,
+        "timestamp_ns": 3693391888
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 5,
+        "timestamp_ns": 3693686317
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 2,
+        "timestamp_ns": 3694031347
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 7,
+        "timestamp_ns": 3694262577
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 3694450907
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 1,
+        "timestamp_ns": 3694679807
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 6,
+        "timestamp_ns": 3694860797
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 3,
+        "timestamp_ns": 3695038677
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 0,
+        "timestamp_ns": 3695198787
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 6,
+        "timestamp_ns": 3695339997
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 7,
+        "timestamp_ns": 3695478147
+      },
+      {
+        "delta": 1,
+        "depth": 8,
+        "producer_id": 1,
+        "timestamp_ns": 3695534847
+      },
+      {
+        "delta": -1,
+        "depth": 7,
+        "producer_id": 3,
+        "timestamp_ns": 3769345202
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 0,
+        "timestamp_ns": 3837649959
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 0,
+        "timestamp_ns": 3837854698
+      },
+      {
+        "delta": 1,
+        "depth": 8,
+        "producer_id": 3,
+        "timestamp_ns": 3838012088
+      },
+      {
+        "delta": -1,
+        "depth": 7,
+        "producer_id": 7,
+        "timestamp_ns": 3839093578
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 3844524457
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 2,
+        "timestamp_ns": 3878672600
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 3878928750
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 3,
+        "timestamp_ns": 3899646986
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 3,
+        "timestamp_ns": 3899777176
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 5,
+        "timestamp_ns": 3910314934
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 3910437494
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 0,
+        "timestamp_ns": 3945094067
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 0,
+        "timestamp_ns": 3945300187
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 6,
+        "timestamp_ns": 3990362038
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 5,
+        "timestamp_ns": 3990505628
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 6,
+        "timestamp_ns": 3990529158
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 3993423267
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 7,
+        "timestamp_ns": 3993536327
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 4057808557
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 1,
+        "timestamp_ns": 4057884017
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 5,
+        "timestamp_ns": 4118725200
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 5,
+        "timestamp_ns": 4118891180
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 4135967077
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 4137047377
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 7,
+        "timestamp_ns": 4137323157
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 1,
+        "timestamp_ns": 4204953659
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 4205136219
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 6,
+        "timestamp_ns": 4217842007
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 0,
+        "timestamp_ns": 4238512544
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 5,
+        "timestamp_ns": 4270499090
+      },
+      {
+        "delta": -1,
+        "depth": 2,
+        "producer_id": 7,
+        "timestamp_ns": 4270684900
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 3,
+        "timestamp_ns": 4270885110
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 1,
+        "timestamp_ns": 4270950330
+      },
+      {
+        "delta": 1,
+        "depth": 1,
+        "producer_id": 6,
+        "timestamp_ns": 4271120770
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 7,
+        "timestamp_ns": 4271562650
+      },
+      {
+        "delta": 1,
+        "depth": 3,
+        "producer_id": 0,
+        "timestamp_ns": 4271719650
+      },
+      {
+        "delta": 1,
+        "depth": 4,
+        "producer_id": 1,
+        "timestamp_ns": 4272161820
+      },
+      {
+        "delta": 1,
+        "depth": 5,
+        "producer_id": 5,
+        "timestamp_ns": 4272420190
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 3,
+        "timestamp_ns": 4272723270
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 4,
+        "timestamp_ns": 4272878880
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 0,
+        "timestamp_ns": 4376163287
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 6,
+        "timestamp_ns": 4377767556
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 6,
+        "timestamp_ns": 4377915206
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 4386710575
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 4,
+        "timestamp_ns": 4386868465
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 0,
+        "timestamp_ns": 4386992215
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 3,
+        "timestamp_ns": 4430086800
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 3,
+        "timestamp_ns": 4430188130
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 4478478113
+      },
+      {
+        "delta": 1,
+        "depth": 7,
+        "producer_id": 2,
+        "timestamp_ns": 4478833093
+      },
+      {
+        "delta": -1,
+        "depth": 6,
+        "producer_id": 6,
+        "timestamp_ns": 4523753178
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 0,
+        "timestamp_ns": 4558669833
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 0,
+        "timestamp_ns": 4558852263
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 5,
+        "timestamp_ns": 4559363823
+      },
+      {
+        "delta": 1,
+        "depth": 6,
+        "producer_id": 1,
+        "timestamp_ns": 4559454253
+      },
+      {
+        "delta": -1,
+        "depth": 5,
+        "producer_id": 4,
+        "timestamp_ns": 4630163494
+      },
+      {
+        "delta": -1,
+        "depth": 4,
+        "producer_id": 3,
+        "timestamp_ns": 4630319144
+      },
+      {
+        "delta": -1,
+        "depth": 3,
+        "producer_id": 2,
+        "timestamp_ns": 4630616334
+      },
+      {
+        "delta": -1,
+        "depth": 2,
+        "producer_id": 0,
+        "timestamp_ns": 4630744574
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 7,
+        "timestamp_ns": 4631081664
+      },
+      {
+        "delta": 1,
+        "depth": 2,
+        "producer_id": 6,
+        "timestamp_ns": 4631367654
+      },
+      {
+        "delta": -1,
+        "depth": 1,
+        "producer_id": 1,
+        "timestamp_ns": 4631512924
+      },
+      {
+        "delta": -1,
+        "depth": 0,
+        "producer_id": 6,
+        "timestamp_ns": 4657128791
+      }
+    ],
+    "source_read_bytes": 8044936192,
+    "source_read_count": 60,
+    "source_requested_bytes": 8044936192,
+    "source_returned_bytes": 8044936192,
+    "source_wall_ms": 1708.397186,
+    "source_worker_busy_ms": 10808.391079,
+    "source_worker_busy_ns": 10808391079,
+    "source_worker_busy_time_ms": 10808.391079,
+    "source_worker_busy_time_ns": 10808391079,
+    "source_worker_timing": {
+      "0": {
+        "busy_ms": 1352.4109750000002,
+        "busy_ns": 1352410975,
+        "first_start_ns": 2949902404,
+        "last_end_ns": 4630742374,
+        "read_bytes": 1065614336,
+        "read_count": 8,
+        "release_reason": "source_completion",
+        "wall_ms": 1352.584865,
+        "worker_release_ns": 4630742374,
+        "worker_terminated_ns": 4657325591
+      },
+      "1": {
+        "busy_ms": 1456.618099,
+        "busy_ns": 1456618099,
+        "first_start_ns": 2950467014,
+        "last_end_ns": 4631511864,
+        "read_bytes": 1207959552,
+        "read_count": 9,
+        "release_reason": "source_completion",
+        "wall_ms": 1456.752619,
+        "worker_release_ns": 4631511864,
+        "worker_terminated_ns": 4657325591
+      },
+      "2": {
+        "busy_ms": 966.79047,
+        "busy_ns": 966790470,
+        "first_start_ns": 2951078204,
+        "last_end_ns": 4630615054,
+        "read_bytes": 671088640,
+        "read_count": 5,
+        "release_reason": "source_completion",
+        "wall_ms": 966.9213599999999,
+        "worker_release_ns": 4630615054,
+        "worker_terminated_ns": 4657325591
+      },
+      "3": {
+        "busy_ms": 1343.0959870000002,
+        "busy_ns": 1343095987,
+        "first_start_ns": 2951544024,
+        "last_end_ns": 4630318494,
+        "read_bytes": 1073741824,
+        "read_count": 8,
+        "release_reason": "source_completion",
+        "wall_ms": 1343.307907,
+        "worker_release_ns": 4630318494,
+        "worker_terminated_ns": 4657325591
+      },
+      "4": {
+        "busy_ms": 1426.026382,
+        "busy_ns": 1426026382,
+        "first_start_ns": 2951942994,
+        "last_end_ns": 4630159754,
+        "read_bytes": 805306368,
+        "read_count": 6,
+        "release_reason": "source_completion",
+        "wall_ms": 1426.1537019999998,
+        "worker_release_ns": 4630159754,
+        "worker_terminated_ns": 4657325591
+      },
+      "5": {
+        "busy_ms": 1422.9915959999998,
+        "busy_ns": 1422991596,
+        "first_start_ns": 2952588484,
+        "last_end_ns": 4559362053,
+        "read_bytes": 939524096,
+        "read_count": 7,
+        "release_reason": "source_completion",
+        "wall_ms": 1423.122936,
+        "worker_release_ns": 4559362053,
+        "worker_terminated_ns": 4657325591
+      },
+      "6": {
+        "busy_ms": 1449.491775,
+        "busy_ns": 1449491775,
+        "first_start_ns": 3043171528,
+        "last_end_ns": 4657127041,
+        "read_bytes": 1207959552,
+        "read_count": 9,
+        "release_reason": "source_completion",
+        "wall_ms": 1449.652385,
+        "worker_release_ns": 4657127041,
+        "worker_terminated_ns": 4657325591
+      },
+      "7": {
+        "busy_ms": 1390.965795,
+        "busy_ns": 1390965795,
+        "first_start_ns": 3045275958,
+        "last_end_ns": 4631073174,
+        "read_bytes": 1073741824,
+        "read_count": 8,
+        "release_reason": "source_completion",
+        "wall_ms": 1391.123815,
+        "worker_release_ns": 4631073174,
+        "worker_terminated_ns": 4657325591
+      }
+    },
+    "staging_buffer": {
+      "allocation_identity": "one_contiguous_pinned_cpu_uint8_arena",
+      "arena_bytes": 1073741824,
+      "contiguous": true,
+      "device": "cpu",
+      "dtype": "torch.uint8",
+      "extent_count": 8,
+      "extent_shape": [
+        134217728
+      ],
+      "kind": "torch_cpu_uint8_pinned_contiguous_arena",
+      "physical_allocation_count": 1,
+      "pinned": true,
+      "shape": [
+        1073741824
+      ]
+    },
+    "staging_buffer_allocation_count": 1,
+    "staging_buffer_allocation_identity": "one_contiguous_pinned_cpu_uint8_arena",
+    "staging_buffer_contiguous": true,
+    "staging_buffer_device": "cpu",
+    "staging_buffer_dtype": "torch.uint8",
+    "staging_buffer_extent_count": 8,
+    "staging_buffer_extent_shape": [
+      134217728
+    ],
+    "staging_buffer_kind": "torch_cpu_uint8_pinned_contiguous_arena",
+    "staging_buffer_observed": true,
+    "staging_buffer_pinned": true,
+    "staging_buffer_shape": [
+      1073741824
+    ],
+    "time_at_qd_ms": {
+      "0": 1.16147,
+      "1": 28.124807,
+      "2": 73.987584,
+      "3": 2.518839,
+      "4": 61.970471,
+      "5": 34.073685,
+      "6": 664.839992,
+      "7": 506.753166,
+      "8": 333.792783
+    },
+    "time_at_qd_ns": {
+      "0": 1161470,
+      "1": 28124807,
+      "2": 73987584,
+      "3": 2518839,
+      "4": 61970471,
+      "5": 34073685,
+      "6": 664839992,
+      "7": 506753166,
+      "8": 333792783
+    },
+    "transport_cleanup_timeout_seconds": 300.0,
+    "writable_byte_view_contract": "golden_serial._writable_bytes_view"
+  }
+}

@@ -12,7 +12,7 @@ import asyncio
 import os
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from canonical_execution import (
     _reset_restore_publish_cache,
@@ -68,7 +68,7 @@ class TestBuildExecutionPlan(unittest.TestCase):
         )
         self.assertIsInstance(plan.execution_options, ExecutionOptions)
         self.assertFalse(plan.execution_options.production_enabled)
-        self.assertEqual(plan.execution_options.output_conversion_options["format"], "webp")
+        self.assertEqual(plan.execution_options.output_conversion_options["format"], "webp_lossy")
         self.assertEqual(plan.source_workflow_hash, plan.workflow_hash)
         with self.assertRaises(AttributeError):
             plan.workflow = {}  # type: ignore[misc]
@@ -80,6 +80,21 @@ class TestBuildExecutionPlan(unittest.TestCase):
 
 
 class TestExecutePlan(unittest.TestCase):
+    def setUp(self):
+        # Pin the effective env profile to production for the duration of the
+        # class so the pre-submission profile checker/setter path always runs
+        # (the inherit no-op gate would otherwise skip setter invocation,
+        # breaking the pinned setter-invocation assertions below).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     def test_publishes_once_and_returns_one_stream_result(self):
         observed = {}
 
@@ -349,6 +364,20 @@ class TestExecutePlan(unittest.TestCase):
 
 
 class TestTraceMetadataMerge(unittest.TestCase):
+    def setUp(self):
+        # Pin the effective env profile to production so the profile setter
+        # path runs and its metadata/events merge into the result trace
+        # (the inherit no-op gate would skip the setter entirely).
+        self._env_patch = patch.dict(
+            os.environ,
+            {"COMFYMODAL_V2_ENV_PROFILE": "production"},
+            clear=False,
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
     def test_local_events_and_metadata_merge_into_remote_trace(self):
         """Local RuntimeTrace events and metadata are merged into the remote
         result trace without discarding existing remote fields."""
@@ -615,9 +644,11 @@ class TestRestorePublisherWiring(unittest.TestCase):
         asyncio.run(run())
 
     def test_restore_publisher_not_called_when_omitted(self):
-        """When restore_publisher is None, no publication occurs: exactly one
-        restore_plan_publish_start/end pair is emitted and the terminal
-        marker records status=not_configured with honest cache/remote metadata."""
+        """When restore_publisher is None (the default no-publish path),
+        no publication occurs: the run emits the bounded
+        ``restore_publish_skipped`` marker with honest metadata and does NOT
+        emit ``restore_plan_publish_start/end`` (so ``restore_publish_ms``
+        renders absent downstream)."""
         async def stream(**kwargs):
             yield {"type": "result", "data": {"images": [], "outputs": {}}}
 
@@ -630,16 +661,21 @@ class TestRestorePublisherWiring(unittest.TestCase):
             trace = RuntimeTrace(request_id="no_pub", process="local")
             transport = ModalTransport(prompt_stream_fn=stream)
             result = await execute_plan(plan, transport=transport, trace=trace)
+            skipped_events = [e for e in trace.events if e.name == "restore_publish_skipped"]
             start_events = [e for e in trace.events if e.name == "restore_plan_publish_start"]
-            found_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
-            self.assertEqual(len(start_events), 1,
-                             "Must have exactly one restore_plan_publish_start event")
-            self.assertEqual(len(found_events), 1,
-                             "Must have exactly one restore_plan_publish_end event")
-            md = found_events[0].metadata
+            end_events = [e for e in trace.events if e.name == "restore_plan_publish_end"]
+            self.assertEqual(len(skipped_events), 1,
+                             "Must have exactly one restore_publish_skipped event")
+            self.assertEqual(len(start_events), 0,
+                             "No restore_plan_publish_start event on the no-publish path")
+            self.assertEqual(len(end_events), 0,
+                             "No restore_plan_publish_end event on the no-publish path")
+            md = skipped_events[0].metadata
             status = md.get("status") if hasattr(md, "get") else md.get("status")
-            self.assertEqual(status, "not_configured",
-                             f"status should be 'not_configured'. metadata={md} type={type(md)}")
+            self.assertEqual(status, "skipped", f"status should be 'skipped'. metadata={md} type={type(md)}")
+            reason = md.get("reason") if hasattr(md, "get") else md.get("reason")
+            self.assertEqual(reason, "flag_disabled",
+                             f"reason should be 'flag_disabled'. metadata={md} type={type(md)}")
             # Honest metadata: no remote publication was performed or simulated.
             self.assertFalse(trace._metadata.get("restore_remote_call_performed", False),
                              "no remote call must be recorded when publisher is None")
@@ -648,6 +684,9 @@ class TestRestorePublisherWiring(unittest.TestCase):
                 local_timing.get("restore_remote_call_performed"),
                 "no-publisher derived timing must not claim a remote call",
             )
+            # restore_publish_ms renders absent (no publish span exists).
+            self.assertIsNone(local_timing.get("restore_publish_ms"),
+                              "restore_publish_ms must be absent on the no-publish path")
         asyncio.run(run())
 
     def test_restore_plan_build_start_paired_with_end(self):
@@ -1561,3 +1600,20 @@ class TestLocalV2TracePreservation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# -- D1 registry-proof store isolation (never write the real shared store;
+#    see tests/d1_store_isolation.py) -----------------------------------
+import sys as _d1_sys
+from pathlib import Path as _d1_Path
+
+if str(_d1_Path(__file__).resolve().parents[1]) not in _d1_sys.path:
+    _d1_sys.path.insert(0, str(_d1_Path(__file__).resolve().parents[1]))
+from tests.d1_store_isolation import isolate_module_store, restore_module_store
+
+
+def setUpModule():
+    isolate_module_store()
+
+
+def tearDownModule():
+    restore_module_store()

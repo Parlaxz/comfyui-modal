@@ -1,0 +1,30 @@
+Total messages: 84 (Errors: 27, Warnings: 44)
+Returning 27 messages for level "error"
+
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/user.css:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/user.css:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/favicon.ico:0
+[ERROR] ComfyApp graph accessed before initialization @ http://127.0.0.1:8188/assets/dialogService-D7CHWuTa.js:177
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata?dir=subgraphs&recurse=true&split=false&full_info=true:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/userdata/comfy.templates.json:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/extensions/core/clipspace.js:0
+[ERROR] [vite:preloadError] {url: http://127.0.0.1:8188/extensions/ComfyUI-Impact-Pack/impact-sam-editor.js, fileType: js, chunkName: impact-sam-editor, message: Failed to fetch dynamically imported module: http:…tensions/ComfyUI-Impact-Pack/impact-sam-editor.js} @ http://127.0.0.1:8188/assets/index-C4O64qgY.js:1
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/lm/settings:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/pysssss/autocomplete:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_sdccd_00003_.png&type=temp&subfolder=&rand=0.8700225303784748:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_sdccd_00004_.png&type=temp&subfolder=&rand=0.2336594318531625:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_kaupx_00027_.png&type=temp&subfolder=&rand=0.9643628753522745:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_kaupx_00028_.png&type=temp&subfolder=&rand=0.009572729445437744:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_hools_00009_.png&type=temp&subfolder=&rand=0.939664086995029:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?filename=rgthree.compare._temp_hools_00010_.png&type=temp&subfolder=&rand=0.3288849112092421:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.03355817231520719:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.03355817231520719:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_04912485_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_05022fd1_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.8300341122824322:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/api/view?type=input&filename=rgthree.compare._temp_ebbfp_00047_.png&subfolder=&rand=0.8300341122824322:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_04912485_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_05022fd1_107_b_0.png:0
+[ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:8188/comfymodal/studio/outputs/production_867654c7_107_b_0.png:0

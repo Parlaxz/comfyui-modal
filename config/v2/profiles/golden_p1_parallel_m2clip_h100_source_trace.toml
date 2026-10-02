@@ -1,0 +1,10 @@
+schema_version = 1
+name = "golden_p1_parallel_m2clip_h100_source_trace"
+extends = "golden_p1_parallel_m2clip_h100"
+owner = "m2-golden-clip-source-trace"
+
+[target]
+app = "batch-p005-source-trace-sep28"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_WINDOW_TRACE = "1"

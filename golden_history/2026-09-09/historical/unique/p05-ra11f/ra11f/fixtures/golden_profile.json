@@ -1,0 +1,23 @@
+{
+  "profile_id": "golden_fixture_from_latest_benchmark_workflow",
+  "source_workflow": "latest_benchmark_workflow.json",
+  "environment_kind": "synthetic_published_environment",
+  "runtime_node_count": 60,
+  "serialized_entry_count": 61,
+  "absent_from_runtime": ["1501"],
+  "input_rewrites": {
+    "1262.inputs.model": "1499"
+  },
+  "class_ids": [
+    "CLIPLoader",
+    "UNETLoader",
+    "CLIPTextEncode",
+    "ClownsharKSampler_Beta",
+    "VAELoader",
+    "VAEDecode",
+    "SaveImage",
+    "Any Switch (rgthree)",
+    "GoldenFixtureNode"
+  ],
+  "source_limitation": "The harness uses a narrow synthetic adapter, not installed ComfyUI or custom-node trees. This profile is fixture evidence only."
+}

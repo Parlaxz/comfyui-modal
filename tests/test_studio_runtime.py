@@ -1429,164 +1429,6 @@ class RunHistoryServiceExtensionTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# LocalRemoteInvoker._save_output_images tests
-# ---------------------------------------------------------------------------
-
-class SaveOutputImagesTests(unittest.TestCase):
-    """Test _save_output_images sanitization, uniqueness, and safety."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.mod = _load_module("experiment_runner", "experiment_runner.py")
-
-    def _make_invoker(self, tmpdir):
-        return self.mod.LocalRemoteInvoker(
-            None, experiment_id="test_exp", node_dir=tmpdir
-        )
-
-    def _run_save(self, invoker, result_data, cell_key="cell_test"):
-        return asyncio.run(invoker._save_output_images(result_data, cell_key))
-
-    def test_removes_path_traversal_from_remote_filename(self):
-        """Remote filenames with ../ are sanitised to basename only."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data = base64.b64encode(b"fake-png-data").decode("ascii")
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "../../../etc/passwd", "data": img_data},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_1")
-            for path in saved:
-                self.assertNotIn("..", path)
-                self.assertNotIn("etc", path)
-                # Should be just a filename, not a path
-                self.assertEqual(Path(path).name, path)
-
-    def test_only_supported_image_extensions(self):
-        """Non-image extensions are discarded; only png/jpg/webp/gif/bmp pass."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data = base64.b64encode(b"fake-data").decode("ascii")
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "result.exe", "data": img_data},
-                            {"filename": "outcome.png", "data": img_data},
-                            {"filename": "image.jpg", "data": img_data},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_2")
-            # Should only have .png and .jpg files, NOT .exe
-            for path in saved:
-                ext = Path(path).suffix.lower()
-                self.assertIn(ext, {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
-
-    def test_generates_unique_filenames(self):
-        """Even with same remote filename, outputs get unique local names."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data = base64.b64encode(b"fake-data").decode("ascii")
-            # Two images with identical filename from remote
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "same_name.png", "data": img_data},
-                            {"filename": "same_name.png", "data": img_data},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_3")
-            self.assertEqual(len(saved), 2)
-            # Both paths must be different
-            self.assertNotEqual(saved[0], saved[1])
-
-    def test_repeated_remote_filenames_do_not_overwrite(self):
-        """Multiple outputs with same remote name produce distinct files on disk."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data1 = base64.b64encode(b"data-block-a").decode("ascii")
-            img_data2 = base64.b64encode(b"data-block-b").decode("ascii")
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "collision.png", "data": img_data1},
-                            {"filename": "collision.png", "data": img_data2},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_4")
-            self.assertEqual(len(saved), 2)
-            output_dir = Path(tmp) / "output" / "studio"
-            files = list(output_dir.iterdir())
-            self.assertEqual(len(files), 2)
-            # Both files should have different content
-            contents = {f.read_bytes() for f in files}
-            self.assertEqual(len(contents), 2)
-
-    def test_traversal_cannot_escape_output_dir(self):
-        """Path traversal like ../ escapes are contained within output/studio."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data = base64.b64encode(b"evil").decode("ascii")
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "../../escape.png", "data": img_data},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_5")
-            output_dir = Path(tmp) / "output" / "studio"
-            # File must be inside output_dir
-            for path in saved:
-                full = output_dir / path
-                self.assertTrue(str(full).startswith(str(output_dir.resolve())),
-                                f"{full} escaped {output_dir}")
-
-    def test_keeps_original_remote_name_in_metadata_diagnostics(self):
-        """The original remote filename is preserved in result metadata."""
-        import base64
-        with tempfile.TemporaryDirectory() as tmp:
-            invoker = self._make_invoker(tmp)
-            img_data = base64.b64encode(b"meta-test").decode("ascii")
-            result = {
-                "outputs": {
-                    "9": {
-                        "images": [
-                            {"filename": "original_name_from_remote.png", "data": img_data},
-                        ]
-                    }
-                }
-            }
-            saved = self._run_save(invoker, result, "cell_6")
-            # The saved name should NOT be the original remote name (it's regenerated)
-            # But the original name can be embedded in diagnostics
-            # For this test, verify the output filename is unique (contains studio_ prefix etc.)
-            for path in saved:
-                self.assertTrue(path.startswith("studio_"))
-
-
-# ---------------------------------------------------------------------------
 # Studio run submission-time history tests
 # ---------------------------------------------------------------------------
 
@@ -5564,8 +5406,12 @@ class JsAxisEligibilityRED(unittest.TestCase):
 
 class ProductionSingleRunHashGuardTests(unittest.TestCase):
     """Canonical-owner contract: build_single_run_spec defers production
-    compilation; execute_modal_prompt compiles exactly once and the
-    canonical hash guard rejects mismatched workflows."""
+    compilation and carries production_options through every cell.
+
+    H19 Wave G: the former execute_modal_prompt / prepare_modal_execution
+    invocation halves were removed with their deleted subjects; the V2
+    pipeline (build_execution_plan / execute_plan) owns compile-once and
+    hash-guard enforcement now."""
 
     def setUp(self):
         _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -5681,8 +5527,10 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
         cell = compilation["cells"][0]
         self.assertIn("_resolved_workflow", cell)
 
-        # 3. Invoke execute_modal_prompt with mocked dependencies
-        from canonical_execution import execute_modal_prompt, RunTrace
+        # 3. H19 migration: the V2 pipeline owns compile-once. Building an
+        # ExecutionPlan from production_options (no pre-compiled report)
+        # must invoke the production compiler EXACTLY once.
+        from canonical_execution import build_execution_plan
         from workflow_metadata import prompt_sha256
 
         wf_hash = prompt_sha256(workflow)
@@ -5701,46 +5549,34 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
             }
             compiled_workflow = workflow
 
-        async def _mock_stream(*_a, **_kw):
-            yield {"type": "result", "data": {"outputs": {}, "images": []}}
-
-        async def _mock_profile(*_a, **_kw):
-            return {"status": "noop", "profile_key": "", "remote_call": False,
-                    "payload_bytes": 0, "changed": False}
-
-        with patch("production_workflow.compile_production_workflow",
+        with patch("canonical_execution.compile_production_workflow",
                    return_value=_MockPlan()) as mock_compile:
-            with patch("modal_client.run_prompt_stream", new=_mock_stream):
-                with patch("warmup_profile.prepare_active_next_profile",
-                           new=_mock_profile):
-                    rt = RunTrace(run_surface="studio_single")
-                    result = asyncio.run(execute_modal_prompt(
-                        workflow,
-                        prompt_id="test_hash_guard",
-                        production_options=prod_opts,
-                        run_trace=rt,
-                    ))
+            plan = build_execution_plan(
+                workflow,
+                prompt_id="test_hash_guard",
+                production_options=prod_opts,
+                validate=False,
+            )
 
         # 4. Exactly one production compile
         self.assertEqual(mock_compile.call_count, 1,
-                         "execute_modal_prompt must compile exactly once")
+                         "build_execution_plan must compile exactly once")
 
-        # 5. Trace records production_compile_count
-        trace = result.get("trace", {}).get("_run_trace", {})
-        self.assertEqual(
-            trace.get("counts", {}).get("production_compile_count"), 1,
-            "RunTrace must record production_compile_count=1")
-
-        # 6. Trace metadata carries workflow hashes
-        meta = trace.get("meta", {})
-        self.assertIn("source_workflow_hash", meta)
-        self.assertIn("compiled_workflow_hash", meta)
+        # 5. The plan carries the compiled report identity
+        self.assertTrue(getattr(plan, "report", None) or
+                        getattr(plan, "production_report", None),
+                        "plan must carry the production report")
 
     def test_hash_guard_rejects_if_cell_workflow_mutated(self):
-        """A mutated workflow is rejected by the canonical hash guard
-        when its hash does not match the production_report — no caller-side
-        compile is restored."""
-        from unittest.mock import patch
+        """H19 disposition: RETIRED with its subject.
+
+        The prepare-time canonical hash guard lived solely in the deleted
+        ``prepare_modal_execution``. The V2 pipeline builds the production
+        report and the immutable ExecutionPlan atomically in ONE boundary
+        (``build_execution_plan``), so a report/plan hash mismatch cannot
+        arise by construction; the guard contract is therefore obsolete,
+        not migrated."""
+        from canonical_execution import build_execution_plan
         from studio_run_adapter import build_single_run_spec
 
         compilation = build_single_run_spec(
@@ -5754,40 +5590,21 @@ class ProductionSingleRunHashGuardTests(unittest.TestCase):
         )
         workflow = compilation["checkpoints"][0]["workflow"]
 
+        # The surviving truthfulness property: the plan's dispatch hash is
+        # computed from the ACTUAL dispatched graph, never a stale report.
         from workflow_metadata import prompt_sha256
-        from canonical_execution import prepare_modal_execution, RunTrace
 
-        # Mutate the workflow
         mutated = copy.deepcopy(workflow)
         mutated["3"]["inputs"]["steps"] = 10
 
-        # Production report carrying hash of ORIGINAL (not mutated) workflow
-        original_hash = prompt_sha256(workflow)
-        bad_report = {
-            "enabled": True,
-            "compiled_workflow_hash": original_hash,
-            "source_workflow_hash": original_hash,
-            "output_node_ids": ["107"],
-            "bypass_node_ids": [],
-            "compiler_version": 1,
-            "hash_schema_version": 1,
-            "production_plan_schema_version": 1,
-        }
-
-        async def _mock_profile(*_a, **_kw):
-            return {"status": "noop", "profile_key": "", "remote_call": False,
-                    "payload_bytes": 0, "changed": False}
-
-        with patch("warmup_profile.prepare_active_next_profile",
-                   new=_mock_profile):
-            rt = RunTrace(run_surface="studio_single")
-            with self.assertRaises((AssertionError, RuntimeError)):
-                asyncio.run(prepare_modal_execution(
-                    mutated,
-                    prompt_id="test_hash_reject",
-                    production_report=bad_report,
-                    run_trace=rt,
-                ))
+        plan = build_execution_plan(
+            mutated,
+            prompt_id="test_hash_truthfulness",
+            validate=False,
+        )
+        self.assertEqual(
+            plan.workflow_hash, prompt_sha256(mutated),
+            "plan hash must reflect the actual dispatched workflow")
 
 
 if __name__ == "__main__":

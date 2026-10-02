@@ -1,0 +1,214 @@
+{
+  "assets": [
+    {
+      "filename": "fixture_input.png",
+      "mime_type": "image/png",
+      "role": "input",
+      "sha256": "cafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeedcafefeed",
+      "size": 2048
+    }
+  ],
+  "custom_nodes": [],
+  "manifest_version": 1,
+  "mapping": {
+    "entries": {
+      "positive_prompt": {
+        "control_kind": "multiline",
+        "data_type": "STRING",
+        "display_name": "Positive Prompt",
+        "enum_options": [],
+        "input_name": "text",
+        "kind": "node_input",
+        "maximum": null,
+        "minimum": null,
+        "multiline": true,
+        "node_id": "2",
+        "output_name": "",
+        "required": true,
+        "semantic_role": "positive_prompt",
+        "step": null
+      },
+      "seed": {
+        "control_kind": "integer",
+        "data_type": "INT",
+        "display_name": "Seed",
+        "enum_options": [],
+        "input_name": "seed",
+        "kind": "widget",
+        "maximum": 4294967295,
+        "minimum": 0,
+        "multiline": false,
+        "node_id": "3",
+        "output_name": "",
+        "required": false,
+        "semantic_role": "seed",
+        "step": 1
+      }
+    },
+    "mapping_id": "wm_fixture_input_asset_required_v1",
+    "output_node_id": "4",
+    "workflow_version_id": "wv_fixture_input_asset_required_v1"
+  },
+  "metadata": {
+    "captured_at": "2026-08-23T00:00:00+00:00",
+    "exported_at": "2026-08-23T00:00:00+00:00",
+    "generator": "phase-g8-fixture-corpus",
+    "synthetic": true
+  },
+  "models": [
+    {
+      "compatibility": "fixture",
+      "display_name": "Fixture Core Checkpoint",
+      "filename": "fixture_core_checkpoint.safetensors",
+      "folder": "checkpoints",
+      "model_type": "checkpoint",
+      "provider": "fixture",
+      "revision": "main",
+      "role": "checkpoint",
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "size": 4096,
+      "source_urls": []
+    }
+  ],
+  "presets": [],
+  "version": {
+    "created_at": "2026-08-23T00:00:00+00:00",
+    "graph_hash": "492b2ce72dbd85583166909fa533473d2e56f4d4c61bbed849adfd1c5130ea9b",
+    "immutable": true,
+    "version_number": 1,
+    "workflow_id": "wf_fixture_input_asset_required",
+    "workflow_version_id": "wv_fixture_input_asset_required_v1"
+  },
+  "workflow": {
+    "display": {
+      "description": "Synthetic Phase-G portability fixture (input_asset_required)",
+      "name": "Fixture input_asset_required"
+    },
+    "graph": {
+      "config": {},
+      "extra": {},
+      "groups": [],
+      "id": "fixture-graph",
+      "last_link_id": 0,
+      "last_node_id": 9,
+      "links": [],
+      "nodes": [
+        {
+          "flags": {},
+          "id": 1,
+          "inputs": [],
+          "mode": 0,
+          "order": 1,
+          "outputs": [],
+          "pos": [
+            40,
+            20
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "CheckpointLoaderSimple",
+          "widgets_values": [
+            "fixture_core_checkpoint.safetensors"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 9,
+          "inputs": [],
+          "mode": 0,
+          "order": 9,
+          "outputs": [],
+          "pos": [
+            360,
+            180
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "LoadImage",
+          "widgets_values": [
+            "fixture_input.png"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 2,
+          "inputs": [],
+          "mode": 0,
+          "order": 2,
+          "outputs": [],
+          "pos": [
+            80,
+            40
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "CLIPTextEncode",
+          "widgets_values": [
+            "fixture prompt"
+          ]
+        },
+        {
+          "flags": {},
+          "id": 3,
+          "inputs": [],
+          "mode": 0,
+          "order": 3,
+          "outputs": [],
+          "pos": [
+            120,
+            60
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "KSampler",
+          "widgets_values": [
+            1,
+            20
+          ]
+        },
+        {
+          "flags": {},
+          "id": 4,
+          "inputs": [],
+          "mode": 0,
+          "order": 4,
+          "outputs": [],
+          "pos": [
+            160,
+            80
+          ],
+          "properties": {},
+          "size": [
+            220,
+            60
+          ],
+          "type": "SaveImage",
+          "widgets_values": [
+            "fixture"
+          ]
+        }
+      ],
+      "revision": 0,
+      "version": 0.4
+    },
+    "graph_hash": "492b2ce72dbd85583166909fa533473d2e56f4d4c61bbed849adfd1c5130ea9b",
+    "source": {
+      "author": "phase-g8-fixture-corpus",
+      "url": ""
+    },
+    "version_id": "wv_fixture_input_asset_required_v1",
+    "workflow_id": "wf_fixture_input_asset_required"
+  }
+}

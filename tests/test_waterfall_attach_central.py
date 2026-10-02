@@ -19,6 +19,8 @@ from comfymodal_runtime.v2_waterfall import (
     graph_result_from_event,
     is_graph_result,
     mark_waterfall_non_applicable,
+    render_waterfall,
+    waterfall_to_dict,
 )
 from modal_client import _attach_waterfall_for_graph
 
@@ -96,6 +98,64 @@ class AttachWaterfallIdempotenceTests(unittest.TestCase):
         self.assertEqual(data["run_label"], "r")
         self.assertIsInstance(data["stages"], list)
 
+    def test_attach_replaces_partial_with_replace_partial(self):
+        """A REMOTE raw artifact marked partial_waterfall=True must never be the
+        final valid report: replace_partial=True rebuilds over it on the host."""
+        from tests.v2_waterfall_reconciliation_fixtures import (
+            build_real_run_result,
+            command_start_ms,
+            response_ns_for,
+        )
+
+        partial_result = build_real_run_result(boundaries=False, restore_begin=False)
+        remote_partial = waterfall_to_dict(build_waterfall(
+            result=partial_result, timing={}, wall_ms=None,
+            command_start_unix_ms=command_start_ms(),
+            response_received_unix_ns=response_ns_for(partial_result["wall_ms"]),
+        ))
+        self.assertTrue(remote_partial["partial_waterfall"])
+
+        full_result = build_real_run_result()
+        full_result["waterfall"] = remote_partial
+        attach_waterfall(
+            full_result,
+            timing={}, wall_ms=None,
+            command_start_unix_ms=command_start_ms(),
+            response_received_unix_ns=response_ns_for(full_result["wall_ms"]),
+            modal_restore_begin_wall_unix_ns=full_result["modal_restore_begin_wall_unix_ns"],
+            replace_partial=True,
+            print_render=False,
+        )
+        rebuilt = full_result["waterfall"]
+        self.assertIsNot(rebuilt, remote_partial)
+        self.assertFalse(rebuilt["partial_waterfall"])
+        self.assertIn("V2 COLD WATERFALL", render_waterfall(rebuilt))
+
+    def test_attach_preserves_partial_without_replace_partial(self):
+        """Without replace_partial the generic preserve-first behavior keeps
+        the existing report (even a partial one)."""
+        from tests.v2_waterfall_reconciliation_fixtures import (
+            build_real_run_result,
+            command_start_ms,
+            response_ns_for,
+        )
+
+        partial_result = build_real_run_result(boundaries=False, restore_begin=False)
+        remote_partial = waterfall_to_dict(build_waterfall(
+            result=partial_result, timing={}, wall_ms=None,
+            command_start_unix_ms=command_start_ms(),
+            response_received_unix_ns=response_ns_for(partial_result["wall_ms"]),
+        ))
+        result = build_real_run_result()
+        result["waterfall"] = remote_partial
+        attach_waterfall(
+            result, timing={}, wall_ms=None,
+            command_start_unix_ms=command_start_ms(),
+            response_received_unix_ns=response_ns_for(result["wall_ms"]),
+            print_render=False,
+        )
+        self.assertIs(result["waterfall"], remote_partial)
+
 
 class ModalWrapperSourceContractTests(unittest.TestCase):
     def test_asyncgen_wrapper_finalizes_graph_result_events_only(self):
@@ -114,6 +174,7 @@ class ModalWrapperSourceContractTests(unittest.TestCase):
     def test_non_workflow_methods_exempted(self):
         self.assertIn('"startup", "restore", "exit"', MODAL_APP)
         self.assertIn('"read_output_asset"', MODAL_APP)
+        self.assertIn('"run_numa_experiment"', MODAL_APP)
         self.assertIn('"publish_restore_plan"', MODAL_APP)
 
     def test_shared_helper_imported(self):
@@ -228,14 +289,17 @@ class ModalClientFallbackTests(unittest.TestCase):
 
 class CanonicalExecuteFallbackTests(unittest.TestCase):
     def test_execute_plan_local_fallback_present(self):
-        self.assertIn('attach_waterfall(result, run_label="canonical execute_plan")', CANONICAL)
-        self.assertIn("result[\"trace\"] = remote_trace", CANONICAL)
-
-    def test_execute_modal_prompt_local_fallback_present(self):
+        # The host-side fallback suppresses its duplicate render: the remote
+        # container already printed the waterfall, so the call passes
+        # print_render=False.
         self.assertIn(
-            'attach_waterfall(result, run_label="canonical execute_modal_prompt")',
+            'attach_waterfall(result, run_label="canonical execute_plan", print_render=False)',
             CANONICAL,
         )
+        self.assertIn("result[\"trace\"] = remote_trace", CANONICAL)
+
+    # H19 Wave G: test_execute_modal_prompt_local_fallback_present removed
+    # with its deleted subject; execute_plan is the only canonical fallback.
 
     def test_local_fallback_is_idempotent(self):
         # Simulate exactly what execute_plan does: the remote already attached a

@@ -1,0 +1,202 @@
+
+[notice] A new release of pip is available: 22.3.1 -> 26.2.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
+
+[notice] A new release of pip is available: 22.3.1 -> 26.2.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
+[32m[INFO][0m 
+Prestartup times for custom nodes:
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-easy-use
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\rgthree-comfy
+[32m[INFO][0m    7.6 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-manager
+[32m[INFO][0m 
+[1m[33m[WARNING][0m WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
+[32m[INFO][0m Found comfy_kitchen backend cuda: {'available': True, 'disabled': True, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'apply_rope_split_half', 'apply_rope_split_half1', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'gemv_awq_w4a16', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'scaled_mm_svdquant_w4a4', 'stochastic_rounding_fp8']}
+[32m[INFO][0m Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'unavailable_reason': "ImportError: No module named 'triton'", 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['apply_rope', 'apply_rope1', 'apply_rope_split_half', 'apply_rope_split_half1', 'dequantize_mxfp8', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'gemv_awq_w4a16', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'scaled_mm_mxfp8', 'scaled_mm_nvfp4', 'scaled_mm_svdquant_w4a4', 'stochastic_rounding_fp8']}
+[32m[INFO][0m Checkpoint files will always be loaded safely.
+[32m[INFO][0m Total VRAM 8192 MB, total RAM 31895 MB
+[32m[INFO][0m pytorch version: 2.8.0+cu128
+[32m[INFO][0m Set vram state to: NORMAL_VRAM
+[32m[INFO][0m Device: cuda:0 NVIDIA GeForce RTX 3070 : cudaMallocAsync
+[32m[INFO][0m Using async weight offloading with 2 streams
+[32m[INFO][0m Enabled pinned memory 12757.0
+[32m[INFO][0m Using pytorch attention
+aimdo: src-win/cuda-detour.c:38:INFO:aimdo_setup_hooks: installing 6 hooks
+aimdo: src-win/cuda-detour.c:28:DEBUG:install_hook_entries: hooks successfully installed
+aimdo: src-win/shmem-detect.c:80:INFO:comfy-aimdo WDDM adapter match: NVIDIA GeForce RTX 3070 runtime_luid=00000000:00016777 dxgi_luid=00000000:00016777
+aimdo: src/control.c:241:INFO:comfy-aimdo inited for GPU: NVIDIA GeForce RTX 3070 (VRAM: 8191 MB)
+[32m[INFO][0m DynamicVRAM support detected and enabled
+[32m[INFO][0m Python version: 3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]
+[32m[INFO][0m ComfyUI version: 0.24.0
+[32m[INFO][0m comfy-aimdo version: 0.4.8
+[32m[INFO][0m comfy-kitchen version: 0.2.10
+[32m[INFO][0m comfyui-frontend-package version: 1.44.19
+[32m[INFO][0m comfy-kitchen version: 0.2.10
+[32m[INFO][0m comfy-aimdo version: 0.4.8
+[32m[INFO][0m [Prompt Server] web root: C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\comfyui_frontend_package\static
+[32m[INFO][0m Asset seeder disabled
+[32m[INFO][0m ### Loading: ComfyUI-Impact-Pack (V8.28.3)
+[1m[33m[WARNING][0m 
+----------------------------------------------------------------------------
+[Impact Pack] The SAM2 functionality is unavailable because the `facebook/sam2` dependency is not installed.
+
+Installation command:
+C:\Program Files\Python311\python.exe -m pip install git+https://github.com/facebookresearch/sam2
+----------------------------------------------------------------------------
+
+[1m[33m[WARNING][0m 
+----------------------------------------------------------------------------
+[Impact Pack] The SAM2 functionality is unavailable because the `facebook/sam2` dependency is not installed.
+
+Installation command:
+C:\Program Files\Python311\python.exe -m pip install git+https://github.com/facebookresearch/sam2
+----------------------------------------------------------------------------
+
+[32m[INFO][0m [Impact Pack] Wildcard total size (0.00 MB) is within cache limit (50.00 MB). Using full cache mode.
+[32m[INFO][0m [Impact Pack] Wildcards loading done.
+[32m[INFO][0m [LoRA-Manager] Found LoRA roots:
+ - C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/models/loras
+[32m[INFO][0m [LoRA-Manager] Found checkpoint roots:
+ - C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/models/checkpoints
+ - C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/models/diffusion_models
+ - C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/models/unet
+[32m[INFO][0m [LoRA-Manager] Found embedding roots:
+ - C:/Users/parla/OneDrive/Documents/AI HUB/ComfyUI June Install/ComfyUI/models/embeddings
+[32m[INFO][0m [LoRA-Manager] Symlink cache loaded with 0 mappings
+[32m[INFO][0m [LoRA-Manager] Symlink mappings restored from cache in 1.19 ms
+[32m[INFO][0m [LoRA-Manager] Updated 'comfyui' library with current folder paths
+[32m[INFO][0m [LoRA-Manager] Detected async ComfyUI execution, installing async metadata hooks
+[32m[INFO][0m [LoRA-Manager] Metadata collection hooks installed for runtime values
+[32m[INFO][0m [LoRA-Manager] ComfyUI Metadata Collector initialized
+[32m[INFO][0m [LoRA-Manager] Example images path: 
+[32m[INFO][0m [LoRA-Manager] Added static route for locales: /locales -> C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-lora-manager\locales
+[32m[INFO][0m ### Loading: ComfyUI-Manager (V3.40)
+[32m[INFO][0m [ComfyUI-Manager] network_mode: public
+[32m[INFO][0m [ComfyUI-Manager] ComfyUI per-queue preview override detected (PR #11261). Manager's preview method feature is disabled. Use ComfyUI's --preview-method CLI option or 'Settings > Execution > Live preview method'.
+[32m[INFO][0m ### ComfyUI Revision: 150 [f49bdb65] *DETACHED | Released on '2026-06-03'
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/alter-list.json
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/model-list.json
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/github-stats.json
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/custom-node-list.json
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://raw.githubusercontent.com/ltdrdata/ComfyUI-Manager/main/extension-node-map.json
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\__init__.py", line 7, in <module>
+    from .src.interfaces import comfy_entrypoint, SeedVR2Extension
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\interfaces\__init__.py", line 8, in <module>
+    from .video_upscaler import SeedVR2VideoUpscaler
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\interfaces\video_upscaler.py", line 10, in <module>
+    from ..utils.downloads import download_weight
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\utils\downloads.py", line 14, in <module>
+    from .model_registry import MODEL_REGISTRY, DEFAULT_VAE
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\utils\model_registry.py", line 12, in <module>
+    from ..models.dit_3b.nadit import NaDiT as NaDiT3B
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\models\dit_3b\nadit.py", line 24, in <module>
+    from .embedding import TimeEmbedding
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\src\models\dit_3b\embedding.py", line 17, in <module>
+    from diffusers.models.embeddings import get_timestep_embedding
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\__init__.py", line 3, in <module>
+    from .configuration_utils import ConfigMixin
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\configuration_utils.py", line 34, in <module>
+    from .utils import DIFFUSERS_CACHE, HUGGINGFACE_CO_RESOLVE_ENDPOINT, DummyObject, deprecate, logging
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\utils\__init__.py", line 37, in <module>
+    from .dynamic_modules_utils import get_class_from_dynamic_module
+  File "C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\diffusers\utils\dynamic_modules_utils.py", line 29, in <module>
+    from huggingface_hub import HfFolder, cached_download, hf_hub_download, model_info
+ImportError: cannot import name 'cached_download' from 'huggingface_hub' (C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\huggingface_hub\__init__.py)
+
+[1m[33m[WARNING][0m Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler module for custom nodes: cannot import name 'cached_download' from 'huggingface_hub' (C:\Users\parla\AppData\Roaming\Python\Python311\site-packages\huggingface_hub\__init__.py)
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using ckpts path: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux\ckpts[0m
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using symlinks: False[0m
+[36;20m[C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux] | INFO -> Using ort providers: ['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'CPUExecutionProvider', 'CoreMLExecutionProvider'][0m
+C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux\node_wrappers\dwpose.py:26: UserWarning: DWPose: Onnxruntime not found or doesn't come with acceleration providers, switch to OpenCV with CPU device. DWPose might run very slowly
+  warnings.warn("DWPose: Onnxruntime not found or doesn't come with acceleration providers, switch to OpenCV with CPU device. DWPose might run very slowly")
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes\__init__.py", line 2, in <module>
+    from .nodes.ai.FL_Fal_Gemini_ImageEdit import FL_Fal_Gemini_ImageEdit
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes\nodes\ai\FL_Fal_Gemini_ImageEdit.py", line 10, in <module>
+    import fal_client
+ModuleNotFoundError: No module named 'fal_client'
+
+[1m[33m[WARNING][0m Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes module for custom nodes: No module named 'fal_client'
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\nodes.py", line 2212, in load_custom_node
+    module_spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\__init__.py", line 11, in <module>
+    from .src.comfyui_sam3.nodes import NODE_CLASS_MAPPINGS
+  File "C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3\src\comfyui_sam3\nodes.py", line 6, in <module>
+    from sam3.model_builder import build_sam3_image_model, build_sam3_video_model
+ModuleNotFoundError: No module named 'sam3'
+
+[1m[33m[WARNING][0m Cannot import C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3 module for custom nodes: No module named 'sam3'
+[32m[INFO][0m Using pytorch attention
+[32m[INFO][0m 
+Import times for custom nodes:
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\websocket_image_save.py
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\masquerade-nodes-comfyui
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-CacheDiT
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_lg_samplingutils
+[32m[INFO][0m    0.0 seconds (IMPORT FAILED): C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_sam3
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\cg-use-everywhere
+[32m[INFO][0m    0.0 seconds (IMPORT FAILED): C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_fill-nodes
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-Flux2Klein-Enhancer
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-custom-scripts
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_image_metadata_extension
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-workflow-encrypt
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_essentials
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-KJNodes
+[32m[INFO][0m    0.0 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui_controlnet_aux
+[32m[INFO][0m    0.1 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-impact-pack
+[32m[INFO][0m    0.1 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-lora-manager
+[32m[INFO][0m    0.1 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-manager
+[32m[INFO][0m    0.1 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-levelpixel
+[32m[INFO][0m    0.2 seconds (IMPORT FAILED): C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler
+[32m[INFO][0m    0.2 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\ComfyUI_LayerStyle
+[32m[INFO][0m    0.2 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-detail-daemon
+[32m[INFO][0m    0.3 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\rgthree-comfy
+[32m[INFO][0m    0.4 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal
+[32m[INFO][0m    0.5 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\RES4LYF
+[32m[INFO][0m    8.9 seconds: C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-easy-use
+[32m[INFO][0m 
+[32m[INFO][0m Context impl SQLiteImpl.
+[32m[INFO][0m Will assume non-transactional DDL.
+[1m[31m[ERROR][0m ********** ERROR ***********
+
+comfyui-workflow-templates is not installed.
+
+Please install the updated requirements.txt file by running:
+C:\Program Files\Python311\python.exe -m pip install -r C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\requirements.txt
+If you are on the portable package you can run: update\update_comfyui.bat to solve this problem.
+
+The ComfyUI frontend is shipped in a pip package so it needs to be updated separately from the ComfyUI code.
+
+********** ERROR ***********
+[32m[INFO][0m comfyui-embedded-docs package not found
+[32m[INFO][0m Using RAM pressure cache.
+[32m[INFO][0m Starting server
+
+[32m[INFO][0m [LoRA-Manager] Lora cache hydrated from persisted snapshot with 1 models
+[32m[INFO][0m To see the GUI go to: http://127.0.0.1:8188
+[32m[INFO][0m [LoRA-Manager] Checkpoint cache hydrated from persisted snapshot with 3 models
+[32m[INFO][0m [LoRA-Manager] Embedding cache initialized in 0.00 seconds. Found 0 models
+[32m[INFO][0m [LoRA-Manager] Recipe cache miss: performing full directory scan
+[32m[INFO][0m [LoRA-Manager] Recipe cache initialized in 0.01 seconds. Found 0 recipes
+[32m[INFO][0m [LoRA-Manager] FTS index validated, reusing existing index with 0 recipes
+[32m[INFO][0m [ComfyUI-Manager] default cache updated: https://api.comfy.org/nodes
+[32m[INFO][0m [ComfyUI-Manager] All startup tasks have been completed.
+[1m[33m[WARNING][0m [DEPRECATION WARNING] Detected import of deprecated legacy API: /scripts/ui.js. This is likely caused by a custom node extension using outdated APIs. Please update your extensions or contact the extension author for an updated version.
+[1m[33m[WARNING][0m [DEPRECATION WARNING] Detected import of deprecated legacy API: /extensions/core/clipspace.js. This is likely caused by a custom node extension using outdated APIs. Please update your extensions or contact the extension author for an updated version.
+[1m[33m[WARNING][0m [DEPRECATION WARNING] Detected import of deprecated legacy API: /extensions/core/groupNode.js. This is likely caused by a custom node extension using outdated APIs. Please update your extensions or contact the extension author for an updated version.
+[1m[33m[WARNING][0m [DEPRECATION WARNING] Detected import of deprecated legacy API: /scripts/ui/components/button.js. This is likely caused by a custom node extension using outdated APIs. Please update your extensions or contact the extension author for an updated version.
+[1m[33m[WARNING][0m [DEPRECATION WARNING] Detected import of deprecated legacy API: /scripts/ui/components/buttonGroup.js. This is likely caused by a custom node extension using outdated APIs. Please update your extensions or contact the extension author for an updated version.
+[1m[33m[WARNING][0m cell cell_7edd211d78110a9ab79fd4d5e2f439d6e19e497d2cc0f2dc5b995519f96ba4f5 attempt run_b2d35080135b557d failed: TransportError('v2 transport requires an active Modal workspace with credentials')

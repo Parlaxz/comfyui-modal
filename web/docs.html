@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ComfyUI Modal | Docs</title>
+  <style>
+    :root { color-scheme: dark; --ink:#e7edf2; --muted:#9aa9b6; --line:#2b3743; --panel:#151c24; --page:#0e141b; --accent:#8fb7ff; --accent-soft:#19263a; --content:900px; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--page); color:var(--ink); font:15px/1.65 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,a { font:inherit; }
+    a { color:inherit; }
+    .docs-frame { display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }
+    .docs-sidebar { position:sticky; top:0; height:100vh; padding:28px 18px; border-right:1px solid var(--line); background:var(--panel); }
+    .brand { display:flex; align-items:center; gap:10px; margin:0 10px 34px; color:var(--ink); text-decoration:none; }
+    .brand-mark { display:grid; place-items:center; width:32px; height:32px; border:1px solid #45638e; border-radius:8px; background:var(--accent-soft); color:var(--accent); font-size:12px; font-weight:800; letter-spacing:-.08em; }
+    .brand strong { display:block; font-size:13px; letter-spacing:.05em; text-transform:uppercase; }
+    .brand small { display:block; color:var(--muted); font-size:11px; }
+    .nav-label { margin:23px 12px 7px; color:#73808d; font-size:10px; font-weight:700; letter-spacing:.13em; text-transform:uppercase; }
+    .docs-nav a { display:block; padding:8px 12px; border-radius:6px; color:var(--muted); font-size:14px; text-decoration:none; }
+    .docs-nav a:hover,.docs-nav a:focus-visible,.docs-nav a.is-active { background:var(--accent-soft); color:var(--accent); outline:none; }
+    .guide-link { margin-left:12px; border-left:1px solid var(--line); border-radius:0 !important; font-size:13px !important; }
+    .docs-main { min-width:0; }
+    .mobile-bar { display:none; position:sticky; top:0; z-index:5; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid var(--line); background:rgba(14,20,27,.94); backdrop-filter:blur(12px); }
+    .mobile-bar button { border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); cursor:pointer; padding:6px 10px; }
+    .content-wrap { width:min(calc(100% - 64px),var(--content)); margin:0 auto; padding:80px 0 100px; }
+    .page { display:none; }
+    .page.is-visible { display:block; }
+    .eyebrow { margin-bottom:14px; color:var(--accent); font-size:11px; font-weight:700; letter-spacing:.14em; text-transform:uppercase; }
+    h1,h2 { margin:0; color:var(--ink); line-height:1.15; letter-spacing:-.035em; }
+    h1 { max-width:700px; font-size:clamp(42px,7vw,70px); font-weight:650; }
+    h2 { margin-top:50px; font-size:clamp(28px,4vw,40px); }
+    .intro { max-width:580px; margin:22px 0 0; color:var(--muted); font-size:18px; }
+    .home-links { display:grid; gap:12px; max-width:620px; margin-top:52px; }
+    .home-link { display:block; padding:18px 20px; border:1px solid var(--line); border-radius:9px; background:var(--panel); text-decoration:none; }
+    .home-link:hover { border-color:#45638e; box-shadow:0 8px 24px rgba(0,0,0,.18); }
+    .home-link strong { display:block; color:var(--ink); font-size:16px; }
+    .home-link span { display:block; margin-top:4px; color:var(--muted); font-size:13px; }
+    .breadcrumb { margin-bottom:15px; color:var(--muted); font-size:13px; }
+    .guide-intro { max-width:650px; margin:18px 0 0; color:var(--muted); font-size:17px; }
+    .step { max-width:760px; margin-top:52px; }
+    .step h2 { margin-top:0; font-size:30px; }
+    .step p { max-width:680px; margin:18px 0 0; color:var(--muted); }
+    .guide-image { display:block; width:100%; max-width:760px; margin-top:24px; border:1px solid var(--line); border-radius:8px; background:var(--panel); box-shadow:0 10px 28px rgba(0,0,0,.22); }
+    :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    @media (max-width:820px) {
+      .docs-frame { display:block; }
+      .docs-sidebar { position:fixed; z-index:10; width:min(300px,88vw); transform:translateX(-100%); transition:transform .2s ease; }
+      .docs-sidebar.is-open { transform:translateX(0); }
+      .mobile-bar { display:flex; }
+      .content-wrap { width:min(calc(100% - 36px),var(--content)); padding-top:54px; }
+    }
+    @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } .docs-sidebar { transition:none; } }
+  </style>
+</head>
+<body>
+  <div class="docs-frame">
+    <aside class="docs-sidebar" id="docs-sidebar" aria-label="Documentation navigation">
+      <a class="brand" href="#home" data-page-link="home"><span class="brand-mark" aria-hidden="true">CM</span><span><strong>ComfyUI Modal</strong><small>Documentation</small></span></a>
+      <nav class="docs-nav" aria-label="Documentation pages">
+        <p class="nav-label">Guides</p>
+        <a href="#home" data-page-link="home">Home</a>
+        <p class="nav-label">Guides</p>
+        <a class="guide-link" href="#guide/workspaces" data-page-link="workspaces">Making and Connecting Workspaces in Modal</a>
+      </nav>
+    </aside>
+    <main class="docs-main">
+      <div class="mobile-bar"><strong>ComfyUI Modal</strong><button type="button" id="menu-toggle" aria-controls="docs-sidebar" aria-expanded="false">Sections</button></div>
+      <div class="content-wrap">
+        <section class="page is-visible" data-page="home" aria-labelledby="home-title">
+          <div class="eyebrow">Documentation</div>
+          <h1 id="home-title">ComfyUI Modal</h1>
+          <p class="intro">Guides for using ComfyUI with Modal GPU workspaces.</p>
+          <div class="home-links">
+            <a class="home-link" href="#guide/workspaces" data-page-link="workspaces"><strong>Making and Connecting Workspaces in Modal</strong><span>Open the workspace setup guide.</span></a>
+          </div>
+        </section>
+        <section class="page" data-page="workspaces" aria-labelledby="workspaces-title">
+          <div class="breadcrumb"><a href="#home" data-page-link="home">Home</a> / Guides</div>
+          <div class="eyebrow">Guide</div>
+          <h1 id="workspaces-title">Making and Connecting Workspaces in Modal.</h1>
+          <div class="step">
+            <h2>Step 1</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/1.PNG" alt="Modal workspace management screen">
+            <p>1. Open modal and press the list of workspaces in the top left. press "Manage Workspaces"</p>
+          </div>
+          <div class="step">
+            <h2>Step 2</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/2.PNG" alt="Modal Docs navigation">
+            <p>2. Press "Docs".</p>
+          </div>
+          <div class="step">
+            <h2>Step 3</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/3.PNG" alt="Modal workspace selector">
+            <p>3. Go to the new workspace you just made.</p>
+          </div>
+          <div class="step">
+            <h2>Step 4</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/4.PNG" alt="Modal API section">
+            <p>4. Go to the "API tokens &amp; service users" section.</p>
+          </div>
+          <div class="step">
+            <h2>Step 5</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/5.PNG" alt="Modal new token form">
+            <p>5. Press "New Token", name it, and create it.</p>
+          </div>
+          <div class="step">
+            <h2>Step 6</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/6.PNG" alt="Modal token command">
+            <p>6. Copy the full key text, then extract the 2 parts you need. You need the ID, which starts with "ak-", and the secret, which starts with "as-".</p>
+          </div>
+          <div class="step">
+            <h2>Step 7</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/7.PNG" alt="ComfyUI Modal GPU sidebar">
+            <p>7. Go back to the Modal ComfyUI app and open the Studio.</p>
+          </div>
+          <div class="step">
+            <h2>Step 8</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/8.PNG" alt="Modal Studio workspace controls">
+            <p>8. Add a new workspace.</p>
+          </div>
+          <div class="step">
+            <h2>Step 9</h2>
+            <p>9. Enter a clear label, such as "ComfyUI Production", then press Save.</p>
+          </div>
+          <div class="step">
+            <h2>Step 10</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/10.PNG" alt="Modal workspace manager with Set Active button">
+            <p>10. Select the workspace you want to use, then press "Set Active".</p>
+          </div>
+          <div class="step">
+            <h2>Step 11</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/11.PNG" alt="Modal Install from Manifest panel">
+            <p>11. Press "Install from Manifest", then wait for the workspace deployment and model installation to finish. It might take 10-20 minutes on the first install because it has to deploy and build the app. That's expected.</p>
+          </div>
+          <div class="step">
+            <h2>Step 12</h2>
+            <img class="guide-image" src="/extensions/comfyui-modal/assets/MakingWorspaces/12.PNG" alt="Modal Deployment tab with Redeploy and Restart button">
+            <p>12. Watch the deployment status in the Deployment tab. The first deploy may error when many custom nodes are installed. Press "Redeploy and Restart" and repeat until the deployment completes successfully. It is common for this to take a second or third deploy.</p>
+          </div>
+          <div class="step">
+            <h2>Step 13</h2>
+            <p>13. Once deployment is done, refresh the Chrome page, go back to "Install from Manifest", and install the required stuff.</p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script>
+    const sidebar = document.getElementById("docs-sidebar");
+    const menuButton = document.getElementById("menu-toggle");
+    const pages = [...document.querySelectorAll("[data-page]")];
+    const links = [...document.querySelectorAll("[data-page-link]")];
+    function closeMenu() { sidebar.classList.remove("is-open"); menuButton.setAttribute("aria-expanded", "false"); }
+    function showPage(page) {
+      const nextPage = page === "workspaces" ? "workspaces" : "home";
+      pages.forEach((item) => item.classList.toggle("is-visible", item.dataset.page === nextPage));
+      links.forEach((link) => { link.classList.toggle("is-active", link.dataset.pageLink === nextPage); if (link.tagName === "A") link.removeAttribute("aria-current"); });
+      links.filter((link) => link.dataset.pageLink === nextPage).forEach((link) => link.setAttribute("aria-current", "page"));
+      document.title = nextPage === "workspaces" ? "Workspaces | ComfyUI Modal" : "ComfyUI Modal | Docs";
+      window.scrollTo(0, 0);
+      closeMenu();
+    }
+    function routeFromHash() { showPage(window.location.hash === "#guide/workspaces" ? "workspaces" : "home"); }
+    menuButton.addEventListener("click", () => { const open = sidebar.classList.toggle("is-open"); menuButton.setAttribute("aria-expanded", String(open)); });
+    links.forEach((link) => link.addEventListener("click", () => { closeMenu(); }));
+    window.addEventListener("hashchange", routeFromHash);
+    routeFromHash();
+  </script>
+</body>
+</html>

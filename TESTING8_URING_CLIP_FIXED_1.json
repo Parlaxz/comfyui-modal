@@ -1,0 +1,11 @@
+{
+  "backend": "URING",
+  "copy": false,
+  "error": "RuntimeError: No available backend was found among candidates [URING]. io_uring requires Linux kernel 5.6 or newer; the detected kernel version is 4.19.0-gvisor.",
+  "model_path": "/root/models/text_encoders/qwen_3_4b.safetensors",
+  "status": "error",
+  "waterfall": {
+    "method": "run_testing8_gds_instanttensor_probe",
+    "status": "non_applicable"
+  }
+}

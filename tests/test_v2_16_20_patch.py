@@ -726,11 +726,17 @@ class SourceTextVerificationTests(unittest.TestCase):
     def test_tensor_identity_summary_exists(self):
         self.assertIn("def _tensor_identity_summary", self.comfyapp_src)
 
-    def test_normalize_stable_warmup_profile_exists(self):
-        self.assertIn("def _normalize_stable_warmup_profile", self.init_src)
-
-    def test_compute_stable_warmup_profile_key_updated(self):
-        self.assertIn("def _compute_stable_warmup_profile_key", self.init_src)
+    def test_stable_warmup_profile_helpers_moved_to_warmup_profile(self):
+        """H19 Wave G: __init__'s dead duplicate stable-profile helpers were
+        deleted (zero production callers); the live implementations live in
+        warmup_profile.py (_normalize_stable_profile / _compute_stable_key)."""
+        self.assertNotIn("def _normalize_stable_warmup_profile", self.init_src)
+        self.assertNotIn("def _compute_stable_warmup_profile_key", self.init_src)
+        import io as _io
+        wp_src = _io.open(
+            REPO_ROOT / "warmup_profile.py", encoding="utf-8").read()
+        self.assertIn("def _normalize_stable_profile", wp_src)
+        self.assertIn("def _compute_stable_key", wp_src)
 
     def test_ack_ready_in_prompt_route(self):
         self.assertIn("_modal_prompt_ack_ready", self.init_src)

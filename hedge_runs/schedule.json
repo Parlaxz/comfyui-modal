@@ -1,0 +1,613 @@
+{
+  "seed": 20260922,
+  "arms": [
+    "C",
+    "H75",
+    "H125",
+    "H200"
+  ],
+  "rounds": 25,
+  "runs": [
+    {
+      "ordinal": 1,
+      "round": 1,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 2,
+      "round": 1,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 3,
+      "round": 1,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 4,
+      "round": 1,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 5,
+      "round": 2,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 6,
+      "round": 2,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 7,
+      "round": 2,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 8,
+      "round": 2,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 9,
+      "round": 3,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 10,
+      "round": 3,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 11,
+      "round": 3,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 12,
+      "round": 3,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 13,
+      "round": 4,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 14,
+      "round": 4,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 15,
+      "round": 4,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 16,
+      "round": 4,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 17,
+      "round": 5,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 18,
+      "round": 5,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 19,
+      "round": 5,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 20,
+      "round": 5,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 21,
+      "round": 6,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 22,
+      "round": 6,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 23,
+      "round": 6,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 24,
+      "round": 6,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 25,
+      "round": 7,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 26,
+      "round": 7,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 27,
+      "round": 7,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 28,
+      "round": 7,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 29,
+      "round": 8,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 30,
+      "round": 8,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 31,
+      "round": 8,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 32,
+      "round": 8,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 33,
+      "round": 9,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 34,
+      "round": 9,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 35,
+      "round": 9,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 36,
+      "round": 9,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 37,
+      "round": 10,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 38,
+      "round": 10,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 39,
+      "round": 10,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 40,
+      "round": 10,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 41,
+      "round": 11,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 42,
+      "round": 11,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 43,
+      "round": 11,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 44,
+      "round": 11,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 45,
+      "round": 12,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 46,
+      "round": 12,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 47,
+      "round": 12,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 48,
+      "round": 12,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 49,
+      "round": 13,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 50,
+      "round": 13,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 51,
+      "round": 13,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 52,
+      "round": 13,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 53,
+      "round": 14,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 54,
+      "round": 14,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 55,
+      "round": 14,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 56,
+      "round": 14,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 57,
+      "round": 15,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 58,
+      "round": 15,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 59,
+      "round": 15,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 60,
+      "round": 15,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 61,
+      "round": 16,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 62,
+      "round": 16,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 63,
+      "round": 16,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 64,
+      "round": 16,
+      "position": 4,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 65,
+      "round": 17,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 66,
+      "round": 17,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 67,
+      "round": 17,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 68,
+      "round": 17,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 69,
+      "round": 18,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 70,
+      "round": 18,
+      "position": 2,
+      "arm": "C"
+    },
+    {
+      "ordinal": 71,
+      "round": 18,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 72,
+      "round": 18,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 73,
+      "round": 19,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 74,
+      "round": 19,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 75,
+      "round": 19,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 76,
+      "round": 19,
+      "position": 4,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 77,
+      "round": 20,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 78,
+      "round": 20,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 79,
+      "round": 20,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 80,
+      "round": 20,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 81,
+      "round": 21,
+      "position": 1,
+      "arm": "C"
+    },
+    {
+      "ordinal": 82,
+      "round": 21,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 83,
+      "round": 21,
+      "position": 3,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 84,
+      "round": 21,
+      "position": 4,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 85,
+      "round": 22,
+      "position": 1,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 86,
+      "round": 22,
+      "position": 2,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 87,
+      "round": 22,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 88,
+      "round": 22,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 89,
+      "round": 23,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 90,
+      "round": 23,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 91,
+      "round": 23,
+      "position": 3,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 92,
+      "round": 23,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 93,
+      "round": 24,
+      "position": 1,
+      "arm": "H200"
+    },
+    {
+      "ordinal": 94,
+      "round": 24,
+      "position": 2,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 95,
+      "round": 24,
+      "position": 3,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 96,
+      "round": 24,
+      "position": 4,
+      "arm": "C"
+    },
+    {
+      "ordinal": 97,
+      "round": 25,
+      "position": 1,
+      "arm": "H125"
+    },
+    {
+      "ordinal": 98,
+      "round": 25,
+      "position": 2,
+      "arm": "H75"
+    },
+    {
+      "ordinal": 99,
+      "round": 25,
+      "position": 3,
+      "arm": "C"
+    },
+    {
+      "ordinal": 100,
+      "round": 25,
+      "position": 4,
+      "arm": "H200"
+    }
+  ],
+  "note": "generated once; never regenerated"
+}

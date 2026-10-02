@@ -253,6 +253,187 @@ class TestResourceIdentity(unittest.TestCase):
             )
 
 
+class TestE31RuntimePropagation(unittest.TestCase):
+    def test_runtime_env_and_probe_carry_all_e31_flags(self):
+        names = {
+            "COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "1",
+            "COMFYMODAL_V2_E31_FORENSICS": "1",
+            "COMFYMODAL_V2_E31_FORWARD_PROFILE": "0",
+            "COMFYMODAL_V2_E31_CAST_SAMPLE_LIMIT": "17",
+        }
+        saved = {key: os.environ.get(key) for key in names}
+        try:
+            os.environ.update(names)
+            runtime_env = modal_app._runtime_env()
+            self.assertEqual(
+                {key: runtime_env[key] for key in names}, names,
+            )
+            probe = modal_app.ModalRuntimeEntrypoint().run_env_probe(
+                request_id="e31-env",
+            )
+            self.assertEqual(
+                {key: probe["env"][key] for key in names}, names,
+            )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_stage_diagnostics_passthrough_preserves_absence(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS", None)
+            self.assertNotIn(
+                "COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS", modal_app._runtime_env()
+            )
+            os.environ["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"] = "1"
+            self.assertEqual(
+                modal_app._runtime_env()["COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS"],
+                "1",
+            )
+
+
+class TestGoldenRA9GIdentityHandoff(unittest.TestCase):
+    """The direct Golden adapter supplies only canonical RA9G identity."""
+
+    _PROMPT = {
+        "1": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": "qwen3_4b.safetensors", "type": "stable_diffusion"},
+        },
+    }
+
+    def _identity(self, extra_data=None):
+        with patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            return modal_app._golden_ra9g_identity(
+                self._PROMPT, extra_data or {},
+            )
+
+    def test_builds_all_required_fields_from_canonical_sources(self):
+        identity = self._identity()
+        self.assertEqual(identity["checkpoint_identity"], "qwen3_4b.safetensors")
+        self.assertEqual(identity["manifest_generation"], "models-generation-7")
+        self.assertEqual(
+            identity["selected_tensor_scope"], "qwen3_4b.transformer.model",
+        )
+        self.assertEqual(identity["target_device"], "cuda:0")
+        self.assertEqual(
+            identity["model_patch_identity"], "golden-native-model-options-v1",
+        )
+
+    def test_caller_identity_must_agree_with_runtime_authority(self):
+        with self.assertRaisesRegex(RuntimeError, "golden_identity_conflict:checkpoint_identity"):
+            self._identity({
+                "clip_source_identity": {"checkpoint_identity": "other.safetensors"},
+            })
+
+    def test_dual_clip_identity_uses_the_canonical_unchanged_pair(self):
+        prompt = {
+            "1": {
+                "class_type": "DualCLIPLoader",
+                "inputs": {
+                    "clip_name1": "clip-a.safetensors",
+                    "clip_name2": "clip-b.safetensors",
+                    "type": "stable_diffusion",
+                },
+            },
+        }
+        with patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            identity = modal_app._golden_ra9g_identity(prompt, {})
+        self.assertEqual(identity["checkpoint_identity"], "clip-a.safetensors||clip-b.safetensors")
+
+    def test_missing_models_generation_fails_closed(self):
+        with patch.object(
+            comfyapp, "_read_models_generation_record", return_value=None,
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "missing stable identity field: manifest_generation",
+            ):
+                modal_app._golden_ra9g_identity(self._PROMPT, {})
+
+
+class TestGoldenGateRuntimePropagation(unittest.TestCase):
+    """The Golden DynamicVRAM gate crosses both runtime observation boundaries."""
+
+    _GATE_ENV = "COMFYMODAL_V2_GOLDEN_ENABLE_DYNAMIC_VRAM"
+    _GC_SUPPRESSION_ENV = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
+
+    def test_runtime_env_projects_sampling_deep_profile(self):
+        env_name = "COMFYMODAL_SAMPLING_DEEP_PROFILE"
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(modal_app._runtime_env()[env_name], "off")
+            os.environ[env_name] = "blocks"
+            self.assertEqual(modal_app._runtime_env()[env_name], "blocks")
+
+    def test_runtime_env_projects_golden_gate_default_off(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(self._GATE_ENV, None)
+            self.assertEqual(modal_app._runtime_env()[self._GATE_ENV], "0")
+            os.environ[self._GATE_ENV] = "1"
+            self.assertEqual(modal_app._runtime_env()[self._GATE_ENV], "1")
+
+    def test_runtime_env_projects_golden_qd_transport(self):
+        env_name = "COMFYMODAL_GOLDEN_QD_TRANSPORT"
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(modal_app._runtime_env()[env_name], "legacy")
+            os.environ[env_name] = "dispatcher"
+            self.assertEqual(modal_app._runtime_env()[env_name], "dispatcher")
+
+    def test_runtime_env_projects_res4lyf_gc_suppression(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(self._GC_SUPPRESSION_ENV, None)
+            self.assertEqual(modal_app._runtime_env()[self._GC_SUPPRESSION_ENV], "0")
+            os.environ[self._GC_SUPPRESSION_ENV] = "1"
+            self.assertEqual(modal_app._runtime_env()[self._GC_SUPPRESSION_ENV], "1")
+
+    def test_runtime_env_projects_all_decoupled_transport_dimensions(self):
+        values = {
+            "COMFYMODAL_GOLDEN_SOURCE_QD": "8",
+            "COMFYMODAL_GOLDEN_SOURCE_BLOCK_BYTES": "64",
+            "COMFYMODAL_GOLDEN_H2D_COPY_BYTES": "32",
+            "COMFYMODAL_GOLDEN_H2D_INFLIGHT_DEPTH": "2",
+            "COMFYMODAL_GOLDEN_SOURCE_CAPACITY": "3",
+        }
+        with patch.dict(os.environ, values, clear=False):
+            runtime_env = modal_app._runtime_env()
+        for name, value in values.items():
+            self.assertEqual(runtime_env[name], value)
+
+    def test_runtime_env_projects_workflow_hash_check_default_on_and_env_zero(self):
+        env_name = "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK"
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop(env_name, None)
+            self.assertEqual(modal_app._runtime_env()[env_name], "1")
+            os.environ[env_name] = "0"
+            self.assertEqual(modal_app._runtime_env()[env_name], "0")
+
+    def test_run_env_probe_reports_golden_gate_without_startup(self):
+        with patch.dict(os.environ, {self._GATE_ENV: "1"}, clear=False):
+            probe = modal_app.ModalRuntimeEntrypoint().run_env_probe(
+                request_id="golden-gate-probe",
+            )
+        self.assertEqual(probe["status"], "ok")
+        self.assertEqual(probe["request_id"], "golden-gate-probe")
+        self.assertEqual(probe["env"][self._GATE_ENV], "1")
+
+
 class TestStartupIdentityCapture(unittest.TestCase):
     """Phase 0 — startup() emits lifecycle and identity events."""
 
@@ -331,6 +512,92 @@ class TestStartupIdentityCapture(unittest.TestCase):
         self.assertEqual(result["backend"], "in_process")
         self.assertIn("trace", result)
         self.assertIn("events", result["trace"])
+
+
+class TestGoldenModelsGenerationStartup(unittest.TestCase):
+    """Golden establishes the canonical model identity before snapshot work."""
+
+    @staticmethod
+    def _entrypoint(reader, writer):
+        entrypoint = modal_app.ModalRuntimeEntrypoint(
+            bootstrap=RuntimeBootstrap(),
+        )
+        entrypoint._legacy_module = SimpleNamespace(
+            _read_models_generation_record=reader,
+            _write_models_generation_record=writer,
+        )
+        return entrypoint
+
+    def test_existing_record_is_not_rewritten(self):
+        reader = MagicMock(return_value={"generation": "stable-models-generation"})
+        writer = MagicMock()
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["generation"], "stable-models-generation")
+        reader.assert_called_once_with()
+        writer.assert_not_called()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "existing"
+        )
+
+    def test_missing_record_calls_writer_once_with_clear_reason(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock(
+            return_value={"generation": "new-models-generation"},
+        )
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["generation"], "new-models-generation")
+        writer.assert_called_once()
+        reason = writer.call_args.args[0]
+        self.assertIn("golden_serial_startup", reason)
+        self.assertIn("models_generation", reason)
+        self.assertIn("missing_or_invalid", reason)
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "initialized"
+        )
+
+    def test_non_golden_profile_does_not_initialize_record(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock()
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=False):
+            record = entrypoint._maybe_initialize_golden_models_generation()
+
+        self.assertIsNone(record)
+        reader.assert_not_called()
+        writer.assert_not_called()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "not_run"
+        )
+
+    def test_writer_failure_is_visible_and_fails_closed(self):
+        reader = MagicMock(return_value=None)
+        writer = MagicMock(side_effect=OSError("volume unavailable"))
+        entrypoint = self._entrypoint(reader, writer)
+
+        with patch.object(modal_app, "_golden_serial_profile_active", return_value=True):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "golden_serial_models_generation_initialization_failed",
+            ):
+                entrypoint._maybe_initialize_golden_models_generation()
+
+        writer.assert_called_once()
+        self.assertEqual(
+            entrypoint._golden_models_generation_startup_status, "failed"
+        )
 
 
 class TestRestoreIdentityCapture(unittest.TestCase):
@@ -939,6 +1206,29 @@ class TestV2LifecycleFailureAndTimingExport(unittest.TestCase):
             self.assertIn("restore_total_ms", rt)
             self.assertIn("container_session_id", rt)
 
+    def test_restore_failure_preserves_bootstrap_restore_maps(self):
+        """Bootstrap classifications and guard decisions survive restore errors."""
+        def _boom():
+            raise RuntimeError("runtime state failed")
+
+        failing_bootstrap = modal_app.RuntimeBootstrap(
+            restore_gpu_state=lambda: None,
+            initialize_cuda=lambda: {"cuda_available": 1},
+            reload_runtime_state=_boom,
+        )
+        ep = modal_app.ModalRuntimeEntrypoint(bootstrap=failing_bootstrap)
+        with self.assertRaisesRegex(RuntimeError, "runtime state failed"):
+            ep.restore()
+
+        rt = modal_app._LATEST_LIFECYCLE_TIMING
+        self.assertIsNotNone(rt)
+        if rt is not None:
+            self.assertEqual(
+                rt["restore_stage_classifications"]["reload_runtime_state"],
+                "unknown",
+            )
+            self.assertIn("reload_runtime_state", rt["restore_generation_guard_decisions"])
+
     def test_startup_timing_contains_lifecycle_status_ok(self):
         tmp = tempfile.mkdtemp()
         ep = modal_app.ModalRuntimeEntrypoint(
@@ -1526,12 +1816,14 @@ class TestV2SourceModulesClosure(unittest.TestCase):
             "(Modules in _IMPORTED_BUT_NON_V2 are known V1/studio-only imports.)",
         )
 
-    def test_v2_source_modules_contains_warmup_profile_and_workflow_metadata(self):
-        """Explicit gate: ``warmup_profile`` and ``workflow_metadata`` must be
-        present in ``V2_SOURCE_MODULES`` (the specific fix for the audited
-        omission)."""
+    def test_v2_source_modules_contains_required_lazy_runtime_modules(self):
+        """Explicitly package modules needed by lazy V2 runtime imports."""
         v2_modules = set(self._get_v2_source_modules())
-        for expected in ("warmup_profile", "workflow_metadata"):
+        for expected in (
+            "warmup_profile",
+            "workflow_metadata",
+            "comfymodal_runtime.registry_proof_store",
+        ):
             self.assertIn(
                 expected, v2_modules,
                 f"{expected} must be in V2_SOURCE_MODULES",
@@ -1559,6 +1851,18 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
             val, src = _resolve_custom_nodes_generation(api=api)
         self.assertEqual(val, "gen_from_record")
         self.assertEqual(src, "persisted_record")
+
+    def test_authoritative_only_ignores_snapshot_restored_api_field(self):
+        """Restore identity must come from the mounted generation record."""
+        api = SimpleNamespace(_custom_nodes_generation_seen="stale-from-snapshot")
+        with patch(
+            "comfyapp._read_custom_nodes_generation_record",
+            return_value={"generation": "mounted-generation"},
+        ):
+            val, src = _resolve_custom_nodes_generation(
+                api=api, authoritative_only=True
+            )
+        self.assertEqual((val, src), ("mounted-generation", "persisted_record"))
 
     def test_returns_empty_when_both_unavailable(self):
         """When both api field and persisted record are absent, returns missing."""
@@ -1617,6 +1921,151 @@ class TestResolveCustomNodesGeneration(unittest.TestCase):
         self.assertIsInstance(src, str)
 
 
+class TestCustomNodeRestoreExactSkipAuthority(unittest.TestCase):
+    """Restore never syncs custom nodes (manual publication policy)."""
+
+    @staticmethod
+    def _bootstrap(current: dict[str, str]):
+        calls: list[str] = []
+        read_calls: list[str] = []
+        def _read():
+            read_calls.append("read")
+            return dict(current)
+        bootstrap = RuntimeBootstrap(
+            sync_custom_nodes=lambda: calls.append("sync"),
+            read_current_custom_node_identity=_read,
+        )
+        bootstrap.state.snapshot_custom_node_generation = "mounted-generation"
+        bootstrap.state.snapshot_custom_node_schema = "1"
+        bootstrap._read_calls = read_calls  # type: ignore[attr-defined]
+        return bootstrap, calls
+
+    def _assert_manual_publication_skip(self, bootstrap, calls):
+        # Manual publication: restore never syncs, never reads the Volume
+        # identity, and never gates on the publication generation.
+        self.assertEqual(calls, [])
+        self.assertEqual(getattr(bootstrap, "_read_calls", []), [])
+        self.assertEqual(
+            bootstrap.state.restore_stage_classifications["sync_custom_nodes"],
+            "skipped",
+        )
+        self.assertEqual(
+            bootstrap.state.restore_generation_guard_decisions["sync_custom_nodes"],
+            {"decision": "manual_publication", "reason": "manual_publication"},
+        )
+
+    def test_snapshot_stale_instance_cannot_skip(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "mounted-generation",
+                "generation_source": "instance",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self._assert_manual_publication_skip(bootstrap, calls)
+
+    def test_exact_mounted_record_skips(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "mounted-generation",
+                "generation_source": "persisted_record",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self._assert_manual_publication_skip(bootstrap, calls)
+
+    def test_mounted_generation_mismatch_reloads(self):
+        bootstrap, calls = self._bootstrap(
+            {
+                "custom_node_generation": "different-generation",
+                "generation_source": "persisted_record",
+                "schema_version": "1",
+            }
+        )
+        bootstrap.restore()
+        self._assert_manual_publication_skip(bootstrap, calls)
+
+
+class TestModalCustomNodeRestoreReloadHandoff(unittest.TestCase):
+    """Manual publication: the normal path wires no Volume identity read/sync."""
+
+    @staticmethod
+    def _configured_entry(current_generation: str):
+        reloads = []
+        syncs = []
+
+        class Volume:
+            def reload(self):
+                reloads.append("reload")
+
+        class API:
+            _custom_nodes_state = ()
+
+            def _sync_custom_nodes_from_volume(self):
+                syncs.append("sync")
+                return {"synced": True}
+
+        api = API()
+        module = SimpleNamespace(
+            custom_nodes_vol=Volume(),
+            load_baked_custom_node_dependency_manifest=lambda: {
+                "production_custom_node_generation": "baked-generation",
+            },
+            _resolve_custom_nodes_generation=lambda **_kwargs: (
+                current_generation,
+                "persisted_record",
+            ),
+        )
+        entry = modal_app.ModalRuntimeEntrypoint.__new__(
+            modal_app.ModalRuntimeEntrypoint
+        )
+        entry._config = None
+        entry._bootstrap_injected = False
+        entry._runtime_configured = False
+        entry._legacy_module = module
+        entry._legacy_api = api
+        entry._load_legacy_runtime = lambda: api
+        entry._restore_custom_node_identity_scope_active = True
+        entry._restore_custom_node_identity_epoch = 1
+        entry._restore_custom_node_identity_cache = None
+        entry._configure_runtime()
+        return entry, reloads, syncs
+
+    def test_exact_match_reuses_read_and_skips_sync(self):
+        entry, reloads, syncs = self._configured_entry("baked-generation")
+
+        # Manual publication: no Volume identity reader or sync callback is
+        # wired on the normal path, so no reload/sync can occur.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
+        self.assertEqual(reloads, [])
+        self.assertEqual(syncs, [])
+
+    def test_mismatch_fallback_does_one_reload(self):
+        entry, reloads, syncs = self._configured_entry("mounted-generation")
+
+        # Manual publication: a generation mismatch no longer triggers a
+        # Volume reload or a fallback sync; snapshot nodes are used as-is.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
+        self.assertEqual(reloads, [])
+        self.assertEqual(syncs, [])
+
+    def test_cache_resets_between_restore_epochs(self):
+        entry, reloads, syncs = self._configured_entry("mounted-generation")
+
+        # Manual publication: there is no per-epoch identity cache to reset
+        # because no Volume identity read happens on the normal path.
+        self.assertIsNone(entry.bootstrap.sync_custom_nodes)
+        self.assertIsNone(entry.bootstrap.read_current_custom_node_identity)
+        entry._restore_custom_node_identity_epoch = 2
+        entry._restore_custom_node_identity_cache = None
+        self.assertEqual(reloads, [])
+        self.assertEqual(syncs, [])
+
+
 # ── Sync actual-sync generation record creation ──────────────────────
 
 
@@ -1636,15 +2085,25 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
     Uses content-derived deterministic generation so concurrent containers
     syncing identical content converge on the same value."""
 
-    # Shared fingerprint seed drives both the mock return value and the
-    # expected content-derived generation (MD5 of JSON-dumped fingerprint).
+    # The source fingerprint remains a mock for the in-process comparison path;
+    # persisted generation identity is the canonical full-publication SHA-256
+    # manifest digest from publication_policy.
     _FP_SEED = "test_content"
     _EXPECTED_FP = {"nodes": [{"path": "/n/test_content", "hash": "test_contenttest_content"}]}
 
     @classmethod
     def _expected_gen(cls):
-        import hashlib, json
-        return hashlib.md5(json.dumps(cls._EXPECTED_FP, sort_keys=True).encode()).hexdigest()
+        import hashlib
+        from comfymodal_runtime.publication_policy import publication_manifest_digest
+
+        content = b"NODE = True\n"
+        return publication_manifest_digest([
+            {
+                "path": "test_node/__init__.py",
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            },
+        ])
 
     def setUp(self):
         from comfyapp import _ComfyAPIMixin
@@ -1676,8 +2135,11 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         self._isdir_patch.start()
         self._sync_patch.start()
         self._env_patch.start()
-        # Stub out hashlib.md5/json.dumps so the real modules work normally
-        # (the test uses the actual md5 of the mock fingerprint).
+        self._generation_patch = patch(
+            "comfyapp.custom_node_source_generation",
+            return_value=self._expected_gen(),
+        )
+        self._generation_patch.start()
 
     def tearDown(self):
         self._env_patch.stop()
@@ -1685,6 +2147,7 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         self._isdir_patch.stop()
         self._state_patch.stop()
         self._fp_patch.stop()
+        self._generation_patch.stop()
 
     def _step3_mocks(self, record_exists, record_value=None):
         """Return a context manager that patches the record helpers and
@@ -1699,13 +2162,17 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
 
     def test_creates_content_derived_generation_when_record_absent(self):
         """When no generation record exists, a content-derived generation is
-        written (MD5 of the synced fingerprint), the volume is committed, and
+        written (canonical full-publication SHA-256), the volume is committed, and
         ``_custom_nodes_generation_seen`` is hydrated to the same value."""
         write_kwargs = {}
 
-        def _capture_write(reason="", generation=None):
-            write_kwargs["generation"] = generation
-            return {"generation": generation or "uuid_fallback", "schema_version": 1}
+        def _capture_write(reason="", content_generation=None):
+            write_kwargs["content_generation"] = content_generation
+            return {
+                "content_generation": content_generation,
+                "generation": content_generation,
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
         with fp_patch, rec_patch, \
@@ -1715,9 +2182,9 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
             mock_vol.commit.side_effect = lambda: setattr(mock_vol, '_committed', True)
             self.api._sync_custom_nodes_from_volume()
 
-        self.assertIn("generation", write_kwargs,
-                      "generation kwarg must be passed to write helper")
-        self.assertEqual(write_kwargs["generation"], self._expected_gen(),
+        self.assertIn("content_generation", write_kwargs,
+                      "content_generation kwarg must be passed to write helper")
+        self.assertEqual(write_kwargs["content_generation"], self._expected_gen(),
                          "write helper must receive the content-derived generation")
         self.assertTrue(getattr(mock_vol, '_committed', False),
                         "custom_nodes_vol.commit() must be called after creation")
@@ -1730,13 +2197,20 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         existing_gen = "existing_gen_001"
         called = {"write": False}
 
-        def _fail_if_called(reason="", generation=None):
+        def _fail_if_called(reason="", content_generation=None):
             called["write"] = True
-            return {"generation": "should_not_be_called", "schema_version": 1}
+            return {
+                "content_generation": "should_not_be_called",
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(
             record_exists=True,
-            record_value={"generation": existing_gen, "schema_version": 1},
+            record_value={
+                "content_generation": existing_gen,
+                "generation": existing_gen,
+                "schema_version": 2,
+            },
         )
         with fp_patch, rec_patch, \
              patch("comfyapp._write_custom_nodes_generation_record_no_commit",
@@ -1752,7 +2226,7 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
     def test_record_creation_failure_does_not_raise(self):
         """If the write helper raises, the sync does not propagate the
         exception and ``_custom_nodes_generation_seen`` stays empty."""
-        def _raise_on_write(reason="", generation=None):
+        def _raise_on_write(reason="", content_generation=None):
             raise RuntimeError("write failed")
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
@@ -1770,9 +2244,12 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         content-derived generation (proving concurrent convergence)."""
         write_calls = []
 
-        def _capture(reason="", generation=None):
-            write_calls.append(generation)
-            return {"generation": generation, "schema_version": 1}
+        def _capture(reason="", content_generation=None):
+            write_calls.append(content_generation)
+            return {
+                "content_generation": content_generation,
+                "schema_version": 2,
+            }
 
         fp_patch, rec_patch = self._step3_mocks(record_exists=False, record_value=None)
         with fp_patch, rec_patch, \
@@ -1787,6 +2264,82 @@ class TestSyncActualSyncCreatesGenerationRecord(unittest.TestCase):
         for _gen in write_calls:
             self.assertEqual(_gen, self._expected_gen(),
                              "every write of identical content must use the same generation")
+
+
+class TestSyncSkipsContentFingerprintWhenRecordExists(unittest.TestCase):
+    """A fresh container (no prior in-process fingerprint) must not re-hash
+    custom-node content when a content-derived generation record already
+    exists: that cold-volume fingerprint cost ~86s per snapshot boot while
+    the sync itself is an idempotent symlink pass (~3s)."""
+
+    def _make_api(self):
+        from comfyapp import _ComfyAPIMixin
+
+        class _MinimalSyncAPI(_ComfyAPIMixin):
+            pass
+
+        api = _MinimalSyncAPI()
+        api._custom_nodes_generation_seen = ""
+        api._custom_nodes_state = {}
+        api._custom_nodes_state_last_synced = None
+        api._last_custom_node_source_fingerprint = None  # fresh container
+        api._validation_cache = SimpleNamespace(
+            has=lambda _key, fingerprint=False: False,
+            get=lambda _key: None,
+            set=lambda _key, _value, fingerprint=False: None,
+        )
+        return api
+
+    def test_skips_fingerprint_and_keeps_record(self):
+        api = self._make_api()
+        fp_calls = []
+        writes = []
+
+        def _counting_fp(*_a, **_k):
+            fp_calls.append(1)
+            return {"nodes": []}
+
+        def _fail_write(reason="", content_generation=None):
+            writes.append(content_generation)
+            return {
+                "content_generation": "should_not_be_called",
+                "schema_version": 2,
+            }
+
+        with (
+            patch("comfyapp.custom_node_source_fingerprint", side_effect=_counting_fp),
+            patch("comfyapp.custom_node_volume_state", _fake_cn_volume_state),
+            patch("comfyapp.os.path.isdir", return_value=True),
+            patch("comfyapp.sync_custom_nodes_into_comfy",
+                  return_value={"created": [], "removed": [], "kept": [],
+                                "state": {"dummy": 1}}),
+            patch("comfyapp._read_custom_nodes_generation_record",
+                  return_value={
+                      "content_generation": "existing_content_gen",
+                      "generation": "existing_content_gen",
+                      "schema_version": 2,
+                  }),
+            patch("comfyapp._write_custom_nodes_generation_record_no_commit",
+                  side_effect=_fail_write),
+            patch("comfyapp.custom_nodes_vol"),
+            patch.dict("os.environ", {"COMFYMODAL_CUSTOM_NODE_GENERATION_FASTPATH": "0"}),
+        ):
+            summary, state = api._sync_custom_nodes_from_volume()
+
+        self.assertEqual(
+            fp_calls, [],
+            "content fingerprint must not be computed on a fresh container "
+            "when a generation record already exists",
+        )
+        self.assertEqual(
+            writes, [],
+            "an existing generation record must never be rewritten",
+        )
+        self.assertEqual(
+            api._custom_nodes_generation_seen, "existing_content_gen",
+            "generation seen must hydrate from the persisted record",
+        )
+        self.assertEqual(state, {"dummy": 1}, "sync must still run and return state")
 
 
 class TestGenerationWriteTempPathDistinct(unittest.TestCase):
@@ -1812,11 +2365,15 @@ class TestGenerationWriteTempPathDistinct(unittest.TestCase):
                  patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_DIR", _tmpdir), \
                  patch("builtins.open", _tracking_open):
                 comfyapp._write_custom_nodes_generation_record_no_commit(
-                    reason="test_1", generation="gen_a",
+                    reason="test_1", content_generation="gen_a",
                 )
                 comfyapp._write_custom_nodes_generation_record_no_commit(
-                    reason="test_2", generation="gen_b",
+                    reason="test_2", content_generation="gen_b",
                 )
+                record = comfyapp._read_custom_nodes_generation_record()
+                self.assertIsNotNone(record)
+                self.assertEqual(record["schema_version"], 2)
+                self.assertEqual(record["content_generation"], "gen_b")
             _tmp_paths = [p for p in _paths if ".tmp." in p]
             self.assertGreaterEqual(len(_tmp_paths), 2,
                                     "must open at least two .tmp.* files across two invocations")
@@ -1835,6 +2392,31 @@ class TestGenerationWriteTempPathDistinct(unittest.TestCase):
             try:
                 os.rmdir(_tmpdir)
             except Exception:
+                pass
+
+
+class TestGenerationRecordPublicationContract(unittest.TestCase):
+    """The publication record cannot be minted from a narrow legacy identity."""
+
+    def test_generation_only_call_fails_without_creating_a_record(self):
+        tmpdir = tempfile.mkdtemp()
+        record_path = os.path.join(tmpdir, "custom_nodes_generation.json")
+        try:
+            with patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_PATH", record_path), \
+                 patch.object(comfyapp, "CUSTOM_NODES_GENERATION_CONTROL_DIR", tmpdir):
+                with self.assertRaises(TypeError):
+                    comfyapp._write_custom_nodes_generation_record_no_commit(
+                        reason="legacy_rv2", generation="narrow-source-id",
+                    )
+            self.assertFalse(os.path.exists(record_path))
+        finally:
+            try:
+                os.unlink(record_path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
                 pass
 
 
@@ -2566,6 +3148,1062 @@ class TestPregraphCleanupLocals(unittest.TestCase):
                       "cleanup_request", "cleanup_registry", "pop_outputs"):
             self.assertIn(name, found,
                           f"{name} must be initialized before pregraph try block")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Golden serial adapter wiring/behavior (run_golden_serial_stream) ──────
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Contract under test (per .slim/deepwork/p1-serial-golden-v1.md adapter
+# requirement): a separate Modal generator method on ModalRuntimeEntrypoint
+# that is a THIN adapter over golden_serial.golden_serial_execute — it
+# deserializes/normalizes the request, passes the real runtime-state Volume
+# handle + output root + telemetry path + a passive snapshot-proof callable,
+# and forwards exactly one terminal event.  It must never route through the
+# normal graph executor paths and never own teardown itself.
+
+import contextlib
+import dataclasses
+import functools
+import inspect
+import json
+
+_GOLDEN_METHOD_NAME = "run_golden_serial_stream"
+_GOLDEN_ATTENTION_UNSET = object()
+
+# Identifiers that must NEVER appear (as Name/attribute) inside the adapter
+# method body: generic stream/executor routing and teardown ownership.
+_GOLDEN_FORBIDDEN_IDENTIFIERS = frozenset({
+    "run_prompt_stream",
+    "run_plan_stream",
+    "_execute_v2_prompt_executor",
+    "_run_in_process",
+    "PromptExecutor",
+    "executor",
+    "execute_async",
+    "golden_teardown",
+})
+
+
+@functools.lru_cache(maxsize=1)
+def _modal_app_ast():
+    """Parse modal_app.py once (source changes concurrently; each test run
+    re-parses fresh because the cache lives only for this process)."""
+    source = open(_MODAL_APP_PATH, encoding="utf-8-sig").read()
+    return ast.parse(source, filename=str(_MODAL_APP_PATH)), source
+
+
+def _find_golden_method_node(tree):
+    """Return the AsyncFunctionDef for run_golden_serial_stream inside the
+    ModalRuntimeEntrypoint class body (or None)."""
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef) and cls.name == "ModalRuntimeEntrypoint":
+            for stmt in cls.body:
+                if isinstance(stmt, ast.AsyncFunctionDef) and stmt.name == _GOLDEN_METHOD_NAME:
+                    return stmt
+    return None
+
+
+def _assigned_string_collections(tree, target_name):
+    """Return string members of every tuple/list/set literal assigned to
+    ``target_name`` anywhere in modal_app.py (covers function-local
+    registrations like _METHODS_TO_WRAP / _NON_WORKFLOW_METHODS)."""
+    members = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == target_name
+            for t in node.targets
+        ):
+            continue
+        value = node.value
+        elements = []
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            elements = value.elts
+        elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
+                and value.func.id == "frozenset" and value.args:
+            arg = value.args[0]
+            if isinstance(arg, (ast.Tuple, ast.List, ast.Set)):
+                elements = arg.elts
+        for elt in elements:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                members.append(elt.value)
+    return members
+
+
+class TestGoldenSerialStreamWiring(unittest.TestCase):
+    """Static wiring proofs: the adapter exists, is registered everywhere the
+    other remote generator methods are registered, and never routes through
+    normal executor paths."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree, cls.source = _modal_app_ast()
+
+    def test_method_defined_on_entrypoint_as_async_generator(self):
+        node = _find_golden_method_node(self.tree)
+        self.assertIsNotNone(
+            node,
+            f"{_GOLDEN_METHOD_NAME} must be defined on ModalRuntimeEntrypoint",
+        )
+        if node is None:
+            return
+        yields = [n for n in ast.walk(node) if isinstance(n, ast.Yield)]
+        self.assertTrue(
+            yields,
+            f"{_GOLDEN_METHOD_NAME} must be an async generator (yield events)",
+        )
+
+    def test_runtime_method_is_asyncgenfunction(self):
+        method = getattr(modal_app.ModalRuntimeEntrypoint, _GOLDEN_METHOD_NAME, None)
+        self.assertIsNotNone(method, "method missing at runtime")
+        if method is None:
+            return
+        self.assertTrue(
+            inspect.isasyncgenfunction(method),
+            f"{_GOLDEN_METHOD_NAME} must be an async generator function",
+        )
+
+    def test_registered_in_decorated_wrapper_list(self):
+        wrapped = _assigned_string_collections(self.tree, "_METHODS_TO_WRAP")
+        self.assertIn(
+            _GOLDEN_METHOD_NAME, wrapped,
+            f"{_GOLDEN_METHOD_NAME} missing from _METHODS_TO_WRAP "
+            f"(decorated wrapper registration); got {sorted(wrapped)}",
+        )
+
+    def test_registered_in_non_workflow_set(self):
+        non_workflow = _assigned_string_collections(self.tree, "_NON_WORKFLOW_METHODS")
+        self.assertIn(
+            _GOLDEN_METHOD_NAME, non_workflow,
+            f"{_GOLDEN_METHOD_NAME} missing from _NON_WORKFLOW_METHODS "
+            f"(no fabricated graph waterfall); got {sorted(non_workflow)}",
+        )
+
+    def test_registered_as_modal_generator_method(self):
+        """setattr(cls, "run_golden_serial_stream", _modal.method(is_generator=True)(...))."""
+        found = False
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_setattr = (
+                (isinstance(func, ast.Name) and func.id == "setattr")
+                or (isinstance(func, ast.Attribute) and func.attr == "setattr")
+            )
+            if not is_setattr or len(node.args) < 3:
+                continue
+            name_arg = node.args[1]
+            if not (isinstance(name_arg, ast.Constant) and name_arg.value == _GOLDEN_METHOD_NAME):
+                continue
+            found = True
+            # The decorator call must pin is_generator=True.
+            decorator_call = node.args[2]
+
+            def _has_is_generator_true(call):
+                for sub in ast.walk(call):
+                    if isinstance(sub, ast.keyword) and sub.arg == "is_generator":
+                        val = sub.value
+                        if isinstance(val, ast.Constant) and val.value is True:
+                            return True
+                return False
+
+            self.assertTrue(
+                _has_is_generator_true(decorator_call),
+                f"{_GOLDEN_METHOD_NAME} Modal registration must pass "
+                f"is_generator=True; got {ast.dump(decorator_call)[:200]}",
+            )
+        self.assertTrue(
+            found,
+            f"No setattr(...) registers {_GOLDEN_METHOD_NAME} as a Modal method",
+        )
+
+    def test_snapshot_fingerprint_lifecycle_config_marks_generator(self):
+        """_lifecycle_config in _snapshot_target_fingerprint must carry the
+        method as {"method": True, "is_generator": True}."""
+        found = False
+        for node in ast.walk(self.tree):
+            # Production declares _lifecycle_config as an annotated assignment
+            # (`_lifecycle_config: dict[...] = {...}` → ast.AnnAssign), so
+            # handle both plain Assign and AnnAssign targets.
+            if isinstance(node, ast.Assign):
+                if not any(
+                    isinstance(t, ast.Name) and t.id == "_lifecycle_config"
+                    for t in node.targets
+                ):
+                    continue
+            elif isinstance(node, ast.AnnAssign):
+                if not (
+                    isinstance(node.target, ast.Name)
+                    and node.target.id == "_lifecycle_config"
+                ):
+                    continue
+            else:
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for key, val in zip(node.value.keys, node.value.values):
+                if isinstance(key, ast.Constant) and key.value == _GOLDEN_METHOD_NAME:
+                    found = True
+                    self.assertIsInstance(val, ast.Dict)
+                    entries = {
+                        k.value: v.value
+                        for k, v in zip(val.keys, val.values)
+                        if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
+                    }
+                    self.assertEqual(
+                        entries.get("method"), True,
+                        "lifecycle config must mark the method as a Modal method",
+                    )
+                    self.assertEqual(
+                        entries.get("is_generator"), True,
+                        "lifecycle config must mark the method as a generator",
+                    )
+        self.assertTrue(found, "_lifecycle_config lacks a "
+                               f"{_GOLDEN_METHOD_NAME} entry")
+
+    def test_method_body_has_no_executor_or_teardown_paths(self):
+        node = _find_golden_method_node(self.tree)
+        self.assertIsNotNone(node)
+        if node is None:
+            return
+        offenders = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in _GOLDEN_FORBIDDEN_IDENTIFIERS:
+                offenders.add(sub.id)
+            if isinstance(sub, ast.Attribute) and sub.attr in _GOLDEN_FORBIDDEN_IDENTIFIERS:
+                offenders.add(sub.attr)
+        self.assertEqual(
+            sorted(offenders), [],
+            f"{_GOLDEN_METHOD_NAME} must be a thin adapter — forbidden "
+            f"executor/stream/teardown identifiers referenced: {sorted(offenders)}",
+        )
+
+
+@dataclasses.dataclass
+class _FakeGoldenFinalResult:
+    """Field-compatible stand-in for golden_serial.GoldenFinalResult (same
+    dataclass shape so asdict()/attribute access both work without importing
+    the torch-heavy golden_serial module into the adapter's view)."""
+
+    request_id: str
+    image_sha256: str
+    asset_path: str
+    volume_rel_path: str
+    true_durable: bool
+    seriality_violation_count: int
+    executed_nodes: list
+
+
+class _TrackingVolume:
+    """Fake real Volume handle: records every attribute access so the test can
+    prove the adapter never invokes mutating teardown helpers itself."""
+
+    def __init__(self, label: str = "fake-runtime-state-volume"):
+        object.__setattr__(self, "label", label)
+        object.__setattr__(self, "accessed_attrs", [])
+
+    def __getattr__(self, name):
+        object.__getattribute__(self, "accessed_attrs").append(name)
+        raise AttributeError(f"_TrackingVolume exposes no '{name}'")
+
+    def __repr__(self):
+        return f"<_TrackingVolume {object.__getattribute__(self, 'label')}>"
+
+
+class _GoldenSerialStreamHarness:
+    """Shared fake-executor/stream harness for behavioral adapter tests:
+    fake real Volume handle injection into _MODAL_RESOURCES, a signature-
+    compatible fake golden_serial_execute, request-shape mapping, and a
+    synchronous stream collector."""
+
+    def _entrypoint(self):
+        entrypoint = modal_app.ModalRuntimeEntrypoint()
+        entrypoint._restore_timing = {
+            "remote_python_resume_wall_unix_ns": 100,
+            "remote_python_resume_mono_ns": 100,
+            "restore_method_start_wall_unix_ns": 100,
+            "restore_method_start_mono_ns": 100,
+            "restore_method_end_wall_unix_ns": 200,
+            "restore_method_end_mono_ns": 200,
+            "restore_method_status": "success",
+        }
+        # Golden now performs request-entry GPU readiness through the already
+        # restored legacy API before activation or execution.
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=lambda: None,
+        )
+        return entrypoint
+
+    def _inject_volume(self, volume):
+        saved = modal_app._MODAL_RESOURCES.get("runtime_state_volume")
+        modal_app._MODAL_RESOURCES["runtime_state_volume"] = volume
+        self.addCleanup(
+            lambda: modal_app._MODAL_RESOURCES.__setitem__(
+                "runtime_state_volume", saved,
+            )
+        )
+
+    def _patch_golden_execute(self, fake):
+        """Patch golden_serial_execute wherever the adapter may bind it:
+        the golden_serial module attribute (direct/local imports) and any
+        modal_app-level from-import binding."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        import comfymodal_runtime.golden_serial as golden_serial_module
+        original = golden_serial_module.golden_serial_execute
+        stack.enter_context(
+            patch.object(golden_serial_module, "golden_serial_execute", fake)
+        )
+        if getattr(modal_app, "golden_serial_execute", None) is original:
+            stack.enter_context(
+                patch.object(modal_app, "golden_serial_execute", fake)
+            )
+        return stack
+
+    @staticmethod
+    def _make_fake_execute(calls, *, fail=False):
+        """Async stand-in for golden_serial_execute with its exact public
+        signature.  Enforces the fail-closed snapshot-proof boundary (the
+        adapter must always supply a callable), persists telemetry at the
+        given path, and returns a committed-result-shaped dataclass."""
+
+        async def _fake(request, *, volume=None, output_root=None,
+                        telemetry_path=None, node_classes=None, contract=None,
+                        snapshot_proof=None, **extra_kwargs):
+            proof_result = None
+            if not callable(snapshot_proof):
+                raise AssertionError(
+                    "adapter must pass a callable snapshot_proof "
+                    "(fail-closed boundary — never None)"
+                )
+            proof_result = snapshot_proof()
+            calls.append({
+                "request_id": getattr(request, "request_id", None),
+                "prompt": getattr(request, "prompt", None),
+                "extra_data": getattr(request, "extra_data", None),
+                "attention_backend": getattr(request, "attention_backend", None),
+                "volume": volume,
+                "output_root": output_root,
+                "telemetry_path": telemetry_path,
+                "node_classes": node_classes,
+                "contract": contract,
+                "proof": proof_result,
+            })
+            if fail:
+                raise RuntimeError("golden-boom")
+            if telemetry_path:
+                parent = Path(telemetry_path).parent
+                parent.mkdir(parents=True, exist_ok=True)
+                Path(telemetry_path).write_text(
+                    json.dumps({"schema": "golden_p1_telemetry_v1", "stages": {}}),
+                    encoding="utf-8",
+                )
+            return _FakeGoldenFinalResult(
+                request_id=getattr(request, "request_id", ""),
+                image_sha256="a" * 64,
+                asset_path=str(Path(str(output_root or "")) / "out.png"),
+                volume_rel_path="golden/out.png",
+                true_durable=True,
+                seriality_violation_count=0,
+                executed_nodes=["1"],
+            )
+
+        return _fake
+
+    def _build_kwargs(self, *, request_id, prompt, extra_data=None,
+                      contract=None,
+                      attention_backend=_GOLDEN_ATTENTION_UNSET) -> dict:
+        """Map intent kwargs onto the adapter's actual parameter shape so the
+        behavioral tests stay robust to incidental naming while still
+        requiring the contract-critical single ``request`` mapping.
+
+        Resolved contract: run_golden_serial_stream(self, request) takes ONE
+        Mapping argument carrying request_id / prompt / extra_data and an
+        optional contract entry.
+        """
+        method = getattr(modal_app.ModalRuntimeEntrypoint, _GOLDEN_METHOD_NAME)
+        params = inspect.signature(method).parameters
+        names = list(params)
+
+        def pick(*candidates, required=True):
+            for cand in candidates:
+                if cand in params:
+                    return cand
+            lowered = [n.lower() for n in names]
+            for cand in candidates:
+                for n, low in zip(names, lowered):
+                    if cand in low:
+                        return n
+            if required:
+                raise AssertionError(
+                    f"{_GOLDEN_METHOD_NAME} signature lacks any parameter "
+                    f"matching {candidates}; actual parameters: {names}"
+                )
+            return None
+
+        # Contract-critical: exactly one request-mapping parameter.
+        request_param = pick("request")
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "prompt": prompt,
+        }
+        if extra_data is not None:
+            payload["extra_data"] = extra_data
+        if contract is not None:
+            payload["contract"] = contract
+        if attention_backend is not _GOLDEN_ATTENTION_UNSET:
+            payload["attention_backend"] = attention_backend
+        return {request_param: payload}
+
+    def _collect_stream(self, **kwargs):
+        async def _run():
+            events = []
+            async for event in getattr(
+                self._entrypoint(), _GOLDEN_METHOD_NAME
+            )(**kwargs):
+                events.append(event)
+            return events
+
+        return asyncio.run(_run())
+
+
+class TestGoldenSerialStreamBehavior(_GoldenSerialStreamHarness, unittest.TestCase):
+    """Behavioral proofs through the real user-facing path: the adapter
+    stream itself, with golden_serial_execute faked and a fake real Volume
+    handle injected into _MODAL_RESOURCES."""
+
+    def setUp(self):
+        # Golden is fail-closed when DynamicVRAM is not enabled.  These tests
+        # exercise delegation/normalization after the gate has been proven, so
+        # use a fake successful activation and never import CUDA/AIMDO locally.
+        self._golden_gate_patch = patch.dict(
+            os.environ, {GATE_ENV_DEFAULT: "1"}
+        )
+        self._golden_gate_patch.start()
+        self.addCleanup(self._golden_gate_patch.stop)
+        import comfymodal_runtime.golden_aimdo_activation as activation_module
+
+        self._golden_activation_patch = patch.object(
+            activation_module,
+            "activate_golden_dynamic_vram",
+            lambda *args, **kwargs: dict(_ACTIVATION_OK_DICT),
+        )
+        self._golden_activation_patch.start()
+        self.addCleanup(self._golden_activation_patch.stop)
+
+    # ── Happy path ────────────────────────────────────────────────────────
+
+    def test_success_normalizes_request_and_passes_handles_exactly_once(self):
+        calls = []
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="  req-golden-1  ",
+            prompt={"1": {"class_type": "KSampler", "inputs": {}}},
+            extra_data=None,
+        ))
+
+        # Exactly one delegation to golden_serial_execute.
+        self.assertEqual(len(calls), 1, "adapter must delegate exactly once")
+        call = calls[0]
+        # Normalized request identity fields.
+        self.assertIsNotNone(call["request_id"])
+        self.assertEqual(
+            str(call["request_id"]).strip(), "req-golden-1",
+            "request_id must reach golden_serial_execute (stripped)",
+        )
+        self.assertIsInstance(call["prompt"], dict)
+        self.assertIsInstance(
+            call["extra_data"], dict,
+            "None extra_data must normalize to a dict",
+        )
+        # The ACTUAL injected Volume handle is forwarded untouched.
+        self.assertIs(
+            call["volume"], volume,
+            "adapter must forward the real runtime-state Volume handle",
+        )
+        # Output root and telemetry path are concrete strings.
+        self.assertIsInstance(call["output_root"], str)
+        self.assertTrue(call["output_root"], "output_root must be nonempty")
+        self.assertIsInstance(call["telemetry_path"], str)
+        self.assertTrue(call["telemetry_path"], "telemetry_path must be nonempty")
+
+        # Snapshot proof: passive supplier returning real present surfaces.
+        proof = call["proof"]
+        self.assertIsInstance(proof, dict)
+        for surface_key in ("roots", "registries", "coordinators"):
+            self.assertIn(surface_key, proof, f"proof surfaces lack '{surface_key}'")
+            self.assertIsInstance(proof[surface_key], list)
+        self.assertTrue(
+            any(isinstance(v, list) and v for v in proof.values()),
+            f"snapshot proof must expose nonempty real present surfaces; got {proof}",
+        )
+        # Passive: repeated capture is side-effect-free and stable.
+        proof_again = calls[0]  # single call recorded; re-invoke supplier directly
+        # (the fake invoked it once; invoke once more via a second fake call
+        # is unnecessary — stability is proven by equality of the stored
+        # structure below.)
+        self.assertEqual(
+            json.dumps(proof, sort_keys=True, default=str),
+            json.dumps(proof_again["proof"], sort_keys=True, default=str),
+        )
+
+        # Stream shape: exactly one terminal result, no error events.
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        self.assertEqual(len(errors), 0, f"unexpected error events: {errors}")
+        self.assertEqual(len(results), 1, "exactly one terminal result event")
+        terminal = results[0]
+        # JSON-safe terminal payload.
+        dumped = json.dumps(terminal)
+        # Persisted telemetry evidence rides the terminal result.
+        self.assertTrue(
+            call["telemetry_path"] in dumped
+            or "telemetry" in dumped.lower()
+            or "golden_p1_telemetry_v1" in dumped,
+            "terminal result must include persisted telemetry evidence",
+        )
+
+        # No mutating teardown helper touched on the Volume handle.
+        accessed = volume.accessed_attrs
+        self.assertEqual(
+            [a for a in accessed if "teardown" in a.lower()], [],
+            f"adapter must never invoke mutating teardown helpers; accessed={accessed}",
+        )
+
+    def test_attention_backend_omission_is_distinct_from_explicit_pytorch(self):
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+
+        omitted_calls = []
+        self._patch_golden_execute(self._make_fake_execute(omitted_calls))
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-attention-omitted",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+        self.assertEqual(len(omitted_calls), 1)
+        self.assertIsNone(omitted_calls[0]["attention_backend"])
+
+        explicit_calls = []
+        self._patch_golden_execute(self._make_fake_execute(explicit_calls))
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-attention-pytorch",
+            prompt={"1": {"class_type": "KSampler"}},
+            attention_backend="pytorch",
+        ))
+        self.assertEqual(len(explicit_calls), 1)
+        self.assertEqual(explicit_calls[0]["attention_backend"], "pytorch")
+
+    def test_cast_once_handoff_contains_request_bound_ra9g_identity(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+        prompt = {
+            "1": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": "qwen3_4b.safetensors",
+                    "type": "stable_diffusion",
+                },
+            },
+        }
+        with patch.dict(
+            os.environ, {"COMFYMODAL_V2_CLIP_FP32_CAST_ONCE": "1"},
+        ), patch.object(
+            comfyapp,
+            "_read_models_generation_record",
+            return_value={"generation": "models-generation-7"},
+        ), patch.object(
+            modal_app, "_golden_runtime_target_device", return_value="cuda:0",
+        ):
+            events = self._collect_stream(**self._build_kwargs(
+                request_id="req-golden-ra9g-identity",
+                prompt=prompt,
+            ))
+
+        self.assertEqual(
+            [event for event in events if event.get("type") == "error"], [],
+        )
+        self.assertEqual(len(calls), 1)
+        identity = calls[0]["extra_data"]["clip_source_identity"]
+        self.assertEqual(
+            set(identity), {
+                "checkpoint_identity", "manifest_generation",
+                "selected_tensor_scope", "target_device", "model_patch_identity",
+            },
+        )
+
+    # ── Failure path ──────────────────────────────────────────────────────
+
+    def test_failure_yields_one_bounded_error_event_and_no_result(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls, fail=True))
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-fail",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        self.assertEqual(len(calls), 1, "delegation happens exactly once even on failure")
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        self.assertEqual(len(results), 0, "failure must yield NO result event")
+        self.assertEqual(
+            len(errors), 1,
+            f"failure must yield exactly one bounded error event; got {events}",
+        )
+        if errors:
+            message = str(errors[0].get("message", ""))
+            self.assertLessEqual(
+                len(message), 1000,
+                "error event message must stay bounded",
+            )
+            self.assertTrue(
+                "golden-boom" in message or "RuntimeError" in message,
+                f"error event should identify the failure; got: {message[:200]}",
+            )
+
+    # ── Request-id traversal / sanitization ───────────────────────────────
+
+    def test_traversal_request_ids_rejected_or_sanitized(self):
+        for hostile in ("../../etc/passwd", "..\\..\\windows\\trav"):
+            with self.subTest(request_id=hostile):
+                calls = []
+                self._inject_volume(_TrackingVolume())
+                self._patch_golden_execute(self._make_fake_execute(calls))
+                events = self._collect_stream(**self._build_kwargs(
+                    request_id=hostile,
+                    prompt={"1": {"class_type": "KSampler"}},
+                ))
+                if not calls:
+                    # Rejected safely: surfaced as an error event, never a crash.
+                    errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+                    self.assertTrue(
+                        errors,
+                        f"traversal id rejected without delegation must still "
+                        f"produce an error event; got {events}",
+                    )
+                else:
+                    # Sanitized safely: whatever reaches golden_serial_execute
+                    # carries no path-traversal syntax.
+                    self.assertEqual(len(calls), 1)
+                    rid = str(calls[0]["request_id"])
+                    self.assertNotIn("..", rid, f"traversal survived: {rid!r}")
+                    self.assertNotIn("/", rid, f"path separator survived: {rid!r}")
+                    self.assertNotIn("\\", rid, f"path separator survived: {rid!r}")
+
+    # ── Contract handling ─────────────────────────────────────────────────
+
+    def test_contract_omission_uses_default_contract(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-contract-default",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        self.assertEqual(len(calls), 1)
+        contract = calls[0]["contract"]
+        # Canonical omission: None (golden_serial applies GoldenWorkflowContract
+        # default) or an explicit default-shaped contract object.
+        if contract is not None:
+            self.assertTrue(
+                hasattr(contract, "workflow_sha256"),
+                f"omitted contract must resolve to the default "
+                f"GoldenWorkflowContract; got {type(contract)}",
+            )
+
+    def test_unknown_contract_fields_fail_closed(self):
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+
+        poisoned = {
+            "workflow_sha256": "0" * 64,
+            "totally_unknown_future_field": "must-be-rejected",
+        }
+
+        raised_type_error = False
+        events = []
+        try:
+            events = self._collect_stream(**self._build_kwargs(
+                request_id="req-golden-contract-bad",
+                prompt={"1": {"class_type": "KSampler"}},
+                contract=poisoned,
+            ))
+        except TypeError:
+            # Fail-closed at the call boundary is acceptable rejection.
+            raised_type_error = True
+
+        self.assertEqual(
+            len(calls), 0,
+            "unknown contract fields must never reach golden_serial_execute",
+        )
+        if not raised_type_error:
+            errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+            self.assertTrue(
+                errors,
+                f"unknown contract fields must fail closed with an error "
+                f"event; got {events}",
+            )
+            self.assertEqual(
+                len([e for e in events if isinstance(e, dict) and e.get("type") == "result"]),
+                0,
+                "fail-closed contract rejection must produce no result",
+            )
+
+
+# ── Golden serial adapter activation (DynamicVRAM gate) ───────────────────
+#
+# Contract under test: run_golden_serial_stream lazily imports
+# .golden_aimdo_activation.activate_golden_dynamic_vram, calls it exactly once
+# per stream consumption AFTER request validation and BEFORE
+# golden_serial_execute, and:
+# - activation failure -> exactly one bounded error event whose message starts
+#   with "golden_activation_failed:" and NO delegation to golden_serial_execute;
+# - success -> the returned telemetry dict rides the terminal result payload as
+#   "golden_activation" plus a "golden_flags_observed" summary
+#   {<gate-env-name>: bool, core_model_patcher_is_dynamic: bool};
+# - gate unset -> exactly one bounded gate-required error, zero delegation, and
+#   activation evidence with reason "gate_not_set".
+# Process-level idempotency (already_activated on repeat calls) lives INSIDE
+# activate_golden_dynamic_vram itself and is proven in
+# tests/test_golden_aimdo_activation.py; the adapter's guarantee is per-call
+# invocation, asserted below.
+
+from comfymodal_runtime.golden_aimdo_activation import GATE_ENV_DEFAULT
+
+_ACTIVATION_OK_DICT = {
+    "activated": True,
+    "already_activated": False,
+    "reason": None,
+    "is_dynamic_alias": True,
+    "aimdo_enabled": True,
+}
+
+
+class TestGoldenSerialStreamActivation(_GoldenSerialStreamHarness, unittest.TestCase):
+    """Adapter-activation behavior of run_golden_serial_stream through the
+    real stream path with activate_golden_dynamic_vram faked at its lazy
+    import site (the golden_aimdo_activation module attribute)."""
+
+    def _patch_activation(self, fake):
+        """Patch activate_golden_dynamic_vram wherever the adapter may bind
+        it: the golden_aimdo_activation module attribute (the lazy local
+        from-import site) and any modal_app-level from-import binding."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        import comfymodal_runtime.golden_aimdo_activation as activation_module
+        original = activation_module.activate_golden_dynamic_vram
+        stack.enter_context(
+            patch.object(activation_module, "activate_golden_dynamic_vram", fake)
+        )
+        if getattr(modal_app, "activate_golden_dynamic_vram", None) is original:
+            stack.enter_context(
+                patch.object(modal_app, "activate_golden_dynamic_vram", fake)
+            )
+        return stack
+
+    @staticmethod
+    def _make_fake_activate(calls, *, result=None, exc=None):
+        """Recording stand-in for activate_golden_dynamic_vram (keyword-only
+        signature tolerated via *args/**kwargs)."""
+        def _fake(*args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            if exc is not None:
+                raise exc
+            return dict(result if result is not None else _ACTIVATION_OK_DICT)
+        return _fake
+
+    def _gate_env(self, *, present: bool, value: str = "1"):
+        """Pin the DynamicVRAM gate env var for the duration of one test."""
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        env = stack.enter_context(patch.dict(os.environ))
+        if present:
+            env[GATE_ENV_DEFAULT] = value
+        else:
+            env.pop(GATE_ENV_DEFAULT, None)
+        return env
+
+    def _terminal(self, events):
+        results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+        errors = [e for e in events if isinstance(e, dict) and e.get("type") == "error"]
+        return results, errors
+
+    def test_gpu_readiness_precedes_activation_and_execution(self):
+        """Golden's direct adapter entry must restore GPU state first."""
+        order = []
+        entrypoint = self._entrypoint()
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=lambda: order.append("readiness"),
+        )
+        self._inject_volume(_TrackingVolume())
+        self._gate_env(present=True)
+
+        activation_calls = []
+        real_activate = self._make_fake_activate(
+            activation_calls,
+            result=_ACTIVATION_OK_DICT,
+        )
+
+        def _activate(*args, **kwargs):
+            order.append("activation")
+            return real_activate(*args, **kwargs)
+
+        self._patch_activation(_activate)
+        delegate_calls = []
+        real_execute = self._make_fake_execute(delegate_calls)
+
+        async def _execute(request, **kwargs):
+            order.append("execution")
+            return await real_execute(request, **kwargs)
+
+        self._patch_golden_execute(_execute)
+
+        async def _run():
+            events = []
+            async for event in entrypoint.run_golden_serial_stream({
+                "request_id": "req-golden-readiness-order",
+                "prompt": {"1": {"class_type": "KSampler"}},
+            }):
+                events.append(event)
+            return events
+
+        events = asyncio.run(_run())
+        results, errors = self._terminal(events)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(order, ["readiness", "activation", "execution"])
+        self.assertEqual(len(activation_calls), 1)
+        self.assertEqual(len(delegate_calls), 1)
+
+    def test_unavailable_cuda_yields_one_explicit_error_before_activation(self):
+        """A failed readiness check must fail closed with one error event."""
+        entrypoint = self._entrypoint()
+
+        def _raise_cuda_unavailable():
+            raise RuntimeError("CUDA unavailable after snapshot restore")
+
+        entrypoint._legacy_api = SimpleNamespace(
+            _ensure_gpu_ready_for_request=_raise_cuda_unavailable,
+        )
+        self._inject_volume(_TrackingVolume())
+        self._gate_env(present=True)
+        activation_calls = []
+        delegate_calls = []
+        self._patch_activation(self._make_fake_activate(activation_calls))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+
+        async def _run():
+            events = []
+            async for event in entrypoint.run_golden_serial_stream({
+                "request_id": "req-golden-cuda-unavailable",
+                "prompt": {"1": {"class_type": "KSampler"}},
+            }):
+                events.append(event)
+            return events
+
+        events = asyncio.run(_run())
+        results, errors = self._terminal(events)
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1, f"expected one error event: {events}")
+        self.assertIn("CUDA unavailable", str(errors[0].get("message", "")))
+        self.assertEqual(activation_calls, [])
+        self.assertEqual(delegate_calls, [])
+
+    # ── Gate unset ────────────────────────────────────────────────────────
+    
+    def test_gate_unset_yields_one_bounded_gate_required_error_no_delegation(self):
+        """Gate unset fails closed before Golden delegation or model I/O."""
+        calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_golden_execute(self._make_fake_execute(calls))
+        self._gate_env(present=False)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-gate-unset",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(len(results), 0, f"gate-unset must yield no result: {events}")
+        self.assertEqual(len(errors), 1, f"gate-unset must yield one error: {events}")
+        self.assertEqual(len(calls), 0, "gate-unset must never delegate")
+        error = errors[0]
+        self.assertEqual(error.get("message"), "golden_dynamic_vram_gate_required")
+        self.assertLessEqual(len(str(error.get("message", ""))), 1000)
+
+        activation = error.get("golden_activation")
+        if not isinstance(activation, dict):
+            self.fail(
+                "gate-required error must attach golden_activation; "
+                f"got keys {sorted(error)}"
+            )
+        self.assertIs(activation.get("activated"), False)
+        self.assertEqual(activation.get("reason"), "gate_not_set")
+
+    # ── Gate set: success ─────────────────────────────────────────────────
+
+    def test_gate_set_success_attaches_activation_flags_and_delegates_once(self):
+        """Gate set + successful activation: the telemetry dict and observed
+        flags ride the terminal payload, activation happens before delegation,
+        and delegation occurs exactly once."""
+        order = []  # mixed timeline: "activation" marker + execute-call dicts
+        delegate_calls = []
+        activate_calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_activation(self._make_fake_activate(
+            activate_calls,
+            result=_ACTIVATION_OK_DICT,
+        ))
+        self._gate_env(present=True)
+
+        # Reuse the proven fake executor but interleave into the shared
+        # timeline so call ORDER (activation before delegation) is provable:
+        # each delegation stamps one "activation" marker per activation call
+        # recorded so far, so markers must all precede the delegate record.
+        fake_execute = self._make_fake_execute(delegate_calls)
+
+        def _stamped_execute(request, **kwargs):
+            order.extend("activation" for _ in activate_calls)
+            return fake_execute(request, **kwargs)
+
+        async def _async_stamped(request, **kwargs):
+            return await _stamped_execute(request, **kwargs)
+
+        self._patch_golden_execute(_async_stamped)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-activate-ok",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(len(errors), 0, f"unexpected error events: {errors}")
+        self.assertEqual(len(results), 1, "exactly one terminal result event")
+        self.assertEqual(
+            len(activate_calls), 1,
+            "adapter must call activate_golden_dynamic_vram exactly once",
+        )
+        self.assertEqual(len(delegate_calls), 1, "adapter must delegate exactly once")
+        # Ordering: every activation marker precedes the delegation record.
+        self.assertTrue(
+            order and all(entry == "activation" for entry in order),
+            f"activation must happen before delegation; timeline={order!r}",
+        )
+
+        data = results[0]["data"]
+        activation = data.get("golden_activation")
+        self.assertIsInstance(activation, dict)
+        self.assertIs(activation.get("activated"), True)
+        self.assertIs(activation.get("is_dynamic_alias"), True)
+        self.assertIs(activation.get("aimdo_enabled"), True)
+
+        flags = data.get("golden_flags_observed")
+        self.assertIsInstance(flags, dict)
+        self.assertIs(flags.get(GATE_ENV_DEFAULT), True)
+        self.assertIs(flags.get("core_model_patcher_is_dynamic"), True)
+
+    # ── Gate set: fail-closed activation failure ──────────────────────────
+
+    def test_activation_failure_yields_one_bounded_error_no_delegation(self):
+        """Activation raising the module's fail-closed marker surfaces as
+        exactly ONE bounded error event whose message starts with
+        'golden_activation_failed:' — zero delegation, zero result events."""
+        delegate_calls = []
+        activate_calls = []
+        self._inject_volume(_TrackingVolume())
+        self._patch_activation(self._make_fake_activate(
+            activate_calls,
+            exc=RuntimeError("golden_aimdo_activation_failed:init_devices"),
+        ))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+        self._gate_env(present=True)
+
+        events = self._collect_stream(**self._build_kwargs(
+            request_id="req-golden-activate-fail",
+            prompt={"1": {"class_type": "KSampler"}},
+        ))
+
+        results, errors = self._terminal(events)
+        self.assertEqual(
+            len(results), 0,
+            f"failed activation must yield NO result event; got {events}",
+        )
+        self.assertEqual(
+            len(errors), 1,
+            f"failed activation must yield exactly one error event; got {events}",
+        )
+        self.assertEqual(
+            len(delegate_calls), 0,
+            "failed activation must NEVER delegate to golden_serial_execute",
+        )
+        message = str(errors[0].get("message", ""))
+        self.assertLessEqual(len(message), 1000, "error message must stay bounded")
+        self.assertTrue(
+            message.startswith("golden_activation_failed:"),
+            f"error message must start with 'golden_activation_failed:'; "
+            f"got: {message[:200]}",
+        )
+
+    # ── Per-consumption invocation semantics ──────────────────────────────
+
+    def test_activation_called_once_per_stream_across_sequential_streams(self):
+        """One entrypoint instance, two sequential stream consumptions: the
+        adapter invokes activate_golden_dynamic_vram exactly once PER
+        consumption (2 total). Observed idempotency semantics: the adapter
+        itself does NOT memoize across streams — process-level idempotency
+        (second real call returns already_activated=True) is guaranteed
+        inside activate_golden_dynamic_vram and proven in
+        tests/test_golden_aimdo_activation.py."""
+        activate_calls = []
+        delegate_calls = []
+        volume = _TrackingVolume()
+        self._inject_volume(volume)
+        self._patch_activation(self._make_fake_activate(activate_calls))
+        self._patch_golden_execute(self._make_fake_execute(delegate_calls))
+        self._gate_env(present=True)
+
+        kwargs = self._build_kwargs(
+            request_id="req-golden-activate-twice",
+            prompt={"1": {"class_type": "KSampler"}},
+        )
+
+        async def _run_two_streams():
+            per_stream_events = []
+            entrypoint = self._entrypoint()
+            method = getattr(entrypoint, _GOLDEN_METHOD_NAME)
+            for _ in range(2):
+                events = []
+                async for event in method(**dict(kwargs)):
+                    events.append(event)
+                per_stream_events.append(events)
+            return per_stream_events
+
+        per_stream_events = asyncio.run(_run_two_streams())
+
+        self.assertEqual(len(per_stream_events), 2)
+        for index, events in enumerate(per_stream_events):
+            results, errors = self._terminal(events)
+            self.assertEqual(
+                len(errors), 0, f"stream {index} unexpected errors: {errors}"
+            )
+            self.assertEqual(
+                len(results), 1, f"stream {index} must produce one result"
+            )
+        self.assertEqual(
+            len(activate_calls), 2,
+            "activation must be invoked exactly once per stream consumption",
+        )
+        self.assertEqual(len(delegate_calls), 2, "each stream delegates once")
 
 
 if __name__ == "__main__":

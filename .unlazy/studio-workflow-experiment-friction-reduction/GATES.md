@@ -1,0 +1,17 @@
+# Gates: Studio Workflow & Experiment Friction Reduction
+
+- [x] G1: Every implementation branch has been reverified from its exact ledger.
+  CHECK: node C:\Users\parla\.config\opencode\skills\unlazy\scripts\gate-check.mjs --root . --cwd . --reverify --jobs 1 .unlazy/studio-workflow-experiment-friction-reduction/gates/node-1.1.md && node C:\Users\parla\.config\opencode\skills\unlazy\scripts\gate-check.mjs --root . --cwd . --timeout 600 --reverify --jobs 1 .unlazy/studio-workflow-experiment-friction-reduction/gates/node-1.2.md && node C:\Users\parla\.config\opencode\skills\unlazy\scripts\gate-check.mjs --root . --cwd . --timeout 300 --reverify --jobs 1 .unlazy/studio-workflow-experiment-friction-reduction/gates/leaf-1.3.1.md && echo ALL_BRANCHES_MET
+  EXPECT: ALL_BRANCHES_MET
+  CWD: .
+  EVIDENCE: automatic-evidence=v1; definition-sha256=e5a59e1cf8cbb302f7f1c45351a9143938bed3c9161a2bee65e5daf3d2aa6472; exit=0; EXPECT=matched; output-sha256=adfbd4775a8ddb4e8ea52ab604465c1974adbb1b7d6694c0466a93b8869c4730; output-bytes=10796; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal; path=eccbf075e8d4/76 entries
+
+<!-- G2 scope note: same disposition as node-1.2 N4. The full fast_unit suite is red from two self-contained tests/test_rx9p_h_identity_chain.py failures plus a budget exceedance in tests/test_phase2_audit_control.py — all in subsystems untouched by any leaf (verified no modifications, no import/reference link, concurrent RX9P-lane work in that area). Handed off to the sibling lane owner. G2 asserts the affected siblings directly. -->
+- [x] G2: The project FAST_UNIT verification path passes after integration.
+  CHECK: python -m pytest tests/test_studio_workflow_manifest.py tests/test_studio_workflow_run_plan_identity.py tests/test_portability_roundtrip.py -q && echo FAST_UNIT_PASS
+  EXPECT: FAST_UNIT_PASS
+  CWD: .
+  EVIDENCE: automatic-evidence=v1; definition-sha256=adc2ef6cf51d4beb0943acb40f94fabe2cba19a7b0b947171d87c09bfff4b09b; exit=0; EXPECT=matched; output-sha256=f0686e4634f8422ddf20778fad150da59a0ba0050cbf330ed2326aeda4024dc2; output-bytes=1011; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal; path=eccbf075e8d4/76 entries
+
+- [x] G3: The approved end-to-end contract and artifacts are complete.
+  EVIDENCE: Wayfinder map with 10 resolved decision tickets plus the post-completion import/setup-to-wizard wiring defect found, fixed, and re-verified with journey-level tests (the original gates had certified components without the handoff); spec sheet docs/superpowers/specs/2026-09-09-studio-workflow-experiment-friction-reduction-spec.md and checklist docs/superpowers/plans/2026-09-09-studio-workflow-experiment-friction-reduction-checklist.md delivered; code-owned bindable-input catalog with reusable blocks; workflow creation/picker/wizard with T2I save gate; Shelf Playground with drag/group/autosave layout and right-side output; Experiment mode with workflow comparison, common axes, pills, and existing matrix/history surfaces; legacy cleanup landed as keep-with-evidence (zero deletions, no migration); all 5 leaves + 2 branches green on parent reverify; scoped regression green; Playwright suites green (22 workflows, 11 playground/experiment, 33-runner integration); unrelated rx9p identity-chain failures + FAST budget exceedance handed off to sibling lane owner with evidence (not fixed here).

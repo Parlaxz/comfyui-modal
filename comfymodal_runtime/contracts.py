@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -29,6 +30,13 @@ METADATA_MEMORY_MB = "memory_mb"
 METADATA_SNAPSHOT_ENABLED = "snapshot_enabled"
 METADATA_GPU_SNAPSHOT_ENABLED = "gpu_snapshot_enabled"
 METADATA_RESTORE_PLAN_GENERATION = "restore_plan_generation"
+
+# All current deployment fingerprints use this namespace.  The explicit
+# namespace keeps the source-identity compatibility spelling from being
+# confused with the canonical image-plan deployment hash.
+DEPLOYMENT_HASH_NAMESPACE = "comfy-modal/deployment/v2"
+SOURCE_IDENTITY_HASH_NAMESPACE = "comfy-modal/source/v2"
+DEPLOYMENT_IDENTITY_SCHEMA_VERSION = 2
 
 VAE_POLICY_VERSION = 1
 VAE_POLICY_ENV_KEY = "COMFYMODAL_V2_VAE_POLICY"
@@ -399,6 +407,175 @@ def _ordered_ids(values: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+OUTPUT_FORMATS = ("original", "webp_lossless", "webp_lossy", "jpeg")
+WEBP_LOSSLESS_COMPRESSION = ("fast", "balanced", "max")
+OUTPUT_MODES = ("original", "preview")
+DEFAULT_OUTPUT_QUALITY = 75
+DEFAULT_PREVIEW_QUALITY = 70
+# E2D: encoder-effort policy.  The historical field name carries the
+# fast/balanced/max vocabulary; the mapped Pillow/libwebp method integer is a
+# speed/size dial at fixed quality and is applied to BOTH WebP modes.
+WEBP_EFFORT_METHODS = {"fast": 0, "balanced": 4, "max": 6}
+DEFAULT_WEBP_EFFORT = "balanced"
+# Preview is a latency-sensitive path: freeze the fast effort unless the
+# accepted request explicitly supplies one.
+PREVIEW_WEBP_EFFORT = "fast"
+
+_OUTPUT_FORMAT_ALIASES = {
+    "original": "original",
+    "png": "original",
+    "webp": "webp_lossy",
+    "webp_lossy": "webp_lossy",
+    "webp-lossy": "webp_lossy",
+    "webp_lossless": "webp_lossless",
+    "webp-lossless": "webp_lossless",
+    "jpeg": "jpeg",
+    "jpg": "jpeg",
+}
+
+
+def normalize_output_mode(value: Any) -> str:
+    """Return the explicit semantic output mode.
+
+    Codec and filename values are deliberately not accepted as mode aliases:
+    WebP can be an explicitly requested Original, so mode must be carried by
+    the accepted request rather than inferred downstream.
+    """
+    raw = "original" if value is None else str(value).strip().lower()
+    if not raw:
+        raw = "original"
+    if raw not in OUTPUT_MODES:
+        raise ValueError(
+            f"unsupported output mode {value!r}; expected one of "
+            f"{', '.join(OUTPUT_MODES)}"
+        )
+    return raw
+
+
+def build_logical_output_key(
+    node_id: Any, output_key: Any, output_index: Any = 0
+) -> str | None:
+    """Build the stable attempt/variant/codec-independent output identity."""
+    if not isinstance(node_id, str) or not isinstance(output_key, str):
+        return None
+    node = node_id.strip()
+    slot = output_key.strip()
+    if not node or not slot or isinstance(output_index, bool):
+        return None
+    try:
+        item_index = int(output_index)
+    except (TypeError, ValueError):
+        return None
+    if item_index < 0:
+        return None
+    return f"node:{node}:slot:{slot}:item:{item_index}"
+
+
+def normalize_output_format(value: Any) -> str:
+    """Return the canonical runtime output format or reject it."""
+    raw = "original" if value is None else str(value).strip().lower()
+    if not raw:
+        raw = "original"
+    try:
+        return _OUTPUT_FORMAT_ALIASES[raw]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported output format {value!r}; expected one of "
+            f"{', '.join(OUTPUT_FORMATS)} or the webp/png/jpg aliases"
+        ) from exc
+
+
+def normalize_quality(value: Any, *, default: int = DEFAULT_OUTPUT_QUALITY) -> int:
+    """Coerce quality to an integer in the Pillow-supported 0-100 range."""
+    try:
+        if value is None:
+            raise ValueError
+        quality = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        quality = int(default)
+    return max(0, min(100, quality))
+
+
+def normalize_webp_lossless_compression(value: Any) -> str:
+    """Return a supported WebP lossless method name."""
+    raw = "balanced" if value is None else str(value).strip().lower()
+    if raw not in WEBP_LOSSLESS_COMPRESSION:
+        raise ValueError(
+            f"unsupported webp_lossless_compression {value!r}; expected "
+            f"one of {', '.join(WEBP_LOSSLESS_COMPRESSION)}"
+        )
+    return raw
+
+
+def resolve_webp_pillow_method(effort: Any) -> int:
+    """Map an encoder-effort label to the Pillow/libwebp method integer.
+
+    Single source of truth for both WebP save seams (direct tensor sink and
+    byte converter).  Unknown values fall back to the historical balanced
+    method so behavior never silently drifts from the pre-E2D encoder.
+    """
+    try:
+        normalized = normalize_webp_lossless_compression(effort)
+    except ValueError:
+        normalized = DEFAULT_WEBP_EFFORT
+    return WEBP_EFFORT_METHODS[normalized]
+
+
+def normalize_output_conversion_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize the serializable output codec contract once at its boundary."""
+    source = dict(value) if isinstance(value, Mapping) else {}
+    if not source:
+        return {}
+    raw_format = source.get("format", source.get("output_format", "original"))
+    output_format = normalize_output_format(raw_format)
+    normalized = dict(source)
+    normalized["format"] = output_format
+
+    quality_default = (
+        DEFAULT_PREVIEW_QUALITY
+        if str(raw_format or "").strip().lower() == "webp"
+        else DEFAULT_OUTPUT_QUALITY
+    )
+    if "quality" in source or str(raw_format or "").strip().lower() == "webp":
+        normalized["quality"] = normalize_quality(source.get("quality"), default=quality_default)
+    if "webp_lossless_compression" in source:
+        normalized["webp_lossless_compression"] = normalize_webp_lossless_compression(
+            source.get("webp_lossless_compression")
+        )
+    return normalized
+
+
+def normalize_output_intent_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Freeze output mode and Preview codec settings at plan acceptance."""
+    source = dict(value) if isinstance(value, Mapping) else {}
+    raw_mode = source.get("output_mode")
+    if raw_mode is None and "preview_enabled" in source:
+        raw_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+    output_mode = normalize_output_mode(raw_mode)
+    normalized = dict(source)
+    normalized["output_mode"] = output_mode
+
+    conversion = source.get("output_conversion_options", source.get("output_conversion"))
+    conversion = dict(conversion) if isinstance(conversion, Mapping) else {}
+    if output_mode == "preview":
+        conversion.setdefault("format", source.get("preview_codec", "webp"))
+        if conversion.get("quality") is None:
+            conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
+        # E2D: freeze the fast encoder effort into the accepted Preview intent
+        # so replay/history truth carries the effective lossy method.
+        conversion.setdefault("webp_lossless_compression", PREVIEW_WEBP_EFFORT)
+    if conversion:
+        normalized["output_conversion_options"] = normalize_output_conversion_options(conversion)
+        normalized["output_format"] = normalized["output_conversion_options"]["format"]
+        if "quality" in normalized["output_conversion_options"]:
+            normalized["quality"] = normalized["output_conversion_options"]["quality"]
+        if "webp_lossless_compression" in normalized["output_conversion_options"]:
+            normalized["webp_lossless_compression"] = normalized["output_conversion_options"][
+                "webp_lossless_compression"
+            ]
+    return normalized
+
+
 def _normalized_entries(values: Any) -> tuple[dict[str, Any], ...]:
     """Normalize a sequence of mapping entries into frozen, str-keyed dicts.
 
@@ -429,11 +606,25 @@ class ExecutionOptions:
     progress_options: Mapping[str, Any] = field(default_factory=dict)
     compatibility_flags: Mapping[str, Any] = field(default_factory=dict)
     legacy_passthrough: Mapping[str, Any] = field(default_factory=dict)
+    output_mode: str = "original"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "production_output_node_ids", _normalized_ids(self.production_output_node_ids))
-        for name in (
+        output_mode = normalize_output_mode(self.output_mode)
+        conversion = dict(self.output_conversion_options or {})
+        if output_mode == "preview":
+            conversion.setdefault("format", "webp")
+            if conversion.get("quality") is None:
+                conversion["quality"] = DEFAULT_PREVIEW_QUALITY
+            # E2D: freeze the fast encoder effort into the accepted Preview
+            # options so the serialized plan carries the effective method.
+            conversion.setdefault("webp_lossless_compression", PREVIEW_WEBP_EFFORT)
+        object.__setattr__(
+            self,
             "output_conversion_options",
+            normalize_output_conversion_options(conversion),
+        )
+        for name in (
             "cancellation_options",
             "progress_options",
             "compatibility_flags",
@@ -441,6 +632,7 @@ class ExecutionOptions:
         ):
             object.__setattr__(self, name, _freeze(getattr(self, name) or {}))
         object.__setattr__(self, "production_enabled", bool(self.production_enabled))
+        object.__setattr__(self, "output_mode", output_mode)
         object.__setattr__(self, "result_route", str(self.result_route or ""))
         object.__setattr__(self, "profiling_level", str(self.profiling_level or "summary").lower())
         object.__setattr__(self, "requested_backend", str(self.requested_backend or "in_process").lower())
@@ -472,6 +664,22 @@ class ExecutionOptions:
             _record_compatibility_key("output_format")
         if conversion is None:
             conversion = {}
+        elif not isinstance(conversion, Mapping):
+            raise ValueError("output_conversion_options must be a mapping")
+        else:
+            conversion = dict(conversion)
+        for key in ("quality", "webp_lossless_compression"):
+            if key not in conversion and key in source:
+                conversion[key] = source[key]
+        raw_output_mode = source.get("output_mode")
+        if raw_output_mode is None and "preview_enabled" in source:
+            raw_output_mode = "preview" if bool(source.get("preview_enabled")) else "original"
+        output_mode = normalize_output_mode(raw_output_mode)
+        if output_mode == "preview":
+            if "format" not in conversion:
+                conversion["format"] = source.get("preview_codec", "webp")
+            if conversion.get("quality") is None:
+                conversion["quality"] = source.get("preview_quality", DEFAULT_PREVIEW_QUALITY)
         if "output_conversion" in source:
             _record_compatibility_key("output_conversion")
 
@@ -492,6 +700,12 @@ class ExecutionOptions:
             "output_conversion_options",
             "output_conversion",
             "output_format",
+            "output_mode",
+            "preview_enabled",
+            "preview_codec",
+            "preview_quality",
+            "quality",
+            "webp_lossless_compression",
             "result_route",
             "profiling_level",
             "profile_level",
@@ -542,6 +756,7 @@ class ExecutionOptions:
         return cls(
             production_enabled=production_enabled,
             production_output_node_ids=output_ids,
+            output_mode=output_mode,
             output_conversion_options=conversion,
             result_route=source.get("result_route", ""),
             profiling_level=profile,
@@ -562,6 +777,7 @@ class ExecutionOptions:
                 "enabled": self.production_enabled,
                 "output_node_ids": list(self.production_output_node_ids),
             },
+            "output_mode": self.output_mode,
             "output_conversion_options": _thaw(self.output_conversion_options),
             "result_route": self.result_route,
             "profiling_level": self.profiling_level,
@@ -589,6 +805,7 @@ class ExecutionOptions:
             "output_node_ids": list(self.production_output_node_ids),
         }
         result["output_conversion_options"] = _thaw(self.output_conversion_options)
+        result["output_mode"] = self.output_mode
         result["result_route"] = self.result_route
         result["profiling_level"] = self.profiling_level
         result["requested_backend"] = self.requested_backend
@@ -605,11 +822,218 @@ class ExecutionOptions:
         conversion = _thaw(self.output_conversion_options)
         if isinstance(conversion, dict) and "format" in conversion:
             result["output_format"] = conversion["format"]
+        if isinstance(conversion, dict) and "quality" in conversion:
+            result["quality"] = conversion["quality"]
+        if isinstance(conversion, dict) and "webp_lossless_compression" in conversion:
+            result["webp_lossless_compression"] = conversion["webp_lossless_compression"]
         flags = _thaw(self.compatibility_flags)
         actual_load = flags.get("actual_load") if isinstance(flags, dict) else None
         if isinstance(actual_load, Mapping):
             result["actual_load"] = dict(actual_load)
         return result
+
+
+# Schema version for the plan-carried host-side validation proof payload
+# (ExecutionPlan.validation).  Bump on any incompatible change to the
+# payload shape consumed by instrumentation/tooling.
+VALIDATION_PROOF_SCHEMA_VERSION = 1
+
+# Schema version for the canonical deployment-static proof frozen into
+# BootstrapState at snapshot creation (executor-side, never consumed by
+# decisions in Step 2).
+DEPLOYMENT_PROOF_SCHEMA_VERSION = 1
+
+
+def compute_registry_fingerprint(class_mappings=None, *, roots=None) -> str:
+    """Deterministic SHA-256 over the custom-node class registry.
+
+    Pure and lazy: ``nodes`` is imported only when ``class_mappings`` is not
+    supplied.  When *roots* is a non-empty iterable of directory paths, only
+    classes whose module file lives under one of the roots are included, so a
+    consistent deployment layout yields the same fingerprint across host and
+    container despite different absolute paths.  Modules that cannot be
+    resolved (``sys.modules`` miss) are included conservatively.  File paths
+    are never part of the hash input (path-independent).  Returns ``""``
+    (ineligible — never fabricate identity) when the registry is unavailable,
+    empty, or cannot be enumerated.
+    """
+    if class_mappings is None:
+        try:
+            import nodes
+        except Exception:
+            return ""
+        class_mappings = getattr(nodes, "NODE_CLASS_MAPPINGS", None) or {}
+    _norm_roots: tuple[str, ...] = ()
+    if roots is not None:
+        _norm_roots = tuple(
+            os.path.normpath(str(r))
+            for r in roots
+            if str(r or "").strip()
+        )
+    try:
+        entries = []
+        for _name in sorted(str(k) for k in class_mappings.keys()):
+            _cls = class_mappings[_name]
+            if _norm_roots:
+                _mod = sys.modules.get(getattr(_cls, "__module__", ""))
+                if _mod is not None:
+                    _file = str(getattr(_mod, "__file__", "") or "")
+                    if _file:
+                        _norm_file = os.path.normpath(_file)
+                        if not any(
+                            _norm_file == _root or _norm_file.startswith(_root + os.sep)
+                            for _root in _norm_roots
+                        ):
+                            continue
+                # module not resolvable -> include the class conservatively
+            entries.append(f"{_name}={getattr(_cls, '__module__', '')}.{getattr(_cls, '__qualname__', '')}")
+        if not entries:
+            return ""
+        return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def evaluate_plan_snapshot_parity(plan_identity: Mapping | None, snapshot_proof: Mapping | None) -> dict:
+    """Exact-match matrix between plan-carried deployment identity and the
+    frozen snapshot proof.  Never consumed by decisions in Step 2.
+
+    The AUTHORITATIVE registry axis is the workflow-relevant registry proof:
+    the plan must carry a complete per-class canonical-identity proof for the
+    workflow's own class set and that proof must match the snapshot's registry
+    manifest for exactly those classes.  The legacy full-registry fingerprint
+    equality is still computed but only as DIAGNOSTIC (``registry_fingerprint_match``).
+    """
+    # Lazy import keeps this module stdlib-only at import time.
+    from comfymodal_runtime.registry_proof import evaluate_workflow_registry_parity
+    _plan = dict(plan_identity or {})
+    _proof = dict(snapshot_proof or {})
+    _dep_match = bool(_plan.get("deployment_combined_hash") and _proof.get("deployment_combined_hash")
+                      and _plan["deployment_combined_hash"] == _proof["deployment_combined_hash"])
+    _gen_match = bool(_plan.get("custom_nodes_generation") and _proof.get("custom_nodes_generation")
+                      and _plan["custom_nodes_generation"] == _proof["custom_nodes_generation"])
+    # Manual publication policy: the whole custom-node generation is
+    # DIAGNOSTIC ONLY (``custom_nodes_generation_match`` below) and never an
+    # eligibility gate.  Deployment-hash, workflow-registry, and
+    # dependency-proof gates stay as they are.
+    _reg_parity = evaluate_workflow_registry_parity(_plan.get("registry_proof"), _proof.get("registry_manifest"))
+    _reg_match = bool(_plan.get("registry_proof_complete")) and bool(_reg_parity.get("workflow_registry_match"))
+    # When the planner supplies the optional exact binding, reject a proof
+    # copied from a different dispatch workflow.  Legacy frozen identities
+    # without this field retain the existing class-set parity behavior.
+    _plan_workflow_hash = str(_plan.get("workflow_hash", "") or "")
+    _plan_registry_proof = _plan.get("registry_proof")
+    _proof_workflow_hash = str(
+        _plan_registry_proof.get("workflow_hash", "")
+        if isinstance(_plan_registry_proof, Mapping) else ""
+    )
+    _workflow_binding_ok = not _plan_workflow_hash or not _proof_workflow_hash or _plan_workflow_hash == _proof_workflow_hash
+    if not _workflow_binding_ok:
+        _reg_match = False
+    # Legacy full-registry fingerprint equality — DIAGNOSTIC ONLY (never an
+    # eligibility blocker).
+    _reg_full_match = bool(_plan.get("registry_fingerprint") and _proof.get("registry_fingerprint")
+                           and _plan["registry_fingerprint"] == _proof["registry_fingerprint"])
+    _dep_proof_match = bool(_plan.get("dependency_manifest_identity") and _proof.get("dependency_manifest_identity")
+                            and _plan["dependency_manifest_identity"] == _proof["dependency_manifest_identity"])
+    _schema_ok = bool(_proof.get("schema_version") and _proof.get("valid"))
+    _eligible = bool(_plan.get("complete") and _proof.get("complete") and _schema_ok
+                      and _dep_match and _reg_match and _dep_proof_match)
+    _reasons = []
+    if not _plan.get("complete"):
+        _reasons.append("plan_identity_incomplete")
+    if not _proof.get("complete"):
+        _reasons.append("snapshot_proof_incomplete")
+    if not _schema_ok:
+        _reasons.append("snapshot_proof_invalid_or_unsupported")
+    if not _dep_match:
+        _reasons.append("deployment_hash_mismatch")
+    if not _reg_match:
+        _reasons.append("workflow_registry_mismatch")
+    if not _dep_proof_match:
+        _reasons.append("dependency_proof_mismatch")
+    return {
+        "plan_validation_schema": _plan.get("schema_version", 0),
+        "plan_deployment_complete": bool(_plan.get("complete", False)),
+        "snapshot_proof_present": bool(_proof),
+        "snapshot_proof_complete": bool(_proof.get("complete", False)),
+        "snapshot_proof_valid": bool(_proof.get("valid", False)),
+        "deployment_hash_match": _dep_match,
+        "custom_nodes_generation_match": _gen_match,
+        # Full-registry fingerprint equality — DIAGNOSTIC only now.
+        "registry_fingerprint_match": _reg_full_match,
+        # Workflow-relevant registry proof parity — the AUTHORITATIVE axis.
+        "workflow_registry_match": _reg_match,
+        "registry_parity_reason": str(_reg_parity.get("reason", "") or ""),
+        "registry_parity_counts": {
+            k: _reg_parity.get(k)
+            for k in ("workflow_class_count", "host_proved_count", "snapshot_proved_count",
+                      "missing_host_total", "missing_snapshot_total", "identity_mismatch_total")
+        },
+        "dependency_proof_match": _dep_proof_match,
+        "future_fast_path_eligible": _eligible,
+        "future_fast_path_ineligible_reason": ",".join(_reasons) if not _eligible else "",
+    }
+
+
+def evaluate_plan_validation_consumption(
+    parity: Mapping | None,
+    plan_validation: Mapping | None,
+    *,
+    workflow_hash_match: bool,
+    validation_hash_match: bool,
+    structure_ok: bool,
+    outputs_nonempty: bool,
+) -> dict:
+    """Final Step-3 decision: may plan-carried validation be consumed?
+
+    Pure and decision-free for tests; modal_app applies it.  Never trusts the
+    plan-provided workflow hash (the caller passes the recompute result).
+    """
+    _pv = dict(plan_validation or {})
+    _parity = dict(parity or {})
+    _schema_ok = _pv.get("schema_version") == VALIDATION_PROOF_SCHEMA_VERSION
+    _validated = bool(_pv.get("validated", False))
+    _parity_eligible = bool(_parity.get("future_fast_path_eligible", False))
+    _eligible = bool(
+        _parity_eligible and _schema_ok and _validated
+        and validation_hash_match and workflow_hash_match
+        and structure_ok and outputs_nonempty
+    )
+    _reasons = []
+    if not _parity_eligible:
+        _reasons.append(_parity.get("future_fast_path_ineligible_reason") or "parity_ineligible")
+    if not _schema_ok:
+        _reasons.append("unsupported_validation_schema")
+    if not _validated:
+        _reasons.append("validation_not_validated")
+    if not validation_hash_match:
+        _reasons.append("validation_hash_mismatch")
+    if not workflow_hash_match:
+        _reasons.append("workflow_hash_mismatch")
+    if not structure_ok:
+        _reasons.append("structure_check_failed")
+    if not outputs_nonempty:
+        _reasons.append("empty_outputs")
+    return {"eligible": _eligible, "ineligible_reason": ",".join(_reasons) if not _eligible else ""}
+
+
+def apply_repair_invalidation(consumed: bool, reason: str) -> tuple[bool, str]:
+    """Oracle Gate-2: a missing-node repair invalidates a consumed plan-proof.
+
+    Returns the post-repair ``(consumed, reason)`` pair.  Pure and testable;
+    the runtime applies it so the plan-proof state is cleared before the
+    legacy re-validation path runs.
+    """
+    if consumed:
+        return (False, str(reason or "repair_changed"))
+    return (consumed, str(reason or ""))
+
+
+def should_write_validation_cert(scheduled: bool, preflight_ran: bool) -> bool:
+    """A validation certificate is written only when scheduled AND preflight
+    actually ran (never on a cert/plan-proof skip)."""
+    return bool(scheduled and preflight_ran)
 
 
 @dataclass(frozen=True)
@@ -625,6 +1049,11 @@ class ExecutionPlan:
     input_images: Mapping[str, str] = field(default_factory=dict)
     execution_options: ExecutionOptions = field(default_factory=ExecutionOptions)
     request_metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Step-1 plan-carried workflow-validation proof + deployment identity.
+    # Carried and instrumented only — never consumed by the container's
+    # validation/certificate decision path.
+    validation: Mapping[str, Any] = field(default_factory=dict)
+    deployment_identity: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workflow", _freeze(self.workflow or {}))
@@ -633,6 +1062,8 @@ class ExecutionPlan:
         object.__setattr__(self, "prompt_bundle", _freeze(self.prompt_bundle or {}))
         object.__setattr__(self, "input_images", _freeze(self.input_images or {}))
         object.__setattr__(self, "request_metadata", _freeze(self.request_metadata or {}))
+        object.__setattr__(self, "validation", _freeze(self.validation or {}))
+        object.__setattr__(self, "deployment_identity", _freeze(self.deployment_identity or {}))
         if not isinstance(self.execution_options, ExecutionOptions):
             object.__setattr__(self, "execution_options", ExecutionOptions.from_dict(self.execution_options))
         output_ids = self.output_node_ids
@@ -658,6 +1089,8 @@ class ExecutionPlan:
             input_images=source.get("input_images", {}),
             execution_options=ExecutionOptions.from_dict(source.get("execution_options", {})),
             request_metadata=source.get("request_metadata", {}),
+            validation=dict(source.get("validation") or {}),
+            deployment_identity=dict(source.get("deployment_identity") or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -673,6 +1106,8 @@ class ExecutionPlan:
             "input_images": _thaw(self.input_images),
             "execution_options": self.execution_options.to_dict(),
             "request_metadata": _thaw(self.request_metadata),
+            "validation": _thaw(self.validation) if self.validation else {},
+            "deployment_identity": _thaw(self.deployment_identity) if self.deployment_identity else {},
         }
 
 
@@ -968,19 +1403,28 @@ class SnapshotExecutionSeed:
 
 @dataclass(frozen=True)
 class DeploymentIdentity:
-    schema_version: int = 1
+    schema_version: int = DEPLOYMENT_IDENTITY_SCHEMA_VERSION
     runtime_hash: str = ""
     dependency_hash: str = ""
     custom_node_hash: str = ""
     source_bytes: int = 0
     file_hashes: Mapping[str, str] = field(default_factory=dict)
+    # Compatibility records may carry the canonical image-plan deployment
+    # hash.  When present it is authoritative; ``combined_hash`` is only its
+    # compatibility alias.  An absent value retains the source-only hash for
+    # standalone legacy callers and is explicitly marked by the namespace.
+    deployment_hash: str = ""
+    hash_namespace: str = SOURCE_IDENTITY_HASH_NAMESPACE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "file_hashes", _freeze(self.file_hashes or {}))
 
     @property
     def combined_hash(self) -> str:
+        if self.deployment_hash:
+            return self.deployment_hash
         return stable_hash({
+            "hash_namespace": self.hash_namespace,
             "schema_version": self.schema_version,
             "runtime_hash": self.runtime_hash,
             "dependency_hash": self.dependency_hash,
@@ -996,8 +1440,18 @@ class DeploymentIdentity:
             "custom_node_hash": self.custom_node_hash,
             "source_bytes": self.source_bytes,
             "file_hashes": _thaw(self.file_hashes),
+            "deployment_hash": self.deployment_hash,
+            "hash_namespace": self.hash_namespace,
             "combined_hash": self.combined_hash,
         }
+
+    def with_deployment_hash(self, deployment_hash: str) -> "DeploymentIdentity":
+        """Attach the canonical image-plan hash without changing source data."""
+        return replace(
+            self,
+            deployment_hash=str(deployment_hash or ""),
+            hash_namespace=DEPLOYMENT_HASH_NAMESPACE,
+        )
 
 
 @dataclass(frozen=True)

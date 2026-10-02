@@ -11,10 +11,12 @@ Covers:
   - No CPU-cache-hit prerequisite when baseline says 0
 """
 
+import ast
 import os
 import sys
 import unittest
 from unittest.mock import patch
+import pytest
 
 # Add project root to path
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +27,7 @@ if _PROJECT_ROOT not in sys.path:
 COMFYAPP_PATH = os.path.join(_PROJECT_ROOT, "comfyapp.py")
 
 
+@pytest.mark.fast_unit
 class ProductionBaselineFlagTests(unittest.TestCase):
     """Test that the production baseline resolver overrides stale env/volume flags."""
 
@@ -208,6 +211,7 @@ class ProductionBaselineFlagTests(unittest.TestCase):
         self.assertEqual(report["removed_node_count"], 0)
 
 
+@pytest.mark.fast_unit
 class WarmupProfileDedupTests(unittest.TestCase):
     """Test that warmup_profile dedup key changes with production state."""
 
@@ -415,90 +419,113 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
     # into module-level functions stored as class attributes.
 
     def _import_resolve_preload_mode(self):
-        from comfyapp import _resolve_preload_mode
+        from comfymodal_runtime.baseline_resolvers import _resolve_preload_mode
         return _resolve_preload_mode
 
     def _import_resolve_sage(self):
-        from comfyapp import _resolve_sage_runtime_env_override
-        return _resolve_sage_runtime_env_override
+        from comfymodal_runtime.sage_policy import resolve_sage_runtime_mode
+        return resolve_sage_runtime_mode
 
     def _import_resolve_sage_probe(self):
-        from comfyapp import _resolve_sage_probe_on_restore
-        return _resolve_sage_probe_on_restore
+        from comfymodal_runtime.sage_policy import resolve_sage_probe_on_restore
+        return resolve_sage_probe_on_restore
 
     def _import_baseline_flag(self):
-        from comfyapp import _resolve_production_baseline_flag
+        from comfymodal_runtime.baseline_resolvers import _resolve_production_baseline_flag
         return _resolve_production_baseline_flag
 
     # ── Task 1: Baseline-first for preload mode ──────────────────────
 
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
+    @pytest.mark.fast_unit
+    @patch("comfymodal_runtime.baseline_resolvers.os.path.isfile")
+    @patch("builtins.open")
     def test_preload_mode_baseline_overrides_stale_file(self, mock_open, mock_isfile):
         """production baseline says clip_only even if volume file says sequential."""
         mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "sequential"
+        mock_open.return_value.read.return_value = "sequential"
         result = self._import_resolve_preload_mode()()
         self.assertEqual(result, "clip_only",
                          "Baseline must override stale volume file sequential")
 
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
+    @pytest.mark.fast_unit
+    @patch("comfymodal_runtime.baseline_resolvers.os.path.isfile")
+    @patch("builtins.open")
     def test_preload_mode_baseline_overrides_stale(self, mock_open, mock_isfile):
         """production baseline remains clip_only even when volume file says workers_2."""
         mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "workers_2"
+        mock_open.return_value.read.return_value = "workers_2"
         result = self._import_resolve_preload_mode()()
         self.assertEqual(result, "clip_only",
                          "Production baseline must resolve to clip_only")
 
     # ── Task 1: Baseline-first for sage runtime env override ─────────
 
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
-    def test_sage_runtime_baseline_overrides_stale_file(self, mock_open, mock_isfile):
+    @pytest.mark.fast_unit
+    def test_sage_runtime_baseline_overrides_stale_file(self):
         """production baseline says baked_cuda even if volume file says auto."""
-        mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "auto"
-        result = self._import_resolve_sage()()
-        self.assertEqual(result, "baked_cuda",
+        result = self._import_resolve_sage()(
+            file_value="auto", env_value="auto", baseline_value="baked_cuda"
+        )
+        self.assertEqual(result[0], "baked_cuda",
                          "Baseline must override stale volume file auto")
 
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
-    def test_sage_runtime_baseline_overrides_triton(self, mock_open, mock_isfile):
+    @pytest.mark.fast_unit
+    def test_sage_runtime_baseline_overrides_triton(self):
         """production baseline says baked_cuda even if volume file says triton_fallback."""
-        mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "triton_fallback"
-        result = self._import_resolve_sage()()
-        self.assertEqual(result, "baked_cuda",
+        result = self._import_resolve_sage()(
+            file_value="triton_fallback", env_value="auto", baseline_value="baked_cuda"
+        )
+        self.assertEqual(result[0], "baked_cuda",
                          "Baseline must override stale volume file triton_fallback")
 
     # ── Task 1: Baseline-first for sage probe on restore ─────────────
 
-    @patch("comfyapp.os.path.isfile")
-    @patch("comfyapp.open")
-    def test_sage_probe_baseline_overrides_stale_file(self, mock_open, mock_isfile):
+    @pytest.mark.fast_unit
+    def test_sage_probe_baseline_overrides_stale_file(self):
         """production baseline says probe=False even if volume file says 1."""
-        mock_isfile.return_value = True
-        mock_file = mock_open.return_value.__enter__.return_value
-        mock_file.read.return_value = "1"
-        result = self._import_resolve_sage_probe()()
-        self.assertFalse(result,
+        result = self._import_resolve_sage_probe()(
+            file_value="1", env_value="1", baseline_value="0"
+        )
+        self.assertFalse(result[0],
                          "Baseline must override stale volume file probe=1")
 
-    # ── Task 2: DIRECT_WARMUP_CLIP_ENCODE baseline ───────────────────
+    @pytest.mark.fast_unit
+    def test_sage_resolution_exposes_four_field_identity(self):
+        result = self._import_resolve_sage()(
+            file_value="auto", env_value="auto", baseline_value="baked_cuda"
+        )
+        self.assertEqual(
+            result,
+            (
+                "baked_cuda",
+                "production-baseline-overrides-runtime-file",
+                "baked_cuda",
+                "baseline",
+            ),
+        )
 
+    @pytest.mark.fast_unit
+    def test_golden_sage_policy_ignores_inherited_production_baseline(self):
+        result = self._import_resolve_sage()(
+            file_value="auto",
+            env_value="baked_cuda",
+            baseline_value="baked_cuda",
+            golden_flag=True,
+        )
+        self.assertEqual(result[0], "baked_cuda")
+        self.assertEqual(result[2], "baked_cuda")
+        self.assertEqual(result[3], "golden_env")
+
+    # ── Production baseline flags ────────────────────────────────────
+
+    @pytest.mark.fast_unit
     def test_direct_warmup_clip_encode_baseline_is_one(self):
         """Production baseline says DIRECT_WARMUP_CLIP_ENCODE=1 (historical 34b6274)."""
         val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE")
         self.assertEqual(val, "1",
                          "Baseline must be 1 so CLIP encode runs during direct warmup")
 
+    @pytest.mark.fast_unit
     def test_direct_warmup_clip_encode_overrides_env(self):
         """Baseline=1 wins even when env var says 0."""
         with patch.dict(os.environ, {"COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "0"}):
@@ -506,35 +533,67 @@ class ProductionBaselineResolveOverrideTests(unittest.TestCase):
             self.assertEqual(val, "1",
                              "Baseline=1 must override env=0")
 
+    @pytest.mark.fast_unit
     def test_direct_warmup_load_unet_baseline_is_zero(self):
         """Production baseline says DIRECT_WARMUP_LOAD_UNET=0 (UNET loaded by production restore UNET)."""
         val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
         self.assertEqual(val, "0",
                          "Baseline must be 0 so production UNET handles UNET load")
 
+    @pytest.mark.fast_unit
     def test_direct_warmup_load_unet_production_unet_submit(self):
-        """When DIRECT_WARMUP_LOAD_UNET resolves to False, _resolve_runtime_flag
-        returns False under the production baseline, proving the
-        production_unet_start_boundary branch in comfyapp.py will call
-        _start_production_restore_unet."""
-        from comfyapp import _resolve_runtime_flag, _resolve_production_baseline_flag
-        baseline_val = _resolve_production_baseline_flag("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
+        """The baseline makes the direct UNET gate resolve to False."""
+        from comfymodal_runtime.baseline_resolvers import _resolve_runtime_flag
+        baseline_val = self._import_baseline_flag()("COMFYMODAL_DIRECT_WARMUP_LOAD_UNET")
         self.assertEqual(baseline_val, "0",
                          "Baseline overrides must set DIRECT_WARMUP_LOAD_UNET=0")
-        rt_val = _resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0")
-        self.assertFalse(rt_val,
+        self.assertFalse(_resolve_runtime_flag("DIRECT_WARMUP_LOAD_UNET", "0"),
                          "_resolve_runtime_flag must return False under baseline")
 
+    @pytest.mark.fast_unit
     def test_direct_module_flags_follow_production_baseline(self):
-        """Directly-read module flags must match the authoritative baseline."""
-        import comfyapp
+        """All direct-warmup baseline flags match the production contract."""
+        expected = {
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_UNET": "0",
+            "COMFYMODAL_DIRECT_WARMUP_LOAD_CLIP": "1",
+            "COMFYMODAL_DIRECT_WARMUP_CLIP_ENCODE": "1",
+            "COMFYMODAL_DIRECT_WARMUP_REQUIRE_CPU_CACHE_HIT": "1",
+            "COMFYMODAL_SAGE_RUNTIME_MODE": "baked_cuda",
+            "COMFYMODAL_SAGE_RUNTIME_PROBE_ON_RESTORE": "0",
+            "COMFYMODAL_PRELOAD_MODE": "clip_only",
+        }
+        baseline = self._import_baseline_flag()
+        for name, value in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(baseline(name), value)
 
-        self.assertEqual(comfyapp.DEFAULT_EXECUTION_BACKEND, "in_process")
-        self.assertTrue(comfyapp.ENABLE_WARMUP)
-        self.assertFalse(comfyapp.ENABLE_TORCH_COMPILE)
-        self.assertEqual(comfyapp.SAGE_RUNTIME_MODE, "baked_cuda")
+    @pytest.mark.fast_unit
+    def test_direct_warmup_clip_encode_uses_env_when_file_missing(self):
+        from comfymodal_runtime.baseline_resolvers import _resolve_runtime_flag
+        with patch.dict(os.environ, {"COMFYMODAL_SOME_TEST_FLAG": "1"}):
+            with patch("comfymodal_runtime.baseline_resolvers.os.path.isfile", return_value=False):
+                self.assertTrue(_resolve_runtime_flag("SOME_TEST_FLAG", "0"))
 
 
+@pytest.mark.fast_unit
+class ComfyappResolverReexportTests(unittest.TestCase):
+    def test_comfyapp_reexports_lightweight_resolvers(self):
+        tree = ast.parse(open(COMFYAPP_PATH, encoding="utf-8-sig").read(), filename=COMFYAPP_PATH)
+        exported = {
+            alias.name for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "comfymodal_runtime.baseline_resolvers"
+            for alias in node.names
+        }
+        self.assertTrue({
+            "production_baseline_value", "_resolve_production_baseline_flag",
+            "_resolve_runtime_flag", "_resolve_runtime_string",
+            "_resolve_sage_runtime_env_override", "_resolve_sage_probe_on_restore",
+            "_resolve_preload_mode",
+        } <= exported)
+
+
+@pytest.mark.component
 class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
     """Phase 2 regression: production restore skips CPU preload and uses
     only direct warmup (_warmup_direct) to load UNET+CLIP to GPU, with
@@ -559,6 +618,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
 
     # ── Phase 2: production skips CPU preload ────────────────────────
 
+    @pytest.mark.fast_unit
     def test_production_restore_skips_cpu_preload_fallback_gate(self):
         """The fallback preload submit must be gated on
         and not _production_stable_path so production skips CPU preload."""
@@ -571,6 +631,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "and not _production_stable_path",
         )
 
+    @pytest.mark.fast_unit
     def test_production_restore_skips_cpu_preload_elif_gate(self):
         """The elif asynchronous preload fallback must also be gated on
         and not _production_stable_path."""
@@ -596,6 +657,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "elif preload fallback must guard against production",
         )
 
+    @pytest.mark.fast_unit
     def test_production_restore_calls_warmup_direct(self):
         """Production warmup must still invoke _warmup_direct."""
         restore_src = self._get_restore_source()
@@ -605,6 +667,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "restore() must still call _warmup_direct for GPU direct warmup",
         )
 
+    @pytest.mark.fast_unit
     def test_restore_still_has_preload_models_for_non_production(self):
         """Non-production code paths in restore() still reference
         _preload_models_to_cpu (via _start_restore_preload or directly)."""
@@ -615,6 +678,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "Non-production restore must still have CPU preload infrastructure",
         )
 
+    @pytest.mark.heavy_local
     def test_production_baseline_loads_clip_with_encode_and_skip_unet(self):
         """The production baseline must skip UNET direct load (production UNET handles it),
         load CLIP, run CLIP encode, and require CPU cache hit for direct warmup
@@ -648,6 +712,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
             "Module default must require CPU cache hit",
         )
 
+    @pytest.mark.fast_unit
     def test_production_restore_invokes_start_restore_preload_with_production_params(self):
         """The production restore path calls _start_restore_preload for CLIP
         preload with production-specific parameters (read_strategy='normal',
@@ -664,6 +729,7 @@ class ProductionRestorePreloadPhase2RegressionTests(unittest.TestCase):
         self.assertIn('restore_preload_submitted_production', restore_src)
 
 
+@pytest.mark.fast_unit
 class StudioProfileProductionPropagationTests(unittest.TestCase):
     """Test that the Studio profile-preparer path forwards production options
     from compilation data to prepare_active_next_profile.

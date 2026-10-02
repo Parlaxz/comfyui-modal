@@ -1,0 +1,423 @@
+"""Agent B tests: tools/v2_control/fingerprints.py (Batch E32).
+
+Covers (contract §21 subset):
+- deploy-required change (COMFYMODAL_V2_UNET_FASTSAFETENSORS 0->1) alters
+  the deploy fingerprint AND the run fingerprint (run embeds deploy fp);
+- run-only change (V2_BENCHMARK_GAP_SECONDS) does NOT alter the deploy fp
+  but alters the run fp;
+- unregistered flag change alters BOTH fingerprints (unknown is not trusted);
+- determinism: same config -> same fingerprints across engine instances;
+- canonical_json format (sort_keys, compact separators, ensure_ascii=False);
+- float formatting via repr().
+
+Python 3.11 stdlib + pytest only; no network.
+"""
+
+from __future__ import annotations
+
+import sys
+from copy import deepcopy
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.v2_control.fingerprints import FingerprintEngine  # noqa: E402
+from comfymodal_runtime.deployment_spec import build_v2_late_config  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Minimal ResolvedConfig duck-type (Agent A's config.py is not required).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Target:
+    app: str = "stable-modal-comfy-v2-restore-only-shadow"
+    class_name: str = "ModalRuntimeEntrypointV2"
+    method: str = "run_plan_stream"
+
+
+@dataclass
+class _Resources:
+    gpu: str = "rtx-pro-6000"
+    cpu: int = 12
+    memory_mb: int = 32768
+    min_containers: int = 0
+    scaledown_window: int = 4
+
+
+@dataclass
+class _Workload:
+    fresh_required: bool = True
+    conditioning_cache: str = "forced_miss"
+    expected_output_sha: str = ""
+    run_count: int = 10
+    gap_seconds: float = 35.0
+    nonce: str = "test-nonce"
+
+
+@dataclass
+class _Git:
+    head: str = "0ba7000bd5f3c7ed52e8d9e0facbc0c598eb6997"
+    branch: str = "main"
+    dirty: bool = False
+    dirty_hashes: dict = field(default_factory=dict)
+
+
+@dataclass
+class _Flag:
+    name: str
+    value: str
+    source: str = "profile:production"
+    registered: bool = True
+    consumed_at: str = "request"
+    change_requires: str = "run"
+    type: str = "bool"
+    description: str = ""
+
+
+@dataclass
+class _Config:
+    profile_name: str = "production"
+    owner: str = "v2-core"
+    target: _Target = field(default_factory=_Target)
+    resources: _Resources = field(default_factory=_Resources)
+    workload: _Workload = field(default_factory=_Workload)
+    flags: list = field(default_factory=list)
+    unregistered: list = field(default_factory=list)
+    runtime_override_policy: str = "forbid"
+    git: _Git = field(default_factory=_Git)
+
+
+def _flag(name: str, value: str, change_requires: str = "run") -> _Flag:
+    return _Flag(name=name, value=value, change_requires=change_requires)
+
+
+def _base_config(**overrides) -> _Config:
+    config = _Config(
+        flags=[
+            _flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS", "0", "deploy"),
+            _flag("V2_BENCHMARK_GAP_SECONDS", "35.0", "run"),
+        ],
+        unregistered=[],
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Determinism
+# ---------------------------------------------------------------------------
+
+
+def test_same_config_same_fingerprints_across_engines():
+    config = _base_config()
+    a = FingerprintEngine(config)
+    b = FingerprintEngine(config)
+    assert a.deploy_fingerprint() == b.deploy_fingerprint()
+    assert a.run_fingerprint() == b.run_fingerprint()
+    assert a.deploy_fingerprint() == a.deploy_fingerprint()  # idempotent
+
+
+def test_fingerprints_are_sha256_hex():
+    engine = FingerprintEngine(_base_config())
+    for fp in (engine.deploy_fingerprint(), engine.run_fingerprint()):
+        assert len(fp) == 64
+        int(fp, 16)  # raises if not hex
+
+
+# ---------------------------------------------------------------------------
+# Deploy-required change
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_required_change_alters_deploy_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.flags = [
+        _flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS", "1", "deploy"),
+        _flag("V2_BENCHMARK_GAP_SECONDS", "35.0", "run"),
+    ]
+    assert FingerprintEngine(base).deploy_fingerprint() != FingerprintEngine(changed).deploy_fingerprint()
+
+
+def test_deploy_required_change_alters_run_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.flags = [
+        _flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS", "1", "deploy"),
+        _flag("V2_BENCHMARK_GAP_SECONDS", "35.0", "run"),
+    ]
+    assert FingerprintEngine(base).run_fingerprint() != FingerprintEngine(changed).run_fingerprint()
+
+
+def test_deploy_flags_contain_only_deploy_required():
+    engine = FingerprintEngine(_base_config())
+    inputs = engine.deploy_inputs()
+    assert inputs["deploy_flags"] == {"COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0"}
+    # run-only flag excluded from deploy inputs
+    assert "V2_BENCHMARK_GAP_SECONDS" not in inputs["deploy_flags"]
+
+
+def test_run_flags_contain_only_run_safe():
+    engine = FingerprintEngine(_base_config())
+    inputs = engine.run_inputs()
+    assert inputs["run_flags"] == {"V2_BENCHMARK_GAP_SECONDS": "35.0"}
+    assert "COMFYMODAL_V2_UNET_FASTSAFETENSORS" not in inputs["run_flags"]
+
+
+# ---------------------------------------------------------------------------
+# Run-only change
+# ---------------------------------------------------------------------------
+
+
+def test_run_only_change_does_not_alter_deploy_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.flags = [
+        _flag("COMFYMODAL_V2_UNET_FASTSAFETENSORS", "0", "deploy"),
+        _flag("V2_BENCHMARK_GAP_SECONDS", "45.0", "run"),
+    ]
+    assert FingerprintEngine(base).deploy_fingerprint() == FingerprintEngine(changed).deploy_fingerprint()
+    assert FingerprintEngine(base).run_fingerprint() != FingerprintEngine(changed).run_fingerprint()
+
+
+def test_run_inputs_embed_deploy_fingerprint():
+    engine = FingerprintEngine(_base_config())
+    inputs = engine.run_inputs()
+    assert inputs["deploy_fingerprint"] == engine.deploy_fingerprint()
+
+
+# ---------------------------------------------------------------------------
+# Unregistered flags — unknown is not trusted
+# ---------------------------------------------------------------------------
+
+
+def test_unregistered_change_alters_both_fingerprints():
+    base = _base_config()
+    changed = _base_config()
+    changed.unregistered = [_flag("V2_BRAND_NEW_EXPERIMENT", "1", "unknown")]
+    base_engine = FingerprintEngine(base)
+    changed_engine = FingerprintEngine(changed)
+    assert base_engine.deploy_fingerprint() != changed_engine.deploy_fingerprint()
+    assert base_engine.run_fingerprint() != changed_engine.run_fingerprint()
+
+
+def test_unregistered_appears_in_both_inputs():
+    config = _base_config()
+    config.unregistered = [_flag("V2_BRAND_NEW_EXPERIMENT", "1", "unknown")]
+    engine = FingerprintEngine(config)
+    # deploy inputs: deploy-required flag + unregistered flag
+    assert engine.deploy_inputs()["deploy_flags"] == {
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "0",
+        "V2_BRAND_NEW_EXPERIMENT": "1",
+    }
+    # run inputs: run-safe flag + unregistered flag
+    assert engine.run_inputs()["run_flags"] == {
+        "V2_BENCHMARK_GAP_SECONDS": "35.0",
+        "V2_BRAND_NEW_EXPERIMENT": "1",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Git / target / resources / profile / policy shape
+# ---------------------------------------------------------------------------
+
+
+def test_dirty_git_state_alters_deploy_fp():
+    base = _base_config()
+    dirty = _base_config()
+    dirty.git = _Git(head="0ba7000bd5f3c7ed52e8d9e0facbc0c598eb6997", dirty=True,
+                     dirty_hashes={"comfymodal_runtime/modal_app.py": "abc123"})
+    assert FingerprintEngine(base).deploy_fingerprint() != FingerprintEngine(dirty).deploy_fingerprint()
+    assert FingerprintEngine(base).run_fingerprint() != FingerprintEngine(dirty).run_fingerprint()
+
+
+def test_excluded_only_git_dirt_does_not_alter_deploy_fp():
+    clean = _base_config()
+    excluded_only = _base_config()
+    excluded_only.git = _Git(dirty=True, dirty_hashes={})
+
+    # Overall worktree dirt remains available for doctor/reporting, but it is
+    # absent from deployment identity when no deploy-relevant paths changed.
+    assert excluded_only.git.dirty is True
+    assert FingerprintEngine(excluded_only).deploy_inputs()["git_dirty"] is False
+    assert FingerprintEngine(clean).deploy_fingerprint() == FingerprintEngine(excluded_only).deploy_fingerprint()
+
+
+def test_deploy_relevant_dirty_hashes_alter_deploy_fp():
+    clean = _base_config()
+    relevant_dirty = _base_config()
+    relevant_dirty.git = _Git(dirty=True, dirty_hashes={"tools/v2_control/fingerprints.py": "abc123"})
+
+    assert FingerprintEngine(relevant_dirty).deploy_inputs()["git_dirty"] is True
+    assert FingerprintEngine(clean).deploy_fingerprint() != FingerprintEngine(relevant_dirty).deploy_fingerprint()
+
+
+def test_dirty_hashes_sorted_in_inputs():
+    config = _base_config()
+    config.git = _Git(head="h", dirty=True, dirty_hashes={"z.py": "1", "a.py": "2"})
+    inputs = FingerprintEngine(config).deploy_inputs()
+    assert list(inputs["dirty_hashes"].items()) == [("a.py", "2"), ("z.py", "1")]
+
+
+def test_target_change_alters_deploy_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.target = _Target(app="different-app")
+    assert FingerprintEngine(base).deploy_fingerprint() != FingerprintEngine(changed).deploy_fingerprint()
+
+
+def test_resource_change_alters_deploy_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.resources = _Resources(gpu="a10g", cpu=4, memory_mb=8192, min_containers=1, scaledown_window=0)
+    assert FingerprintEngine(base).deploy_fingerprint() != FingerprintEngine(changed).deploy_fingerprint()
+
+
+def test_profile_and_policy_in_inputs():
+    engine = FingerprintEngine(_base_config())
+    inputs = engine.deploy_inputs()
+    assert inputs["profile"] == "production"
+    assert inputs["runtime_override_policy"] == "forbid"
+    assert inputs["target"]["app"].startswith("stable-modal")
+
+
+# ---------------------------------------------------------------------------
+# Workload -> run fingerprint only
+# ---------------------------------------------------------------------------
+
+
+def test_workload_change_alters_run_fp_not_deploy_fp():
+    base = _base_config()
+    changed = _base_config()
+    changed.workload = _Workload(fresh_required=False)
+    assert FingerprintEngine(base).deploy_fingerprint() == FingerprintEngine(changed).deploy_fingerprint()
+    assert FingerprintEngine(base).run_fingerprint() != FingerprintEngine(changed).run_fingerprint()
+
+
+# ---------------------------------------------------------------------------
+# canonical_json
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_json_sorted_compact_ascii():
+    data = {"b": "β", "a": 1}
+    out = FingerprintEngine.canonical_json(data)
+    assert out == '{"a":1,"b":"β"}'
+    assert "," in out and ":" in out
+    assert " " not in out
+
+
+def test_float_formatting_repr():
+    config = _base_config()
+    config.workload = _Workload(gap_seconds=0.30000000000000004)
+    inputs = FingerprintEngine(config).run_inputs()
+    assert inputs["workload"]["gap_seconds"] == repr(0.30000000000000004)
+
+
+# ---------------------------------------------------------------------------
+# Post-selector runtime provenance
+# ---------------------------------------------------------------------------
+
+
+def test_e30_selector_fingerprint_matches_post_bat_runtime_values():
+    """E30 arms inherit E19; the BAT then force-sets these four flags."""
+    from tools.v2_control.config import ConfigResolver
+    from tools.v2_control.profiles import Profiles
+    from tools.v2_control.registry import FlagRegistry
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = ConfigResolver(
+        repo_root,
+        Profiles(repo_root / "config" / "v2" / "profiles"),
+        FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml"),
+    ).resolve(profile_name="e30-clip-qd-arm-b")
+    engine = FingerprintEngine(config)
+    runtime_flags = {
+        "COMFYMODAL_V2_CLIP_FAST_HYDRATION": "1",
+        "COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS": "1",
+        "COMFYMODAL_V2_FAST_COLD_ORCHESTRATION": "1",
+        "COMFYMODAL_V2_UNET_FASTSAFETENSORS": "1",
+    }
+
+    # Resolution remains the pre-BAT input; the fingerprint is post-selector.
+    for name in runtime_flags:
+        flag = config.flag(name)
+        assert flag is not None
+        assert flag.value == "0"
+    assert {
+        name: engine.deploy_inputs()["deploy_flags"][name]
+        for name in runtime_flags
+    } == runtime_flags
+
+    # A config representing the values actually handed to the runtime must
+    # produce the same identity as v2ctl's projected fingerprint.
+    runtime_config = deepcopy(config)
+    for flag in runtime_config.flags:
+        if flag.name in runtime_flags:
+            flag.value = runtime_flags[flag.name]
+    assert engine.deploy_fingerprint() == FingerprintEngine(runtime_config).deploy_fingerprint()
+
+
+def test_selector_projection_does_not_change_unrelated_production_profile():
+    from tools.v2_control.config import ConfigResolver
+    from tools.v2_control.profiles import Profiles
+    from tools.v2_control.registry import FlagRegistry
+
+    repo_root = Path(__file__).resolve().parents[1]
+    config = ConfigResolver(
+        repo_root,
+        Profiles(repo_root / "config" / "v2" / "profiles"),
+        FlagRegistry(repo_root / "config" / "v2" / "flag_registry.toml"),
+    ).resolve(profile_name="production")
+    inputs = FingerprintEngine(config).deploy_inputs()["deploy_flags"]
+    assert inputs["COMFYMODAL_V2_CLIP_FAST_HYDRATION"] == "0"
+    assert inputs["COMFYMODAL_V2_CLIP_SNAPSHOT_EXCLUDE_WEIGHTS"] == "0"
+    assert inputs["COMFYMODAL_V2_FAST_COLD_ORCHESTRATION"] == "0"
+    assert inputs["COMFYMODAL_V2_UNET_FASTSAFETENSORS"] == "0"
+
+
+def test_shared_late_config_is_nonempty_and_complete():
+    late = build_v2_late_config(
+        resolved_values={
+            "COMFYMODAL_V2_PREFILL_LANES": "full",
+            "COMFYMODAL_V2_NATIVE_FAST_DISK_UNET": "1",
+            "COMFYMODAL_SAMPLING_DEEP_PROFILE": "on",
+        },
+        cpu_request=12,
+        memory_request=32768,
+    )
+    assert late
+    assert all(isinstance(key, str) and isinstance(value, str) for key, value in late.items())
+    assert late["COMFYMODAL_V2_PREFILL_LANES"] == "full"
+    assert late["COMFYMODAL_V2_NATIVE_FAST_DISK_UNET"] == "1"
+    assert late["COMFYMODAL_SAMPLING_DEEP_PROFILE"] == "on"
+    assert late["COMFYMODAL_V2_CPU_REQUEST"] == "12"
+    assert late["COMFYMODAL_V2_MEMORY_MB"] == "32768"
+    assert late["COMFYMODAL_V2_RUNTIME_REVISION"]
+    assert late["COMFYMODAL_V2_RUNTIME_SHAPE_FINGERPRINT"]
+
+
+def test_shared_late_config_is_deterministic():
+    kwargs = {
+        "resolved_values": {"COMFYMODAL_V2_THREAD_POLICY": "T1"},
+        "cpu_request": 12,
+        "memory_request": 32768,
+    }
+    assert build_v2_late_config(**kwargs) == build_v2_late_config(**kwargs)
+
+
+def test_v2ctl_canonical_identity_includes_late_config():
+    identity = FingerprintEngine(_base_config()).canonical_identity()
+    assert identity.late_config
+
+
+def test_v2ctl_late_config_does_not_use_ambient_environment(monkeypatch):
+    baseline = FingerprintEngine(_base_config()).deploy_fingerprint()
+    monkeypatch.setenv("COMFYMODAL_V2_PREFILL_LANES", "full")
+    monkeypatch.setenv("COMFYMODAL_V2_NATIVE_FAST_DISK_UNET", "1")
+    monkeypatch.setenv("COMFYMODAL_SAMPLING_DEEP_PROFILE", "on")
+    assert FingerprintEngine(_base_config()).deploy_fingerprint() == baseline

@@ -1,0 +1,54 @@
+EVENT=PRE_RUN_DRIFT_DETECTION
+COMMAND=git status --short
+--- status ---
+ M .opencode/skills/comfymodal-golden-ops/SKILL.md
+ M tools/v2_control/cli.py
+?? EXPERIMENT_EVIDENCE_golden_p1_0308695d024e41d5_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0474d478ce3245d6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_0ed32930ae864850_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_133afac7c9004337_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_25606a90ca244cf9_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_2e4d4cdeffde4b3a_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3916d2e167e94868_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_3a982925da824d2d_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_48f7057bc7e3487b_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_5fbe85f45830404f_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74364aa898644799_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_74920442013c440c_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_7bf4f53dfd404c89_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8020d1eccaeb40e2_2026-09-02.md
+?? EXPERIMENT_EVIDENCE_golden_p1_8088a8ce0adc44d0_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b062782af4884be6_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_b55885b5864a47e1_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_ce6827c491ae47be_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f2787dfec45943ae_2026-09-03.md
+?? EXPERIMENT_EVIDENCE_golden_p1_f8514ab2fa8f49ea_2026-09-03.md
+?? RX9P_G_FAILED_SMOKE_REPAIR_AUDIT_2026-09-01.md
+?? RX9P_M_PROFILER_E27_AND_LOGGING_REPAIR_2026-09-02.md
+?? unetClipExperimentsSeptember/
+--- HEAD ---
+9f2ce64cfe93b1ae74567b802b30da4c3533e594
+--- golden status ---
+[v2ctl.golden.status]
+schema_version=2
+profile=golden_p1
+target={'app': 'sept-unetclip-01-transport-core', 'class': 'ModalRuntimeEntrypointV2', 'method': 'run_golden_serial_stream'}
+deployment_manifest=C:\Users\parla\OneDrive\Documents\AI HUB\ComfyUI June Install\ComfyUI\custom_nodes\comfyui-modal\.v2ctl\deployments\deploy_20260903-140910_f6b59e42.json
+deployment_fingerprint_current=417dfd21fb8e011c5245f43234da14dbe8eaf2ff1ba1cb30df268b4c128179e8
+deployment_fingerprint_stored=f6b59e429175eaa76fecbe6062a33c3d2e2c3d7bed53c3e4fc295be93e657919
+deployment_fingerprint_match=False
+deployment_target_match=True
+deployed_state_present=True
+deployed_state_target_match=False
+deployed_state_app=batch-ra2-active-patcher
+deployed_state_class=ModalRuntimeEntrypointV2
+deployed_state_combined_hash=d25161544d2d2d7461d32a1b2f99ea381c6cf7a108d3c9b2481037192fbeac96
+deployed_state_error=
+runtime_health_status=unverified
+source_identity_status=unverified
+runtime_overrides_present=0
+deploy_lock_active=False
+capture_guard={'schema_version': 2, 'state': 'idle', 'post_capture_guard_pending': False, 'last_snapshot_capture_request_id': '', 'last_snapshot_capture_at': '', 'guard_armed_by_request_id': '', 'last_guard_consumed_by_request_id': '', 'last_guard_consumed_at': '', 'capture_identity': '', 'capture_request_id': '', 'capture_at': '', 'deployment_identity': '{"app_name":"sept-unetclip-01-transport-core","class_name":"ModalRuntimeEntrypointV2","deploy_fingerprint":"417dfd21fb8e011c5245f43234da14dbe8eaf2ff1ba1cb30df268b4c128179e8","deployment_combined_hash":"","gpu":"rtx-pro-6000"}', 'last_transition_reason': 'initial'}
+next_request_guarded=False
+remote_checks=not_performed
+ready=False

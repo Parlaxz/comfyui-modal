@@ -1,0 +1,15 @@
+schema_version = 1
+name = "golden_p1_parallel_m2clip_h100_registration_diag"
+extends = "golden_p1_parallel_m2clip_h100"
+owner = "c0-registration-investigation"
+
+[target]
+app = "batch-testing8-registration-diag-sep28"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_HOST_REGISTER = "1"
+COMFYMODAL_GOLDEN_C0_READER_GATE = "1"
+COMFYMODAL_GOLDEN_C0_DMA_RING = "0"
+COMFYMODAL_GOLDEN_C0_FIVE_SLOTS = "1"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_DIAG = "1"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_ORDER = "overlap"
