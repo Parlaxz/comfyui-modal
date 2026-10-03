@@ -1802,14 +1802,46 @@ _PROBE: Any = None
 _PROBE_SENTINEL_RECORD: dict = {}
 
 
+def _load_probe_module() -> Any:
+    """Import the probe module from a process that may not be a package member.
+
+    The source owner is launched as a plain script::
+
+        python .../golden_source_threads.py --source-child ...
+
+    so in that process this file is ``__main__`` with no parent package and a
+    relative import raises "attempted relative import with no known parent
+    package".  Because the child's stderr is a pipe nobody drains, that
+    ImportError used to surface only as a silent
+    ``source_process_exited_before_ready`` during restore.  The absolute form
+    works in both cases because the deployment root is on ``sys.path``.
+    """
+    try:
+        from comfymodal_runtime import source_copy_probe  # noqa: PLC0415
+
+        return source_copy_probe
+    except ImportError:
+        import importlib.util  # noqa: PLC0415
+
+        spec = importlib.util.spec_from_file_location(
+            "comfymodal_runtime.source_copy_probe",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "source_copy_probe.py"),
+        )
+        if spec is None or spec.loader is None:
+            raise
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 def _init_native() -> None:
     global _MAPPER, _PAGE_SIZE, _PROBE, _PROBE_SENTINEL_RECORD
     _MAPPER = _native_mmap_setup()
     _PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
-    from .source_copy_probe import SourceCopyProbe, sentinel_record
-
-    _PROBE_SENTINEL_RECORD = sentinel_record()
-    _PROBE = SourceCopyProbe()
+    probe_module = _load_probe_module()
+    _PROBE_SENTINEL_RECORD = probe_module.sentinel_record()
+    _PROBE = probe_module.SourceCopyProbe()
 
 
 def _run_reader_loop(
