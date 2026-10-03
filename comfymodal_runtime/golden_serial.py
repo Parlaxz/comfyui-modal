@@ -11633,6 +11633,38 @@ async def golden_clip_load(
             transports.append(transport)
             session.register_qd_owner(transport["owner"])
             state_dicts.append(transport["sd"])
+            if (
+                index == 0
+                and transports
+                and _golden_model_transport_enabled()
+                and preloaded_transports is None
+            ):
+                from .golden_model_transport import get_golden_model_transport
+
+                unet_path = (getattr(session, "model_paths", None) or {}).get("unet")
+                shared_transport = (
+                    getattr(session, "model_transport", None)
+                    or get_golden_model_transport()
+                )
+                if unet_path and shared_transport is not None:
+                    session.model_transport = shared_transport
+                    holder = shared_transport.begin_layout_preresolve(unet_path)
+                    session._unet_layout_preresolve_holder = holder
+                    session.unet_layout_preresolve_record = {
+                        "path_basename": os.path.basename(str(unet_path)),
+                        "started_ns": holder.started_ns,
+                        "finished_ns": holder.finished_ns,
+                        "completed_before_clip_forward": None,
+                        "preresolve_ms": holder.ms,
+                        "status": (
+                            "error" if holder.error is not None
+                            else "completed" if holder.done.is_set() else "started"
+                        ),
+                    }
+                    rec.event(
+                        "unet_layout_preresolve",
+                        **dict(session.unet_layout_preresolve_record),
+                    )
             stats = transport.get("stats") or {}
             if _golden_model_transport_enabled():
                 transport_record = {
@@ -12428,6 +12460,23 @@ async def golden_clip_forward(session: GoldenSession) -> Any:
     prefetch, and no UNET/VAE source activity may begin here."""
     rec = session.recorder
     rec.begin_stage("golden_clip_forward")
+    preresolve_record = getattr(session, "unet_layout_preresolve_record", None)
+    if isinstance(preresolve_record, dict):
+        holder = getattr(session, "_unet_layout_preresolve_holder", None)
+        done = getattr(holder, "done", None)
+        try:
+            completed_before_clip_forward = bool(done is not None and done.is_set())
+        except BaseException:
+            completed_before_clip_forward = False
+        preresolve_record["completed_before_clip_forward"] = completed_before_clip_forward
+        if holder is not None:
+            preresolve_record["preresolve_ms"] = getattr(holder, "ms", None)
+            preresolve_record["finished_ns"] = getattr(holder, "finished_ns", None)
+            preresolve_record["status"] = (
+                "error" if getattr(holder, "error", None) is not None
+                else "completed" if completed_before_clip_forward else "started"
+            )
+        rec.event("unet_layout_preresolve", **dict(preresolve_record))
     rec.event("CLIP_FORWARD_START")
     diagnostics_enabled = stage_diagnostics_enabled()
     clip_page_fault_start = _clip_page_fault_snapshot() if diagnostics_enabled else None
@@ -13251,6 +13300,34 @@ async def golden_unet_load(
             from .golden_model_transport import get_golden_model_transport
             shared_transport = getattr(session, "model_transport", None) or get_golden_model_transport()
             session.model_transport = shared_transport
+            preresolve = shared_transport.join_layout_preresolve(unet_path)
+            preresolve_record = getattr(session, "unet_layout_preresolve_record", None)
+            if not isinstance(preresolve_record, dict):
+                preresolve_record = {
+                    "path_basename": os.path.basename(str(unet_path)),
+                    "started_ns": preresolve.started_ns,
+                    "finished_ns": preresolve.finished_ns,
+                    "completed_before_clip_forward": None,
+                    "preresolve_ms": preresolve.ms,
+                    "status": "not_started" if preresolve.started_ns is None else "completed",
+                }
+                session.unet_layout_preresolve_record = preresolve_record
+            else:
+                preresolve_record["started_ns"] = preresolve.started_ns
+                preresolve_record["finished_ns"] = preresolve.finished_ns
+                preresolve_record["preresolve_ms"] = preresolve.ms
+                if preresolve.started_ns is None:
+                    preresolve_record["status"] = "not_started"
+                elif preresolve.error is not None:
+                    preresolve_record["status"] = "error"
+                else:
+                    preresolve_record["status"] = "completed"
+            preresolve_record["unet_layout_preresolve_joined"] = (
+                preresolve.started_ns is not None
+            )
+            preresolve_record["unet_layout_preresolve_ms"] = preresolve.ms
+            session._unet_layout_preresolve_holder = preresolve
+            rec.event("unet_layout_preresolve", **dict(preresolve_record))
             shared_layout = shared_transport.inspect(unet_path)
             shared_transport_task = asyncio.create_task(shared_transport.load(unet_path, role="unet"))
             await asyncio.sleep(0)
@@ -13417,6 +13494,10 @@ async def golden_unet_load(
             }
             session.model_transport_records.append(transport_record)
             rec.event("golden_model_transport_load", **transport_record)
+            preresolve_record = getattr(session, "unet_layout_preresolve_record", None)
+            if isinstance(preresolve_record, dict):
+                preresolve_record["layout_cache_hit"] = loaded.stats.get("layout_cache_hit")
+                rec.event("unet_layout_preresolve", **dict(preresolve_record))
         else:
             with _golden_trace_span("golden.unet.source_h2d_transport"):
                 with _golden_qd_transport_arm_scope(getattr(session, "qd_transport_arm", "legacy")):
