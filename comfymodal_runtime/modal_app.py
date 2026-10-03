@@ -688,8 +688,8 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
         return base
 
 
-def _prepare_triton_cache_for_startup() -> dict[str, Any]:
-    """Hydrate the durable cache before startup/snapshot work begins."""
+def _prepare_triton_cache_for_restore() -> dict[str, Any]:
+    """Hydrate the durable cache after snapshot restoration, fail-soft."""
     if not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
         return {"status": "disabled"}
     try:
@@ -11395,29 +11395,6 @@ class ModalRuntimeEntrypoint:
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
         _ensure_custom_nodes_compat_symlink()
-        self._triton_cache_startup = _prepare_triton_cache_for_startup()
-        # The compile observer is gated by the same flag as hydration.
-        # `startup()` runs with snap=True during snapshot capture, and this repo
-        # deliberately blocks CUDA-touching imports while capturing (see
-        # comfyapp.find_spec) to keep the snapshot clean.  Touching Triton here
-        # therefore poisons the snapshot: the captured container reported
-        # vram_mib=81559 with an H100 present, yet every restored container then
-        # failed restore with "No CUDA GPUs are available".  Observation must
-        # happen outside snapshot capture, never inside it.
-        try:
-            if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
-                from .triton_cache import install_compile_observer
-
-                self._triton_compile_observer = install_compile_observer()
-            else:
-                self._triton_compile_observer = {
-                    "installed": False, "reason": "disabled",
-                }
-        except Exception as exc:  # noqa: BLE001
-            self._triton_compile_observer = {
-                "installed": False,
-                "reason": type(exc).__name__,
-            }
         _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
         _v2_startup_stage(
             "container_python_import",
@@ -13100,6 +13077,26 @@ class ModalRuntimeEntrypoint:
         restore_method_start_wall_ns: int = remote_python_resume_wall_ns
         restore_method_start_mono_ns: int = remote_python_resume_mono_ns
         _restore_perf_start = time.perf_counter()
+        # Triton cache hydration and compile observation are explicitly
+        # restore-only: startup() may run with snap=True, while restore() runs
+        # after snapshot materialization with snap=False.  Both are diagnostic
+        # optimizations and fail soft so a missing/stale cache or unavailable
+        # Triton hook never blocks the ordinary request path.
+        self._triton_cache_restore = _prepare_triton_cache_for_restore()
+        try:
+            if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+                from .triton_cache import install_compile_observer
+
+                self._triton_compile_observer = install_compile_observer()
+            else:
+                self._triton_compile_observer = {
+                    "installed": False, "reason": "disabled",
+                }
+        except Exception as exc:  # noqa: BLE001
+            self._triton_compile_observer = {
+                "installed": False,
+                "reason": type(exc).__name__,
+            }
         if _golden_minimal_restore_enabled():
             # ── Golden Parallel minimal restore (Golden Serial default) ──
             # A new from-first-principles post-snapshot contract that runs

@@ -191,10 +191,43 @@ def install_compile_observer() -> dict[str, Any]:
     try:
         from triton import knobs  # noqa: PLC0415
 
+        def _describe(value: Any) -> Any:
+            """Keep hook arguments inspectable without retaining Triton objects."""
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value if not isinstance(value, str) else value[:8192]
+            if isinstance(value, Mapping):
+                return {
+                    str(key): _describe(item)
+                    for key, item in list(value.items())[:64]
+                }
+            if isinstance(value, (tuple, list)):
+                return [_describe(item) for item in value[:64]]
+            result: dict[str, Any] = {
+                "type": type(value).__name__,
+                "repr": repr(value)[:8192],
+            }
+            # Triton has changed the concrete compiled-kernel wrapper over
+            # time; preserve the public-looking fields when this version
+            # exposes them instead of guessing a hook signature.
+            for name in (
+                "name", "key", "cache_key", "specialization", "constants",
+                "constexprs", "metadata", "options", "kernel", "src",
+            ):
+                try:
+                    field = getattr(value, name)
+                except Exception:
+                    continue
+                result[name] = _describe(field)
+            return result
+
         def _hook(*args: Any, **kwargs: Any) -> None:
             _COMPILE_EVENTS.append({
                 "args": [type(value).__name__ for value in args],
                 "kwargs": sorted(str(key) for key in kwargs),
+                "args_detail": [_describe(value) for value in args],
+                "kwargs_detail": {
+                    str(key): _describe(value) for key, value in kwargs.items()
+                },
                 "time_ns": time.time_ns(),
             })
 
