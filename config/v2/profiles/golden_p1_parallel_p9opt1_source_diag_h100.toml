@@ -1,0 +1,55 @@
+# v2ctl profile: Production 9 source-stall DIAGNOSTIC on H100.
+#
+# DIAGNOSTIC-ONLY.  This profile exists to answer one question: what is a
+# 1-4.3 second 64 MiB `libc.memmove` actually doing?  It measures, it does not
+# treat.
+#
+# It extends the Production-008 counted base
+# (golden_p1_parallel_c0_p8_h100) so every runtime invariant is inherited
+# unchanged rather than restated, including:
+#
+#   H100! / CPU=12 / memory 24576 MB
+#   whole mmap lifecycle                   COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE=whole
+#   thread source owner                    COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND=thread
+#   qd4_64 source/transport geometry       64 MiB blocks, 16 x 64 MiB arena
+#   forced-miss conditioning               [workload] conditioning_cache=forced_miss
+#   fresh-run requirement                  [workload] fresh_required=true
+#   correctness SHA                        3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#
+# Source behaviour is deliberately UNCHANGED.  This profile adds no posix_fadvise,
+# no readahead, no MADV_WILLNEED, no MADV_HUGEPAGE, no mlock, no NUMA binding,
+# no CPU affinity, no extra readers, and no change to QD, block size, pacer or
+# mmap lifecycle.  Adding any of those would confound the measurement with the
+# treatment.
+#
+# What it adds is the per-copy probe from dce3c4ac: the exact memmove interval,
+# CLOCK_THREAD_CPUTIME_ID, RUSAGE_THREAD fault/block-I/O counters, context
+# switches and sched_getcpu, plus evidence-based classification of each slow
+# copy as PAGE_IO_STALL / DESCHEDULE_STALL / CPU_MEMORY_STALL / MIXED /
+# UNRESOLVED.  The probe is observation only.
+#
+# Measured cost of the probe is 1.2 us per block, 833x under the 1 ms/block
+# ceiling and ~0.3 ms per model, so it cannot account for a stall it observes.
+#
+# mincore() residency stays OFF.  Two independent reasons: its residency
+# semantics under gVisor on a mounted Volume are unverified, and its per-block
+# cost could not be priced on the build host.  Turning it on here would risk
+# both faulting pages in and distorting the very throughput being measured.  The
+# rusage and thread-CPU evidence is the mandatory signal and is unaffected.
+#
+# The target app is deliberately distinct from batch-p9opt1-h100 and
+# batch-p9opt1-prof so no counted or profiled deployment is modified.
+schema_version = 1
+name = "golden_p1_parallel_p9opt1_source_diag_h100"
+extends = "golden_p1_parallel_c0_p8_h100"
+owner = "production-009-diagnostic"
+
+[target]
+app = "batch-p9opt1-diag-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+# Diagnostic per-copy stall probe.  Observation only; no source behaviour change.
+COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE = "1"
+# mincore() residency intentionally left unset (off).  See the header.

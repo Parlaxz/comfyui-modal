@@ -813,6 +813,24 @@ owner = "c0-experiment-3"
 description = "Experiment-3 treatment: 5 x 64 MiB global pageable source pool plus 2 x 64 MiB pinned DMA ring (default OFF = production-005 8-slot registered arena)."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "production-009-diagnostic"
+description = "Diagnostic-only per-copy source stall evidence. Around the existing native memmove, and nothing else, records the exact memmove interval, CLOCK_THREAD_CPUTIME_ID, RUSAGE_THREAD fault/block-I/O counters, context switches and sched_getcpu, then classifies each slow copy from that evidence alone (PAGE_IO_STALL / DESCHEDULE_STALL / CPU_MEMORY_STALL / MIXED / UNRESOLVED). Observation only: no source behaviour changes. Measured cost 1.2 us per block. Default OFF so counted profiles are unaffected."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE_MINCORE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "production-009-diagnostic"
+description = "Adds mincore() page-residency inspection to the source copy probe, gated separately because its gVisor semantics on a mounted Volume are unverified and its per-block cost was never priced. Requires COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE. Stays OFF for the normal diagnostic cohort."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS"
 type = "bool"
 default = "0"
