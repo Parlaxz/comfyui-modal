@@ -89,9 +89,12 @@ EXPECTED_WORKFLOW_SHA256 = "e44389ea2eda82ba5e2328acc08307b6879ed6d4ea4b030727ab
 # mismatch is recorded as a warning and does not prevent durability proof.
 EXPECTED_OUTPUT_PNG_SHA256 = "790c3052a9b4a5ed01369e81cf79eac389f1d69b25578be3aa033e673570e89d"
 CANONICAL_CLIP_NAME = "qwen_3_4b.safetensors"
+CANONICAL_CLIP_FOLDER = "text_encoders"
 CANONICAL_CLIP_TYPE = "lumina2"
 CANONICAL_UNET_NAME = "z_image_turbo_bf16.safetensors"
+CANONICAL_UNET_FOLDER = "diffusion_models"
 CANONICAL_VAE_NAME = "ae.safetensors"
+CANONICAL_VAE_FOLDER = "vae"
 CANONICAL_SAMPLER_CLASS = "ClownsharKSampler_Beta"
 
 # P4-6 is deliberately opt-in. The diagnostic path only observes existing
@@ -791,7 +794,7 @@ class ClipLoadSpec:
 
     checkpoint_names: tuple[str, ...]
     clip_type: str
-    folder: str = "text_encoders"
+    folder: str = CANONICAL_CLIP_FOLDER
     embedding_directory: Optional[list] = None
     model_options_overrides: dict = field(default_factory=dict)
     dtype_policy: str = "uniform"
@@ -2214,27 +2217,50 @@ def _clip_te_normalize_sd_keys(sd: dict) -> str:
     return "ok"
 
 
-def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str]:
+def _clip_meta_state_dict_from_header(path: str) -> tuple[Optional[dict], str, dict[str, Any]]:
+    details: dict[str, Any] = {
+        "clip_meta_cache_hit": False,
+        "metadata_cache_identity_match": False,
+        "meta_blueprint_lookup_ms": 0.0,
+        "residual_meta_build_ms": 0.0,
+        "layout_cache_source": "runtime_parse",
+    }
     try:
         from comfymodal_runtime import clip_qd_reader
-        parsed = clip_qd_reader.parse_safetensors_header(str(path))
-        if parsed.get("status") != "ok":
-            return None, f"header:{parsed.get('reason')}"
+        from comfymodal_runtime import golden_model_metadata_cache as metadata_cache
+
+        lookup_started = time.perf_counter_ns()
+        cached = metadata_cache.lookup(str(path))
+        details["meta_blueprint_lookup_ms"] = (time.perf_counter_ns() - lookup_started) / 1e6
+        details["clip_meta_cache_hit"] = bool(cached.get("entry") is not None)
+        details["metadata_cache_identity_match"] = bool(cached.get("identity_match"))
+        if cached.get("entry") is not None:
+            tensor_items = cached["entry"]["tensors"]
+            details["layout_cache_source"] = "persistent"
+        else:
+            parsed = clip_qd_reader.parse_safetensors_header(str(path))
+            if parsed.get("status") != "ok":
+                return None, f"header:{parsed.get('reason')}", details
+            tensor_items = [
+                [str(key), str(info.get("dtype") or ""), [int(dim) for dim in (info.get("shape") or [])], 0, 0]
+                for key, info in (parsed.get("header") or {}).items()
+                if key != "__metadata__" and isinstance(info, dict)
+            ]
         state: dict[str, Any] = {}
-        for key, info in (parsed.get("header") or {}).items():
-            if key == "__metadata__" or not isinstance(info, dict):
-                continue
-            dtype = clip_qd_reader._TORCH_DTYPE.get(str(info.get("dtype") or ""))
+        residual_started = time.perf_counter_ns()
+        for key, dtype_name, shape_values, _offset, _length in tensor_items:
+            dtype = clip_qd_reader._TORCH_DTYPE.get(str(dtype_name))
             if dtype is None:
-                return None, f"dtype:{key}"
-            shape = tuple(int(dim) for dim in (info.get("shape") or []))
+                return None, f"dtype:{key}", details
+            shape = tuple(int(dim) for dim in shape_values)
             state[str(key)] = torch.empty(shape, dtype=dtype, device="meta")
         if not state:
-            return None, "empty_header"
+            return None, "empty_header", details
         reason = _clip_te_normalize_sd_keys(state)
-        return (state, "ok") if reason == "ok" else (None, reason)
+        details["residual_meta_build_ms"] = (time.perf_counter_ns() - residual_started) / 1e6
+        return (state, "ok", details) if reason == "ok" else (None, reason, details)
     except Exception as exc:
-        return None, f"meta_header:{type(exc).__name__}"
+        return None, f"meta_header:{type(exc).__name__}", details
 
 
 class _ClipSkeletonOverlap:
@@ -2242,6 +2268,7 @@ class _ClipSkeletonOverlap:
         self.future = future
         self.executor = executor
         self.started_ns = started_ns if started_ns is not None else time.monotonic_ns()
+        self.metadata_cache_details: list[dict[str, Any]] = []
 
     def _shutdown_executor(self) -> None:
         try:
@@ -2308,6 +2335,7 @@ class _ClipSkeletonOverlap:
         payload["join_wait_ms"] = (
             time.monotonic_ns() - join_started_ns
         ) / 1e6
+        self.metadata_cache_details = list(payload.get("metadata_cache_details") or [])
         if payload.get("outcome") == "refused":
             if rec is not None:
                 rec.event("clip_skeleton_overlap_refused", reason=payload.get("reason"))
@@ -2321,6 +2349,7 @@ class _ClipSkeletonOverlap:
                     (payload["construct_end_ns"] - payload["construct_start_ns"]) / 1e6, 3
                 ),
                 meta_sd_build_ms=round(float(payload["meta_sd_build_ms"]), 3),
+                metadata_cache_details=list(payload.get("metadata_cache_details") or []),
                 join_wait_ms=round(float(payload.get("join_wait_ms", 0.0)), 3),
                 source_start_ns=source_start_ns,
                 source_end_ns=source_end_ns,
@@ -2341,8 +2370,10 @@ def _start_clip_skeleton_overlap(session: Any, *, spec: Any, rec: Any) -> Option
     def build() -> dict[str, Any]:
         started = time.monotonic_ns()
         meta = []
+        cache_details = []
         for path in paths:
-            state, reason = _clip_meta_state_dict_from_header(path)
+            state, reason, details = _clip_meta_state_dict_from_header(path)
+            cache_details.append(details)
             if state is None:
                 return {"outcome": "refused", "reason": reason}
             meta.append(state)
@@ -2374,6 +2405,7 @@ def _start_clip_skeleton_overlap(session: Any, *, spec: Any, rec: Any) -> Option
                 model_management.text_encoder_initial_device = native_initial
             return {
                 "outcome": "ok", "clip": clip, "meta_sd_build_ms": meta_ms,
+                "metadata_cache_details": cache_details,
                 "construct_start_ns": construct_start,
                 "construct_end_ns": time.monotonic_ns(),
             }
@@ -11576,6 +11608,23 @@ async def golden_clip_load(
         if not session.clip_paths:
             raise RuntimeError("clip_paths_missing")
 
+        from comfymodal_runtime import golden_model_metadata_cache as metadata_cache
+        metadata_state = metadata_cache.hydrate()
+        session.metadata_cache_telemetry = {
+            "metadata_cache_loaded": bool(metadata_state.get("loaded")),
+            "metadata_cache_schema": metadata_state.get("schema"),
+            "metadata_cache_file_bytes": int(metadata_state.get("file_bytes") or 0),
+            "metadata_cache_hydration_ms": float(metadata_state.get("hydration_ms") or 0.0),
+            "metadata_cache_entry_hit": False,
+            "metadata_cache_identity_match": False,
+            "layout_cache_source": "runtime_parse",
+            "clip_meta_cache_hit": False,
+            "residual_meta_build_ms": 0.0,
+            "layout_lookup_ms": 0.0,
+            "meta_blueprint_lookup_ms": 0.0,
+        }
+        rec.event("golden_metadata_cache", **dict(session.metadata_cache_telemetry))
+
         # One QD physical transport PER checkpoint, in spec order; every
         # per-file owner is retained (no reread, no second H2D).
         state_dicts: list[dict] = []
@@ -12013,6 +12062,25 @@ async def golden_clip_load(
                 model_management.text_encoder_initial_device = native_initial_device
         if clip is None:
             raise RuntimeError("clip_construct_failed")
+        cache_details = list(getattr(overlap_construct, "metadata_cache_details", []) or [])
+        if cache_details:
+            session.metadata_cache_telemetry.update({
+                "metadata_cache_entry_hit": all(bool(item.get("clip_meta_cache_hit")) for item in cache_details),
+                "metadata_cache_identity_match": all(bool(item.get("metadata_cache_identity_match")) for item in cache_details),
+                "layout_cache_source": "persistent" if all(item.get("layout_cache_source") == "persistent" for item in cache_details) else "runtime_parse",
+                "clip_meta_cache_hit": all(bool(item.get("clip_meta_cache_hit")) for item in cache_details),
+                "residual_meta_build_ms": sum(float(item.get("residual_meta_build_ms") or 0.0) for item in cache_details),
+                "meta_blueprint_lookup_ms": sum(float(item.get("meta_blueprint_lookup_ms") or 0.0) for item in cache_details),
+            })
+        layout_stats = [dict(item.get("stats") or {}) for item in transports]
+        if layout_stats:
+            session.metadata_cache_telemetry.update({
+                "layout_cache_source": "persistent" if all(item.get("layout_cache_source") == "persistent" for item in layout_stats) else "runtime_parse",
+                "metadata_cache_entry_hit": all(bool(item.get("metadata_cache_entry_hit")) for item in layout_stats),
+                "metadata_cache_identity_match": all(bool(item.get("metadata_cache_identity_match")) for item in layout_stats),
+                "layout_lookup_ms": sum(float(item.get("layout_lookup_ms") or 0.0) for item in layout_stats),
+            })
+        rec.event("golden_metadata_cache_result", **dict(session.metadata_cache_telemetry))
         if clip_transfer is not None:
             # Golden bypasses the legacy snapshot manifest wiring.  Freeze the
             # live constructor-owned names now, before the actual bind, so the

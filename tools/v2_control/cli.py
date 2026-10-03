@@ -2626,7 +2626,7 @@ def cmd_golden_profile(args, repo_root: Path) -> int:
     run_flags = ", ".join(k for k, _ in GOLDEN_PROFILE_RUN_FLAGS)
 
     if getattr(args, "dry_run", False):
-        steps = "source-probe, run, fetch, analyze, render"
+        steps = "source-probe, publish-model-metadata-cache, run, fetch, analyze, render"
         if not skip_deploy:
             steps = "deploy, " + steps
         print(
@@ -2690,6 +2690,22 @@ def cmd_golden_profile(args, repo_root: Path) -> int:
             file=sys.stderr,
         )
         return rc or 1
+
+    advance("publish-model-metadata-cache")
+    rc, publication = _run_v2ctl(
+        repo_root,
+        base() + ["publish-model-metadata-cache"],
+        capture=True,
+    )
+    sys.stdout.write(publication)
+    sys.stdout.flush()
+    if rc != 0:
+        print(
+            "[v2ctl.golden_profile] note: model metadata publication did not "
+            "complete; continuing fail-soft",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Identify the trace by what the run creates, not by scraping its log.
     before = _volume_trace_ids(repo_root, profile)
@@ -4535,6 +4551,85 @@ def cmd_source_probe(args, repo_root: Path) -> int:
         return 1
 
 
+def cmd_publish_model_metadata_cache(args, repo_root: Path) -> int:
+    """Publish static Golden model metadata on the profile's deployment.
+
+    This command is intentionally not a gate.  Its result is printed for run
+    evidence, while ``golden profile`` treats every nonzero result as a
+    visible, fail-soft warning and still starts the cohort.
+    """
+    identity_error = _reject_golden_identity_args(args)
+    if identity_error is not None:
+        return identity_error
+    try:
+        from . import source_probe as sp
+
+        (
+            _registry,
+            _profiles,
+            _resolver,
+            config,
+            _fingerprints,
+            _env_builder,
+            _backend_registry,
+        ) = _build_components_for_args(repo_root, args)
+        _reject_protected_effective_target(
+            config, command="v2ctl publish-model-metadata-cache"
+        )
+        _reject_golden_mode_override(
+            config, command="v2ctl publish-model-metadata-cache"
+        )
+        workspace_binding = _canonical_workspace_binding(args, repo_root, config)
+        _print_destination_preflight(workspace_binding)
+        if getattr(args, "dry_run", False):
+            print("[v2ctl.dry-run] no invocation performed; metadata publication skipped")
+            print(
+                f"target.app={config.target.app} target.class={config.target.class_name} "
+                f"target.gpu={config.resources.gpu}"
+            )
+            return 0
+
+        workspace = (
+            workspace_binding._workspace_payload()
+            if workspace_binding is not None
+            else sp._load_workspace(repo_root)
+        )
+        app_name = config.target.app
+        class_name = config.target.class_name
+        gpu = config.resources.gpu
+        probe_env = {
+            name: str(value)
+            for name, value in {
+                "COMFYMODAL_V2_APP_NAME": app_name,
+                "COMFYMODAL_V2_CLASS_NAME": class_name,
+                "COMFYMODAL_V2_GPU": gpu,
+            }.items()
+            if value
+        }
+        with _workspace_process_environment(workspace_binding, probe_env):
+            report = sp.call_remote_runtime_method(
+                repo_root,
+                workspace=workspace,
+                gpu=str(gpu),
+                method_name="publish_model_metadata_cache",
+                request_id="v2-publish-model-metadata-cache",
+            )
+        print(f"[v2ctl.publish-model-metadata-cache] profile={args.profile}")
+        print(json.dumps(report, sort_keys=True))
+        status = str(report.get("status", "error"))
+        if status in {"ok", "nothing_to_do"}:
+            print(f"[v2ctl.publish-model-metadata-cache] RESULT={status.upper()}")
+            return 0
+        print(
+            f"[v2ctl.publish-model-metadata-cache] RESULT={status.upper()}",
+            file=sys.stderr,
+        )
+        return 1
+    except (V2CtlError, OSError, RuntimeError) as exc:
+        print(f"[v2ctl.publish-model-metadata-cache] ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_runtime_flags(args, repo_root: Path) -> int:
     inventory = ro_mod.RuntimeOverrideInventory(local_dir=repo_root / ".runtime_state")
     sub = args.runtime_command
@@ -4864,6 +4959,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("source-probe")
     p.set_defaults(func=cmd_source_probe)
+
+    p = sub.add_parser(
+        "publish-model-metadata-cache",
+        help="publish static Golden model metadata before a cohort",
+    )
+    p.set_defaults(func=cmd_publish_model_metadata_cache)
 
     p = sub.add_parser(
         "guard",

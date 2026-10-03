@@ -10812,6 +10812,20 @@ class ModalRuntimeEntrypoint:
             volume = getattr(module, "runtime_config_vol", None)
             if volume is not None:
                 volume.reload()
+            # The SafeTensors metadata blueprint lives on this Volume, so warm
+            # it here, right after the reload that makes it visible.  Reading it
+            # costs one first-touch Volume fetch (~0.5 s here versus ~12 ms of
+            # local parsing), and doing that lazily would put the cost on the
+            # measured request path.  Restoring is snap=False and already owns
+            # Triton hydration, so this only reads - it never publishes.
+            try:
+                from .golden_model_metadata_cache import hydrate as _hydrate_model_metadata
+
+                _hydrate_model_metadata()
+            except Exception:  # noqa: BLE001
+                # Purely an optimization: an unavailable cache must fall back to
+                # the canonical parse and never fail a restore.
+                pass
             global _RUNTIME_STATE_VOLUME_RELOADED_MONO
             _RUNTIME_STATE_VOLUME_RELOADED_MONO = time.monotonic()
 
@@ -20258,6 +20272,130 @@ class ModalRuntimeEntrypoint:
             "probe_taken_at": int(_time.time()),
         }
 
+    def publish_model_metadata_cache(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """Publish the static Golden model metadata before a cohort starts.
+
+        This is deliberately a separate pre-cohort operation.  It does not
+        initialize the runtime, enter ``restore()``, or participate in an
+        inference request.  Every failure is returned as structured evidence
+        so the harness can continue fail-soft when the cache is unavailable.
+        """
+        result: dict[str, Any] = {
+            "status": "nothing_to_do",
+            "request_id": str(request_id or ""),
+            "cache_path": "",
+            "file_bytes": 0,
+            "runtime_config_volume": "unknown",
+            "models": {},
+        }
+        try:
+            metadata_cache = importlib.import_module(
+                "comfymodal_runtime.golden_model_metadata_cache"
+            )
+            golden_serial = importlib.import_module("comfymodal_runtime.golden_serial")
+            cache_path = str(getattr(metadata_cache, "CACHE_PATH", "") or "")
+            result["cache_path"] = cache_path
+
+            try:
+                comfyapp = importlib.import_module("comfyapp")
+                runtime_config_volume = getattr(comfyapp, "runtime_config_vol", None)
+            except BaseException as exc:  # noqa: BLE001
+                runtime_config_volume = None
+                result["runtime_config_volume_error"] = (
+                    f"{type(exc).__name__}: {str(exc)[:160]}"
+                )
+            result["runtime_config_volume"] = (
+                "available" if runtime_config_volume is not None else "absent"
+            )
+
+            specs = (
+                (
+                    "clip",
+                    golden_serial.CANONICAL_CLIP_NAME,
+                    golden_serial.CANONICAL_CLIP_SPEC.folder,
+                ),
+                (
+                    "unet",
+                    golden_serial.CANONICAL_UNET_NAME,
+                    golden_serial.CANONICAL_UNET_FOLDER,
+                ),
+                (
+                    "vae",
+                    golden_serial.CANONICAL_VAE_NAME,
+                    golden_serial.CANONICAL_VAE_FOLDER,
+                ),
+            )
+            published = 0
+            failed = 0
+            present = 0
+            for role, filename, folder in specs:
+                relative_path = posixpath.join(str(folder), str(filename))
+                model_path = os.path.join(MODELS_PATH, *relative_path.split("/"))
+                model_result: dict[str, Any] = {
+                    "role": role,
+                    "path": model_path,
+                    "relative_path": relative_path,
+                    "file_bytes": 0,
+                }
+                try:
+                    if not os.path.isfile(model_path):
+                        model_result.update({"status": "skipped", "reason": "missing"})
+                    else:
+                        present += 1
+                        published_result = metadata_cache.publish_model_metadata(
+                            model_path,
+                            relative_path,
+                            runtime_config_volume,
+                            cache_path=cache_path,
+                        )
+                        if not isinstance(published_result, dict):
+                            raise TypeError(
+                                "publish_model_metadata returned a non-dict result"
+                            )
+                        model_result.update(published_result)
+                        model_result["file_bytes"] = int(
+                            published_result.get("file_bytes", 0) or 0
+                        )
+                        if published_result.get("status") in {"ok", "noop"}:
+                            published += 1
+                        else:
+                            failed += 1
+                except BaseException as exc:  # noqa: BLE001
+                    failed += 1
+                    model_result.update(
+                        {
+                            "status": "error",
+                            "reason": f"{type(exc).__name__}: {str(exc)[:160]}",
+                        }
+                    )
+                result["models"][role] = model_result
+
+            try:
+                result["file_bytes"] = int(os.path.getsize(cache_path))
+            except (OSError, TypeError, ValueError):
+                result["file_bytes"] = 0
+
+            if present == 0:
+                result["status"] = "nothing_to_do"
+            elif failed and published:
+                result["status"] = "partial"
+            elif failed:
+                result["status"] = "error"
+            elif runtime_config_volume is None:
+                result["status"] = "partial"
+                result["reason"] = "runtime_config_volume_absent"
+            else:
+                result["status"] = "ok"
+            return result
+        except BaseException as exc:  # noqa: BLE001
+            result["status"] = "error"
+            result["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            return result
+
     def run_entry_probe(
         self,
         *,
@@ -24900,6 +25038,7 @@ def _build_decorated_v2_class() -> type:
         "run_testing8_gds_instanttensor_probe",
         "run_e27_followup_probe",
         "source_identity_probe",
+        "publish_model_metadata_cache",
     )
     # Lifecycle / infrastructure / probe / no-graph methods.  Their dict
     # results must NOT receive a fabricated graph waterfall.  Any future Modal
@@ -24924,6 +25063,7 @@ def _build_decorated_v2_class() -> type:
         "run_testing8_gds_instanttensor_probe",
         "run_e27_followup_probe",
         "source_identity_probe",
+        "publish_model_metadata_cache",
     })
     for _name in _METHODS_TO_WRAP:
         _orig = getattr(cls, _name)
@@ -25103,6 +25243,11 @@ def _build_decorated_v2_class() -> type:
         cls,
         "source_identity_probe",
         _modal.method()(cls.source_identity_probe),
+    )
+    setattr(
+        cls,
+        "publish_model_metadata_cache",
+        _modal.method()(cls.publish_model_metadata_cache),
     )
     return cls
 

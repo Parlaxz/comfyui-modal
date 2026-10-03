@@ -14,12 +14,13 @@ import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 from . import m2_source_core
 from . import source_race_gpu
 from . import golden_source_threads
+from . import golden_model_metadata_cache
 from .source_latency_telemetry import (
     collect_placement_telemetry,
     summarize_first_h2d,
@@ -90,6 +91,11 @@ class SafetensorsLayout:
     data_start: int
     data_bytes: int
     tensor_map: tuple[dict[str, Any], ...]
+    cache_source: str = "runtime_parse"
+    metadata_cache_entry_hit: bool = False
+    metadata_cache_identity_match: bool = False
+    metadata_cache_hydration_ms: float = 0.0
+    metadata_cache_lookup_ms: float = 0.0
 
 
 @dataclass
@@ -1012,15 +1018,57 @@ class GoldenModelTransport:
                 if response.get("command") != "INVALIDATE_FDS_DONE":
                     raise RuntimeError("persistent_reader_fd_invalidation_failed")
 
-    def inspect(self, path: str) -> SafetensorsLayout:
+    def inspect(self, path: str, *, role: str = "model") -> SafetensorsLayout:
         normalized = os.path.abspath(str(path))
         identity = _file_identity(normalized)
+        persistent_lookup = None
+        persistent_started = time.perf_counter_ns()
+        if str(role).startswith("clip"):
+            persistent_lookup = golden_model_metadata_cache.lookup(normalized)
+            if persistent_lookup.get("entry") is not None:
+                entry = persistent_lookup["entry"]
+                layout = SafetensorsLayout(
+                    path=normalized,
+                    identity=identity,
+                    header={},
+                    data_start=int(entry["data_start"]),
+                    data_bytes=int(entry["data_bytes"]),
+                    tensor_map=tuple(
+                        {
+                            "key": str(item[0]),
+                            "dtype": str(item[1]),
+                            "shape": [int(value) for value in item[2]],
+                            "offset": int(item[3]),
+                            "length": int(item[4]),
+                        }
+                        for item in entry["tensors"]
+                    ),
+                    cache_source="persistent",
+                    metadata_cache_entry_hit=True,
+                    metadata_cache_identity_match=True,
+                    metadata_cache_hydration_ms=float(persistent_lookup.get("hydration_ms") or 0.0),
+                    metadata_cache_lookup_ms=(time.perf_counter_ns() - persistent_started) / 1e6,
+                )
+                with self._layout_lock:
+                    self._layout_cache[normalized] = layout
+                    self._layout_cache.move_to_end(normalized)
+                    while len(self._layout_cache) > LAYOUT_CACHE_LIMIT:
+                        self._layout_cache.popitem(last=False)
+                return layout
         with self._layout_lock:
             cached = self._layout_cache.get(normalized)
             if cached is not None and cached.identity == identity:
                 self._layout_cache.move_to_end(normalized)
                 return cached
         layout = _parse_layout(normalized, identity)
+        if persistent_lookup is not None:
+            layout = replace(
+                layout,
+                metadata_cache_entry_hit=bool(persistent_lookup.get("entry_hit")),
+                metadata_cache_identity_match=bool(persistent_lookup.get("identity_match")),
+                metadata_cache_hydration_ms=float(persistent_lookup.get("hydration_ms") or 0.0),
+                metadata_cache_lookup_ms=(time.perf_counter_ns() - persistent_started) / 1e6,
+            )
         with self._layout_lock:
             self._layout_cache[normalized] = layout
             self._layout_cache.move_to_end(normalized)
@@ -1131,7 +1179,7 @@ class GoldenModelTransport:
             normalized_path = os.path.abspath(str(path))
             layout_cache_hit = normalized_path in self._layout_cache
             layout_started_ns = time.perf_counter_ns()
-            layout = self.inspect(path)
+            layout = self.inspect(path, role=role)
             layout_end_ns = time.perf_counter_ns()
             total_blocks = (layout.data_bytes + self.block_bytes - 1) // self.block_bytes
             if total_blocks > MAX_SOURCE_BLOCKS:
@@ -1252,6 +1300,12 @@ class GoldenModelTransport:
                 "destination_reused": bool(owner.reused),
                 "transport_runtime_reused": True,
                 "layout_cache_hit": bool(layout_cache_hit),
+                "layout_cache_source": layout.cache_source,
+                "metadata_cache_entry_hit": layout.metadata_cache_entry_hit,
+                "metadata_cache_identity_match": layout.metadata_cache_identity_match,
+                "metadata_cache_hydration_ms": layout.metadata_cache_hydration_ms,
+                "metadata_cache_lookup_ms": layout.metadata_cache_lookup_ms,
+                "layout_lookup_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "fd_cache_hit": bool(result["fd_cache_hit"]),
                 "source_scheduler": result["source_scheduler"],
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
@@ -1300,7 +1354,7 @@ class GoldenModelTransport:
             layout_cache_hit = normalized_path in self._layout_cache
             layout_started_ns = time.perf_counter_ns()
             marks["layout_resolve_begin"] = time.monotonic_ns()
-            layout = self.inspect(path)
+            layout = self.inspect(path, role=role)
             marks["layout_resolve_end"] = time.monotonic_ns()
             layout_end_ns = time.perf_counter_ns()
             owner = self._pool.acquire(layout.data_bytes)
@@ -1598,6 +1652,12 @@ class GoldenModelTransport:
                 "destination_reused": bool(owner.reused),
                 "transport_runtime_reused": True,
                 "layout_cache_hit": bool(layout_cache_hit),
+                "layout_cache_source": layout.cache_source,
+                "metadata_cache_entry_hit": layout.metadata_cache_entry_hit,
+                "metadata_cache_identity_match": layout.metadata_cache_identity_match,
+                "metadata_cache_hydration_ms": layout.metadata_cache_hydration_ms,
+                "metadata_cache_lookup_ms": layout.metadata_cache_lookup_ms,
+                "layout_lookup_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "views_ready_ns": views_ready_ns,
                 "total_load_ms": (finished_ns - started_ns) / 1e6,
@@ -1652,7 +1712,7 @@ class GoldenModelTransport:
             layout_cache_hit = normalized_path in self._layout_cache
             layout_started_ns = time.perf_counter_ns()
             marks["layout_resolve_begin"] = int(time.monotonic_ns())
-            layout = self.inspect(path)
+            layout = self.inspect(path, role=role)
             marks["layout_resolve_end"] = int(time.monotonic_ns())
             layout_end_ns = time.perf_counter_ns()
             marks["owner_acquire_begin"] = int(time.monotonic_ns())
@@ -1848,6 +1908,12 @@ class GoldenModelTransport:
                 "destination_reused": bool(owner.reused),
                 "transport_runtime_reused": self._load_count > 0,
                 "layout_cache_hit": bool(layout_cache_hit),
+                "layout_cache_source": layout.cache_source,
+                "metadata_cache_entry_hit": layout.metadata_cache_entry_hit,
+                "metadata_cache_identity_match": layout.metadata_cache_identity_match,
+                "metadata_cache_hydration_ms": layout.metadata_cache_hydration_ms,
+                "metadata_cache_lookup_ms": layout.metadata_cache_lookup_ms,
+                "layout_lookup_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "fd_cache_hit": bool(getattr(source, "fd_reuse_count", 0)),
                 "layout_resolve_ms": (layout_end_ns - layout_started_ns) / 1e6,
                 "source_go_offset_ms": (int(getattr(source, "first_source_read_start_mono_ns", 0) or 0) - started_ns) / 1e6,
