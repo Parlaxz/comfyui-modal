@@ -23,6 +23,8 @@ TRITON_CACHE_VOLUME_NAME = "comfymodal-triton-cache-h100-sm90"
 TRITON_CACHE_VOLUME_PATH = "/mnt/comfymodal_triton_cache"
 TRITON_CACHE_MANIFEST = "comfymodal_triton_cache_manifest.json"
 _COMPILE_EVENTS: list[dict[str, Any]] = []
+# Real observed bmm_outer_product specializations (see install_bmm_shape_observer).
+_SHAPE_EVENTS: list[dict[str, Any]] = []
 
 
 def _jsonable(value: Any) -> Any:
@@ -184,6 +186,58 @@ def runtime_identity() -> dict[str, Any]:
         "target_arch": f"sm{major}{minor}",
         "device_name": device_name,
     }
+
+
+def install_bmm_shape_observer() -> dict[str, Any]:
+    """Record the REAL bmm_outer_product specialization this request compiles.
+
+    Triton's ``jit_post_compile_hook`` is not invoked on this deployment, so the
+    specialization has to be read where it is unambiguous: the arguments the
+    installed PyTorch native op actually receives. This wraps that plain Python
+    entry point to record the shapes/dtype of the real tensors and the block
+    sizes the kernel derives from them via its own ``_pick_block_sizes``.
+
+    Nothing is synthesised and nothing is replaced: the original function is
+    called with the original arguments, and the record is a side effect only.
+    """
+    global _SHAPE_EVENTS
+    try:
+        from torch._native.ops.bmm_outer_product import (  # noqa: PLC0415
+            triton_kernels as _kernels,
+        )
+
+        original = _kernels.bmm_outer_product
+        if getattr(original, "_comfymodal_shape_observer", False):
+            return {"installed": True, "reason": "already_installed"}
+
+        def _observed(a, b, _original=original):
+            try:
+                block_m, block_n = _kernels._pick_block_sizes(
+                    int(a.shape[1]), int(b.shape[2])
+                )
+                _SHAPE_EVENTS.append({
+                    "B": int(a.shape[0]),
+                    "M": int(a.shape[1]),
+                    "N": int(b.shape[2]),
+                    "dtype": str(a.dtype),
+                    "BLOCK_M": int(block_m),
+                    "BLOCK_N": int(block_n),
+                    "a_shape": list(a.shape),
+                    "b_shape": list(b.shape),
+                })
+            except Exception:  # noqa: BLE001 - observation must never break the op
+                pass
+            return _original(a, b)
+
+        _observed._comfymodal_shape_observer = True  # type: ignore[attr-defined]
+        _kernels.bmm_outer_product = _observed
+        return {"installed": True, "observed_calls": len(_SHAPE_EVENTS)}
+    except Exception as exc:  # pragma: no cover - torch-version dependent
+        return {"installed": False, "reason": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+
+def shape_events() -> list[dict[str, Any]]:
+    return [dict(event) for event in _SHAPE_EVENTS]
 
 
 def install_compile_observer() -> dict[str, Any]:

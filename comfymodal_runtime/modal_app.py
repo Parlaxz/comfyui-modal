@@ -646,6 +646,7 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             reset_compile_events as _reset_compile_events,
             read_manifest,
             runtime_identity,
+            shape_events,
         )
 
         if reset_compile_events:
@@ -667,6 +668,7 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             if isinstance(row, Mapping)
         }
         events = compile_events()
+        shapes = shape_events()
         # Report the artifacts that are ACTUALLY on disk right now. Without this
         # the observation can only say "not present in the manifest"; it cannot
         # distinguish "never compiled" from "compiled but not recorded", which
@@ -692,6 +694,8 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             ),
             "cache_manifest": manifest,
             "triton_compile_events": events,
+            # The specialization actually compiled, read from the real tensors.
+            "triton_shape_events": shapes,
             "cache_root": TRITON_CACHE_DIR,
             "cache_file_count": len(listing),
             "cache_artifacts": listing[:64],
@@ -13100,19 +13104,30 @@ class ModalRuntimeEntrypoint:
         # restore-only: startup() may run with snap=True, while restore() runs
         # after snapshot materialization with snap=False.  Both are diagnostic
         # optimizations and fail soft so a missing/stale cache or unavailable
-        # Triton hook never blocks the ordinary request path.
+# Triton hook never blocks the ordinary request path.
         self._triton_cache_restore = _prepare_triton_cache_for_restore()
         try:
             if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
-                from .triton_cache import install_compile_observer
+                from .triton_cache import (
+                    install_bmm_shape_observer,
+                    install_compile_observer,
+                )
 
                 self._triton_compile_observer = install_compile_observer()
+                self._triton_shape_observer = install_bmm_shape_observer()
             else:
                 self._triton_compile_observer = {
                     "installed": False, "reason": "disabled",
                 }
+                self._triton_shape_observer = {
+                    "installed": False, "reason": "disabled",
+                }
         except Exception as exc:  # noqa: BLE001
             self._triton_compile_observer = {
+                "installed": False,
+                "reason": type(exc).__name__,
+            }
+            self._triton_shape_observer = {
                 "installed": False,
                 "reason": type(exc).__name__,
             }
