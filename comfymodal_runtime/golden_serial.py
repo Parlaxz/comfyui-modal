@@ -14484,6 +14484,11 @@ async def golden_vae_load(
                 effective_h2d_gbps=transport["stats"].get("effective_h2d_gbps"),
                 page_faults=page_faults,
             )
+        # Audit-only, default-OFF residency snapshot at the preload boundary.
+        # Read-only and noexcept; see comfymodal_runtime/vae_residency_audit.py.
+        from .vae_residency_audit import record as _vae_residency_record
+
+        _vae_residency_record(rec, "after_golden_vae_load", vae)
         rec.end_stage(
             "golden_vae_load",
             ready=True,
@@ -14536,6 +14541,11 @@ async def golden_vae_decode(session: GoldenSession) -> Any:
         tail = session.recorder.intervals.get("golden_sampler_tail")
         if tail is None or tail.end_monotonic_ns is None or tail.ok is not True:
             raise RuntimeError("vae_decode_requires_completed_sampler_tail")
+        # Audit-only, default-OFF residency snapshot immediately before decode,
+        # i.e. the state `VAE.decode`'s `load_models_gpu` call would consume.
+        from .vae_residency_audit import record as _vae_residency_record
+
+        _vae_residency_record(rec, "before_golden_vae_decode", session.vae)
         runner = session.runner
         node_map = session.node_map
         # Native socket-major cache shape: one output socket, one item.
@@ -14593,6 +14603,10 @@ async def golden_vae_decode(session: GoldenSession) -> Any:
             images = entry.outputs[0][0] if isinstance(entry.outputs[0], list) else entry.outputs[0]
             session.images = images
             shape = tuple(images.shape) if hasattr(images, "shape") else None
+            # Audit-only, default-OFF: the post-decode snapshot.  Comparing it
+            # with `before_golden_vae_decode` measures exactly what the
+            # decode-time load_models_gpu changed.
+            _vae_residency_record(rec, "after_golden_vae_decode", session.vae)
         details = {"image_shape": str(shape)}
         if _full_trace_active():
             details["full_trace_phases"] = full_trace_phases
