@@ -482,3 +482,47 @@ def test_persistent_reader_fd_cache_closes_fd_from_identity_tuple(monkeypatch):
 
     assert closed == [17]
     assert not cache
+
+
+def test_source_thread_arena_gate_follows_the_source_threads_module(monkeypatch) -> None:
+    """The source-thread arena gate must track golden_source_threads, exactly.
+
+    Production-009's 16-slot deploy crash-looped on
+    ``source_threads_requires_8x64m_arena``: the gate restated the geometry as a
+    literal, so widening the arena without widening the gate failed closed at
+    restore.  It now compares against the owning module and stays exact.
+    """
+    from comfymodal_runtime import golden_source_threads as st
+    from comfymodal_runtime.golden_io_process_v2 import SharedArenaRing
+
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_SOURCE_THREADS", "1")
+    monkeypatch.setenv("COMFYMODAL_GOLDEN_C0_HOST_REGISTER", "1")
+
+    ring = SharedArenaRing(
+        size_bytes=st.ARENA_BYTES,
+        slot_count=st.SLOT_COUNT,
+        slot_bytes=st.SLOT_BYTES,
+    )
+    assert ring.size_bytes == 16 * 64 * 1024 * 1024 == 1073741824
+    assert ring.slot_count == 16
+    assert ring.slot_bytes == 64 * 1024 * 1024
+
+    # The gate is still exact: the retired 8-slot geometry fails closed.
+    with pytest.raises(RuntimeError, match="source_threads_requires_16x64m_arena"):
+        SharedArenaRing(
+            size_bytes=512 * 1024 * 1024,
+            slot_count=8,
+            slot_bytes=64 * 1024 * 1024,
+        )
+
+
+def test_arena_size_must_exactly_equal_slot_count_times_slot_bytes() -> None:
+    """The strict product invariant is preserved, not weakened."""
+    from comfymodal_runtime.golden_io_process_v2 import SharedArenaRing
+
+    with pytest.raises(ValueError, match="c0_arena_geometry_mismatch"):
+        SharedArenaRing(
+            size_bytes=1024 * 1024 * 1024,
+            slot_count=16,
+            slot_bytes=32 * 1024 * 1024,
+        )
