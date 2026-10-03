@@ -1141,3 +1141,159 @@ record. The full cohort is the 10 per-run cohorts under
 `cohort_2026-10-02_16-34-55_21e69a`, plus one gate cohort at
 `cohort_2026-10-02_16-28-50_0ecd78`. Note that `attempt_*.json` also matches the
 `attempt_0_events.json` sidecar, so a naive count reports 22 attempts; there are 10.
+---
+
+# ADDENDUM: the acceptance cohort above was on a regressed build
+
+This addendum supersedes nothing in the body above but corrects its central claim.
+Sections 0 and the 10-run cohort describe `opt/p8-profile-cleanup-1` at
+`9c27b4e` / `0f4f8e2a` and report it as accepted. That build carried a
+production-006 -> production-008 CLIP source-read regression, and could also hang
+silently for 13 minutes. The three phases approved above are all still present and
+all still correct; they were simply measured on top of two defects that were not
+part of this optimization pass.
+
+## A1. Regression: `container_facts` (commits 6efecb7a + c19e61c1)
+
+Seven `os.environ` reads at the restore boundary, plus one kwarg on the restore
+stage recorder:
+
+```python
+"container_facts": _container_restore_facts(),      # 6efecb7a
+rec.end_stage(..., container_facts=baseline["container_facts"])   # c19e61c1
+```
+
+`_container_restore_facts()` probes `COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT` plus
+`MODAL_REGION`, `MODAL_DEFAULT_REGION`, `MODAL_ENVIRONMENT`, `MODAL_CONTAINER_ID`
+and `MODAL_TASK_ID`. Every lookup is guarded, so it could never fail a request -
+which is exactly why it went unnoticed.
+
+Isolated by a forward bisect from the `production-006` tag (P6 plus commits
+re-added one at a time, 10 unprofiled runs per rung), then confirmed with an
+**interleaved same-window A/B, 10 unprofiled runs per arm, alternating**:
+
+| arm | CLIP p50 | CLIP mean | slow mode (<2.5 GB/s) |
+|---|---|---|---|
+| facts removed | 4.80 GB/s | 4.49 GB/s | 1/10 |
+| facts present | 2.63 GB/s | 3.13 GB/s | 8/16 |
+
+-2.17 GB/s p50 and -1.36 GB/s mean. The bimodal ~1.2 GB/s slow mode goes from
+rare to common.
+
+The whole cost lands in `source_open_read`, and inside it almost entirely in
+`ready_queue_wait_ms` - the parent blocking at the restore boundary before the C0
+readers start. It is not slower reading. `effective_reader_concurrency` is
+exactly 4.00 on every run in every arm, and `pacing_wait_count`,
+`all_slots_occupied_count` and `slot_wait_ms` are identical between fast and slow
+runs. The readers do identical work; the parent just waits longer for blocks that
+have already been produced.
+
+The diagnostic could not have answered its own question either.
+`memory_snapshot_enabled` records whether the app ASKED for a memory snapshot,
+not whether Modal actually restored one, so it cannot distinguish a snapshot
+restore from a cold container start. That has to come from the platform.
+
+Removing only the `rec.end_stage` kwarg is not sufficient. The pair is atomic:
+the kwarg reads `baseline["container_facts"]`, which the helper creates. Both go.
+
+## A2. Hang: unbounded stage-pair overlap join
+
+`_golden_stage_pair_overlap` awaited `owner_task` and `sibling_task` with no
+timeout, while the child IPC underneath permits 900 s
+(`golden_io_process_v2._recv`) to 1800 s (`golden_loader_process.REPLY_TIMEOUT_S`).
+One stuck lane left the container emitting nothing - no further stage marks, no
+telemetry - until the Modal client gave up.
+
+Observed as a 13-minute silent stall at `clip_forward_unet_window_begin`
+(run started 20:11:31, last log line 20:11:38, cancelled 20:25). The unfixed
+build also produced a 779 s cancel and a 955 s run. Production-006 does not
+exhibit it.
+
+Each leg is now bounded by `_OVERLAP_JOIN_TIMEOUT_S` (120 s), well above the
+slowest healthy overlap pair observed (~6 s) and far below the child IPC
+ceilings, so a stuck lane now fails inside the container and produces evidence.
+`asyncio.shield` keeps the timeout from cancelling a leg that was about to
+complete; the existing `BaseException` handler still cancels both and re-raises.
+
+This is a bound, not a root-cause fix. Slow-but-progressing lanes still occur -
+the longest post-fix run was 250 s - so the more likely common case is slow
+progress rather than deadlock.
+
+## A3. Verified result at production-009
+
+`production-009` = `45f512ab4c9cd68d6ded9005fe939b1fb73679e1`, i.e. production-008
+plus the two performance/liveness fixes above. `main` and `production-008` were not
+moved.
+
+10 unprofiled runs on app `batch-p8fixed`: **10/10 valid, 10/10 exact output SHA,
+10/10 true cold, 0 invalid.**
+
+| | CLIP p50 | CLIP mean | source_open_read | slow mode |
+|---|---|---|---|---|
+| production-006 baseline | 4.25 GB/s | 4.45 GB/s | 1864 ms | 0/13 |
+| production-008 (regressed) | 2.80 GB/s | 2.87 GB/s | 4101 ms | 3/6 |
+| **production-009** | **4.24 GB/s** | **4.37 GB/s** | **1899 ms** | **1/10** |
+
+E2E is at parity with P6: 10423 ms vs 10437 ms, delta -14 ms, z = -0.03. No run
+hung; longest was 250 s and it completed normally.
+
+Per-run CLIP GB/s: 6.31, 5.92, 5.40, 4.88, 4.35, 4.13, 3.86, 3.63, 3.51, 1.68.
+One slow run at 1.68 remains - the bimodality is reduced, not eliminated.
+
+## A4. Known remaining gap: UNET load
+
+| stage | P6 | production-009 | delta |
+|---|---|---|---|
+| `golden_sampler_prepare` | 296 ms | 31 ms | **-265** |
+| `golden_clip_forward` | 2863 ms | 2670 ms | -192 |
+| `golden_clip_load` | 1853 ms | 1777 ms | -76 |
+| `golden_vae_load` | 528 ms | 477 ms | -51 |
+| **`golden_unet_load`** | **2773 ms** | **2996 ms** | **+223** |
+| `golden_vae_decode` | 514 ms | 596 ms | +81 |
+
+Phase 2 is paying off (sampler_prepare is ~10x faster than P6). But
+`golden_unet_load` sits 223 ms / 8% below P6 (3.86 vs 4.18 GB/s), which absorbs
+roughly 38% of what the other stages gained. E2E parity currently hides it.
+
+UNET was never bisected - every rung in the isolation ladder was scored on CLIP
+bandwidth. If the goal is parity with P6 rather than with the regressed P8, this
+is the next target.
+
+## A5. Latent defects fixed alongside
+
+Found during the isolation, invisible under single-use benchmarking:
+
+- `_OUTER_MARKS` was a module-global never cleared, so on a reused or concurrent
+  container it accumulated marks from earlier requests with a foreign clock.
+  Reset at request entry.
+- `self._golden_telemetry_path` was assigned deep in the impl and never cleared,
+  so a request failing validation before reassigning it could write into the
+  PREVIOUS request's telemetry file. Cleared at method entry.
+- `COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN=1` was unreachable on Golden:
+  `_release_on_close` only listed `run_plan_stream` and `run_prompt_stream`, so the
+  flag was inert while the profile claimed otherwise. The production-007 report
+  used `golden_teardown` stage timings as proof it worked, which measures a
+  different mechanism entirely. Both Golden entrypoints are now listed.
+- `tools/p7_acceptance.py` exited 0 when NOTHING was accepted and never exited
+  non-zero on a partial pass. It reported; it did not gate. Empty or partial is
+  now `GATE: FAIL` with exit 1.
+- `golden deploy --for-profiling` was broken for every caller: it built
+  `["--set", "NAME=VALUE", ...]` and assigned that list to `args.set` verbatim, so
+  the parser read the literal `"--set"` as a value. Now `extra[1::2]`.
+
+## A6. Method note
+
+The isolation took 13 deploys and 113 runs, and the decisive measurement was the
+last one: an interleaved A/B between two arms that were ALREADY deployed, costing
+zero deploys.
+
+Earlier comparisons that ran each arm in its own time window were unreliable on
+this distribution. It is bimodal, and a good window versus a bad window
+manufactures or destroys an effect at will - two intermediate rungs were read as
+decisive and were wrong. Interleaving same-window arms, alternating, is what
+finally made the result unambiguous, and it should have been the method from the
+start.
+
+The fix itself was visible in the diff long before it was measured: two
+diagnostic-only commits touching one runtime file, with nothing to do with model
+loading.
