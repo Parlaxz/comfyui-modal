@@ -36,7 +36,7 @@ from comfymodal_runtime.source_copy_isolation import (  # noqa: E402
     summarize_copies,
 )
 
-PROFILE = "golden_p1_parallel_p9_srccopy_iso_h100"
+PROFILE_PREFIX = "golden_p1_parallel_p9_srccopy_iso"
 EVENT_NAME = "golden_source_copy_isolation"
 SLOW_MS = 100.0
 
@@ -59,7 +59,7 @@ def _find_reports(node: Any) -> list[dict[str, Any]]:
     return []
 
 
-def load_attempts(root: Path, profile: str = PROFILE) -> list[dict[str, Any]]:
+def load_attempts(root: Path, profile_prefix: str = PROFILE_PREFIX) -> list[dict[str, Any]]:
     """One row per cohort manifest found under the artifacts tree."""
     attempts: list[dict[str, Any]] = []
     for manifest_path in sorted(root.glob("artifacts/**/manifest.json")):
@@ -69,7 +69,7 @@ def load_attempts(root: Path, profile: str = PROFILE) -> list[dict[str, Any]]:
             continue
         if not isinstance(manifest, Mapping):
             continue
-        if str(manifest.get("profile") or "") != profile:
+        if not str(manifest.get("profile") or "").startswith(profile_prefix):
             continue
         for attempt in manifest.get("attempts") or []:
             if not isinstance(attempt, Mapping):
@@ -77,6 +77,7 @@ def load_attempts(root: Path, profile: str = PROFILE) -> list[dict[str, Any]]:
             reports = _find_reports(attempt)
             row: dict[str, Any] = {
                 "cohort_dir": str(manifest.get("cohort_dir") or ""),
+                "profile": str(manifest.get("profile") or ""),
                 "request_id": str(attempt.get("request_id") or ""),
                 "run_index": attempt.get("run_index"),
                 "valid": bool(attempt.get("valid")),
@@ -275,8 +276,8 @@ def host_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build(root: Path, profile: str = PROFILE) -> dict[str, Any]:
-    attempts = load_attempts(root, profile)
+def build(root: Path, profile_prefix: str = PROFILE_PREFIX) -> dict[str, Any]:
+    attempts = load_attempts(root, profile_prefix)
     usable = [row for row in attempts if attempt_is_usable(row)]
     by_arm: dict[str, list[dict[str, Any]]] = {arm: [] for arm in ARMS}
     for row in usable:
@@ -296,20 +297,37 @@ def build(root: Path, profile: str = PROFILE) -> dict[str, Any]:
             "host": host_evidence(rows),
             "pooled": arm_summary(rows),
             "variants": {},
+            "cohorts": {},
         }
+        by_profile: dict[str, list[Mapping[str, Any]]] = {}
+        for row in rows:
+            by_profile.setdefault(str(row.get("profile") or ""), []).append(row)
+        for profile_name, profile_rows in sorted(by_profile.items()):
+            profile_pooled = arm_summary(profile_rows)
+            entry["cohorts"][profile_name] = {
+                "usable_containers": len(profile_rows),
+                "images": sorted({
+                    str(row.get("image_id") or "") for row in profile_rows
+                }),
+                "pooled": profile_pooled,
+                "pathological": is_pathological(
+                    profile_pooled, len(profile_rows)
+                ),
+            }
         for variant in report.get("arm_layout", {}).get("variants", []):
             if not variant_complete(rows, str(variant)):
                 continue
             entry["variants"][str(variant)] = arm_summary(rows, str(variant))
         arms[arm] = entry
     return {
-        "profile": profile,
+        "profile_prefix": profile_prefix,
         "attempt_count": len(attempts),
         "usable_count": len(usable),
         "attempts": [
             {
                 "request_id": row["request_id"],
                 "run_index": row["run_index"],
+                "profile": row["profile"],
                 "arm": row["arm"],
                 "valid": row["valid"],
                 "dnf": row["dnf"],
@@ -328,32 +346,53 @@ def build(root: Path, profile: str = PROFILE) -> dict[str, Any]:
     }
 
 
-def classify(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """Apply the decision structure to the pooled per-arm evidence.
+# Absolute, not relative.  "Pathological" has to mean the regime Phase-1
+# measured (rare copies from ~100 ms to seconds), not "slower than some other
+# arm", because the arm that happens to be slowest is itself a candidate for the
+# mechanism.  A copy over 100 ms is 2x a healthy 50 ms copy and 12x a resident
+# anonymous one, and Phase-1 saw the same copies run to 1460 ms.
+SLOW_FRACTION_FLOOR = 0.01
+PATHOLOGICAL_P99_MS = 100.0
 
-    ``pathological`` is defined on the pooled p99 against the control arm, and
-    is only asserted when the arm has at least two usable containers; a single
-    container cannot establish that a distribution is sick.
-    """
+
+def is_pathological(pooled: Mapping[str, Any], containers: int) -> bool:
+    """One arm's pooled distribution, judged on its own absolute shape."""
+    if int(containers) < 2:
+        # A single container cannot establish that a distribution is sick.
+        return False
+    wall = (pooled.get("wall_ms") or {})
+    count = int(wall.get("count") or 0)
+    p99 = wall.get("p99")
+    if count <= 0 or p99 is None:
+        return False
+    over_100 = int((pooled.get("over_thresholds") or {}).get(">100ms") or 0)
+    slow_fraction = over_100 / count
+    return bool(
+        slow_fraction >= SLOW_FRACTION_FLOOR and p99 >= PATHOLOGICAL_P99_MS
+    )
+
+
+def classify(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the decision structure to the pooled per-arm evidence."""
     arms = summary.get("arms") or {}
     verdicts: dict[str, dict[str, Any]] = {}
-    control = arms.get("A") or {}
-    control_p99 = ((control.get("pooled") or {}).get("wall_ms") or {}).get("p99")
     for arm, entry in arms.items():
         pooled = entry.get("pooled") or {}
-        p99 = (pooled.get("wall_ms") or {}).get("p99")
         containers = int(entry.get("usable_containers") or 0)
-        pathological = bool(
-            containers >= 2 and p99 is not None and control_p99 is not None
-            and p99 > 3.0 * max(control_p99, 1e-9)
-        )
+        wall = (pooled.get("wall_ms") or {})
+        count = int(wall.get("count") or 0)
+        over_100 = int((pooled.get("over_thresholds") or {}).get(">100ms") or 0)
         verdicts[arm] = {
             "usable_containers": containers,
-            "p99_ms": p99,
-            "max_ms": (pooled.get("wall_ms") or {}).get("max"),
+            "copy_count": count,
+            "p50_ms": wall.get("p50"),
+            "p99_ms": wall.get("p99"),
+            "max_ms": wall.get("max"),
+            "over_100ms": over_100,
+            "over_100ms_fraction": round(over_100 / count, 6) if count else None,
             "over_250ms": (pooled.get("over_thresholds") or {}).get(">250ms"),
             "over_1000ms": (pooled.get("over_thresholds") or {}).get(">1000ms"),
-            "pathological": pathological,
+            "pathological": is_pathological(pooled, containers),
         }
     sick = {arm for arm, item in verdicts.items() if item["pathological"]}
     if not sick:
@@ -387,11 +426,11 @@ def classify(summary: Mapping[str, Any]) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root of the experiment worktree")
-    parser.add_argument("--profile", default=PROFILE)
+    parser.add_argument("--profile-prefix", default=PROFILE_PREFIX)
     parser.add_argument("--out", default="", help="optional JSON output path")
     args = parser.parse_args(argv)
     root = Path(args.root).resolve()
-    summary = build(root, args.profile)
+    summary = build(root, args.profile_prefix)
     summary["classification"] = classify(summary)
     text = json.dumps(summary, indent=2, sort_keys=True)
     if args.out:
