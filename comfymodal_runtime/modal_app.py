@@ -23331,6 +23331,11 @@ class ModalRuntimeEntrypoint:
             request_id_raw = request.get("request_id")
             if not isinstance(request_id_raw, str) or not request_id_raw.strip():
                 raise ValueError("golden_request_id_required_nonempty_string")
+            # The Playground must opt in explicitly.  In particular, v2ctl
+            # requests omit this key and retain the original direct await path.
+            stream_golden_stage_events = (
+                request.get("stream_golden_stage_events") is True
+            )
             output_policy = resolve_output_durability()
             requested_mode = str(request.get("golden_mode", "serial")).strip().lower()
             if requested_mode not in {"serial", "parallel"}:
@@ -23778,17 +23783,105 @@ class ModalRuntimeEntrypoint:
                         if requested_mode == "parallel"
                         else golden_serial_execute
                     )
-                    result = await execute_golden(
-                        golden_request,
-                        volume=volume,
-                        volume_mount_root=volume_mount_root,
-                        output_root=str(output_root),
-                        telemetry_path=str(telemetry_path),
-                        node_classes=node_classes,
-                        snapshot_proof=_golden_snapshot_proof_supplier,
-                        restore_metadata=restore_metadata,
-                        cpu_prefetch_ticket=cpu_prefetch_ticket,
-                    )
+                    if not stream_golden_stage_events:
+                        # Ordinary v2ctl path: no queue, observer, task, or
+                        # alternate scheduling; preserve the original await.
+                        result = await execute_golden(
+                            golden_request,
+                            volume=volume,
+                            volume_mount_root=volume_mount_root,
+                            output_root=str(output_root),
+                            telemetry_path=str(telemetry_path),
+                            node_classes=node_classes,
+                            snapshot_proof=_golden_snapshot_proof_supplier,
+                            restore_metadata=restore_metadata,
+                            cpu_prefetch_ticket=cpu_prefetch_ticket,
+                        )
+                    else:
+                        # Keep Golden on this event-loop thread: CUDA/runtime
+                        # ownership and the existing orchestration are unchanged.
+                        # Only the adapter's consumption is concurrent with it.
+                        golden_stage_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+                            maxsize=64
+                        )
+                        stage_wakeup = asyncio.Event()
+                        stage_loop = asyncio.get_running_loop()
+                        stage_owner_thread = threading.get_ident()
+                        golden_stage_observer_closed = threading.Event()
+
+                        def _queue_stage_event(event: dict[str, Any]) -> None:
+                            if golden_stage_observer_closed.is_set():
+                                return
+                            try:
+                                golden_stage_queue.put_nowait(event)
+                                stage_wakeup.set()
+                            except (asyncio.QueueFull, RuntimeError):
+                                # The finite canonical stage boundary stream must
+                                # never be allowed to fail the Golden request.
+                                return
+
+                        def _observe_stage_event(event: dict[str, Any]) -> None:
+                            if golden_stage_observer_closed.is_set():
+                                return
+                            try:
+                                if threading.get_ident() == stage_owner_thread:
+                                    _queue_stage_event(event)
+                                else:
+                                    stage_loop.call_soon_threadsafe(
+                                        _queue_stage_event, event
+                                    )
+                            except BaseException:
+                                # Observer delivery is explicitly best effort.
+                                return
+
+                        golden_execution_task = asyncio.create_task(
+                            execute_golden(
+                                golden_request,
+                                volume=volume,
+                                volume_mount_root=volume_mount_root,
+                                output_root=str(output_root),
+                                telemetry_path=str(telemetry_path),
+                                node_classes=node_classes,
+                                snapshot_proof=_golden_snapshot_proof_supplier,
+                                restore_metadata=restore_metadata,
+                                cpu_prefetch_ticket=cpu_prefetch_ticket,
+                                stage_observer=_observe_stage_event,
+                            )
+                        )
+                        golden_execution_task.add_done_callback(
+                            lambda _task: stage_wakeup.set()
+                        )
+                        try:
+                            while True:
+                                if not golden_stage_queue.empty():
+                                    yield golden_stage_queue.get_nowait()
+                                    continue
+                                if golden_execution_task.done():
+                                    # Same-thread observers enqueue synchronously;
+                                    # give cross-thread callbacks one loop turn
+                                    # before deciding the queue is drained.
+                                    await asyncio.sleep(0)
+                                    if golden_stage_queue.empty():
+                                        break
+                                    continue
+                                stage_wakeup.clear()
+                                if (
+                                    not golden_stage_queue.empty()
+                                    or golden_execution_task.done()
+                                ):
+                                    continue
+                                await stage_wakeup.wait()
+                            result = golden_execution_task.result()
+                        finally:
+                            golden_stage_observer_closed.set()
+                            if not golden_execution_task.done():
+                                golden_execution_task.cancel()
+                            await asyncio.gather(
+                                golden_execution_task, return_exceptions=True
+                            )
+                            # Drop the request-local queue captured by the
+                            # observer closure before terminal-result shaping.
+                            golden_stage_queue = None
             finally:
                 golden_call_end_wall_ns = time.time_ns()
                 golden_call_end_mono_ns = time.monotonic_ns()
@@ -23802,6 +23895,8 @@ class ModalRuntimeEntrypoint:
                             flush=True,
                         )
                 self._golden_execution_active = False
+        except asyncio.CancelledError:
+            raise
         except BaseException as exc:
             if cpu_prefetch_ticket is not None:
                 try:

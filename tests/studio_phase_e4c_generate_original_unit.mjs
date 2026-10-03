@@ -31,9 +31,14 @@ import {
 } from "../web/studio-history-v2-experiment.js";
 
 const ROOT = path.join(import.meta.dirname, "..");
-const repoSource = fs.readFileSync(path.join(ROOT, "web", "history-v2-repository.js"), "utf8");
-const detailSource = fs.readFileSync(path.join(ROOT, "web", "studio-history-v2-detail.js"), "utf8");
-const experimentSource = fs.readFileSync(path.join(ROOT, "web", "studio-history-v2-experiment.js"), "utf8");
+// Normalize newlines: these files are CRLF on Windows checkouts, and the
+// structural assertions below join source lines with "\n".
+function readSource(...parts) {
+  return fs.readFileSync(path.join(ROOT, ...parts), "utf8").replace(/\r\n/g, "\n");
+}
+const repoSource = readSource("web", "history-v2-repository.js");
+const detailSource = readSource("web", "studio-history-v2-detail.js");
+const experimentSource = readSource("web", "studio-history-v2-experiment.js");
 
 function section(name) {
   console.log("PASS: " + name);

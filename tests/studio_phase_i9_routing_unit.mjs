@@ -26,6 +26,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WEB = path.join(ROOT, "web");
 const readWeb = (name) => fs.readFileSync(path.join(WEB, name), "utf8");
 
+/**
+ * Remove line and block comments so source-level "does not do X" assertions
+ * are not defeated by documentation that merely mentions X.
+ */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+}
+
 function section(name) {
   console.log("PASS: " + name);
 }
@@ -192,7 +202,9 @@ const PAGE_FILES = [
 ];
 for (const banned of ["pushState", "replaceState", "hashchange", "popstate", "location.hash"]) {
   for (const file of PAGE_FILES) {
-    assert.equal(readWeb(file).includes(banned), false, `${file} must not contain ${banned}`);
+    // Code only: pages may legitimately document why the hash is not a
+    // reliable routing signal, and that prose is not a violation.
+    assert.equal(stripComments(readWeb(file)).includes(banned), false, `${file} must not contain ${banned}`);
   }
 }
 

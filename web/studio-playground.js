@@ -11,15 +11,12 @@ import {
   renderExperimentMode,
   enhanceControlWithAxisCheckbox,
 } from "./studio-experiment-mode.js";
-import { getRuntimePresets } from "./studio-backend.js";
-import { runStudioPreset, getStudioRunStatus, stopExperiment, listModels } from "./studio-backend-api.js";
+// Presets were removed from the codebase; the legacy preset-driven Playground
+// path below is dead and resolves to an empty preset list. It is retained only
+// until the legacy lane is deleted outright.
+import { runStudioWorkflow, getStudioRunStatus, stopExperiment, listModels } from "./studio-backend-api.js";
 import { loadModalOptions } from "./studio-output-preferences.js";
 
-import {
-  getVisibleControlsForPreset,
-  getPresetCapabilitySummary,
-  getUnavailableControlReasons,
-} from "./studio-preset-capabilities.js";
 import { resolveRunImageUrl, hasRunImage, normalizeStudioRun, normalizeGenerationSettings, buildWaterfallLines } from "./studio-run-normalizer.js";
 import {
   saveSelection,
@@ -451,54 +448,14 @@ export async function hydratePlayground(state, context) {
   // 1. Load saved selection from localStorage
   const saved = loadSelection();
 
-  // 2. Fetch runtime presets
-  let presets = [];
-  try {
-    const { listPresets } = await import("./studio-backend-api.js");
-    presets = await listPresets(apiBase) || [];
-  } catch (e) {
-    presets = [];
-  }
-
-  // 3. Determine feature ID (saved > default)
+  // 2. No backend presets exist any more: the selected Workflow (and its
+  // current Version) is the only run identity, and the run store hydrates it.
   const featureId = (saved && saved.featureId) || "txt2img";
   if (state.playground) {
     state.playground.featureId = featureId;
+    state.playground.selectedBackendId = "";
   }
-
-  // 4. Determine preset ID (saved > empty)
-  let targetPresetId = (saved && saved.presetId) || "";
-
-  // 5. Validate preset exists
-  const presetExists = targetPresetId && presets.some(function (p) {
-    return (p.id || p.label || "") === targetPresetId;
-  });
-
-  if (!presetExists) {
-    // Invalid/deleted preset â€” try another runnable preset first
-    if (targetPresetId) {
-      const otherRunnable = presets.find(function (p) {
-        return (p.id || p.label || "") !== targetPresetId && p.status === "runnable";
-      });
-      if (otherRunnable) {
-        targetPresetId = otherRunnable.id || otherRunnable.label || "";
-        if (state.playground) {
-          state.playground.selectedBackendId = targetPresetId;
-        }
-        saveSelection(targetPresetId, featureId);
-      } else {
-        clearSelection();
-        targetPresetId = "";
-        if (state.playground) {
-          state.playground.selectedBackendId = "";
-        }
-      }
-    }
-  } else {
-    if (state.playground) {
-      state.playground.selectedBackendId = targetPresetId;
-    }
-  }
+  const targetPresetId = "";
 
   const experimentDraft = loadExperimentDraft(targetPresetId, featureId);
   if (state.playground) {
@@ -536,16 +493,13 @@ export async function hydratePlayground(state, context) {
     }
   }
 
-  // 6b. Hydrate control values from persisted draft or preset snapshot defaults
-  const preset = presets.find(function (p) { return (p.id || p.label || "") === targetPresetId; });
-  if (preset) {
-    state.playground._currentPreset = preset;
-  }
-  hydrateControlsForSelection(state, targetPresetId, featureId, preset);
+  // 6b. Controls come from the selected Workflow's own version (no preset).
+  hydrateControlsForSelection(state, targetPresetId, featureId, null);
 
-  // 7. Persist the resolved selection
-  if (targetPresetId) {
-    saveSelection(targetPresetId, featureId);
+  // 7. Persist the resolved feature selection (the run identity is the
+  // Workflow + Version, not a preset id).
+  if (featureId) {
+    saveSelection("", featureId);
   }
 
   // 8. Kick off the modern workflow selector init (idempotent â€” it is also
@@ -577,7 +531,7 @@ export function renderPlayground(state, context) {
   // global shared tracker. This prevents unrelated ComfyUI executions
   // from driving the Studio progress UI.
   //
-  // Scoped trackers are created in doRunSubmit (single runs) and in the
+  // Scoped trackers are created in _modernRunSubmit (single runs) and in the
   // experiment run handlers, then disposed on terminal states.
   // The _scopedTracker reference in state.playground is managed there.
   //
@@ -722,17 +676,8 @@ function renderControlPanel(state, context) {
     panel.appendChild(expBlock);
   }
 
-  // â”€â”€ Backend Selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Shelf flow (a modern Workflow is selected): no Backend/Preset UI.
-  // The Shelf owns field cards and the shared picker owns switching.
-  // The legacy preset lane keeps this UI when no Workflow is selected.
-  if (!_isModernRunSelected(state)) {
-    panel.appendChild(renderControlGroup("Backend", renderBackendSelector(state, actions, context)));
-  }
-
   // â”€â”€ Workflow Selector (modern workflow-driven runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // Separate container rendered after the legacy selector row so legacy
-  // test-ids/order stay intact. Empty-state only until a workflow is chosen.
+  // Empty-state only until a workflow is chosen.
   panel.appendChild(renderWorkflowSelector(state, context, actions));
 
   // Shelf field cards (Studio Workflow effort, leaf 1.2.2): bound field
@@ -742,165 +687,6 @@ function renderControlPanel(state, context) {
     panel.appendChild(renderShelfSection(state, context, actions));
   }
 
-  // â”€â”€ Preset-driven Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  const controlsContainer = el("div", { class: "comfymodal-studio-controls", "data-testid": "controls-container" });
-  // Phase I8: section-level loading uses the shared primitive (legal DOM
-  // container — it is fully replaced once capabilities resolve).
-  controlsContainer.appendChild(renderLoadingState({
-    label: "Loading preset capabilities…",
-    size: "inline",
-    testid: "playground-capabilities-loading",
-  }));
-
-  const selectedPresetId = state.playground && state.playground.selectedBackendId;
-  if (selectedPresetId) {
-    const currentPreset = getCurrentPresetForSelection(state, selectedPresetId);
-    if (currentPreset) {
-      hydrateControlsForSelection(state, selectedPresetId, currentFeatureId, currentPreset);
-    }
-  } else {
-    state.playground._hydratedControls = {};
-  }
-
-  // Async load presets to derive capabilities
-  getRuntimePresets({ apiBase }).then((presets) => {
-    if (!controlsContainer.isConnected) return;
-    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
-
-    const preset = (presets || []).find((p) => (p.id || p.label || "") === selectedPresetId);
-
-    if (preset) {
-      state.playground._currentPreset = preset;
-    }
-
-    if (!selectedPresetId || !preset) {
-      // No preset selected â€” prompt to select one
-      const noPresetMsg = el("div", {
-        class: "comfymodal-studio-card",
-        style: "padding:12px;text-align:center;",
-      }, [
-        el("p", {
-          text: "Select a Backend Preset to see controls.",
-          style: "font-size:11px;color:#888;margin:0 0 8px;",
-        }),
-        el("a", {
-          text: "Open Backend to create presets",
-          style: "font-size:11px;color:var(--color-accent);cursor:pointer;",
-          onclick: (e) => {
-            e.preventDefault();
-            if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
-          },
-        }),
-      ]);
-      controlsContainer.appendChild(noPresetMsg);
-      return;
-    }
-
-    // Feature compatibility check
-    const compat = preset.compatibleFeatures || [];
-    if (!compat.includes(currentFeatureId)) {
-      controlsContainer.appendChild(el("p", {
-        text: `Selected preset does not support "${currentFeatureId}".`,
-        style: "font-size:11px;color:#fbbf24;padding:8px;",
-      }));
-      return;
-    }
-
-    // Derive visible controls from capabilities + bindings
-    const visibleControlIds = getVisibleControlsForPreset(preset, currentFeatureId);
-    const summary = getPresetCapabilitySummary(preset, currentFeatureId);
-    const reasons = getUnavailableControlReasons(preset, currentFeatureId);
-
-    // If feature is a placeholder (object_remove/replace), show honest disabled state
-    if (currentSpec.isPlaceholder) {
-      const placeholderMsg = el("div", { class: "comfymodal-studio-placeholder-notice" }, [
-        el("p", {
-          text: currentSpec.placeholderReason || "This feature is not implemented yet.",
-          style: "color:var(--color-text-muted);font-size:var(--font-size-sm);font-style:italic;",
-        }),
-      ]);
-      controlsContainer.appendChild(placeholderMsg);
-    }
-
-    // Render visible controls
-    visibleControlIds.forEach((ctrlId) => {
-      const def = CONTROL_DEFS[ctrlId];
-      if (!def) return;
-
-      // Instruction is only visible for placeholder features (object_remove/object_replace)
-      if (ctrlId === "instruction" && !currentSpec.isPlaceholder) return;
-
-      const isBound = summary.requiredBindings.some((r) => r.key === ctrlId && r.bound)
-        || summary.optionalBindings.some((o) => o.key === ctrlId && o.bound);
-
-      // Check if this control is in the preset's nodeBindings
-      const hasBinding = !!(preset.nodeBindings && preset.nodeBindings[ctrlId] && preset.nodeBindings[ctrlId].nodeId);
-      const hasResolvedSchema = !!(
-        preset.controlSchemas
-        && preset.controlSchemas[ctrlId]
-        && preset.controlSchemas[ctrlId].schemaResolved
-      );
-
-      const controlRow = renderControl(def, state, actions, preset);
-
-      // Disable the control if it's a required binding not yet bound
-      if (!isBound && !hasBinding && !hasResolvedSchema) {
-        controlRow.style.opacity = "0.5";
-        const reason = reasons[ctrlId] || "Requires node binding";
-        const reasonEl = el("p", {
-          text: `\u26a0 ${reason}`,
-          style: "font-size:9px;color:#fbbf24;margin:2px 0 0;",
-        });
-        controlRow.appendChild(reasonEl);
-      }
-
-      // In experiment mode, add axis checkbox for eligible controls
-      if (isExperiment && def.experimentEligible) {
-        const checkboxWrapper = enhanceControlWithAxisCheckbox(controlRow, ctrlId, state, actions);
-        if (checkboxWrapper && controlRow.firstChild) {
-          controlRow.insertBefore(checkboxWrapper, controlRow.firstChild);
-        }
-        const axisData = state.playground && state.playground.experimentAxes && state.playground.experimentAxes[ctrlId];
-        const eligibleAxes = (state.playground && state.playground._eligibleAxes) || [];
-        if (axisData && axisData.enabled && eligibleAxes.includes(ctrlId)) {
-          const originalInput = controlRow.querySelector('[data-testid="input-' + ctrlId + '"]');
-          if (originalInput) originalInput.remove();
-        }
-      }
-
-      controlsContainer.appendChild(controlRow);
-    });
-
-    // If no visible controls (shouldn't normally happen), show a message
-    if (visibleControlIds.length === 0 && !currentSpec.isPlaceholder) {
-      controlsContainer.appendChild(el("p", {
-        text: "No controls available for this preset+feature combination.",
-        style: "font-size:11px;color:#888;padding:8px;font-style:italic;",
-      }));
-    }
-  }).catch(() => {
-    if (!controlsContainer.isConnected) return;
-    while (controlsContainer.firstChild) controlsContainer.removeChild(controlsContainer.firstChild);
-    controlsContainer.appendChild(el("p", {
-      text: "Could not load preset data.",
-      style: "font-size:11px;color:#f87171;padding:8px;",
-    }));
-  }).then(() => {
-    if (!panel.isConnected) return;
-    const pg = state.playground;
-    if (pg && pg._controlPanelScrollRestorePending && pg._controlPanelScrollTop != null) {
-      panel.scrollTop = pg._controlPanelScrollTop;
-      if (panel.scrollTop === pg._controlPanelScrollTop) {
-        pg._controlPanelScrollRestorePending = false;
-      }
-    }
-  });
-
-  // Shelf flow: the Shelf owns the bound fields, so the legacy
-  // preset-driven controls stay out of this flow entirely.
-  if (!_isModernRunSelected(state)) {
-    panel.appendChild(controlsContainer);
-  }
 
   // â”€â”€ Run Button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   panel.appendChild(renderRunButton(state, context, actions));
@@ -1247,103 +1033,6 @@ function renderControlGroup(labelText, inputEl) {
 // Filters by feature compatibility when appropriate.
 // In empty state, links to the Backend tab (H10: no Legacy Setup funnels).
 
-function renderBackendSelector(state, actions, context) {
-  const container = el("div", { class: "comfymodal-studio-backend-selector", "data-testid": "backend-selector" });
-
-  const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "backend-select",
-  });
-  select.addEventListener("mousedown", () => {
-    if (state.playground) state.playground._backendSelectInteracting = true;
-  });
-  select.addEventListener("focus", () => {
-    if (state.playground) state.playground._backendSelectInteracting = true;
-  });
-  select.addEventListener("blur", () => {
-    if (state.playground) state.playground._backendSelectInteracting = false;
-  });
-  const loadingOpt = el("option", { value: "", text: "Loading backends…", disabled: true, selected: true });
-  select.appendChild(loadingOpt);
-  select.disabled = true;
-  container.appendChild(select);
-
-    // Async load presets through the Studio abstraction (runtime selectors only)
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  getRuntimePresets({ apiBase }).then((backends) => {
-    if (!select.isConnected) return;
-    while (select.firstChild) select.removeChild(select.firstChild);
-
-    if (!backends || backends.length === 0) {
-      // Empty state: show disabled select + link to Backend tab
-      const emptyOpt = el("option", { value: "", text: "No backends available", disabled: true, selected: true });
-      select.appendChild(emptyOpt);
-      select.disabled = true;
-
-      // Remove any existing empty message and add fresh one linking to Backend tab
-      const existingMsg = container.querySelector(".comfymodal-studio-backend-empty-msg");
-      if (existingMsg) existingMsg.remove();
-
-      // Phase I8: ordinary no-selection empty state via the shared primitive
-      // (copy supplied here; the cleanup marker class is preserved).
-      const backendLink = el("a", {
-        text: "Go to Backend tab to add backends.",
-        style: "color:var(--color-accent);cursor:pointer;",
-        onclick: (e) => {
-          e.preventDefault();
-          if (actions && actions.navigateToBackendTab) actions.navigateToBackendTab();
-        },
-      });
-      const emptyMsg = renderEmptyState({
-        title: "No backends configured.",
-        action: backendLink,
-        testid: "playground-backend-empty",
-      });
-      emptyMsg.classList.add("comfymodal-studio-backend-empty-msg");
-      container.appendChild(emptyMsg);
-      return;
-    }
-
-    // Populate select with loaded backends
-    select.disabled = false;
-    const placeholderOpt = el("option", { value: "", text: "Select a backend…", disabled: true, selected: true });
-    select.appendChild(placeholderOpt);
-
-    const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-    backends.forEach((b) => {
-      const compat = b.compatibleFeatures || [];
-      // Show all backends; compatibility is advisory
-      const opt = el("option", { value: b.id || b.label || "", text: b.label || b.id || "Unknown" });
-      if (compat.length > 0 && !compat.includes(currentFeatureId)) {
-        opt.style.opacity = "0.5";
-        opt.title = `Not tested with ${currentFeatureId}`;
-      }
-      select.appendChild(opt);
-    });
-
-    // Set current selection from state
-    const currentId = state.playground && state.playground.selectedBackendId;
-    if (currentId) {
-      select.value = currentId;
-    }
-
-    // Wire change handler to update state
-    select.addEventListener("change", () => {
-      if (actions && actions.setBackend) {
-        actions.setBackend(select.value);
-      }
-    });
-  }).catch(() => {
-    if (!select.isConnected) return;
-    while (select.firstChild) select.removeChild(select.firstChild);
-    const errOpt = el("option", { value: "", text: "Could not load backends", disabled: true, selected: true });
-    select.appendChild(errOpt);
-    select.disabled = true;
-  });
-
-  return container;
-}
-
 // â”€â”€ Workflow Run Selector (modern workflow-driven runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // Renders a Workflow / Version / Preset selector backed by the frozen
@@ -1360,62 +1049,50 @@ function renderBackendSelector(state, actions, context) {
 let _workflowModelLibraryCache = null;
 let _workflowModelLibraryCacheKey = "";
 
+/**
+ * Load the model inventory the run gate needs, once per apiBase.
+ *
+ * Compatibility is a server-owned answer, but the browser still needs the
+ * inventory to know WHICH model the selected version actually references.
+ * Failures degrade to an empty inventory: model compatibility then falls back
+ * to the version's own dependency metadata, and an unknown model never blocks
+ * a run on a catalogue miss alone.
+ *
+ * Must never throw — it is awaited inside the Workflow-change handler, and a
+ * rejection there would strand the run store mid-selection.
+ */
+async function _loadWorkflowModelLibrary(state, apiBase) {
+  const pg = state && state.playground;
+  if (!pg) return [];
+  const base = apiBase || "/comfymodal";
+  if (_workflowModelLibraryCacheKey !== base || !_workflowModelLibraryCache) {
+    let records = [];
+    try {
+      const data = await listModels(base);
+      if (data && data.status !== "error" && Array.isArray(data.models)) {
+        records = data.models;
+      }
+    } catch (e) {
+      records = [];
+    }
+    _workflowModelLibraryCache = records;
+    _workflowModelLibraryCacheKey = base;
+  }
+  pg._workflowModelLibrary = _workflowModelLibraryCache;
+  return _workflowModelLibraryCache;
+}
+
 function _isModernRunSelected(state) {
   const store = state && state.playground && state.playground._workflowRun;
   return !!(store && store.workflowId && store.workflowVersionId);
 }
 
 function _workflowOptionLabel(w) {
-  const name = (w && w.name) ? w.name : "Unnamed workflow";
-  if (w && w.version_count != null) {
-    return name + " (" + w.version_count + " version" + (w.version_count === 1 ? "" : "s") + ")";
-  }
-  if (w && w.latest_version_number != null) {
-    return name + " (v" + w.latest_version_number + ")";
-  }
-  return name;
+  // A workflow has one current version, so the chooser shows just the name.
+  // Version counts/numbers are internal history, not a choice to offer here.
+  return (w && w.name) ? w.name : "Unnamed workflow";
 }
 
-function _workflowVersionOptionLabel(v) {
-  const label = "v" + (v && v.version_number != null ? v.version_number : "?");
-  const created = (v && v.created_at) ? _workflowShortDate(v.created_at) : "";
-  return created ? label + " \u00b7 " + created : label;
-}
-
-function _workflowShortDate(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return String(iso);
-  try {
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  } catch (e) {
-    return String(iso);
-  }
-}
-
-async function _loadWorkflowModelLibrary(state, apiBase) {
-  try {
-    if (_workflowModelLibraryCacheKey === apiBase && _workflowModelLibraryCache) {
-      if (state && state.playground) state.playground._workflowModelLibrary = _workflowModelLibraryCache;
-      return _workflowModelLibraryCache;
-    }
-    const data = await listModels(apiBase);
-    const records = (data && Array.isArray(data.models)) ? data.models : [];
-    _workflowModelLibraryCache = records;
-    _workflowModelLibraryCacheKey = apiBase;
-    if (state && state.playground) state.playground._workflowModelLibrary = records;
-    return records;
-  } catch (e) {
-    if (state && state.playground) state.playground._workflowModelLibrary = [];
-    return [];
-  }
-}
-
-/**
- * True when the selected workflow/version declares a non-empty model
- * compatibility contract. With no declared contract every enum model is
- * treated as compatible (no suffix, no gating).
- */
 function _workflowHasModelContract(store) {
   const ctx = store && store.runContext;
   if (!ctx) return false;
@@ -1473,7 +1150,7 @@ function _workflowGatingInfo(store, wf, state) {
   if (store.statusLine) return { text: store.statusLine, color: "#d9a441" };
   if (store.status === "error") return { text: store.error || "Load error", color: "#f87171" };
   if (!store.workflowId) return { text: "Select a workflow", color: "" };
-  if (!store.workflowVersionId) return { text: "Select a version", color: "" };
+  if (!store.workflowVersionId) return { text: "Select a Workflow", color: "" };
   if (store.status === "loading" || !wf || !store.runContext) {
     return { text: store.status === "loading" ? "Loading\u2026" : "Loading workflow\u2026", color: "" };
   }
@@ -1509,63 +1186,6 @@ function _workflowSelectEl(state, actions, context) {
   return select;
 }
 
-function _workflowVersionSelectEl(state, actions, context) {
-  // A workflow has one version, so this is a read-only label rather than a
-  // chooser. It keeps the field's place in the layout and its testid, so the
-  // surrounding run form is unchanged; only the ability to switch is gone.
-  const store = state && state.playground && state.playground._workflowRun;
-  if (!store || !store.workflowId) {
-    return el("span", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-version-selector",
-      text: "No workflow selected",
-    });
-  }
-  const versions = store.versions || [];
-  const current = versions.find(
-    (v) => String(v.workflow_version_id) === String(store.workflowVersionId)
-  ) || versions[versions.length - 1];
-  if (!current) {
-    return el("span", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-version-selector",
-      text: "No version",
-    });
-  }
-  return el("span", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "workflow-version-selector",
-    "data-version-id": String(current.workflow_version_id),
-    text: _workflowVersionOptionLabel(current),
-  });
-}
-
-function _workflowPresetSelectEl(state, actions, context) {
-  const store = state && state.playground && state.playground._workflowRun;
-  const select = el("select", {
-    class: "comfymodal-input comfymodal-studio-select",
-    "data-testid": "workflow-preset-selector",
-  });
-  if (!store || !store.workflowVersionId) {
-    select.appendChild(el("option", { value: "", text: "No version selected", disabled: true, selected: true }));
-    select.disabled = true;
-    return select;
-  }
-  const placeholder = el("option", { value: "", text: "Select a preset\u2026", disabled: true });
-  if (!store.presetId) placeholder.selected = true;
-  select.appendChild(placeholder);
-  (store.presets || []).forEach((p) => {
-    const opt = el("option", { value: String(p.preset_id), text: p.name || "Unnamed preset" });
-    if (store.presetId && String(store.presetId) === String(p.preset_id)) opt.selected = true;
-    select.appendChild(opt);
-  });
-  select.disabled = !store.workflowVersionId || (store.presets || []).length === 0;
-  select.addEventListener("change", () => {
-    _handlePresetChange(state, context, actions, select.value);
-  });
-  return select;
-}
-
 function _workflowGatingLineEl(state, wf, context) {
   const store = state && state.playground && state.playground._workflowRun;
   const info = _workflowGatingInfo(store, wf, state);
@@ -1592,159 +1212,6 @@ function _workflowGatingLineEl(state, wf, context) {
   return line;
 }
 
-function _workflowControlRow(entry, schemaEntry, store, wf, state, actions, context, compat) {
-  const role = entry.semantic_role;
-  const group = el("div", {
-    class: "comfymodal-studio-control-group",
-    "data-testid": "workflow-control-" + role,
-  });
-  group.appendChild(el("label", { class: "comfymodal-studio-control-label", text: role }));
-
-  const current = (store.controlValues && typeof store.controlValues === "object") ? store.controlValues : {};
-  const hasValue = Object.prototype.hasOwnProperty.call(current, role);
-  const value = hasValue ? current[role] : undefined;
-  const kind = schemaEntry.control_kind || "string";
-  const enumOptions = Array.isArray(schemaEntry.enum_options) ? schemaEntry.enum_options : [];
-  const hasEnums = enumOptions.length > 0;
-  // With no declared compatibility contract every enum model is treated as
-  // compatible (no suffix, no gating).
-  const hasModelContract = _workflowHasModelContract(store);
-
-  // DOMâ†’store round-trip: preserve falsy values verbatim. Number inputs only
-  // convert to Number when the schema kind is integer/float; selects produce
-  // the exact option string (including "" if an option is empty string).
-  function commit(rawValue) {
-    store.setControlValue(role, rawValue);
-    const schema = wf.getControlSchema(store);
-    const validation = wf.validateMappedValues(store.controlValues || {}, schema);
-    store.setControlValues(validation.values);
-    const reasons = validation.errors && validation.errors.length
-      ? validation.errors.map((e) => e.message)
-      : [];
-    // Known incompatible models must not silently execute: mirror the reason
-    // in the store so every gating consumer sees it.
-    const incompatible = _selectedIncompatibleModel(store, wf, compat);
-    if (incompatible) {
-      reasons.push("model '" + incompatible + "' is not compatible with this workflow version");
-    }
-    store.setReasons(reasons);
-    _syncWorkflowGating(state, context, actions);
-  }
-
-  let input = null;
-
-  if (kind === "enum" || hasEnums) {
-    input = el("select", {
-      class: "comfymodal-input comfymodal-studio-select",
-      "data-testid": "workflow-input-" + role,
-    });
-    enumOptions.forEach((opt) => {
-      let text = String(opt);
-      if (hasModelContract && compat && compat.byFilename && Object.prototype.hasOwnProperty.call(compat.byFilename, String(opt))) {
-        const c = compat.byFilename[String(opt)];
-        if (c && c.compatible === false) {
-          text = String(opt) + " (incompatible)";
-        } else if (c && c.installed === false) {
-          text = String(opt) + " (missing)";
-        }
-      }
-      const option = el("option", { value: String(opt), text: text });
-      if (value !== undefined && String(value) === String(opt)) option.selected = true;
-      input.appendChild(option);
-    });
-    input.addEventListener("change", () => commit(input.value));
-  } else if (kind === "boolean") {
-    input = el("input", {
-      type: "checkbox",
-      class: "comfymodal-input comfymodal-studio-checkbox",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.checked = value === true || value === 1 || value === "1" || value === "true";
-    input.addEventListener("change", () => commit(input.checked));
-  } else if (kind === "integer") {
-    input = el("input", {
-      type: "number",
-      step: "1",
-      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
-      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
-      class: "comfymodal-input comfymodal-studio-number-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => {
-      const raw = input.value;
-      const parsed = parseInt(raw, 10);
-      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
-    });
-  } else if (kind === "number") {
-    input = el("input", {
-      type: "number",
-      step: schemaEntry.step != null ? String(schemaEntry.step) : "any",
-      min: schemaEntry.minimum != null ? String(schemaEntry.minimum) : "",
-      max: schemaEntry.maximum != null ? String(schemaEntry.maximum) : "",
-      class: "comfymodal-input comfymodal-studio-number-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => {
-      const raw = input.value;
-      const parsed = parseFloat(raw);
-      commit(raw === "" || Number.isNaN(parsed) ? raw : parsed);
-    });
-  } else if (kind === "multiline") {
-    input = el("textarea", {
-      class: "comfymodal-input comfymodal-studio-textarea",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => commit(input.value));
-  } else if (kind === "file" || kind === "image") {
-    // Read-only display of the current filename (upload is out of scope);
-    // the value stays whatever the preset/graph declared.
-    input = el("input", {
-      type: "text",
-      class: "comfymodal-input comfymodal-studio-text-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      disabled: true,
-      title: "File selection is out of scope — the current value comes from the preset/graph.",
-      "data-testid": "workflow-input-" + role,
-    });
-    group.appendChild(el("span", {
-      class: "comfymodal-studio-control-note",
-      text: "File selection is out of scope — value preserved from preset/graph.",
-      style: "font-size:var(--font-size-xs);color:var(--color-text-muted);",
-    }));
-  } else {
-    input = el("input", {
-      type: "text",
-      class: "comfymodal-input comfymodal-studio-text-input",
-      value: value !== undefined && value !== null ? String(value) : "",
-      "data-testid": "workflow-input-" + role,
-    });
-    input.addEventListener("input", () => commit(input.value));
-  }
-
-  if (input) group.appendChild(input);
-  return group;
-}
-
-function _renderWorkflowMappedControls(container, state, context, actions) {
-  while (container.firstChild) container.removeChild(container.firstChild);
-  const store = state && state.playground && state.playground._workflowRun;
-  const wf = state && state.playground && state.playground._workflowRunModule;
-  if (!store || !wf || !store.runContext || !store.runContext.mapping) return;
-  const entries = Array.isArray(store.runContext.mapping.entries) ? store.runContext.mapping.entries : [];
-  const schema = wf.getControlSchema(store);
-  const modelRecords = (state && state.playground && state.playground._workflowModelLibrary) || [];
-  const compat = wf.modelCompatibility(store, modelRecords);
-  entries.forEach((entry) => {
-    const role = entry && entry.semantic_role;
-    if (!role || !Object.prototype.hasOwnProperty.call(schema, role)) return;
-    const row = _workflowControlRow(entry, schema[role], store, wf, state, actions, context, compat);
-    if (row) container.appendChild(row);
-  });
-}
-
 function _populateWorkflowSelector(container, state, context, actions) {
   while (container.firstChild) container.removeChild(container.firstChild);
   try { _populateWorkflowSelectorInner(container, state, context, actions); } catch (e) {
@@ -1764,8 +1231,6 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
   const wf = state && state.playground && state.playground._workflowRunModule;
 
   container.appendChild(_workflowSelectEl(state, actions, context));
-  container.appendChild(_workflowVersionSelectEl(state, actions, context));
-  container.appendChild(_workflowPresetSelectEl(state, actions, context));
   container.appendChild(_workflowGatingLineEl(state, wf, context));
 
   if (store && store.handoff) {
@@ -1777,17 +1242,13 @@ function _populateWorkflowSelectorInner(container, state, context, actions) {
     }));
   }
   if (store && store.handoffError) {
-    container.appendChild(el("div", {
+container.appendChild(el("div", {
       "data-testid": "workflow-handoff-error",
       class: "comfymodal-studio-empty-state",
       text: store.handoffError,
       style: "font-size:var(--font-size-xs);color:#f87171;margin-top:4px;",
     }));
   }
-
-  const controlsBox = el("div", { "data-testid": "workflow-mapped-controls" });
-  _renderWorkflowMappedControls(controlsBox, state, context, actions);
-  container.appendChild(controlsBox);
 }
 
 function _rerenderWorkflowSection(state, context, actions, opts) {
@@ -1922,9 +1383,7 @@ function _failWorkflowHandoff(wf, store, error) {
   store.setReasons([error]);
   store.setWorkflowId("");
   store.setVersionId("");
-  store.setPresetId("");
   store.setWorkflowName("");
-  store.setPresetName("");
   store.setRunContext(null);
   store.controlValues = {};
   store.setStatus("idle");
@@ -1936,7 +1395,7 @@ function _failWorkflowHandoff(wf, store, error) {
 
 async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff) {
   const apiBase = (context && context.apiBase) || "/comfymodal";
-  const missing = "Requested workflow/version/preset no longer available";
+  const missing = "Requested workflow/version no longer available";
 
   const wfRes = await wf.selectWorkflow(apiBase, store, handoff.workflowId);
   if (!wfRes.ok) {
@@ -1955,19 +1414,6 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
       return;
     }
   }
-  if (handoff.presetId) {
-    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(handoff.presetId));
-    if (!presetExists) {
-      _failWorkflowHandoff(wf, store, missing);
-      return;
-    }
-    const preRes = await wf.selectPreset(apiBase, store, handoff.presetId);
-    if (!preRes.ok) {
-      _failWorkflowHandoff(wf, store, preRes.error || missing);
-      return;
-    }
-  }
-
   // Consume + validate the one-shot handoff against the now-loaded data.
   const h = wf.resolveHandoffSelection(store);
   if (!h || !h.ok) {
@@ -1979,9 +1425,7 @@ async function _applyWorkflowHandoff(state, context, actions, wf, store, handoff
   wf.saveWorkflowSelection({
     workflowId: store.workflowId,
     workflowVersionId: store.workflowVersionId,
-    presetId: store.presetId,
     workflowName: store.workflowName || "",
-    presetName: store.presetName || "",
   });
 }
 
@@ -2014,8 +1458,6 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     if (!target) {
       store.statusLine = "Requested version no longer available";
       store.setVersionId("");
-      store.setPresetId("");
-      store.setPresetName("");
       store.controlValues = {};
       store.setStatus("ready");
       store.setReasons(["Requested version no longer available"]);
@@ -2024,23 +1466,6 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
     if (!verRes.ok) {
       store.statusLine = verRes.error || "Requested version no longer available";
-      return;
-    }
-  }
-  if (saved.presetId) {
-    const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(saved.presetId));
-    if (!presetExists) {
-      // Keep the workflow/version; never silently substitute a preset.
-      store.statusLine = "Requested preset no longer available";
-      store.setPresetId("");
-      store.setPresetName("");
-      store.setStatus("ready");
-      store.setReasons(["Requested preset no longer available"]);
-      return;
-    }
-    const preRes = await wf.selectPreset(apiBase, store, saved.presetId);
-    if (!preRes.ok) {
-      store.statusLine = preRes.error || "Requested preset no longer available";
       return;
     }
   }
@@ -2059,32 +1484,11 @@ async function _handleWorkflowChange(state, context, actions, workflowId) {
     wf.saveWorkflowSelection({
       workflowId: store.workflowId,
       workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
       workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
     });
   }
   // Shelf: a new Workflow loads its own durably autosaved field values.
   _rerenderWorkflowSection(state, context, actions, { applySaved: true });
-}
-
-async function _handlePresetChange(state, context, actions, presetId) {
-  const store = state && state.playground && state.playground._workflowRun;
-  const wf = state && state.playground && state.playground._workflowRunModule;
-  if (!store || !wf) return;
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  store.handoffError = null;
-  const result = await wf.selectPreset(apiBase, store, presetId || "");
-  if (result && result.ok) {
-    wf.saveWorkflowSelection({
-      workflowId: store.workflowId,
-      workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
-      workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
-    });
-  }
-  _rerenderWorkflowSection(state, context, actions);
 }
 
 // â”€â”€ Run button gating (modern mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2222,10 +1626,11 @@ async function _modernRunSubmit(state, context, actions, btn) {
   const schema = wf.getControlSchema(store);
 
   ctrl.mark("validation_start");
-  const presetObj = (store.presets || []).find(function (p) {
-    return String(p.preset_id) === String(store.presetId || "");
-  }) || null;
-  const merged = wf.mergePresetAndOverrides(presetObj, store.controlValues || {}, schema);
+  const merged = wf.mergeDefaultsAndOverrides(
+    wf.defaultValuesFromContext(store),
+    store.controlValues || {},
+    schema,
+  );
   ctrl.mark("validation_end");
   if (merged.errors && merged.errors.length) {
     ctrl.applyLocalError(merged.errors[0].message);
@@ -2256,7 +1661,7 @@ async function _modernRunSubmit(state, context, actions, btn) {
   ctrl.mark("build_end");
 
   ctrl.mark("http_invoked");
-  const result = await runStudioPreset(apiBase, payload);
+  const result = await runStudioWorkflow(apiBase, payload);
   ctrl.mark("backend_ack");
 
   if (result && result.status === "ok") {
@@ -2807,121 +2212,6 @@ function _handleDirectRunResult(result, state, context, actions, controls) {
   return true;
 }
 
-async function doRunSubmit(state, context, actions, clickedBtn) {
-  // T0: request identity origin (literal first line, before any workflow prep)
-  const requestId = crypto.randomUUID();
-  const ui_run_triggered_wall_unix_ms = Date.now();
-  const ui_run_triggered_perf_ms = performance.now();
-  const browser_time_origin_ms = performance.timeOrigin;
-  const requestOriginInfo = {
-    request_id: requestId,
-    trigger_source: "playground_run",
-    ui_run_triggered_wall_unix_ms: ui_run_triggered_wall_unix_ms,
-    ui_run_triggered_perf_ms: ui_run_triggered_perf_ms,
-    browser_time_origin_ms: browser_time_origin_ms,
-  };
-
-  // â”€â”€ Modern workflow mode: never fall back to the legacy preset path â”€â”€
-  // Prefer the actually-clicked button; fall back to the visible primary
-  // run button (never an unscoped first-match that could be hidden/stale).
-  if (_isModernRunSelected(state)) {
-    var _modernBtn = clickedBtn || _resolvePrimaryRunButton();
-    await _modernRunSubmit(state, context, actions, _modernBtn);
-    return;
-  }
-
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  var ctrl = _getRunController(state, actions);
-  if (!ctrl) return;
-  ctrl.beginRun();
-  ctrl.mark("submit_entered");
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-  const selectedId = state.playground && state.playground.selectedBackendId;
-  if (!selectedId) return;
-
-  const { listPresets } = await import("./studio-backend-api.js");
-  ctrl.mark("build_start");
-  const presets = await listPresets(apiBase) || [];
-  const preset = presets.find(function (p) { return (p.id || p.label || "") === selectedId; });
-  if (!preset) return;
-  ctrl.mark("build_end");
-
-  const controls = buildEffectiveControls(state, preset, currentFeatureId);
-
-  ctrl.mark("validation_start");
-  const validationError = validateControls(controls, preset);
-  ctrl.mark("validation_end");
-  if (validationError) {
-    ctrl.applyLocalError(validationError);
-    return;
-  }
-  const modalOptions = await buildStudioModalOptions(apiBase);
-
-  // Clear previous output so canvas shows live progress immediately
-  if (state.playground) {
-    state.playground.lastRunOutput = null;
-    state.playground._selectedRun = null;
-  }
-  // Put determinate sampler fields into running state BEFORE remote call
-  var _runSteps = controls.steps;
-  var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-  if (state.playground && state.playground.runState) delete state.playground.runState._localStartTime;
-  // Start local elapsed timer immediately on press
-  _startLocalElapsedTimer(state, context);
-
-  // Capture client-side timestamps at press time (top-level `trace` for server)
-  const t0_perf_ms = performance.now();
-  const t0_now = Date.now();
-
-  ctrl.mark("http_invoked");
-  const result = await runStudioPreset(apiBase, {
-    presetId: preset.id || selectedId,
-    featureId: currentFeatureId,
-    controls: controls,
-    modal_options: modalOptions,
-    request_origin: requestOriginInfo,
-    metadata: {
-      source: "studio_playground",
-    },
-    trace: {
-      t0_perf_ms: t0_perf_ms,
-      t0_perf_now_ms: t0_now,
-      t0_client_press_ms: t0_now,
-      request_id: requestId,
-    },
-  });
-  ctrl.mark("backend_ack");
-
-  if (result && result.status === "ok") {
-    // â”€â”€ Direct run: result is already completed, no polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (_handleDirectRunResult(result, state, context, actions, controls)) {
-      return;
-    }
-
-    // â”€â”€ Scheduler path: result is a submission, start polling â”€â”€â”€â”€â”€â”€â”€
-    // Derive initial sampler maximum from submitted steps control
-    var _submittedSteps = controls.steps;
-    ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
-    ctrl.applySubmission({
-      experimentId: result.experimentId || result.runId || "",
-      samplerMaximum: (_submittedSteps != null && Number(_submittedSteps) > 0) ? Number(_submittedSteps) : 0,
-    });
-    ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
-
-    // Restart local elapsed timer; preserves original _localStartTime
-    _startLocalElapsedTimer(state, context);
-  } else {
-    const errMsg = (result && result.message) || "Run failed.";
-    if (result && result.error_code) {
-      console.error("[Studio run] execution failed", {
-        error_code: result.error_code,
-        error: result.error || null,
-      });
-    }
-    ctrl.applyLocalError(errMsg);
-  }
-}
-
 function renderRunButton(state, context, actions) {
   const container = el("div", { class: "comfymodal-studio-run-section" });
 
@@ -3061,11 +2351,11 @@ function renderRunButton(state, context, actions) {
       messageEl.appendChild(viewLink);
     }
     // Single click: immediately submit another run using visible settings.
-    // Prioritize doRunSubmit so prior image/metadata stays visible until
+    // Prioritize _modernRunSubmit so prior image/metadata stays visible until
     // the new submission enters flight (setRunState("running") clears the
     // completed state and triggers re-render).
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -3098,7 +2388,7 @@ function renderRunButton(state, context, actions) {
     reason.appendChild(dismissBtn);
     // Retry button re-uses the Run button's existing onclick setup
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
@@ -3115,182 +2405,18 @@ function renderRunButton(state, context, actions) {
     msgEl.textContent = _canceled ? "Run canceled." : "Run interrupted.";
     reason.appendChild(msgEl);
     btn.onclick = function () {
-      doRunSubmit(state, context, actions, btn);
+      _modernRunSubmit(state, context, actions, btn);
     };
     return container;
   }
 
-  // Async-load presets to determine runnability
-  getRuntimePresets({ apiBase }).then((presets) => {
-    if (!container.isConnected) return;
+  // Gating is driven entirely by the modern workflow run store: there are
+  // no backend presets to load, so no async preset fetch and no legacy
+  // fallback branch.
+  if (container.isConnected) {
     while (reason.firstChild) reason.removeChild(reason.firstChild);
-
-    // Modern workflow mode: gating is driven by the workflow run store.
-    // Never fall back to the legacy preset path when a workflow is selected.
-    if (_isModernRunSelected(state)) {
-      _applyModernRunButtonState(state, context, actions, btn, reason);
-      return;
-    }
-
-    if (!presets || presets.length === 0) {
-      btn.disabled = true;
-      btn.title = "No backend presets configured";
-
-      const p1 = el("p", {
-        text: "No backend presets configured. ",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      });
-      const link = el("a", {
-        text: "Go to Backend tab",
-        style: "font-size:var(--font-size-sm);color:var(--color-accent);cursor:pointer;",
-        onclick: (e) => {
-          e.preventDefault();
-          actions.navigateToBackendTab();
-        },
-      });
-      reason.appendChild(p1);
-      reason.appendChild(link);
-      reason.appendChild(document.createTextNode(" to create presets."));
-      return;
-    }
-
-    // â”€â”€ Single run mode (also used in experiment mode, since experiment
-    //     mode has its own dedicated "Run Experiment" button) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const selectedId = state.playground && state.playground.selectedBackendId;
-    if (!selectedId) {
-      btn.disabled = true;
-      btn.title = "Select a backend preset";
-      reason.appendChild(el("p", {
-        text: "Select or create a Backend Preset.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-      return;
-    }
-
-    const preset = presets.find((p) => (p.id || p.label || "") === selectedId);
-    if (!preset) {
-      btn.disabled = true;
-      btn.title = "Selected preset not found";
-      reason.appendChild(el("p", {
-        text: "Selected preset is no longer available.",
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-      return;
-    }
-
-    const presetRunnable = preset.status === "runnable";
-    const featureCompat = (preset.compatibleFeatures || []).includes(currentFeatureId);
-    let disabledReason = "";
-
-    if (preset.archived) {
-      disabledReason = "This preset is archived.";
-    } else if (!featureCompat) {
-      disabledReason = `This preset does not support "${currentFeatureId}".`;
-    } else if (!presetRunnable && preset.disabledReason) {
-      disabledReason = preset.disabledReason;
-    } else if (!presetRunnable) {
-      disabledReason = "This preset is not runnable.";
-    }
-
-    if (disabledReason) {
-      btn.disabled = true;
-      btn.title = disabledReason;
-      reason.appendChild(el("p", {
-        text: disabledReason,
-        style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-      }));
-    } else {
-      btn.disabled = false;
-      btn.title = "";
-      btn.onclick = async () => {
-        btn.disabled = true;
-        btn.textContent = "Running\u2026";
-        var ctrl = _getRunController(state, actions);
-
-        // Build controls early so sampler fields are available for running state
-        if (ctrl) ctrl.mark("build_start");
-        const controls = buildEffectiveControls(state);
-        if (ctrl) ctrl.mark("build_end");
-
-        // Clear previous output so canvas shows live progress immediately
-        state.playground.lastRunOutput = null;
-        state.playground._selectedRun = null;
-
-        // Put determinate sampler fields into running state BEFORE remote call
-        var _runSteps = controls.steps;
-        var _runMaxSteps = (_runSteps != null && Number(_runSteps) > 0) ? Number(_runSteps) : 0;
-        if (ctrl) ctrl.beginRun({ samplerMaximum: _runMaxSteps });
-        // Start local elapsed timer immediately on press
-        _startLocalElapsedTimer(state, context);
-
-        const validationError = validateControls(controls, preset);
-        if (validationError) {
-          btn.disabled = false;
-          btn.textContent = "Run";
-          if (ctrl) ctrl.applyLocalError(validationError);
-          return;
-        }
-        const modalOptions = await buildStudioModalOptions(apiBase);
-
-        // Capture client-side timestamps at press time (top-level `trace` for server)
-        var t0_perf_ms = performance.now();
-        var t0_now = Date.now();
-
-        if (ctrl) ctrl.mark("http_invoked");
-        const result = await runStudioPreset(apiBase, {
-          presetId: preset.id || selectedId,
-          featureId: currentFeatureId,
-          controls: controls,
-          modal_options: modalOptions,
-          metadata: {
-            source: "studio_playground",
-          },
-          trace: {
-            t0_perf_ms: t0_perf_ms,
-            t0_perf_now_ms: t0_now,
-            t0_client_press_ms: t0_now,
-          },
-        });
-        if (ctrl) ctrl.mark("backend_ack");
-
-        if (result && result.status === "ok") {
-          // â”€â”€ Direct run: result is already completed, no polling â”€â”€
-          if (_handleDirectRunResult(result, state, context, actions, controls)) {
-            return;
-          }
-
-          // â”€â”€ Scheduler path: submission, start polling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-          var _inlineSteps = controls.steps;
-          if (ctrl) {
-            ctrl.setBackendIds(result.runId || result.experimentId, result.experimentId);
-            ctrl.applySubmission({
-              experimentId: result.experimentId || result.runId || "",
-              samplerMaximum: (_inlineSteps != null && Number(_inlineSteps) > 0) ? Number(_inlineSteps) : 0,
-            });
-            ctrl.attachEventSource((context && context.comfyApi) || (context && context.api));
-          }
-
-          // Restart local elapsed timer; preserves original _localStartTime
-          _startLocalElapsedTimer(state, context);
-        } else {
-          const errMsg = (result && result.message) || "Run failed.";
-          if (ctrl) ctrl.applyLocalError(errMsg);
-        }
-      };
-    }
-  }).catch(() => {
-    if (!container.isConnected) return;
-    if (_isModernRunSelected(state)) {
-      while (reason.firstChild) reason.removeChild(reason.firstChild);
-      _applyModernRunButtonState(state, context, actions, btn, reason);
-      return;
-    }
-    while (reason.firstChild) reason.removeChild(reason.firstChild);
-    reason.appendChild(el("p", {
-      text: "Could not load presets.",
-      style: "font-size:var(--font-size-sm);color:var(--color-text-secondary);margin:4px 0 0;",
-    }));
-  });
+    _applyModernRunButtonState(state, context, actions, btn, reason);
+  }
 
   return container;
 }
@@ -4513,28 +3639,6 @@ function _normalizeShelfControlSchema(state) {
       repaired[k] = values[k];
     }
   });
-  if (store.presetId && Array.isArray(store.presets)) {
-    var preset = null;
-    for (var i = 0; i < store.presets.length; i++) {
-      if (String(store.presets[i].preset_id) === String(store.presetId)) { preset = store.presets[i]; break; }
-    }
-    var fromPreset = {};
-    if (preset) {
-      if (preset.values && typeof preset.values === "object") {
-        for (var vk in preset.values) {
-          if (Object.prototype.hasOwnProperty.call(preset.values, vk)) fromPreset[vk] = preset.values[vk];
-        }
-      }
-      if (preset.model_choices && typeof preset.model_choices === "object") {
-        for (var mk in preset.model_choices) {
-          if (Object.prototype.hasOwnProperty.call(preset.model_choices, mk)) fromPreset[mk] = preset.model_choices[mk];
-        }
-      }
-    }
-    Object.keys(fromPreset).forEach(function (r) {
-      if (Object.prototype.hasOwnProperty.call(obj, r)) repaired[r] = fromPreset[r];
-    });
-  }
   store.controlValues = repaired;
 }
 
@@ -4554,6 +3658,12 @@ function _normalizeShelfControlSchema(state) {
 //   lane and never overwrites Workflow values.
 
 var _SHELF_TYPE = "t2i";
+
+// Mapped roles that are deliberately NOT rendered as Shelf fields. These are
+// model-loader inputs: the files are chosen in the Model Library and already
+// flow through the version's executable prompt, so an editable field here only
+// invited a second, conflicting place to change the model stack.
+var _SHELF_HIDDEN_ROLES = ["model_unet", "clip", "vae", "model", "model_clip", "model_vae"];
 var _SHELF_SAVE_DELAY_MS = 300;
 
 function _shelfStore(state) {
@@ -4580,6 +3690,10 @@ function _shelfEntries(state) {
     if (!e || typeof e !== "object") return false;
     var role = e.semantic_role || e.input_name || "";
     if (!role || role === "output") return false;
+    // Model-loader roles are not editable knobs: the model/CLIP/VAE files are
+    // chosen in the Model Library and already flow through the version's
+    // executable prompt. Rendering them here just invited conflicting edits.
+    if (_SHELF_HIDDEN_ROLES.indexOf(role) !== -1) return false;
     return true;
   }) : [];
 }
@@ -4963,7 +4077,7 @@ function _populateShelfSection(section, state, context, actions) {
     section.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-empty",
-      text: "Select a Workflow and Version to see Shelf fields.",
+      text: "Select a Workflow to see its fields.",
     }));
     return;
   }
@@ -5000,7 +4114,7 @@ function _populateShelfSection(section, state, context, actions) {
     section.appendChild(el("p", {
       class: "comfymodal-studio-control-note",
       "data-testid": "shelf-unmapped",
-      text: "This Workflow version has no mapped fields yet.",
+      text: "This Workflow has no mapped fields yet.",
     }));
     return;
   }
@@ -5279,9 +4393,7 @@ async function _performShelfSwitch(state, context, actions, nextId, reuse) {
     wf.saveWorkflowSelection({
       workflowId: store.workflowId,
       workflowVersionId: store.workflowVersionId,
-      presetId: store.presetId,
       workflowName: store.workflowName || "",
-      presetName: store.presetName || "",
     });
   }
   // Old output stays visible but stale until a new run completes.

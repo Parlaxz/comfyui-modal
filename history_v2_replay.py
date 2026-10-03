@@ -289,7 +289,12 @@ def validate_replay_capability(
             snapshot_identity=snapshot_identity,
             generation=generation,
         )
+        # ``preset_id`` is provenance on historical records, not a run
+        # identity: a modern preset-free run legitimately carries none. It is
+        # only cross-checked when at least one source supplies a value.
         if not values:
+            if identity_name == "preset_id":
+                continue
             return _fail(REASON_MISSING_IDENTITY, field=identity_name)
         unique = {value for _, value in values}
         if len(unique) != 1:

@@ -1,0 +1,36 @@
+# v2ctl profile: Golden Parallel on H100, C0 source owner, DIAGNOSTIC arm.
+#
+# This profile exists so intrusive instrumentation never contaminates the
+# counted performance cohort.  It differs from
+# golden_p1_parallel_c0_source_h100 only by turning the stage decomposition
+# hooks on, which are what distinguish
+#
+#   A. real Qwen transformer compute becoming slow
+# from
+#   B. Qwen compute staying similar while the post-forward CUDA/quiescence
+#      wait becomes slow
+#
+# Use it for ONE diagnostic request per architecture arm.  Never use it for a
+# counted run: it deliberately pays the instrumentation cost on every request.
+schema_version = 1
+name = "golden_p1_parallel_c0_source_diagnostic_h100"
+extends = "golden_p1_parallel_c0_source_h100"
+owner = "golden-c0-source"
+
+[target]
+app = "batch-c0-source-diag-h100"
+
+[workload]
+run_count = 1
+
+[environment]
+# Golden stage decomposition: CLIP forward entry/setup, tokenization prep,
+# Qwen transformer forward, post-forward CUDA sync wait, and conditioning
+# packaging.  This is the instrument that answers the CLIP-forward/UNET
+# contention question.
+COMFYMODAL_GOLDEN_STAGE_DIAGNOSTICS = "1"
+# Per-window source trace: allocates and retains per-fill raw mmap/memcpy/
+# munmap lifecycle records so per-operation distributions can be computed.
+# One diagnostic request per arm only.
+COMFYMODAL_GOLDEN_C0_WINDOW_TRACE = "1"
+COMFYMODAL_GOLDEN_IO_PROCESS_V2_MMAP_COPY_DIAG = "1"

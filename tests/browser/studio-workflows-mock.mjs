@@ -162,13 +162,29 @@ function _defaultEntryValues() {
     cfg: 7,
     positive_prompt: "",
     negative_prompt: "",
-    model: "",
+    // The version's own prompt must carry a real model: with presets gone
+    // this is the default source, and the `model` role is required.
+    model: "sd_xl_base_1.0.safetensors",
     width: 1024,
     height: 1024,
     denoise: 1,
     source_image: "",
     hires_fix: false,
   };
+}
+
+/**
+ * Build an executable-prompt-shaped object ({ nodeId: { inputs: {...} } })
+ * from mapping entries and their default values.
+ */
+function _executablePromptFromEntries(entries) {
+  const out = {};
+  for (const e of entries || []) {
+    if (!e || !e.node_id || !e.input_name) continue;
+    if (!out[e.node_id]) out[e.node_id] = { inputs: {}, class_type: "MockNode" };
+    out[e.node_id].inputs[e.input_name] = e.value;
+  }
+  return out;
 }
 
 function _mappingEntriesWithDefaults() {
@@ -357,6 +373,11 @@ export async function installWorkflowsMock(page, seed) {
       state.mappings.set(vid, m);
       v.mapping_id = m.mapping_id;
       v.output_node_id = m.output_node_id;
+      // With presets gone, a version's OWN executable prompt is its default
+      // configuration: the run store derives control values from it
+      // (defaultValuesFromContext). Synthesize it from the seeded mapping
+      // entries so version-derived defaults actually resolve.
+      v.executable_prompt = _executablePromptFromEntries(m.entries);
     }
     wf.latest_version_id = vid;
     wf.updated_at = _now();
@@ -418,6 +439,7 @@ export async function installWorkflowsMock(page, seed) {
       mapping: true,
       dependency_metadata: {
         model_stack: ["sd_xl_base_1.0.safetensors"],
+        installed_models: ["sd_xl_base_1.0.safetensors"],
         node_classes: ["KSampler", "CLIPTextEncode"],
       },
     });
@@ -428,7 +450,17 @@ export async function installWorkflowsMock(page, seed) {
       folder: "Abstract",
       tags: ["experiment"],
     });
-    seedVersion(at.workflow_id, { version_number: 1, mapping: false });
+    seedVersion(at.workflow_id, {
+      version_number: 1,
+      mapping: false,
+      // A dependency that is NOT installed, so the reconciliation spec can
+      // exercise the Missing -> "Not needed" -> Missing round trip.
+      dependency_metadata: {
+        model_stack: ["abstract_missing.safetensors"],
+        installed_models: [],
+        node_classes: ["KSampler"],
+      },
+    });
   }
 
   // Seed the default dataset. An explicit `seed` option is accepted for
@@ -656,33 +688,116 @@ export async function installWorkflowsMock(page, seed) {
     return _json({ status: "ok", version: _versionEnriched(state, v) });
   }
 
+  // Server-owned dependency truth. A model present in the seeded
+  // dependency_metadata is "installed" (with a remote size); anything else is
+  // "missing". Nonessential ("Not needed") overrides round-trip through the
+  // POST route below and come back on the next read.
+  const _REMOTE_SIZE_4GB = 4 * 1024 * 1024 * 1024;
+
+  function _isNonessential(v, filename) {
+    const set = v.nonessential_keys;
+    return !!(Array.isArray(set) && set.indexOf("model|" + filename) !== -1);
+  }
+
+  function _dependencyRow(filename, installed, v) {
+    const row = {
+      key: "model|" + filename,
+      role: "model",
+      filename: String(filename),
+      state: installed ? "installed" : "missing",
+      source_urls: [],
+      local_path: installed ? "models/" + filename : "",
+      folder: installed ? "models" : "",
+    };
+    if (installed) {
+      row.remote_model = { size: _REMOTE_SIZE_4GB, folder: "models" };
+    }
+    if (_isNonessential(v, filename)) {
+      row.nonessential = true;
+      row.nonessential_source = "user";
+    }
+    return row;
+  }
+
   function getVersionDependencies(route, url, body, params) {
     const v = state.versions.get(params.vid);
     if (!v) return _error("Version not found", 404);
     const meta = v.dependency_metadata || { model_stack: [], node_classes: [] };
     const stack = Array.isArray(meta.model_stack) ? meta.model_stack : [];
-    const models = stack.map((filename) => ({
-      key: "model|" + filename,
-      role: "model",
-      filename: String(filename),
-      state: "unknown",
-      source_urls: [],
-    }));
+    const available = Array.isArray(meta.installed_models) ? meta.installed_models : [];
+    const models = stack.map((filename) =>
+      _dependencyRow(filename, available.indexOf(filename) !== -1, v)
+    );
+    const missing = models.filter((m) => m.state === "missing" && !m.nonessential);
+    const installed = models.filter((m) => m.state === "installed");
     return _json({
       status: "ok",
       version_id: v.workflow_version_id,
-      models,
+      models: models,
       custom_nodes: [],
       summary: {
-        installed: 0,
-        missing: models.length,
+        installed: installed.length,
+        missing: missing.length,
         wrong_version: 0,
         unknown: 0,
-        attention: models.length,
-        ready: models.length === 0,
+        attention: missing.length,
+        ready: missing.length === 0,
       },
     });
   }
+
+  /**
+   * POST /studio/workflows/{id}/dependencies/nonessential
+   * Body: { keys: ["model|<file>", ...] } — the FULL set of nonessential keys
+   * for the workflow, so the server answer stays authoritative (no toggle
+   * guessing on the client).
+   */
+  function setDependencyNonessential(route, url, body, params) {
+    const w = state.workflows.get(params.id);
+    if (!w) return _error("Workflow not found", 404);
+    const keys = body && Array.isArray(body.keys) ? body.keys.map(String) : [];
+    w.nonessential_keys = keys;
+    for (const v of state.versions.values()) {
+      if (v.workflow_id !== w.workflow_id) continue;
+      v.nonessential_keys = keys;
+    }
+    return _json({ status: "ok", workflow_id: w.workflow_id, keys: keys });
+  }
+
+  function listWorkflowVersions(route, url, body, params) {
+    const w = state.workflows.get(params.id);
+    if (!w) return _error("Workflow not found", 404);
+    const versions = [...state.versions.values()].filter(
+      (v) => v.workflow_id === params.id
+    );
+    return _json({ status: "ok", versions: versions.map((v) => _versionEnriched(state, v)) });
+  }
+
+  function captureVersion(route, url, body, params) {
+    const w = state.workflows.get(params.id);
+    if (!w) return _error("Workflow not found", 404);
+    const graphJson = body ? body.graph_json : undefined;
+    const key = graphJson !== undefined ? JSON.stringify(graphJson) : null;
+    if (key !== null) {
+      for (const v of state.versions.values()) {
+        if (v.workflow_id === params.id && JSON.stringify(v.graph_json) === key) {
+          return _json({ status: "ok", version: _versionEnriched(state, v) });
+        }
+      }
+    }
+    const v = seedVersion(params.id, {
+      graph_json: graphJson || null,
+      api_prompt_json: body ? body.api_prompt_json : null,
+    });
+    return _json({ status: "ok", version: _versionEnriched(state, v) });
+  }
+
+  function getWorkflowVersion(route, url, body, params) {
+    const v = state.versions.get(params.vid);
+    if (!v) return _error("Version not found", 404);
+    return _json({ status: "ok", version: _versionEnriched(state, v) });
+  }
+
 
   function getVersionState(route, url, body, params) {
     const v = state.versions.get(params.vid);
@@ -1023,22 +1138,12 @@ export async function installWorkflowsMock(page, seed) {
     ["POST", "/comfymodal/studio/workflows/versions/:vid/mapping", createMapping],
     ["GET", "/comfymodal/studio/workflows/versions/:vid/mapping", getMapping],
     ["GET", "/comfymodal/studio/workflows/versions/:vid/dependencies", getVersionDependencies],
-    ["POST", "/comfymodal/studio/workflows/versions/:vid/presets/copy-bulk", bulkCopyPresets],
-    ["POST", "/comfymodal/studio/workflows/versions/:vid/presets/from-legacy", createPresetFromLegacy],
-    ["GET", "/comfymodal/studio/workflows/versions/:vid/presets", listVersionPresets],
-    ["POST", "/comfymodal/studio/workflows/versions/:vid/presets", createVersionPreset],
+  ["POST", "/comfymodal/studio/workflows/:id/dependencies/nonessential", setDependencyNonessential],
     ["GET", "/comfymodal/studio/workflows/versions/:vid", getWorkflowVersion],
 
-    ["POST", "/comfymodal/studio/workflows/presets/:pid/duplicate", duplicatePreset],
-    ["POST", "/comfymodal/studio/workflows/presets/:pid/copy-to-version", copyPresetToVersion],
-    ["GET", "/comfymodal/studio/workflows/presets/:pid", getWorkflowPreset],
-    ["PATCH", "/comfymodal/studio/workflows/presets/:pid", updateWorkflowPreset],
-    ["DELETE", "/comfymodal/studio/workflows/presets/:pid", deleteWorkflowPreset],
 
     ["GET", "/comfymodal/studio/workflows", listWorkflows],
     ["POST", "/comfymodal/studio/workflows", createWorkflow],
-    ["POST", "/comfymodal/studio/workflows/:id/default-preset", setDefaultPreset],
-    ["DELETE", "/comfymodal/studio/workflows/:id/default-preset", clearDefaultPreset],
     ["GET", "/comfymodal/studio/workflows/:id/run-context", getRunContext],
     ["GET", "/comfymodal/studio/workflows/:id/versions", listWorkflowVersions],
     ["POST", "/comfymodal/studio/workflows/:id/versions", captureVersion],

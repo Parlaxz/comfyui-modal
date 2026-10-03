@@ -10,9 +10,9 @@ routed through the exact modern workflow seam (``studio_workflow_run``)::
       -> build_workflow_execution_plan
 
 Nothing is duplicated: the legacy ``resolve_and_inject_cell`` slot-path graph
-mutation is never reused.  Workflow-only ``latest_version_id`` /
-``default_preset_id`` resolution happens exactly once, at plan time, and the
-resolved ids are frozen into every cell; execution never re-resolves them.
+mutation is never reused.  Workflow-only ``latest_version_id`` resolution
+happens exactly once, at plan time, and the resolved ids are frozen into every
+cell; execution never re-resolves them.
 
 Public API
 ----------
@@ -69,7 +69,6 @@ _AXIS_ROLE_ALIASES = MappingProxyType({
 })
 
 _VERSION_ALIAS_KEYS = ("workflow_version_id", "version_id", "version")
-_PRESET_ALIAS_KEYS = ("preset_id", "preset")
 
 
 # ── Errors ─────────────────────────────────────────────────────────────────
@@ -245,15 +244,17 @@ def _expand_axis_values(label: str, raw: Any) -> list[Any]:
 def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
     """Normalise one workflow value into a list of target specs.
 
-    Each target spec is ``{"workflow_id", "workflow_version_id", "preset_id"}``
-    with ``None`` for unpinned ids.  A value may pin version/preset directly
-    or expand via ``versions`` / ``presets`` lists (cartesian when both).
+    Each target spec is ``{"workflow_id", "workflow_version_id"}`` with
+    ``None`` for an unpinned version.  A value may pin the version directly or
+    expand via a ``versions`` list.  Control values are NOT pinned here: every
+    run resolves its defaults from the target version's own
+    ``executable_prompt``, so there is no separate configuration identity.
     """
     if isinstance(entry, str):
         value = entry.strip()
         if not value:
             raise ExperimentDefinitionError("workflow value cannot be empty")
-        return [{"workflow_id": value, "workflow_version_id": None, "preset_id": None}]
+        return [{"workflow_id": value, "workflow_version_id": None}]
     if not isinstance(entry, dict):
         raise ExperimentDefinitionError(
             "workflow value must be a string or dict, got "
@@ -268,14 +269,10 @@ def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
     wf_id = wf_id.strip()
 
     versions = entry.get("versions")
-    presets = entry.get("presets")
     if versions is not None and not isinstance(versions, list):
         raise ExperimentDefinitionError("'versions' must be a list")
-    if presets is not None and not isinstance(presets, list):
-        raise ExperimentDefinitionError("'presets' must be a list")
 
     version_pin = _first_present(entry, _VERSION_ALIAS_KEYS)
-    preset_pin = _first_present(entry, _PRESET_ALIAS_KEYS)
 
     def _version_pin(item: Any) -> Optional[str]:
         if isinstance(item, str):
@@ -286,50 +283,17 @@ def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
             "workflow 'versions' entries must be strings or dicts"
         )
 
-    def _preset_pin(item: Any) -> Optional[str]:
-        if isinstance(item, str):
-            return item.strip() or preset_pin
-        if isinstance(item, dict):
-            return _first_present(item, _PRESET_ALIAS_KEYS) or preset_pin
-        raise ExperimentDefinitionError(
-            "workflow 'presets' entries must be strings or dicts"
-        )
-
-    if versions is None and presets is None:
+    if versions is None:
         return [{
             "workflow_id": wf_id,
             "workflow_version_id": version_pin,
-            "preset_id": preset_pin,
         }]
-    if versions is None:
-        if not presets:
-            raise ExperimentDefinitionError("workflow 'presets' must not be empty")
-        return [{
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(p),
-            "preset_id": _preset_pin(p),
-        } for p in presets]
-    if presets is None:
-        if not versions:
-            raise ExperimentDefinitionError("workflow 'versions' must not be empty")
-        return [{
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(v),
-            "preset_id": _preset_pin(v),
-        } for v in versions]
-    if not versions or not presets:
-        raise ExperimentDefinitionError(
-            "workflow 'versions' and 'presets' must not be empty"
-        )
-    return [
-        {
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(v),
-            "preset_id": _preset_pin(p),
-        }
-        for v in versions
-        for p in presets
-    ]
+    if not versions:
+        raise ExperimentDefinitionError("workflow 'versions' must not be empty")
+    return [{
+        "workflow_id": wf_id,
+        "workflow_version_id": _version_pin(v),
+    } for v in versions]
 
 
 # ── Public types ───────────────────────────────────────────────────────────
@@ -349,9 +313,7 @@ class WorkflowResolution:
     status: str
     workflow_id: str = ""
     workflow_version_id: str = ""
-    preset_id: str = ""
     workflow_name: str = ""
-    preset_name: str = ""
     version_number: int = 0
     error_code: str = ""
     message: str = ""
@@ -364,9 +326,7 @@ class WorkflowResolution:
     def __post_init__(self) -> None:
         object.__setattr__(self, "workflow_id", str(self.workflow_id or ""))
         object.__setattr__(self, "workflow_version_id", str(self.workflow_version_id or ""))
-        object.__setattr__(self, "preset_id", str(self.preset_id or ""))
         object.__setattr__(self, "workflow_name", str(self.workflow_name or ""))
-        object.__setattr__(self, "preset_name", str(self.preset_name or ""))
         object.__setattr__(self, "version_number", int(self.version_number or 0))
         object.__setattr__(self, "error_code", str(self.error_code or ""))
         object.__setattr__(self, "message", str(self.message or ""))
@@ -385,9 +345,7 @@ class WorkflowResolution:
             "status": self.status,
             "workflow_id": self.workflow_id,
             "workflow_version_id": self.workflow_version_id,
-            "preset_id": self.preset_id,
             "workflow_name": self.workflow_name,
-            "preset_name": self.preset_name,
             "version_number": self.version_number,
             "error_code": self.error_code,
             "message": self.message,
@@ -410,9 +368,7 @@ class CellPlan:
     axis_to_control: Mapping = field(default_factory=dict)
     workflow_id: str = ""
     workflow_version_id: str = ""
-    preset_id: str = ""
     workflow_name: str = ""
-    preset_name: str = ""
     version_number: int = 0
     controls: Mapping = field(default_factory=dict)
     merged_values: Mapping = field(default_factory=dict)
@@ -437,9 +393,7 @@ class CellPlan:
         object.__setattr__(self, "axis_to_control", _freeze(self.axis_to_control or {}))
         object.__setattr__(self, "workflow_id", str(self.workflow_id or ""))
         object.__setattr__(self, "workflow_version_id", str(self.workflow_version_id or ""))
-        object.__setattr__(self, "preset_id", str(self.preset_id or ""))
         object.__setattr__(self, "workflow_name", str(self.workflow_name or ""))
-        object.__setattr__(self, "preset_name", str(self.preset_name or ""))
         object.__setattr__(self, "version_number", int(self.version_number or 0))
         object.__setattr__(self, "controls", _freeze(self.controls or {}))
         object.__setattr__(self, "merged_values", _freeze(self.merged_values or {}))
@@ -473,9 +427,7 @@ class CellPlan:
             "axis_to_control": _plain_copy(self.axis_to_control),
             "workflow_id": self.workflow_id,
             "workflow_version_id": self.workflow_version_id,
-            "preset_id": self.preset_id,
             "workflow_name": self.workflow_name,
-            "preset_name": self.preset_name,
             "version_number": self.version_number,
             "controls": _plain_copy(self.controls),
             "merged_values": _plain_copy(self.merged_values),
@@ -632,17 +584,15 @@ def resolve_workflow_axis_value(
 
     Reuses ``resolve_workflow_run_bundle`` verbatim, so the workflow-only
     fallback rule is identical to the modern single-run path: empty
-    ``workflow_version_id`` -> ``workflow.latest_version_id``; empty
-    ``preset_id`` -> ``workflow.default_preset_id``.
+    ``workflow_version_id`` -> ``workflow.latest_version_id``.
 
     * A single-target value (string or dict pinning ids) is resolved and
       returned as a frozen ``WorkflowResolution``.
-    * Domain failures (workflow/version/preset missing, unrunnable version,
-      mapping missing, preset mismatch) return ``status == "error"`` — the
-      caller rejects only the affected cells.
-    * A value that expands to multiple targets (``versions``/``presets``
-      lists) or that is structurally malformed raises
-      ``ExperimentDefinitionError``.
+    * Domain failures (workflow/version missing, unrunnable version, mapping
+      missing) return ``status == "error"`` — the caller rejects only the
+      affected cells.
+    * A value that expands to multiple targets (``versions`` lists) or that is
+      structurally malformed raises ``ExperimentDefinitionError``.
     """
     targets = _normalize_workflow_targets(workflow_value)
     if len(targets) != 1:
@@ -654,7 +604,6 @@ def resolve_workflow_axis_value(
     bundle = _seam.resolve_workflow_run_bundle(
         target["workflow_id"],
         target["workflow_version_id"] or "",
-        target["preset_id"] or "",
         node_dir,
     )
     return _resolution_from_bundle(target, bundle)
@@ -674,14 +623,11 @@ def _resolution_from_bundle(
         )
     workflow = bundle.get("workflow") or {}
     version = bundle.get("version") or {}
-    preset = bundle.get("preset") or {}
     return WorkflowResolution(
         status="ok",
         workflow_id=str(workflow.get("workflow_id", "") or ""),
         workflow_version_id=str(version.get("workflow_version_id", "") or ""),
-        preset_id=str(preset.get("preset_id", "") or ""),
         workflow_name=str(workflow.get("name", "") or ""),
-        preset_name=str(preset.get("name", "") or ""),
         version_number=int(version.get("version_number", 0) or 0),
         bundle=bundle,
         control_schema=bundle.get("control_schema") or {},
@@ -761,12 +707,10 @@ def _workflow_axis_value(target: dict[str, Any], resolution: WorkflowResolution)
         return {
             "workflow_id": resolution.workflow_id,
             "workflow_version_id": resolution.workflow_version_id,
-            "preset_id": resolution.preset_id,
         }
     return {
         "workflow_id": str(target.get("workflow_id") or ""),
         "workflow_version_id": str(target.get("workflow_version_id") or ""),
-        "preset_id": str(target.get("preset_id") or ""),
     }
 
 
@@ -807,7 +751,7 @@ def _build_cell(
 
         control_errors = validate_cell_controls(controls, schema)
         merged = _seam.merge_workflow_controls(
-            dict(bundle.get("preset") or {}), controls, schema
+            dict(bundle.get("defaults") or {}), controls, schema
         )
         merged_values = dict(merged.get("values") or {})
         all_errors = list(control_errors) + list(merged.get("errors") or [])
@@ -858,9 +802,7 @@ def _build_cell(
         axis_to_control=axis_to_control,
         workflow_id=resolution.workflow_id,
         workflow_version_id=resolution.workflow_version_id,
-        preset_id=resolution.preset_id,
         workflow_name=resolution.workflow_name,
-        preset_name=resolution.preset_name,
         version_number=resolution.version_number,
         controls=controls,
         merged_values=merged_values,
@@ -908,10 +850,10 @@ def build_cell_plan(
       apply_workflow_values_to_prompt -> build_workflow_execution_plan``.
 
     Accepts the aliases ``workflows``/``workflow`` (top level), ``axes``/
-    ``axis`` (axis container), and version/preset pinning via
-    ``workflow_version_id``/``version_id``/``version`` and
-    ``preset_id``/``preset`` (plus ``versions``/``presets`` expansion lists
-    on a workflow value).
+    ``axis`` (axis container), and version pinning via
+    ``workflow_version_id``/``version_id``/``version`` (plus a ``versions``
+    expansion list on a workflow value).  There is no separate configuration
+    identity: each target version carries its own control defaults.
     """
     if not isinstance(experiment_def, dict):
         raise ExperimentDefinitionError("experiment definition must be a dict")
@@ -995,7 +937,7 @@ def build_cell_plan(
     if not other_combos:
         other_combos = [()]
 
-    resolution_cache: dict[tuple[str, str, str], WorkflowResolution] = {}
+    resolution_cache: dict[tuple[str, str], WorkflowResolution] = {}
     cells: list[CellPlan] = []
     branches: list[dict[str, Any]] = []
     position = 0
@@ -1009,7 +951,6 @@ def build_cell_plan(
         cache_key = (
             str(target.get("workflow_id") or ""),
             str(target.get("workflow_version_id") or ""),
-            str(target.get("preset_id") or ""),
         )
         resolution = resolution_cache.get(cache_key)
         if resolution is None:
@@ -1018,9 +959,7 @@ def build_cell_plan(
         branch = {
             "workflow_id": resolution.workflow_id,
             "workflow_version_id": resolution.workflow_version_id,
-            "preset_id": resolution.preset_id,
             "workflow_name": resolution.workflow_name,
-            "preset_name": resolution.preset_name,
         }
         if not any(b == branch for b in branches):
             branches.append(branch)

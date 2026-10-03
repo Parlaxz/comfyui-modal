@@ -16,6 +16,7 @@
 //  - All new localStorage keys are flat strings.
 
 import { publishStudioSync, subscribeStudioSync } from "./studio-sync.js";
+import { renderCredentialsSection } from "./studio-backend-credentials.js";
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -358,7 +359,7 @@ export function renderSettings(state, context) {
     const ok = confirm(
       "Reset all Studio settings (General, Generation, Outputs, History, Experiments, Interface, Advanced) to defaults. " +
       "The GPU selection is reset to the default. " +
-      "Your Workflows, run History, snapshots, presets, drafts, and assets are NOT affected."
+      "Your Workflows, run History, drafts, and assets are NOT affected."
     );
     if (!ok) return;
     removeKeys(MODERN_SETTINGS_KEYS);
@@ -439,7 +440,7 @@ export function renderSettings(state, context) {
     // The canvas compatibility layer keeps its own key; nothing here resets
     // or writes it. Nothing in General is resettable → no reset button.
     section.appendChild(buildSectionHeader("General", ""));
-    section.appendChild(infoRow("Primary navigation: Playground / History / Workflows / Backend / Settings."));
+    section.appendChild(infoRow("Primary navigation: Playground / History / Workflows / Manage Modal / Settings."));
     return section;
   }
 
@@ -567,9 +568,9 @@ export function renderSettings(state, context) {
     // Runtime & Backend group
     const runtimeGroup = el("div", {
       class: "comfymodal-settings-group",
-      "data-search": "runtime backend deploy state snapshots presets workspace workspaces edit",
+      "data-search": "runtime manage modal deploy state credentials token workspace workspaces edit",
     });
-    runtimeGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Runtime & Backend" }));
+    runtimeGroup.appendChild(el("h4", { class: "comfymodal-settings-group-title", text: "Runtime & Manage Modal" }));
 
     const deployWrap = el("div", { class: "comfymodal-settings-control", "data-search": "deploy state" });
     deployWrap.appendChild(settingsRow("Deploy state", el("span", {
@@ -579,75 +580,46 @@ export function renderSettings(state, context) {
     })));
     runtimeGroup.appendChild(deployWrap);
 
-    const snapWrap = el("div", { class: "comfymodal-settings-control", "data-search": "snapshots" });
-    snapWrap.appendChild(settingsRow("Snapshots", el("span", {
+    // Credentials live here in Settings: the Modal connection badge plus the
+    // HuggingFace / Civitai token blocks. They were the Backend > Credentials
+    // tab, which is gone.
+    const credentialsWrap = el("div", {
+      class: "comfymodal-settings-control",
+      "data-search": "credentials token huggingface civitai modal account",
+    });
+    credentialsWrap.appendChild(settingsRow("Credentials", el("span", {
       class: "comfymodal-studio-settings-row-value",
-      "data-testid": "settings-runtime-snapshots",
-      text: "\u2014",
+      text: "Modal account \u00b7 HuggingFace \u00b7 Civitai tokens",
     })));
-    runtimeGroup.appendChild(snapWrap);
+    runtimeGroup.appendChild(credentialsWrap);
+    renderCredentialsSection(credentialsWrap, (context && context.apiBase) || "/comfymodal");
 
-    const presetWrap = el("div", { class: "comfymodal-settings-control", "data-search": "presets" });
-    presetWrap.appendChild(settingsRow("Presets", el("span", {
-      class: "comfymodal-studio-settings-row-value",
-      "data-testid": "settings-runtime-presets",
-      text: "\u2014",
-    })));
-    runtimeGroup.appendChild(presetWrap);
-
-    // H16 Wave F (FD-8): the legacy-compatibility count row for the retired
-    // comparison store was removed here along with its fetch leg. Settings
-    // owns preferences only; the remaining rows stay as recorded debt.
-
-    const backendLinkWrap = el("div", { class: "comfymodal-settings-control", "data-search": "open backend tab" });
+    const backendLinkWrap = el("div", { class: "comfymodal-settings-control", "data-search": "open manage modal" });
     const backendLink = el("a", {
       class: "comfymodal-settings-link",
       "data-testid": "settings-open-backend",
-      text: "Open Backend tab",
+      text: "Open Manage Modal",
       href: "#",
     });
     backendLink.addEventListener("click", (e) => {
       e.preventDefault();
       if (context && context.setPage) context.setPage("backend");
     });
-    backendLinkWrap.appendChild(settingsRow("Backend", backendLink));
+    backendLinkWrap.appendChild(settingsRow("Manage Modal", backendLink));
     runtimeGroup.appendChild(backendLinkWrap);
 
-    // Workspace editing lives in the Backend tab, with a hash deep-link for
-    // reloads and embeds that do not expose the shell's focus API.
+    // Workspace editing lives in the Manage Modal tab. Navigation goes
+    // through the shell's routing authority (context.applyRoute) rather than
+    // writing history here; the Backend page consumes the focus identity and
+    // switches its own tab, so no click-after-timeout hack is needed.
     function openWorkspaces(e) {
       e.preventDefault();
+      if (context && typeof context.applyRoute === "function") {
+        context.applyRoute({ page: "backend", focus: "workspaces" });
+        return;
+      }
       if (context && typeof context.setPage === "function") {
         context.setPage("backend");
-      }
-
-      const targetHash = "#comfymodal=backend&focus=workspaces";
-      if (typeof window !== "undefined") {
-        try {
-          const loc = window.location || {};
-          const base = (loc.pathname || "") + (loc.search || "");
-          window.history.pushState(window.history.state, "", base + targetHash);
-        } catch (_) {
-          try { window.location.hash = targetHash; } catch (_) {}
-        }
-      }
-
-      if (typeof setTimeout === "function") {
-        setTimeout(() => {
-          if (typeof document === "undefined") return;
-          const workspacesTab = document.querySelector('[data-tab="workspaces"]');
-          if (workspacesTab && typeof workspacesTab.click === "function") {
-            workspacesTab.click();
-          }
-        }, 160);
-        setTimeout(() => {
-          if (typeof document === "undefined") return;
-          const workspacesTab2 = document.querySelector('[data-tab="workspaces"]');
-          if (workspacesTab2 && typeof workspacesTab2.click === "function") {
-            const isActive = workspacesTab2.classList.contains("active") || workspacesTab2.getAttribute("aria-current") === "true";
-            if (!isActive) workspacesTab2.click();
-          }
-        }, 420);
       }
     }
 
@@ -686,7 +658,7 @@ export function renderSettings(state, context) {
     const footer = el("div", { class: "comfymodal-settings-footer-inner" }, [
       el("p", {
         class: "comfymodal-settings-footer-note",
-        text: "Reset all Studio settings to defaults. The GPU selection resets to the default. User data (workflows, history, snapshots, presets, drafts, assets) is preserved.",
+        text: "Reset all Studio settings to defaults. The GPU selection resets to the default. User data (workflows, history, drafts, assets) is preserved.",
       }),
       el("button", {
         type: "button",
@@ -709,7 +681,6 @@ export function renderSettings(state, context) {
     refreshEngineMigrationNotice(apiBase);
     refreshGpuConfig(apiBase);
     refreshDeployStatus(apiBase);
-    refreshRuntimeCounts(apiBase);
     refreshOutputsPrefs(apiBase);
     refreshProfileLevel(apiBase);
   }
@@ -796,21 +767,6 @@ export function renderSettings(state, context) {
         row.textContent = state + (message ? " \u2014 " + message : "");
       })
       .catch(() => { row.textContent = "Unknown"; });
-  }
-
-  // ── Runtime inventory counts ──
-  function refreshRuntimeCounts(base) {
-    const snapEl = sectionsHost.querySelector('[data-testid="settings-runtime-snapshots"]');
-    const presetEl = sectionsHost.querySelector('[data-testid="settings-runtime-presets"]');
-    if (!snapEl && !presetEl) return;
-
-    Promise.all([
-      fetch(base + "/studio/snapshots").then((r) => r.json()).catch(() => ({})),
-      fetch(base + "/studio/presets").then((r) => r.json()).catch(() => ({})),
-    ]).then(([snapData, presetData]) => {
-      if (snapEl) snapEl.textContent = String((snapData && snapData.snapshots ? snapData.snapshots.length : 0));
-      if (presetEl) presetEl.textContent = String((presetData && presetData.presets ? presetData.presets.length : 0));
-    });
   }
 
   // ── Outputs refresh (through studio-output-preferences.js) ──
@@ -1011,10 +967,16 @@ export function renderSettings(state, context) {
             syncValue("settings-preview-quality-value", (n) => { n.textContent = String(freshPreview.preview_quality); });
           };
           window.addEventListener("comfymodal:output-preferences-changed", _outputPrefsListener);
+          // The outputs rows are added asynchronously, after the initial
+          // applyFilter() pass that already hid this section for having no
+          // [data-search] units. Re-filter so the section is revealed (and
+          // respects any active query).
+          applyFilter();
         });
       })
       .catch(function () {
         host.appendChild(el("p", { class: "comfymodal-studio-settings-hint", text: "Output preferences unavailable." }));
+        applyFilter();
       });
   }
 

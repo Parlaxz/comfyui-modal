@@ -61,14 +61,6 @@ async function openDetail(page, name) {
   return wf;
 }
 
-/** Select a version in the detail versions list. */
-async function selectVersion(page, vid) {
-  const item = page.locator(`[data-testid="version-item"][data-version-id="${vid}"]`);
-  await expect(item).toBeVisible({ timeout: 10000 });
-  await item.click();
-  await expect(item).toHaveClass(/active/, { timeout: 10000 });
-}
-
 /** Open the mapping editor ("Set up Mapping" or "Edit mapping"). */
 async function openMappingEditor(page) {
   const btn = page
@@ -77,30 +69,6 @@ async function openMappingEditor(page) {
   await expect(btn).toBeVisible({ timeout: 10000 });
   await btn.click();
   await expect(page.locator('[data-testid="mapping-candidates"]')).toBeVisible({ timeout: 10000 });
-}
-
-/** Set a preset-editor control by its role label. */
-async function setPresetField(page, label, value) {
-  const field = page
-    .locator('.comfymodal-studio-preset-editor .comfymodal-studio-backend-field', { hasText: label })
-    .first();
-  await expect(field).toBeVisible({ timeout: 10000 });
-  if (typeof value === "boolean") {
-    const cb = field.locator('input[type="checkbox"]');
-    if ((await cb.isChecked()) !== value) await cb.click();
-    return;
-  }
-  const select = field.locator("select");
-  if (await select.count()) {
-    await select.selectOption(String(value));
-    return;
-  }
-  const textarea = field.locator("textarea");
-  if (await textarea.count()) {
-    await textarea.fill(String(value));
-    return;
-  }
-  await field.locator("input").fill(String(value));
 }
 
 // ── Primary-extension pin ───────────────────────────────────────────────
@@ -190,14 +158,6 @@ async function wizardContinueToBindings(panel) {
   await expect(panel.locator('[data-testid="wizard-required-bindings"]')).toBeVisible({ timeout: 10000 });
 }
 
-/** Click the detail "New Preset" button and wait for the editor. */
-async function clickNewPreset(page) {
-  const section = page.locator(".comfymodal-studio-section", {
-    has: page.locator(".comfymodal-studio-section-title", { hasText: "Presets" }),
-  });
-  await section.getByRole("button", { name: "New Preset" }).click();
-  await expect(page.locator('[data-testid="preset-editor"]')).toBeVisible({ timeout: 10000 });
-}
 
 // ── Suite ─────────────────────────────────────────────────────────────────
 
@@ -348,12 +308,17 @@ test.describe("Studio Workflows", () => {
       await expect(page.locator('[data-testid="workflow-detail-tags"]')).toContainText("portrait");
       await expect(page.locator('[data-testid="workflow-detail-source"]')).toContainText("Modal Team");
 
-      await expect(page.locator('[data-testid="version-item"]')).toHaveCount(2);
-      await expect(page.locator('[data-testid="version-item-state"]')).toHaveCount(2);
+      // One version per workflow: a single non-selectable row, no version
+      // number, no preset count.
+      await expect(page.locator('[data-testid="version-item"]')).toHaveCount(1);
+      await expect(page.locator('[data-testid="version-item-state"]')).toHaveCount(1);
       await expect(page.locator('[data-testid="version-item-state"]').first()).toHaveText("Ready");
+      await expect(page.locator('[data-testid="version-item"]')).toContainText("Mapped");
+      await expect(page.locator(".comfymodal-studio-version-number")).toHaveCount(0);
+      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(0);
 
       const versions = wfMock.getVersions(pp.workflow_id);
-      expect(versions.some((v) => v.version_number === 2)).toBe(true);
+      expect(versions.length).toBeGreaterThan(0);
       await expect(page.locator('[data-testid="dependencies-summary"]')).toBeVisible();
       await expect(page.locator('[data-testid="dependencies-summary"]')).toContainText("KSampler");
       await expect(page.locator('[data-testid="dependencies-summary"]')).toContainText("sd_xl_base_1.0.safetensors");
@@ -379,7 +344,9 @@ test.describe("Studio Workflows", () => {
         nodes: [{ id: 7, type: "KSampler", widgets_values: [42] }],
       });
 
-      await page.locator('[data-testid="workflows-import-button"]').click();
+      // "New Workflow" opens the same creation dialog that the former
+      // "Import" entry opened (that entry no longer exists).
+      await page.locator('[data-testid="workflows-new-button"]').click();
       await expect(page.locator('[data-testid="import-dialog"]')).toBeVisible({ timeout: 10000 });
       await page
         .locator('[data-testid="import-dialog"] input[placeholder*="Workflow name (optional"]')
@@ -429,8 +396,10 @@ test.describe("Studio Workflows", () => {
       guard = installConsoleGuard(page);
 
       const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      await selectVersion(page, v1.workflow_version_id);
+      // One version per workflow: the detail view already targets the
+      // workflow's current version, so there is nothing to select.
+      const current = wfMock.getVersions(pp.workflow_id);
+      expect(current.length).toBeGreaterThan(0);
       await openMappingEditor(page);
 
       const samplerRow = page.locator('[data-testid="mapping-role-row"]', {
@@ -506,9 +475,8 @@ test.describe("Studio Workflows", () => {
         ["cfg_scale", "clip", "model_unet", "prompt", "sampler", "seed", "step_count", "vae"]
       );
       expect(mappingPosts[0].body.output_node_id).toBe("9");
-      // No Backend snapshot/preset concepts leak into the version flow.
-      expect(api.activeSnapshots().length).toBe(0);
-      expect(api.activePresets().length).toBe(0);
+      // Snapshots/presets no longer exist at all, so there is nothing to leak
+      // and no mock collection to assert against.
 
       // Completion returns to the detail page with the version mapped and
       // runnable.
@@ -586,15 +554,14 @@ test.describe("Studio Workflows", () => {
   });
 
   // ── Test 10: mapping revision creates a new immutable version ─────────
-  test("10. mapping revision creates a new version and keeps the old one", async ({ page }) => {
+  test("10. mapping revision appends a version and the UI shows the new current one", async ({ page }) => {
     let guard;
     try {
       guard = installConsoleGuard(page);
 
       const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      const v2 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 2);
-      await selectVersion(page, v1.workflow_version_id);
+      const before = wfMock.getVersions(pp.workflow_id);
+      const currentId = before[before.length - 1].workflow_version_id;
 
       await openMappingEditor(page);
       await page.locator('[data-testid="mapping-revision-button"]').click();
@@ -602,16 +569,20 @@ test.describe("Studio Workflows", () => {
       await expect(page.locator('[data-testid="mapping-revision-confirm"]')).toBeVisible();
       await page.locator('[data-testid="mapping-revision-confirm"]').click();
 
-      await expect(page.locator('[data-testid="version-item"]')).toHaveCount(3, { timeout: 10000 });
-      await expect(page.locator(".comfymodal-studio-version-number", { hasText: "v3" })).toBeVisible();
-      await expect(page.locator(`[data-testid="version-item"][data-version-id="${v1.workflow_version_id}"]`)).toBeVisible();
-      await expect(page.locator(`[data-testid="version-item"][data-version-id="${v2.workflow_version_id}"]`)).toBeVisible();
+      // Versions are immutable, so a revision still appends a record. The UI
+      // shows exactly ONE current version and adopts the new one.
+      await expect(page.locator('[data-testid="version-item"]')).toHaveCount(1, { timeout: 10000 });
+      const after = wfMock.getVersions(pp.workflow_id);
+      expect(after.length).toBe(before.length + 1);
+      const newId = after[after.length - 1].workflow_version_id;
+      expect(newId).not.toBe(currentId);
+      await expect(
+        page.locator(`[data-testid="version-item"][data-version-id="${newId}"]`)
+      ).toBeVisible();
 
-      // Old version + its mapping still intact.
-      await selectVersion(page, v1.workflow_version_id);
-      await expect(page.locator('[data-testid="mapping-editor"]')).toContainText("Edit mapping");
-      expect(wfMock.state.mappings.has(v1.workflow_version_id)).toBe(true);
-      expect(wfMock.getVersions(pp.workflow_id).some((v) => v.version_number === 3)).toBe(true);
+      // The historical version and its mapping are still intact on disk.
+      expect(wfMock.state.mappings.has(currentId)).toBe(true);
+      expect(wfMock.state.mappings.has(newId)).toBe(true);
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
       api.assertNoUnhandledCalls();
@@ -622,241 +593,6 @@ test.describe("Studio Workflows", () => {
   });
 
   // ── Test 11: preset creation preserves falsy values ───────────────────
-  test("11. preset creation preserves falsy values exactly", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = await openDetail(page, "Portrait Pro");
-      const v2 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 2);
-      await expect(page.locator(`[data-testid="version-item"][data-version-id="${v2.workflow_version_id}"]`)).toHaveClass(/active/);
-
-      await clickNewPreset(page);
-      await page.locator('[data-testid="preset-name-input"]').fill("Zero Values");
-      await setPresetField(page, "Steps", "0");
-      await setPresetField(page, "CFG", "0.0");
-      await setPresetField(page, "Positive Prompt", "");
-      await setPresetField(page, "Model", "test-model.safetensors");
-
-      const hiresField = page
-        .locator('.comfymodal-studio-preset-editor .comfymodal-studio-backend-field', { hasText: "Hires Fix" })
-        .first();
-      await expect(hiresField.locator('input[type="checkbox"]')).not.toBeChecked();
-
-      await page.locator('[data-testid="preset-save"]').click();
-
-      const post = wfMock
-        .callsFor("POST", `/comfymodal/studio/workflows/versions/${v2.workflow_version_id}/presets`)
-        .pop();
-      expect(post).toBeTruthy();
-      expect(post.body.values.steps).toBe(0);
-      expect(post.body.values.cfg).toBe(0);
-      expect(post.body.values.positive_prompt).toBe("");
-      expect(post.body.values.hires_fix).toBe(false);
-      expect("steps" in post.body.values).toBe(true);
-      expect("cfg" in post.body.values).toBe(true);
-      expect("positive_prompt" in post.body.values).toBe(true);
-      expect("hires_fix" in post.body.values).toBe(true);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 12: preset with a missing required value shows incomplete ────
-  test("12. preset with a missing required value shows incomplete reasons", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      await openDetail(page, "Portrait Pro");
-      await clickNewPreset(page);
-      await page.locator('[data-testid="preset-name-input"]').fill("Incomplete Preset");
-      // Leave the required "Model" control empty.
-      await page.locator('[data-testid="preset-save"]').click();
-
-      await expect(page.locator('[data-testid="preset-state-reasons"]')).toBeVisible({ timeout: 10000 });
-      await expect(page.locator('[data-testid="preset-state-reasons"]')).toContainText(
-        "missing value for required control"
-      );
-      await expect(page.locator(".comfymodal-studio-notice")).not.toContainText("Preset saved");
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 13: default preset ───────────────────────────────────────────
-  test("13. setting a default preset reflects on card and library", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      await selectVersion(page, v1.workflow_version_id);
-
-      const presetCard = page.locator('[data-testid="preset-card"]').first();
-      await expect(presetCard.locator('[data-testid="preset-card-name"]')).toHaveText("Portrait Default");
-      await presetCard.locator('[data-testid="preset-default-button"]').click();
-      await expect(presetCard.locator(".comfymodal-studio-wf-chip.default")).toBeVisible({ timeout: 10000 });
-      await expect(presetCard.locator('[data-testid="preset-default-button"]')).toHaveText("Clear default");
-
-      // Back in the library the card shows the default preset name.
-      await page.getByRole("button", { name: /Back to Workflows/ }).click();
-      await expect(page.locator('[data-testid="workflows-page"]')).toBeVisible();
-      await expect(wfCard(page, pp.workflow_id)).toContainText("Portrait Default", { timeout: 10000 });
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 14: duplicate preset ─────────────────────────────────────────
-  test("14. duplicating a preset adds a (Copy) card", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      await selectVersion(page, v1.workflow_version_id);
-
-      await page.locator('[data-testid="preset-card"]').first().locator('[data-testid="preset-duplicate-button"]').click();
-      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(2, { timeout: 10000 });
-      await expect(page.locator('[data-testid="preset-card-name"]', { hasText: "Portrait Default (Copy)" })).toBeVisible();
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 15: copy preset to newer version ─────────────────────────────
-  test("15. copying a preset to the latest version keeps the original", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      const v2 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 2);
-      await selectVersion(page, v1.workflow_version_id);
-
-      await page.locator('[data-testid="preset-card"]').first().locator('[data-testid="preset-copy-button"]').click();
-      await expect(page.locator('[data-testid="copy-results"]')).toBeVisible({ timeout: 10000 });
-      await expect(page.locator('[data-testid="copy-results"]')).toContainText("Copied");
-
-      // Version 2 now lists the copied preset.
-      await selectVersion(page, v2.workflow_version_id);
-      await expect(page.locator('[data-testid="preset-card-name"]', { hasText: "Portrait Default" })).toBeVisible({ timeout: 10000 });
-
-      // Version 1 is untouched — exactly one preset remains.
-      await selectVersion(page, v1.workflow_version_id);
-      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(1);
-      await expect(page.locator('[data-testid="preset-card-name"]', { hasText: "Portrait Default" })).toBeVisible();
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 16: bulk copy ────────────────────────────────────────────────
-  test("16. bulk copy to latest copies every preset", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = await openDetail(page, "Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      await selectVersion(page, v1.workflow_version_id);
-
-      // Add a second preset so bulk copy has two items to move.
-      await page.locator('[data-testid="preset-card"]').first().locator('[data-testid="preset-duplicate-button"]').click();
-      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(2, { timeout: 10000 });
-
-      await page.locator('[data-testid="preset-bulk-copy-button"]').click();
-      await expect(page.locator('[data-testid="copy-results"]')).toBeVisible({ timeout: 10000 });
-      await expect(page.locator('[data-testid="copy-result-item"]')).toHaveCount(2);
-
-      const bulk = wfMock
-        .callsFor("POST", `/comfymodal/studio/workflows/versions/${v1.workflow_version_id}/presets/copy-bulk`)
-        .pop();
-      expect(bulk).toBeTruthy();
-      expect(bulk.body.preset_ids.length).toBe(2);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 17: run button lifecycle on an unmapped workflow ─────────────
-  // Mapping now happens through the binding wizard; the preset step uses
-  // the wizard-created mapping's catalog controls.
-  test("17. run button is disabled until mapping and preset exist", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      await stubGraphCapture(page, RICH_WIZARD_GRAPH);
-
-      await openDetail(page, "Abstract Test");
-      await expect(page.locator('[data-testid="run-button"]')).toBeDisabled();
-
-      // Mapping alone makes the version runnable → run enabled.
-      const panel = await openSetupWizard(page);
-      await wizardContinueToBindings(panel);
-      await panel.locator('[data-testid="wizard-suggest-button"]').click();
-      await expect(panel.locator('[data-testid="wizard-suggest-status"]')).toContainText(
-        "Confirm each one below",
-        { timeout: 10000 }
-      );
-      await confirmAllWizardSuggestions(panel);
-      await panel.getByRole("button", { name: "Continue to Details" }).click();
-      await panel.locator('[data-testid="wizard-version-save"]').click();
-      await expect(panel).toContainText("Setup Complete", { timeout: 10000 });
-      await panel.locator('[data-testid="wizard-version-done"]').click();
-      await expect(page.locator('[data-testid="run-button"]')).toBeEnabled({ timeout: 10000 });
-
-      // Add a preset on the freshly mapped version (catalog control labels
-      // come from the wizard-created mapping).
-      await clickNewPreset(page);
-      await page.locator('[data-testid="preset-name-input"]').fill("Abstract Preset");
-      await setPresetField(page, "Prompt", "a test prompt");
-      await setPresetField(page, "Seed", "7");
-      await setPresetField(page, "Model UNET", "test-model.safetensors");
-      await setPresetField(page, "VAE", "test-vae.safetensors");
-      await setPresetField(page, "CLIP", "test-clip.safetensors");
-      await page.locator('[data-testid="preset-save"]').click();
-      await expect(page.locator(".comfymodal-studio-notice")).toContainText("Preset saved", { timeout: 10000 });
-      await expect(page.locator('[data-testid="run-button"]')).toBeEnabled();
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 18: run-context endpoint shape ───────────────────────────────
   test("18. run-context endpoint returns the expected shape", async ({ page }) => {
     let guard;
     try {
@@ -940,7 +676,7 @@ test.describe("Studio Workflows", () => {
         // copy only. Resource/script-derived bases can resolve to stale
         // sibling lane copies (e.g. /extensions/comfyui-modal-rx9p-t/), so
         // they are not probed here.
-        const url = `${new URL("/extensions/comfyui-modal/", location.href).href}studio-preset-wizard.js`;
+        const url = `${new URL("/extensions/comfyui-modal/", location.href).href}studio-workflow-setup-wizard.js`;
         let m = null;
         try {
           const probe = await fetch(url, { method: "GET" });
@@ -1022,7 +758,7 @@ test.describe("Studio Workflows", () => {
         // copy only. Resource/script-derived bases can resolve to stale
         // sibling lane copies (e.g. /extensions/comfyui-modal-rx9p-t/), so
         // they are not probed here.
-        const url = `${new URL("/extensions/comfyui-modal/", location.href).href}studio-preset-wizard.js`;
+        const url = `${new URL("/extensions/comfyui-modal/", location.href).href}studio-workflow-setup-wizard.js`;
         let m = null;
         try {
           const probe = await fetch(url, { method: "GET" });
@@ -1209,225 +945,4 @@ test.describe("Studio Workflows", () => {
   }
 
   // ── Test 24: Backend Presets page is backed by workflow routes ─────────
-  test("24. backend presets page lists and mutates through workflow routes only", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-      page.on("dialog", (d) => d.accept());
-
-      await openBackendPresets(page);
-
-      // Seeded "Portrait Default" (Portrait Pro v1) resolves through the
-      // workflows domain: workflows → versions → version presets.
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("1 preset");
-      await expect(page.getByText("Portrait Default").first()).toBeVisible();
-      const versionPresetLists = wfMock
-        .callsFor("GET", "/comfymodal/studio/workflows/versions/")
-        .filter((c) => c.path.endsWith("/presets"));
-      expect(versionPresetLists.length).toBeGreaterThan(0);
-      expect(legacyPresetRouteCalls().length).toBe(0);
-
-      const detail = page.locator('[data-testid="backend-detail"]');
-
-      // Duplicate through the workflow duplicate route.
-      await detail.getByRole("button", { name: "Duplicate", exact: true }).click();
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets", { timeout: 10000 });
-      await expect(page.getByText("Portrait Default (Copy)").first()).toBeVisible();
-      expect(wfMock.callsFor("POST", "/comfymodal/studio/workflows/presets/").filter((c) => c.path.endsWith("/duplicate")).length).toBe(1);
-      expect(legacyPresetRouteCalls().length).toBe(0);
-
-      // Save renames through PATCH on the workflow preset route.
-      await detail.locator('input[type="text"]').first().fill("Renamed Default");
-      await detail.getByRole("button", { name: "Save", exact: true }).click();
-      await expect(page.getByText("Renamed Default").first()).toBeVisible({ timeout: 10000 });
-      const patches = wfMock.callsFor("PATCH", "/comfymodal/studio/workflows/presets/");
-      expect(patches.length).toBe(1);
-      expect(patches[0].body.name).toBe("Renamed Default");
-      expect(legacyPresetRouteCalls().length).toBe(0);
-
-      // Delete through the workflow preset route (confirm accepted above).
-      await detail.getByRole("button", { name: "Delete preset" }).click();
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("1 preset", { timeout: 10000 });
-      expect(wfMock.callsFor("DELETE", "/comfymodal/studio/workflows/presets/").length).toBe(1);
-      expect(legacyPresetRouteCalls().length).toBe(0);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 25: manual create enters through the from-legacy route ────────
-  test("25. manual preset creation posts a legacy payload to the from-legacy route", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      await openBackendPresets(page);
-      await page.getByRole("button", { name: "+ New Preset (Manual)" }).click();
-      const detail = page.locator('[data-testid="backend-detail"]');
-      const workflowSelect = detail.locator('select[aria-label="Workflow"]');
-      const versionSelect = detail.locator('select[aria-label="Version"]');
-      await expect.poll(async () => workflowSelect.locator("option").count()).toBeGreaterThan(0);
-      await expect.poll(async () => versionSelect.locator("option").count()).toBeGreaterThan(0);
-
-      await detail.locator('input[type="text"]').first().fill("Manual From Legacy");
-      await detail.getByRole("button", { name: "Create", exact: true }).click();
-
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets", { timeout: 10000 });
-      await expect(page.getByText("Manual From Legacy").first()).toBeVisible();
-
-      const fromLegacy = wfMock.callsFor("POST", "/presets/from-legacy");
-      expect(fromLegacy.length).toBe(1);
-      expect(fromLegacy[0].body.name).toBe("Manual From Legacy");
-      expect(legacyPresetRouteCalls().length).toBe(0);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 26: from-legacy translates legacy roles to canonical keys ─────
-  test("26. from-legacy route translates legacy roles and passes unknowns through", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = wfMock.getWorkflow("Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      const result = await page.evaluate(async ({ vid, body }) => {
-        const res = await fetch(`/comfymodal/studio/workflows/versions/${vid}/presets/from-legacy`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        return { http: res.status, json: await res.json() };
-      }, {
-        vid: v1.workflow_version_id,
-        body: {
-          name: "Legacy Import",
-          description: "legacy keys in",
-          values: {
-            positive_prompt: "a portrait",
-            steps: 20,
-            cfg: 5,
-            guidance: 6,
-            model: "m.safetensors",
-            unet: "u.safetensors",
-            custom_thing: "kept",
-          },
-          model_choices: { model: "mc.safetensors" },
-        },
-      });
-
-      expect(result.http).toBe(200);
-      expect(result.json.status).toBe("ok");
-      const values = result.json.preset.values;
-      // Verified abs-1 LEGACY_ROLE_MAP; input-order last-wins on collision.
-      expect(values.prompt).toBe("a portrait");
-      expect(values.step_count).toBe(20);
-      expect(values.cfg_scale).toBe(6);
-      expect(values.model_unet).toBe("u.safetensors");
-      expect(values.custom_thing).toBe("kept");
-      expect(values.positive_prompt).toBeUndefined();
-      expect(values.steps).toBeUndefined();
-      expect(values.cfg).toBeUndefined();
-      expect(values.model).toBeUndefined();
-      expect(result.json.preset.model_choices.model_unet).toBe("mc.safetensors");
-
-      // Canonical persistence is readable back through the version presets.
-      const listed = await page.evaluate(async (vid) => {
-        const res = await fetch(`/comfymodal/studio/workflows/versions/${vid}/presets`);
-        return res.json();
-      }, v1.workflow_version_id);
-      const stored = listed.presets.find((p) => p.name === "Legacy Import");
-      expect(stored).toBeTruthy();
-      expect(stored.values.prompt).toBe("a portrait");
-      expect(stored.values.step_count).toBe(20);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
-
-  // ── Test 27: getRuntimePresets cache keys include workflow/version ──────
-  test("27. scoped runtime presets resolve via workflow routes with scoped cache keys", async ({ page }) => {
-    let guard;
-    try {
-      guard = installConsoleGuard(page);
-
-      const pp = wfMock.getWorkflow("Portrait Pro");
-      const v1 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 1);
-      const at = wfMock.getWorkflow("Abstract Test");
-      const atV = wfMock.getVersions(at.workflow_id)[0];
-      const result = await page.evaluate(async ({ vidScoped, vidOther }) => {
-        // Mount-pinning: import from the PRIMARY extension copy only (see
-        // tests 20/21).
-        const url = `${new URL("/extensions/comfyui-modal/", location.href).href}studio-backend.js`;
-        const m = await import(url);
-        const apiBase = "/comfymodal";
-        let presetFetches = 0;
-        const origFetch = window.fetch;
-        window.fetch = function (...args) {
-          try {
-            const u = String(args[0] || "");
-            if (u.includes("/presets")) presetFetches += 1;
-          } catch { /* ignore */ }
-          return origFetch.apply(this, args);
-        };
-        try {
-          const n0 = presetFetches;
-          const a = await m.getRuntimePresets({ apiBase, workflowVersionId: vidScoped });
-          const n1 = presetFetches;
-          const b = await m.getRuntimePresets({ apiBase, workflowVersionId: vidScoped });
-          const n2 = presetFetches;
-          const c = await m.getRuntimePresets({ apiBase, workflowVersionId: vidOther });
-          const n3 = presetFetches;
-          const d = await m.getRuntimePresets({ apiBase });
-          const n4 = presetFetches;
-          return {
-            scopedLen: a.length, scopedId: a.length ? a[0].id : "",
-            scopedScope: a.length ? a[0].workflowVersionId : "",
-            cachedLen: b.length,
-            otherLen: c.length,
-            unscopedLen: d.length,
-            firstFetchDelta: n1 - n0,
-            cacheHitDelta: n2 - n1,
-            otherScopeDelta: n3 - n2,
-            unscopedDelta: n4 - n3,
-          };
-        } finally {
-          window.fetch = origFetch;
-        }
-      }, { vidScoped: v1.workflow_version_id, vidOther: atV.workflow_version_id });
-
-      // Scoped resolution comes from the workflow version presets.
-      expect(result.scopedLen).toBe(1);
-      expect(result.scopedId).toBeTruthy();
-      expect(result.scopedScope).toBe(v1.workflow_version_id);
-      expect(result.firstFetchDelta).toBeGreaterThan(0);
-      // Same scope hits the cache: no new preset fetch.
-      expect(result.cachedLen).toBe(1);
-      expect(result.cacheHitDelta).toBe(0);
-      // A different version scope refetches (keys include the scope).
-      expect(result.otherLen).toBe(0);
-      expect(result.otherScopeDelta).toBeGreaterThan(0);
-      // The unscoped legacy path still resolves (abs-3 owns its removal).
-      expect(result.unscopedDelta).toBeGreaterThan(0);
-
-      guard.assertNoErrors(APP_NOISE_PATTERNS);
-      api.assertNoUnhandledCalls();
-      wfMock.assertNoUnhandledWorkflowCalls();
-    } finally {
-      if (guard) guard.dispose();
-    }
-  });
 });

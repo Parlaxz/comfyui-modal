@@ -125,9 +125,8 @@ class ValidationProofRegressionTests(unittest.TestCase):
         self.wf = self.service.create_workflow("T2I")
         self.version = self._capture(self.wf["workflow_id"])
         self.version_id = self.version["workflow_version_id"]
-        self.preset = self.service.create_preset(self.version_id, "P", values=default_values())
-        self.preset_id = self.preset["preset_id"]
-        self.service.set_default_preset(self.wf["workflow_id"], self.preset_id)
+        # No preset exists; the version's executable prompt is the default set.
+        self.preset_id = ""
         self.addCleanup(self._tmp.cleanup)
 
     def tearDown(self):
@@ -143,10 +142,10 @@ class ValidationProofRegressionTests(unittest.TestCase):
 
     def _bundle(self):
         with mock.patch("studio_workflow_run._get_domain_service", new=lambda nd: WorkflowDomainService(str(nd))):
-            return swr.resolve_workflow_run_bundle(self.wf["workflow_id"], self.version_id, self.preset_id, self.root)
+            return swr.resolve_workflow_run_bundle(self.wf["workflow_id"], self.version_id, self.root)
 
     def _merged(self, bundle, overrides=None):
-        m = swr.merge_workflow_controls(bundle["preset"], overrides or {}, bundle["control_schema"])
+        m = swr.merge_workflow_controls(bundle.get("defaults") or {}, overrides or {}, bundle["control_schema"])
         self.assertEqual(m["errors"], [])
         return m["values"]
 
@@ -212,9 +211,9 @@ class ValidationProofRegressionTests(unittest.TestCase):
         # Add required identity scaffolding
         snap["request"].setdefault("workflow_id", bundle["workflow"]["workflow_id"])
         snap["request"].setdefault("workflow_version_id", bundle["version"]["workflow_version_id"])
-        snap["request"].setdefault("preset_id", bundle["preset"]["preset_id"])
-        snap["preset_snapshot"] = {"preset_id": bundle["preset"]["preset_id"]}
-        snap["generation_params"] = {"workflow_id": bundle["workflow"]["workflow_id"], "workflow_version_id": bundle["version"]["workflow_version_id"], "preset_id": bundle["preset"]["preset_id"]}
+        snap["request"].setdefault("preset_id", "")
+        snap["preset_snapshot"] = {"preset_id": ""}
+        snap["generation_params"] = {"workflow_id": bundle["workflow"]["workflow_id"], "workflow_version_id": bundle["version"]["workflow_version_id"], "preset_id": ""}
         cap = validate_replay_capability(snap)
         self.assertTrue(cap.capable, f"replay should be capable but got {cap.reason}")
 
@@ -227,7 +226,7 @@ class ValidationProofRegressionTests(unittest.TestCase):
             plan, err = swr.build_workflow_execution_plan(bundle, values, modal_options={"production": {"enabled": True}}, comfyui_root=self.root)
         meta = swr._build_plan_replay_meta(plan)
         raw = meta["execution_plan_json"]
-        snap = {"snapshot_id": "snap1", "schema_version": 1, "workflow": meta["workflow_json"], "workflow_hash": meta["workflow_hash"], "workflow_version_id": bundle["version"]["workflow_version_id"], "request": meta["request_json"], "execution_plan": raw, "deployment_identity": meta["deployment_identity_json"], "preset_snapshot": {"preset_id": bundle["preset"]["preset_id"]}, "generation_params": {"workflow_id": bundle["workflow"]["workflow_id"], "workflow_version_id": bundle["version"]["workflow_version_id"], "preset_id": bundle["preset"]["preset_id"]}}
+        snap = {"snapshot_id": "snap1", "schema_version": 1, "workflow": meta["workflow_json"], "workflow_hash": meta["workflow_hash"], "workflow_version_id": bundle["version"]["workflow_version_id"], "request": meta["request_json"], "execution_plan": raw, "deployment_identity": meta["deployment_identity_json"], "preset_snapshot": {"preset_id": ""}, "generation_params": {"workflow_id": bundle["workflow"]["workflow_id"], "workflow_version_id": bundle["version"]["workflow_version_id"], "preset_id": ""}}
         cap = validate_replay_capability(snap)
         self.assertTrue(cap.capable)
         # No mutable lookup needed: snapshot alone suffices
@@ -308,7 +307,7 @@ class WorkspaceResolutionTests(unittest.TestCase):
     def test_saved_workspace_id_exact_available(self):
         plan = ExecutionPlan(workflow={"1": {"class_type": "KSampler"}}, workflow_hash="h", source_workflow_hash="sh", production_report={}, model_stack={}, prompt_bundle={}, output_node_ids=("1",), execution_options=ExecutionOptions(), request_metadata={"workspace_id": "ws_aaa"}, validation={"validated": True}, deployment_identity={})
         fake_ws = {"id": "ws_aaa", "token_id": "ak-aaa", "token_secret": "as-aaa"}
-        with mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [fake_ws], "active_workspace_id": "ws_aaa"}), mock.patch("modal_workspaces.get_active_workspace", return_value=fake_ws), mock.patch("modal_workspaces.get_workspace", return_value=fake_ws) as gw:
+        with mock.patch("modal_workspaces.resolve_modal_destination", return_value={"workspace_id": "ws_aaa"}), mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [fake_ws], "active_workspace_id": "ws_aaa"}), mock.patch("modal_workspaces.get_active_workspace", return_value=fake_ws), mock.patch("modal_workspaces.get_workspace", return_value=fake_ws) as gw:
             ws = _resolve_replay_workspace(plan)
             self.assertEqual(ws, fake_ws)
             gw.assert_called_with(mock.ANY, "ws_aaa")
@@ -316,7 +315,7 @@ class WorkspaceResolutionTests(unittest.TestCase):
     def test_saved_workspace_id_unknown_does_not_fallback(self):
         plan = ExecutionPlan(workflow={}, workflow_hash="h", source_workflow_hash="sh", production_report={}, model_stack={}, prompt_bundle={}, output_node_ids=("1",), execution_options=ExecutionOptions(), request_metadata={"workspace_id": "ws_missing"}, validation={"validated": True}, deployment_identity={})
         active = {"id": "ws_active", "token_id": "ak-active", "token_secret": "as-active"}
-        with mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [active], "active_workspace_id": "ws_active"}), mock.patch("modal_workspaces.get_active_workspace", return_value=active), mock.patch("modal_workspaces.get_workspace", return_value=None) as gw:
+        with mock.patch("modal_workspaces.resolve_modal_destination", return_value={"workspace_id": "ws_missing"}), mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [active], "active_workspace_id": "ws_active"}), mock.patch("modal_workspaces.get_active_workspace", return_value=active), mock.patch("modal_workspaces.get_workspace", return_value=None) as gw:
             ws = _resolve_replay_workspace(plan)
             self.assertIsNone(ws)
             gw.assert_called_with(mock.ANY, "ws_missing")
@@ -324,7 +323,7 @@ class WorkspaceResolutionTests(unittest.TestCase):
     def test_no_saved_id_fallback_to_active(self):
         plan = ExecutionPlan(workflow={}, workflow_hash="h", source_workflow_hash="sh", production_report={}, model_stack={}, prompt_bundle={}, output_node_ids=("1",), execution_options=ExecutionOptions(), request_metadata={}, validation={"validated": True}, deployment_identity={})
         active = {"id": "ws_active", "token_id": "ak-active", "token_secret": "as-active"}
-        with mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [active], "active_workspace_id": "ws_active"}), mock.patch("modal_workspaces.get_active_workspace", return_value=active), mock.patch("modal_workspaces.get_workspace", return_value=active) as gw:
+        with mock.patch("modal_workspaces.resolve_modal_destination", return_value={"workspace_id": "ws_active"}), mock.patch("modal_workspaces.load_workspace_registry", return_value={"workspaces": [active], "active_workspace_id": "ws_active"}), mock.patch("modal_workspaces.get_active_workspace", return_value=active), mock.patch("modal_workspaces.get_workspace", return_value=active) as gw:
             ws = _resolve_replay_workspace(plan)
             self.assertEqual(ws, active)
             gw.assert_called_with(mock.ANY, "ws_active")

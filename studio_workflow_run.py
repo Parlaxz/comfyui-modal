@@ -87,25 +87,24 @@ def _get_domain_service(node_dir: str | os.PathLike) -> Any:
 def resolve_workflow_run_bundle(
     workflow_id: str,
     version_id: str,
-    preset_id: str,
     node_dir: str | os.PathLike,
 ) -> dict[str, Any]:
-    """Resolve and gate a workflow run: workflow + version + mapping + preset.
+    """Resolve and gate a workflow run: workflow + version + mapping.
 
-    Returns ``{"status": "ok", "workflow", "version", "mapping", "preset",
-    "state", "executable_prompt", "control_schema"}`` or a fail-closed error
-    dict (``{"status": "error", "error_code", "message", ...}``).
+    Returns ``{"status": "ok", "workflow", "version", "mapping", "state",
+    "executable_prompt", "control_schema", "defaults"}`` or a fail-closed
+    error dict (``{"status": "error", "error_code", "message", ...}``).
 
     * Version resolution: empty ``version_id`` → the workflow's latest version.
     * Runnable gate: the version's derived state must be ``runnable``; an
       incomplete version returns ``WORKFLOW_VERSION_NOT_RUNNABLE`` with the
       derivation reasons (never guessed).
-    * Preset resolution: explicit ``preset_id`` (verified to belong to the
-      version) else the workflow's ``default_preset_id`` else an error.
+
+    There is no preset: control defaults are read from the version's own
+    ``executable_prompt`` (see ``default_controls_from_version``).
     """
     service = _get_domain_service(node_dir)
     workflow_id = str(workflow_id or "")
-    preset_id = str(preset_id or "")
     version_id = str(version_id or "").strip()
 
     try:
@@ -146,46 +145,9 @@ def resolve_workflow_run_bundle(
             "message": f"workflow version {version_id!r} has no mapping",
         }
 
-    preset: Optional[dict[str, Any]] = None
-    if preset_id:
-        try:
-            preset = service.get_preset(preset_id)
-        except Exception as exc:  # WorkflowPresetNotFoundError
-            return {
-                "status": "error",
-                "error_code": "PRESET_NOT_FOUND",
-                "message": str(exc) or f"preset {preset_id!r} not found",
-            }
-        if not isinstance(preset, dict):
-            return {
-                "status": "error",
-                "error_code": "PRESET_NOT_FOUND",
-                "message": f"preset {preset_id!r} not found",
-            }
-        if str(preset.get("workflow_version_id", "")) != version_id:
-            return {
-                "status": "error",
-                "error_code": "PRESET_VERSION_MISMATCH",
-                "message": (
-                    f"preset {preset_id!r} belongs to a different workflow "
-                    f"version; expected {version_id!r}"
-                ),
-            }
-    else:
-        default_id = str(workflow.get("default_preset_id", "") or "")
-        if default_id:
-            try:
-                preset = service.get_preset(default_id)
-            except Exception:
-                preset = None
-        if preset is None:
-            return {
-                "status": "error",
-                "error_code": "NO_PRESET",
-                "message": "no preset is available for this workflow run",
-            }
-
     executable_prompt = version.get("executable_prompt") or {}
+    if not isinstance(executable_prompt, dict):
+        executable_prompt = {}
     control_schema: dict[str, Any] = {}
     for entry in mapping.get("entries") or []:
         if isinstance(entry, dict) and entry.get("semantic_role"):
@@ -196,10 +158,10 @@ def resolve_workflow_run_bundle(
         "workflow": workflow,
         "version": version,
         "mapping": mapping,
-        "preset": preset,
         "state": state,
-        "executable_prompt": executable_prompt if isinstance(executable_prompt, dict) else {},
+        "executable_prompt": executable_prompt,
         "control_schema": control_schema,
+        "defaults": default_controls_from_version(executable_prompt, control_schema),
     }
 
 
@@ -283,16 +245,54 @@ def validate_workflow_controls(
     return errors
 
 
+def default_controls_from_version(
+    executable_prompt: dict[str, Any],
+    control_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Read each mapped control's current value out of the version's own graph.
+
+    A workflow version is self-describing: the node inputs captured in
+    ``executable_prompt`` already hold the values a run should start from, so
+    no separate preset record is needed to supply defaults.
+
+    Only roles that appear in ``control_schema`` are read, and only scalar
+    widget values are copied (dicts/lists are node configuration, not control
+    values). Roles with no matching node or widget are simply absent, which the
+    required-control check in ``merge_workflow_controls`` then reports.
+    """
+    defaults: dict[str, Any] = {}
+    if not isinstance(executable_prompt, dict):
+        return defaults
+    for role, entry in (control_schema or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        node_id = str(entry.get("node_id") or "")
+        input_name = str(entry.get("input_name") or "")
+        if not node_id or not input_name:
+            continue
+        node = executable_prompt.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        node_inputs = node.get("inputs")
+        if not isinstance(node_inputs, dict) or input_name not in node_inputs:
+            continue
+        value = node_inputs.get(input_name)
+        if isinstance(value, (dict, list)):
+            continue
+        defaults[role] = value
+    return defaults
+
+
 def merge_workflow_controls(
-    preset: dict[str, Any],
+    defaults: dict[str, Any],
     overrides: dict[str, Any],
     control_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """Merge preset values + request overrides and validate the result.
+    """Merge version-derived defaults + request overrides, then validate.
 
-    Base = ``preset["values"]`` keyed by semantic role; for roles present in
-    ``preset["model_choices"]`` the model choice wins.  Request overrides are
-    applied on top (only keys present in *overrides*; overrides win).
+    Base = ``defaults`` keyed by semantic role (see
+    ``default_controls_from_version``).  Request overrides are applied on top
+    (only keys present in *overrides*; overrides win).
 
     The merged dict is validated with ``validate_workflow_controls`` and any
     required mapping role missing from the merged values adds a
@@ -300,16 +300,11 @@ def merge_workflow_controls(
 
     Returns ``{"values": merged, "errors": [...]}``.
     """
-    preset = preset or {}
+    defaults = defaults or {}
     overrides = overrides or {}
     control_schema = control_schema or {}
 
-    base: dict[str, Any] = dict(preset.get("values") or {})
-    for role, model_name in (preset.get("model_choices") or {}).items():
-        if role in control_schema:
-            base[role] = model_name
-
-    merged: dict[str, Any] = dict(base)
+    merged: dict[str, Any] = dict(defaults)
     for key, value in overrides.items():
         merged[key] = value
 
@@ -324,52 +319,6 @@ def merge_workflow_controls(
                 })
 
     return {"values": merged, "errors": errors}
-
-
-# ── Legacy absorption bridge (abs-1) ─────────────────────────────────────
-
-
-def prepare_legacy_run_controls(
-    control_schema: dict[str, Any],
-    legacy_preset: dict[str, Any] | None = None,
-    overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Translate legacy-keyed values, then merge+validate via the verified path.
-
-    Inputs: ``control_schema`` — the bundle's canonical control schema (from
-      ``resolve_workflow_run_bundle``); ``legacy_preset`` — a legacy preset
-      PAYLOAD (``values``/``model_choices`` keyed by old roles; a bare
-      values dict must be wrapped as ``{"values": ...}``); ``overrides`` —
-      optional legacy-keyed request overrides (translated, then win per
-      canonical key).
-    Outputs: ``{"values": merged_canonical, "errors": [...]}`` — the exact
-      shape ``merge_workflow_controls`` returns.  Translation is pure
-      (``studio_domain.legacy_adapters``: renames per role table, unknown
-      keys verbatim); validation stays STRICT (unknown controls error —
-      visible, never silently dropped).  Run contract order:
-      ``resolve_workflow_run_bundle`` → this → ``build_workflow_execution_plan``
-      / ``handle_workflow_run_async``.
-    """
-    from studio_domain.legacy_adapters import (
-        translate_model_choices,
-        translate_values,
-    )
-
-    payload = legacy_preset if isinstance(legacy_preset, dict) else {}
-    raw_values = payload.get("values")
-    raw_models = payload.get("model_choices")
-    canonical_preset = {
-        "values": translate_values(raw_values if isinstance(raw_values, dict) else {}),
-        "model_choices": translate_model_choices(
-            raw_models if isinstance(raw_models, dict) else {}
-        ),
-    }
-    translated_overrides = translate_values(
-        overrides if isinstance(overrides, dict) else {}
-    )
-    return merge_workflow_controls(
-        canonical_preset, translated_overrides, control_schema or {}
-    )
 
 
 # ── Prompt application ───────────────────────────────────────────────────
@@ -641,9 +590,9 @@ def build_workflow_execution_plan(
         studio_meta = _build_workflow_studio_meta(
             workflow_id=str(bundle.get("workflow", {}).get("workflow_id", "")),
             version_id=str(bundle.get("version", {}).get("workflow_version_id", "")),
-            preset_id=str(bundle.get("preset", {}).get("preset_id", "")),
+            preset_id="",
             workflow_name=str(bundle.get("workflow", {}).get("name", "")),
-            preset_name=str(bundle.get("preset", {}).get("name", "")),
+            preset_name="",
             controls=values,
             workflow_hash=workflow_hash,
             output_mode=output_mode,
@@ -1165,9 +1114,9 @@ async def _record_workflow_run_failure(
             "workflow_version_id": str(
                 bundle.get("version", {}).get("workflow_version_id", "") or ""
             ),
-            "preset_id": str(bundle.get("preset", {}).get("preset_id", "") or ""),
+            "preset_id": "",
             "workflow_name": str(bundle.get("workflow", {}).get("name", "") or ""),
-            "preset_name": str(bundle.get("preset", {}).get("name", "") or ""),
+            "preset_name": "",
             "studio_feature_id": "workflow",
             "requested_controls": dict(values or {}),
             "experiment_id": run_history_id,
@@ -1270,12 +1219,12 @@ async def _workflow_v2_run(
             "identity": {
                 "workflow_id": workflow_id,
                 "workflow_version_id": version_id,
-                "preset_id": str(bundle.get("preset", {}).get("preset_id", "")),
+                "preset_id": "",
                 "workflow_name": str(bundle.get("workflow", {}).get("name", "")),
-                "preset_name": str(bundle.get("preset", {}).get("name", "")),
+                "preset_name": "",
             },
         }
-        return bundle.get("preset", {}), snapshot, None
+        return bundle.get("defaults") or {}, snapshot, None
 
     async def _validate_fn(preset: dict, snapshot: dict, fid: str) -> None:
         # Runnable gating already happened in resolve_workflow_run_bundle.
@@ -1488,12 +1437,12 @@ async def handle_workflow_run_async(
     Returns the same result dict shapes as the legacy adapter.
     """
     try:
-        bundle = resolve_workflow_run_bundle(workflow_id, version_id, preset_id, node_dir)
+        bundle = resolve_workflow_run_bundle(workflow_id, version_id, node_dir)
         if bundle.get("status") != "ok":
             return bundle
 
         merged = merge_workflow_controls(
-            bundle["preset"], controls or {}, bundle["control_schema"]
+            bundle.get("defaults") or {}, controls or {}, bundle["control_schema"]
         )
         if merged["errors"]:
             return {

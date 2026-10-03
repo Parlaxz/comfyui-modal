@@ -472,8 +472,6 @@ function childrenOf(el) {
   // I7 truth: the three Backend modules now import the shared primitive,
   // and Settings remains static with none.
   for (const file of [
-    "studio-backend-presets.js",
-    "studio-backend-snapshots.js",
     "studio-backend-workspaces.js",
   ]) {
     assert.ok(readWeb(file).includes("./studio-loading.js"), `${file} consumes the shared loading primitive (I7)`);

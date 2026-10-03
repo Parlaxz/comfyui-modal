@@ -88,10 +88,20 @@ async function selectPortraitV1(page, wfMock) {
   const wfSelect = page.locator('[data-testid="workflow-selector"]');
   await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
   await wfSelect.selectOption(ids.workflowId);
-  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
-  const verSelect = page.locator('[data-testid="workflow-version-selector"]');
-  await verSelect.selectOption(ids.v1);
+  // The Shelf is the single field editor: selecting a Workflow is all that is
+  // needed. `shelf-fields` only renders once the run context is loaded and
+  // mapped fields exist, so it is the real readiness gate.
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="shelf-fields"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="shelf-input-seed"]')).toBeVisible({ timeout: 15000 });
+  // No duplicate top-section field editor, and no version/preset choosers.
+  await expect(page.locator('[data-testid="workflow-mapped-controls"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="workflow-version-selector"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="workflow-preset-selector"]')).toHaveCount(0);
+  // Model-loader roles are not editable knobs.
+  for (const role of ["model_unet", "clip", "vae"]) {
+    await expect(page.locator(`[data-testid="shelf-input-${role}"]`)).toHaveCount(0);
+  }
   await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
   return ids;
 }
@@ -325,8 +335,9 @@ test.describe("Studio Shelf Playground", () => {
     await expect(page.locator('[data-testid="shelf-reuse-dialog"]')).toBeVisible({ timeout: 10000 });
     await page.locator('[data-testid="shelf-reuse-no"]').click();
     await expect(page.locator('[data-testid="shelf-workflow-name"]')).toContainText("Portrait Pro", { timeout: 15000 });
-    await page.locator('[data-testid="workflow-version-selector"]').selectOption(ids.v1);
-    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("444", { timeout: 15000 });
+    // Declining reuse resets the field to the version's own captured graph
+    // default (presets no longer carry values).
+    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("42", { timeout: 15000 });
     await expect(page.locator('[data-testid="shelf-stale-note"]')).toBeVisible();
     await page.locator('[data-testid="run-btn"]').click();
     await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 45000 });

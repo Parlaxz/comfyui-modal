@@ -11,7 +11,6 @@
 // master list page. Run Experiment may be disabled with a precise reason.
 
 import { CONTROL_DEFS, getRecommendedSteps, getRecommendedStepsStatus, getLastFiniteSeed, cryptoRandomSeed } from "./studio-feature-registry.js";
-import { getAxisEligibilityForPresets } from "./studio-preset-capabilities.js";
 import { BINDABLE_INPUTS } from "./studio-bindable-inputs.js";
 import { renderWorkflowPicker } from "./studio-workflow-picker.js";
 import { loadShelfExperimentDraft, saveShelfExperimentDraft } from "./studio-playground-state.js";
@@ -52,17 +51,6 @@ export function renderExperimentToggle(state, actions) {
   return container;
 }
 
-// ── Axis eligibility helper ──────────────────────────────────────────────
-
-function recalcEligibleAxes(state, loadedPresets) {
-  const ids = getExperimentPresetIds(state);
-  if (ids.length === 0) return [];
-  const selectedPresets = ids
-    .map((id) => (loadedPresets || []).find((p) => (p.id || p.label || "") === id))
-    .filter(Boolean);
-  const featureId = (state.playground && state.playground.featureId) || "txt2img";
-  return getAxisEligibilityForPresets(selectedPresets, featureId);
-}
 
 // ── Helpers for collapsible and grouping ──────────────────────────────
 
@@ -98,332 +86,6 @@ function _createCollapsible(labelText, isExpanded, testId) {
   return { summary: summary, content: content };
 }
 
-/**
- * Group presets by their optional `group` field.
- * Returns { groups: { groupName: [preset, ...] }, ungrouped: [preset, ...] }
- */
-function _groupPresetsByField(presets) {
-  var groups = {};
-  var ungrouped = [];
-  presets.forEach(function (p) {
-    var g = p.group;
-    if (g && typeof g === "string" && g.trim() !== "") {
-      if (!groups[g]) groups[g] = [];
-      groups[g].push(p);
-    } else {
-      ungrouped.push(p);
-    }
-  });
-  return { groups: groups, ungrouped: ungrouped };
-}
-
-// ── Compare Backends block ───────────────────────────────────────────────
-
-export function renderCompareBackends(state, actions, context) {
-  const container = document.createElement("div");
-  container.className = "comfymodal-studio-compare-backends";
-  container.setAttribute("data-testid", "compare-backends");
-
-  const heading = document.createElement("h4");
-  heading.className = "comfymodal-studio-block-heading";
-  heading.textContent = "Compare Presets";
-  container.appendChild(heading);
-
-  // Main collapsible wrapper
-  var mainCollapsible = _createCollapsible("Presets", false, "compare-presets-toggle");
-  container.appendChild(mainCollapsible.summary);
-  container.appendChild(mainCollapsible.content);
-
-  const apiBase = (context && context.apiBase) || "/comfymodal";
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-
-  // Lazy import keeps this module Node-importable for deterministic tests
-  // (studio-backend.js pulls ComfyUI-only modules through its own graph).
-  import("./studio-backend.js").then(({ getRuntimePresets }) => {
-    return getRuntimePresets({ apiBase }).then((presets) => {
-    while (mainCollapsible.content.firstChild) mainCollapsible.content.removeChild(mainCollapsible.content.firstChild);
-
-    // Update main summary count
-    var countLabel = mainCollapsible.summary.querySelector("span:last-child");
-    if (countLabel) countLabel.textContent = "Presets (" + (presets ? presets.length : 0) + ")";
-
-    // Calculate eligible axes from compared presets
-    const eligible = recalcEligibleAxes(state, presets);
-    state.playground._eligibleAxes = eligible;
-    // Clear ineligible axes
-    const axes = state.playground.experimentAxes || {};
-    Object.keys(axes).forEach((ctrlId) => {
-      if (!eligible.includes(ctrlId)) {
-        delete axes[ctrlId];
-      }
-    });
-
-    if (!presets || presets.length === 0) {
-      // Phase I8: ordinary empty state via the shared primitive; frozen
-      // wording "Open Backend to create presets" applies here too.
-      const link = document.createElement("a");
-      link.href = "#";
-      link.textContent = "Open Backend to create presets.";
-      link.style.color = "var(--color-accent)";
-      link.style.cursor = "pointer";
-      link.addEventListener("click", (e) => {
-        e.preventDefault();
-        if (actions && actions.navigateToBackendTab) {
-          actions.navigateToBackendTab();
-        }
-      });
-      const emptyState = renderEmptyState({
-        title: "No presets configured.",
-        action: link,
-        testid: "experiment-presets-empty",
-      });
-      mainCollapsible.content.appendChild(emptyState);
-      return;
-    }
-
-    const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-
-    // Shared render function for a single preset row
-    function _renderPresetRow(b) {
-      const bId = b.id || b.label || "";
-      const isRunnable = b.status === "runnable" && !b.archived;
-      const featureCompat = (b.compatibleFeatures || []).includes(currentFeatureId);
-      const canSelect = isRunnable && featureCompat;
-      let disabledReason = "";
-      if (b.archived) disabledReason = "Archived";
-      else if (!featureCompat) disabledReason = 'Not compatible with "' + currentFeatureId + '"';
-      else if (!isRunnable && b.disabledReason) disabledReason = b.disabledReason;
-      else if (!isRunnable) disabledReason = "Not runnable";
-
-      const item = document.createElement("div");
-      item.className = "comfymodal-studio-compare-item";
-      if (!canSelect) item.style.opacity = "0.45";
-
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.className = "comfymodal-studio-compare-checkbox";
-      cb.setAttribute("data-backend-id", bId);
-      cb.setAttribute("data-testid", "compare-preset-" + bId);
-      if (!canSelect) cb.disabled = true;
-      cb.checked = canSelect && compareIds.includes(bId);
-      cb.addEventListener("change", function () {
-        const current = (state.playground && state.playground.compareBackendIds) || [];
-        var updated;
-        if (cb.checked) {
-          updated = current.concat([bId]);
-        } else {
-          updated = current.filter(function (id) { return id !== bId; });
-        }
-        state.playground.compareBackendIds = updated;
-        // Recalculate eligible axes and clear ineligible ones
-        var eligible2 = recalcEligibleAxes(state, presets);
-        state.playground._eligibleAxes = eligible2;
-        var _axes = state.playground.experimentAxes || {};
-        Object.keys(_axes).forEach(function (ctrlId) {
-          if (!eligible2.includes(ctrlId)) {
-            delete _axes[ctrlId];
-          }
-        });
-        if (actions && actions.persistExperimentDraft) {
-          actions.persistExperimentDraft();
-        }
-        var _matrixBody = container.parentNode
-          ? container.parentNode.querySelector('[data-testid="matrix-body"]')
-          : null;
-        if (_matrixBody) {
-          updateMatrixSummary(_matrixBody, state);
-        }
-        if (context && context.setPage) {
-          context.setPage("playground");
-        }
-      });
-      item.appendChild(cb);
-
-      var label = document.createElement("span");
-      label.textContent = b.label || b.id || "Unknown";
-      label.style.fontSize = "var(--font-size-sm)";
-      item.appendChild(label);
-
-      if (disabledReason) {
-        var reasonEl = document.createElement("span");
-        reasonEl.textContent = " (" + disabledReason + ")";
-        reasonEl.style.fontSize = "var(--font-size-xs)";
-        reasonEl.style.color = "var(--color-text-muted)";
-        reasonEl.style.marginLeft = "4px";
-        item.appendChild(reasonEl);
-      }
-
-      return item;
-    }
-
-    // Group presets by their `group` field
-    var grouped = _groupPresetsByField(presets);
-    var groupNames = Object.keys(grouped.groups).sort(function (a, b) { return a.localeCompare(b); });
-
-    // Render each named group as a nested collapsible
-    groupNames.forEach(function (gName) {
-      var groupCollapsible = _createCollapsible(gName, false, "compare-preset-group-" + gName.replace(/[^a-zA-Z0-9_-]/g, "_"));
-      var gPresets = grouped.groups[gName];
-      gPresets.forEach(function (bp) {
-        groupCollapsible.content.appendChild(_renderPresetRow(bp));
-      });
-      mainCollapsible.content.appendChild(groupCollapsible.summary);
-      mainCollapsible.content.appendChild(groupCollapsible.content);
-    });
-
-    // Ungrouped section (no group or empty group)
-    if (grouped.ungrouped.length > 0) {
-      var ungroupedCollapsible = _createCollapsible("Ungrouped", false, "compare-preset-group-ungrouped");
-      grouped.ungrouped.forEach(function (bp) {
-        ungroupedCollapsible.content.appendChild(_renderPresetRow(bp));
-      });
-      mainCollapsible.content.appendChild(ungroupedCollapsible.summary);
-      mainCollapsible.content.appendChild(ungroupedCollapsible.content);
-    }
-    });   // end getRuntimePresets().then
-  }).catch(function () {
-    var errorMsg = document.createElement("p");
-    errorMsg.className = "comfymodal-studio-empty-state";
-    errorMsg.textContent = "Could not load presets.";
-    mainCollapsible.content.appendChild(errorMsg);
-  });
-
-  return container;
-}
-
-// ── Matrix Summary block ─────────────────────────────────────────────────
-
-export function renderMatrixSummary(state, actions) {
-  const container = document.createElement("div");
-  container.className = "comfymodal-studio-matrix-summary";
-  container.setAttribute("data-testid", "matrix-summary");
-
-  const headingRow = document.createElement("div");
-  headingRow.style.display = "flex";
-  headingRow.style.alignItems = "center";
-  headingRow.style.gap = "6px";
-
-  const heading = document.createElement("h4");
-  heading.className = "comfymodal-studio-block-heading";
-  heading.textContent = "Matrix Summary";
-  headingRow.appendChild(heading);
-
-  // Info hint for matrix summary
-  const infoHint = document.createElement("span");
-  infoHint.className = "comfymodal-studio-info-hint";
-  infoHint.tabIndex = 0;
-  infoHint.role = "tooltip";
-  infoHint.setAttribute("aria-label", "Configure axes by checking boxes beside controls. The matrix shows total combinations across all active axes and selected backends.");
-  infoHint.textContent = "\u24d8";
-  const tooltip = document.createElement("span");
-  tooltip.className = "comfymodal-studio-tooltip";
-  tooltip.textContent = "Configure axes by checking boxes beside controls. The matrix shows total combinations across all active axes and selected backends.";
-  infoHint.appendChild(tooltip);
-  infoHint.addEventListener("mouseenter", () => { tooltip.style.display = "block"; });
-  infoHint.addEventListener("mouseleave", () => { tooltip.style.display = ""; });
-  infoHint.addEventListener("focus", () => { tooltip.style.display = "block"; });
-  infoHint.addEventListener("blur", () => { tooltip.style.display = ""; });
-  headingRow.appendChild(infoHint);
-
-  container.appendChild(headingRow);
-
-  const body = document.createElement("div");
-  body.className = "comfymodal-studio-matrix-body";
-  body.setAttribute("data-testid", "matrix-body");
-  container.appendChild(body);
-
-  // Update matrix summary based on current axes
-  updateMatrixSummary(body, state);
-
-  return container;
-}
-
-function updateMatrixSummary(body, state) {
-  while (body.firstChild) body.removeChild(body.firstChild);
-
-  const axes = (state.playground && state.playground.experimentAxes) || {};
-  const axisEntries = Object.entries(axes).filter(([, def]) => def && def.enabled);
-
-  // Canonical preset ID set: unique([selectedBasePresetId, ...comparePresetIds])
-  const canonicalPresetIds = getExperimentPresetIds(state);
-  const backendCount = canonicalPresetIds.length;
-
-  if (axisEntries.length === 0 && backendCount === 0) {
-    // Phase I8: no-selection hint via the shared empty-state primitive
-    // (the warning paragraph below stays a truthful status note).
-    body.appendChild(renderEmptyState({
-      title: "Check boxes next to controls to add them as experiment axes.",
-      testid: "experiment-matrix-empty",
-    }));
-
-    // Warning if zero axes
-    const warn = document.createElement("p");
-    warn.className = "comfymodal-studio-matrix-warning";
-    warn.textContent = "\u26a0 No axes configured. Add at least one axis to create an experiment matrix.";
-    warn.style.fontSize = "var(--font-size-xs)";
-    warn.style.color = "var(--color-warning)";
-    warn.style.marginTop = "4px";
-    body.appendChild(warn);
-    return;
-  }
-
-  const totalCombos = axisEntries.reduce((prod, [, def]) => {
-    const vals = (def.values && def.values.length) || 1;
-    return prod * vals;
-  }, 1);
-
-  const list = document.createElement("ul");
-  list.className = "comfymodal-studio-matrix-axis-list";
-  list.style.fontSize = "var(--font-size-xs)";
-  list.style.margin = "4px 0";
-  list.style.paddingLeft = "16px";
-  axisEntries.forEach(([ctrlId, def]) => {
-    const ctrl = CONTROL_DEFS[ctrlId] || {};
-    const item = document.createElement("li");
-    const vals = (def.values && def.values.length) || 1;
-    item.textContent = `${ctrl.label || ctrlId}: ${vals} value(s)`;
-    list.appendChild(item);
-  });
-  body.appendChild(list);
-
-  // Summary stats
-  const stats = document.createElement("div");
-  stats.style.fontSize = "var(--font-size-xs)";
-  stats.style.marginTop = "4px";
-
-  const axisCount = document.createElement("p");
-  axisCount.textContent = `Active axes: ${axisEntries.length}`;
-  stats.appendChild(axisCount);
-
-  if (backendCount > 0) {
-    const backendStat = document.createElement("p");
-    backendStat.textContent = `Selected backends: ${backendCount}`;
-    stats.appendChild(backendStat);
-  } else {
-    const noBackend = document.createElement("p");
-    noBackend.textContent = "No backends selected.";
-    noBackend.style.color = "var(--color-text-muted)";
-    stats.appendChild(noBackend);
-  }
-
-  const estimatedRuns = totalCombos * Math.max(backendCount, 1);
-  const totalSummary = document.createElement("p");
-  totalSummary.style.fontWeight = "var(--font-weight-semibold)";
-  totalSummary.textContent = `Estimated runs: ${estimatedRuns}`;
-  stats.appendChild(totalSummary);
-
-  body.appendChild(stats);
-
-  // Warning if zero or no backends
-  if (axisEntries.length === 0) {
-    const warn = document.createElement("p");
-    warn.className = "comfymodal-studio-matrix-warning";
-    warn.textContent = "\u26a0 No axes configured. Add at least one axis.";
-    warn.style.color = "var(--color-warning)";
-    warn.style.marginTop = "4px";
-    body.appendChild(warn);
-  }
-}
 
 // ── Axis checkbox enhancement ────────────────────────────────────────────
 //
@@ -450,7 +112,7 @@ export function enhanceControlWithAxisCheckbox(controlEl, controlId, state, acti
   cb.className = "comfymodal-studio-axis-checkbox";
   cb.disabled = !isEligible;
   if (!isEligible) {
-    wrapper.title = "Axis not available: not all selected presets support this control.";
+    wrapper.title = "Axis not available: this control is not mapped in the selected workflow version.";
   }
   cb.addEventListener("change", () => {
     if (actions && actions.toggleExperimentAxis) {
@@ -507,17 +169,21 @@ export function renderAxisEditor(controlId, state, actions) {
   if (def.type === "select") {
     // Select-type axes: dropdowns populated from the backend schema options
     // when available (sampler names, scheduler names, etc.), falling back to
-    // text inputs if the preset schema is not yet resolved.
+    // text inputs if the version control schema is not yet resolved.
     function _renderSelectValues() {
       while (valuesArea.firstChild) valuesArea.removeChild(valuesArea.firstChild);
 
       const axData = (state.playground && state.playground.experimentAxes && state.playground.experimentAxes[controlId]) || {};
       const vals = axData.values || [""];
 
-      // Resolve schema options from the current preset (if available)
-      const preset = state.playground && state.playground._currentPreset;
-      const schema = preset && preset.controlSchemas && preset.controlSchemas[controlId];
-      const options = schema && schema.options && schema.options.length > 0 ? schema.options : null;
+      // Resolve schema options from the version's control schema (if available)
+      const wfStore = state.playground && state.playground._workflowRun;
+      const wfSchema = wfStore && wfStore.runContext
+        && (wfStore.runContext.control_schema || {});
+      const entry = wfSchema && wfSchema[controlId];
+      const options = entry && entry.enum_options && entry.enum_options.length > 0
+        ? entry.enum_options
+        : null;
 
       function collectValues() {
         const inputs = valuesArea.querySelectorAll('[data-testid^="axis-value-' + controlId + '-"]');
@@ -821,7 +487,7 @@ export function renderAxisEditor(controlId, state, actions) {
             recBtn.disabled = true;
             recBtn.title = recStatus.reason;
           } else {
-            recBtn.title = "From selected preset workflow capture";
+            recBtn.title = "From the selected workflow version capture";
             recBtn.addEventListener("click", function () {
               var currentVals = collectValues();
               if (currentVals.length === 0) {
@@ -861,46 +527,6 @@ export function renderAxisEditor(controlId, state, actions) {
   return editor;
 }
 
-/**
- * Check if at least one experiment axis has >= 2 values configured.
- */
-function hasMultiValueAxis(state) {
-  const axes = (state.playground && state.playground.experimentAxes) || {};
-  return Object.values(axes).some(function (def) {
-    return def && def.enabled && def.values && def.values.length >= 2;
-  });
-}
-
-export function canRunExperiment(state) {
-  const canonicalPresetIds = getExperimentPresetIds(state);
-  if (canonicalPresetIds.length >= 2) return true;
-  return canonicalPresetIds.length >= 1 && hasMultiValueAxis(state);
-}
-
-export function getExperimentDisabledReason(state) {
-  const canonicalPresetIds = getExperimentPresetIds(state);
-  const hasAxes = hasMultiValueAxis(state);
-
-  if (canonicalPresetIds.length === 0) return "Select at least 2 presets (or 1 preset with a multi-value axis) to run an experiment.";
-  if (canonicalPresetIds.length === 1 && !hasAxes) return "Add another preset to compare, or add at least 2 values to an experiment axis.";
-  const currentFeatureId = (state.playground && state.playground.featureId) || "txt2img";
-  const experimentsEnabled = currentFeatureId === "txt2img";
-  if (!experimentsEnabled) return "Experiments are only available for txt2img in this release.";
-  return "";
-}
-
-/**
- * Compute the canonical set of preset IDs for experiment validation/display.
- * Returns a unique array derived from the base preset + compare presets.
- */
-export function getExperimentPresetIds(state) {
-  const baseBackendId = (state.playground && state.playground.selectedBackendId) || "";
-  const compareIds = (state.playground && state.playground.compareBackendIds) || [];
-  const allIds = baseBackendId
-    ? [baseBackendId].concat(compareIds.filter(function (id) { return id !== baseBackendId; }))
-    : compareIds;
-  return [...new Set(allIds.filter(Boolean))];
-}
 
 // ── Modern Experiment V2 (D5) ────────────────────────────────────────────
 //
@@ -953,7 +579,7 @@ function _modernExperimentId() {
 }
 
 /**
- * Resolve the workflow/version/preset the modern experiment should run from.
+ * Resolve the workflow/version the modern experiment should run from.
  * Values are used verbatim when state supplies them — never inferred later.
  */
 export function resolveModernWorkflowSelection(state) {
@@ -967,9 +593,7 @@ export function resolveModernWorkflowSelection(state) {
   return {
     workflowId: _firstStr(store.workflowId, pg.workflowId),
     workflowVersionId: _firstStr(store.workflowVersionId, pg.workflowVersionId),
-    presetId: _firstStr(store.presetId, pg.workflowPresetId),
     workflowName: _firstStr(store.workflowName, pg.workflowName),
-    presetName: _firstStr(store.presetName, pg.presetName),
     workflowSnapshot: workflowSnapshot,
   };
 }
@@ -982,10 +606,6 @@ function _resolveModernControls(pg) {
     if (Object.prototype.hasOwnProperty.call(CONTROL_DEFS, id) && CONTROL_DEFS[id].defaultValue !== undefined) {
       resolved[id] = CONTROL_DEFS[id].defaultValue;
     }
-  }
-  var presetDefaults = (pg._currentPreset && pg._currentPreset.defaults) || {};
-  for (var pk in presetDefaults) {
-    if (Object.prototype.hasOwnProperty.call(presetDefaults, pk)) resolved[pk] = presetDefaults[pk];
   }
   var workflowStore = pg._workflowRun && typeof pg._workflowRun === "object" ? pg._workflowRun : {};
   var controlValues = workflowStore.controlValues || {};
@@ -1019,7 +639,7 @@ function _axisCombinations(enabledAxes) {
  * Build the fixed ordered cell list for a modern experiment definition.
  * Cells are keyed by stable cell_id (cell_0..cell_N-1) in generation order;
  * never reordered by completion.  Axis labels/values and the resolved
- * workflow/version/preset are baked per cell.
+ * workflow/version are baked per cell.
  */
 export function buildModernExperimentCells(opts) {
   var o = opts && typeof opts === "object" ? opts : {};
@@ -1053,7 +673,6 @@ export function buildModernExperimentCells(opts) {
       generation_id: "gen_" + experimentId + "_" + i,
       workflow_id: selection.workflowId || null,
       workflow_version_id: selection.workflowVersionId || null,
-      preset_id: selection.presetId || null,
       axis_labels: axisLabels,
       axis_values: axisValues,
       workflow_snapshot: snapshot,
@@ -1072,7 +691,7 @@ export function buildModernExperimentCells(opts) {
 
 /**
  * Build the ONE modern experiment definition from the current axes/controls
- * and resolved workflow/version/preset.  No concurrency field (the global
+ * and resolved workflow/version.  No concurrency field (the global
  * default is backend/settings-owned).  Axes are request-generation
  * convenience only.
  */
@@ -1110,9 +729,7 @@ export function buildModernExperimentDefinition(state, context) {
       ? [{
           workflow_id: selection.workflowId,
           workflow_version_id: selection.workflowVersionId || "",
-          preset_id: selection.presetId || "",
           workflow_name: selection.workflowName || "",
-          preset_name: selection.presetName || "",
         }]
       : [],
   };
@@ -1544,7 +1161,7 @@ export function renderModernCellTile(cell, index, state, actions, context) {
 export function modernCellMetaText(cell) {
   if (!cell || typeof cell !== "object") return "";
   var parts = [];
-  // Prefer resolved names (workflow_name/preset_name) over raw ids; ids are
+  // Prefer resolved names (workflow_name) over raw ids; ids are
   // the fallback when the status endpoint only supplies them.
   var wfName = cell.workflowName || cell.workflowId || "";
   var wfVersion = cell.workflowVersionId || "";
@@ -1787,18 +1404,12 @@ export function renderExperimentMode(state, actions, context) {
 
   // Shelf flow (a modern Workflow is selected): Workflow comparison via the
   // shared picker, common-field axes, and per-Workflow unique sections.
-  // No Backend/Preset UI in this flow. The legacy preset lane keeps the
-  // Compare Backends + Matrix Summary blocks when no Workflow is selected.
+  // Experiments run against a selected Workflow. The legacy preset comparison
+  // and matrix-summary blocks are gone with the preset concept.
   var shelfModernSel = null;
   try { shelfModernSel = resolveModernWorkflowSelection(state); } catch (e) { shelfModernSel = null; }
   if (shelfModernSel && shelfModernSel.workflowId) {
     container.appendChild(renderShelfExperimentPanel(state, actions, context || {}));
-  } else {
-    // Compare Backends block (context passed explicitly)
-    container.appendChild(renderCompareBackends(state, actions, context || {}));
-
-    // Matrix Summary block
-    container.appendChild(renderMatrixSummary(state, actions));
   }
 
   // Exactly one run surface: the modern V2 section (gated when modern
@@ -1853,7 +1464,7 @@ export function renderExperimentMode(state, actions, context) {
 
 // ── Shelf Experiment (Studio Workflow effort, leaf 1.2.2) ────────────────
 //
-// Experiment comparison over Workflows (not Backend presets):
+// Experiment comparison over Workflows:
 // - Explicit Experiment/Exit Experiment toggle owns visibility (the toggle
 //   itself is unchanged); axis selectors render only when enabled.
 // - Multi-Workflow comparison via the shared picker
@@ -2496,15 +2107,10 @@ export async function submitShelfExperiment(state, actions, context) {
     var ctxRes = contexts[wid] || {};
     var w = ctxRes.workflow || {};
     var v = ctxRes.version || {};
-    var preset = ctxRes.default_preset || {};
     var entry = {
       workflow_id: wid,
       workflow_version_id: (v.workflow_version_id || (index === 0 ? _shelfExpPrimaryVersion(state) : "") || ""),
-      preset_id: index === 0
-        ? (_shelfExpPrimaryPreset(state) || preset.preset_id || "")
-        : (preset.preset_id || ""),
       workflow_name: w.name || "",
-      preset_name: (index === 0 ? _shelfExpPrimaryPresetName(state) : "") || preset.name || "",
     };
     // Per-Workflow unique values ride along verbatim (additive metadata;
     // the engine contract for axes/defaults/prompts is unchanged).
@@ -2562,14 +2168,3 @@ function _shelfExpPrimaryVersion(state) {
   return (store && store.workflowVersionId) || "";
 }
 
-function _shelfExpPrimaryPreset(state) {
-  var pg = state && state.playground;
-  var store = pg && pg._workflowRun;
-  return (store && store.presetId) || "";
-}
-
-function _shelfExpPrimaryPresetName(state) {
-  var pg = state && state.playground;
-  var store = pg && pg._workflowRun;
-  return (store && store.presetName) || "";
-}

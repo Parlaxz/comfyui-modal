@@ -314,11 +314,9 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.wf = self.service.create_workflow("Text2Img Workflow")
         self.version = self._capture_mapped(self.wf["workflow_id"])
         self.version_id = self.version["workflow_version_id"]
-        self.preset = self.service.create_preset(
-            self.version_id, "Preset A", values=default_values()
-        )
-        self.preset_id = self.preset["preset_id"]
-        self.service.set_default_preset(self.wf["workflow_id"], self.preset_id)
+        # No preset exists: control defaults come from the captured version's
+        # own executable prompt. The run identity carries no preset.
+        self.preset_id = ""
         # E7: stub host validation proof for headless deterministic runs (no parent ComfyUI execution module).
         # Mirrors tests/test_studio_workflow_run_plan_identity.py.
         import canonical_execution as _ce
@@ -387,22 +385,17 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
     def _bundle(self) -> dict:
         with self._service_patcher():
             return swr.resolve_workflow_run_bundle(
-                self.wf["workflow_id"], self.version_id, self.preset_id, self.root
+                self.wf["workflow_id"], self.version_id, self.root
             )
 
     def _clip_repair_fixture(self) -> dict:
-        """A second workflow+version+preset built from ``clip_repair_prompt``."""
+        """A second workflow+version built from ``clip_repair_prompt``."""
         wf = self.service.create_workflow("Clip Repair Workflow")
         version = self._capture_mapped(wf["workflow_id"], clip_repair_prompt())
-        preset = self.service.create_preset(
-            version["workflow_version_id"], "Preset C",
-            values=clip_repair_values(),
-        )
-        self.service.set_default_preset(wf["workflow_id"], preset["preset_id"])
         with self._service_patcher():
             bundle = swr.resolve_workflow_run_bundle(
                 wf["workflow_id"], version["workflow_version_id"],
-                preset["preset_id"], self.root,
+                self.root,
             )
         self.assertEqual(bundle["status"], "ok")
         return bundle
@@ -487,7 +480,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         expected snapshot matches the recorded one.
         """
         schema = bundle["control_schema"]
-        merged = swr.merge_workflow_controls(bundle["preset"], overrides or {}, schema)
+        merged = swr.merge_workflow_controls(bundle["defaults"], overrides or {}, schema)
         self.assertEqual(merged["errors"], [])
         expected = copy.deepcopy(bundle["executable_prompt"])
         for role, entry in schema.items():
@@ -547,7 +540,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(
             extra["workflow_version_id"], bundle["version"]["workflow_version_id"]
         )
-        self.assertEqual(extra["preset_id"], bundle["preset"]["preset_id"])
+        self.assertEqual(extra["preset_id"], "")
         self.assertEqual(extra["workflow_hash"], expected_hash)
         self.assertEqual(record["workflow_hash"], expected_hash)
         self.assertEqual(extra["requested_controls"]["steps"], 20)
@@ -564,7 +557,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(
             gen.workflow_version_id, bundle["version"]["workflow_version_id"]
         )
-        self.assertEqual(gen.preset_id, bundle["preset"]["preset_id"])
+        self.assertEqual(gen.preset_id, "")
         self.assertEqual(len(detail.attempts), 1)
         attempt = detail.attempts[0]
         self.assertEqual(attempt.status, "failed")
@@ -601,7 +594,9 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(
             bundle["version"]["workflow_version_id"], self.version_id
         )
-        self.assertEqual(bundle["preset"]["preset_id"], self.preset_id)
+        # The bundle carries no preset at all: the run resolves from the
+        # version's own captured graph via version-derived defaults.
+        self.assertNotIn("preset", bundle)
         self.assertEqual(bundle["state"]["runnable"], True)
         self.assertIn("seed", bundle["control_schema"])
         self.assertIn("sampler", bundle["control_schema"])
@@ -611,39 +606,23 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.service.create_version_from_capture(bare["workflow_id"], make_capture(txt2img_prompt()))
         with self._service_patcher():
             err = swr.resolve_workflow_run_bundle(
-                bare["workflow_id"], "", "", self.root
+                bare["workflow_id"], "", self.root
             )
         self.assertEqual(err["status"], "error")
         self.assertEqual(err["error_code"], "WORKFLOW_VERSION_NOT_RUNNABLE")
         self.assertTrue(err["reasons"])
         self.assertTrue(any("missing mapping" in r for r in err["reasons"]))
 
-        # Preset version mismatch → PRESET_VERSION_MISMATCH.
-        other = self.service.create_workflow("Other")
-        other_version = self._capture_mapped(other["workflow_id"])
-        with self._service_patcher():
-            err2 = swr.resolve_workflow_run_bundle(
-                self.wf["workflow_id"], self.version_id,
-                other_version["workflow_version_id"] + "_preset_does_not_exist",
-                self.root,
-            )
-        # Unknown preset id → PRESET_NOT_FOUND (the mismatch arm needs a real
-        # preset that belongs to a different version).
-        self.assertEqual(err2["error_code"], "PRESET_NOT_FOUND")
-        foreign_preset = self.service.create_preset(
-            other_version["workflow_version_id"], "Foreign", values=default_values()
-        )
-        with self._service_patcher():
-            err3 = swr.resolve_workflow_run_bundle(
-                self.wf["workflow_id"], self.version_id,
-                foreign_preset["preset_id"], self.root,
-            )
-        self.assertEqual(err3["status"], "error")
-        self.assertEqual(err3["error_code"], "PRESET_VERSION_MISMATCH")
+        # A run resolves with NO preset record anywhere: the bundle carries
+        # version-derived control defaults instead of a preset payload.
+        self.assertNotIn("preset", bundle)
+        self.assertEqual(bundle["defaults"], swr.default_controls_from_version(
+            bundle["executable_prompt"], bundle["control_schema"],
+        ))
 
         # Unknown workflow → WORKFLOW_NOT_FOUND.
         with self._service_patcher():
-            err4 = swr.resolve_workflow_run_bundle("wf_ghost", "", "", self.root)
+            err4 = swr.resolve_workflow_run_bundle("wf_ghost", "", self.root)
         self.assertEqual(err4["error_code"], "WORKFLOW_NOT_FOUND")
 
     # ── 2. control validation verbatim ───────────────────────────────────
@@ -718,18 +697,18 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         # Merge: preset base → overrides win → model_choices win for model.
         merged = swr.merge_workflow_controls(
-            bundle["preset"], {"steps": 30}, schema
+            bundle["defaults"], {"steps": 30}, schema
         )
         self.assertEqual(merged["errors"], [])
         self.assertEqual(merged["values"]["steps"], 30, "override wins")
         self.assertEqual(merged["values"]["seed"], 0, "preset value preserved verbatim")
         self.assertEqual(
-            merged["values"]["model"], bundle["preset"]["values"]["model"]
+            merged["values"]["model"], bundle["defaults"]["model"]
         )
 
         # Merge surfaces invalid overrides as errors.
         merged_bad = swr.merge_workflow_controls(
-            bundle["preset"], {"sampler": "definitely-not-a-sampler"}, schema
+            bundle["defaults"], {"sampler": "definitely-not-a-sampler"}, schema
         )
         self.assertTrue(merged_bad["errors"])
 
@@ -773,7 +752,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
     def test_04_plan_build(self):
         bundle = self._bundle()
         schema = bundle["control_schema"]
-        merged = swr.merge_workflow_controls(bundle["preset"], {}, schema)
+        merged = swr.merge_workflow_controls(bundle["defaults"], {}, schema)
         mapping_output = bundle["mapping"]["output_node_id"]
 
         plan, err = swr.build_workflow_execution_plan(
@@ -788,9 +767,9 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         meta = dict(plan.request_metadata)
         self.assertEqual(meta["workflow_id"], self.wf["workflow_id"])
         self.assertEqual(meta["workflow_version_id"], self.version_id)
-        self.assertEqual(meta["preset_id"], self.preset_id)
+        self.assertEqual(meta["preset_id"], "")
         self.assertEqual(meta["workflow_name"], self.wf["name"])
-        self.assertEqual(meta["preset_name"], "Preset A")
+        self.assertEqual(meta["preset_name"], "")
         self.assertEqual(meta["workflow_hash"], plan.workflow_hash)
         # Modern identity: NO legacy studio keys.
         self.assertNotIn("studio_preset_id", meta)
@@ -851,9 +830,9 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         identity = inst.snapshot["identity"]
         self.assertEqual(identity["workflow_id"], self.wf["workflow_id"])
         self.assertEqual(identity["workflow_version_id"], self.version_id)
-        self.assertEqual(identity["preset_id"], self.preset_id)
+        self.assertEqual(identity["preset_id"], "")
         self.assertEqual(identity["workflow_name"], self.wf["name"])
-        self.assertEqual(identity["preset_name"], "Preset A")
+        self.assertEqual(identity["preset_name"], "")
 
         # The built plan carries modern identity and the applied workflow.
         self.assertIsNotNone(inst.plan)
@@ -992,7 +971,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         bundle = self._clip_repair_fixture()
         schema = bundle["control_schema"]
         merged = swr.merge_workflow_controls(
-            bundle["preset"], {"steps": 30}, schema
+            bundle["defaults"], {"steps": 30}, schema
         )
         self.assertEqual(merged["errors"], [])
 
@@ -1106,7 +1085,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         bundle = self._clip_repair_fixture()
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
 
         fake_registry = FakeRegistry()
         fake_exp_module = types.ModuleType("experiment_service")
@@ -1167,7 +1146,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
@@ -1274,7 +1253,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
@@ -1554,7 +1533,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
@@ -1682,7 +1661,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
         ), patch(
@@ -1744,7 +1723,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(
             gen.workflow_version_id, bundle["version"]["workflow_version_id"]
         )
-        self.assertEqual(gen.preset_id, bundle["preset"]["preset_id"])
+        self.assertEqual(gen.preset_id, "")
         # F6: the stored generation prompt equals the supplied positive prompt.
         self.assertEqual(gen.prompt_text, overrides["positive_prompt"])
         self.assertEqual(len(detail.attempts), 1)
@@ -1814,7 +1793,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         ), patch("studio_workflow_run.time.monotonic", return_value=102.5):
             _run(swr._record_workflow_run_failure(
                 bundle,
-                bundle["preset"]["values"],
+                bundle["defaults"],
                 "controlled accepted wait",
                 # Same wall second: the timestamp fallback would produce 0.0.
                 started_at="2026-01-01T00:00:00Z",
@@ -1880,7 +1859,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
@@ -1984,7 +1963,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
         ), patch(
@@ -2024,7 +2003,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
         self.assertEqual(
             gen.workflow_version_id, bundle["version"]["workflow_version_id"]
         )
-        self.assertEqual(gen.preset_id, bundle["preset"]["preset_id"])
+        self.assertEqual(gen.preset_id, "")
         self.assertEqual(gen.prompt_text, overrides["positive_prompt"])
         self.assertEqual(len(detail.attempts), 1)
         attempt = detail.attempts[0]
@@ -2128,7 +2107,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
@@ -2217,7 +2196,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}
         ), patch(
@@ -2315,7 +2294,7 @@ class WorkflowRunIntegrationTests(unittest.TestCase):
 
         wf_id = bundle["workflow"]["workflow_id"]
         version_id = bundle["version"]["workflow_version_id"]
-        preset_id = bundle["preset"]["preset_id"]
+        preset_id = ""
         window_start = datetime.now(timezone.utc)
         with self._service_patcher(), patch.dict(
             sys.modules, {"experiment_service": fake_exp_module}

@@ -3,16 +3,15 @@
 Entities
 --------
 * ``Workflow`` — logical workflow identity (name, folder, tags, favorite,
-  source metadata, compatible models, default preset, latest version).
+  source metadata, compatible models, latest version).
 * ``WorkflowVersion`` — immutable snapshot of the exact graph. Frozen once
   created; never mutated by the store or services.
 * ``Mapping`` — exactly one per WorkflowVersion. Maps Studio semantic roles
   to graph nodes/inputs/outputs plus graph-derived metadata.
 * ``MappingEntry`` — one mapped semantic role.
-* ``WorkflowPreset`` — saved values for one mapped WorkflowVersion.
 
-States (``VersionState`` / ``PresetState``) are DERIVED at read time from
-stored data — they are never persisted on the immutable version record.
+``VersionState`` is DERIVED at read time from stored data — it is never
+persisted on the immutable version record.
 """
 
 from __future__ import annotations
@@ -79,19 +78,11 @@ class MappingAlreadyExistsError(WorkflowDomainError):
     """A Workflow Version already has its (immutable) Mapping."""
 
 
-class WorkflowPresetNotFoundError(WorkflowDomainError):
-    pass
-
-
-class WorkflowPresetValidationError(WorkflowDomainError):
+class WorkflowDomainValidationError(WorkflowDomainError):
     pass
 
 
 class ImmutableVersionError(WorkflowDomainError):
-    pass
-
-
-class PresetCopyError(WorkflowDomainError):
     pass
 
 
@@ -120,10 +111,6 @@ def make_version_id() -> str:
 
 def make_mapping_id() -> str:
     return f"wm_{uuid.uuid4().hex[:16]}"
-
-
-def make_preset_id() -> str:
-    return f"wpres_{uuid.uuid4().hex[:16]}"
 
 
 def _sanitize_str(value: Any, max_len: int = 2000, default: str = "") -> str:
@@ -208,7 +195,6 @@ class Workflow:
     source_url: str = ""
     source_author: str = ""
     compatible_models: list[str] = field(default_factory=list)
-    default_preset_id: str = ""
     latest_version_id: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -224,7 +210,6 @@ class Workflow:
             "source_url": self.source_url,
             "source_author": self.source_author,
             "compatible_models": list(self.compatible_models),
-            "default_preset_id": self.default_preset_id,
             "latest_version_id": self.latest_version_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -242,7 +227,6 @@ class Workflow:
             source_url=_sanitize_str(data.get("source_url", ""), 2000),
             source_author=_sanitize_str(data.get("source_author", ""), 500),
             compatible_models=_sanitize_str_list(data.get("compatible_models")),
-            default_preset_id=_sanitize_str(data.get("default_preset_id", ""), 100),
             latest_version_id=_sanitize_str(data.get("latest_version_id", ""), 100),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
@@ -361,87 +345,11 @@ class Mapping:
         )
 
 
-@dataclass
-class WorkflowPreset:
-    preset_id: str
-    workflow_version_id: str
-    workflow_id: str
-    name: str
-    description: str = ""
-    values: dict = field(default_factory=dict)
-    model_choices: dict = field(default_factory=dict)
-    lora_values: dict = field(default_factory=dict)
-    exposed_controls: list[str] = field(default_factory=list)
-    recommended_values: dict = field(default_factory=dict)
-    favorite: bool = False
-    tags: list[str] = field(default_factory=list)
-    dropped_controls: list[str] = field(default_factory=list)
-    created_at: str = ""
-    updated_at: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "preset_id": self.preset_id,
-            "workflow_version_id": self.workflow_version_id,
-            "workflow_id": self.workflow_id,
-            "name": self.name,
-            "description": self.description,
-            "values": dict(self.values),
-            "model_choices": dict(self.model_choices),
-            "lora_values": dict(self.lora_values),
-            "exposed_controls": list(self.exposed_controls),
-            "recommended_values": dict(self.recommended_values),
-            "favorite": self.favorite,
-            "tags": list(self.tags),
-            "dropped_controls": list(self.dropped_controls),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WorkflowPreset":
-        values = data.get("values")
-        model_choices = data.get("model_choices")
-        lora_values = data.get("lora_values")
-        recommended = data.get("recommended_values")
-        return cls(
-            preset_id=str(data.get("preset_id", "")),
-            workflow_version_id=str(data.get("workflow_version_id", "")),
-            workflow_id=str(data.get("workflow_id", "")),
-            name=_sanitize_str(data.get("name", ""), 200, "Untitled Preset"),
-            description=_sanitize_str(data.get("description", ""), 2000),
-            values=dict(values) if isinstance(values, dict) else {},
-            model_choices=dict(model_choices) if isinstance(model_choices, dict) else {},
-            lora_values=dict(lora_values) if isinstance(lora_values, dict) else {},
-            exposed_controls=_sanitize_str_list(data.get("exposed_controls")),
-            recommended_values=dict(recommended) if isinstance(recommended, dict) else {},
-            favorite=bool(data.get("favorite", False)),
-            tags=_sanitize_str_list(data.get("tags")),
-            dropped_controls=_sanitize_str_list(data.get("dropped_controls")),
-            created_at=str(data.get("created_at", "")),
-            updated_at=str(data.get("updated_at", "")),
-        )
-
-
 # ── Derived states ───────────────────────────────────────────────────────
 
 
 @dataclass
 class VersionState:
-    status: str = "incomplete"  # "ready" | "incomplete"
-    reasons: list[str] = field(default_factory=list)
-    runnable: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "reasons": list(self.reasons),
-            "runnable": self.runnable,
-        }
-
-
-@dataclass
-class PresetState:
     status: str = "incomplete"  # "ready" | "incomplete"
     reasons: list[str] = field(default_factory=list)
     runnable: bool = False

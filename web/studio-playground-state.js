@@ -561,22 +561,20 @@ const WORKFLOW_HANDOFF_STORAGE_KEY = "comfymodal.studio.playground.workflow-hand
  * Normalize a raw selection/handoff object into the canonical string-field
  * shape. Returns null for non-object input.
  * @param {*} raw
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 function _sanitizeSelectionFields(raw) {
   if (!raw || typeof raw !== "object") return null;
   return {
     workflowId: typeof raw.workflowId === "string" ? raw.workflowId : "",
     workflowVersionId: typeof raw.workflowVersionId === "string" ? raw.workflowVersionId : "",
-    presetId: typeof raw.presetId === "string" ? raw.presetId : "",
     workflowName: typeof raw.workflowName === "string" ? raw.workflowName : "",
-    presetName: typeof raw.presetName === "string" ? raw.presetName : "",
   };
 }
 
 /**
  * Save the current workflow selection to localStorage.
- * @param {{workflowId?: string, workflowVersionId?: string, presetId?: string, workflowName?: string, presetName?: string}} sel
+ * @param {{workflowId?: string, workflowVersionId?: string, workflowName?: string}} sel
  */
 export function saveWorkflowSelection(sel) {
   const clean = _sanitizeSelectionFields(sel);
@@ -591,7 +589,7 @@ export function saveWorkflowSelection(sel) {
 
 /**
  * Load the persisted workflow selection from localStorage.
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 export function loadWorkflowSelection() {
   try {
@@ -636,7 +634,7 @@ export function saveWorkflowHandoff(sel) {
 /**
  * Read and remove the one-shot workflow handoff. The write is consumed
  * exactly once: the value is returned AND deleted from localStorage.
- * @returns {{workflowId: string, workflowVersionId: string, presetId: string, workflowName: string, presetName: string}|null}
+ * @returns {{workflowId: string, workflowVersionId: string, workflowName: string}|null}
  */
 export function takeWorkflowHandoff() {
   try {

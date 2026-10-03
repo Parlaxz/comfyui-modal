@@ -48,8 +48,6 @@ import {
   refreshModernExperimentStatus,
   startModernExperimentPolling,
   stopModernExperimentPolling,
-  canRunExperiment,
-  getExperimentPresetIds,
   renderExperimentMode,
 } from "../web/studio-experiment-mode.js";
 import {
@@ -187,14 +185,13 @@ function statusDetail(overrides) {
   assert.equal("featureId" in payload, false, "no legacy top-level featureId");
   assert.equal(serialized.includes("/studio/experiment"), false, "no legacy route reference in the payload");
 
-  // Resolved workflow/version/preset and axis values are preserved in the
-  // definition; immutable cell snapshots are server-owned.
+  // Resolved workflow/version and axis values are preserved in the
+  // definition; immutable cell snapshots are server-owned. No preset
+  // identity exists any more.
   assert.deepEqual(payload.definition.workflows[0], {
     workflow_id: "wf_1",
     workflow_version_id: "ver_1",
-    preset_id: "preset_1",
     workflow_name: "Portrait Pro",
-    preset_name: "preset_a",
   });
   assert.deepEqual(payload.definition.axes.steps.values, [10, 20]);
   assert.deepEqual(payload.definition.axes.seed.values, [1, 2]);
@@ -627,17 +624,16 @@ function statusDetail(overrides) {
   const selection = resolveModernWorkflowSelection(state);
   assert.equal(selection.workflowId, "wf_axis_a");
   assert.equal(selection.workflowVersionId, "ver_axis_1");
-  assert.equal(selection.presetId, "preset_axis_x");
   assert.equal(selection.workflowName, "Axis Workflow");
-  assert.equal(selection.presetName, "axis_preset");
+  assert.equal("presetId" in selection, false, "no preset identity in the selection");
 
   const payload = buildModernExperimentDefinition(state);
   assert.equal(payload.definition.workflows.length, 1);
   assert.equal(payload.definition.workflows[0].workflow_id, "wf_axis_a");
   assert.equal(payload.definition.workflows[0].workflow_version_id, "ver_axis_1");
-  assert.equal(payload.definition.workflows[0].preset_id, "preset_axis_x");
   assert.equal(payload.definition.workflows[0].workflow_name, "Axis Workflow");
-  assert.equal(payload.definition.workflows[0].preset_name, "axis_preset");
+  assert.equal("preset_id" in payload.definition.workflows[0], false,
+    "no preset identity in the experiment definition");
 
   assert.deepEqual(payload.definition.axes.steps.values, [8, 16]);
   assert.deepEqual(payload.definition.axes.seed.values, [7]);
@@ -733,12 +729,7 @@ function statusDetail(overrides) {
 
 {
   assert.equal(typeof renderExperimentMode, "function", "legacy experiment-mode renderer retained");
-  assert.equal(typeof canRunExperiment, "function", "legacy eligibility retained");
 
-  const state = makeState({ selectedBackendId: "preset_a", compareBackendIds: ["preset_b", "preset_a"] });
-  assert.deepEqual(getExperimentPresetIds(state), ["preset_a", "preset_b"], "canonical preset ids dedupe base+compare");
-  const onePreset = makeState({ selectedBackendId: "preset_a", compareBackendIds: [] });
-  assert.equal(canRunExperiment(onePreset), false, "single preset without multi-value axis is not runnable");
 
   // H-WAVE D: the legacy creator/run helpers are fully retired — zero
   // references anywhere in the module; the modern V2 import remains.

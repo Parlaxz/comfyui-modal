@@ -822,7 +822,7 @@ try {
     .find((s) => s.dataset.section === "general");
   assert.ok(generalL);
   assert.ok(
-    generalL.textContent.includes("Playground / History / Workflows / Backend / Settings."),
+    generalL.textContent.includes("Playground / History / Workflows / Manage Modal / Settings."),
     "navigation row lists all five pages truthfully",
   );
   assert.equal(generalL.textContent.includes("Backend remains available"), false);

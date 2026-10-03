@@ -9,7 +9,8 @@ domain store under *node_dir* (``.studio_workflows.json`` /
 
 Domain invariants enforced by the service (never re-implemented here):
 
-* Workflow Versions are immutable -- no endpoint mutates or deletes a version.
+* Workflow Versions are immutable -- no endpoint independently mutates or
+  deletes a version.
 * A Mapping can be inserted only once per Version (``POST .../mapping``).
 * Mapping edits create a NEW Version (``POST .../mapping/revision``).
 * Presets are tied to their Version and only move forward via copy-forward.
@@ -25,6 +26,7 @@ Route summary (all under ``/comfymodal/studio/workflows``):
         GET   /comfymodal/studio/workflows/tags                       -- tag list
         GET   /comfymodal/studio/workflows/{workflow_id}              -- detail
         PATCH /comfymodal/studio/workflows/{workflow_id}              -- update metadata
+        DELETE /comfymodal/studio/workflows/{workflow_id}             -- delete and cascade
         POST  /comfymodal/studio/workflows/{workflow_id}/default-preset   -- set default preset
         DELETE /comfymodal/studio/workflows/{workflow_id}/default-preset -- clear default preset
         GET   /comfymodal/studio/workflows/{workflow_id}/run-context  -- Playground bundle
@@ -81,6 +83,7 @@ import studio_workflow_manifest as studio_workflow_manifest
 from custom_node_registry import CustomNodeRegistryStore
 from model_library import ModelLibraryStore
 from portability_cache import DEFAULT_SIDECAR_FILENAME, PortabilityReportCache
+import remote_inventory
 from portability_service import (
     ExportRefusedError,
     ImportBlockedError,
@@ -92,12 +95,10 @@ from studio_domain import (
     ImmutableVersionError,
     MappingAlreadyExistsError,
     MappingNotFoundError,
-    PresetCopyError,
-    WorkflowDomainError,
+   WorkflowDomainError,
     WorkflowNotFoundError,
     WorkflowNotRunnableError,
-    WorkflowPresetNotFoundError,
-    WorkflowPresetValidationError,
+    WorkflowDomainValidationError,
     WorkflowVersionNotFoundError,
     derive_mapping_candidates,
 )
@@ -113,12 +114,12 @@ def _json_error(status: int, message: str) -> web.Response:
 def _domain_status(exc: Exception) -> tuple[int, str]:
     """Map a domain exception to ``(http_status, message)``."""
     if isinstance(exc, (WorkflowNotFoundError, WorkflowVersionNotFoundError,
-                        MappingNotFoundError, WorkflowPresetNotFoundError)):
+                        MappingNotFoundError)):
         return 404, str(exc)
     if isinstance(exc, (MappingAlreadyExistsError, ImmutableVersionError,
                         WorkflowNotRunnableError)):
         return 409, str(exc)
-    if isinstance(exc, (WorkflowPresetValidationError, PresetCopyError, GraphHashError)):
+    if isinstance(exc, (WorkflowDomainValidationError, GraphHashError)):
         return 400, str(exc)
     if isinstance(exc, WorkflowDomainError):
         return 400, str(exc)
@@ -185,11 +186,22 @@ def _manifest_workflow_config(payload: dict[str, Any]) -> dict[str, Any]:
     return fields
 
 
+# Durable Workflow config that a library LIST row must not carry. The static
+# graph is ~99% of a stored Workflow record (megabytes each), no list view
+# reads it, and it is already served per-workflow by
+# GET /comfymodal/studio/workflows/{workflow_id} when a detail view needs it.
+_LIST_OMITTED_FIELDS = frozenset({"static_graph"})
+
+
 def _enrich_workflow_summary(
     service: WorkflowDomainService, raw: dict[str, Any]
 ) -> dict[str, Any]:
     """Lightweight summary for library lists (no heavy per-item enrichment)."""
-    summary = dict(raw)
+    summary = {
+        field: value
+        for field, value in raw.items()
+        if field not in _LIST_OMITTED_FIELDS
+    }
     workflow_id = str(raw.get("workflow_id", ""))
     versions = service.store.list_versions_for_workflow(workflow_id)
     summary["version_count"] = len(versions)
@@ -206,12 +218,22 @@ def _enrich_workflow_summary(
     summary["latest_version_state"] = (
         service.derive_version_state(latest_id).to_dict() if latest else None
     )
-    default_id = str(raw.get("default_preset_id", ""))
-    default_preset = service.store.get_preset(default_id) if default_id else None
-    summary["default_preset_name"] = (
-        str(default_preset.get("name", "")) if default_preset else None
-    )
     return summary
+
+
+async def _refresh_remote_inventory() -> None:
+    """Refresh the shared Modal volume snapshot that version state reads.
+
+    Version state is derived on synchronous paths, so it consults the last
+    snapshot instead of paying its own round trip. Every read-only route that
+    reports state refreshes here so the version card and the dependency report
+    can never disagree. Cached, so a page of routes costs one call. A failure
+    is silent: state then falls back to local-only truth.
+    """
+    try:
+        await remote_inventory.get_inventory()
+    except Exception:  # noqa: BLE001
+        _log.debug("Remote inventory refresh failed", exc_info=True)
 
 
 def register_workflow_routes(
@@ -268,6 +290,7 @@ def register_workflow_routes(
     @server.routes.get("/comfymodal/studio/workflows")
     async def workflows_list(request: web.Request) -> web.Response:
         try:
+            await _refresh_remote_inventory()
             workflows = service.list_workflows()
             search = (request.query.get("search") or "").strip().lower()
             tag = (request.query.get("tag") or "").strip()
@@ -318,7 +341,7 @@ def register_workflow_routes(
                 **_workflow_config_kwargs(body),
             )
             return web.json_response({"status": "ok", "workflow": workflow})
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow create failed")
@@ -358,7 +381,7 @@ def register_workflow_routes(
             if resolver is not None:
                 payload["dependency_summary"] = resolver.resolve_version(version)
             return web.json_response(payload)
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except GraphHashError as exc:
             return _json_error(400, str(exc))
@@ -373,6 +396,21 @@ def register_workflow_routes(
             return web.json_response({"status": "ok", "folders": service.list_folders()})
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow folders failed")
+            status, message = _domain_status(exc)
+            return _json_error(status, message)
+
+    @server.routes.post("/comfymodal/studio/workflows/folders")
+    async def workflows_folder_create(request: web.Request) -> web.Response:
+        body = await _read_body(request)
+        if body is None:
+            return _json_error(400, "Invalid JSON body")
+        try:
+            folders = service.create_folder(body.get("path"))
+            return web.json_response({"status": "ok", "folders": folders})
+        except WorkflowDomainValidationError as exc:
+            return _json_error(400, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("Workflow folder create failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
@@ -419,7 +457,7 @@ def register_workflow_routes(
             return web.json_response({"status": "ok", "workflow": workflow})
         except WorkflowNotFoundError as exc:
             return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow autosave failed")
@@ -437,51 +475,34 @@ def register_workflow_routes(
             return web.json_response({"status": "ok", "workflow": workflow})
         except WorkflowNotFoundError as exc:
             return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Workflow update failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
-    @server.routes.post("/comfymodal/studio/workflows/{workflow_id}/default-preset")
-    async def workflows_set_default_preset(request: web.Request) -> web.Response:
-        wf_id = request.match_info.get("workflow_id", "")
-        body = await _read_body(request)
-        if body is None or not body.get("preset_id"):
-            return _json_error(400, "preset_id is required")
-        try:
-            workflow = service.set_default_preset(wf_id, str(body["preset_id"]))
-            return web.json_response({"status": "ok", "workflow": workflow})
-        except (WorkflowNotFoundError, WorkflowPresetNotFoundError) as exc:
-            return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Set default preset failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.delete("/comfymodal/studio/workflows/{workflow_id}/default-preset")
-    async def workflows_clear_default_preset(request: web.Request) -> web.Response:
+    @server.routes.delete("/comfymodal/studio/workflows/{workflow_id}")
+    async def workflows_delete(request: web.Request) -> web.Response:
         wf_id = request.match_info.get("workflow_id", "")
         try:
-            workflow = service.clear_default_preset(wf_id)
-            return web.json_response({"status": "ok", "workflow": workflow})
+            service.delete_workflow(wf_id)
+            return web.json_response({"status": "ok"})
         except WorkflowNotFoundError as exc:
             return _json_error(404, str(exc))
         except Exception as exc:  # noqa: BLE001
-            _log.exception("Clear default preset failed")
+            _log.exception("Workflow delete failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
     @server.routes.get("/comfymodal/studio/workflows/{workflow_id}/run-context")
     async def workflows_run_context(request: web.Request) -> web.Response:
         """Read-only Playground bundle: workflow + selected version + mapping +
-        default preset + runnable state + control schema."""
+        runnable state + control schema."""
         wf_id = request.match_info.get("workflow_id", "")
         version_id = request.query.get("version_id") or ""
         try:
+            await _refresh_remote_inventory()
             workflow = service.get_workflow(wf_id)
             if not version_id:
                 version_id = str(workflow.get("latest_version_id", ""))
@@ -492,7 +513,6 @@ def register_workflow_routes(
                 version = service.get_version(version_id)
                 state = service.derive_version_state(version_id).to_dict()
                 mapping = service.get_mapping(version_id)
-            default_preset = service.get_default_preset(wf_id)
             control_schema: dict[str, Any] = {}
             workflow_config = service.get_workflow_config(wf_id)
             for role, entry in (workflow_config.get("bindings") or {}).items():
@@ -509,7 +529,7 @@ def register_workflow_routes(
                 "workflow": workflow,
                 "version": version,
                 "mapping": mapping,
-                "default_preset": default_preset,
+                
                 "workflow_config": workflow_config,
                 "state": state,
                 "control_schema": control_schema,
@@ -527,6 +547,7 @@ def register_workflow_routes(
     async def versions_list(request: web.Request) -> web.Response:
         wf_id = request.match_info.get("workflow_id", "")
         try:
+            await _refresh_remote_inventory()
             versions = service.list_versions(wf_id)
             return web.json_response({"status": "ok", "versions": versions})
         except WorkflowNotFoundError as exc:
@@ -563,6 +584,7 @@ def register_workflow_routes(
     async def versions_detail(request: web.Request) -> web.Response:
         version_id = request.match_info.get("version_id", "")
         try:
+            await _refresh_remote_inventory()
             version = service.get_version(version_id)
             return web.json_response({"status": "ok", "version": version})
         except WorkflowVersionNotFoundError as exc:
@@ -576,6 +598,7 @@ def register_workflow_routes(
     async def versions_state(request: web.Request) -> web.Response:
         version_id = request.match_info.get("version_id", "")
         try:
+            await _refresh_remote_inventory()
             state = service.derive_version_state(version_id).to_dict()
             return web.json_response({"status": "ok", "state": state})
         except Exception as exc:  # noqa: BLE001
@@ -589,6 +612,7 @@ def register_workflow_routes(
     async def mapping_get(request: web.Request) -> web.Response:
         version_id = request.match_info.get("version_id", "")
         try:
+            await _refresh_remote_inventory()
             mapping = service.get_mapping(version_id)
             return web.json_response({"status": "ok", "mapping": mapping})
         except Exception as exc:  # noqa: BLE001
@@ -614,7 +638,7 @@ def register_workflow_routes(
             return _json_error(404, str(exc))
         except MappingAlreadyExistsError as exc:
             return _json_error(409, str(exc))
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Mapping create failed")
@@ -662,192 +686,13 @@ def register_workflow_routes(
             return web.json_response({"status": "ok", "version": version})
         except WorkflowVersionNotFoundError as exc:
             return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
+        except WorkflowDomainValidationError as exc:
             return _json_error(400, str(exc))
         except Exception as exc:  # noqa: BLE001
             _log.exception("Mapping revision failed")
             status, message = _domain_status(exc)
             return _json_error(status, message)
 
-    # ── Presets ────────────────────────────────────────────────────────
-
-    @server.routes.get("/comfymodal/studio/workflows/versions/{version_id}/presets")
-    async def presets_list(request: web.Request) -> web.Response:
-        version_id = request.match_info.get("version_id", "")
-        try:
-            presets = service.list_presets(version_id)
-            return web.json_response({"status": "ok", "presets": presets})
-        except WorkflowVersionNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset list failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.post("/comfymodal/studio/workflows/versions/{version_id}/presets")
-    async def presets_create(request: web.Request) -> web.Response:
-        version_id = request.match_info.get("version_id", "")
-        body = await _read_body(request)
-        if body is None:
-            return _json_error(400, "Invalid JSON body")
-        try:
-            preset = service.create_preset(
-                version_id,
-                str(body.get("name", "")),
-                description=str(body.get("description", "")),
-                values=body.get("values"),
-                model_choices=body.get("model_choices"),
-                lora_values=body.get("lora_values"),
-                exposed_controls=body.get("exposed_controls"),
-                recommended_values=body.get("recommended_values"),
-                favorite=bool(body.get("favorite", False)),
-                tags=body.get("tags"),
-            )
-            return web.json_response({"status": "ok", "preset": preset})
-        except WorkflowVersionNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset create failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.get("/comfymodal/studio/workflows/presets/{preset_id}")
-    async def presets_detail(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            preset = service.get_preset(preset_id)
-            return web.json_response({"status": "ok", "preset": preset})
-        except WorkflowPresetNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset detail failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.patch("/comfymodal/studio/workflows/presets/{preset_id}")
-    async def presets_update(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        body = await _read_body(request)
-        if body is None:
-            return _json_error(400, "Invalid JSON body")
-        try:
-            preset = service.update_preset(preset_id, body)
-            return web.json_response({"status": "ok", "preset": preset})
-        except WorkflowPresetNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset update failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.delete("/comfymodal/studio/workflows/presets/{preset_id}")
-    async def presets_delete(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            service.delete_preset(preset_id)
-            return web.json_response({"status": "ok"})
-        except WorkflowPresetNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset delete failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.post("/comfymodal/studio/workflows/presets/{preset_id}/duplicate")
-    async def presets_duplicate(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        try:
-            preset = service.duplicate_preset(preset_id)
-            return web.json_response({"status": "ok", "preset": preset})
-        except WorkflowPresetNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset duplicate failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.post("/comfymodal/studio/workflows/presets/{preset_id}/copy-to-version")
-    async def presets_copy_forward(request: web.Request) -> web.Response:
-        preset_id = request.match_info.get("preset_id", "")
-        body = await _read_body(request)
-        if body is None or not body.get("target_version_id"):
-            return _json_error(400, "target_version_id is required")
-        try:
-            result = service.copy_preset_to_version(
-                preset_id, str(body["target_version_id"])
-            )
-            return web.json_response({"status": "ok", "result": result})
-        except WorkflowPresetNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except WorkflowVersionNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except PresetCopyError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset copy forward failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    @server.routes.post(
-        "/comfymodal/studio/workflows/versions/{version_id}/presets/copy-bulk"
-    )
-    async def presets_copy_bulk(request: web.Request) -> web.Response:
-        version_id = request.match_info.get("version_id", "")
-        body = await _read_body(request)
-        if body is None or not isinstance(body.get("preset_ids"), list):
-            return _json_error(400, "preset_ids list is required")
-        try:
-            results = service.copy_presets_to_version(
-                [str(pid) for pid in body["preset_ids"]], version_id
-            )
-            return web.json_response({"status": "ok", "results": results})
-        except WorkflowVersionNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except PresetCopyError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset bulk copy failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
-
-    # ── Legacy absorption bridge (abs-1) ─────────────────────────────────
-    # Accepts an UNSCOPED legacy preset payload (values/model_choices keyed
-    # by old semantic roles), translates it via
-    # ``studio_domain.legacy_adapters`` (pure, no migration), and persists it
-    # through the verified ``create_preset_from_legacy`` → ``create_preset``
-    # path under the URL version scope.  All existing preset routes are
-    # untouched; the legacy ``/studio/run`` dispatch branch stays as-is
-    # (removal happens only in a later lane with caller proof).
-
-    @server.routes.post(
-        "/comfymodal/studio/workflows/versions/{version_id}/presets/from-legacy"
-    )
-    async def presets_from_legacy(request: web.Request) -> web.Response:
-        version_id = request.match_info.get("version_id", "")
-        body = await _read_body(request)
-        if body is None:
-            return _json_error(400, "Invalid JSON body")
-        try:
-            preset = service.create_preset_from_legacy(
-                version_id,
-                body,
-                strict=bool(body.get("strict", True)),
-            )
-            return web.json_response({"status": "ok", "preset": preset})
-        except WorkflowVersionNotFoundError as exc:
-            return _json_error(404, str(exc))
-        except WorkflowPresetValidationError as exc:
-            return _json_error(400, str(exc))
-        except Exception as exc:  # noqa: BLE001
-            _log.exception("Preset from-legacy failed")
-            status, message = _domain_status(exc)
-            return _json_error(status, message)
 
     # ── Portability (Phase G9) ────────────────────────────────────────
 
@@ -867,17 +712,8 @@ def register_workflow_routes(
     async def version_export(request: web.Request) -> web.Response:
         """Read-only manifest v1 download for one immutable Version."""
         version_id = request.match_info.get("version_id", "")
-        include_presets, error = _parse_bool_query(
-            request,
-            portability_contract.EXPORT_QUERY_INCLUDE_PRESETS,
-            portability_contract.EXPORT_DEFAULT_INCLUDE_PRESETS,
-        )
-        if error:
-            return _json_error(400, error)
         try:
-            result = portability.export_manifest(
-                version_id, include_presets=bool(include_presets)
-            )
+            result = portability.export_manifest(version_id)
         except WorkflowVersionNotFoundError as exc:
             return _json_error(404, str(exc))
         except ExportRefusedError as exc:
@@ -953,24 +789,6 @@ def register_workflow_routes(
             _log.exception("Manifest import payload parse failed")
             return _json_error(500, "Internal error")
 
-        import_presets = payload.pop(
-            portability_contract.IMPORT_FIELD_IMPORT_PRESETS, False
-        )
-        apply_default_preset = payload.pop(
-            portability_contract.IMPORT_FIELD_APPLY_DEFAULT_PRESET, False
-        )
-        if not isinstance(import_presets, bool) or not isinstance(
-            apply_default_preset, bool
-        ):
-            return _json_error(
-                400,
-                "%s and %s must be booleans"
-                % (
-                    portability_contract.IMPORT_FIELD_IMPORT_PRESETS,
-                    portability_contract.IMPORT_FIELD_APPLY_DEFAULT_PRESET,
-                ),
-            )
-
         try:
             if dry_run:
                 preview = portability.preview_import(payload)
@@ -991,11 +809,7 @@ def register_workflow_routes(
                         "allowed_options": durable_config.get("allowed_options", {}),
                     }
                 )
-            committed = portability.commit_import(
-                payload,
-                import_presets=import_presets,
-                apply_default_preset=apply_default_preset,
-            )
+            committed = portability.commit_import(payload)
             # Import always minted a new local Workflow.  Apply the whitelisted
             # wrapper fields to that new record only; foreign ids and all
             # experiment/history fields remain non-authoritative.

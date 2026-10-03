@@ -1371,9 +1371,14 @@ class GoldenTelemetryRecorder:
         *,
         monotonic: Callable[[], int] = time.monotonic_ns,
         wall: Callable[[], int] = time.time_ns,
+        stage_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+        request_id: str = "",
     ):
         self._monotonic = monotonic
         self._wall = wall
+        self._stage_observer = stage_observer
+        self._stage_observer_request_id = str(request_id) if stage_observer else ""
+        self._stage_observer_sequence = 0
         self._intervals: dict[str, GoldenStageInterval] = {}
         self._events: list[dict] = []
         self._open_stage: Optional[str] = None
@@ -1464,7 +1469,9 @@ class GoldenTelemetryRecorder:
             self._intervals[name] = interval
             self._open_stages.add(name)
             self._open_stage = name
-            return interval
+        if self._stage_observer is not None:
+            self._notify_stage_observer("started", interval)
+        return interval
 
     @contextlib.contextmanager
     def concurrent_stage_mode(self):
@@ -1514,6 +1521,8 @@ class GoldenTelemetryRecorder:
             if name in {"golden_clip_load", "golden_clip_forward"}:
                 interval.details.update(copy.deepcopy(telemetry))
         self._close_open_stage(name)
+        if self._stage_observer is not None:
+            self._notify_stage_observer("completed", interval)
 
     def fail_stage(self, name: str, exc: BaseException, **details: Any) -> None:
         interval = self._require_open(name)
@@ -1544,6 +1553,49 @@ class GoldenTelemetryRecorder:
         if isinstance(transport_failure, Mapping):
             interval.details["transport_failure"] = copy.deepcopy(dict(transport_failure))
         self._close_open_stage(name)
+        if self._stage_observer is not None:
+            self._notify_stage_observer("failed", interval, exc=exc)
+
+    def _notify_stage_observer(
+        self,
+        phase: str,
+        interval: GoldenStageInterval,
+        *,
+        exc: Optional[BaseException] = None,
+    ) -> None:
+        """Best-effort request-local stage notification at the authoritative boundary."""
+        with self._stage_lock:
+            observer = self._stage_observer
+            if observer is None:
+                return
+            sequence = self._stage_observer_sequence
+            self._stage_observer_sequence += 1
+            event = {
+                "schema": "golden_stage_event_v1",
+                "type": "golden_stage",
+                "request_id": self._stage_observer_request_id,
+                "sequence": sequence,
+                "stage": interval.name,
+                "phase": str(phase),
+                "entry_wall_ns": int(interval.entry_wall_ns),
+                "entry_monotonic_ns": int(interval.entry_monotonic_ns),
+                "end_wall_ns": (
+                    int(interval.end_wall_ns)
+                    if interval.end_wall_ns is not None else None
+                ),
+                "end_monotonic_ns": (
+                    int(interval.end_monotonic_ns)
+                    if interval.end_monotonic_ns is not None else None
+                ),
+                "ok": interval.ok,
+            }
+            if exc is not None:
+                event["error"] = f"{type(exc).__name__}: {exc}"[:512]
+        try:
+            observer(event)
+        except BaseException:
+            # Progress is diagnostic and must never alter Golden execution.
+            return
 
     def _require_open(self, name: str) -> GoldenStageInterval:
         interval = self._intervals.get(name)
@@ -8114,6 +8166,7 @@ class GoldenSession:
         restore_metadata: Optional[dict] = None,
         restore_observation: Optional[dict] = None,
         cpu_prefetch_ticket: Optional[CpuRawPrefetchTicket] = None,
+        stage_observer: Optional[Callable[[dict[str, Any]], None]] = None,
     ):
         self.request = request
         self.contract = contract or GoldenWorkflowContract()
@@ -8165,7 +8218,10 @@ class GoldenSession:
         self.restore_metadata = dict(supplied_restore or {})
         self.cpu_prefetch_ticket = cpu_prefetch_ticket
         self._cpu_prefetch_event_cursor = 0
-        self.recorder = GoldenTelemetryRecorder()
+        self.recorder = GoldenTelemetryRecorder(
+            stage_observer=stage_observer,
+            request_id=request.request_id,
+        )
         self.recorder.output_durability_mode = self.output_durability_mode
         self.recorder.durability_requested = self.durability_requested
         self.recorder.clip_residency = self.clip_residency
@@ -15496,6 +15552,7 @@ async def golden_serial_execute(
     restore_metadata: Optional[dict] = None,
     restore_observation: Optional[dict] = None,
     cpu_prefetch_ticket: Optional[CpuRawPrefetchTicket] = None,
+    stage_observer: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> GoldenFinalResult:
     """The one obvious explicit strictly-serial Golden execution.
 
@@ -15529,6 +15586,7 @@ async def golden_serial_execute(
         restore_metadata=restore_metadata,
         restore_observation=restore_observation,
         cpu_prefetch_ticket=cpu_prefetch_ticket,
+        stage_observer=stage_observer,
     )
     primary_error: Optional[BaseException] = None
     teardown_error: Optional[BaseException] = None

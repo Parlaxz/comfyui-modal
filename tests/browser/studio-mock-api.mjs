@@ -2,7 +2,7 @@
 //
 // Installs a Playwright page.route interceptor that replaces the
 // /comfymodal/ backend with an in-memory mock.  Supports both
-// snapshot/preset CRUD and experiment/run-history lifecycle.
+// run, experiment and run-history lifecycle.
 //
 // Usage:
 //   import { installStudioMockApi } from "./studio-mock-api.mjs";
@@ -74,8 +74,6 @@ function _compilePattern(pattern) {
  *   state: object,
  *   lastRunRequest: object|null,
  *   lastExperimentRequest: object|null,
- *   activePresets: function(): Array,
- *   activeSnapshots: function(): Array,
  *   reset: function(): void,
  *   failNext: function(method:string, pattern:string): void,
  *   setExperimentBehavior: function(id:string, opts:object): void,
@@ -94,6 +92,10 @@ export async function installStudioMockApi(page, options = {}) {
     saveRequests: [], // { run_id, output_index } from POST /run-history/:id/save
     configPost: null, // last POST /comfymodal/config body (Settings page)
     profileLevel: "off", // in-memory /comfymodal/profile/level stored value
+    // Level the current process is actually running. A POST updates only
+    // profileLevel; effectiveProfileLevel lags until restart, which is what
+    // the Settings restart banner reports on.
+    effectiveProfileLevel: "off",
   };
 
   let lastRunRequest = null;
@@ -132,209 +134,6 @@ export async function installStudioMockApi(page, options = {}) {
   //
   // Each handler receives (route, url, body, params) and returns
   // { status, contentType, body } or a Promise thereof.
-
-  /** GET /comfymodal/studio/snapshots/:id */
-  async function snapshotDetail(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s || s.archived) return _error("Snapshot not found", 404);
-    return _json({ status: "ok", snapshot: { ...s } });
-  }
-
-  /** GET /comfymodal/studio/snapshots */
-  async function listSnapshots(route, url, body, params) {
-    const includeArchived = url.searchParams.get("includeArchived") === "1";
-    const snapshots = [];
-    for (const s of state.snapshots.values()) {
-      if (!includeArchived && s.archived) continue;
-      snapshots.push({ ...s });
-    }
-    return _json({ status: "ok", snapshots });
-  }
-
-  /** POST /comfymodal/studio/snapshots */
-  async function createSnapshot(route, url, body) {
-    const id = _makeSnapshotId();
-    const now = _now();
-    const compatibleFeatures = Array.isArray(body?.compatibleFeatures)
-      ? body.compatibleFeatures
-      : ["txt2img"];
-    const entry = {
-      id,
-      name: body?.name || "Untitled Snapshot",
-      description: body?.description || "",
-      createdAt: now,
-      updatedAt: now,
-      compatibleFeatures,
-      graphJson: body?.graphJson || null,
-      apiPromptJson: body?.apiPromptJson || null,
-      nodeBindings: body?.nodeBindings || {},
-      outputNodeId: body?.outputNodeId || "",
-      modelSummary: body?.modelSummary || "",
-      source: body?.source || "manual",
-      controlSchemas: body?.controlSchemas || {},
-      archived: false,
-      status: "runnable",
-      featureStatus: Object.fromEntries(
-        compatibleFeatures.map((fid) => [fid, { status: "runnable", reason: "" }])
-      ),
-      disabledReason: "",
-    };
-    state.snapshots.set(id, entry);
-    return _json({ status: "ok", snapshot: { ...entry } });
-  }
-
-  /** PATCH /comfymodal/studio/snapshots/:id */
-  async function updateSnapshot(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s) return _error("Snapshot not found", 404);
-    if (body.name !== undefined) s.name = String(body.name).slice(0, 200);
-    if (body.description !== undefined) s.description = String(body.description).slice(0, 2000);
-    if (body.compatibleFeatures !== undefined && Array.isArray(body.compatibleFeatures)) {
-      s.compatibleFeatures = body.compatibleFeatures;
-      s.featureStatus = Object.fromEntries(
-        body.compatibleFeatures.map((fid) => [fid, { status: "runnable", reason: "" }])
-      );
-    }
-    if (body.graphJson !== undefined) s.graphJson = body.graphJson;
-    if (body.apiPromptJson !== undefined) s.apiPromptJson = body.apiPromptJson;
-    if (body.nodeBindings !== undefined && typeof body.nodeBindings === "object") {
-      s.nodeBindings = body.nodeBindings;
-    }
-    if (body.outputNodeId !== undefined) s.outputNodeId = String(body.outputNodeId);
-    if (body.modelSummary !== undefined) s.modelSummary = String(body.modelSummary).trim();
-    if (body.controlSchemas !== undefined && typeof body.controlSchemas === "object") {
-      s.controlSchemas = body.controlSchemas;
-    }
-    if (body.archived !== undefined) s.archived = Boolean(body.archived);
-    s.updatedAt = _now();
-    return _json({ status: "ok", snapshot: { ...s } });
-  }
-
-  /** DELETE /comfymodal/studio/snapshots/:id (archive) */
-  async function deleteSnapshot(route, url, body, params) {
-    const s = state.snapshots.get(params.id);
-    if (!s) return _error("Snapshot not found", 404);
-    s.archived = true;
-    s.updatedAt = _now();
-    return _json({ status: "ok" });
-  }
-
-  /** GET /comfymodal/studio/presets/:id */
-  async function presetDetail(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p || p.archived) return _error("Preset not found", 404);
-    const sid = p.snapshotId || "";
-    const snap = sid ? state.snapshots.get(sid) : null;
-    return _json({
-      status: "ok",
-      preset: {
-        ...p,
-        nodeBindings: snap?.nodeBindings || {},
-        outputNodeId: snap?.outputNodeId || "",
-        featureStatus: snap?.featureStatus || {},
-        hasApiPromptJson: Boolean(snap?.apiPromptJson),
-        hasGraphJson: Boolean(snap?.graphJson),
-        snapshotSummary: snap
-          ? {
-              name: snap.name || "",
-              status: snap.status || "",
-              compatibleFeatures: snap.compatibleFeatures || [],
-              modelSummary: snap.modelSummary || "",
-              source: snap.source || "",
-            }
-          : {},
-        controlSchemas: snap?.controlSchemas || {},
-        defaults: p.defaults || {},
-      },
-    });
-  }
-
-  /** GET /comfymodal/studio/presets */
-  async function listPresets(route, url, body, params) {
-    const includeArchived = url.searchParams.get("includeArchived") === "1";
-    const presets = [];
-    for (const p of state.presets.values()) {
-      if (!includeArchived && p.archived) continue;
-      // Enrich with snapshot-backed runtime fields
-      const sid = p.snapshotId || "";
-      const snap = sid ? state.snapshots.get(sid) : null;
-      presets.push({
-        ...p,
-        nodeBindings: snap?.nodeBindings || {},
-        outputNodeId: snap?.outputNodeId || "",
-        featureStatus: snap?.featureStatus || {},
-        hasApiPromptJson: Boolean(snap?.apiPromptJson),
-        hasGraphJson: Boolean(snap?.graphJson),
-        snapshotSummary: snap
-          ? {
-              name: snap.name || "",
-              status: snap.status || "",
-              compatibleFeatures: snap.compatibleFeatures || [],
-              modelSummary: snap.modelSummary || "",
-              source: snap.source || "",
-            }
-          : {},
-        controlSchemas: snap?.controlSchemas || {},
-        defaults: p.defaults || {},
-      });
-    }
-    return _json({ status: "ok", presets });
-  }
-
-  /** POST /comfymodal/studio/presets */
-  async function createPreset(route, url, body) {
-    const id = _makePresetId();
-    const now = _now();
-    const compatibleFeatures = Array.isArray(body?.compatibleFeatures)
-      ? body.compatibleFeatures
-      : ["txt2img"];
-    const entry = {
-      id,
-      label: body?.label || body?.name || "Untitled Preset",
-      description: body?.description || "",
-      snapshotId: body?.snapshotId || "",
-      compatibleFeatures,
-      defaults: body?.defaults || {},
-      sourceType: body?.sourceType || "manual",
-      sourceId: body?.sourceId || "",
-      archived: false,
-      createdAt: now,
-      updatedAt: now,
-      status: "runnable",
-      disabledReason: "",
-    };
-    state.presets.set(id, entry);
-    return _json({ status: "ok", preset: { ...entry } });
-  }
-
-  /** PATCH /comfymodal/studio/presets/:id */
-  async function updatePreset(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p) return _error("Preset not found", 404);
-    if (body.label !== undefined) p.label = String(body.label).slice(0, 200);
-    if (body.description !== undefined) p.description = String(body.description).slice(0, 2000);
-    if (body.snapshotId !== undefined) p.snapshotId = String(body.snapshotId);
-    if (body.compatibleFeatures !== undefined && Array.isArray(body.compatibleFeatures)) {
-      p.compatibleFeatures = body.compatibleFeatures;
-    }
-    if (body.defaults !== undefined && typeof body.defaults === "object") {
-      p.defaults = body.defaults;
-    }
-    if (body.sourceType !== undefined) p.sourceType = String(body.sourceType);
-    if (body.sourceId !== undefined) p.sourceId = String(body.sourceId);
-    if (body.archived !== undefined) p.archived = Boolean(body.archived);
-    p.updatedAt = _now();
-    return _json({ status: "ok", preset: { ...p } });
-  }
-
-  /** DELETE /comfymodal/studio/presets/:id (archive) */
-  async function deletePreset(route, url, body, params) {
-    const p = state.presets.get(params.id);
-    if (!p) return _error("Preset not found", 404);
-    p.archived = true;
-    p.updatedAt = _now();
-    return _json({ status: "ok" });
-  }
 
   /** POST /comfymodal/studio/run */
   async function studioRun(route, url, body) {
@@ -1001,11 +800,14 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({
       status: "ok",
       level: state.profileLevel,
-      effective: state.profileLevel,
+      effective: state.effectiveProfileLevel,
     });
   }
 
-  /** POST /comfymodal/profile/level — persist the requested level. */
+  /**
+   * POST /comfymodal/profile/level — persist the requested level. The running
+   * process keeps its old level until restart, so `effective` is unchanged.
+   */
   async function saveProfileLevel(route, url, body) {
     if (body && typeof body.level === "string") {
       state.profileLevel = body.level;
@@ -1063,18 +865,8 @@ export async function installStudioMockApi(page, options = {}) {
 
   const routeEntries = [
     // Snapshots (detail before list so :id never shadows list)
-    ["GET", "/comfymodal/studio/snapshots/:id", snapshotDetail],
-    ["GET", "/comfymodal/studio/snapshots", listSnapshots],
-    ["POST", "/comfymodal/studio/snapshots", createSnapshot],
-    ["PATCH", "/comfymodal/studio/snapshots/:id", updateSnapshot],
-    ["DELETE", "/comfymodal/studio/snapshots/:id", deleteSnapshot],
 
     // Presets (detail before list)
-    ["GET", "/comfymodal/studio/presets/:id", presetDetail],
-    ["GET", "/comfymodal/studio/presets", listPresets],
-    ["POST", "/comfymodal/studio/presets", createPreset],
-    ["PATCH", "/comfymodal/studio/presets/:id", updatePreset],
-    ["DELETE", "/comfymodal/studio/presets/:id", deletePreset],
 
     // Studio run & experiment
     ["POST", "/comfymodal/studio/run", studioRun],
@@ -1221,18 +1013,10 @@ export async function installStudioMockApi(page, options = {}) {
       return lastExperimentRequest;
     },
 
-    activePresets() {
-      return [...state.presets.values()].filter((p) => !p.archived);
-    },
 
-    activeSnapshots() {
-      return [...state.snapshots.values()].filter((s) => !s.archived);
-    },
 
     /** Reset all state */
     reset() {
-      state.snapshots.clear();
-      state.presets.clear();
       state.experiments.clear();
       state.history.length = 0;
       state.calls.length = 0;

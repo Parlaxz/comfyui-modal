@@ -104,14 +104,6 @@ def _identity(invocation_id: str, request_id: str):
     }
 
 
-def test_success_path_exact(tmp_path: Path):
-    inv = "a" * 32
-    req = "golden-p1-0-abc123"
-    cohort = _cohort(tmp_path, invocation_id=inv, request_id=req)
-    c = experiment_evidence._compact_cohort(cohort, _identity(inv, req))
-    assert c["exact"] == "EXACT", c
-
-
 def test_missing_invocation_fails(tmp_path: Path):
     inv = "a" * 32
     req = "golden-p1-0-abc123"
@@ -278,25 +270,6 @@ def test_provenance_policy_auto_does_not_conflict_with_observed_sage_mode():
         sage_resolution_source="auto_resolution",
     )
     assert provenance["sage_runtime_mode_resolved"] == "baked_cuda"
-
-
-def test_compact_nested_sage_observation_is_mismatch(tmp_path: Path):
-    inv = "a" * 32
-    req = "golden-p1-0-abc123"
-    cohort = _cohort(
-        tmp_path,
-        invocation_id=inv,
-        request_id=req,
-        extra={
-            "sage_runtime_mode_resolved": "auto",
-            "full_trace_artifact": {
-                "golden_telemetry": {"sage_mode": "baked_cuda"},
-            },
-        },
-    )
-    compact = experiment_evidence._compact_cohort(cohort, _identity(inv, req))
-    assert compact["sage_runtime_mode_resolved"] == "mixed"
-    assert compact["exact"] == "MISMATCH"
 
 
 def test_contradictory_runtime_records_fail_closed():

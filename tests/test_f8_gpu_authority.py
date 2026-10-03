@@ -338,11 +338,7 @@ class F8WorkflowCaptureTests(unittest.TestCase):
             self.version["workflow_version_id"],
             entries=entries, output_node_id=output_node_id,
         )
-        self.preset = self.service.create_preset(
-            self.version["workflow_version_id"], "Preset A",
-            values=_default_values(),
-        )
-        self.service.set_default_preset(self.wf["workflow_id"], self.preset["preset_id"])
+        self.preset = None  # no preset layer: defaults come from the version itself
         self._orig_gpu = modal_client.get_gpu()
         modal_client._current_gpu = "l4"
         self.addCleanup(self._teardown)
@@ -357,7 +353,7 @@ class F8WorkflowCaptureTests(unittest.TestCase):
         ):
             return self.swr.resolve_workflow_run_bundle(
                 self.wf["workflow_id"], self.version["workflow_version_id"],
-                self.preset["preset_id"], self.root,
+                self.root,
             )
 
     def test_workflow_v2_run_receives_captured_server_gpu(self):
@@ -366,7 +362,7 @@ class F8WorkflowCaptureTests(unittest.TestCase):
              patch.object(self.swr, "_workflow_v2_run", recorder):
             result = _run(self.swr.handle_workflow_run_async(
                 self.wf["workflow_id"], self.version["workflow_version_id"],
-                self.preset["preset_id"], "txt2img", {}, self.root,
+                "", "txt2img", {}, self.root,
                 modal_options={"execution_mode": "v2"},
             ))
         self.assertEqual(result.get("status"), "ok")
@@ -379,13 +375,13 @@ class F8WorkflowCaptureTests(unittest.TestCase):
              patch.object(self.swr, "_workflow_v2_run", recorder):
             _run(self.swr.handle_workflow_run_async(
                 self.wf["workflow_id"], self.version["workflow_version_id"],
-                self.preset["preset_id"], "txt2img", {}, self.root,
+                "", "txt2img", {}, self.root,
                 modal_options={"execution_mode": "v2"},
             ))
             modal_client._current_gpu = "a10g"
             _run(self.swr.handle_workflow_run_async(
                 self.wf["workflow_id"], self.version["workflow_version_id"],
-                self.preset["preset_id"], "txt2img", {}, self.root,
+                "", "txt2img", {}, self.root,
                 modal_options={"execution_mode": "v2"},
             ))
         self.assertEqual(recorder.calls[0]["args"][5], "l4")
@@ -595,20 +591,16 @@ class F8PlanFreezeTests(unittest.TestCase):
             version["workflow_version_id"],
             entries=entries, output_node_id=output_node_id,
         )
-        preset = service.create_preset(
-            version["workflow_version_id"], "Preset A", values=_default_values()
-        )
-        service.set_default_preset(wf["workflow_id"], preset["preset_id"])
         with patch.object(self.swr, "_get_domain_service", lambda node_dir: service):
             return self.swr.resolve_workflow_run_bundle(
                 wf["workflow_id"], version["workflow_version_id"],
-                preset["preset_id"], self._tmp.name,
+                self._tmp.name,
             )
 
     def test_workflow_plan_freezes_selected_gpu_production_path(self):
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle.get("defaults") or {}, {}, bundle["control_schema"]
         )
         plan, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",
@@ -619,7 +611,7 @@ class F8PlanFreezeTests(unittest.TestCase):
     def test_workflow_plan_freezes_selected_gpu_nonproduction_path(self):
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         plan, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"],
@@ -631,7 +623,7 @@ class F8PlanFreezeTests(unittest.TestCase):
     def test_later_settings_change_does_not_mutate_accepted_plan(self):
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         plan, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",
@@ -652,7 +644,7 @@ class F8PlanFreezeTests(unittest.TestCase):
 
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         saved, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",
@@ -668,7 +660,7 @@ class F8PlanFreezeTests(unittest.TestCase):
 
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         saved, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",
@@ -683,7 +675,7 @@ class F8PlanFreezeTests(unittest.TestCase):
 
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         saved, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",
@@ -699,7 +691,7 @@ class F8PlanFreezeTests(unittest.TestCase):
 
         bundle = self._bundle()
         merged = self.swr.merge_workflow_controls(
-            bundle["preset"], {}, bundle["control_schema"]
+            bundle["defaults"], {}, bundle["control_schema"]
         )
         saved, err = self.swr.build_workflow_execution_plan(
             bundle, merged["values"], modal_options=None, gpu="l4",

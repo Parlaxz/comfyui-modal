@@ -1,8 +1,8 @@
 // Modal Studio — Workflows Page
 //
 // Workflow library, graph import / manual creation, workflow detail
-// (versions, dependencies placeholder, mapping, presets, copy-forward),
-// the mapping editor, and the preset editor.
+// (version, dependencies, mapping),
+// and the mapping editor.
 //
 // Render contract: export function renderWorkflows(state, context) → DOM node.
 //   state   — shell state (unused directly; view state lives in this module)
@@ -38,10 +38,10 @@ import {
   importWorkflow,
   getWorkflow,
   updateWorkflow,
+  createWorkflowFolder,
+  deleteWorkflow,
   listWorkflowFolders,
   listWorkflowTags,
-  setWorkflowDefaultPreset,
-  clearWorkflowDefaultPreset,
   getWorkflowRunContext,
   listWorkflowVersions,
   captureWorkflowVersion,
@@ -51,14 +51,6 @@ import {
   createMapping,
   getMappingCandidates,
   createMappingRevision,
-  listVersionPresets,
-  createVersionPreset,
-  getWorkflowPreset,
-  updateWorkflowPreset,
-  deleteWorkflowPreset,
-  duplicateWorkflowPreset,
-  copyPresetToVersion,
-  bulkCopyPresetsToVersion,
   getVersionDependencies,
   getVersionPortability,
   fetchWorkflowManifestExport,
@@ -81,12 +73,15 @@ const _view = {
   mode: "library",                 // "library" | "detail" | "models"
   selectedWorkflowId: "",
   selectedVersionId: "",
-  editorMode: "",                  // "" | "mapping" | "preset"
-  activePresetId: "",              // preset being edited; "" = new preset
+  editorMode: "",                  // "" | "mapping"
+
   detailEditing: false,
   revisionConfirm: false,          // mapping immutability confirmation open
   capturingVersion: false,
   importMode: "",                  // "" | "graph" | "manual" (dialog section)
+  selectionMode: false,
+  selectedWorkflowIds: new Set(),
+  bulkAction: { busy: false, label: "" },
   picker: { open: false, mode: "single", selectedIds: [] },
   portability: {
     report: null,                  // current G5 report for the selected version
@@ -96,7 +91,6 @@ const _view = {
   },
   exportFlow: {
     open: false,
-    includePresets: false,         // default OFF — never silently export presets
     busy: false,
     error: "",
     done: "",
@@ -113,10 +107,11 @@ const _view = {
     committing: false,
     commitError: "",
     result: null,
-    importPresets: false,          // explicit choice, default OFF
-    applyDefaultPreset: false,     // explicit choice, default OFF
   },
   filters: { query: "", tag: "", folder: "", favoritesOnly: false, usageModel: "" },
+  folderMove: { open: false, workflowId: "", workflowIds: [], busy: false, error: "" },
+  folderCreate: { open: false, path: "", busy: false, error: "" },
+  deleteConfirm: { open: false, mode: "", workflowId: "", workflowName: "", workflowIds: [], busy: false },
   // Session-derived reverse usage index (I6): model filename → Set of
   // workflow_ids, filled ONLY from dependency payloads the frontend already
   // fetched through normal navigation.  Purely in-memory — no persistence
@@ -132,7 +127,7 @@ const _view = {
     loading: false,
     _loaded: false,
   },
-  modelsCache: null,               // library models for the preset model picker
+  modelsCache: null,               // library models for the model picker
   modelsCacheState: "idle",        // "idle" | "loading" | "loaded" | "failed"
   data: {
     workflows: null,
@@ -141,15 +136,15 @@ const _view = {
     workflow: null,
     versions: [],
     version: null,
-    presets: [],
+  
     mapping: null,
     mappingVersionId: "",
     candidates: null,
     candidatesVersionId: "",
-    editPreset: null,
-    copyResults: null,
+  
+  
     notice: null,
-    presetIncomplete: null,
+  
     loadError: null,
     dependencies: null,
     // Lazy workflow-detail Manager context. Loaded only when the SELECTED
@@ -442,8 +437,8 @@ export function renderWorkflows(state, context) {
   // Mount-local rendering refs
   let gridEl = null;
   let mappingControls = {};
-  let presetRefs = { values: {}, rec: {}, models: {}, exposed: {}, loraRows: [] };
-  let presetEntries = [];
+
+
   const expandedVersions = new Set();
 
   function stale() { return token !== _currentToken; }
@@ -482,7 +477,7 @@ export function renderWorkflows(state, context) {
     if (_view.mode === "detail") {
       root.appendChild(renderDetailView());
       if (_view.editorMode === "mapping") ensureMappingEditorData();
-      else if (_view.editorMode === "preset") ensurePresetEditorData();
+  
     } else if (_view.mode === "models") {
       root.appendChild(renderModelLibraryView({ apiBase, view: _view, refresh: render }));
     } else {
@@ -493,22 +488,25 @@ export function renderWorkflows(state, context) {
   // ── Navigation ──────────────────────────────────────────────────────────
 
   function openWorkflowDetail(wfId, versionId, notice) {
+    // `versionId` is a hint only. A workflow has one version, so loadDetailData
+    // resolves the latest and overwrites this; the argument is kept so existing
+    // callers (library navigation, import, wizard hand-off) need no churn.
     _view.mode = "detail";
     _view.selectedWorkflowId = wfId;
     _view.selectedVersionId = versionId || "";
     _view.editorMode = "";
-    _view.activePresetId = "";
+
     _view.detailEditing = false;
     _view.revisionConfirm = false;
-    _view.data.editPreset = null;
-    _view.data.copyResults = null;
-    _view.data.presetIncomplete = null;
+
+
+
     _view.data.notice = notice ? { text: notice, error: false } : null;
     _view.data.loadError = null;
     _view.data.workflow = null;
     _view.data.versions = [];
     _view.data.version = null;
-    _view.data.presets = [];
+
     _view.data.mapping = null;
     _view.data.dependencies = null;
     _resetManagerContext();
@@ -527,15 +525,15 @@ export function renderWorkflows(state, context) {
   // untouched. A missing version context falls back to the detail page.
 
   function openVersionSetupWizard(wfId, versionId, notice) {
-    import("./studio-preset-wizard.js").then(({ openPresetWizard }) => {
+    import("./studio-workflow-setup-wizard.js").then(({ openWorkflowSetupWizard }) => {
       if (stale()) return;
       if (!wfId || !versionId) {
         openWorkflowDetail(wfId, versionId, notice);
         return;
       }
-      openPresetWizard(() => {
+      openWorkflowSetupWizard(() => {
         openWorkflowDetail(wfId, versionId, notice);
-      }, apiBase, null, null, { workflowId: wfId, workflowVersionId: versionId });
+      }, apiBase, { workflowId: wfId, workflowVersionId: versionId });
     }).catch(() => {
       openWorkflowDetail(wfId, versionId, notice);
     });
@@ -547,7 +545,6 @@ export function renderWorkflows(state, context) {
     _view.portability.error = "";
     _view.portability.checking = false;
     _view.exportFlow.open = false;
-    _view.exportFlow.includePresets = false;
     _view.exportFlow.busy = false;
     _view.exportFlow.error = "";
     _view.exportFlow.done = "";
@@ -556,12 +553,14 @@ export function renderWorkflows(state, context) {
   function goToLibrary() {
     _view.mode = "library";
     _view.editorMode = "";
-    _view.activePresetId = "";
+
     _view.detailEditing = false;
     _view.revisionConfirm = false;
     _view.importMode = "";
     _view.data.notice = null;
-    _view.data.copyResults = null;
+
+    _view.selectionMode = false;
+    _view.selectedWorkflowIds.clear();
     render();
     loadLibrary();
   }
@@ -665,24 +664,57 @@ export function renderWorkflows(state, context) {
     const wf = w || {};
     const id = wf.workflow_id || "";
     const state = wf.latest_version_state || null;
+    // Selection mode reuses the whole card as the selection target: the
+    // checkbox stays a visible/accessible affordance, but the card body is
+    // also clickable so a large grid does not require precise aiming.
+    const selected = _view.selectionMode && _view.selectedWorkflowIds.has(id);
+    function toggleSelected() {
+      if (selected) _view.selectedWorkflowIds.delete(id);
+      else _view.selectedWorkflowIds.add(id);
+      render();
+    }
     const card = el("div", {
-      class: "comfymodal-studio-workflow-card",
+      class: "comfymodal-studio-workflow-card" + (selected ? " is-selected" : ""),
       "data-testid": "workflow-card",
       "data-workflow-id": id,
       tabindex: "0",
-      role: "button",
-      "aria-label": "Open workflow " + (wf.name || ""),
-      onclick: () => openWorkflowDetail(id, wf.latest_version_id || "", null),
+      role: _view.selectionMode ? "checkbox" : "button",
+      "aria-label": _view.selectionMode
+        ? "Select workflow " + (wf.name || "")
+        : "Open workflow " + (wf.name || ""),
+      // Only meaningful in selection mode; el() stringifies any passed value,
+      // so the attribute is omitted entirely outside it.
+      ...(_view.selectionMode ? { "aria-checked": selected ? "true" : "false" } : {}),
+      onclick: () => {
+        if (_view.selectionMode) toggleSelected();
+        else openWorkflowDetail(id, wf.latest_version_id || "", null);
+      },
       onkeydown: (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openWorkflowDetail(id, wf.latest_version_id || "", null);
-        }
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        if (_view.selectionMode) toggleSelected();
+        else openWorkflowDetail(id, wf.latest_version_id || "", null);
       },
     }, [
+      _view.selectionMode ? el("input", {
+        type: "checkbox", class: "comfymodal-studio-workflow-select-checkbox",
+        "data-testid": "workflow-card-checkbox",
+        // Decorative mirror only: hidden from the accessibility tree and
+        // removed from the tab order, because the card itself is the control.
+        "aria-hidden": "true", tabindex: "-1",
+        checked: selected,
+        // Purely visual mirror of the card's selection state; the card owns the
+        // interaction, so the control never toggles independently.
+        onchange: () => {},
+        onclick: (e) => { e.preventDefault(); e.stopPropagation(); toggleSelected(); },
+        onkeydown: (e) => e.stopPropagation(),
+      }) : null,
       el("div", { class: "comfymodal-studio-workflow-card-top" }, [
         el("h3", { class: "comfymodal-studio-workflow-card-name", text: wf.name || "Untitled workflow" }),
-        renderFavoriteButton(wf, true),
+        el("div", { class: "comfymodal-studio-workflow-card-actions" }, [
+          renderFavoriteButton(wf, true),
+          renderWorkflowMenu(wf),
+        ]),
       ]),
       wf.folder ? el("div", { class: "comfymodal-studio-workflow-card-folder", text: wf.folder }) : null,
       (wf.tags && wf.tags.length)
@@ -690,8 +722,7 @@ export function renderWorkflows(state, context) {
         : null,
       el("div", { class: "comfymodal-studio-workflow-card-meta" }, [
         _stateBadge(state, "workflow-card-state"),
-        el("span", { text: "v" + (wf.latest_version_number != null ? wf.latest_version_number : "0") }),
-        wf.default_preset_name ? el("span", { text: wf.default_preset_name }) : null,
+        el("span", { text: wf.mapping_id ? "Mapped" : "Not mapped" }),
         renderCardPortabilityChip(wf),
       ]),
       (wf.source_url || wf.source_author)
@@ -699,6 +730,274 @@ export function renderWorkflows(state, context) {
         : null,
     ]);
     return card;
+  }
+
+  function renderWorkflowMenu(wf) {
+    const menu = el("div", {
+      class: "comfymodal-studio-workflow-menu",
+      "data-testid": "workflow-card-menu",
+      role: "menu",
+      style: "display:none;",
+    }, [
+      el("button", {
+        type: "button",
+        class: "comfymodal-studio-workflow-menu-item",
+        "data-testid": "workflow-move-to-folder",
+        role: "menuitem",
+        text: "Move to folder",
+        onclick: (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openFolderMoveDialog(wf);
+        },
+        onkeydown: (e) => e.stopPropagation(),
+      }),
+      el("button", {
+        type: "button", class: "comfymodal-studio-workflow-menu-item comfymodal-studio-workflow-menu-item-danger",
+        "data-testid": "workflow-card-delete", role: "menuitem", text: "Delete",
+        onclick: (e) => { e.preventDefault(); e.stopPropagation(); deleteSingleWorkflow(wf); },
+        onkeydown: (e) => e.stopPropagation(),
+      }),
+    ]);
+    const button = el("button", {
+      type: "button",
+      class: "comfymodal-studio-workflow-kebab",
+      "data-testid": "workflow-menu-button",
+      "aria-label": "More actions for " + (wf.name || "this workflow"),
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      text: "\u22ee",
+      onclick: (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const open = menu.style.display !== "none";
+        menu.style.display = open ? "none" : "block";
+        button.setAttribute("aria-expanded", open ? "false" : "true");
+      },
+      onkeydown: (e) => e.stopPropagation(),
+    });
+    return el("div", { class: "comfymodal-studio-workflow-menu-wrap" }, [button, menu]);
+  }
+
+  function selectedWorkflows() {
+    const ids = _view.selectedWorkflowIds;
+    return (_view.data.workflows || []).filter((wf) => ids.has(wf.workflow_id));
+  }
+
+  async function bulkDeleteWorkflows() {
+    const workflows = selectedWorkflows();
+    if (!workflows.length || _view.bulkAction.busy) return;
+    _view.deleteConfirm = { open: true, mode: "bulk", workflowId: "", workflowName: "", workflowIds: workflows.map((wf) => wf.workflow_id), busy: false };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function closeDeleteConfirmation() {
+    if (_view.deleteConfirm.busy) return;
+    _view.deleteConfirm = { open: false, mode: "", workflowId: "", workflowName: "", workflowIds: [], busy: false };
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  function clearDeleteConfirmation() {
+    _view.deleteConfirm = { open: false, mode: "", workflowId: "", workflowName: "", workflowIds: [], busy: false };
+    _maybeRemoveDialogEscHandler();
+  }
+
+  async function confirmDeleteWorkflows() {
+    const confirmation = _view.deleteConfirm;
+    if (!confirmation.open || confirmation.busy) return;
+    confirmation.busy = true;
+    render();
+
+    if (confirmation.mode === "single") {
+      let result;
+      try { result = await deleteWorkflow(apiBase, confirmation.workflowId); } catch (err) {
+        if (stale()) { clearDeleteConfirmation(); return; }
+        clearDeleteConfirmation();
+        _view.data.notice = { text: "Could not delete workflow: " + (err.message || "Request failed"), error: true };
+        render(); return;
+      }
+      if (stale()) { clearDeleteConfirmation(); return; }
+      if (!result || result.status === "error" || result._httpStatus >= 400) {
+        clearDeleteConfirmation();
+        _view.data.notice = { text: "Could not delete workflow: " + _errorText(result), error: true };
+        render(); return;
+      }
+      _view.data.workflows = (_view.data.workflows || []).filter((item) => item.workflow_id !== confirmation.workflowId);
+      _view.selectedWorkflowIds.delete(confirmation.workflowId);
+      _view.data.notice = { text: "Workflow deleted", error: false };
+      clearDeleteConfirmation();
+      render();
+      return;
+    }
+
+    _view.bulkAction = { busy: true, label: "Deleting…" }; render();
+    const failed = [];
+    for (const workflowId of confirmation.workflowIds) {
+      try {
+        const result = await deleteWorkflow(apiBase, workflowId);
+        if (!result || result.status === "error" || result._httpStatus >= 400) failed.push(workflowId);
+        else _view.selectedWorkflowIds.delete(workflowId);
+      } catch (err) { failed.push(workflowId); }
+    }
+    _view.bulkAction = { busy: false, label: "" };
+    _view.data.notice = failed.length
+      ? { text: "Could not delete " + failed.length + " workflow" + (failed.length === 1 ? "" : "s") + ".", error: true }
+      : { text: "Workflows deleted", error: false };
+    clearDeleteConfirmation();
+    await loadLibrary();
+  }
+
+  async function bulkFavoriteWorkflows() {
+    const workflows = selectedWorkflows();
+    if (!workflows.length || _view.bulkAction.busy) return;
+    _view.bulkAction = { busy: true, label: "Favoriting…" }; render();
+    const failed = [];
+    for (const wf of workflows) {
+      try {
+        const result = await updateWorkflow(apiBase, wf.workflow_id, { favorite: true });
+        if (!result || result.status === "error" || result._httpStatus >= 400) failed.push(wf.workflow_id);
+        else { wf.favorite = true; _view.selectedWorkflowIds.delete(wf.workflow_id); }
+      } catch (err) { failed.push(wf.workflow_id); }
+    }
+    _view.bulkAction = { busy: false, label: "" };
+    _view.data.notice = failed.length ? { text: "Could not favorite " + failed.length + " workflow" + (failed.length === 1 ? "" : "s") + ".", error: true } : { text: "Workflows added to favorites", error: false };
+    render();
+  }
+
+  function openBulkFolderMoveDialog() {
+    const ids = Array.from(_view.selectedWorkflowIds);
+    if (!ids.length || _view.bulkAction.busy) return;
+    _view.folderMove = { open: true, workflowId: ids[0], workflowIds: ids, busy: false, error: "" };
+    _ensureDialogEscHandler(); render();
+  }
+
+  function renderBulkActions() {
+    const count = _view.selectedWorkflowIds.size;
+    if (!_view.selectionMode || !count) return null;
+    return el("div", { class: "comfymodal-studio-workflows-bulk-actions", "data-testid": "workflow-bulk-actions", role: "toolbar", "aria-label": "Actions for selected workflows" }, [
+      el("span", { class: "comfymodal-studio-workflows-selection-count", text: count + " selected" }),
+      el("button", { type: "button", class: "comfymodal-secondary-btn", "data-testid": "workflow-bulk-favorite", text: "Favorite", disabled: _view.bulkAction.busy, onclick: bulkFavoriteWorkflows }),
+      el("button", { type: "button", class: "comfymodal-secondary-btn", "data-testid": "workflow-bulk-move", text: "Move to folder", disabled: _view.bulkAction.busy, onclick: openBulkFolderMoveDialog }),
+      el("button", { type: "button", class: "comfymodal-destructive-btn", "data-testid": "workflow-bulk-delete", text: _view.bulkAction.busy ? _view.bulkAction.label : "Delete", disabled: _view.bulkAction.busy, onclick: bulkDeleteWorkflows }),
+    ]);
+  }
+
+  function openFolderMoveDialog(wf) {
+    _view.folderMove = { open: true, workflowId: wf.workflow_id || "", workflowIds: [wf.workflow_id || ""], busy: false, error: "" };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function closeFolderMoveDialog() {
+    if (_view.folderMove.busy) return;
+    _view.folderMove = { open: false, workflowId: "", workflowIds: [], busy: false, error: "" };
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  async function moveWorkflowToFolder(folder) {
+    const move = _view.folderMove;
+    if (!move.open || move.busy) return;
+    move.busy = true;
+    move.error = "";
+    render();
+    try {
+      const ids = move.workflowIds && move.workflowIds.length ? move.workflowIds : [move.workflowId];
+      const results = await Promise.all(ids.map((id) => updateWorkflow(apiBase, id, { folder: folder || "" })));
+      const failed = results.find((result) => !result || result.status === "error" || result._httpStatus >= 400);
+      if (failed) throw new Error((failed.message || failed.error) || "Could not move workflow.");
+      ids.forEach((id) => _view.selectedWorkflowIds.delete(id));
+      _view.folderMove = { open: false, workflowId: "", workflowIds: [], busy: false, error: "" };
+      _maybeRemoveDialogEscHandler();
+      await loadLibrary();
+    } catch (err) {
+      if (stale()) return;
+      _view.folderMove.busy = false;
+      _view.folderMove.error = err && err.message ? err.message : "Could not move workflow.";
+      render();
+    }
+  }
+
+  function renderFolderMoveDialog() {
+    const move = _view.folderMove;
+    const wf = (_view.data.workflows || []).find((item) => item.workflow_id === move.workflowId) || {};
+    const movingMany = (move.workflowIds || []).length > 1;
+    const overlay = el("div", { class: "comfymodal-studio-dialog-overlay", "data-testid": "workflow-folder-move-overlay" });
+    overlay.appendChild(el("div", { class: "comfymodal-studio-dialog-backdrop", onclick: closeFolderMoveDialog }));
+    const dialog = el("div", {
+      class: "comfymodal-studio-dialog comfymodal-studio-folder-dialog",
+      "data-testid": "workflow-folder-move-dialog",
+      role: "dialog", "aria-modal": "true", "aria-label": "Move workflow to folder",
+    }, [
+      el("h3", { class: "comfymodal-studio-dialog-title", text: "Move to folder" }),
+      el("p", { class: "comfymodal-studio-dialog-note", text: movingMany ? "Move " + move.workflowIds.length + " selected workflows to one folder." : (wf.name || "Workflow") + (wf.folder ? " is in " + wf.folder + "." : " is not in a folder.") }),
+      el("div", { class: "comfymodal-studio-folder-options", "aria-label": "Available folders" }, [
+        el("button", { type: "button", class: "comfymodal-studio-folder-option" + (!wf.folder ? " active" : ""), "data-testid": "workflow-remove-from-folder", text: "No folder", disabled: move.busy, onclick: () => moveWorkflowToFolder("") }),
+        ...(_view.data.folders || []).map((path) => el("button", { type: "button", class: "comfymodal-studio-folder-option" + (wf.folder === path ? " active" : ""), "data-testid": "workflow-folder-option", text: path, disabled: move.busy, onclick: () => moveWorkflowToFolder(path) })),
+      ]),
+      move.error ? el("div", { class: "comfymodal-studio-dialog-status error", "data-testid": "workflow-folder-move-error", text: move.error }) : null,
+      move.busy ? el("div", { class: "comfymodal-studio-dialog-status", "data-testid": "workflow-folder-move-loading", text: "Moving workflow…" }) : null,
+      el("div", { class: "comfymodal-studio-dialog-actions" }, [el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Cancel", disabled: move.busy, onclick: closeFolderMoveDialog })]),
+    ]);
+    overlay.appendChild(dialog);
+    return overlay;
+  }
+
+  function renderDeleteConfirmation() {
+    const confirmation = _view.deleteConfirm;
+    const isBulk = confirmation.mode === "bulk";
+    const title = isBulk ? "Delete selected workflows" : "Delete workflow";
+    const body = isBulk
+      ? "Permanently delete " + confirmation.workflowIds.length + " selected workflows? This cannot be undone."
+      : "Permanently delete \"" + confirmation.workflowName + "\"? This cannot be undone.";
+    const overlay = el("div", { class: "comfymodal-studio-dialog-overlay", "data-testid": "workflow-delete-confirmation-overlay" });
+    overlay.appendChild(el("div", { class: "comfymodal-studio-dialog-backdrop", onclick: closeDeleteConfirmation }));
+    const dialog = el("div", {
+      class: "comfymodal-studio-dialog comfymodal-studio-delete-dialog",
+      "data-testid": "workflow-delete-confirmation-dialog",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": "workflow-delete-confirmation-title",
+      "aria-describedby": "workflow-delete-confirmation-body",
+    }, [
+      el("h3", { id: "workflow-delete-confirmation-title", class: "comfymodal-studio-dialog-title", text: title }),
+      el("p", { id: "workflow-delete-confirmation-body", class: "comfymodal-studio-dialog-note", text: body }),
+      confirmation.busy ? el("div", { class: "comfymodal-studio-dialog-status", "data-testid": "workflow-delete-confirmation-loading", role: "status", text: "Deleting…" }) : null,
+      el("div", { class: "comfymodal-studio-dialog-actions" }, [
+        el("button", { type: "button", class: "comfymodal-secondary-btn", "data-testid": "workflow-delete-confirmation-cancel", text: "Cancel", disabled: confirmation.busy, onclick: closeDeleteConfirmation }),
+        el("button", { type: "button", class: "comfymodal-destructive-btn", "data-testid": "workflow-delete-confirmation-confirm", text: confirmation.busy ? "Deleting…" : "Delete permanently", disabled: confirmation.busy, onclick: confirmDeleteWorkflows }),
+      ]),
+    ]);
+    overlay.appendChild(dialog);
+    return overlay;
+  }
+
+  async function deleteSingleWorkflow(wf) {
+    if (!wf || !wf.workflow_id || _view.deleteConfirm.open) return;
+    _view.deleteConfirm = { open: true, mode: "single", workflowId: wf.workflow_id, workflowName: wf.name || "Untitled workflow", workflowIds: [], busy: false };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function renderDeleteButton(wf) {
+    const button = el("button", {
+      type: "button",
+      class: "comfymodal-destructive-btn comfymodal-studio-workflow-card-delete",
+      "data-testid": "workflow-card-delete",
+      "aria-label": "Delete workflow " + (wf.name || "Untitled workflow"),
+      title: "Delete workflow",
+      text: "Delete",
+      onkeydown: (e) => e.stopPropagation(),
+      onclick: async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (button.disabled) return;
+        deleteSingleWorkflow(wf);
+      },
+    });
+    return button;
   }
 
   /**
@@ -755,7 +1054,6 @@ export function renderWorkflows(state, context) {
     const state = chipStateFromSummary(normalizePortabilitySummary(raw));
     const wf = _view.data.workflow;
     const version = _view.data.versions.find((v) => v.workflow_version_id === _view.selectedVersionId) || _view.data.version;
-    const versionPart = version && version.version_number != null ? " v" + version.version_number : "";
     return el("button", {
       type: "button",
       class: "comfymodal-studio-portability-chip " + state.kind + " cm-chip cm-chip--portability",
@@ -765,7 +1063,7 @@ export function renderWorkflows(state, context) {
       // Unique on the detail page, but named with workflow/version context so
       // it stays distinguishable from list chips in accessibility trees that
       // expose both.
-      "aria-label": "Portability for " + ((wf && wf.name) || "this workflow") + versionPart +
+      "aria-label": "Portability for " + ((wf && wf.name) || "this workflow") +
         ": " + state.label + ". Opens the portability panel.",
       onclick: () => {
         const panel = root.querySelector('[data-testid="portability-panel"]');
@@ -821,6 +1119,75 @@ export function renderWorkflows(state, context) {
     return container;
   }
 
+  function openFolderCreateDialog() {
+    _view.folderCreate = { open: true, path: "", busy: false, error: "" };
+    _ensureDialogEscHandler();
+    render();
+  }
+
+  function closeFolderCreateDialog() {
+    if (_view.folderCreate.busy) return;
+    _view.folderCreate = { open: false, path: "", busy: false, error: "" };
+    _maybeRemoveDialogEscHandler();
+    render();
+  }
+
+  async function createFolder(pathInput) {
+    const path = String(pathInput || "").trim().replace(/[\\]+/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!path) {
+      _view.folderCreate.error = "Enter a folder name or path.";
+      render();
+      return;
+    }
+    _view.folderCreate.path = path;
+    _view.folderCreate.busy = true;
+    _view.folderCreate.error = "";
+    render();
+    try {
+      const result = await createWorkflowFolder(apiBase, path);
+      if (!result || result.status === "error" || result._httpStatus >= 400) {
+        throw new Error((result && (result.message || result.error)) || "Could not create folder.");
+      }
+      _view.folderCreate = { open: false, path: "", busy: false, error: "" };
+      _maybeRemoveDialogEscHandler();
+      await loadLibrary();
+    } catch (err) {
+      if (stale()) return;
+      _view.folderCreate.busy = false;
+      _view.folderCreate.error = err && err.message ? err.message : "Could not create folder.";
+      render();
+    }
+  }
+
+  function renderFolderCreateDialog() {
+    const state = _view.folderCreate;
+    const input = el("input", {
+      type: "text", class: "comfymodal-studio-workflows-folder-input",
+      "data-testid": "workflow-folder-name-input", "aria-label": "Folder name or path",
+      placeholder: "e.g. character / portraits", value: state.path, disabled: state.busy,
+      oninput: (e) => { _view.folderCreate.path = e.currentTarget.value; },
+      onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); createFolder(e.currentTarget.value); } },
+    });
+    const overlay = el("div", { class: "comfymodal-studio-dialog-overlay", "data-testid": "workflow-folder-create-overlay" });
+    overlay.appendChild(el("div", { class: "comfymodal-studio-dialog-backdrop", onclick: closeFolderCreateDialog }));
+    const dialog = el("div", {
+      class: "comfymodal-studio-dialog comfymodal-studio-folder-dialog",
+      "data-testid": "workflow-folder-create-dialog", role: "dialog", "aria-modal": "true", "aria-label": "Create workflow folder",
+    }, [
+      el("h3", { class: "comfymodal-studio-dialog-title", text: "New folder" }),
+      el("p", { class: "comfymodal-studio-dialog-note", text: "Use a name or nested path to organize workflows." }),
+      input,
+      state.error ? el("div", { class: "comfymodal-studio-dialog-status error", "data-testid": "workflow-folder-create-error", text: state.error }) : null,
+      state.busy ? el("div", { class: "comfymodal-studio-dialog-status", "data-testid": "workflow-folder-create-loading", text: "Creating folder…" }) : null,
+      el("div", { class: "comfymodal-studio-dialog-actions" }, [
+        el("button", { type: "button", class: "comfymodal-secondary-btn", text: "Cancel", disabled: state.busy, onclick: closeFolderCreateDialog }),
+        el("button", { type: "button", class: "comfymodal-primary-btn", "data-testid": "workflow-folder-create-submit", text: "Create folder", disabled: state.busy, onclick: () => createFolder(input.value) }),
+      ]),
+    ]);
+    overlay.appendChild(dialog);
+    return overlay;
+  }
+
   function appendFolderNodes(container, children, depth) {
     const names = Object.keys(children || {}).sort((a, b) => a.localeCompare(b));
     names.forEach((name) => {
@@ -867,32 +1234,43 @@ export function renderWorkflows(state, context) {
       ]),
       el("div", { class: "comfymodal-studio-workflows-header-actions" }, [
         el("button", {
-          class: "comfymodal-secondary-btn",
+          type: "button", class: "comfymodal-secondary-btn",
           "data-testid": "workflows-picker-button",
-          text: "Select workflow",
+          text: "Open picker",
           onclick: () => openPickerDialog("single"),
         }),
         el("button", {
-          class: "comfymodal-secondary-btn",
+          type: "button", class: "comfymodal-secondary-btn",
+          "data-testid": "workflows-multiselect-button",
+          "aria-pressed": _view.selectionMode ? "true" : "false",
+          text: _view.selectionMode ? "Exit selection" : "Multiselect",
+          onclick: () => {
+            _view.selectionMode = !_view.selectionMode;
+            if (!_view.selectionMode) _view.selectedWorkflowIds.clear();
+            render();
+          },
+        }),
+        el("button", {
+          type: "button", class: "comfymodal-secondary-btn",
           "data-testid": "workflows-import-manifest-button",
           text: "Import workflow manifest",
           onclick: () => openImportManifestDialog(),
         }),
         el("button", {
-          class: "comfymodal-secondary-btn",
-          "data-testid": "workflows-import-button",
-          text: "Import",
-          onclick: () => openImportDialog("graph"),
-        }),
-        el("button", {
+          type: "button",
           class: "comfymodal-primary-btn",
           "data-testid": "workflows-new-button",
           text: "New Workflow",
           style: "width:auto;padding:6px 14px;",
-          onclick: () => openImportDialog("manual"),
+          // Direct action, not a menu trigger: this opens the same import
+          // dialog the former "Import" entry opened. That dialog already
+          // carries every creation path (current graph, new empty workflow,
+          // file/link), so no submenu is needed.
+          onclick: () => openImportDialog("graph"),
         }),
       ]),
     ]));
+
 
     const searchInput = el("input", {
       type: "search",
@@ -936,11 +1314,17 @@ export function renderWorkflows(state, context) {
     });
 
     viewEl.appendChild(el("div", { class: "comfymodal-studio-workflows-toolbar" }, [searchInput, tagSelect, favToggle]));
+    const bulkActions = renderBulkActions();
+    if (bulkActions) viewEl.appendChild(bulkActions);
 
+    if (_view.data.notice) viewEl.appendChild(renderNotice());
     if (_view.filters.usageModel) viewEl.appendChild(renderUsageFocusNotice());
 
     const sidebar = el("div", { class: "comfymodal-studio-workflows-sidebar" }, [
-      el("div", { class: "comfymodal-studio-workflows-sidebar-label", text: "Folders" }),
+      el("div", { class: "comfymodal-studio-workflows-sidebar-heading" }, [
+        el("div", { class: "comfymodal-studio-workflows-sidebar-label", text: "Folders" }),
+        el("button", { type: "button", class: "comfymodal-studio-workflows-new-folder", "data-testid": "workflows-new-folder", "aria-label": "New folder", text: "+ New folder", onclick: (e) => { e.stopPropagation(); openFolderCreateDialog(); } }),
+      ]),
       renderFolderTree(),
     ]);
 
@@ -967,6 +1351,9 @@ export function renderWorkflows(state, context) {
     if (_view.importMode) viewEl.appendChild(renderImportDialog());
     if (_view.picker.open) viewEl.appendChild(renderPickerDialog());
     if (_view.importManifest.open) viewEl.appendChild(renderImportManifestDialog());
+    if (_view.folderMove.open) viewEl.appendChild(renderFolderMoveDialog());
+    if (_view.folderCreate.open) viewEl.appendChild(renderFolderCreateDialog());
+    if (_view.deleteConfirm.open) viewEl.appendChild(renderDeleteConfirmation());
     return viewEl;
   }
 
@@ -1070,6 +1457,15 @@ export function renderWorkflows(state, context) {
         } else if (_view.importManifest.open) {
           e.stopPropagation();
           closeImportManifestDialog();
+        } else if (_view.folderMove.open) {
+          e.stopPropagation();
+          closeFolderMoveDialog();
+        } else if (_view.folderCreate.open) {
+          e.stopPropagation();
+          closeFolderCreateDialog();
+        } else if (_view.deleteConfirm.open) {
+          e.stopPropagation();
+          closeDeleteConfirmation();
         }
       };
       document.addEventListener("keydown", _importEscHandler, true);
@@ -1077,7 +1473,7 @@ export function renderWorkflows(state, context) {
   }
 
   function _maybeRemoveDialogEscHandler() {
-    if (_importEscHandler && !_view.importMode && !_view.importManifest.open && !_view.picker.open) {
+    if (_importEscHandler && !_view.importMode && !_view.importManifest.open && !_view.picker.open && !_view.folderMove.open && !_view.folderCreate.open && !_view.deleteConfirm.open) {
       document.removeEventListener("keydown", _importEscHandler, true);
       _importEscHandler = null;
     }
@@ -1096,7 +1492,69 @@ export function renderWorkflows(state, context) {
 
     dialog.appendChild(el("h3", { class: "comfymodal-studio-dialog-title", text: "Import / New Workflow" }));
 
-    // Section 1: import from the current graph
+    // Section 1: file / link import (leaf 1.2.1). A JSON file is parsed as
+    // graph content; a link is recorded as the source URL. This leads the
+    // dialog because it is the only path that brings in work authored
+    // elsewhere, and the entry most users reach for first.
+    const fileStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
+    const fileName = el("span", {
+      class: "comfymodal-studio-wf-file-name",
+      "data-testid": "import-file-name",
+      text: "No file chosen",
+    });
+    const fileInput = el("input", {
+      type: "file",
+      class: "comfymodal-studio-wf-file-input",
+      "data-testid": "import-file-input",
+      accept: ".json,application/json",
+      "aria-label": "Workflow JSON file",
+      onchange: (e) => {
+        const file = e.currentTarget.files && e.currentTarget.files[0];
+        if (!file) return;
+        fileName.textContent = file.name;
+        fileName.classList.add("is-chosen");
+        handleFileImport(file, fileStatus);
+      },
+    });
+    // The native input stays in the DOM (and keeps its testid) so the browser
+    // picker, automation, and the change handler all keep working; the button
+    // is only the visible affordance that opens it.
+    const browseBtn = el("button", {
+      type: "button",
+      class: "comfymodal-secondary-btn comfymodal-studio-wf-file-browse",
+      "data-testid": "import-file-browse",
+      text: "Choose file\u2026",
+      onclick: () => fileInput.click(),
+    });
+    const linkInput = el("input", {
+      type: "url",
+      class: "comfymodal-studio-wf-input",
+      "data-testid": "import-link-input",
+      placeholder: "https://\u2026",
+      "aria-label": "Workflow link",
+    });
+    const linkStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
+    const linkBtn = el("button", {
+      class: "comfymodal-secondary-btn",
+      "data-testid": "import-link-confirm",
+      text: "Import link",
+      onclick: async () => {
+        linkBtn.disabled = true;
+        try { await handleLinkImport(linkInput, linkStatus); }
+        finally { linkBtn.disabled = false; }
+      },
+    });
+    dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-section" }, [
+      el("h4", { class: "comfymodal-studio-dialog-section-title", text: "Import from file or link" }),
+      el("p", { class: "comfymodal-studio-dialog-note", text: "Load a workflow JSON file exported from ComfyUI, or record a link as the workflow source." }),
+      el("div", { class: "comfymodal-studio-wf-file-row" }, [browseBtn, fileName, fileInput]),
+      fileStatus,
+      linkInput,
+      linkStatus,
+      el("div", { class: "comfymodal-studio-dialog-actions" }, [linkBtn]),
+    ]));
+
+    // Section 2: import from the current graph
     const graphNameInput = el("input", {
       type: "text",
       class: "comfymodal-studio-wf-input",
@@ -1122,7 +1580,7 @@ export function renderWorkflows(state, context) {
       el("div", { class: "comfymodal-studio-dialog-actions" }, [importBtn]),
     ]));
 
-    // Section 2: manual empty workflow
+    // Section 3: manual empty workflow
     const manualName = el("input", { type: "text", class: "comfymodal-studio-wf-input", placeholder: "Workflow name" });
     const manualFolder = el("input", { type: "text", class: "comfymodal-studio-wf-input", placeholder: "Folder (optional)" });
     const manualDesc = el("textarea", { class: "comfymodal-studio-textarea", rows: 2, placeholder: "Description (optional)" });
@@ -1144,47 +1602,6 @@ export function renderWorkflows(state, context) {
       manualDesc,
       manualStatus,
       el("div", { class: "comfymodal-studio-dialog-actions" }, [createBtn]),
-    ]));
-
-    // Section 3: minimal file / link import entry (leaf 1.2.1). A JSON file
-    // is parsed as graph content; a link is recorded as the source URL.
-    const fileStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
-    const fileInput = el("input", {
-      type: "file",
-      class: "comfymodal-studio-wf-input",
-      "data-testid": "import-file-input",
-      accept: ".json,application/json",
-      "aria-label": "Workflow JSON file",
-      onchange: (e) => {
-        const file = e.currentTarget.files && e.currentTarget.files[0];
-        if (file) handleFileImport(file, fileStatus);
-      },
-    });
-    const linkInput = el("input", {
-      type: "url",
-      class: "comfymodal-studio-wf-input",
-      "data-testid": "import-link-input",
-      placeholder: "https://…",
-      "aria-label": "Workflow link",
-    });
-    const linkStatus = el("div", { class: "comfymodal-studio-dialog-status", style: "display:none;" });
-    const linkBtn = el("button", {
-      class: "comfymodal-secondary-btn",
-      "data-testid": "import-link-confirm",
-      text: "Import link",
-      onclick: async () => {
-        linkBtn.disabled = true;
-        try { await handleLinkImport(linkInput, linkStatus); }
-        finally { linkBtn.disabled = false; }
-      },
-    });
-    dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-section" }, [
-      el("h4", { class: "comfymodal-studio-dialog-section-title", text: "Import from file or link" }),
-      fileInput,
-      fileStatus,
-      linkInput,
-      linkStatus,
-      el("div", { class: "comfymodal-studio-dialog-actions" }, [linkBtn]),
     ]));
 
     dialog.appendChild(el("div", { class: "comfymodal-studio-dialog-actions" }, [
@@ -1341,8 +1758,6 @@ export function renderWorkflows(state, context) {
       committing: false,
       commitError: "",
       result: null,
-      importPresets: false,
-      applyDefaultPreset: false,
     };
     _ensureDialogEscHandler();
     render();
@@ -1590,47 +2005,12 @@ export function renderWorkflows(state, context) {
       if (wc.workflow) bits.push("Workflow");
       if (wc.version) bits.push("Version #1");
       if (wc.mapping) bits.push("Mapping");
-      bits.push(String(wc.preset_count || 0) + " preset" + ((wc.preset_count || 0) === 1 ? "" : "s"));
       wrap.appendChild(el("p", {
         class: "comfymodal-studio-dialog-note",
         "data-testid": "import-manifest-will-create",
         text: "Creates: " + bits.join(" \u00b7 "),
       }));
     }
-
-    // Explicit preset policy choices — no silent defaults.
-    const presetCount = wc ? Number(wc.preset_count || 0) : 0;
-    const hasCandidate = preview.has_default_preset_candidate === true;
-    const presetsCb = el("input", {
-      type: "checkbox",
-      class: "comfymodal-studio-wf-checkbox",
-      "data-testid": "import-manifest-presets",
-      disabled: presetCount === 0,
-      onchange: (e) => {
-        st.importPresets = !!e.currentTarget.checked;
-        if (!st.importPresets) st.applyDefaultPreset = false;
-        render();
-      },
-    });
-    presetsCb.checked = st.importPresets;
-    const defaultCb = el("input", {
-      type: "checkbox",
-      class: "comfymodal-studio-wf-checkbox",
-      "data-testid": "import-manifest-apply-default",
-      disabled: !(st.importPresets && presetCount > 0 && hasCandidate),
-      onchange: (e) => { st.applyDefaultPreset = !!e.currentTarget.checked; },
-    });
-    defaultCb.checked = st.applyDefaultPreset;
-    wrap.appendChild(el("div", { style: "display:flex;flex-direction:column;gap:6px;margin:10px 0;" }, [
-      el("label", { style: "display:flex;align-items:center;gap:6px;" }, [
-        presetsCb,
-        el("span", { text: "Import workflow presets" + (presetCount ? " (" + presetCount + ")" : " (none in manifest)") }),
-      ]),
-      el("label", { style: "display:flex;align-items:center;gap:6px;" }, [
-        defaultCb,
-        el("span", { text: "Apply imported default preset" + (hasCandidate ? "" : " (no imported default candidate)") }),
-      ]),
-    ]));
 
     // Commit — absent entirely while invalid; mandatory dry-run means there is
     // no path from file selection straight to commit.
@@ -1666,8 +2046,6 @@ export function renderWorkflows(state, context) {
     render();
     const resp = await importWorkflowManifest(apiBase, st.manifestObject || {}, {
       dryRun: false,
-      importPresets: st.importPresets,
-      applyDefaultPreset: st.applyDefaultPreset,
     });
     if (stale()) return;
     st.committing = false;
@@ -1694,7 +2072,6 @@ export function renderWorkflows(state, context) {
     if (result.workflow_name) bits.push("Workflow \"" + result.workflow_name + "\"");
     if (result.workflow_version_id) bits.push("Version #1");
     if (result.mapping_id) bits.push("Mapping");
-    bits.push(((result.preset_ids || []).length) + " preset" + ((result.preset_ids || []).length === 1 ? "" : "s"));
     wrap.appendChild(el("p", {
       class: "comfymodal-studio-dialog-note",
       "data-testid": "import-manifest-created",
@@ -1751,13 +2128,13 @@ export function renderWorkflows(state, context) {
       _view.data.loadError = "Could not load this workflow.";
     }
     _view.data.versions = Array.isArray(versions) ? versions : [];
-    const valid = _view.data.versions.find((v) => v.workflow_version_id === _view.selectedVersionId);
-    if (!valid) {
-      const latest = _view.data.versions.find((v) => v.workflow_version_id === (workflow && workflow.latest_version_id))
-        || _view.data.versions[_view.data.versions.length - 1]
-        || null;
-      _view.selectedVersionId = latest ? latest.workflow_version_id : "";
-    }
+    // A workflow has one version: the latest. Resolve to it unconditionally
+    // rather than honouring a previously selected id, so no stale selection
+    // can survive a recapture that replaced the latest version.
+    const latest = _view.data.versions.find((v) => v.workflow_version_id === (workflow && workflow.latest_version_id))
+      || _view.data.versions[_view.data.versions.length - 1]
+      || null;
+    _view.selectedVersionId = latest ? latest.workflow_version_id : "";
     render();
     if (_view.selectedVersionId) await loadVersionData();
   }
@@ -1765,9 +2142,8 @@ export function renderWorkflows(state, context) {
   async function loadVersionData() {
     const verId = _view.selectedVersionId;
     if (!verId) return;
-    const [verResp, preResp, mapResp, depResp] = await Promise.all([
+    const [verResp, mapResp, depResp] = await Promise.all([
       getWorkflowVersion(apiBase, verId),
-      listVersionPresets(apiBase, verId),
       getMapping(apiBase, verId),
       getVersionDependencies(apiBase, verId),
     ]);
@@ -1786,8 +2162,6 @@ export function renderWorkflows(state, context) {
         if (vi !== -1) _view.data.versions[vi] = Object.assign({}, _view.data.versions[vi], version);
       }
     }
-    const presets = _unwrap(preResp, "presets");
-    _view.data.presets = Array.isArray(presets) ? presets : [];
     const mapData = _unwrap(mapResp, "mapping");
     _view.data.mapping = mapData && mapData.mapping_id ? mapData : null;
     if (_view.data.mapping) _view.data.mappingVersionId = verId;
@@ -1800,23 +2174,11 @@ export function renderWorkflows(state, context) {
   }
 
   function selectVersion(versionId) {
+    // A workflow has one version, so there is nothing to select. Kept as an
+    // explicit no-op rather than deleted so any remaining caller resolves
+    // visibly to "already on the latest" instead of silently doing nothing.
     if (_view.selectedVersionId === versionId) return;
-    _view.selectedVersionId = versionId;
-    _view.editorMode = "";
-    _view.activePresetId = "";
-    _view.detailEditing = false;
-    _view.revisionConfirm = false;
-    _view.data.editPreset = null;
-    _view.data.copyResults = null;
-    _view.data.presetIncomplete = null;
-    _view.data.version = null;
-    _view.data.presets = [];
-    _view.data.mapping = null;
-    _view.data.dependencies = null;
-    _resetManagerContext();
-    _resetPortabilityState();
-    render();
-    loadVersionData();
+    void versionId;
   }
 
   async function captureNewVersion() {
@@ -1879,7 +2241,6 @@ export function renderWorkflows(state, context) {
     const wrap = el("div", { class: "comfymodal-studio-workflow-detail", "data-testid": "workflow-detail" });
     const wf = _view.data.workflow;
     const version = _view.data.version;
-    const presets = _view.data.presets || [];
     const mapping = _view.data.mapping;
 
     wrap.appendChild(el("div", { class: "comfymodal-studio-detail-top" }, [
@@ -1905,13 +2266,11 @@ export function renderWorkflows(state, context) {
 
     if (_view.data.notice) wrap.appendChild(renderNotice());
     wrap.appendChild(renderDetailHeader(wf));
-    wrap.appendChild(renderRunBar(version, presets, mapping));
+    wrap.appendChild(renderRunBar(version, mapping));
     wrap.appendChild(renderVersionsSection(wf));
     if (version) wrap.appendChild(renderDependenciesSection(version));
     if (version) wrap.appendChild(renderPortabilitySection(version));
     wrap.appendChild(renderMappingSection(wf, version));
-    wrap.appendChild(renderPresetsSection(wf, version, presets));
-    if (_view.data.copyResults) wrap.appendChild(renderCopyResults());
     return wrap;
   }
 
@@ -2076,7 +2435,7 @@ export function renderWorkflows(state, context) {
     return form;
   }
 
-  function renderRunBar(version, presets, mapping) {
+  function renderRunBar(version, mapping) {
     const bar = el("div", { class: "comfymodal-studio-run-bar" });
     const info = el("div", { class: "comfymodal-studio-run-bar-info" });
     let enabled = false;
@@ -2089,19 +2448,18 @@ export function renderWorkflows(state, context) {
       }));
     } else {
       const runnable = !!(version.state && version.state.runnable === true);
-      const hasPresets = (presets || []).length > 0;
       const hasMapping = !!mapping;
       if (!runnable) {
         (version.state && Array.isArray(version.state.reasons) ? version.state.reasons : [])
           .forEach((r) => reasons.push(_reasonText(r)));
       }
-      if (runnable && !hasPresets && !hasMapping) {
-        reasons.push("No preset or mapping on this version. Set up a mapping and create a preset to run it.");
+      if (runnable && !hasMapping) {
+        reasons.push("This workflow has no mapping yet. Set one up to run it.");
       }
-      enabled = runnable && (hasPresets || hasMapping);
+      enabled = runnable && hasMapping;
       info.appendChild(el("span", {
         class: "comfymodal-studio-run-bar-version",
-        text: "Version " + (version.version_number != null ? version.version_number : ""),
+        text: version.name || "Current version",
       }));
       if (enabled) {
         info.appendChild(el("span", { class: "comfymodal-studio-run-bar-hint", text: "Opens the Playground with this version's controls." }));
@@ -2115,18 +2473,11 @@ export function renderWorkflows(state, context) {
       text: "Run",
       disabled: !enabled,
       onclick: () => {
-        // Hand off the selected workflow/version/preset to the Playground.
-        // The preset is the version's default when determinable, else ""
-        // (the Playground picks the version's default preset itself).
-        const handoffPresetId =
-          (version && version.default_preset_id)
-          || ((presets || []).find((p) => p.is_default) || {}).preset_id
-          || "";
+        // Hand off the selected workflow/version to the Playground.
         import("./studio-workflow-run.js").then((wf) => {
           wf.saveWorkflowHandoff({
             workflowId: version && version.workflow_id,
             workflowVersionId: version && version.workflow_version_id,
-            presetId: handoffPresetId,
           });
           setPage("playground");
         }).catch(() => {
@@ -2139,11 +2490,30 @@ export function renderWorkflows(state, context) {
     return bar;
   }
 
+  /**
+   * Re-render the page without losing the reader's place.
+   *
+   * The workflows page renders as one tree, so any state change rebuilds every
+   * node and drops the scroll offset. A toggle deep in the Dependencies list
+   * must not teleport the reader back to the top, so hold the offset across
+   * the rebuild. Only the offset is restored: the caller still decides what to
+   * re-render, so a genuine navigation is unaffected.
+   */
+  function renderKeepingScroll() {
+    const win = typeof window !== "undefined" ? window : null;
+    const top = win ? win.scrollY : 0;
+    render();
+    if (win && top) win.scrollTo(0, top);
+  }
+
   function renderVersionsSection(wf) {
     const versions = _view.data.versions || [];
     const section = el("div", { class: "comfymodal-studio-section" });
+    // A workflow has one version, so there is nothing to choose between. The
+    // current version is still shown (number, state, reasons) so an incomplete
+    // capture is as diagnosable as it was when it was one row in a list.
     section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
-      el("h3", { class: "comfymodal-studio-section-title", text: "Versions (" + versions.length + ")" }),
+      el("h3", { class: "comfymodal-studio-section-title", text: "Version" }),
       el("button", {
         class: "comfymodal-secondary-btn",
         "data-testid": "version-capture-button",
@@ -2157,29 +2527,26 @@ export function renderWorkflows(state, context) {
     if (versions.length === 0) {
       list.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No versions yet. Capture the current ComfyUI graph to create the first version." }));
     } else {
-      versions.slice().sort((a, b) => (a.version_number || 0) - (b.version_number || 0)).forEach((v) => {
-        list.appendChild(renderVersionItem(v));
-      });
+      const latest = versions.find((v) => v.workflow_version_id === _view.selectedVersionId)
+        || versions[versions.length - 1];
+      list.appendChild(renderVersionItem(latest, true));
     }
     section.appendChild(list);
     return section;
   }
 
-  function renderVersionItem(v) {
-    const active = v.workflow_version_id === _view.selectedVersionId;
+  function renderVersionItem(v, single) {
+    const active = single === true || v.workflow_version_id === _view.selectedVersionId;
     const state = v.state || null;
     const incomplete = state && state.status === "incomplete";
     const reasons = incomplete && Array.isArray(state.reasons) ? state.reasons : [];
     const expanded = expandedVersions.has(v.workflow_version_id);
-    const vnum = v.version_number != null ? v.version_number : "?";
 
     const main = el("div", { class: "comfymodal-studio-version-item-main" }, [
-      el("span", { class: "comfymodal-studio-version-number", text: "v" + vnum }),
       _stateBadge(state, "version-item-state"),
       el("span", { class: "comfymodal-studio-version-sub", text: _shortDate(v.created_at) }),
       v.graph_hash ? el("span", { class: "comfymodal-studio-version-sub", text: _shortHash(v.graph_hash) }) : null,
       el("span", { class: "comfymodal-studio-version-sub", text: v.mapping_id ? "Mapped" : "Not mapped" }),
-      el("span", { class: "comfymodal-studio-version-sub", text: (v.preset_count != null ? v.preset_count : 0) + " preset" + (v.preset_count === 1 ? "" : "s") }),
     ]);
     if (incomplete) {
       main.appendChild(el("button", {
@@ -2199,16 +2566,6 @@ export function renderWorkflows(state, context) {
       class: "comfymodal-studio-version-item" + (active ? " active" : ""),
       "data-testid": "version-item",
       "data-version-id": v.workflow_version_id,
-      role: "button",
-      tabindex: "0",
-      "aria-label": "Select version " + vnum,
-      onclick: () => selectVersion(v.workflow_version_id),
-      onkeydown: (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          selectVersion(v.workflow_version_id);
-        }
-      },
     }, [main]);
 
     if (expanded) {
@@ -2217,6 +2574,16 @@ export function renderWorkflows(state, context) {
       ]));
     }
     return item;
+  }
+
+  /** Keys the user explicitly marked unnecessary, so a toggle can replace the
+   *  whole set without needing a second fetch of the stored overrides. */
+  function _nonessentialKeys(deps) {
+    const rows = deps && Array.isArray(deps.models) ? deps.models : [];
+    return rows
+      .filter((m) => m && m.nonessential === true && m.nonessential_source === "user")
+      .map((m) => m.key || m.filename || "")
+      .filter(Boolean);
   }
 
   function renderDependenciesSection(version) {
@@ -2228,6 +2595,15 @@ export function renderWorkflows(state, context) {
     const mgr = _view.data.manager;
     return renderDependencySection(version, _view.data.dependencies, refreshDependencies, {
       apiBase,
+      workflowId: String((version && version.workflow_id) || _view.data.workflowId || ""),
+      nonessentialKeys: _nonessentialKeys(_view.data.dependencies),
+      onNonessentialChanged: (keys) => {
+        _view.data.nonessentialKeys = keys;
+        // Re-reading the report is what makes the row flip, and that rebuilds
+        // the page; hold the scroll offset so the toggle stays where it was
+        // clicked instead of jumping to the top of a long workflow.
+        refreshDependencies({ keepScroll: true });
+      },
       onFindInLibrary: openModelLibraryFiltered,
       onFindInRegistry: openRegistryFiltered,
       managerPacks: mgr.packs,
@@ -2275,14 +2651,16 @@ export function renderWorkflows(state, context) {
     });
   }
 
-  async function refreshDependencies() {
+  async function refreshDependencies(opts) {
+    const keepScroll = !!(opts && opts.keepScroll);
     const verId = _view.selectedVersionId;
     if (!verId) return;
     const resp = await getVersionDependencies(apiBase, verId);
     if (stale()) return;
     _view.data.dependencies = resp && resp.status === "ok" ? resp : null;
     _recordDependencyUsage(_view.data.dependencies);
-    render();
+    if (keepScroll) renderKeepingScroll();
+    else render();
     maybeLoadManagerContext();
   }
 
@@ -2420,7 +2798,7 @@ export function renderWorkflows(state, context) {
     const flow = _view.exportFlow;
     const panel = el("div", { class: "comfymodal-studio-confirm-panel", "data-testid": "portability-export-popover" });
     panel.appendChild(el("p", {
-      text: "Download this version's Studio Workflow Manifest (.workflow.json). Presets are only included when explicitly chosen.",
+      text: "Download this version's Studio Workflow Manifest (.workflow.json).",
       style: "margin:0 0 8px;",
     }));
     if (flow.done) {
@@ -2439,16 +2817,6 @@ export function renderWorkflows(state, context) {
         style: "margin:0 0 8px;color:#f87171;",
       }));
     }
-    const cb = el("input", {
-      type: "checkbox",
-      class: "comfymodal-studio-wf-checkbox",
-      "data-testid": "portability-export-include-presets",
-      onchange: (e) => { flow.includePresets = !!e.currentTarget.checked; },
-    });
-    cb.checked = flow.includePresets;
-    panel.appendChild(el("label", {
-      style: "display:flex;align-items:center;gap:6px;margin-bottom:10px;",
-    }, [cb, el("span", { text: "Include workflow presets" })]));
     panel.appendChild(el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
       el("button", {
         type: "button",
@@ -2491,8 +2859,7 @@ export function renderWorkflows(state, context) {
     flow.error = "";
     flow.done = "";
     render();
-    const includePresets = flow.includePresets;
-    const result = await fetchWorkflowManifestExport(apiBase, verId, includePresets);
+    const result = await fetchWorkflowManifestExport(apiBase, verId);
     if (stale()) return;
     flow.busy = false;
     if (!result.ok) {
@@ -2686,7 +3053,7 @@ export function renderWorkflows(state, context) {
       }));
       if (_view.revisionConfirm) {
         container.appendChild(el("div", { class: "comfymodal-studio-confirm-panel" }, [
-          el("p", { text: "Workflow Versions are immutable. Saving changes creates a NEW version; this version and its presets stay untouched.", style: "margin:0;" }),
+          el("p", { text: "Workflow Versions are immutable. Saving changes creates a NEW version; this version stays untouched.", style: "margin:0;" }),
           el("div", { class: "comfymodal-studio-dialog-actions", style: "justify-content:flex-start;" }, [
             el("button", {
               class: "comfymodal-primary-btn",
@@ -2815,541 +3182,6 @@ export function renderWorkflows(state, context) {
     await loadVersionData();
   }
 
-  // ── Presets section ─────────────────────────────────────────────────────
-
-  function openPresetEditor(preset) {
-    _view.editorMode = "preset";
-    _view.activePresetId = preset ? preset.preset_id : "";
-    _view.data.editPreset = preset || null;
-    _view.data.presetIncomplete = null;
-    render();
-    ensurePresetEditorData();
-  }
-
-  function renderPresetsSection(wf, version, presets) {
-    const section = el("div", { class: "comfymodal-studio-section" });
-    const latestId = wf.latest_version_id;
-    const hasNewer = !!latestId && !!_view.selectedVersionId && latestId !== _view.selectedVersionId;
-    const presetIds = (presets || []).map((p) => p.preset_id).filter(Boolean);
-
-    section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
-      el("h3", { class: "comfymodal-studio-section-title", text: "Presets" }),
-      el("div", { class: "comfymodal-studio-workflows-header-actions" }, [
-        hasNewer && presetIds.length ? el("button", {
-          class: "comfymodal-secondary-btn",
-          "data-testid": "preset-bulk-copy-button",
-          text: "Copy all to latest",
-          onclick: bulkCopyToLatest,
-        }) : null,
-        el("button", {
-          class: "comfymodal-primary-btn",
-          text: "New Preset",
-          style: "width:auto;padding:6px 14px;",
-          onclick: () => openPresetEditor(null),
-        }),
-      ]),
-    ]));
-
-    const list = el("div", { class: "comfymodal-studio-preset-list", "data-testid": "preset-list" });
-    if (presets.length === 0) {
-      list.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No presets for this version yet. Create one to store control values." }));
-    } else {
-      presets.forEach((p) => list.appendChild(renderPresetCard(wf, p, hasNewer, latestId)));
-    }
-    section.appendChild(list);
-
-    if (_view.editorMode === "preset") {
-      section.appendChild(renderPresetEditor(wf, version, presets));
-    }
-    return section;
-  }
-
-  function renderPresetCard(wf, p, hasNewer, latestId) {
-    const state = p.state || null;
-    const reasons = (state && Array.isArray(state.reasons)) ? state.reasons : [];
-    const card = el("div", {
-      class: "comfymodal-studio-wf-preset-card" + (p.is_default ? " is-default" : ""),
-      "data-testid": "preset-card",
-      "data-preset-id": p.preset_id,
-    }, [
-      el("div", { class: "comfymodal-studio-wf-preset-card-top" }, [
-        el("span", { class: "comfymodal-studio-wf-preset-card-name", "data-testid": "preset-card-name", text: p.name || "Unnamed preset" }),
-        p.is_default ? el("span", { class: "comfymodal-studio-wf-chip default cm-chip", "data-tone": "running", text: "Default" }) : null,
-        _stateBadge(state, "preset-card-state"),
-      ]),
-      p.description ? el("p", { class: "comfymodal-studio-wf-preset-card-desc", text: p.description }) : null,
-      reasons.length ? _reasonList(reasons) : null,
-      (p.tags && p.tags.length)
-        ? el("div", { class: "comfymodal-studio-workflows-tags" }, p.tags.map((t) => _chip(String(t))))
-        : null,
-      el("div", { class: "comfymodal-studio-wf-preset-card-actions" }, [
-        el("button", {
-          class: "comfymodal-secondary-btn",
-          "data-testid": "preset-default-button",
-          text: p.is_default ? "Clear default" : "Set as default",
-          onclick: () => toggleDefaultPreset(p),
-        }),
-        el("button", { class: "comfymodal-secondary-btn", "data-testid": "preset-duplicate-button", text: "Duplicate", onclick: () => duplicatePresetAction(p) }),
-        el("button", { class: "comfymodal-secondary-btn", "data-testid": "preset-edit-button", text: "Edit", onclick: () => openPresetEditor(p) }),
-        hasNewer && latestId ? el("button", {
-          class: "comfymodal-secondary-btn",
-          "data-testid": "preset-copy-button",
-          text: "Copy to latest",
-          onclick: () => copyPresetToLatest(p, latestId),
-        }) : null,
-        el("button", {
-          class: "comfymodal-destructive-btn",
-          text: "Delete",
-          style: "font-size:10px;padding:4px 10px;",
-          onclick: () => deletePresetAction(p),
-        }),
-      ]),
-    ]);
-    return card;
-  }
-
-  async function toggleDefaultPreset(p) {
-    const wf = _view.data.workflow;
-    if (!wf) return;
-    const result = p.is_default
-      ? await clearWorkflowDefaultPreset(apiBase, wf.workflow_id)
-      : await setWorkflowDefaultPreset(apiBase, wf.workflow_id, p.preset_id);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not update default preset: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    await loadVersionData();
-    render();
-  }
-
-  async function duplicatePresetAction(p) {
-    const result = await duplicateWorkflowPreset(apiBase, p.preset_id);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not duplicate preset: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    _view.data.notice = { text: "Preset duplicated", error: false };
-    await loadVersionData();
-    render();
-  }
-
-  async function deletePresetAction(p) {
-    const result = await deleteWorkflowPreset(apiBase, p.preset_id);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not delete preset: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    _view.data.notice = { text: "Preset deleted", error: false };
-    await loadVersionData();
-    render();
-  }
-
-  async function copyPresetToLatest(p, latestId) {
-    const result = await copyPresetToVersion(apiBase, p.preset_id, latestId);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not copy preset: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    _view.data.copyResults = [result];
-    render();
-  }
-
-  async function bulkCopyToLatest() {
-    const wf = _view.data.workflow;
-    if (!wf || !wf.latest_version_id) return;
-    const presetIds = (_view.data.presets || []).map((p) => p.preset_id).filter(Boolean);
-    if (!presetIds.length) return;
-    const result = await bulkCopyPresetsToVersion(apiBase, _view.selectedVersionId, presetIds);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not copy presets: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    let results = (result && (result.results || result.copy_results || result.items)) || [];
-    if (!results.length && result && result.preset) results = [result];
-    _view.data.copyResults = results.length ? results : null;
-    render();
-  }
-
-  function renderCopyResults() {
-    const results = _view.data.copyResults || [];
-    const section = el("div", { class: "comfymodal-studio-section copy-results-section" });
-    section.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
-      el("h3", { class: "comfymodal-studio-section-title", text: "Copy results" }),
-      el("button", { class: "comfymodal-secondary-btn", text: "Dismiss", onclick: () => { _view.data.copyResults = null; render(); } }),
-    ]));
-    section.appendChild(el("div", { class: "comfymodal-studio-copy-results", "data-testid": "copy-results" },
-      results.map((r) => renderCopyResultItem(r))));
-    return section;
-  }
-
-  function renderCopyResultItem(r) {
-    const state = r.state || {};
-    const runnable = state.runnable === true;
-    const reasons = (state.reasons || []).map(_reasonText);
-    const dropped = (r.dropped_controls || [])
-      .map(_reasonText)
-      .filter((x) => reasons.indexOf(x) === -1);
-    const name = (r.preset && r.preset.name) || "Preset";
-    const item = el("div", {
-      class: "comfymodal-studio-copy-result-item " + (runnable ? "ok" : "warn"),
-      "data-testid": "copy-result-item",
-    }, [
-      el("div", { class: "comfymodal-studio-copy-result-name", text: runnable ? name + " \u2014 Copied" : name + " \u2014 Copied but incomplete" }),
-    ]);
-    if (!runnable && reasons.length) item.appendChild(_reasonList(reasons));
-    if (dropped.length) {
-      item.appendChild(el("ul", { class: "comfymodal-studio-reason-list dropped" },
-        dropped.map((x) => el("li", { text: "Dropped mapped control: " + x }))));
-    }
-    return item;
-  }
-
-  // ── Preset editor ───────────────────────────────────────────────────────
-
-  async function ensurePresetEditorData() {
-    const verId = _view.selectedVersionId;
-    if (!verId) return;
-    let changed = false;
-    if (_view.data.mappingVersionId !== verId) {
-      const mapResp = await getMapping(apiBase, verId);
-      if (stale()) return;
-      const mapData = _unwrap(mapResp, "mapping");
-      _view.data.mapping = mapData && mapData.mapping_id ? mapData : null;
-      _view.data.mappingVersionId = verId;
-      changed = true;
-    }
-    if (_view.activePresetId && (!_view.data.editPreset || _view.data.editPreset.preset_id !== _view.activePresetId)) {
-      const pResp = await getWorkflowPreset(apiBase, _view.activePresetId);
-      if (stale()) return;
-      const preset = _unwrap(pResp, "preset");
-      _view.data.editPreset = preset && preset.preset_id ? preset : null;
-      changed = true;
-    }
-    // Render ONLY when data actually changed. render() re-invokes this helper
-    // on every pass while editorMode === "preset", so an unconditional
-    // render() here is unbounded mutual recursion (stack overflow) and the
-    // preset editor never settles in the DOM.
-    if (changed) render();
-  }
-
-  // Lazily fetch the model library once per editor session for the preset
-  // "Model choices" pickers. On failure the editor falls back to text inputs.
-  async function ensureModelsCache() {
-    if (_view.modelsCacheState === "loading") return;
-    _view.modelsCacheState = "loading";
-    const resp = await listModels(apiBase, {});
-    if (stale()) return;
-    if (resp && resp.status === "ok" && Array.isArray(resp.models)) {
-      _view.modelsCache = resp.models;
-      _view.modelsCacheState = "loaded";
-    } else {
-      _view.modelsCache = null;
-      _view.modelsCacheState = "failed";
-    }
-    render();
-  }
-
-  function renderPresetEditor(wf, version, presets) {
-    const container = el("div", { class: "comfymodal-studio-section preset-editor-section", "data-testid": "preset-editor" });
-    const editPreset = _view.data.editPreset;
-    const isEdit = !!editPreset;
-    const mapping = _view.data.mapping;
-    presetEntries = (mapping && Array.isArray(mapping.entries)) ? mapping.entries : [];
-    presetRefs = { values: {}, rec: {}, models: {}, exposed: {}, loraRows: [] };
-
-    container.appendChild(el("div", { class: "comfymodal-studio-section-head" }, [
-      el("h3", { class: "comfymodal-studio-section-title", text: isEdit ? "Edit Preset" : "New Preset" }),
-      el("button", {
-        class: "comfymodal-secondary-btn",
-        text: "Close",
-        onclick: () => {
-          _view.editorMode = "";
-          _view.activePresetId = "";
-          _view.data.editPreset = null;
-          _view.data.presetIncomplete = null;
-          render();
-        },
-      }),
-    ]));
-
-    // Incomplete state from the last save — shown instead of claiming success.
-    if (_view.data.presetIncomplete) {
-      container.appendChild(el("div", { class: "comfymodal-studio-confirm-panel incomplete", "data-testid": "preset-state-reasons" }, [
-        el("p", { text: "Preset was saved but is incomplete:", style: "margin:0;" }),
-        el("ul", { class: "comfymodal-studio-reason-list" },
-          _view.data.presetIncomplete.reasons.map((r) => el("li", { text: _reasonText(r) }))),
-      ]));
-    }
-
-    if (presetEntries.length === 0) {
-      container.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "This version has no mapping yet. Set up a mapping first so preset controls can be defined." }));
-    }
-
-    const editor = el("div", { class: "comfymodal-studio-preset-editor" });
-
-    // Basic fields
-    const nameIn = el("input", { type: "text", class: "comfymodal-studio-wf-input", "data-testid": "preset-name-input", value: (editPreset && editPreset.name) || "" });
-    presetRefs.name = nameIn;
-    const descIn = el("textarea", { class: "comfymodal-studio-textarea", rows: 2, value: (editPreset && editPreset.description) || "" });
-    presetRefs.description = descIn;
-    const tagsIn = el("input", { type: "text", class: "comfymodal-studio-wf-input", value: ((editPreset && editPreset.tags) || []).join(", ") });
-    presetRefs.tags = tagsIn;
-    const favIn = el("input", { type: "checkbox", class: "comfymodal-studio-wf-checkbox" });
-    favIn.checked = !!(editPreset && editPreset.favorite);
-    presetRefs.favorite = favIn;
-
-    editor.appendChild(_editorBlock("Details", el("div", { class: "comfymodal-studio-editor-grid" }, [
-      _field("Name", nameIn),
-      _field("Description", descIn),
-      _field("Tags (comma separated)", tagsIn),
-      el("div", { class: "comfymodal-studio-backend-field" }, [el("label", { text: "Favorite" }), favIn]),
-    ])));
-
-    // Values from mapping entries
-    if (presetEntries.length) {
-      const pv = (editPreset && editPreset.values) || {};
-      const grid = el("div", { class: "comfymodal-studio-editor-grid" });
-      presetEntries.forEach((entry) => {
-        const role = entry.semantic_role || entry.input_name;
-        const value = pv[role] !== undefined
-          ? pv[role]
-          : (entry.value !== undefined ? entry.value : (entry.default !== undefined ? entry.default : undefined));
-        const ctrl = _makeControl(entry, value);
-        presetRefs.values[role] = ctrl;
-        const wrap = el("div", { class: "comfymodal-studio-backend-field" }, [
-          el("label", { text: _roleName(entry) + (entry.required ? " *" : "") }),
-          ctrl,
-        ]);
-        const hint = _numHint(entry);
-        if (hint) wrap.appendChild(el("span", { class: "comfymodal-studio-role-hint", text: hint }));
-        grid.appendChild(wrap);
-      });
-      editor.appendChild(_editorBlock("Values", grid));
-    }
-
-    // Model choices — library dropdowns for model-kind roles. Model-ness
-    // lives in control_kind ("file"), mirroring the playground shelf
-    // convention; the mapping "kind" vocabulary only ever carries the
-    // binding mechanism (widget/node_input/node_output/node), so filtering
-    // on kind would never match. Falls back to plain text inputs when the
-    // model library cannot be fetched.
-    const modelEntries = presetEntries.filter((e) => e.control_kind === "file");
-    if (modelEntries.length) {
-      const mc = (editPreset && editPreset.model_choices) || {};
-      const compatibleModels = (version && Array.isArray(version.compatible_models))
-        ? version.compatible_models
-        : [];
-      const grid = el("div", { class: "comfymodal-studio-editor-grid" });
-      modelEntries.forEach((entry) => {
-        const role = entry.semantic_role || entry.input_name;
-        const currentValue = mc[role] !== undefined ? String(mc[role]) : "";
-        let ctrl;
-        if (_view.modelsCacheState === "failed") {
-          ctrl = el("input", { type: "text", class: "comfymodal-studio-wf-input", value: currentValue });
-        } else {
-          ctrl = renderModelPicker({
-            compatibleModels,
-            currentValue,
-            models: _view.modelsCache || [],
-            onSelect: () => { /* selection is read from select.value */ },
-          });
-        }
-        presetRefs.models[role] = ctrl;
-        grid.appendChild(_field("Model \u00b7 " + _roleName(entry), ctrl));
-      });
-      editor.appendChild(_editorBlock("Model choices", grid));
-      if (_view.modelsCacheState !== "loaded" && _view.modelsCacheState !== "failed") {
-        ensureModelsCache();
-      }
-    }
-
-    // LoRA values — free-form key/value rows
-    const loraBlock = el("div", { class: "comfymodal-studio-editor-block" });
-    loraBlock.appendChild(el("h4", { class: "comfymodal-studio-editor-block-title", text: "LoRA values" }));
-    const loraRowsWrap = el("div", { class: "comfymodal-studio-lora-rows" });
-    const lv = (editPreset && editPreset.lora_values) || {};
-    const loraPairs = Object.keys(lv).map((k) => ({ name: k, weight: lv[k] }));
-    if (!loraPairs.length) loraPairs.push({ name: "", weight: "" });
-    loraPairs.forEach((pair) => loraRowsWrap.appendChild(_loraRow(pair)));
-    loraBlock.appendChild(loraRowsWrap);
-    loraBlock.appendChild(el("button", {
-      class: "comfymodal-secondary-btn",
-      text: "Add LoRA",
-      style: "align-self:flex-start;",
-      onclick: () => { loraRowsWrap.appendChild(_loraRow({ name: "", weight: "" })); },
-    }));
-    editor.appendChild(loraBlock);
-
-    // Recommended values — editable per entry
-    if (presetEntries.length) {
-      const rec = (editPreset && editPreset.recommended_values) || {};
-      const grid = el("div", { class: "comfymodal-studio-editor-grid" });
-      presetEntries.forEach((entry) => {
-        const role = entry.semantic_role || entry.input_name;
-        const value = rec[role] !== undefined ? rec[role] : (entry.value !== undefined ? entry.value : undefined);
-        const ctrl = _makeControl(entry, value);
-        presetRefs.rec[role] = ctrl;
-        grid.appendChild(_field("Recommended \u00b7 " + _roleName(entry), ctrl));
-      });
-      editor.appendChild(_editorBlock("Recommended values", grid));
-    }
-
-    // Exposed controls — checkboxes per role
-    if (presetEntries.length) {
-      const exp = (editPreset && editPreset.exposed_controls) || [];
-      const grid = el("div", { class: "comfymodal-studio-editor-grid" });
-      presetEntries.forEach((entry) => {
-        const role = entry.semantic_role || entry.input_name;
-        const cb = el("input", { type: "checkbox", class: "comfymodal-studio-wf-checkbox" });
-        cb.checked = exp.indexOf(role) !== -1;
-        presetRefs.exposed[role] = cb;
-        grid.appendChild(el("div", { class: "comfymodal-studio-backend-field" }, [
-          el("label", { text: _roleName(entry) }),
-          cb,
-        ]));
-      });
-      editor.appendChild(_editorBlock("Exposed controls", grid));
-    }
-
-    editor.appendChild(el("div", { class: "comfymodal-studio-backend-actions" }, [
-      el("button", { class: "comfymodal-primary-btn", "data-testid": "preset-save", text: "Save", style: "width:auto;padding:7px 18px;", onclick: onSavePreset }),
-      el("button", {
-        class: "comfymodal-secondary-btn",
-        text: "Cancel",
-        onclick: () => {
-          _view.editorMode = "";
-          _view.activePresetId = "";
-          _view.data.editPreset = null;
-          _view.data.presetIncomplete = null;
-          render();
-        },
-      }),
-    ]));
-
-    container.appendChild(editor);
-    return container;
-  }
-
-  function _editorBlock(title, content) {
-    return el("div", { class: "comfymodal-studio-editor-block" }, [
-      el("h4", { class: "comfymodal-studio-editor-block-title", text: title }),
-      content,
-    ]);
-  }
-
-  function _loraRow(pair) {
-    const nameIn = el("input", { type: "text", class: "comfymodal-studio-wf-input", placeholder: "LoRA name", value: pair.name || "" });
-    const weightIn = el("input", { type: "text", class: "comfymodal-studio-wf-input", placeholder: "Weight", value: pair.weight != null ? String(pair.weight) : "" });
-    const row = el("div", { class: "comfymodal-studio-lora-row" }, [
-      nameIn,
-      weightIn,
-      el("button", {
-        type: "button",
-        class: "comfymodal-destructive-btn",
-        text: "Remove",
-        style: "font-size:10px;padding:4px 8px;",
-        onclick: () => row.remove(),
-      }),
-    ]);
-    presetRefs.loraRows.push({ name: nameIn, weight: weightIn });
-    return row;
-  }
-
-  function _entryByRole(role) {
-    return (presetEntries || []).find((e) => (e.semantic_role || e.input_name) === role) || {};
-  }
-
-  function buildPresetPayload() {
-    const name = (presetRefs.name && (presetRefs.name.value || "").trim()) || "";
-    const description = presetRefs.description ? presetRefs.description.value : "";
-    const tags = (presetRefs.tags && (presetRefs.tags.value || "")).split(",").map((t) => t.trim()).filter(Boolean);
-    const favorite = presetRefs.favorite ? presetRefs.favorite.checked : false;
-
-    const values = {};
-    Object.keys(presetRefs.values).forEach((role) => {
-      values[role] = _readControlValue(_entryByRole(role), presetRefs.values[role]);
-    });
-
-    const recommended_values = {};
-    Object.keys(presetRefs.rec).forEach((role) => {
-      recommended_values[role] = _readControlValue(_entryByRole(role), presetRefs.rec[role]);
-    });
-
-    const model_choices = {};
-    Object.keys(presetRefs.models).forEach((role) => {
-      model_choices[role] = presetRefs.models[role].value || "";
-    });
-
-    const lora_values = {};
-    presetRefs.loraRows.forEach((row) => {
-      const n = (row.name.value || "").trim();
-      if (!n) return;
-      const w = row.weight.value.trim();
-      lora_values[n] = w === "" ? "" : w;
-    });
-
-    const exposed_controls = [];
-    Object.keys(presetRefs.exposed).forEach((role) => {
-      if (presetRefs.exposed[role].checked) exposed_controls.push(role);
-    });
-
-    return {
-      name: name,
-      description: description,
-      tags: tags,
-      favorite: favorite,
-      values: values,
-      model_choices: model_choices,
-      lora_values: lora_values,
-      recommended_values: recommended_values,
-      exposed_controls: exposed_controls,
-    };
-  }
-
-  async function onSavePreset() {
-    const name = (presetRefs.name && (presetRefs.name.value || "").trim()) || "";
-    if (!name) {
-      _view.data.presetIncomplete = { reasons: ["Enter a preset name."] };
-      _view.data.notice = { text: "Enter a preset name before saving.", error: true };
-      render();
-      return;
-    }
-    const payload = buildPresetPayload();
-    const isEdit = !!_view.data.editPreset;
-    const result = isEdit
-      ? await updateWorkflowPreset(apiBase, _view.activePresetId, payload)
-      : await createVersionPreset(apiBase, _view.selectedVersionId, payload);
-    if (stale()) return;
-    if (!result || result.status === "error") {
-      _view.data.notice = { text: "Could not save preset: " + _errorText(result), error: true };
-      render();
-      return;
-    }
-    const preset = result.preset || null;
-    if (preset && preset.state && preset.state.status === "incomplete") {
-      _view.data.presetIncomplete = { reasons: preset.state.reasons || [] };
-      _view.data.notice = { text: "Preset is incomplete — review the reasons below.", error: true };
-      render();
-      return;
-    }
-    _view.editorMode = "";
-    _view.activePresetId = "";
-    _view.data.editPreset = null;
-    _view.data.presetIncomplete = null;
-    _view.data.notice = { text: "Preset saved", error: false };
-    await loadVersionData();
-    render();
-  }
 
   // ── Mount ───────────────────────────────────────────────────────────────
 
@@ -3359,7 +3191,7 @@ export function renderWorkflows(state, context) {
   // Version-setup only, and stale ids degrade softly to the library. No other
   // page reads or writes the draft.
   function maybeResumeSetupWizard() {
-    import("./studio-preset-wizard.js").then(({ readWizardDraft }) => {
+    import("./studio-workflow-setup-wizard.js").then(({ readWizardDraft }) => {
       if (stale() || !root.isConnected || _view.mode !== "library") return;
       // Only a real reload auto-reopens the wizard, and a single page load
       // resumes at most once.

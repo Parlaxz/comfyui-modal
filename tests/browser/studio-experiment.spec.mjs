@@ -80,9 +80,12 @@ async function selectPortraitV1(page, wfMock) {
   const wfSelect = page.locator('[data-testid="workflow-selector"]');
   await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
   await wfSelect.selectOption(ids.workflowId);
-  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
-  await page.locator('[data-testid="workflow-version-selector"]').selectOption(ids.v1);
+  // The Shelf is the single field editor: selecting a Workflow is all that is
+  // needed, and `shelf-fields` only renders once mapped fields are loaded.
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="shelf-fields"]')).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('[data-testid="workflow-mapped-controls"]')).toHaveCount(0);
+  await expect(page.locator('[data-testid="workflow-version-selector"]')).toHaveCount(0);
   await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
   return ids;
 }
@@ -326,6 +329,8 @@ test.describe("Studio Shelf Experiment", () => {
       const runBtn = page.locator('[data-testid="shelf-exp-run-btn"]');
       await expect(runBtn).toBeDisabled({ timeout: 10000 });
       await page.locator('[data-testid="shelf-axis-seed"]').click();
+      // Enabling the axis seeds one value from the version's graph default;
+      // the second is added explicitly.
       await page.locator('[data-testid="shelf-axis-input-seed"]').fill("222");
       await page.locator('[data-testid="shelf-axis-input-seed"]').press("Enter");
 

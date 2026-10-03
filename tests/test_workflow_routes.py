@@ -7,7 +7,7 @@ decorated handlers and each test looks one up and drives it synchronously
 with a fake ``aiohttp`` request.
 
 The workflow domain business rules (immutable versions, one immutable mapping
-per version, incomplete-but-saved presets, copy-forward) live in
+per version, mapping revisions) live in
 ``studio_domain.services.WorkflowDomainService`` and are NOT re-implemented
 here — the handlers only translate HTTP <-> service calls.
 """
@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from studio_domain import derive_mapping_candidates
+from studio_domain.store import WorkflowDomainStore
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -293,20 +294,6 @@ class WorkflowRoutesTests(unittest.TestCase):
             "model": prompt["4"]["inputs"]["ckpt_name"],
         }
 
-    def _create_preset(self, version_id: str, name: str = "Preset",
-                       values: dict | None = None, **extra) -> dict:
-        body = {
-            "name": name,
-            "values": values if values is not None else self._default_values(),
-            **extra,
-        }
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": version_id}, json_body=body,
-        )
-        self.assertEqual(resp.status, 200, msg=f"preset body={resp.body}")
-        return self._body(resp)["preset"]
-
     # ── 1. list empty / create / missing name ────────────────────────────
 
     def test_01_list_empty_create_and_missing_name(self):
@@ -449,14 +436,28 @@ class WorkflowRoutesTests(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(self._body(resp)["folders"], ["a", "a/b", "a/b/c", "x"])
 
-        # Add a preset on a mapped version so preset tags are aggregated too.
-        e = self._create_workflow(name="E", folder="y")
-        version = self._setup_mapped(e["workflow_id"])
-        self._create_preset(version["workflow_version_id"], "P", tags=["t2", "t3"])
+        # Tags aggregate from workflow tags only; presets no longer exist.
+        e = self._create_workflow(name="E", folder="y", tags=["t3"])
+        self._setup_mapped(e["workflow_id"])
 
         resp = self._call("GET", "/comfymodal/studio/workflows/tags")
         self.assertEqual(resp.status, 200)
         self.assertEqual(self._body(resp)["tags"], ["t1", "t2", "t3"])
+
+        resp = self._call(
+            "POST", "/comfymodal/studio/workflows/folders",
+            json_body={"path": " /empty/new/"},
+        )
+        self.assertEqual(resp.status, 200, msg=resp.body)
+        self.assertEqual(
+            self._body(resp)["folders"],
+            ["a", "a/b", "a/b/c", "empty", "empty/new", "x", "y"],
+        )
+        resp = self._call(
+            "POST", "/comfymodal/studio/workflows/folders",
+            json_body={"path": " / "},
+        )
+        self.assertEqual(resp.status, 400)
 
     # ── 6. list filters ──────────────────────────────────────────────────
 
@@ -491,6 +492,31 @@ class WorkflowRoutesTests(unittest.TestCase):
 
         # favorite.
         self.assertEqual(_ids({"favorite": "1"}), ["Sunset Portrait"])
+
+    def test_06b_list_omits_static_graph_but_detail_serves_it(self):
+        """Library list rows must not carry the durable static graph: it is
+        ~99% of a stored Workflow record and no list view reads it. The
+        per-workflow detail endpoint remains the authority for it."""
+        graph = {"nodes": [{"id": 1, "type": "KSampler"}], "links": []}
+        created = self._create_workflow(name="Graphy", static_graph=graph)
+        self.assertEqual(created.get("static_graph"), graph)
+
+        resp = self._call("GET", "/comfymodal/studio/workflows")
+        self.assertEqual(resp.status, 200)
+        rows = self._body(resp)["workflows"]
+        self.assertEqual([w["name"] for w in rows], ["Graphy"])
+        self.assertNotIn("static_graph", rows[0])
+        # List-specific enrichment is still present.
+        self.assertIn("version_count", rows[0])
+
+        detail = self._call(
+            "GET", "/comfymodal/studio/workflows/{workflow_id}",
+            match_info={"workflow_id": created["workflow_id"]},
+        )
+        self.assertEqual(detail.status, 200)
+        self.assertEqual(
+            self._body(detail)["workflow"]["static_graph"], graph
+        )
 
     # ── 7. versions: capture / dedupe / list / state ─────────────────────
 
@@ -644,388 +670,65 @@ class WorkflowRoutesTests(unittest.TestCase):
         self.assertNotIn("steps", roles2)
         self.assertIn("seed", roles2)
 
-    # ── 11. presets create ───────────────────────────────────────────────
-
-    def test_11_presets_create(self):
-        workflow = self._create_workflow(name="Presets")
-        version = self._setup_mapped(workflow["workflow_id"])
-        version_id = version["workflow_version_id"]
-
-        # Complete preset → ready + runnable.
-        preset = self._create_preset(version_id, "Complete")
-        self.assertEqual(preset["state"]["status"], "ready")
-        self.assertTrue(preset["state"]["runnable"])
-
-        # 0 / 0.0 / False / "" survive a round-trip through the detail route.
-        zero_prompt = {
-            "1": {"class_type": "TestNode", "inputs": {
-                "seed": 0, "ratio": 0.0, "enabled": False, "text": ""}},
-            "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
-        }
-        zero_version = self._capture_version(workflow["workflow_id"], zero_prompt)
-        zero_entries = {
-            "seed": {"node_id": "1", "input_name": "seed", "kind": "node_input",
-                     "control_kind": "integer", "data_type": "INT", "minimum": 0.0, "required": True},
-            "ratio": {"node_id": "1", "input_name": "ratio", "kind": "node_input",
-                      "control_kind": "number", "data_type": "FLOAT", "required": False},
-            "enabled": {"node_id": "1", "input_name": "enabled", "kind": "node_input",
-                        "control_kind": "boolean", "data_type": "BOOLEAN", "required": False},
-            "label": {"node_id": "1", "input_name": "text", "kind": "node_input",
-                      "control_kind": "string", "data_type": "STRING", "required": False},
-        }
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/mapping",
-            match_info={"version_id": zero_version["workflow_version_id"]},
-            json_body={"entries": zero_entries, "output_node_id": "2"},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        values = {"seed": 0, "ratio": 0.0, "enabled": False, "label": ""}
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": zero_version["workflow_version_id"]},
-            json_body={"name": "ZeroPreset", "values": values},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        zero_preset = self._body(resp)["preset"]
-        self.assertEqual(zero_preset["state"]["status"], "ready")
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": zero_preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        stored = self._body(resp)["preset"]
-        self.assertEqual(stored["values"]["seed"], 0)
-        self.assertEqual(stored["values"]["ratio"], 0.0)
-        self.assertEqual(stored["values"]["enabled"], False)
-        self.assertEqual(stored["values"]["label"], "")
-
-        # Missing required value → saved but incomplete with reasons.
-        values = self._default_values()
-        del values["seed"]
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": version_id},
-            json_body={"name": "NoSeed", "values": values},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        preset = self._body(resp)["preset"]
-        self.assertEqual(preset["name"], "NoSeed")
-        self.assertEqual(preset["state"]["status"], "incomplete")
-        self.assertFalse(preset["state"]["runnable"])
-        self.assertTrue(any("seed" in r for r in preset["state"]["reasons"]))
-
-        # Invalid enum value: the domain SAVES it and marks the preset
-        # incomplete (it does not reject with 400).
-        values = self._default_values()
-        values["sampler"] = "not-a-real-sampler"
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": version_id},
-            json_body={"name": "BadSampler", "values": values},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        preset = self._body(resp)["preset"]
-        self.assertEqual(preset["state"]["status"], "incomplete")
-        self.assertTrue(any("sampler" in r for r in preset["state"]["reasons"]))
-
-    # ── 12. preset update ────────────────────────────────────────────────
-
-    def test_12_preset_update(self):
-        workflow = self._create_workflow(name="Update")
-        version = self._setup_mapped(workflow["workflow_id"])
-        preset = self._create_preset(version["workflow_version_id"], "Original")
-
-        values = self._default_values()
-        values["seed"] = 999
-        resp = self._call(
-            "PATCH", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": preset["preset_id"]},
-            json_body={"name": "Renamed", "values": values},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        updated = self._body(resp)["preset"]
-        self.assertEqual(updated["name"], "Renamed")
-        self.assertEqual(updated["values"]["seed"], 999)
-
-        # Unknown preset → 404.
-        resp = self._call(
-            "PATCH", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": "wpres_ghost"},
-            json_body={"name": "Ghost"},
-        )
-        self.assertEqual(resp.status, 404)
-
-        # Update with an unknown control → 400.
-        resp = self._call(
-            "PATCH", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": preset["preset_id"]},
-            json_body={"values": {"not_a_control": 1}},
-        )
-        self.assertEqual(resp.status, 400)
-        body = self._body(resp)
-        self.assertEqual(body.get("status"), "error")
-        self.assertIn("unknown control", body.get("message", ""))
-
-    # ── 13. default preset ───────────────────────────────────────────────
-
-    def test_13_default_preset(self):
-        workflow = self._create_workflow(name="Default")
-        version = self._setup_mapped(workflow["workflow_id"])
-        preset = self._create_preset(version["workflow_version_id"], "P1")
-
-        # Set → default_preset_id wired.
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            json_body={"preset_id": preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        self.assertEqual(self._body(resp)["workflow"]["default_preset_id"],
-                         preset["preset_id"])
-
-        # Clear → "".
-        resp = self._call(
-            "DELETE", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(self._body(resp)["workflow"]["default_preset_id"], "")
-
-        # Preset from another workflow → 400.
-        other = self._create_workflow(name="Other")
-        other_version = self._setup_mapped(other["workflow_id"])
-        other_preset = self._create_preset(other_version["workflow_version_id"], "OP")
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            json_body={"preset_id": other_preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 400)
-        body = self._body(resp)
-        self.assertEqual(body.get("status"), "error")
-        self.assertIn("does not belong", body.get("message", ""))
-
-        # Unknown preset → 404.
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            json_body={"preset_id": "wpres_ghost"},
-        )
-        self.assertEqual(resp.status, 404)
-
-        # Missing preset_id → 400.
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            json_body={},
-        )
-        self.assertEqual(resp.status, 400)
-
-    # ── 14. duplicate preset ─────────────────────────────────────────────
-
-    def test_14_preset_duplicate(self):
-        workflow = self._create_workflow(name="Duplicate")
-        version = self._setup_mapped(workflow["workflow_id"])
-        preset = self._create_preset(version["workflow_version_id"], "Source Preset")
-
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/presets/{preset_id}/duplicate",
-            match_info={"preset_id": preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        dup = self._body(resp)["preset"]
-        self.assertNotEqual(dup["preset_id"], preset["preset_id"])
-        self.assertTrue(dup["name"].endswith("(Copy)"))
-        self.assertEqual(dup["workflow_version_id"], version["workflow_version_id"])
-        self.assertEqual(dup["values"]["seed"], preset["values"]["seed"])
-
-    # ── 15. copy preset to a newer version ───────────────────────────────
-
-    def test_15_copy_preset_to_newer_version(self):
-        workflow = self._create_workflow(name="Copy")
-        v1 = self._setup_mapped(workflow["workflow_id"])
-        v1_id = v1["workflow_version_id"]
-        preset = self._create_preset(v1_id, "Preset A")
-
-        # Structural change (batch_size) → version 2, then map it.
-        changed = txt2img_prompt()
-        changed["5"]["inputs"]["batch_size"] = 2
-        v2 = self._capture_version(workflow["workflow_id"], changed)
-        self._set_mapping(v2["workflow_version_id"], changed)
-
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/presets/{preset_id}/copy-to-version",
-            match_info={"preset_id": preset["preset_id"]},
-            json_body={"target_version_id": v2["workflow_version_id"]},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        result = self._body(resp)["result"]
-        self.assertEqual(result["preset"]["workflow_version_id"], v2["workflow_version_id"])
-        self.assertIn("dropped_controls", result)
-        self.assertIn("state", result)
-        self.assertEqual(result["state"]["status"], "ready")
-        self.assertEqual(result["preset"]["values"]["seed"], preset["values"]["seed"])
-
-        # Copy to the same/older version → 400.
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/presets/{preset_id}/copy-to-version",
-            match_info={"preset_id": preset["preset_id"]},
-            json_body={"target_version_id": v1_id},
-        )
-        self.assertEqual(resp.status, 400)
-        body = self._body(resp)
-        self.assertEqual(body.get("status"), "error")
-        self.assertIn("not newer", body.get("message", ""))
-
-        # Original preset still lives on v1, untouched.
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": v1_id},
-        )
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(len(self._body(resp)["presets"]), 1)
-
-    # ── 16. bulk copy ────────────────────────────────────────────────────
-
-    def test_16_bulk_copy(self):
-        workflow = self._create_workflow(name="Bulk")
-        v1 = self._setup_mapped(workflow["workflow_id"])
-        v1_id = v1["workflow_version_id"]
-        p1 = self._create_preset(v1_id, "P1")
-        p2 = self._create_preset(v1_id, "P2")
-
-        changed = txt2img_prompt()
-        changed["5"]["inputs"]["batch_size"] = 2
-        v2 = self._capture_version(workflow["workflow_id"], changed)
-        self._set_mapping(v2["workflow_version_id"], changed)
-
-        resp = self._call(
-            "POST", "/comfymodal/studio/workflows/versions/{version_id}/presets/copy-bulk",
-            match_info={"version_id": v2["workflow_version_id"]},
-            json_body={"preset_ids": [p1["preset_id"], p2["preset_id"]]},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        results = self._body(resp)["results"]
-        self.assertEqual(len(results), 2)
-        source_ids = {r["source_preset_id"] for r in results}
-        self.assertEqual(source_ids, {p1["preset_id"], p2["preset_id"]})
-        for result in results:
-            self.assertEqual(result["preset"]["workflow_version_id"], v2["workflow_version_id"])
-
-        # Originals untouched on v1.
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/versions/{version_id}/presets",
-            match_info={"version_id": v1_id},
-        )
-        self.assertEqual(len(self._body(resp)["presets"]), 2)
-
-    # ── 17. delete preset ────────────────────────────────────────────────
-
-    def test_17_preset_delete(self):
-        workflow = self._create_workflow(name="Delete")
-        version = self._setup_mapped(workflow["workflow_id"])
-        preset = self._create_preset(version["workflow_version_id"], "P")
-
-        resp = self._call(
-            "DELETE", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        self.assertEqual(self._body(resp).get("status"), "ok")
-
-        # Gone.
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": preset["preset_id"]},
-        )
-        self.assertEqual(resp.status, 404)
-
-        # Deleting the default preset clears default_preset_id.
-        preset2 = self._create_preset(version["workflow_version_id"], "DefaultPreset")
-        self._call(
-            "POST", "/comfymodal/studio/workflows/{workflow_id}/default-preset",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            json_body={"preset_id": preset2["preset_id"]},
-        )
-        resp = self._call(
-            "DELETE", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": preset2["preset_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/{workflow_id}",
-            match_info={"workflow_id": workflow["workflow_id"]},
-        )
-        self.assertEqual(self._body(resp)["workflow"]["default_preset_id"], "")
-
-        # Unknown preset → 404.
-        resp = self._call(
-            "DELETE", "/comfymodal/studio/workflows/presets/{preset_id}",
-            match_info={"preset_id": "wpres_ghost"},
-        )
-        self.assertEqual(resp.status, 404)
-
-    # ── 18. run-context ──────────────────────────────────────────────────
-
-    def test_18_run_context(self):
-        workflow = self._create_workflow(name="RunContext")
-        version = self._setup_mapped(workflow["workflow_id"])
-        self._create_preset(version["workflow_version_id"], "Ready")
-
-        # Fully set up → runnable true + control schema mapping roles.
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/{workflow_id}/run-context",
-            match_info={"workflow_id": workflow["workflow_id"]},
-        )
-        self.assertEqual(resp.status, 200, msg=resp.body)
-        body = self._body(resp)
-        self.assertEqual(body["workflow"]["latest_version_id"], version["workflow_version_id"])
-        self.assertTrue(body["state"]["runnable"])
-        self.assertEqual(body["state"]["status"], "ready")
-        self.assertIn("seed", body["control_schema"])
-        self.assertEqual(body["control_schema"]["seed"]["semantic_role"], "seed")
-        self.assertEqual(body["control_schema"]["sampler"]["semantic_role"], "sampler")
-        self.assertIsNotNone(body["version"])
-        self.assertIsNotNone(body["mapping"])
-
-        # Without a mapping → runnable false.
-        bare = self._create_workflow(name="Bare")
-        self._capture_version(bare["workflow_id"])
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/{workflow_id}/run-context",
-            match_info={"workflow_id": bare["workflow_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        body = self._body(resp)
-        self.assertFalse(body["state"]["runnable"])
-        self.assertTrue(body["state"]["reasons"])
-
-        # version_id query selects a non-latest version.
-        changed = txt2img_prompt()
-        changed["5"]["inputs"]["batch_size"] = 2
-        v2 = self._capture_version(workflow["workflow_id"], changed)
-        self._set_mapping(v2["workflow_version_id"], changed)
-        resp = self._call(
-            "GET", "/comfymodal/studio/workflows/{workflow_id}/run-context",
-            match_info={"workflow_id": workflow["workflow_id"]},
-            query={"version_id": version["workflow_version_id"]},
-        )
-        self.assertEqual(resp.status, 200)
-        body = self._body(resp)
-        self.assertEqual(body["version"]["workflow_version_id"], version["workflow_version_id"])
-        self.assertEqual(body["version"]["version_number"], 1)
-        # Latest is now v2.
-        self.assertEqual(body["workflow"]["latest_version_id"], v2["workflow_version_id"])
-
-    # ── 19. no route mutates versions ────────────────────────────────────
+    # ── 11. no version mutation routes ──────────────────────────────────
 
     def test_19_no_version_mutation_routes(self):
-        # Versions are immutable: no PATCH route for a version, no DELETE
-        # route for a workflow.
+        # Versions are immutable: no PATCH route for a version.
         self.assertIsNone(_handler_for(
             self.mod, "PATCH", "/comfymodal/studio/workflows/versions/{version_id}"))
-        self.assertIsNone(_handler_for(
-            self.mod, "DELETE", "/comfymodal/studio/workflows/{workflow_id}"))
+
+    def test_20_delete_workflow_cascades_and_preserves_unrelated_records(self):
+        workflow = self._create_workflow(name="Delete Me")
+        version = self._setup_mapped(workflow["workflow_id"])
+        changed_prompt = txt2img_prompt()
+        changed_prompt["5"]["inputs"]["batch_size"] = 2
+        second_version = self._setup_mapped(workflow["workflow_id"], changed_prompt)
+
+        other = self._create_workflow(name="Keep Me")
+        other_version = self._setup_mapped(other["workflow_id"])
+
+        response = self._call(
+            "DELETE", "/comfymodal/studio/workflows/{workflow_id}",
+            match_info={"workflow_id": workflow["workflow_id"]},
+        )
+        self.assertEqual(response.status, 200, msg=response.body)
+        self.assertEqual(self._body(response), {"status": "ok"})
+
+        snapshot = WorkflowDomainStore(self.root).snapshot_all()
+        self.assertNotIn(workflow["workflow_id"], {
+            row["workflow_id"] for row in snapshot["workflows"]
+        })
+        self.assertNotIn(version["workflow_version_id"], {
+            row["workflow_version_id"] for row in snapshot["versions"]
+        })
+        self.assertNotIn(second_version["workflow_version_id"], {
+            row["workflow_version_id"] for row in snapshot["versions"]
+        })
+        self.assertFalse(any(
+            row.get("workflow_version_id") in {
+                version["workflow_version_id"],
+                second_version["workflow_version_id"],
+            }
+for row in snapshot["mappings"]
+        ))
+
+        self.assertIn(other["workflow_id"], {
+            row["workflow_id"] for row in snapshot["workflows"]
+        })
+        self.assertIn(other_version["workflow_version_id"], {
+            row["workflow_version_id"] for row in snapshot["versions"]
+        })
+        self.assertTrue(any(
+            row.get("workflow_version_id") == other_version["workflow_version_id"]
+            for row in snapshot["mappings"]
+        ), "unrelated mapping survives")
+
+        response = self._call(
+            "DELETE", "/comfymodal/studio/workflows/{workflow_id}",
+            match_info={"workflow_id": "wf_missing"},
+        )
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self._body(response).get("status"), "error")
 
 
 if __name__ == "__main__":

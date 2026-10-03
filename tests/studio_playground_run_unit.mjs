@@ -634,17 +634,19 @@ function buildLegacyForStatus(status) {
   // Shared primitives imported by the Playground page module.
   assert.ok(pg.includes('from "./studio-loading.js"'), "studio-loading.js consumed");
   assert.ok(pg.includes('renderEmptyState } from "./studio-ui.js"'), "renderEmptyState consumed");
-  assert.ok(pg.includes('testid: "playground-capabilities-loading"'), "capabilities loading primitive");
   assert.ok(pg.includes('label: "Loading recent runs…"' ), "recent-runs loading primitive");
   assert.ok(
     pg.includes('"playground-recent-runs-cleared"')
       && pg.includes('"playground-recent-runs-empty"')
-      && pg.includes('"playground-backend-empty"'),
+      && pg.includes('"playground-recent-runs-loading"'),
     "ordinary empty states migrated to the shared primitive"
   );
 
-  // Control-level loading stays textual (intentional, per freeze).
-  assert.ok(pg.includes('text: "Loading backends…"'), "backend select keeps its textual loading option");
+  // Control-level loading stays textual (intentional, per freeze). The legacy
+  // backend/preset selector is gone, so the workflow picker carries the
+  // textual loading state instead.
+  assert.equal(pg.includes('text: "Loading backends…"'), false,
+    "the legacy backend selector is removed");
   assert.ok(
     pg.includes('"Loading\\u2026" : "Loading workflow\\u2026"'),
     "workflow gating line keeps its textual status"
@@ -657,9 +659,12 @@ function buildLegacyForStatus(status) {
   assert.ok(pg.includes("scope \u2014 value preserved"), "real em-dash in file-selection notice");
   assert.ok(pg.includes("unavailable \u2014 value preserved"), "real em-dash in schema-options notice");
 
-  // Frozen copy change.
-  assert.ok(pg.includes("Open Backend to create presets"), "frozen Backend copy applied");
-  assert.equal(pg.includes("Go to Backend tab to create presets"), false, "stale wording removed");
+  // Preset copy is gone from the Playground entirely; the Backend page is
+  // renamed Manage Modal.
+  assert.equal(pg.includes("Open Backend to create presets"), false,
+    "no preset-creation copy in the Playground");
+  assert.equal(pg.includes("Select a Backend Preset"), false,
+    "no backend-preset selector copy in the Playground");
 
   // Carousel accessible names.
   assert.ok(pg.includes("function _carouselAccessibleNames"), "naming helper present");
@@ -680,17 +685,21 @@ function buildLegacyForStatus(status) {
     "handoff error keeps the legacy class; genuine empties moved to cm-empty-state"
   );
 
-  // Experiment mode: empties migrated, error retained, cell chips toned.
+  // Experiment mode: the preset comparison lane is gone with the concept;
+  // experiments run against a selected Workflow.
   assert.ok(em.includes('from "./studio-ui.js"'), "experiment-mode consumes studio-ui");
-  assert.ok(em.includes('"experiment-presets-empty"'), "presets empty via shared primitive");
-  assert.ok(em.includes('"experiment-matrix-empty"'), "matrix hint via shared primitive");
-  assert.ok(em.includes("Open Backend to create presets."), "frozen copy applies here too");
-  assert.equal(em.includes("Go to Backend tab"), false, "stale wording removed from experiment mode");
-  assert.ok(em.includes('"Could not load presets."'), "fetch-failure message retained (error, not empty)");
+  assert.equal(em.includes('"experiment-presets-empty"'), false,
+    "the presets empty state is removed");
+  assert.equal(em.includes("Open Backend to create presets."), false,
+    "no preset-creation copy in experiment mode");
+  assert.equal(em.includes("Compare Presets"), false,
+    "the compare-presets block is removed");
+  assert.equal(em.includes("renderCompareBackends"), false,
+    "the compare-presets renderer is gone");
   assert.equal(
     (em.match(/comfymodal-studio-empty-state/g) || []).length,
-    1,
-    "only the catch-error site keeps the legacy empty-state class in experiment mode"
+    0,
+    "no legacy empty-state class remains in experiment mode"
   );
   assert.ok(em.includes('status-" + status + " cm-chip"'), "cell chips on shared base");
   assert.ok(em.includes("_cellStatusTone"), "truthful status-tone mapping present");

@@ -442,6 +442,822 @@
           "manifest_version": 1,
           "comfyui_version": "0.34.2"
         }
+      },
+      "wv_529e8122c76249d3": {
+        "report": {
+          "version_id": "wv_529e8122c76249d3",
+          "graph_hash": "c98ea61205a933725673a277b1e353202c89dd417e95ee65bab18b274e9315f5",
+          "risk_level": "high",
+          "rule_version": "portability-rules-v1",
+          "issue_count": 19,
+          "counts": {
+            "high": 4,
+            "medium": 13,
+            "low": 2
+          },
+          "issues": [
+            {
+              "code": "dependency_missing",
+              "severity": "high",
+              "message": "Required dependencies are missing (models: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, ae.safetensors, ema_vae_fp16.safetensors, qwen_3_4b.safetensors, seedvr2_ema_7b_sharp_fp16.safetensors, z_image_turbo_bf16.safetensors; custom nodes: comfyui-detail-daemon, kijai/ComfyUI-KJNodes). 6 model reference(s) expose no source reference.",
+              "subject": "models",
+              "fix_hint": "Install the missing dependencies on the target or attach source references.",
+              "evidence": {
+                "models_without_source": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "ae.safetensors",
+                  "ema_vae_fp16.safetensors",
+                  "qwen_3_4b.safetensors",
+                  "seedvr2_ema_7b_sharp_fp16.safetensors"
+                ],
+                "count": 8
+              }
+            },
+            {
+              "code": "local_dependency_missing",
+              "severity": "high",
+              "message": "Required custom nodes are not installed locally: DetailDaemonSamplerNode, GetNode, SetNode.",
+              "subject": "custom_nodes",
+              "fix_hint": "Install the missing custom nodes locally.",
+              "evidence": {
+                "count": 3,
+                "names": [
+                  "DetailDaemonSamplerNode",
+                  "GetNode",
+                  "SetNode"
+                ]
+              }
+            },
+            {
+              "code": "local_model_missing",
+              "severity": "high",
+              "message": "Required models are missing from the local library: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, ae.safetensors, ema_vae_fp16.safetensors, qwen_3_4b.safetensors, seedvr2_ema_7b_sharp_fp16.safetensors; and 1 more.",
+              "subject": "models",
+              "fix_hint": "Place the required models into their ComfyUI model buckets.",
+              "evidence": {
+                "count": 6,
+                "names": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "ae.safetensors",
+                  "ema_vae_fp16.safetensors",
+                  "qwen_3_4b.safetensors",
+                  "seedvr2_ema_7b_sharp_fp16.safetensors",
+                  "z_image_turbo_bf16.safetensors"
+                ]
+              }
+            },
+            {
+              "code": "unresolved_node_type",
+              "severity": "high",
+              "message": "38 required node class(es) have no usable identity evidence: 0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77, 19052e92-2610-4c13-afc6-7817b84b9a07, 192950b8-c967-400e-a626-baa41fba08c1, 2fedb267-4762-4332-bc82-415449a34537, 35d9b5f5-a2d8-4656-a5aa-4e37581e616c, 7be0f333-a421-4b5a-8612-47f46ad0aa7d and 32 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Install or map the owning node package, then re-run analysis.",
+              "evidence": {
+                "classes": [
+                  "0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77",
+                  "19052e92-2610-4c13-afc6-7817b84b9a07",
+                  "192950b8-c967-400e-a626-baa41fba08c1",
+                  "2fedb267-4762-4332-bc82-415449a34537",
+                  "35d9b5f5-a2d8-4656-a5aa-4e37581e616c"
+                ],
+                "count": 38
+              }
+            },
+            {
+              "code": "baseten_custom_node_bake_required",
+              "severity": "medium",
+              "message": "Baseten build_commands must clone/install: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Clone and install required custom nodes in Truss build_commands.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "baseten_deployment_embedding_required",
+              "severity": "medium",
+              "message": "Baseten embeds the workflow into a deployment; free arbitrary graph-per-request dispatch is not the default model.",
+              "subject": "target",
+              "fix_hint": "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+            },
+            {
+              "code": "baseten_frontend_setup_required",
+              "severity": "medium",
+              "message": "The baseten image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "comfy_cloud_node_support_unknown",
+              "severity": "medium",
+              "message": "Comfy Cloud catalog support for these required nodes is not established by supplied evidence: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Confirm the node appears in Comfy Cloud's supported list before exporting there.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "comfy_cloud_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "comfy_cloud frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "custom_node_unpinned",
+              "severity": "medium",
+              "message": "58 custom node class(es) lack trusted revision pinning: 0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77, 19052e92-2610-4c13-afc6-7817b84b9a07, 192950b8-c967-400e-a626-baa41fba08c1, 2fedb267-4762-4332-bc82-415449a34537, 35d9b5f5-a2d8-4656-a5aa-4e37581e616c, 7be0f333-a421-4b5a-8612-47f46ad0aa7d and 52 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Pin exact trusted repo revisions for each custom node.",
+              "evidence": {
+                "classes": [
+                  "0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77",
+                  "19052e92-2610-4c13-afc6-7817b84b9a07",
+                  "192950b8-c967-400e-a626-baa41fba08c1",
+                  "2fedb267-4762-4332-bc82-415449a34537",
+                  "35d9b5f5-a2d8-4656-a5aa-4e37581e616c"
+                ],
+                "count": 58
+              }
+            },
+            {
+              "code": "model_hash_unpinned",
+              "severity": "medium",
+              "message": "6 model reference(s) have no pinned sha256: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, ae.safetensors, ema_vae_fp16.safetensors, qwen_3_4b.safetensors, seedvr2_ema_7b_sharp_fp16.safetensors, z_image_turbo_bf16.safetensors.",
+              "subject": "models",
+              "fix_hint": "Populate sha256 in the model library and pin hashes at export.",
+              "evidence": {
+                "filenames": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "ae.safetensors",
+                  "ema_vae_fp16.safetensors",
+                  "qwen_3_4b.safetensors",
+                  "seedvr2_ema_7b_sharp_fp16.safetensors"
+                ],
+                "count": 6
+              }
+            },
+            {
+              "code": "required_input_asset",
+              "severity": "medium",
+              "message": "1 external user asset requirement(s) must travel separately: LoadImage.",
+              "subject": "assets",
+              "fix_hint": "Ship referenced assets alongside the workflow into the target input folder.",
+              "evidence": {
+                "assets": [
+                  "LoadImage"
+                ],
+                "count": 1
+              }
+            },
+            {
+              "code": "runcomfy_auto_setup_required",
+              "severity": "medium",
+              "message": "RunComfy auto-setup must install: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Let RunComfy auto-setup install the missing nodes, then snapshot.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "runcomfy_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "runcomfy frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runpod_frontend_setup_required",
+              "severity": "medium",
+              "message": "The runpod image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "runpod_image_setup_required",
+              "severity": "medium",
+              "message": "RunPod requires these custom nodes to be baked into the worker image: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Build the required custom nodes into the RunPod worker image.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "target_capability_unknown",
+              "severity": "medium",
+              "message": "A provider capability this readiness decision depends on is unverified.",
+              "subject": "target",
+              "fix_hint": "Verify the provider capability before relying on this target."
+            },
+            {
+              "code": "baseten_storage_capability_unknown",
+              "severity": "low",
+              "message": "Baseten persistent storage options for ComfyUI-style model trees were unverified in the G3 audit.",
+              "subject": "target",
+              "fix_hint": "Verify Baseten storage options before baking large model trees."
+            },
+            {
+              "code": "subgraph_frontend_requirement",
+              "severity": "low",
+              "message": "Graph defines 11 subgraph definition(s); loading requires a frontend >= 1.44.",
+              "subject": "frontend",
+              "fix_hint": "Ensure the target frontend >= 1.44 or flatten subgraphs.",
+              "evidence": {
+                "count": 11
+              }
+            }
+          ],
+          "signals": {
+            "has_absolute_path": false,
+            "has_unresolved_node_type": true,
+            "unresolved_node_count": 38,
+            "custom_node_count": 58,
+            "custom_repo_count": 8,
+            "custom_node_revision_pinned": false,
+            "model_ref_basename_only": true,
+            "model_hash_pinned": false,
+            "model_extraction_gap": false,
+            "requires_input_asset": true,
+            "has_external_endpoint": false,
+            "uses_subgraphs": true,
+            "exact_roundtrip_proven": true,
+            "env_bound_registry_leak": false
+          },
+          "targets": {
+            "local": {
+              "risk_level": "high",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "local_dependency_missing",
+                "local_model_missing",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Resolve missing local dependencies before running."
+              ]
+            },
+            "modal": {
+              "risk_level": "low",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": []
+            },
+            "runpod": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "runpod_frontend_setup_required",
+                "runpod_image_setup_required",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Provide input assets via the job payload or S3.",
+                "Build the required custom nodes into the RunPod worker image.",
+                "Ship a subgraph-capable ComfyUI frontend in the worker image."
+              ]
+            },
+            "runcomfy": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "runcomfy_auto_setup_required",
+                "runcomfy_subgraph_support_unknown",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Upload required input assets through the RunComfy session.",
+                "Let RunComfy auto-setup install the missing nodes/models.",
+                "Verify subgraph execution in a RunComfy session first."
+              ]
+            },
+            "comfy_cloud": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "comfy_cloud_node_support_unknown",
+                "comfy_cloud_subgraph_support_unknown",
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Upload required input assets through the Comfy Cloud assets API.",
+                "Confirm Comfy Cloud catalog/frontend support before exporting there."
+              ]
+            },
+            "baseten": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "baseten_custom_node_bake_required",
+                "baseten_deployment_embedding_required",
+                "baseten_frontend_setup_required",
+                "baseten_storage_capability_unknown",
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Wire input assets through deployment values or the predict payload.",
+                "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch.",
+                "Clone and install required custom nodes in build_commands.",
+                "Verify Baseten persistent-storage options for large model trees."
+              ]
+            }
+          },
+          "environment": {
+            "risk_level": "high",
+            "issues": [
+              {
+                "code": "custom_node_source_unpinned",
+                "severity": "high",
+                "message": "Custom-node sources are deployed without recorded/enforced revisions.",
+                "subject": "environment",
+                "fix_hint": ""
+              },
+              {
+                "code": "model_hash_unpinned",
+                "severity": "medium",
+                "message": "Model bytes are not pinned by sha256 coverage.",
+                "subject": "environment",
+                "fix_hint": ""
+              }
+            ],
+            "source": "current_studio_environment"
+          },
+          "stale": false,
+          "invalidation": {
+            "workflow_version_id": "wv_529e8122c76249d3",
+            "graph_hash": "c98ea61205a933725673a277b1e353202c89dd417e95ee65bab18b274e9315f5",
+            "dependency_metadata_hash": "a4df56d7eb8550f225be804051f6cb57e28b1d387b7c226b326be5e41998a42e",
+            "model_library_generation": "b18e0079dbd1d43fb7ab77f6bf99639bcf531a20de7f37874b1f0cdd460e0daa",
+            "custom_node_registry_generation": "479d49b6181f3bb70ee2e1edbe567c45bf7a4d00b7084387dd6c5a7505ab494f",
+            "rule_version": "portability-rules-v1",
+            "manifest_version": 1,
+            "comfyui_version": "0.34.2"
+          },
+          "analyzed_at": "2026-09-30T02:57:31.761700+00:00"
+        },
+        "stamp": {
+          "workflow_version_id": "wv_529e8122c76249d3",
+          "graph_hash": "c98ea61205a933725673a277b1e353202c89dd417e95ee65bab18b274e9315f5",
+          "dependency_metadata_hash": "a4df56d7eb8550f225be804051f6cb57e28b1d387b7c226b326be5e41998a42e",
+          "model_library_generation": "b18e0079dbd1d43fb7ab77f6bf99639bcf531a20de7f37874b1f0cdd460e0daa",
+          "custom_node_registry_generation": "479d49b6181f3bb70ee2e1edbe567c45bf7a4d00b7084387dd6c5a7505ab494f",
+          "rule_version": "portability-rules-v1",
+          "manifest_version": 1,
+          "comfyui_version": "0.34.2"
+        }
+      },
+      "wv_c1d54c92aba64ca7": {
+        "report": {
+          "version_id": "wv_c1d54c92aba64ca7",
+          "graph_hash": "5190f7a64a6455fce7c831005bd21de4e9fa13be8a4c3d16c354024676703a90",
+          "risk_level": "high",
+          "rule_version": "portability-rules-v1",
+          "issue_count": 18,
+          "counts": {
+            "high": 3,
+            "medium": 13,
+            "low": 2
+          },
+          "issues": [
+            {
+              "code": "dependency_missing",
+              "severity": "high",
+              "message": "Required dependencies are missing (models: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, Z-image-Turbo\\DigitalAnime.safetensors, Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors, Z-image-Turbo\\del\\woman549-zit.safetensors, Z-image-Turbo\\del\\woman992-ZIT.safetensors, Z-image-Turbo\\woman037-zimage.safetensors and 2 more). 8 model reference(s) expose no source reference.",
+              "subject": "models",
+              "fix_hint": "Install the missing dependencies on the target or attach source references.",
+              "evidence": {
+                "models_without_source": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "Z-image-Turbo\\DigitalAnime.safetensors",
+                  "Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors",
+                  "Z-image-Turbo\\del\\woman549-zit.safetensors",
+                  "Z-image-Turbo\\del\\woman992-ZIT.safetensors"
+                ],
+                "count": 8
+              }
+            },
+            {
+              "code": "local_model_missing",
+              "severity": "high",
+              "message": "Required models are missing from the local library: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, Z-image-Turbo\\DigitalAnime.safetensors, Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors, Z-image-Turbo\\del\\woman549-zit.safetensors, Z-image-Turbo\\del\\woman992-ZIT.safetensors; and 3 more.",
+              "subject": "models",
+              "fix_hint": "Place the required models into their ComfyUI model buckets.",
+              "evidence": {
+                "count": 8,
+                "names": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "Z-image-Turbo\\DigitalAnime.safetensors",
+                  "Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors",
+                  "Z-image-Turbo\\del\\woman549-zit.safetensors",
+                  "Z-image-Turbo\\del\\woman992-ZIT.safetensors",
+                  "Z-image-Turbo\\woman037-zimage.safetensors",
+                  "ema_vae_fp16.safetensors",
+                  "seedvr2_ema_7b_sharp_fp16.safetensors"
+                ]
+              }
+            },
+            {
+              "code": "unresolved_node_type",
+              "severity": "high",
+              "message": "38 required node class(es) have no usable identity evidence: 0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77, 19052e92-2610-4c13-afc6-7817b84b9a07, 192950b8-c967-400e-a626-baa41fba08c1, 2fedb267-4762-4332-bc82-415449a34537, 35d9b5f5-a2d8-4656-a5aa-4e37581e616c, 7be0f333-a421-4b5a-8612-47f46ad0aa7d and 32 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Install or map the owning node package, then re-run analysis.",
+              "evidence": {
+                "classes": [
+                  "0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77",
+                  "19052e92-2610-4c13-afc6-7817b84b9a07",
+                  "192950b8-c967-400e-a626-baa41fba08c1",
+                  "2fedb267-4762-4332-bc82-415449a34537",
+                  "35d9b5f5-a2d8-4656-a5aa-4e37581e616c"
+                ],
+                "count": 38
+              }
+            },
+            {
+              "code": "baseten_custom_node_bake_required",
+              "severity": "medium",
+              "message": "Baseten build_commands must clone/install: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Clone and install required custom nodes in Truss build_commands.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "baseten_deployment_embedding_required",
+              "severity": "medium",
+              "message": "Baseten embeds the workflow into a deployment; free arbitrary graph-per-request dispatch is not the default model.",
+              "subject": "target",
+              "fix_hint": "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch."
+            },
+            {
+              "code": "baseten_frontend_setup_required",
+              "severity": "medium",
+              "message": "The baseten image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "comfy_cloud_node_support_unknown",
+              "severity": "medium",
+              "message": "Comfy Cloud catalog support for these required nodes is not established by supplied evidence: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Confirm the node appears in Comfy Cloud's supported list before exporting there.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "comfy_cloud_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "comfy_cloud frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "custom_node_unpinned",
+              "severity": "medium",
+              "message": "58 custom node class(es) lack trusted revision pinning: 0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77, 19052e92-2610-4c13-afc6-7817b84b9a07, 192950b8-c967-400e-a626-baa41fba08c1, 2fedb267-4762-4332-bc82-415449a34537, 35d9b5f5-a2d8-4656-a5aa-4e37581e616c, 7be0f333-a421-4b5a-8612-47f46ad0aa7d and 52 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Pin exact trusted repo revisions for each custom node.",
+              "evidence": {
+                "classes": [
+                  "0324d3cd-a5a2-4bf0-9e02-a9f2aae29e77",
+                  "19052e92-2610-4c13-afc6-7817b84b9a07",
+                  "192950b8-c967-400e-a626-baa41fba08c1",
+                  "2fedb267-4762-4332-bc82-415449a34537",
+                  "35d9b5f5-a2d8-4656-a5aa-4e37581e616c"
+                ],
+                "count": 58
+              }
+            },
+            {
+              "code": "model_hash_unpinned",
+              "severity": "medium",
+              "message": "11 model reference(s) have no pinned sha256: Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors, Z-image-Turbo\\DigitalAnime.safetensors, Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors, Z-image-Turbo\\del\\woman549-zit.safetensors, Z-image-Turbo\\del\\woman992-ZIT.safetensors, Z-image-Turbo\\woman037-zimage.safetensors and 5 more.",
+              "subject": "models",
+              "fix_hint": "Populate sha256 in the model library and pin hashes at export.",
+              "evidence": {
+                "filenames": [
+                  "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+                  "Z-image-Turbo\\DigitalAnime.safetensors",
+                  "Z-image-Turbo\\del\\TP2KKFHC9NPFNVSK522R051N20.safetensors",
+                  "Z-image-Turbo\\del\\woman549-zit.safetensors",
+                  "Z-image-Turbo\\del\\woman992-ZIT.safetensors"
+                ],
+                "count": 11
+              }
+            },
+            {
+              "code": "required_input_asset",
+              "severity": "medium",
+              "message": "1 external user asset requirement(s) must travel separately: LoadImage.",
+              "subject": "assets",
+              "fix_hint": "Ship referenced assets alongside the workflow into the target input folder.",
+              "evidence": {
+                "assets": [
+                  "LoadImage"
+                ],
+                "count": 1
+              }
+            },
+            {
+              "code": "runcomfy_auto_setup_required",
+              "severity": "medium",
+              "message": "RunComfy auto-setup must install: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Let RunComfy auto-setup install the missing nodes, then snapshot.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "runcomfy_subgraph_support_unknown",
+              "severity": "medium",
+              "message": "runcomfy frontend/subgraph support for this graph is unverified.",
+              "subject": "frontend",
+              "fix_hint": "Verify subgraph execution before relying on it."
+            },
+            {
+              "code": "runpod_frontend_setup_required",
+              "severity": "medium",
+              "message": "The runpod image must ship a ComfyUI frontend that supports subgraphs.",
+              "subject": "frontend",
+              "fix_hint": "Bake a subgraph-capable ComfyUI frontend into the image."
+            },
+            {
+              "code": "runpod_image_setup_required",
+              "severity": "medium",
+              "message": "RunPod requires these custom nodes to be baked into the worker image: AIO_Preprocessor, CacheDiT_Model_Optimizer, ClownsharKSampler_Beta, DWPreprocessor, DetailDaemonSamplerNode; and 15 more.",
+              "subject": "custom_nodes",
+              "fix_hint": "Build the required custom nodes into the RunPod worker image.",
+              "evidence": {
+                "count": 20,
+                "names": [
+                  "AIO_Preprocessor",
+                  "CacheDiT_Model_Optimizer",
+                  "ClownsharKSampler_Beta",
+                  "DWPreprocessor",
+                  "DetailDaemonSamplerNode",
+                  "DrawMaskOnImage",
+                  "FL_ImageAspectCropper",
+                  "GetNode"
+                ]
+              }
+            },
+            {
+              "code": "target_capability_unknown",
+              "severity": "medium",
+              "message": "A provider capability this readiness decision depends on is unverified.",
+              "subject": "target",
+              "fix_hint": "Verify the provider capability before relying on this target."
+            },
+            {
+              "code": "baseten_storage_capability_unknown",
+              "severity": "low",
+              "message": "Baseten persistent storage options for ComfyUI-style model trees were unverified in the G3 audit.",
+              "subject": "target",
+              "fix_hint": "Verify Baseten storage options before baking large model trees."
+            },
+            {
+              "code": "subgraph_frontend_requirement",
+              "severity": "low",
+              "message": "Graph defines 11 subgraph definition(s); loading requires a frontend >= 1.44.",
+              "subject": "frontend",
+              "fix_hint": "Ensure the target frontend >= 1.44 or flatten subgraphs.",
+              "evidence": {
+                "count": 11
+              }
+            }
+          ],
+          "signals": {
+            "has_absolute_path": false,
+            "has_unresolved_node_type": true,
+            "unresolved_node_count": 38,
+            "custom_node_count": 58,
+            "custom_repo_count": 6,
+            "custom_node_revision_pinned": false,
+            "model_ref_basename_only": false,
+            "model_hash_pinned": false,
+            "model_extraction_gap": false,
+            "requires_input_asset": true,
+            "has_external_endpoint": false,
+            "uses_subgraphs": true,
+            "exact_roundtrip_proven": true,
+            "env_bound_registry_leak": false
+          },
+          "targets": {
+            "local": {
+              "risk_level": "high",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "local_model_missing",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": []
+            },
+            "modal": {
+              "risk_level": "low",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": []
+            },
+            "runpod": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "runpod_frontend_setup_required",
+                "runpod_image_setup_required",
+                "subgraph_frontend_requirement"
+              ],
+              "advice": [
+                "Provide input assets via the job payload or S3.",
+                "Build the required custom nodes into the RunPod worker image.",
+                "Ship a subgraph-capable ComfyUI frontend in the worker image."
+              ]
+            },
+            "runcomfy": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "runcomfy_auto_setup_required",
+                "runcomfy_subgraph_support_unknown",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Upload required input assets through the RunComfy session.",
+                "Let RunComfy auto-setup install the missing nodes/models.",
+                "Verify subgraph execution in a RunComfy session first."
+              ]
+            },
+            "comfy_cloud": {
+              "risk_level": "unknown",
+              "issue_codes": [
+                "comfy_cloud_node_support_unknown",
+                "comfy_cloud_subgraph_support_unknown",
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Upload required input assets through the Comfy Cloud assets API.",
+                "Confirm Comfy Cloud catalog/frontend support before exporting there."
+              ]
+            },
+            "baseten": {
+              "risk_level": "medium",
+              "issue_codes": [
+                "baseten_custom_node_bake_required",
+                "baseten_deployment_embedding_required",
+                "baseten_frontend_setup_required",
+                "baseten_storage_capability_unknown",
+                "custom_node_unpinned",
+                "model_hash_unpinned",
+                "subgraph_frontend_requirement",
+                "target_capability_unknown"
+              ],
+              "advice": [
+                "Wire input assets through deployment values or the predict payload.",
+                "Embed the workflow into a Baseten Truss deployment rather than expecting graph-per-request dispatch.",
+                "Clone and install required custom nodes in build_commands.",
+                "Verify Baseten persistent-storage options for large model trees."
+              ]
+            }
+          },
+          "environment": {
+            "risk_level": "high",
+            "issues": [
+              {
+                "code": "custom_node_source_unpinned",
+                "severity": "high",
+                "message": "Custom-node sources are deployed without recorded/enforced revisions.",
+                "subject": "environment",
+                "fix_hint": ""
+              },
+              {
+                "code": "model_hash_unpinned",
+                "severity": "medium",
+                "message": "Model bytes are not pinned by sha256 coverage.",
+                "subject": "environment",
+                "fix_hint": ""
+              }
+            ],
+            "source": "current_studio_environment"
+          },
+          "stale": false,
+          "invalidation": {
+            "workflow_version_id": "wv_c1d54c92aba64ca7",
+            "graph_hash": "5190f7a64a6455fce7c831005bd21de4e9fa13be8a4c3d16c354024676703a90",
+            "dependency_metadata_hash": "fa07583a91acafe8543cb0a0ccffe77e4a3f77210dae837b844315f683681b69",
+            "model_library_generation": "b18e0079dbd1d43fb7ab77f6bf99639bcf531a20de7f37874b1f0cdd460e0daa",
+            "custom_node_registry_generation": "479d49b6181f3bb70ee2e1edbe567c45bf7a4d00b7084387dd6c5a7505ab494f",
+            "rule_version": "portability-rules-v1",
+            "manifest_version": 1,
+            "comfyui_version": "0.34.2"
+          },
+          "analyzed_at": "2026-09-30T16:45:24.753432+00:00"
+        },
+        "stamp": {
+          "workflow_version_id": "wv_c1d54c92aba64ca7",
+          "graph_hash": "5190f7a64a6455fce7c831005bd21de4e9fa13be8a4c3d16c354024676703a90",
+          "dependency_metadata_hash": "fa07583a91acafe8543cb0a0ccffe77e4a3f77210dae837b844315f683681b69",
+          "model_library_generation": "b18e0079dbd1d43fb7ab77f6bf99639bcf531a20de7f37874b1f0cdd460e0daa",
+          "custom_node_registry_generation": "479d49b6181f3bb70ee2e1edbe567c45bf7a4d00b7084387dd6c5a7505ab494f",
+          "rule_version": "portability-rules-v1",
+          "manifest_version": 1,
+          "comfyui_version": "0.34.2"
+        }
       }
     }
   }

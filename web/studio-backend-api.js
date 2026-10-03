@@ -22,10 +22,9 @@ function syncKindForMutation(path, method) {
     /^\/(?:history-v2|run-history|experiments)(?:\/|$)/.test(path)
   ) return "history";
   if (/^\/studio\/(?:workflows|models|custom-nodes)(?:\/|$)/.test(path)) return "workflows";
-  if (
-    /^\/(?:workspaces|deploy|manifest\/repair|hf-token|civitai-token)(?:\/|$)/.test(path) ||
-    /^\/studio\/(?:snapshots|presets)(?:\/|$)/.test(path)
-  ) return "workspace";
+  if (/^\/(?:workspaces|deploy|manifest\/repair|hf-token|civitai-token)(?:\/|$)/.test(path)) {
+    return "workspace";
+  }
   return null;
 }
 
@@ -47,81 +46,9 @@ async function apiFetch(apiBase, path, options) {
   } catch { return null; }
 }
 
-// ── Snapshots API ─────────────────────────────────────────────────────────
-
-export async function listSnapshots(apiBase) {
-  const data = await apiFetch(apiBase, "/studio/snapshots");
-  if (data === null) return null; // network/API error
-  return (data && data.snapshots) || [];
-}
-
-export async function createSnapshot(apiBase, payload) {
-  return apiFetch(apiBase, "/studio/snapshots", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function updateSnapshot(apiBase, id, payload) {
-  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function duplicateSnapshot(apiBase, id) {
-  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}/duplicate`, {
-    method: "POST",
-  });
-}
-
-export async function archiveSnapshot(apiBase, id) {
-  return apiFetch(apiBase, `/studio/snapshots/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
-// ── Backend Presets API ───────────────────────────────────────────────────
-
-export async function listPresets(apiBase) {
-  const data = await apiFetch(apiBase, "/studio/presets");
-  if (data === null) return null; // network/API error
-  return (data && data.presets) || [];
-}
-
-export async function createPreset(apiBase, payload) {
-  return apiFetch(apiBase, "/studio/presets", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function updatePreset(apiBase, id, payload) {
-  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function duplicatePreset(apiBase, id) {
-  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}/duplicate`, {
-    method: "POST",
-  });
-}
-
-export async function deletePreset(apiBase, id) {
-  return apiFetch(apiBase, `/studio/presets/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  });
-}
-
 // ── Studio Run / Experiment API ──────────────────────────────────────────
 
-export async function runStudioPreset(apiBase, payload) {
+export async function runStudioWorkflow(apiBase, payload) {
   const data = await apiFetch(apiBase, "/studio/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -336,19 +263,7 @@ export async function listWorkflowTags(apiBase) {
   return apiFetch(apiBase, "/studio/workflows/tags");
 }
 
-export async function setWorkflowDefaultPreset(apiBase, workflowId, presetId) {
-  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/default-preset`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ preset_id: presetId }),
-  });
-}
 
-export async function clearWorkflowDefaultPreset(apiBase, workflowId) {
-  return apiFetch(apiBase, `/studio/workflows/${encodeURIComponent(workflowId)}/default-preset`, {
-    method: "DELETE",
-  });
-}
 
 export async function getWorkflowRunContext(apiBase, workflowId, versionId = "") {
   let path = `/studio/workflows/${encodeURIComponent(workflowId)}/run-context`;
@@ -423,80 +338,6 @@ export async function createMappingRevision(apiBase, versionId, payload) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
-}
-
-// ── Studio Workflow Presets API ──────────────────────────────────────────
-
-export async function listVersionPresets(apiBase, versionId) {
-  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets`);
-}
-
-export async function createVersionPreset(apiBase, versionId, payload) {
-  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function getWorkflowPreset(apiBase, presetId) {
-  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`);
-}
-
-export async function updateWorkflowPreset(apiBase, presetId, payload) {
-  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function deleteWorkflowPreset(apiBase, presetId) {
-  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}`, {
-    method: "DELETE",
-  });
-}
-
-export async function duplicateWorkflowPreset(apiBase, presetId) {
-  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}/duplicate`, {
-    method: "POST",
-  });
-}
-
-export async function copyPresetToVersion(apiBase, presetId, targetVersionId) {
-  return apiFetch(apiBase, `/studio/workflows/presets/${encodeURIComponent(presetId)}/copy-to-version`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target_version_id: targetVersionId }),
-  });
-}
-
-export async function bulkCopyPresetsToVersion(apiBase, versionId, presetIds) {
-  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets/copy-bulk`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ preset_ids: presetIds }),
-  });
-}
-
-// ── Legacy absorption bridge (abs-2) ────────────────────────────────────
-//
-// Client for the abs-1 verified route
-// POST /comfymodal/studio/workflows/versions/{version_id}/presets/from-legacy
-// (``create_preset_from_legacy`` on the domain service). The payload is an
-// UNSCOPED legacy preset shape (``name``/``label``, ``description``,
-// ``values`` / ``model_choices`` keyed by old semantic roles); the server
-// translates it via ``translate_legacy_preset`` (LEGACY_ROLE_MAP) and
-// persists it through the verified ``create_preset`` path under the URL
-// version scope. The browser never translates keys itself — unknown keys
-// pass through verbatim server-side and surface via preset state.
-
-export async function createPresetFromLegacy(apiBase, versionId, legacyPayload) {
-  return apiFetch(apiBase, `/studio/workflows/versions/${encodeURIComponent(versionId)}/presets/from-legacy`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(legacyPayload || {}),
   });
 }
 
@@ -750,7 +591,7 @@ export async function managerRebootAndWait(options) {
 // details to sessionStorage (and a marker in the Studio URL hash) so a browser
 // refresh can reopen the same workflow/version wizard at the same step.
 // These pure builders/parsers live here (no DOM) so the bounded schema is
-// unit-testable in Node; web/studio-preset-wizard.js owns the storage + URL
+// unit-testable in Node; web/studio-workflow-setup-wizard.js owns the storage + URL
 // side effects.
 
 export const WIZARD_DRAFT_KEY = "comfymodal.studio.wizard.draft.v1";
@@ -1178,9 +1019,8 @@ export function portabilityEndpointPath(versionId) {
 }
 
 /** Endpoint path builder for manifest export (pure; unit-testable). */
-export function exportManifestEndpointPath(versionId, includePresets) {
-  return `/studio/workflows/versions/${encodeURIComponent(versionId)}/export` +
-    `?include_presets=${includePresets ? "1" : "0"}`;
+export function exportManifestEndpointPath(versionId) {
+  return `/studio/workflows/versions/${encodeURIComponent(versionId)}/export`;
 }
 
 /** Query string for import-manifest (pure; unit-testable). */
@@ -1212,8 +1052,8 @@ function _contentDispositionFilename(header) {
  * { ok:false, status, message } on failure. The backend is the manifest
  * authority — no manifest JSON is built in the browser.
  */
-export async function fetchWorkflowManifestExport(apiBase, versionId, includePresets) {
-  const path = exportManifestEndpointPath(versionId, includePresets);
+export async function fetchWorkflowManifestExport(apiBase, versionId) {
+  const path = exportManifestEndpointPath(versionId);
   try {
     const res = await fetch(`${apiBase}${path}`);
     if (!res.ok) {
@@ -1243,14 +1083,7 @@ export async function importWorkflowManifest(apiBase, body, opts) {
   const dryRun = o.dryRun !== false;
   const payload = typeof body === "string"
     ? body
-    : JSON.stringify(
-        dryRun
-          ? (body || {})
-          : Object.assign({}, body || {}, {
-              import_presets: !!o.importPresets,
-              apply_default_preset: !!o.applyDefaultPreset,
-            })
-      );
+    : JSON.stringify(body || {});
   return apiFetch(apiBase, "/studio/workflows/import-manifest" + importManifestQuery(dryRun), {
     method: "POST",
     headers: { "Content-Type": "application/json" },

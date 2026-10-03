@@ -594,6 +594,53 @@ body.comfymodal-body-scroll-lock {
   background: #2a0000;
 }
 
+/* ── File picker row (workflow import dialog) ────────────── */
+
+/* The real <input type="file"> stays in the DOM for the native picker and for
+   test automation; the styled button beside it is the visible affordance. */
+.comfymodal-studio-wf-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.comfymodal-studio-wf-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.comfymodal-studio-wf-file-browse {
+  width: auto;
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 11px;
+}
+.comfymodal-studio-wf-file-browse:focus-visible {
+  outline: 2px solid var(--color-accent, #5a7fdb);
+  outline-offset: 1px;
+}
+
+.comfymodal-studio-wf-file-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: #777;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comfymodal-studio-wf-file-name.is-chosen {
+  color: #ccc;
+}
+
 /* ── Backend Selector ────────────────────────────────────── */
 
 .comfymodal-studio-backend-selector {
@@ -4718,6 +4765,7 @@ button.comfymodal-studio-feature-chip {
   display: flex;
   gap: 6px;
   align-items: center;
+  position: relative;
 }
 
 .comfymodal-studio-workflows-toolbar {
@@ -4817,6 +4865,27 @@ button.comfymodal-studio-feature-chip {
   letter-spacing: 0.04em;
 }
 
+.comfymodal-studio-workflows-sidebar-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.comfymodal-studio-workflows-new-folder {
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  background: #111;
+  color: #999;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  padding: 3px 6px;
+}
+.comfymodal-studio-workflows-new-folder:hover {
+  color: #ddd;
+  border-color: var(--color-accent, #5a7fdb);
+}
+
 .comfymodal-studio-workflows-folder-tree {
   display: flex;
   flex-direction: column;
@@ -4878,12 +4947,104 @@ button.comfymodal-studio-feature-chip {
   background: #15181f;
   transform: translateY(-1px);
 }
+/* Multiselect: the selected card is the selection target, so it carries a
+   persistent accent border (hover alone cannot express a chosen state). */
+.comfymodal-studio-workflow-card.is-selected {
+  border-color: var(--color-accent, #5a7fdb);
+  background: var(--color-accent-muted, rgba(90, 127, 219, 0.1));
+}
 
 .comfymodal-studio-workflow-card-top {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 6px;
+}
+
+.comfymodal-studio-workflow-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.comfymodal-studio-workflow-menu-wrap { position: relative; }
+.comfymodal-studio-workflow-kebab {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #888;
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  line-height: 20px;
+}
+.comfymodal-studio-workflow-kebab:hover,
+.comfymodal-studio-workflow-kebab[aria-expanded="true"] {
+  border-color: #333;
+  background: #1b1b1b;
+  color: #ddd;
+}
+.comfymodal-studio-workflow-menu {
+  position: absolute;
+  z-index: 5;
+  top: 26px;
+  right: 0;
+  min-width: 138px;
+  padding: 4px;
+  border: 1px solid #333;
+  border-radius: 5px;
+  background: #171717;
+  box-shadow: 0 8px 22px rgba(0,0,0,.35);
+}
+.comfymodal-studio-workflow-menu-item {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #ccc;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  padding: 7px 8px;
+  text-align: left;
+}
+.comfymodal-studio-workflow-menu-item:hover {
+  background: var(--color-accent-muted, rgba(90,127,219,.16));
+  color: #fff;
+}
+.comfymodal-studio-workflow-menu-item-danger { color: #f08a8a; }
+.comfymodal-studio-workflow-menu-item-danger:hover { color: #fff; background: rgba(190, 62, 62, .2); }
+
+.comfymodal-studio-workflows-bulk-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--color-accent, #5a7fdb);
+  border-radius: 6px;
+  background: var(--color-accent-muted, rgba(90, 127, 219, .12));
+}
+.comfymodal-studio-workflows-selection-count {
+  margin-right: auto;
+  color: #ddd;
+  font-size: 11px;
+  font-weight: 600;
+}
+.comfymodal-studio-workflow-select-checkbox {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--color-accent, #5a7fdb);
+}
+
+.comfymodal-studio-workflow-card-delete {
+  padding: 4px 7px;
+  font-size: 10px;
 }
 
 .comfymodal-studio-workflow-card-name {
@@ -4919,6 +5080,44 @@ button.comfymodal-studio-feature-chip {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.comfymodal-studio-folder-dialog { max-width: 420px; }
+.comfymodal-studio-folder-options {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 10px 0;
+}
+.comfymodal-studio-folder-option {
+  border: 1px solid #292929;
+  border-radius: 4px;
+  background: #111;
+  color: #bbb;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 9px;
+  text-align: left;
+}
+.comfymodal-studio-folder-option:hover,
+.comfymodal-studio-folder-option.active {
+  border-color: var(--color-accent, #5a7fdb);
+  background: var(--color-accent-muted, rgba(90,127,219,.16));
+  color: #eee;
+}
+.comfymodal-studio-workflows-folder-input {
+  box-sizing: border-box;
+  width: 100%;
+  border: 1px solid #2a2a2a;
+  border-radius: 5px;
+  background: #111;
+  color: #ddd;
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 9px;
 }
 
 .comfymodal-studio-workflows-tags {
@@ -5800,6 +5999,14 @@ button.comfymodal-studio-feature-chip {
   background: #111;
   color: #888;
   border: 1px solid #2a2a2a;
+}
+
+/* Nonessential: real, but no active node loads it. Deliberately quieter than
+   "missing" so an advisory row never reads as a blocker. */
+.comfymodal-studio-model-badge.optional {
+  background: #161616;
+  color: #9ca3af;
+  border: 1px solid #2f2f2f;
 }
 
 /* In-progress states share the existing accent (running) family — no new

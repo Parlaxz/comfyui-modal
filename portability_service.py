@@ -80,10 +80,8 @@ from studio_domain.graph import extract_dependency_metadata, extract_executable_
 from studio_domain.models import (
     Mapping,
     Workflow,
-    WorkflowPreset,
     WorkflowVersion,
     make_mapping_id,
-    make_preset_id,
     make_version_id,
     make_workflow_id,
 )
@@ -520,7 +518,7 @@ class PortabilityService:
 
     # ── Export (read-only) ────────────────────────────────────────────
 
-    def export_manifest(self, version_id: str, include_presets: bool = False) -> dict:
+    def export_manifest(self, version_id: str) -> dict:
         """Build the manifest-v1 export artifact for one WorkflowVersion.
 
         READ-ONLY: touches no domain collection.  Returns
@@ -661,20 +659,6 @@ class PortabilityService:
                 "entries": entries,
             }
 
-        preset_records = []
-        if include_presets:
-            default_preset_id = str(workflow.get("default_preset_id") or "")
-            for preset in self.store.list_presets():
-                if preset.get("workflow_version_id") != version_id:
-                    continue
-                record = copy.deepcopy(preset)
-                record["is_default"] = (
-                    default_preset_id != ""
-                    and preset.get("preset_id") == default_preset_id
-                )
-                preset_records.append(record)
-        preset_records.sort(key=lambda p: str(p.get("preset_id") or ""))
-
         metadata: dict[str, Any] = {
             "exported_at": _utc_now_iso(),
             "exporter": EXPORTER_ID,
@@ -686,7 +670,6 @@ class PortabilityService:
             workflow=manifest_workflow,
             version=manifest_version_section,
             mapping=manifest_mapping,
-            presets=preset_records,
             models=model_records,
             custom_nodes=custom_records,
             assets=asset_records,
@@ -821,7 +804,6 @@ class PortabilityService:
         analysis = self._manifest_analysis(manifest)
         base_name = self._display_name_of(manifest)
         proposed_name = base_name + pc.IMPORT_SUGGESTED_NAME_SUFFIX
-        import_presets = bool(manifest.get("presets"))
         # Deterministic security finding (never a blocker per the frozen G5
         # contract; values are never echoed).
         credential_shapes = detect_manifest_credential_shapes(manifest)
@@ -849,8 +831,7 @@ class PortabilityService:
                 "workflow": True,
                 "version": True,
                 "mapping": True,
-                "preset_count": len(manifest.get("presets") or []) if import_presets else 0,
-            },
+                            },
             "dependency_summary": _dependency_summary(
                 analysis["model_rows"], analysis["custom_node_rows"]
             ),
@@ -865,9 +846,6 @@ class PortabilityService:
     def _build_import_records(
         self,
         manifest: dict,
-        *,
-        import_presets: bool,
-        apply_default_preset: bool,
     ) -> dict:
         """Mint ALL local records for a committed import (no writes here)."""
         workflow_section = manifest.get("workflow") or {}
@@ -952,7 +930,6 @@ class PortabilityService:
             source_url=source_url,
             source_author=source_author,
             compatible_models=[],
-            default_preset_id="",
             latest_version_id=new_version_id,
             created_at=now,
             updated_at=now,
@@ -990,81 +967,26 @@ class PortabilityService:
             }
         )
 
-        presets: list[WorkflowPreset] = []
-        preset_id_map: dict[str, str] = {}
-        default_source_id = ""
-        defaults = [
-            p
-            for p in (manifest.get("presets") or [])
-            if isinstance(p, dict) and p.get("is_default") is True
-        ]
-        if len(defaults) == 1:
-            default_source_id = str(defaults[0].get("preset_id") or "")
-        if import_presets:
-            for source_preset in manifest.get("presets") or []:
-                if not isinstance(source_preset, dict):
-                    continue
-                new_preset_id = make_preset_id()
-                source_id = str(source_preset.get("preset_id") or "")
-                if source_id:
-                    preset_id_map[source_id] = new_preset_id
-                record = dict(source_preset)
-                record["preset_id"] = new_preset_id
-                record["workflow_version_id"] = new_version_id
-                record["workflow_id"] = new_workflow_id
-                presets.append(WorkflowPreset.from_dict(record))
-
-        applied_default_preset_id = ""
-        default_application_note = ""
-        if apply_default_preset:
-            if not import_presets:
-                default_application_note = (
-                    "apply_default_preset requested without import_presets; "
-                    "no default applied"
-                )
-            elif not default_source_id:
-                default_application_note = (
-                    "no single manifest default preset; no default applied"
-                )
-            else:
-                local_default = preset_id_map.get(default_source_id)
-                if local_default:
-                    workflow.default_preset_id = local_default
-                    applied_default_preset_id = local_default
-                    default_application_note = ""
-
         return {
             "workflow": workflow,
             "version": version,
             "mapping": mapping,
-            "presets": presets,
-            "applied_default_preset_id": applied_default_preset_id,
-            "default_application_note": default_application_note,
-            "preset_id_map": preset_id_map,
             "proposed_name": proposed_name,
         }
 
     def commit_import(
         self,
         source: Any,
-        *,
-        import_presets: bool = False,
-        apply_default_preset: bool = False,
     ) -> dict:
         """Committed import: validate fully, then create ALL records in ONE
         atomic domain transaction.  Any failure leaves zero partial state."""
         manifest = self._parse_validated_manifest(source)
         analysis = self._manifest_analysis(manifest)
-        records = self._build_import_records(
-            manifest,
-            import_presets=import_presets,
-            apply_default_preset=apply_default_preset,
-        )
+        records = self._build_import_records(manifest)
         created = self.store.commit_import_transaction(
             records["workflow"],
             records["version"],
             records["mapping"],
-            records["presets"],
         )
         provenance = created["version"]["dependency_metadata"].get(
             "import_provenance"
@@ -1074,9 +996,6 @@ class PortabilityService:
             "workflow_id": created["workflow"]["workflow_id"],
             "workflow_version_id": created["version"]["workflow_version_id"],
             "mapping_id": created["mapping"]["mapping_id"],
-            "preset_ids": [p["preset_id"] for p in created["presets"]],
-            "applied_default_preset_id": records["applied_default_preset_id"] or None,
-            "default_application_note": records["default_application_note"],
             "workflow_name": created["workflow"]["name"],
             "provenance": provenance,
             "dependency_summary": _dependency_summary(

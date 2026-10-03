@@ -706,6 +706,56 @@ class StudioStoreAndModelTests(unittest.TestCase):
             store.update(_noop)
             self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
 
+    def test_json_store_read_cache_follows_on_disk_change(self):
+        """An unchanged file is served from the parse cache, but any on-disk
+        change is re-parsed. ``read()`` caches on ``(st_mtime_ns, st_size)``,
+        so both a size change and a same-size mtime bump must invalidate."""
+        studio_store = _load_repo_module("studio_store_cache_test", "studio_store.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "data.json"
+            store = studio_store.StudioJsonStore(path)
+            store.write_atomic([{"id": "a"}])
+
+            first = store.read()
+            # Unchanged file: the parsed rows are reused, not re-parsed.
+            self.assertIs(store.read(), first)
+
+            # Same byte size, different content, explicitly bumped mtime.
+            path.write_text(json.dumps([{"id": "b"}]), encoding="utf-8")
+            stamp = path.stat().st_mtime_ns + 1_000_000_000
+            os.utime(path, ns=(stamp, stamp))
+            second = store.read()
+            self.assertEqual(second, [{"id": "b"}])
+            self.assertIsNot(second, first)
+
+            # A size change alone is enough to invalidate.
+            path.write_text(json.dumps([{"id": "cc"}]), encoding="utf-8")
+            self.assertEqual(store.read(), [{"id": "cc"}])
+
+    def test_json_store_update_after_read_does_not_write_cached_rows(self):
+        """``update()`` must not edit the list ``read()`` already handed out:
+        the mutator gets a fresh parse, and only its own result is persisted.
+        This is the invariant the read cache must preserve."""
+        studio_store = _load_repo_module(
+            "studio_store_update_cache_test", "studio_store.py"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "data.json"
+            store = studio_store.StudioJsonStore(path)
+            store.write_atomic([{"id": "a"}, {"id": "b"}])
+
+            handed_out = store.read()  # populates the cache
+
+            def _remover(data):
+                data[:] = [d for d in data if d["id"] != "a"]
+
+            store.update(_remover)
+
+            # The pre-update list handed to the earlier caller is untouched.
+            self.assertEqual([d["id"] for d in handed_out], ["a", "b"])
+            # And the persisted state reflects the mutation, not the cache.
+            self.assertEqual(store.read(), [{"id": "b"}])
+
     def test_strict_validate_feature_ids_rejects_mixed_list(self):
         """Strict validation rejects mixed valid+unknown features."""
         studio_models = _load_repo_module("studio_models_mixed", "studio_models.py")

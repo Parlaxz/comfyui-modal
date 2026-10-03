@@ -1,10 +1,9 @@
-// Modal Studio — Preset Wizard
+// Modal Studio — Workflow Setup Wizard
 //
-// Side-panel wizard for creating or editing a Studio preset from the
+// Side-panel wizard for mapping a Workflow Version's semantic roles to
 // current ComfyUI graph.
 // Steps: Feature Type → Required Bindings → Exposed Controls → Details
-// Wires into studio-backend.js as the primary "Make Preset" flow.
-// Supports edit mode: pass existingPreset + existingSnapshot to pre-fill.
+// Wires into studio-workflows.js as the version setup flow.
 
 import { el } from "./studio-ui.js";
 import {
@@ -29,10 +28,6 @@ import {
   renderDependencySection,
 } from "./studio-model-library.js";
 import {
-  createSnapshot,
-  createPreset,
-  updateSnapshot,
-  updatePreset,
   getWorkflowVersion,
   createMapping,
   getVersionDependencies,
@@ -256,7 +251,7 @@ export function isValidConcreteBinding(val) {
 let _wizardState = null;
 let _wizardRoot = null;
 
-function makeInitialState(existingPreset, existingSnapshot, options) {
+function makeInitialState(options) {
   const state = {
     step: "features",           // features | bindings | details | saving | saved | error
     selectedFeatures: [],
@@ -294,43 +289,13 @@ function makeInitialState(existingPreset, existingSnapshot, options) {
     snapshotResult: null,
     presetResult: null,
     errorMessage: "",
-    // Edit-mode fields
-    isEdit: false,
-    existingPreset: null,
-    existingSnapshot: null,
-    existingPresetId: null,
-    existingSnapshotId: null,
+    // The wizard is only ever opened for one unmapped workflow version
+    // (version-setup mode, below). There is no preset/snapshot record to
+    // pre-fill or edit any more.
+    isVersionSetup: false,
+    workflowId: "",
+    workflowVersionId: "",
   };
-
-  // ── Edit mode: pre-fill from existing preset + snapshot ─────────────
-  if (existingPreset) {
-    state.isEdit = true;
-    state.existingPreset = existingPreset;
-    state.existingPresetId = existingPreset.id;
-    state.step = "bindings"; // skip feature selection in edit mode
-    state.selectedFeatures = existingPreset.compatibleFeatures || [];
-    state.details.name = existingPreset.label || existingPreset.name || "";
-    state.details.description = existingPreset.description || "";
-
-    if (existingSnapshot) {
-      state.existingSnapshot = existingSnapshot;
-      state.existingSnapshotId = existingSnapshot.id;
-      state.graphJson = existingSnapshot.graphJson || null;
-      state.apiPromptJson = existingSnapshot.apiPromptJson || null;
-      state.graphCaptured = true;
-    }
-
-    // Pre-fill bindings from either preset's or snapshot's nodeBindings
-    const srcBindings = existingPreset.nodeBindings || (existingSnapshot && existingSnapshot.nodeBindings) || {};
-    Object.entries(srcBindings).forEach(([key, val]) => {
-      if (val && val.nodeId) {
-        state.bindings[key] = { ...val };
-      }
-    });
-
-    // Pre-fill capture warnings
-    state.captureWarnings = (existingSnapshot && existingSnapshot.warnings) || [];
-  }
 
   // ── Workflow-version setup mode (leaf 1.2.1) ────────────────────────
   // Bound to one unmapped workflow version. The step flow, T2I save gate,
@@ -360,10 +325,10 @@ function _setStudioHeaderWizardMode(on) {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapshot, options) {
-  closePresetWizard({ keepDraft: true }); // Clean up any existing wizard first
+export function openWorkflowSetupWizard(onDone, apiBase, options) {
+  closeWorkflowSetupWizard({ keepDraft: true }); // Clean up any existing wizard first
 
-  _wizardState = makeInitialState(existingPreset, existingSnapshot, options);
+  _wizardState = makeInitialState(options);
   _wizardState._onDone = onDone;
   _wizardState._apiBase = apiBase || "/comfymodal";
 
@@ -421,7 +386,7 @@ export function openPresetWizard(onDone, apiBase, existingPreset, existingSnapsh
   document.dispatchEvent(new CustomEvent("comfymodal:wizard-opening"));
 }
 
-export function closePresetWizard(options) {
+export function closeWorkflowSetupWizard(options) {
   const keepDraft = !!(options && options.keepDraft);
   // Clean up graph binding capture + transient node highlight
   cancelGraphBinding();
@@ -448,7 +413,7 @@ export function closePresetWizard(options) {
   }
 
   // Done/close clears the persisted draft + URL marker; the internal cleanup
-  // at the start of openPresetWizard keeps it (keepDraft) so reopening the
+  // at the start of openWorkflowSetupWizard keeps it (keepDraft) so reopening the
   // same wizard — e.g. after a reboot reload — still resumes in place.
   if (!keepDraft) clearWizardDraft();
 
@@ -567,7 +532,7 @@ function renderWizard(panel, state) {
   clearNodeViewHighlight();
 
   // Header
-  const headerTitle = state.isVersionSetup ? "Set up Workflow" : state.isEdit ? "Edit Preset" : "Make Preset";
+  const headerTitle = "Set up Workflow";
   const header = el("div", { class: "comfymodal-studio-wizard-header" }, [
     el("h3", { text: headerTitle, class: "comfymodal-studio-wizard-title" }),
     el("button", {
@@ -575,12 +540,12 @@ function renderWizard(panel, state) {
       text: "Back to Modal Studio",
       "data-testid": "wizard-back-to-studio",
       style: "width:auto;padding:4px 10px;font-size:11px;",
-      onclick: () => closePresetWizardAndNotify(),
+      onclick: () => closeSetupWizardAndNotify(),
     }),
     el("button", {
       class: "comfymodal-studio-wizard-close",
       text: "×",
-      onclick: () => closePresetWizardAndNotify(),
+      onclick: () => closeSetupWizardAndNotify(),
     }),
   ]);
   panel.appendChild(header);
@@ -702,7 +667,7 @@ function renderWizard(panel, state) {
       text: state.isEdit ? "Cancel" : (includeDeps ? "Back to Dependencies" : "Back to Features"),
       onclick: () => {
         if (state.isEdit) {
-          closePresetWizardAndNotify();
+          closeSetupWizardAndNotify();
         } else {
           navigateStep(includeDeps ? "dependencies" : "features");
         }
@@ -729,9 +694,9 @@ function renderWizard(panel, state) {
     }));
     footer.appendChild(el("button", {
       class: "comfymodal-primary-btn",
-      "data-role": state.isVersionSetup ? "save-setup" : "save-preset",
-      "data-testid": state.isVersionSetup ? "wizard-version-save" : "wizard-preset-save",
-      text: state.isVersionSetup ? "Save Setup" : state.isEdit ? "Update Preset" : "Save Preset",
+      "data-role": "save-setup",
+      "data-testid": "wizard-version-save",
+      text: "Save Setup",
       disabled: !canSave,
       onclick: async () => {
         if (!canSave) return;
@@ -746,7 +711,7 @@ function renderWizard(panel, state) {
         "data-testid": "wizard-version-done",
         text: "Back to Workflow",
         onclick: () => {
-          closePresetWizardAndNotify();
+          closeSetupWizardAndNotify();
         },
       }));
     } else {
@@ -754,18 +719,18 @@ function renderWizard(panel, state) {
         class: "comfymodal-primary-btn",
         text: "Back to Backend",
         onclick: () => {
-          closePresetWizardAndNotify();
+          closeSetupWizardAndNotify();
         },
       }));
       footer.appendChild(el("button", {
         class: "comfymodal-secondary-btn",
         text: state.isEdit ? "Edit Again" : "Make Another",
         onclick: () => {
-          closePresetWizard();
+          closeWorkflowSetupWizard();
           if (state.isEdit) {
-            openPresetWizard(state._onDone, state._apiBase, state.existingPreset, state.existingSnapshot);
+            openWorkflowSetupWizard(state._onDone, state._apiBase);
           } else {
-            openPresetWizard(state._onDone, state._apiBase);
+            openWorkflowSetupWizard(state._onDone, state._apiBase);
           }
         },
       }));
@@ -779,7 +744,7 @@ function renderWizard(panel, state) {
     footer.appendChild(el("button", {
       class: "comfymodal-destructive-btn",
       text: "Cancel",
-      onclick: () => closePresetWizardAndNotify(),
+      onclick: () => closeSetupWizardAndNotify(),
     }));
   }
   panel.appendChild(footer);
@@ -807,7 +772,7 @@ function renderFeaturesStep(body, state) {
 
   const desc = el("p", {
     class: "comfymodal-studio-wizard-description",
-    text: "Choose which features this preset should support.",
+    text: "Choose which features this Workflow Version should support.",
   });
   body.appendChild(desc);
 
@@ -2097,12 +2062,12 @@ function renderDetailsStep(body, state) {
     return;
   }
 
-  const heading = el("h4", { class: "comfymodal-studio-wizard-section-title", text: "Preset Details" });
+  const heading = el("h4", { class: "comfymodal-studio-wizard-section-title", text: "Version Details" });
   body.appendChild(heading);
 
   const desc = el("p", {
     class: "comfymodal-studio-wizard-description",
-    text: "Name your preset and add an optional description.",
+    text: "Name this Workflow Version and add an optional description.",
   });
   body.appendChild(desc);
 
@@ -2110,15 +2075,15 @@ function renderDetailsStep(body, state) {
 
   // Name
   const nameGroup = el("div", { class: "comfymodal-studio-backend-field" });
-  nameGroup.appendChild(el("label", { text: "Preset Name *" }));
+  nameGroup.appendChild(el("label", { text: "Version Name *" }));
   const nameInput = el("input", {
     type: "text",
     value: state.details.name,
-    placeholder: "My Amazing Preset",
+    placeholder: "My Workflow Version",
   });
   nameInput.addEventListener("input", () => {
     state.details.name = nameInput.value;
-    const saveBtn = _wizardRoot && _wizardRoot.querySelector('[data-role="save-preset"]');
+    const saveBtn = _wizardRoot && _wizardRoot.querySelector('[data-role="save-setup"]');
     if (saveBtn) {
       saveBtn.disabled = !(state.details.name.trim().length > 0 && checkAllRequiredBindings(state) && getComfyGraphContext().ok);
     }
@@ -2293,90 +2258,12 @@ async function executeSave(state) {
 
     const outputNodeId = state.bindings.output && state.bindings.output.nodeId ? state.bindings.output.nodeId : null;
 
-    if (state.isEdit && state.existingSnapshotId) {
-      // ── Edit mode: update snapshot bindings + control schemas ──────
-      const controlSchemas = buildControlSchemas(state);
-      const snapshotUpdate = {
-        compatibleFeatures: state.selectedFeatures,
-        nodeBindings: nodeBindings,
-        controlSchemas: controlSchemas,
-      };
-      if (outputNodeId) snapshotUpdate.outputNodeId = outputNodeId;
-
-      await updateSnapshot(apiBase, state.existingSnapshotId, snapshotUpdate);
-
-      // ── Update preset metadata ────────────────────────────────────
-      if (state.existingPresetId) {
-        await updatePreset(apiBase, state.existingPresetId, {
-          label: state.details.name,
-          description: state.details.description,
-          compatibleFeatures: state.selectedFeatures,
-          snapshotId: state.existingSnapshotId,
-        });
-      }
-
-      state.step = "saved";
-      return;
-    }
-
-    // ── New preset flow ─────────────────────────────────────────────
-
-    // 1. Capture the current graph
-    const captureResult = await captureCurrentComfyGraph();
-    if (!captureResult.ok) {
-      state.step = "error";
-      state.errorMessage = captureResult.reason || "Failed to capture graph";
-      return;
-    }
-
-    state.graphJson = captureResult.graphJson;
-    state.apiPromptJson = captureResult.apiPromptJson;
-    state.captureWarnings = captureResult.warnings || [];
-
-    // 2. Create snapshot
-    const controlSchemas = buildControlSchemas(state);
-    const snapshotPayload = {
-      name: state.details.name + " (snapshot)",
-      description: state.details.description,
-      compatibleFeatures: state.selectedFeatures,
-      graphJson: state.graphJson,
-      apiPromptJson: state.apiPromptJson,
-      nodeBindings: nodeBindings,
-      outputNodeId: outputNodeId || "",
-      source: "current_graph",
-      controlSchemas: controlSchemas,
-    };
-
-    const snapshotResult = await createSnapshot(apiBase, snapshotPayload);
-    if (!snapshotResult || !snapshotResult.snapshot) {
-      state.step = "error";
-      state.errorMessage = "Server rejected snapshot creation";
-      return;
-    }
-
-    state.snapshotResult = snapshotResult.snapshot;
-    const snapshotId = snapshotResult.snapshot.id;
-
-    // 3. Create preset
-    const presetPayload = {
-      label: state.details.name,
-      description: state.details.description,
-      snapshotId: snapshotId,
-      compatibleFeatures: state.selectedFeatures,
-      defaults: {},
-    };
-
-    const presetResult = await createPreset(apiBase, presetPayload);
-    if (!presetResult || !presetResult.preset) {
-      state.step = "error";
-      state.errorMessage = "Server rejected preset creation";
-      return;
-    }
-
-    state.presetResult = presetResult.preset;
-
-    // 4. Show success
-    state.step = "saved";
+    // Presets and snapshots no longer exist. The wizard's one live job is
+    // persisting a version's Mapping (the branch above); every other caller
+    // shape is gone, so say so truthfully instead of writing a dead record.
+    state.step = "error";
+    state.errorMessage =
+      "Presets have been removed. Use the version's Mapping editor to change bindings.";
   } catch (err) {
     state.step = "error";
     state.errorMessage = err.message || "An unexpected error occurred";
@@ -2629,9 +2516,9 @@ function applySuggestedBinding(state, roleKey, suggestion) {
   return true;
 }
 
-function closePresetWizardAndNotify() {
+function closeSetupWizardAndNotify() {
   const onDone = _wizardState ? _wizardState._onDone : null;
-  closePresetWizard();
+  closeWorkflowSetupWizard();
   if (onDone) onDone();
 }
 

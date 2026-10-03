@@ -353,8 +353,9 @@ def test_export_endpoint_constants():
     path = c.EXPORT_ENDPOINT.format(version_id="wv_abc")
     assert path.startswith("/comfymodal/studio/workflows/")
     assert path.endswith("/export")
-    assert c.EXPORT_QUERY_INCLUDE_PRESETS == "include_presets"
-    assert c.EXPORT_DEFAULT_INCLUDE_PRESETS is False
+    # Presets are gone, so the export contract carries no preset query flag.
+    assert not hasattr(c, "EXPORT_QUERY_INCLUDE_PRESETS")
+    assert not hasattr(c, "EXPORT_DEFAULT_INCLUDE_PRESETS")
 
 
 def test_import_endpoint_constants():
@@ -368,12 +369,17 @@ def test_import_dry_run_default_contract():
     assert isinstance(c.IMPORT_DEFAULT_DRY_RUN, bool)
 
 
-def test_include_presets_default_false():
-    assert c.EXPORT_DEFAULT_INCLUDE_PRESETS is False
-    assert c.IMPORT_DEFAULT_IMPORT_PRESETS is False
-    assert c.IMPORT_DEFAULT_APPLY_DEFAULT_PRESET is False
-    assert c.IMPORT_FIELD_IMPORT_PRESETS == "import_presets"
-    assert c.IMPORT_FIELD_APPLY_DEFAULT_PRESET == "apply_default_preset"
+def test_preset_policy_flags_are_gone():
+    """Presets no longer exist, so the contract must not offer preset policy."""
+    for name in (
+        "EXPORT_QUERY_INCLUDE_PRESETS",
+        "EXPORT_DEFAULT_INCLUDE_PRESETS",
+        "IMPORT_FIELD_IMPORT_PRESETS",
+        "IMPORT_FIELD_APPLY_DEFAULT_PRESET",
+        "IMPORT_DEFAULT_IMPORT_PRESETS",
+        "IMPORT_DEFAULT_APPLY_DEFAULT_PRESET",
+    ):
+        assert not hasattr(c, name), f"{name} must not be re-introduced"
     assert c.IMPORT_PREVIEW_STATUS == "preview"
 
 

@@ -16,10 +16,9 @@ from pathlib import Path
 from studio_domain import (
     ImmutableVersionError,
     MappingAlreadyExistsError,
-    PresetCopyError,
     WorkflowDomainService,
     WorkflowNotRunnableError,
-    WorkflowPresetValidationError,
+    WorkflowDomainValidationError,
     WorkflowVersion,
     derive_mapping_candidates,
     graph_hash_from_capture,
@@ -171,26 +170,25 @@ class WorkflowTests(WorkflowDomainTestCase):
         self.assertTrue(updated["favorite"])
         self.assertEqual(updated["source_author"], "Krea")
         self.assertEqual(updated["compatible_models"], ["a.safetensors"])
-        with self.assertRaises(WorkflowPresetValidationError):
+        with self.assertRaises(WorkflowDomainValidationError):
             self.service.update_workflow(wf["workflow_id"], {"latest_version_id": "x"})
 
-    def test_nested_folders_and_tags(self):
-        self.create_workflow(name="A", folder="a/b/c", tags=["t1"])
-        self.create_workflow(name="B", folder="a/b", tags=["t2"])
-        self.create_workflow(name="C", folder="a/b/c")
-        self.create_workflow(name="D", folder="x")
-        self.assertEqual(self.service.list_folders(), ["a", "a/b", "a/b/c", "x"])
-        wf = self.create_workflow(name="E", folder="y")
-        version = self.create_version(wf["workflow_id"])
-        mapping = self.full_mapping_dict()
-        self.service.set_mapping(
-            version["workflow_version_id"],
-            entries=mapping["entries"], output_node_id=mapping["output_node_id"],
+    def test_explicit_folders_are_durable_and_include_parents(self):
+        self.service.create_folder(" /empty/ ")
+        self.service.create_folder("nested/child")
+        self.service.create_workflow("Legacy", folder="legacy/deep")
+
+        self.assertEqual(
+            self.service.list_folders(),
+            ["empty", "legacy", "legacy/deep", "nested", "nested/child"],
         )
-        self.service.create_preset(
-            version["workflow_version_id"], "P", values=self.default_values(), tags=["t2", "t3"]
-        )
-        self.assertEqual(self.service.list_tags(), ["t1", "t2", "t3"])
+        with self.assertRaises(WorkflowDomainValidationError):
+            self.service.create_folder(" /")
+        with self.assertRaises(WorkflowDomainValidationError):
+            self.service.create_folder(None)
+
+        reloaded = WorkflowDomainService(self.root)
+        self.assertEqual(reloaded.list_folders(), self.service.list_folders())
 
 
 # ── Versions ─────────────────────────────────────────────────────────────
@@ -281,30 +279,6 @@ class VersionTests(WorkflowDomainTestCase):
         self.assertTrue(state.runnable)
         self.service.assert_runnable(version_id)  # does not raise
 
-    def test_mapping_missing_node_marks_incomplete(self):
-        wf = self.create_workflow()
-        version = self.create_version(wf["workflow_id"])
-        mapping = self.full_mapping_dict()
-        mapping["entries"]["positive_prompt"]["node_id"] = "99"
-        self.service.set_mapping(
-            version["workflow_version_id"],
-            entries=mapping["entries"], output_node_id=mapping["output_node_id"],
-        )
-        version_id = version["workflow_version_id"]
-        state = self.service.derive_version_state(version_id)
-        self.assertEqual(state.status, "incomplete")
-        self.assertTrue(any("node 99" in r for r in state.reasons))
-        # A preset on this version is incomplete too.
-        preset = self.service.create_preset(
-            version_id, "P", values=self.default_values()
-        )
-        self.assertEqual(preset["state"]["status"], "incomplete")
-        self.assertFalse(preset["state"]["runnable"])
-
-
-# ── Mapping ──────────────────────────────────────────────────────────────
-
-
 class MappingTests(WorkflowDomainTestCase):
     def test_one_mapping_per_version(self):
         wf = self.create_workflow()
@@ -369,341 +343,6 @@ class MappingTests(WorkflowDomainTestCase):
 
 
 # ── Presets ──────────────────────────────────────────────────────────────
-
-
-class PresetTests(WorkflowDomainTestCase):
-    def test_zero_and_false_values_survive(self):
-        wf = self.create_workflow()
-        prompt = {
-            "1": {"class_type": "TestNode", "inputs": {
-                "seed": 0, "ratio": 0.0, "enabled": False, "text": "",
-            }},
-            "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
-        }
-        version = self.create_version(wf["workflow_id"], prompt)
-        entries = {
-            "seed": {"node_id": "1", "input_name": "seed", "kind": "node_input",
-                     "control_kind": "integer", "data_type": "INT", "minimum": 0.0, "required": True},
-            "ratio": {"node_id": "1", "input_name": "ratio", "kind": "node_input",
-                      "control_kind": "number", "data_type": "FLOAT", "required": False},
-            "enabled": {"node_id": "1", "input_name": "enabled", "kind": "node_input",
-                        "control_kind": "boolean", "data_type": "BOOLEAN", "required": False},
-            "label": {"node_id": "1", "input_name": "text", "kind": "node_input",
-                      "control_kind": "string", "data_type": "STRING", "required": False},
-        }
-        self.service.set_mapping(
-            version["workflow_version_id"], entries=entries, output_node_id="2"
-        )
-        values = {"seed": 0, "ratio": 0.0, "enabled": False, "label": ""}
-        preset = self.service.create_preset(
-            version["workflow_version_id"], "ZeroPreset", values=values
-        )
-        self.assertEqual(preset["state"]["status"], "ready")
-        self.assertTrue(preset["state"]["runnable"])
-        stored = self.service.get_preset(preset["preset_id"])
-        self.assertEqual(stored["values"]["seed"], 0)
-        self.assertEqual(stored["values"]["enabled"], False)
-        self.assertEqual(stored["values"]["ratio"], 0.0)
-        self.assertEqual(stored["values"]["label"], "")
-        # strict=False tolerates unknown controls (forward-compat).
-        loose = self.service.create_preset(
-            version["workflow_version_id"], "Loose",
-            values={**values, "future_control": 42}, strict=False,
-        )
-        self.assertEqual(loose["values"]["future_control"], 42)
-
-    def test_enum_invalid_value_saved_but_incomplete(self):
-        wf = self.create_workflow()
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        values = self.default_values()
-        values["sampler"] = "not-a-real-sampler"
-        preset = self.service.create_preset(version_id, "BadSampler", values=values)
-        self.assertEqual(preset["state"]["status"], "incomplete")
-        self.assertTrue(any("sampler" in r for r in preset["state"]["reasons"]))
-
-    def test_unknown_control_rejected(self):
-        wf = self.create_workflow()
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.create_preset(
-                version_id, "P", values={"not_a_control": 1}
-            )
-
-    def test_many_presets_per_version(self):
-        wf = self.create_workflow()
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        for i in range(3):
-            self.service.create_preset(version_id, f"Preset {i}", values=self.default_values())
-        presets = self.service.list_presets(version_id)
-        self.assertEqual(len(presets), 3)
-        self.assertEqual(len(self.service.list_presets_for_workflow(wf["workflow_id"])), 3)
-
-    def test_required_missing_value_incomplete(self):
-        wf = self.create_workflow()
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        values = self.default_values()
-        del values["seed"]  # seed is required in the mapping
-        preset = self.service.create_preset(version_id, "NoSeed", values=values)
-        self.assertEqual(preset["state"]["status"], "incomplete")
-        self.assertTrue(any("seed" in r for r in preset["state"]["reasons"]))
-        # The incomplete preset is still saved.
-        self.assertEqual(self.service.get_preset(preset["preset_id"])["name"], "NoSeed")
-
-    def test_recommended_and_exposed_roundtrip(self):
-        wf = self.create_workflow()
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        preset = self.service.create_preset(
-            version_id, "P", values=self.default_values(),
-            exposed_controls=["seed", "steps"], recommended_values={"seed": 42},
-            favorite=True, tags=["fav"],
-        )
-        stored = self.service.get_preset(preset["preset_id"])
-        self.assertEqual(stored["exposed_controls"], ["seed", "steps"])
-        self.assertEqual(stored["recommended_values"], {"seed": 42})
-        self.assertTrue(stored["favorite"])
-        self.assertEqual(stored["tags"], ["fav"])
-
-    def test_default_preset(self):
-        wf = self.create_workflow()
-        other_wf = self.create_workflow(name="Other")
-        version_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(version_id, "P1", values=self.default_values())
-        self.service.set_default_preset(wf["workflow_id"], p1["preset_id"])
-        default = self.service.get_default_preset(wf["workflow_id"])
-        if default is None:
-            self.fail("expected a default preset")
-        self.assertEqual(default["preset_id"], p1["preset_id"])
-        self.assertTrue(self.service.get_preset(p1["preset_id"])["is_default"])
-        # A preset from another workflow cannot become the default here.
-        other_version = self.create_version(other_wf["workflow_id"])
-        other_mapping = self.full_mapping_dict()
-        self.service.set_mapping(
-            other_version["workflow_version_id"],
-            entries=other_mapping["entries"], output_node_id=other_mapping["output_node_id"],
-        )
-        other_preset = self.service.create_preset(
-            other_version["workflow_version_id"], "OP", values=self.default_values()
-        )
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.set_default_preset(wf["workflow_id"], other_preset["preset_id"])
-        self.service.clear_default_preset(wf["workflow_id"])
-        self.assertIsNone(self.service.get_default_preset(wf["workflow_id"]))
-
-
-# ── copy-forward ─────────────────────────────────────────────────────────
-
-
-class CopyForwardTests(WorkflowDomainTestCase):
-    def test_copy_forward_values_copied_old_untouched(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        values = self.default_values()
-        p1 = self.service.create_preset(v1_id, "Preset A", values=values)
-        before = copy.deepcopy(self.service.get_preset(p1["preset_id"]))
-
-        changed = txt2img_prompt()
-        changed["5"]["inputs"]["batch_size"] = 2  # structural change, mapping unchanged
-        v2 = self.create_version(wf["workflow_id"], changed)
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-
-        result = self.service.copy_preset_to_version(p1["preset_id"], v2["workflow_version_id"])
-        self.assertEqual(result["dropped_controls"], [])
-        self.assertEqual(result["state"]["status"], "ready")
-        copied = result["preset"]
-        self.assertEqual(copied["workflow_version_id"], v2["workflow_version_id"])
-        self.assertEqual(copied["workflow_id"], wf["workflow_id"])
-        self.assertEqual(copied["values"]["seed"], values["seed"])
-        self.assertEqual(copied["values"]["steps"], 20)
-        # Original is untouched, still on v1.
-        after = copy.deepcopy(self.service.get_preset(p1["preset_id"]))
-        self.assertEqual(before, after)
-        self.assertEqual(len(self.service.list_presets(v1_id)), 1)
-        self.assertEqual(len(self.service.list_presets(v2["workflow_version_id"])), 1)
-
-    def test_copy_forward_dropped_mapped_input_marks_incomplete(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(v1_id, "Preset A", values=self.default_values())
-        before = copy.deepcopy(self.service.get_preset(p1["preset_id"]))
-
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["seed"]  # mapped input disappears
-        v2 = self.create_version(wf["workflow_id"], changed)
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-
-        result = self.service.copy_preset_to_version(p1["preset_id"], v2["workflow_version_id"])
-        self.assertEqual(result["dropped_controls"], ["seed"])
-        self.assertEqual(result["state"]["status"], "incomplete")
-        self.assertTrue(any("seed" in r for r in result["state"]["reasons"]))
-        copied = result["preset"]
-        self.assertNotIn("seed", copied["values"])
-        self.assertEqual(copied["dropped_controls"], ["seed"])
-        self.assertEqual(before, copy.deepcopy(self.service.get_preset(p1["preset_id"])))
-
-    def test_copy_to_older_version_rejected(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["steps"]
-        v2 = self.create_version(wf["workflow_id"], changed)
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-        p2 = self.service.create_preset(v2["workflow_version_id"], "P2", values={
-            "positive_prompt": "x", "negative_prompt": "y", "seed": 0, "cfg": 7.0,
-            "sampler": "euler", "scheduler": "normal", "denoise": 1.0,
-            "width": 512, "height": 512, "model": "krea_model.safetensors",
-        })
-        with self.assertRaises(PresetCopyError):
-            self.service.copy_preset_to_version(p2["preset_id"], v1_id)
-
-    def test_copy_cross_workflow_rejected(self):
-        wf_a = self.create_workflow(name="A")
-        wf_b = self.create_workflow(name="B")
-        v1_id, mapping = self.setup_mapped_workflow(wf_a["workflow_id"])
-        p1 = self.service.create_preset(v1_id, "P1", values=self.default_values())
-        v_b = self.create_version(wf_b["workflow_id"])
-        with self.assertRaises(PresetCopyError):
-            self.service.copy_preset_to_version(p1["preset_id"], v_b["workflow_version_id"])
-
-    def test_bulk_copy_forward_all_or_nothing(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(v1_id, "P1", values=self.default_values())
-        p2 = self.service.create_preset(v1_id, "P2", values=self.default_values())
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["steps"]
-        v2 = self.create_version(wf["workflow_id"], changed)
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-        count_before = len(self.service.store.list_presets())
-        with self.assertRaises(PresetCopyError):
-            self.service.copy_presets_to_version(
-                [p1["preset_id"], "no-such-preset", p2["preset_id"]],
-                v2["workflow_version_id"],
-            )
-        self.assertEqual(len(self.service.store.list_presets()), count_before)
-        results = self.service.copy_presets_to_version(
-            [p1["preset_id"], p2["preset_id"]], v2["workflow_version_id"]
-        )
-        self.assertEqual(len(results), 2)
-        self.assertEqual(len(self.service.list_presets(v2["workflow_version_id"])), 2)
-
-
-# ── model compatibility ──────────────────────────────────────────────────
-
-
-class ModelCompatibilityTests(WorkflowDomainTestCase):
-    def test_model_choice_compatibility(self):
-        wf = self.create_workflow(
-            compatible_models=["krea_model.safetensors", "flux-dev.safetensors"]
-        )
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        values = self.default_values()
-        ok = self.service.create_preset(
-            v1_id, "WithModel", values=values,
-            model_choices={"model": "krea_model.safetensors"},
-        )
-        self.assertEqual(ok["state"]["status"], "ready")
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.create_preset(
-                v1_id, "BadModel", values=values,
-                model_choices={"model": "some_other_model.safetensors"},
-            )
-
-    def test_empty_compatible_models_allows_any(self):
-        wf = self.create_workflow()  # no compatible_models declared
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        preset = self.service.create_preset(
-            v1_id, "AnyModel", values=self.default_values(),
-            model_choices={"model": "anything.safetensors"},
-        )
-        self.assertEqual(preset["state"]["status"], "ready")
-
-    def test_copy_forward_incompatible_model_marks_incomplete(self):
-        wf = self.create_workflow(
-            compatible_models=["krea_model.safetensors", "flux-dev.safetensors"]
-        )
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(
-            v1_id, "P1", values=self.default_values(),
-            model_choices={"model": "krea_model.safetensors"},
-        )
-        # Change the logical compatibility BEFORE creating the new version:
-        # the new version freezes the new list; the old version keeps the old.
-        self.service.update_workflow(
-            wf["workflow_id"], {"compatible_models": ["flux-dev.safetensors"]}
-        )
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["steps"]
-        v2 = self.create_version(wf["workflow_id"], changed)
-        self.assertEqual(v2["compatible_models"], ["flux-dev.safetensors"])
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-        # Old preset still validates against v1's frozen list.
-        self.assertEqual(self.service.get_preset(p1["preset_id"])["state"]["status"], "ready")
-        result = self.service.copy_preset_to_version(p1["preset_id"], v2["workflow_version_id"])
-        self.assertEqual(result["state"]["status"], "incomplete")
-        self.assertTrue(any("compatible" in r for r in result["state"]["reasons"]))
-
-
-# ── integration ──────────────────────────────────────────────────────────
-
-
-class IntegrationTests(WorkflowDomainTestCase):
-    def test_one_workflow_many_versions_one_mapping_each_many_presets(self):
-        wf = self.create_workflow(name="Krea Portrait Workflow")
-        v1_id, mapping1 = self.setup_mapped_workflow(wf["workflow_id"])
-        for i in range(2):
-            self.service.create_preset(v1_id, f"P{i}", values=self.default_values())
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["steps"]
-        v2 = self.create_version(wf["workflow_id"], changed)
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-        self.service.create_preset(v2["workflow_version_id"], "P2", values={
-            "positive_prompt": "x", "negative_prompt": "y", "seed": 1, "cfg": 7.0,
-            "sampler": "euler", "scheduler": "normal", "denoise": 1.0,
-            "width": 512, "height": 512, "model": "krea_model.safetensors",
-        })
-        # Exactly one mapping per version.
-        for version_id in (v1_id, v2["workflow_version_id"]):
-            records = [
-                m for m in self.service.store.list_mappings()
-                if m.get("workflow_version_id") == version_id
-            ]
-            self.assertEqual(len(records), 1)
-        self.assertEqual(len(self.service.list_presets(v1_id)), 2)
-        self.assertEqual(len(self.service.list_presets(v2["workflow_version_id"])), 1)
-        # Old version record still intact.
-        v1_state = self.service.derive_version_state(v1_id)
-        self.assertEqual(v1_state.status, "ready")
-        self.assertTrue(v1_state.runnable)
-        # Versions are listed in order.
-        numbers = [v["version_number"] for v in self.service.list_versions(wf["workflow_id"])]
-        self.assertEqual(numbers, [1, 2])
-
-
-# ── mapping immutability (hardening) ─────────────────────────────────────
 
 
 class MappingImmutabilityTests(WorkflowDomainTestCase):
@@ -794,37 +433,6 @@ class MappingRevisionTests(WorkflowDomainTestCase):
         self.assertEqual(old["mapping_id"], m1["mapping_id"])
         self.assertEqual(self.service.derive_version_state(v1_id).status, "ready")
 
-    def test_old_presets_unchanged_after_revision(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(v1_id, "P1", values=self.default_values())
-        before = copy.deepcopy(self.service.get_preset(p1["preset_id"]))
-        revised = self._revised_entries()
-        self.service.create_mapping_revision(
-            v1_id, entries=revised["entries"], output_node_id=revised["output_node_id"]
-        )
-        after = copy.deepcopy(self.service.get_preset(p1["preset_id"]))
-        self.assertEqual(before, after)
-        self.assertEqual(len(self.service.list_presets(v1_id)), 1)
-        self.assertEqual(self.service.get_preset(p1["preset_id"])["state"]["status"], "ready")
-
-    def test_copy_forward_to_revision_version(self):
-        wf = self.create_workflow()
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        p1 = self.service.create_preset(v1_id, "P1", values=self.default_values())
-        revised = self._revised_entries()
-        v2 = self.service.create_mapping_revision(
-            v1_id, entries=revised["entries"], output_node_id=revised["output_node_id"]
-        )
-        result = self.service.copy_preset_to_version(p1["preset_id"], v2["workflow_version_id"])
-        self.assertEqual(result["preset"]["workflow_version_id"], v2["workflow_version_id"])
-        # steps is dropped (not mapped in the revision) → copied preset incomplete.
-        self.assertEqual(result["dropped_controls"], ["steps"])
-        self.assertEqual(result["state"]["status"], "incomplete")
-        self.assertTrue(any("steps" in r for r in result["state"]["reasons"]))
-        # Original preset untouched.
-        self.assertEqual(len(self.service.list_presets(v1_id)), 1)
-
     def test_capture_after_revision_dedupes_to_latest(self):
         wf = self.create_workflow()
         v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
@@ -859,59 +467,6 @@ class MappingRevisionTests(WorkflowDomainTestCase):
 
 
 class VersionCompatTests(WorkflowDomainTestCase):
-    def test_workflow_compat_change_does_not_alter_old_preset_validation(self):
-        wf = self.create_workflow(
-            compatible_models=["krea_model.safetensors", "flux-dev.safetensors"]
-        )
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        self.assertEqual(
-            self.service.get_version(v1_id)["compatible_models"],
-            ["krea_model.safetensors", "flux-dev.safetensors"],
-        )
-        p1 = self.service.create_preset(
-            v1_id, "P1", values=self.default_values(),
-            model_choices={"model": "krea_model.safetensors"},
-        )
-        self.assertEqual(p1["state"]["status"], "ready")
-        # Logical workflow list changes — old version/preset semantics frozen.
-        self.service.update_workflow(
-            wf["workflow_id"], {"compatible_models": ["flux-dev.safetensors"]}
-        )
-        self.assertEqual(
-            self.service.get_workflow(wf["workflow_id"])["compatible_models"],
-            ["flux-dev.safetensors"],
-        )
-        self.assertEqual(
-            self.service.get_version(v1_id)["compatible_models"],
-            ["krea_model.safetensors", "flux-dev.safetensors"],
-        )
-        self.assertEqual(self.service.get_preset(p1["preset_id"])["state"]["status"], "ready")
-        self.assertTrue(self.service.get_preset(p1["preset_id"])["state"]["runnable"])
-
-    def test_new_version_captures_new_compatibility_set(self):
-        wf = self.create_workflow(
-            compatible_models=["krea_model.safetensors", "flux-dev.safetensors"]
-        )
-        v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])
-        self.service.update_workflow(
-            wf["workflow_id"], {"compatible_models": ["flux-dev.safetensors"]}
-        )
-        changed = txt2img_prompt()
-        del changed["3"]["inputs"]["steps"]
-        v2 = self.create_version(wf["workflow_id"], changed)
-        self.assertEqual(v2["compatible_models"], ["flux-dev.safetensors"])
-        v2_mapping = self.mapping_from_capture(make_capture(changed))
-        self.service.set_mapping(
-            v2["workflow_version_id"],
-            entries=v2_mapping["entries"], output_node_id=v2_mapping["output_node_id"],
-        )
-        # v2 validates against ITS OWN frozen list — krea is no longer allowed.
-        with self.assertRaises(WorkflowPresetValidationError):
-            self.service.create_preset(
-                v2["workflow_version_id"], "Bad", values=self.default_values(),
-                model_choices={"model": "krea_model.safetensors"},
-            )
-
     def test_mapping_revision_captures_current_compatibility(self):
         wf = self.create_workflow(compatible_models=["flux-dev.safetensors"])
         v1_id, mapping = self.setup_mapped_workflow(wf["workflow_id"])

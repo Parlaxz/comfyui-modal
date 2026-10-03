@@ -27,12 +27,14 @@
 // the version can never become runnable.
 
 import { test, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { installConsoleGuard, openStudio } from "./studio-fixtures.mjs";
 import { installStudioMockApi } from "./studio-mock-api.mjs";
 
 const COMFYUI_URL = process.env.COMFYUI_URL || "http://127.0.0.1:8188";
-const ZIT_ABS = "C:\\Users\\parla\\Downloads\\ZIT - Current Favorite.json";
+// The ZIT graph is a large local fixture, not checked into the repo. Point
+// ZIT_FIXTURE at it; fall back to the historical local path.
+const ZIT_ABS = process.env.ZIT_FIXTURE || "C:\\Users\\parla\\Downloads\\ZIT - Current Favorite.json";
 const ZIT_NAME = "ZIT - Current Favorite";
 
 const APP_NOISE_PATTERNS = [
@@ -121,6 +123,11 @@ async function readCanvasSelection(page) {
 
 test.describe("Studio ZIT E2E", () => {
   test("zit import, wizard setup, preset, playground run, 2x2 experiment, history", async ({ page }) => {
+    // Skip loudly rather than fail with ENOENT: the fixture is a local file.
+    test.skip(
+      !existsSync(ZIT_ABS),
+      `ZIT fixture not found at ${ZIT_ABS} (set ZIT_FIXTURE to run this spec)`
+    );
     const zit = JSON.parse(readFileSync(ZIT_ABS, "utf-8"));
     expect(Array.isArray(zit.nodes) && zit.nodes.length > 100).toBe(true);
 
@@ -474,7 +481,8 @@ test.describe("Studio ZIT E2E", () => {
     const wfSelect = page.locator('[data-testid="workflow-selector"]');
     await expect(wfSelect.locator(`option[value="${wfId}"]`)).toHaveCount(1, { timeout: 15000 });
     await wfSelect.selectOption(wfId);
-    await expect(page.locator('[data-testid="workflow-version-selector"] option')).toHaveCount(2, { timeout: 15000 });
+    // One version per workflow: the version selector shows no options.
+    await expect(page.locator('[data-testid="workflow-version-selector"] option')).toHaveCount(0, { timeout: 15000 });
     const presetSelect = page.locator('[data-testid="workflow-preset-selector"]');
     await expect(presetSelect.locator(`option[value="${presetId}"]`)).toHaveCount(1, { timeout: 15000 });
     await presetSelect.selectOption(presetId);

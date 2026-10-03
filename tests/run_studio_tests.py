@@ -180,7 +180,6 @@ NODE_UNIT_FILES: list[Path] = [
     ROOT / "tests" / "studio_phase_f6_history_actions_unit.mjs",
     # F3 History V2 Browser Download helper (MIME/filename contract + invariants)
     ROOT / "tests" / "studio_history_v2_download_unit.mjs",
-    ROOT / "tests" / "get_axis_eligibility_unit.mjs",
     ROOT / "tests" / "get_steps_recommendation_unit.mjs",
     ROOT / "tests" / "get_seed_insertion_unit.mjs",
     # H20 Wave G registrations: H6 Backend operations, H7 Model Library

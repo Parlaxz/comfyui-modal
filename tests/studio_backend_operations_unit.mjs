@@ -755,13 +755,19 @@ try {
     section("O20. Model Library ownership not duplicated in Backend");
   }
 
-  // 21. Backend Presets remain distinct (transitional owner preserved).
+  // 21. Backend Presets and Snapshots are removed; Credentials moved to Settings.
   {
-    assert.ok(backendSource.includes('"presets"'), "presets tab id present");
-    assert.ok(backendSource.includes('"Backend Presets"'), "Backend Presets label present");
-    assert.equal(backendSource.includes('"Workflow Presets"'), false, "not renamed to Workflow Presets");
-    assert.ok(backendSource.includes("./studio-backend-presets.js"), "preset module wiring intact");
-    section("O21. Backend Presets remain distinct and preserved");
+    assert.equal(backendSource.includes('"Backend Presets"'), false, "Backend Presets tab removed");
+    assert.equal(backendSource.includes('"snapshots"'), false, "Snapshots tab removed");
+    assert.equal(backendSource.includes('"overview"'), false, "Overview tab removed");
+    assert.equal(backendSource.includes('"credentials"'), false, "Credentials tab removed from Manage Modal");
+    assert.equal(backendSource.includes("./studio-backend-presets.js"), false, "preset module no longer wired");
+    assert.equal(backendSource.includes("./studio-backend-snapshots.js"), false, "snapshot module no longer wired");
+    assert.equal(backendSource.includes("Make Preset"), false, "Make Preset launcher removed");
+    // Credentials now live in Settings.
+    assert.ok(readWeb("studio-settings.js").includes("renderCredentialsSection"),
+      "Settings owns the credentials section");
+    section("O21. Backend Presets/Snapshots/Overview removed; Credentials in Settings");
   }
 
   // 22. H18 Wave G: the legacy settings overlay is deleted. modal-settings.js
@@ -837,22 +843,18 @@ try {
     section("I7-25. Workspaces loading state uses role=status primitive, then server truth");
   }
 
-  // 26. Source truth: all three Backend list modules consume the shared
+  // 26. Source truth: the surviving Backend list modules consume the shared
   //     loading primitive; the dead renderEmptyState glue wrapper stays
   //     deleted; page h2 / tab selection / chip geometry markers present.
   {
-    const presetsSrc = readWeb("studio-backend-presets.js");
-    const snapshotsSrc = readWeb("studio-backend-snapshots.js");
-    for (const [src, name, testid] of [
-      [presetsSrc, "presets", "backend-presets-loading"],
-      [snapshotsSrc, "snapshots", "backend-snapshots-loading"],
+    for (const [name, testid] of [
+      ["workspaces", "backend-workspaces-loading"],
     ]) {
+      const src = readWeb("studio-backend-workspaces.js");
       assert.ok(src.includes('./studio-loading.js'), `${name} imports the shared primitive`);
       assert.ok(src.includes(`"${testid}"`), `${name} loader carries its own testid`);
       assert.ok(src.includes("renderLoadingState({"), `${name} calls renderLoadingState`);
     }
-    assert.equal(presetsSrc.includes('textContent = "Loading presets..."'), false);
-    assert.equal(snapshotsSrc.includes('textContent = "Loading snapshots..."'), false);
     // Dead wrapper stays deleted (I7); shared primitive keeps its generic API.
     assert.equal(backendSource.includes("renderEmptyState"), false);
     assert.ok(readWeb("studio-ui.js").includes("function renderEmptyState(options"));

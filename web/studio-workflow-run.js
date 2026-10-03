@@ -16,8 +16,6 @@ import {
   listWorkflows,
   listWorkflowVersions,
   getWorkflowRunContext,
-  listVersionPresets,
-  getWorkflowPreset,
 } from "./studio-backend-api.js";
 
 import {
@@ -55,12 +53,9 @@ export function createWorkflowRunStore() {
   return {
     workflowId: "",
     workflowVersionId: "",
-    presetId: "",
     workflowName: "",
-    presetName: "",
     library: [],
     versions: [],
-    presets: [],
     runContext: null,
     controlValues: {},
     status: "idle",
@@ -71,9 +66,7 @@ export function createWorkflowRunStore() {
 
     setWorkflowId(id) { this.workflowId = id != null ? String(id) : ""; },
     setVersionId(id) { this.workflowVersionId = id != null ? String(id) : ""; },
-    setPresetId(id) { this.presetId = id != null ? String(id) : ""; },
     setWorkflowName(name) { this.workflowName = name != null ? String(name) : ""; },
-    setPresetName(name) { this.presetName = name != null ? String(name) : ""; },
     setControlValue(role, value) { this.controlValues[role] = value; },
     setControlValues(dict) {
       this.controlValues = dict && typeof dict === "object" ? { ...dict } : {};
@@ -81,7 +74,6 @@ export function createWorkflowRunStore() {
     setRunContext(ctx) { this.runContext = ctx || null; },
     setLibrary(arr) { this.library = Array.isArray(arr) ? arr.slice() : []; },
     setVersions(arr) { this.versions = Array.isArray(arr) ? arr.slice() : []; },
-    setPresets(arr) { this.presets = Array.isArray(arr) ? arr.slice() : []; },
     setStatus(s) { this.status = s || "idle"; },
     setError(e) { this.error = e != null ? String(e) : ""; },
     setReasons(arr) { this.reasons = Array.isArray(arr) ? arr.map(String) : []; },
@@ -90,12 +82,9 @@ export function createWorkflowRunStore() {
     reset() {
       this.workflowId = "";
       this.workflowVersionId = "";
-      this.presetId = "";
       this.workflowName = "";
-      this.presetName = "";
       this.library = [];
       this.versions = [];
-      this.presets = [];
       this.runContext = null;
       this.controlValues = {};
       this.status = "idle";
@@ -116,28 +105,6 @@ function _errorMessage(err, fallback) {
   try { return JSON.stringify(err); } catch (e) { return fallback; }
 }
 
-/** Union of a preset's values + model_choices (model_choices override values). */
-function _presetRoleValues(preset) {
-  if (!preset || typeof preset !== "object") return {};
-  const values = preset.values && typeof preset.values === "object" ? preset.values : {};
-  const choices = preset.model_choices && typeof preset.model_choices === "object" ? preset.model_choices : {};
-  return { ...values, ...choices };
-}
-
-/**
- * Resolve the default preset for a version: the workflow default preset id
- * only when it belongs to this version's preset list, otherwise the first
- * preset, otherwise null.
- */
-function _resolveDefaultPreset(presets, defaultPresetId) {
-  if (!Array.isArray(presets) || !presets.length) return null;
-  if (defaultPresetId) {
-    const match = presets.find((p) => String(p.preset_id) === String(defaultPresetId));
-    if (match) return match;
-  }
-  return presets[0];
-}
-
 /** Pick the version to select: latest_version_id when present, else newest version_number. */
 function _pickDefaultVersionId(versions, latestVersionId) {
   if (!Array.isArray(versions) || !versions.length) return "";
@@ -154,7 +121,7 @@ function _pickDefaultVersionId(versions, latestVersionId) {
 
 /**
  * Reasons that gate runnability, passed through verbatim from the backend
- * version state plus local completeness (mapping + preset selection).
+ * version state plus local completeness (mapping presence).
  */
 function _gateReasons(store) {
   const ctx = store.runContext;
@@ -168,11 +135,10 @@ function _gateReasons(store) {
     reasons.push(...state.reasons.map(String));
   }
   if (!ctx.mapping) reasons.push("missing mapping");
-  if (!store.presetId) reasons.push("no preset selected for version");
   return reasons;
 }
 
-/** Entry default when neither preset nor the graph define a value. */
+/** Entry default when the graph does not define a value. */
 function _entryDefault(entry) {
   if (Array.isArray(entry.enum_options) && entry.enum_options.length) {
     return entry.required ? entry.enum_options[0] : undefined;
@@ -258,8 +224,8 @@ export async function loadRunContext(apiBase, store, workflowId, versionId) {
 }
 
 /**
- * Select a workflow: reset version/preset, load versions + run-context +
- * presets, resolve the default preset.
+ * Select a workflow: reset version state, load versions + run-context, and
+ * derive control defaults from the resolved version.
  * @param {string} apiBase
  * @param {object} store
  * @param {string} workflowId
@@ -275,10 +241,8 @@ export async function selectWorkflow(apiBase, store, workflowId) {
       store.setReasons(["no workflow selected"]);
       return { ok: false, error: "no workflow selected", reasons: ["no workflow selected"] };
     }
-    // Reset version/preset state from any previous selection.
+    // Reset version state from any previous selection.
     store.setVersionId("");
-    store.setPresetId("");
-    store.setPresetName("");
     store.setRunContext(null);
     store.controlValues = {};
     store.setWorkflowId(workflowId);
@@ -309,22 +273,8 @@ export async function selectWorkflow(apiBase, store, workflowId) {
       return { ok: false, error: ctxResult.error, reasons: ctxResult.reasons };
     }
 
-    const presetsData = await listVersionPresets(apiBase, versionId);
-    const presets = (presetsData && Array.isArray(presetsData.presets)) ? presetsData.presets : [];
-    store.setPresets(presets);
-
-    const defaultPresetId = store.runContext && store.runContext.workflow
-      ? store.runContext.workflow.default_preset_id : "";
-    const preset = _resolveDefaultPreset(presets, defaultPresetId);
-    if (preset) {
-      store.setPresetId(String(preset.preset_id));
-      store.setPresetName(preset.name || "");
-    } else {
-      store.setPresetId("");
-      store.setPresetName("");
-      store.setReasons([..._gateReasons(store).filter((r) => r !== "no preset selected for version"), "no preset"]);
-    }
-    store.controlValues = defaultValuesFromContext(store, preset || null);
+    // Control defaults come from the version's own captured graph.
+    store.controlValues = defaultValuesFromContext(store);
     store.lastLoadedAt = Date.now();
     store.setStatus("ready");
     return { ok: true };
@@ -338,7 +288,7 @@ export async function selectWorkflow(apiBase, store, workflowId) {
 }
 
 /**
- * Select a version of the current workflow: reload run-context + presets
+ * Select a version of the current workflow: reload run-context
  * and reset control values to the version's defaults.
  * @param {string} apiBase
  * @param {object} store
@@ -355,8 +305,6 @@ export async function selectVersion(apiBase, store, versionId) {
       store.setReasons(["no version selected"]);
       return { ok: false, error: "no version selected", reasons: ["no version selected"] };
     }
-    store.setPresetId("");
-    store.setPresetName("");
     store.controlValues = {};
 
     const ctxResult = await loadRunContext(apiBase, store, store.workflowId, versionId);
@@ -365,24 +313,7 @@ export async function selectVersion(apiBase, store, versionId) {
       return { ok: false, error: ctxResult.error, reasons: ctxResult.reasons };
     }
 
-    const presetsData = await listVersionPresets(apiBase, versionId);
-    const presets = (presetsData && Array.isArray(presetsData.presets)) ? presetsData.presets : [];
-    store.setPresets(presets);
-
-    // Default preset for THIS version: workflow default only when it belongs
-    // to this version's presets; else first preset; else none.
-    const defaultPresetId = store.runContext && store.runContext.workflow
-      ? store.runContext.workflow.default_preset_id : "";
-    const preset = _resolveDefaultPreset(presets, defaultPresetId);
-    if (preset) {
-      store.setPresetId(String(preset.preset_id));
-      store.setPresetName(preset.name || "");
-    } else {
-      store.setPresetId("");
-      store.setPresetName("");
-      store.setReasons([..._gateReasons(store).filter((r) => r !== "no preset selected for version"), "no preset for version"]);
-    }
-    store.controlValues = defaultValuesFromContext(store, preset || null);
+    store.controlValues = defaultValuesFromContext(store);
     store.lastLoadedAt = Date.now();
     store.setStatus("ready");
     return { ok: true };
@@ -396,73 +327,22 @@ export async function selectVersion(apiBase, store, versionId) {
 }
 
 /**
- * Select a preset for the current version. Verifies the preset belongs to
- * the selected version; never silently substitutes.
- * @param {string} apiBase
+ * Reset control values to the version's graph defaults. There is no preset to
+ * select; the workflow version is self-describing.
  * @param {object} store
- * @param {string} presetId
  * @returns {Promise<{ok: boolean, error?: string, reasons?: string[]}>}
  */
-export async function selectPreset(apiBase, store, presetId) {
+export async function selectVersionDefaults(store) {
   store.setStatus("loading");
   store.setError("");
   try {
-    if (!presetId) {
-      store.setPresetId("");
-      store.setPresetName("");
-      store.controlValues = defaultValuesFromContext(store, null);
-      store.setReasons(_gateReasons(store));
-      store.setStatus("ready");
-      return { ok: true };
-    }
-
-    const data = await getWorkflowPreset(apiBase, presetId);
-    const preset = data && data.status !== "error" && data.preset ? data.preset : null;
-    if (!preset || preset.preset_id == null) {
-      const msg = (data && (data.message || data.error)) || "preset not found";
-      store.setStatus("error");
-      store.setError(msg);
-      store.setReasons([msg]);
-      return { ok: false, error: msg, reasons: [msg] };
-    }
-
-    const presetVersionId = preset.workflow_version_id != null ? String(preset.workflow_version_id) : "";
-    if (presetVersionId !== String(store.workflowVersionId || "")) {
-      const msg = "preset belongs to a different version";
-      store.setStatus("error");
-      store.setError(msg);
-      store.setReasons([msg]);
-      return { ok: false, error: msg, reasons: [msg] };
-    }
-
-    store.setPresetId(String(preset.preset_id));
-    store.setPresetName(preset.name || "");
-
-    // Re-derive control values: preset wins for the roles it defines;
-    // other roles keep current controlValues, falling back to graph defaults.
-    const schema = getControlSchema(store);
-    const fromPreset = _presetRoleValues(preset);
-    const current = store.controlValues && typeof store.controlValues === "object" ? store.controlValues : {};
-    const graphDefaults = defaultValuesFromContext(store, null);
-    const merged = {};
-    for (const role of Object.keys(schema)) {
-      let value;
-      if (Object.prototype.hasOwnProperty.call(fromPreset, role)) {
-        value = fromPreset[role];
-      } else if (Object.prototype.hasOwnProperty.call(current, role)) {
-        value = current[role];
-      } else if (Object.prototype.hasOwnProperty.call(graphDefaults, role)) {
-        value = graphDefaults[role];
-      }
-      if (value !== undefined) merged[role] = value;
-    }
-    store.controlValues = merged;
+    store.controlValues = defaultValuesFromContext(store);
     store.setReasons(_gateReasons(store));
     store.lastLoadedAt = Date.now();
     store.setStatus("ready");
     return { ok: true };
   } catch (err) {
-    const msg = _errorMessage(err, "failed to select preset");
+    const msg = _errorMessage(err, "failed to load version defaults");
     store.setStatus("error");
     store.setError(msg);
     store.setReasons([msg]);
@@ -485,17 +365,14 @@ export function getControlSchema(store) {
 
 /**
  * Derive default control values for every schema entry. Precedence:
- * preset.values → preset.model_choices → graph current value (verbatim,
- * including 0 / 0.0 / false / "") → entry default. Values that cannot be
- * resolved are left unset (backend decides). Never invents values outside
- * graph-declared options.
+ * graph current value (verbatim, including 0 / 0.0 / false / "") → entry
+ * default. Values that cannot be resolved are left unset (backend decides).
+ * Never invents values outside graph-declared options.
  * @param {object} store
- * @param {object|null} [preset]
  * @returns {object} { role: value }
  */
-export function defaultValuesFromContext(store, preset) {
+export function defaultValuesFromContext(store) {
   const schema = getControlSchema(store);
-  const presetRoles = _presetRoleValues(preset);
   const executable = store && store.runContext && store.runContext.version
     ? store.runContext.version.executable_prompt
     : null;
@@ -503,9 +380,7 @@ export function defaultValuesFromContext(store, preset) {
   for (const [role, entry] of Object.entries(schema)) {
     if (!entry || typeof entry !== "object") continue;
     let value;
-    if (Object.prototype.hasOwnProperty.call(presetRoles, role)) {
-      value = presetRoles[role];
-    } else if (executable) {
+    if (executable) {
       const node = executable[String(entry.node_id)];
       if (node && node.inputs && Object.prototype.hasOwnProperty.call(node.inputs, entry.input_name)) {
         value = node.inputs[entry.input_name];
@@ -571,26 +446,20 @@ export function validateMappedValues(values, controlSchema) {
 }
 
 /**
- * Merge a preset's values/model_choices with caller overrides and validate
- * the result.
- * @param {object|null} preset
+ * Merge graph-derived defaults with caller overrides and validate the result.
+ * @param {object} defaults
  * @param {object} overrides
  * @param {object} controlSchema
  * @returns {{values: object, errors: Array<{field: string, message: string}>}}
  */
-export function mergePresetAndOverrides(preset, overrides, controlSchema) {
-  const base = preset
-    ? {
-        ...((preset.values && typeof preset.values === "object") ? preset.values : {}),
-        ...((preset.model_choices && typeof preset.model_choices === "object") ? preset.model_choices : {}),
-      }
-    : {};
+export function mergeDefaultsAndOverrides(defaults, overrides, controlSchema) {
+  const base = defaults && typeof defaults === "object" ? defaults : {};
   const merged = { ...base, ...(overrides && typeof overrides === "object" ? overrides : {}) };
   return validateMappedValues(merged, controlSchema);
 }
 
 /**
- * Runnable gating: backend state reasons (verbatim) + mapping/preset/control
+ * Runnable gating: backend state reasons (verbatim) + mapping/control
  * completeness. Run must be disabled unless runnable.
  * @param {object} store
  * @returns {{runnable: boolean, reasons: string[]}}
@@ -614,10 +483,6 @@ export function resolveRunnable(store) {
     runnable = false;
     reasons.push("missing mapping");
   }
-  if (!store.presetId) {
-    runnable = false;
-    reasons.push("no preset selected for version");
-  }
   const schema = getControlSchema(store);
   const { errors } = validateMappedValues(store.controlValues || {}, schema);
   if (errors.length) {
@@ -631,7 +496,7 @@ export function resolveRunnable(store) {
 
 /**
  * Build the run payload. Controls contain ONLY schema-known roles. Callers
- * must run validation first (resolveRunnable / mergePresetAndOverrides);
+ * must run validation first (resolveRunnable / mergeDefaultsAndOverrides);
  * this sanitizes defensively.
  * @param {string} apiBase - API base URL (not embedded in the payload).
  * @param {object} store
@@ -646,7 +511,6 @@ export function buildRunPayload(apiBase, store, modalOptions, trace) {
   return {
     workflow_id: store.workflowId,
     workflow_version_id: store.workflowVersionId,
-    preset_id: store.presetId,
     featureId: FEATURE_ID,
     controls: values,
     modal_options: modalOptions && typeof modalOptions === "object" ? { ...modalOptions } : {},
@@ -654,9 +518,7 @@ export function buildRunPayload(apiBase, store, modalOptions, trace) {
       source: "studio_playground",
       workflow_id: store.workflowId,
       workflow_version_id: store.workflowVersionId,
-      preset_id: store.presetId,
       workflow_name: store.workflowName || "",
-      preset_name: store.presetName || "",
       workflow_hash: (version && version.graph_hash) || null,
     },
     trace: trace && typeof trace === "object" ? trace : {},
@@ -756,7 +618,7 @@ export function resolveHandoffSelection(store) {
   if (!handoff || !handoff.workflowId) {
     return { ok: false, error: "no handoff selection" };
   }
-  const missing = "Requested workflow/version/preset no longer available";
+  const missing = "Requested workflow/version no longer available";
 
   const workflow = (store.library || []).find((w) => String(w.workflow_id) === String(handoff.workflowId));
   if (!workflow) return { ok: false, error: missing };
@@ -765,18 +627,12 @@ export function resolveHandoffSelection(store) {
     const version = (store.versions || []).find((v) => String(v.workflow_version_id) === String(handoff.workflowVersionId));
     if (!version) return { ok: false, error: missing };
   }
-  if (handoff.presetId) {
-    const preset = (store.presets || []).find((p) => String(p.preset_id) === String(handoff.presetId));
-    if (!preset) return { ok: false, error: missing };
-  }
 
   // Apply: only non-empty handoff ids override, so absent optional ids keep
   // whatever selection the caller already resolved.
   if (handoff.workflowId) store.setWorkflowId(handoff.workflowId);
   if (handoff.workflowVersionId) store.setVersionId(handoff.workflowVersionId);
-  if (handoff.presetId) store.setPresetId(handoff.presetId);
   if (handoff.workflowName) store.setWorkflowName(handoff.workflowName);
-  if (handoff.presetName) store.setPresetName(handoff.presetName);
   store.setHandoff(handoff);
   return { ok: true, handoff };
 }
