@@ -13325,6 +13325,11 @@ async def golden_unet_load(
             preresolve_record["unet_layout_preresolve_joined"] = (
                 preresolve.started_ns is not None
             )
+            # False means the bounded join expired and this stage's own
+            # inspect() did the parse, i.e. the pre-pre-resolve behaviour.
+            preresolve_record["unet_layout_preresolve_join_completed"] = (
+                preresolve.completed
+            )
             preresolve_record["unet_layout_preresolve_ms"] = preresolve.ms
             session._unet_layout_preresolve_holder = preresolve
             rec.event("unet_layout_preresolve", **dict(preresolve_record))
