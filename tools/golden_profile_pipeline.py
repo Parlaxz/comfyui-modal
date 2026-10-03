@@ -26,6 +26,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import time
@@ -40,7 +41,35 @@ if str(REPO_ROOT) not in sys.path:
 #: in Modal, which is not importable in every local context.
 DEFAULT_PROFILE_VOLUME = "comfymodal-v2-profiles"
 
-WORKSPACE_REGISTRY = REPO_ROOT / ".git" / "comfymodal" / "modal_workspaces.json"
+def _workspace_registry_path() -> Path:
+    """Resolve the shared workspace registry the way v2ctl does.
+
+    ``REPO_ROOT / ".git"`` is only correct in a primary checkout.  In a linked
+    worktree ``.git`` is a FILE containing "gitdir: ...", so the naive join
+    produced a path that does not exist and every volume operation died with
+    FileNotFoundError.  Ask git for the common directory instead - the registry
+    is shared state and belongs to the common dir, exactly as
+    ``modal_workspaces`` already resolves it.
+    """
+    probe = REPO_ROOT / ".git"
+    if probe.is_dir():
+        return probe / "comfymodal" / "modal_workspaces.json"
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        return probe / "comfymodal" / "modal_workspaces.json"
+    if not common:
+        return probe / "comfymodal" / "modal_workspaces.json"
+    resolved = Path(common)
+    if not resolved.is_absolute():
+        resolved = (REPO_ROOT / resolved).resolve()
+    return resolved / "comfymodal" / "modal_workspaces.json"
+
+
+WORKSPACE_REGISTRY = _workspace_registry_path()
 MODAL_TARGET = REPO_ROOT / "config" / "v2" / "modal_target.toml"
 RUNS_ROOT = REPO_ROOT / "artifacts" / "golden_exhaustive_runs"
 
