@@ -1478,10 +1478,11 @@ C0_PREADV_SICKNESS_HYPOTHESIS_STATUSES = (
     "not_tested",
 )
 
-C0_ARENA_BYTES = 512 * 1024 * 1024
-
-# Deploy-baked selector -> C0 geometry.  The arena is always exactly 512 MiB;
-# only the slot split and the child source-worker pool change.  ``qd4_64``
+# Deploy-baked selector -> C0 geometry.  The arena is always exactly
+# ``slot_count * slot_bytes`` for the selected arm -- ``SharedArenaRing``
+# rejects any other total with ``c0_arena_geometry_mismatch`` -- so the arena
+# size is derived per arm rather than declared once globally.  Only the slot
+# split and the child source-worker pool change between arms.  ``qd4_64``
 # and ``qd4_128`` select treatment arms.  Every other selector -- the
 # explicit control ``qd2_128`` and the default ``qd4_32`` -- preserves the
 # control geometry exactly, so there is no cross-arm fallback and existing
@@ -1489,9 +1490,9 @@ C0_ARENA_BYTES = 512 * 1024 * 1024
 _C0_TREATMENT_SOURCE_GEOMETRY = "qd4_64"
 _C0_TREATMENT_GEOMETRY = {
     "slot_bytes": 64 * 1024 * 1024,
-    "slot_count": 8,
+    "slot_count": 16,
     "source_workers": 4,
-    "slot_owners": (0, 0, 1, 1, 2, 2, 3, 3),
+    "slot_owners": (0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1, 2, 2, 3, 3),
     "capacity_class": "c0-qd4-64m",
 }
 _C0_TREATMENT_128_GEOMETRY = {
@@ -1519,7 +1520,9 @@ def resolve_c0_geometry(value: Any = None) -> dict:
     geometry.  ``qd4_64`` and ``qd4_128`` map to their treatment tuples;
     anything else maps to the control tuple.  There is deliberately no
     cross-arm fallback, no partial inheritance, and no dependency on the
-    parent H2D QD.
+    parent H2D QD.  The arena is derived as the exact product of the arm's
+    slots, so every arm keeps the full-utilisation invariant that
+    ``SharedArenaRing`` enforces.
     """
     selected = normalize_source_geometry(value)
     if selected == "qd4_128":
@@ -1531,7 +1534,9 @@ def resolve_c0_geometry(value: Any = None) -> dict:
             else _C0_CONTROL_GEOMETRY
         )
     resolved = dict(geometry)
-    resolved["arena_bytes"] = int(C0_ARENA_BYTES)
+    resolved["arena_bytes"] = int(resolved["slot_count"]) * int(resolved["slot_bytes"])
+    if len(resolved["slot_owners"]) != int(resolved["slot_count"]):
+        raise ValueError("c0_slot_owner_geometry_mismatch")
     resolved["source_geometry"] = selected
     return resolved
 
@@ -1539,6 +1544,7 @@ def resolve_c0_geometry(value: Any = None) -> dict:
 # Resolved once at import from the deploy-baked environment so the public
 # constants Golden Serial imports always describe the selected arm.
 _ACTIVE_C0_GEOMETRY = resolve_c0_geometry()
+C0_ARENA_BYTES = int(_ACTIVE_C0_GEOMETRY["arena_bytes"])
 C0_SLOT_BYTES = int(_ACTIVE_C0_GEOMETRY["slot_bytes"])
 C0_SLOT_COUNT = int(_ACTIVE_C0_GEOMETRY["slot_count"])
 C0_SOURCE_WORKERS = int(_ACTIVE_C0_GEOMETRY["source_workers"])
@@ -1637,7 +1643,7 @@ def c0_shm_populate_enabled() -> bool:
     """True only when the Experiment-1 SHM page-population treatment is ON.
 
     Deploy-baked, default OFF (exact production-005 control).  ON
-    materializes the fresh 512 MiB POSIX SHM with real CPU writes across
+    materializes the fresh C0 POSIX SHM with real CPU writes across
     disjoint regions before ``cudaHostRegister`` starts.  No source-file
     reads, no slot-semantic change, no geometry change.
     """
@@ -1659,7 +1665,7 @@ C0_DMA_PINNED_SLOT_BYTES = 64 * 1024 * 1024
 def c0_dma_ring_enabled() -> bool:
     """True only when the Experiment-3 DMA-ring treatment is ON.
 
-    Deploy-baked, default OFF (exact production-005 control: 8 x 64 MiB
+    Deploy-baked, default OFF (exact production-005 control: 16 x 64 MiB
     registered source arena, direct H2D, no staging copy).  ON selects the
     5-slot pageable source pool plus the 2-slot pinned DMA ring.
     """
@@ -1672,7 +1678,7 @@ C0_FIVE_SLOTS_ENV = "COMFYMODAL_GOLDEN_C0_FIVE_SLOTS"
 def c0_five_slots_enabled() -> bool:
     """True only when the 5-slot registered treatment geometry is ON.
 
-    Deploy-baked, default OFF (production-005 8-slot geometry).  ON selects
+    Deploy-baked, default OFF (production-005 16-slot geometry).  ON selects
     5 x 64 MiB globally shared source slots (320 MiB) with NO other change:
     host registration still follows COMFYMODAL_GOLDEN_C0_HOST_REGISTER, the
     DMA ring stays off unless separately selected, and the reader gate still
@@ -1685,7 +1691,7 @@ def resolve_c0_source_arena_geometry() -> dict[str, int]:
     """Resolve (size_bytes, slot_count, slot_bytes) for the C0 source arena.
 
     The DMA ring and the five-slot treatment share the 5 x 64 MiB source
-    geometry; anything else is the production-005 8 x 64 MiB default.
+    geometry; anything else is the production-005 16 x 64 MiB default.
     """
     if c0_dma_ring_enabled() or c0_five_slots_enabled():
         return {
@@ -2835,7 +2841,7 @@ def c0_transport_dimensions() -> dict:
     free slots to whichever producer leases next, so the correspondence is
     recorded, not enforced.  The returned tuple is the deploy-baked selection
     (control ``qd2_128`` -> 2 workers / 4 slots / 128 MiB, treatment
-    ``qd4_64`` -> 4 workers / 8 slots / 64 MiB) with no cross-arm fallback.
+    ``qd4_64`` -> 4 workers / 16 slots / 64 MiB) with no cross-arm fallback.
     """
     return {
         "queue_depth": C0_SOURCE_WORKERS,
@@ -3049,7 +3055,7 @@ class C0SessionTicket:
 class C0ControlLayout:
     """Binary, aligned layout for the model-level C0 control session.
 
-    The block is deliberately separate from the 512 MiB payload arena and is
+    The block is deliberately separate from the C0 payload arena and is
     never passed to CUDA.  ``published``/``consumed`` are monotonically
     increasing per lane; a descriptor is reusable only after both the child
     has published DONE and the parent has observed the existing H2D event.
@@ -4193,7 +4199,7 @@ class C0DmaRing:
 
 
 class SharedArenaRing:
-    """Parent-owned 512 MiB POSIX arena + persistent CUDA-sterile filler child.
+    """Parent-owned C0 POSIX arena + persistent CUDA-sterile filler child.
 
     The mapping is created once, registered once by the CUDA-owning parent, and
     reused for every C0 model stage.  No model-sized backing exists: the four
@@ -4325,7 +4331,7 @@ class SharedArenaRing:
         }
         self.reader_gate_enabled = c0_reader_gate_enabled()
         # Experiment-3 DMA ring: 5-slot pageable source pool + 2-slot pinned
-        # DMA ring.  OFF selects the exact production-005 8-slot registered
+        # DMA ring.  OFF selects the exact production-005 16-slot registered
         # arena; no other path reads these fields.
         self.dma_ring_enabled = c0_dma_ring_enabled()
         self.five_slots_enabled = c0_five_slots_enabled()
@@ -7514,7 +7520,7 @@ def _read_runtime_text(path, limit=240):
 
 def _runtime_markers():
     # Cheap child-side platform/runtime markers for split-IO evidence.  Never
-    # raises; missing values stay None.  The existing 512 MiB C0 mapping is the
+    # raises; missing values stay None.  The existing C0 arena mapping is the
     # same-container reproduction, so these markers (not a separate service)
     # are how a missing upstream gVisor fix becomes visible in evidence.
     markers = {
@@ -11097,7 +11103,7 @@ def arena_runtime_enabled() -> bool:
 
 
 def ensure_arena_runtime() -> SharedArenaRing:
-    """Create/register the single 512 MiB C0 arena + sterile child (idempotent)."""
+    """Create/register the single C0 arena + sterile child (idempotent)."""
     global _C0_RUNTIME
     if _C0_RUNTIME is not None and _C0_RUNTIME.created:
         return _C0_RUNTIME
@@ -11108,11 +11114,14 @@ def ensure_arena_runtime() -> SharedArenaRing:
     )
     if source_threads:
         # This arm is deliberately independent of the qd4_128 treatment.  Its
-        # identity is always the source-thread profile's 8x64 MiB geometry.
+        # identity is always the source-thread module's own geometry, which the
+        # child attaches by name and size and must match byte for byte.
+        from . import golden_source_threads
+
         _geo = {
-            "size_bytes": 512 * 1024 * 1024,
-            "slot_count": 8,
-            "slot_bytes": 64 * 1024 * 1024,
+            "size_bytes": int(golden_source_threads.ARENA_BYTES),
+            "slot_count": int(golden_source_threads.SLOT_COUNT),
+            "slot_bytes": int(golden_source_threads.SLOT_BYTES),
         }
     if (
         _geo["size_bytes"] != C0_ARENA_BYTES

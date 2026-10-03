@@ -179,18 +179,75 @@ def test_c0_transport_geometry_qd4_128(monkeypatch):
 
 
 def test_c0_arena_geometry_qd4_128_keeps_512mib():
+    """The 128 MiB arm is unchanged; only the qd4_64 arm moved to 1 GiB.
+
+    The arena is derived as ``slot_count * slot_bytes`` per arm, because
+    ``SharedArenaRing`` rejects any other total.  So qd4_128 keeps its 512 MiB
+    while the active qd4_64 arm is now 16 x 64 MiB = 1 GiB.
+    """
     from comfymodal_runtime.golden_io_process_v2 import (
-        C0_ARENA_BYTES,
         resolve_c0_geometry,
     )
 
     resolved = resolve_c0_geometry("qd4_128")
 
-    assert resolved["arena_bytes"] == C0_ARENA_BYTES == 536870912
+    assert resolved["arena_bytes"] == 512 * 1024 * 1024
     assert resolved["slot_bytes"] == 128 * 1024 * 1024
     assert resolved["slot_count"] == 4
-    assert resolved["slot_bytes"] * resolved["slot_count"] == 536870912
+    assert resolved["slot_bytes"] * resolved["slot_count"] == resolved["arena_bytes"]
     assert resolved["source_geometry"] == "qd4_128"
+
+
+def test_c0_arena_geometry_qd4_64_is_sixteen_64mib_slots():
+    """The counted Production-009 arm is now 16 x 64 MiB = 1 GiB."""
+    from comfymodal_runtime.golden_io_process_v2 import resolve_c0_geometry
+
+    resolved = resolve_c0_geometry("qd4_64")
+
+    assert resolved["slot_count"] == 16
+    assert resolved["slot_bytes"] == 64 * 1024 * 1024
+    assert resolved["arena_bytes"] == 1024 * 1024 * 1024 == 1073741824
+    assert resolved["slot_bytes"] * resolved["slot_count"] == resolved["arena_bytes"]
+    # Unchanged by this treatment.
+    assert resolved["source_workers"] == 4
+    assert len(resolved["slot_owners"]) == resolved["slot_count"]
+    assert set(resolved["slot_owners"]) == {0, 1, 2, 3}
+
+
+def test_c0_public_constants_track_the_active_arm():
+    """``C0_ARENA_BYTES``/``C0_SLOT_COUNT`` describe whichever arm is deployed."""
+    from comfymodal_runtime.golden_io_process_v2 import (
+        C0_ARENA_BYTES,
+        C0_SLOT_COUNT,
+        resolve_c0_geometry,
+    )
+
+    active = resolve_c0_geometry()
+    assert C0_ARENA_BYTES == active["arena_bytes"]
+    assert C0_SLOT_COUNT == active["slot_count"]
+    assert C0_ARENA_BYTES == C0_SLOT_COUNT * active["slot_bytes"]
+
+
+def test_every_c0_arm_fully_utilises_its_own_arena():
+    """No arm may declare an arena its slots cannot fill.
+
+    ``SharedArenaRing`` raises ``c0_arena_geometry_mismatch`` on any other
+    total, so the product invariant is asserted here for every arm rather than
+    for the counted arm only.
+    """
+    from comfymodal_runtime.golden_io_process_v2 import resolve_c0_geometry
+
+    for selector in ("qd4_32", "qd2_128", "qd4_64", "qd4_128"):
+        resolved = resolve_c0_geometry(selector)
+        assert resolved["arena_bytes"] == resolved["slot_count"] * resolved["slot_bytes"], selector
+        assert len(resolved["slot_owners"]) == resolved["slot_count"], selector
+
+
+def test_c0_geometry_selector_fails_closed_on_an_unknown_arm():
+    from comfymodal_runtime.golden_io_process_v2 import resolve_c0_geometry
+
+    with pytest.raises(ValueError, match="SOURCE_GEOMETRY_invalid"):
+        resolve_c0_geometry("qd16_512")
 
 
 def test_c0_transport_geometry_unknown_fails_closed(monkeypatch):

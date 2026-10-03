@@ -60,7 +60,7 @@ def test_parallel_orchestrator_overlaps_independent_model_stages():
 def test_parallel_c0_profile_keeps_overlap_and_selects_c0_shared_arena():
     # FAST C0 contract: the 12-CPU parallel profile routes CLIP/UNET/VAE
     # through the shared transport, and the transport must resolve to the C0
-    # shared arena (512 MiB, streaming, frozen exact-window mmap engine) --
+    # shared arena (16 x 64 MiB, streaming, frozen exact-window mmap engine) --
     # never to a standalone M2 execution arm.
     profile = M2_PROFILE.read_text(encoding="utf-8")
     transport = MODEL_TRANSPORT_SOURCE.read_text(encoding="utf-8")

@@ -65,8 +65,16 @@ else:  # pragma: no cover - the runtime arm is deliberately POSIX-only.
 
 EXPERIMENT_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_THREADS"
 WORKER_KIND_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
-ARENA_BYTES = 8 * 64 * 1024 * 1024
-SLOT_COUNT = 8
+# 16 x 64 MiB, not 8 x 64 MiB.  Production-009 proved the 8-slot arena can be
+# outrun by a healthy QD4 source: all eight slots were occupied repeatedly with
+# ~654 ms of cumulative slot wait, holding effective reader concurrency at
+# ~3.51/4.  Doubling the buffering is the only variable in this treatment --
+# READER_COUNT, the 64 MiB block size, the 4 ms pacer, the worker topology, the
+# mmap lifecycle and the H2D dispatcher semantics are all unchanged, so this
+# asks one question: can healthy QD4 stay fed when the arena is deeper?
+# Six readers is a separate, later experiment.
+ARENA_BYTES = 16 * 64 * 1024 * 1024
+SLOT_COUNT = 16
 SLOT_BYTES = 64 * 1024 * 1024
 READER_COUNT = 4
 THREAD_COUNT = READER_COUNT

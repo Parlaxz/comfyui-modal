@@ -370,8 +370,8 @@ def _c0_window_trace_enabled() -> bool:
 def resolve_c0_transport_geometry(value: Any = None) -> dict[str, Any]:
     """Resolve the C0 source/H2D scheduling geometry (deploy-baked selector).
 
-    Geometry describes scheduling/window usage only; the 512 MiB C0 arena is
-    never resized here.  ``qd2_128`` requires 128 MiB C0 slots (control
+    Geometry describes scheduling/window usage only; the C0 arena size is
+    never decided here.  ``qd2_128`` requires 128 MiB C0 slots (control
     geometry); anything else requires 64 MiB slots (treatment geometry).
     Unknown selectors fail closed.
     """
@@ -733,7 +733,7 @@ class GoldenModelTransport:
         self._pool: GpuDestinationPool | None = None
         # C0 shared-arena selection (deploy-baked, read once).  When the C0
         # streaming arena + frozen exact-window mmap engine are both selected,
-        # this transport is a thin dispatcher over the persistent 512 MiB C0
+        # this transport is a thin dispatcher over the persistent C0
         # arena: no M2 staging is built, no reader processes are forked, and no
         # extra CUDA context/registration/stream is created here.  M2 owns only
         # the source byte-producer semantics inside the C0 child workers.
@@ -1449,7 +1449,7 @@ class GoldenModelTransport:
     def _load_c0_sync(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         """Load one checkpoint through the persistent C0 shared arena.
 
-        C0 body, M2 engines: the 512 MiB C0 arena stays the backing resource,
+        C0 body, M2 engines: the C0 arena stays the backing resource,
         the C0 child workers produce bytes with the frozen exact-window mmap
         engine (``mmap_fresh`` selection), and the shared dispatcher submits
         H2D asynchronously over the C0-registered mapping with per-transfer
