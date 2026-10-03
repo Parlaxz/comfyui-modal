@@ -138,6 +138,11 @@ from .result_delivery import ConversionFailedError, convert_output_items
 from .trace import RuntimeTrace, _emit_breakdown_line, merge_runtime_traces
 from .v2_waterfall import build_waterfall, render_waterfall, waterfall_to_dict, attach_waterfall, mark_waterfall_non_applicable, is_graph_result, graph_result_from_event
 from .teardown_diagnostics import TeardownDiagnostics
+from .triton_cache import (
+    TRITON_CACHE_DIR,
+    TRITON_CACHE_VOLUME_NAME,
+    TRITON_CACHE_VOLUME_PATH,
+)
 
 # ── Lean production snapshot gate (diagnostic A/B; default off) ──────────
 # COMFYMODAL_V2_LEAN_SNAPSHOT=1 defers the default-off UNET-backing
@@ -618,6 +623,97 @@ CLASS_NAME = "ModalRuntimeEntrypoint"
 # Populated by _wrap_restore_stage wrappers in _configure_runtime, consumed by
 # restore() when building _restore_timing.  Thread-safe via GIL.
 _RESTORE_STAGE_TIMERS: dict[str, float] = {}
+
+
+def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str, Any]:
+    """Return cache-file evidence without causing a compile."""
+    disabled = not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE")
+    base: dict[str, Any] = {
+        "cuda_utils_cache_present_before_request": False,
+        "exact_kernel_cache_present_before_clip_forward": False,
+        "request_time_helper_build": False,
+        "request_time_kernel_compile": False,
+        "triton_cache_enabled": not disabled,
+    }
+    if disabled:
+        base["reason"] = "disabled"
+        return base
+    try:
+        from .triton_cache import (  # noqa: PLC0415
+            cache_files,
+            cache_compatible,
+            compile_events,
+            reset_compile_events as _reset_compile_events,
+            read_manifest,
+            runtime_identity,
+        )
+
+        if reset_compile_events:
+            _reset_compile_events()
+        manifest = read_manifest(TRITON_CACHE_DIR)
+        identity = dict((manifest or {}).get("identity") or {})
+        current = runtime_identity()
+        expected = {**identity, **current}
+        compatible = cache_compatible(manifest, expected)
+        files = {str(row.get("path")) for row in cache_files(TRITON_CACHE_DIR)}
+        helper = (manifest or {}).get("helper") or {}
+        kernel = (manifest or {}).get("kernel") or {}
+        helper_files = {
+            str(row.get("path")) for row in helper.get("artifacts", [])
+            if isinstance(row, Mapping)
+        }
+        kernel_files = {
+            str(row.get("path")) for row in kernel.get("artifacts", [])
+            if isinstance(row, Mapping)
+        }
+        events = compile_events()
+        base.update({
+            "cache_identity_match": compatible,
+            "cuda_utils_cache_present_before_request": bool(
+                compatible and helper_files and helper_files <= files
+            ),
+            "exact_kernel_cache_present_before_clip_forward": bool(
+                compatible and kernel_files and kernel_files <= files
+            ),
+            "cache_manifest": manifest,
+            "triton_compile_events": events,
+            "request_time_kernel_compile": bool(events),
+            "request_time_helper_build": not bool(
+                compatible and helper_files and helper_files <= files
+            ),
+        })
+        return base
+    except Exception as exc:  # noqa: BLE001
+        base["reason"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        return base
+
+
+def _prepare_triton_cache_for_startup() -> dict[str, Any]:
+    """Hydrate the durable cache before startup/snapshot work begins."""
+    if not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+        return {"status": "disabled"}
+    try:
+        from .triton_cache import (  # noqa: PLC0415
+            cache_compatible,
+            hydrate_cache,
+            read_manifest,
+            runtime_identity,
+        )
+
+        manifest = read_manifest(TRITON_CACHE_VOLUME_PATH)
+        identity = dict((manifest or {}).get("identity") or {})
+        expected = {**identity, **runtime_identity()}
+        if not cache_compatible(manifest, expected):
+            return {"status": "stale_or_missing"}
+        return hydrate_cache(
+            source=TRITON_CACHE_VOLUME_PATH,
+            target=TRITON_CACHE_DIR,
+            expected_identity=expected,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Cache hydration is an optimization.  A missing/stale cache must leave
+        # Triton's ordinary fallback path available, never fail startup.
+        return {"status": "fallback", "reason": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
 # Process-local fallback for lifecycle timing when Modal separates enter/method instances.
 # Both startup() and restore() refresh this; _run_in_process and run_plan_stream
@@ -5015,6 +5111,9 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK": os.environ.get(
             "COMFYMODAL_V2_GOLDEN_WORKFLOW_HASH_CHECK", "1"
         ),
+        "COMFYMODAL_GOLDEN_TRITON_CACHE": os.environ.get(
+            "COMFYMODAL_GOLDEN_TRITON_CACHE", "1"
+        ),
         "COMFYMODAL_PHASE1_C0_ARENA": os.environ.get(
             "COMFYMODAL_PHASE1_C0_ARENA", "0"
         ),
@@ -5916,6 +6015,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
             "runtime_state_volume": None,
             "profile_volume": None,
             "prompt_cache_volume": None,
+            "triton_cache_volume": None,
             "source_identity": identity,
             "canonical_identity": canonical_identity,
             "spec": runtime_spec,
@@ -5949,6 +6049,9 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         prompt_cache_volume = _modal.Volume.from_name(
             PROMPT_CACHE_VOLUME_NAME, create_if_missing=True
         )
+    triton_cache_volume = _modal.Volume.from_name(
+        TRITON_CACHE_VOLUME_NAME, create_if_missing=True
+    )
     app = _modal.App(runtime_spec.app_name, image=image)
     return {
         "app": app,
@@ -5958,6 +6061,7 @@ def build_modal_resources(*, spec: ModalRuntimeSpec | None = None) -> dict[str, 
         "runtime_state_volume": runtime_state_volume,
         "profile_volume": profile_volume,
         "prompt_cache_volume": prompt_cache_volume,
+        "triton_cache_volume": triton_cache_volume,
         "source_identity": identity,
         "canonical_identity": canonical_identity,
         "spec": runtime_spec,
@@ -11291,6 +11395,29 @@ class ModalRuntimeEntrypoint:
     def startup(self) -> dict[str, Any]:
         global _LATEST_LIFECYCLE_TIMING
         _ensure_custom_nodes_compat_symlink()
+        self._triton_cache_startup = _prepare_triton_cache_for_startup()
+        # The compile observer is gated by the same flag as hydration.
+        # `startup()` runs with snap=True during snapshot capture, and this repo
+        # deliberately blocks CUDA-touching imports while capturing (see
+        # comfyapp.find_spec) to keep the snapshot clean.  Touching Triton here
+        # therefore poisons the snapshot: the captured container reported
+        # vram_mib=81559 with an H100 present, yet every restored container then
+        # failed restore with "No CUDA GPUs are available".  Observation must
+        # happen outside snapshot capture, never inside it.
+        try:
+            if env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+                from .triton_cache import install_compile_observer
+
+                self._triton_compile_observer = install_compile_observer()
+            else:
+                self._triton_compile_observer = {
+                    "installed": False, "reason": "disabled",
+                }
+        except Exception as exc:  # noqa: BLE001
+            self._triton_compile_observer = {
+                "installed": False,
+                "reason": type(exc).__name__,
+            }
         _snap_enter_started = _v2_startup_stage("snap_true_enter", "start")
         _v2_startup_stage(
             "container_python_import",
@@ -19626,6 +19753,41 @@ class ModalRuntimeEntrypoint:
             pass
         return result
 
+    def build_triton_cache(
+        self,
+        *,
+        specialization: Mapping[str, Any] | None = None,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """One-time H100 builder for Triton's genuine helper and kernel files.
+
+        The specialization is intentionally mandatory.  It must be supplied
+        from the measured CLIP RoPE run; this method never guesses a shape or
+        warms an arbitrary candidate.
+        """
+        if not env_flag("COMFYMODAL_GOLDEN_TRITON_CACHE"):
+            return {"status": "disabled", "request_id": str(request_id or "")}
+        if not isinstance(specialization, Mapping):
+            return {
+                "status": "error",
+                "request_id": str(request_id or ""),
+                "error": "exact_real_rope_specialization_required",
+            }
+        from .triton_cache import build_cache  # noqa: PLC0415
+
+        result = build_cache(
+            cache_root=TRITON_CACHE_VOLUME_PATH,
+            specialization=specialization,
+        )
+        volume = globals().get("_MODAL_RESOURCES", {}).get("triton_cache_volume")
+        if volume is not None:
+            commit = getattr(volume, "commit", None)
+            if callable(commit):
+                commit()
+        result["request_id"] = str(request_id or "")
+        result["volume"] = TRITON_CACHE_VOLUME_NAME
+        return result
+
     def run_triton_introspection_probe(
         self,
         *,
@@ -19698,43 +19860,117 @@ class ModalRuntimeEntrypoint:
 
         # ── the CUDA-driver helper Triton builds at first use ──────────
         def _cuda_utils() -> Any:
-            from triton.backends.nvidia.driver import (  # noqa: PLC0415
-                CudaUtils,
-                CudaUtilsDriver,
-            )
+            import triton.backends.nvidia.driver as _drv  # noqa: PLC0415
 
             out: dict[str, Any] = {
-                "module_file": str(_inspect.getfile(CudaUtils)),
-                "class_init_file": str(_inspect.getfile(CudaUtils.__init__)),
-                "has_compile_module_from_file": hasattr(
-                    CudaUtils, "compile_module_from_file"
+                "driver_module": str(_inspect.getfile(_drv)),
+                # Enumerate what this version ACTUALLY exposes: the Phase-2
+                # brief's CudaUtilsDriver/default_cache_dir names do not exist
+                # on Triton 3.8.0, so the real API has to be read, not assumed.
+                "driver_public_names": sorted(
+                    name for name in dir(_drv) if not name.startswith("_")
                 ),
             }
-            # The built helper's location and the inputs that key it.
-            for attr in ("module_load", "load_binary", "inline_utils"):
-                value = getattr(CudaUtils, attr, None)
-                if callable(value):
+            cuda_utils = getattr(_drv, "CudaUtils", None)
+            if cuda_utils is None:
+                out["error"] = "no CudaUtils on triton.backends.nvidia.driver"
+                return out
+            out["cuda_utils_file"] = str(_inspect.getfile(cuda_utils))
+            out["cuda_utils_public_names"] = sorted(
+                name for name in dir(cuda_utils) if not name.startswith("_")
+            )
+            for attr in ("__init__", "load_binary", "inline_utils"):
+                fn = getattr(cuda_utils, attr, None)
+                if callable(fn):
                     try:
-                        out[f"{attr}_file"] = str(_inspect.getfile(value))
-                    except Exception:  # noqa: BLE001
-                        pass
-            driver_init = getattr(CudaUtilsDriver, "__init__", None)
-            if callable(driver_init):
+                        out[f"{attr}_source"] = _inspect.getsource(fn)[:5000]
+                    except Exception as exc:  # noqa: BLE001
+                        out[f"{attr}_source_error"] = str(exc)[:200]
+            module_compile = getattr(_drv, "compile_module_from_file", None)
+            out["has_compile_module_from_file"] = callable(module_compile)
+            if callable(module_compile):
                 try:
-                    src = _inspect.getsource(driver_init)
-                    out["driver_init_source"] = src[:4000]
+                    out["compile_module_from_file_source"] = _inspect.getsource(
+                        module_compile
+                    )[:8000]
                 except Exception as exc:  # noqa: BLE001
-                    out["driver_init_source_error"] = str(exc)[:200]
+                    out["compile_module_from_file_source_error"] = str(exc)[:200]
+            # The helper's on-disk location and the inputs that key it.
+            try:
+                out["module_path"] = str(getattr(cuda_utils, "module_path", ""))
+                out["module_load_path"] = str(
+                    getattr(cuda_utils, "module_load_path", "")
+                )
+            except Exception as exc:  # noqa: BLE001
+                out["module_path_error"] = str(exc)[:200]
             return out
 
         report["cuda_utils"] = _safe("cuda_utils", _cuda_utils)
 
+        # ── the cache API this version actually provides ───────────────
+        def _cache_api() -> Any:
+            import triton.runtime.cache as _cache  # noqa: PLC0415
+
+            out: dict[str, Any] = {
+                "module": str(_inspect.getfile(_cache)),
+                "public_names": sorted(
+                    name for name in dir(_cache) if not name.startswith("_")
+                ),
+            }
+            for attr in ("make_so_cache_key", "get_cache_key", "FileCacheManager",
+                         "get_cache_dir", "default_cache_dir", "get_triton_cache_dir",
+                         "_get_cache_directory"):
+                fn = getattr(_cache, attr, None)
+                out[f"has_{attr}"] = callable(fn)
+                if callable(fn):
+                    try:
+                        out[f"{attr}_source"] = _inspect.getsource(fn)[:3000]
+                    except Exception as exc:  # noqa: BLE001
+                        out[f"{attr}_source_error"] = str(exc)[:160]
+            # What directory Triton would actually use right now.
+            for attr in ("get_cache_dir", "default_cache_dir"):
+                fn = getattr(_cache, attr, None)
+                if callable(fn):
+                    try:
+                        out[f"{attr}_value"] = str(fn())
+                    except Exception as exc:  # noqa: BLE001
+                        out[f"{attr}_value_error"] = str(exc)[:160]
+            return out
+
+        report["cache_api"] = _safe("cache_api", _cache_api)
+
         # ── cache root and what is already in it ───────────────────────
         def _cache_root() -> Any:
-            from triton.runtime.cache import default_cache_dir  # noqa: PLC0415
+            # 3.8.0 has no default_cache_dir; discover the real accessor.
+            import triton.runtime.cache as _cache  # noqa: PLC0415
 
-            root = default_cache_dir()
-            info: dict[str, Any] = {"root": str(root), "exists": _os.path.isdir(root)}
+            root = ""
+            for attr in ("get_cache_dir", "default_cache_dir",
+                         "get_triton_cache_dir"):
+                fn = getattr(_cache, attr, None)
+                if callable(fn):
+                    try:
+                        root = str(fn())
+                        break
+                    except Exception:  # noqa: BLE001
+                        continue
+            if not root:
+                root = _os.path.join(
+                    _os.environ.get("TRITON_CACHE_DIR", "")
+                    or _os.path.join(_os.environ.get("HOME", "/root"), ".triton", "cache")
+                )
+            info: dict[str, Any] = {
+                "root": str(root),
+                "resolved_via": next(
+                    (
+                        attr for attr in ("get_cache_dir", "default_cache_dir",
+                                          "get_triton_cache_dir")
+                        if callable(getattr(_cache, attr, None))
+                    ),
+                    "env_fallback",
+                ),
+                "exists": _os.path.isdir(root),
+            }
             try:
                 entries = sorted(_os.listdir(root))
                 info["entry_count"] = len(entries)
@@ -23731,6 +23967,7 @@ class ModalRuntimeEntrypoint:
             identity_telemetry.update(
                 _golden_sage_provenance(self)
             )
+            identity_telemetry.update(_triton_cache_observation(reset_compile_events=True))
             _emit_golden_diagnostics_config(
                 "request",
                 api=getattr(self, "_legacy_api", self),
@@ -24071,6 +24308,10 @@ class ModalRuntimeEntrypoint:
                     bytes_read_at_dynamic_vram_ready=cpu_prefetch_ticket.telemetry().get("total_bytes", 0),
                 )
             self._golden_execution_active = True
+            # This is the last boundary before CLIP forward can begin.  Keep
+            # the evidence separate from request setup so a later report can
+            # distinguish cache presence from a request-time compile.
+            identity_telemetry.update(_triton_cache_observation())
             golden_call_start_wall_ns = time.time_ns()
             golden_call_start_mono_ns = time.monotonic_ns()
             try:
@@ -24742,6 +24983,11 @@ def _build_decorated_v2_class() -> type:
         "run_triton_introspection_probe",
         _modal.method()(cls.run_triton_introspection_probe),
     )
+    setattr(
+        cls,
+        "build_triton_cache",
+        _modal.method()(cls.build_triton_cache),
+    )
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
     setattr(cls, "publish_restore_plan", _modal.method()(cls.publish_restore_plan))
@@ -24855,6 +25101,9 @@ def _register_remote_entrypoint(resources: Mapping[str, Any], spec: ModalRuntime
     _pcv = resources.get("prompt_cache_volume")
     if _pcv is not None:
         _volumes[PROMPT_CACHE_VOLUME_PATH] = _pcv
+    _tcv = resources.get("triton_cache_volume")
+    if _tcv is not None:
+        _volumes[TRITON_CACHE_VOLUME_PATH] = _tcv
     _region_pin = _resolve_region_pin()
     _cloud_pin = _resolve_cloud_pin()
     _cls_kwargs: dict[str, Any] = {

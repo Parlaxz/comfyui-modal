@@ -69,6 +69,17 @@ GOLDEN_CONTROL_FLAGS: dict[str, dict[str, Any]] = {
         EXECUTION_POLICY,
         "Require Golden workflow SHA equality during request setup; disabled is fail-closed.",
     ),
+    "COMFYMODAL_GOLDEN_TRITON_CACHE": _spec(
+        "COMFYMODAL_GOLDEN_TRITON_CACHE",
+        "bool",
+        False,
+        CACHE_POLICY,
+        "Hydrate the identity-checked H100/sm90 Triton cache before inference. "
+        "Default OFF: hydration and compile observation must never run while a "
+        "snapshot is being captured (snap=True), because this repo blocks "
+        "CUDA-touching imports during capture and doing so poisons the "
+        "snapshot, leaving every restored container with no working CUDA.",
+    ),
     # CLIP loader and hydration controls.
     "COMFYMODAL_V2_CLIP_QD_READER": _spec("COMFYMODAL_V2_CLIP_QD_READER", "bool", False, LOADER_SELECTION, "Enable the genuine queue-depth CLIP reader."),
     "COMFYMODAL_V2_CLIP_QD_QD": _spec("COMFYMODAL_V2_CLIP_QD_QD", "int", 4, LOADER_SELECTION, "CLIP queue depth."),

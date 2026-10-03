@@ -205,6 +205,15 @@ owner = "golden-ops"
 description = "Optional Golden CLIP/VAE/QD stage diagnostics, including E31 forward evidence. Default OFF; deploy-baked for structurally classified experiment requests."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_TRITON_CACHE"
+type = "bool"
+default = "0"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "golden-triton"
+description = "Hydrate the exact, H100/sm90 Triton cache built by the dedicated cache-builder. Default OFF: it must never run while a snapshot is captured, because this repo blocks CUDA-touching imports during capture and doing so poisons the snapshot (restored containers then fail with 'No CUDA GPUs are available')."
+
+[[flag]]
 name = "COMFYMODAL_GOLDEN_RES4LYF_GC_SUPPRESSION"
 type = "bool"
 default = "0"
