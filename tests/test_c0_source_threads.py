@@ -96,16 +96,113 @@ def _release_all(buf: bytearray) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_geometry_is_exactly_eight_64m_slots_and_four_readers() -> None:
+def test_geometry_is_exactly_sixteen_64m_slots_and_four_readers() -> None:
     assert source.geometry() == {
-        "arena_bytes": 8 * 64 * 1024 * 1024,
-        "slot_count": 8,
+        "arena_bytes": 16 * 64 * 1024 * 1024,
+        "slot_count": 16,
         "slot_bytes": 64 * 1024 * 1024,
         "thread_count": 4,
         "pacer_gap_ns": 4_000_000,
     }
     assert source.READER_COUNT == 4
     assert source.SLOT_COUNT * source.SLOT_BYTES == source.ARENA_BYTES
+    # The treatment is arena depth only: reader count, block size and the pacer
+    # gap are the P9 values and must not drift with the slot count.
+    assert source.SLOT_COUNT == 16
+    assert source.SLOT_BYTES == 64 * 1024 * 1024
+    assert source.READER_COUNT == 4
+    assert source.PACER_GAP_NS == 4_000_000
+
+
+def test_free_mask_covers_every_slot_at_sixteen_slots() -> None:
+    """The free mask is one bit per slot and still fits the 64-bit header field."""
+    assert source.FREE_MASK == (1 << source.SLOT_COUNT) - 1 == 0xFFFF
+    # Would silently truncate above 64 slots, so it is asserted rather than assumed.
+    assert source.SLOT_COUNT <= 64
+    assert source.HEADER.size <= source.HEADER_SIZE
+    assert 11 < 8 * source.HEADER.size - 7  # free_mask is the 12th 64-bit field
+
+
+def test_control_regions_do_not_overlap_the_sixteen_slot_table() -> None:
+    """Header, slot table, counters, error region, op ring and plan stay disjoint.
+
+    The slot table grows with SLOT_COUNT, so every later region is derived from
+    it.  At 16 slots the table is 896 bytes; the assertions below prove the
+    derived offsets still advance monotonically and that the 64 KiB plan region
+    never overlaps the operation ring.
+    """
+    regions = [
+        ("header", 0, source.HEADER_SIZE),
+        ("slot_table", source.SLOT_OFFSET, source.SLOT_OFFSET + source.SLOT_TABLE_BYTES),
+        ("counters", source.COUNTER_OFFSET, source.COUNTER_OFFSET + source.COUNTERS.size),
+        ("error", source.ERROR_OFFSET, source.ERROR_OFFSET + source.ERROR_BYTES),
+        ("op_ring", source.OP_OFFSET, source.PLAN_OFFSET),
+        ("plan", source.PLAN_OFFSET, source.CONTROL_BYTES),
+    ]
+    assert source.SLOT_TABLE_BYTES == source.SLOT_COUNT * source.SLOT.size
+    for (_, start, end), (next_name, next_start, _) in zip(regions, regions[1:]):
+        assert end <= next_start, f"{next_name} overlaps the previous region"
+        assert start < end
+    assert regions[-1][2] <= source.CONTROL_BYTES
+    assert source.OP_OFFSET + source.MAX_OPS * source.OP.size <= source.PLAN_OFFSET
+
+
+def test_all_sixteen_slots_claim_independently_without_aliasing() -> None:
+    """Each of the 16 physical slots is distinct, addressable, and singly owned."""
+    buf = source.new_control_buffer()
+    lock = _NullLock()
+    _install(buf, lock, generation=1)
+    plan = _plan(generation=1, range_count=source.SLOT_COUNT + 4)
+    # Slot generations are per slot, so a fresh arena hands out generation 0 on
+    # every slot; the invariant is per-slot advance, never a shared counter.
+    before = {index: source._slot(buf, index)[1] for index in range(source.SLOT_COUNT)}
+    assert set(before.values()) == {0}
+
+    claims = [source.claim_block(buf, plan) for _ in range(source.SLOT_COUNT)]
+    assert all(claim.outcome == "claimed" for claim in claims)
+    indices = [claim.slot_index for claim in claims]
+    assert sorted(indices) == list(range(source.SLOT_COUNT)), "slot index aliased"
+    # No two claims may share a slot, a source range, or a destination range.
+    assert len({claim.range_index for claim in claims}) == source.SLOT_COUNT
+    assert len({claim.item[0] for claim in claims}) == source.SLOT_COUNT
+    assert len({claim.item[2] for claim in claims}) == source.SLOT_COUNT
+    # Every claimed slot is FILLING with its own generation and range recorded.
+    for claim in claims:
+        state, generation, range_index, source_offset = source._slot(buf, claim.slot_index)[:4]
+        assert state == source.FILLING
+        assert generation == claim.slot_generation == before[claim.slot_index] + 1
+        assert range_index == claim.range_index
+        assert source_offset == claim.item[0]
+    assert source.claim_block(buf, plan).outcome == "no_capacity"
+    assert _free_slots(buf) == set()
+
+    # Quiescence is only reached once every one of the 16 is returned.
+    _release_all(buf)
+    assert source.quiescent(buf, lock) is True
+    assert int(source._read_header(buf)[11]) == source.FREE_MASK
+
+
+def test_sixteenth_slot_occupancy_is_visible_in_the_free_mask() -> None:
+    """The high bit of the widened mask must gate capacity, not alias slot 0."""
+    buf = source.new_control_buffer()
+    lock = _NullLock()
+    _install(buf, lock, generation=1)
+    high = source.SLOT_COUNT - 1
+    assert high == 15
+
+    values = list(source._read_header(buf))
+    values[11] = source.FREE_MASK & ~(1 << high)
+    source._write_header_all(buf, values)
+    source._put_slot(buf, high, (source.READY, 1, 0, 0, 0, 4, 0, 0))
+
+    assert source.quiescent(buf, lock) is False
+    assert 0 in _free_slots(buf), "claiming slot 15 must not consume slot 0"
+    assert high not in _free_slots(buf)
+    # The header refuses a mask wider than the declared geometry.
+    overflow = list(source._read_header(buf))
+    overflow[11] = (1 << (source.SLOT_COUNT + 1)) - 1
+    with pytest.raises(source.SourceProtocolError, match="control_free_mask_invalid"):
+        source._write_header_all(buf, overflow)
 
 
 def test_source_module_is_cuda_sterile() -> None:
@@ -455,7 +552,7 @@ def test_source_gbps_numerator_is_layout_data_bytes() -> None:
 
 
 def test_reader_blocks_on_capacity_instead_of_spinning_the_control_lock() -> None:
-    """All eight slots occupied must not produce repeated control-lock churn."""
+    """A fully occupied arena must not produce repeated control-lock churn."""
     buf = source.new_control_buffer()
     lock = _NullLock()
     _install(buf, lock)
@@ -627,7 +724,7 @@ def test_slot_cannot_be_reused_before_h2d_completion() -> None:
     assert slot not in _free_slots(buf), "an IN_FLIGHT slot was offered as free capacity"
 
     # Every other slot is free and claimable; the IN_FLIGHT one never is, and
-    # the eighth claim finds zero capacity rather than a free IN_FLIGHT slot.
+    # the final claim finds zero capacity rather than a free IN_FLIGHT slot.
     for _ in range(source.SLOT_COUNT - 1):
         again = source.claim_block(buf, plan)
         assert again.outcome == "claimed"
