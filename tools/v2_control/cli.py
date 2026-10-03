@@ -2777,9 +2777,11 @@ def cmd_golden_deploy(args, repo_root: Path) -> int:
             if flag not in already:
                 extra += ["--set", f"{flag}={value}"]
         if extra != list(getattr(args, "set", None) or []):
-            args.set = [
-                s for pair in zip(extra[::2], extra[1::2]) for s in pair
-            ]
+            # args.set holds NAME=VALUE entries; extra interleaves the --set
+            # flag with each one. Passing extra straight through made the parser
+            # read the literal "--set" as a value and fail with
+            # "invalid --set spec '--set': expected NAME=VALUE".
+            args.set = extra[1::2]
             print(
                 "[v2ctl.golden.deploy] --for-profiling: tracing flags added: "
                 + ", ".join(f"{k}={v}" for k, v in GOLDEN_PROFILE_DEPLOY_FLAGS),
