@@ -1,0 +1,49 @@
+{
+  "expected_processes": null,
+  "missing_processes": [],
+  "observed_trace_files": [
+    "viztracer.json.gz"
+  ],
+  "ownership_established": false,
+  "process_coverage": "UNKNOWN",
+  "processes": [
+    {
+      "base_time_nanoseconds": 1791008997301767195,
+      "error": null,
+      "expected": true,
+      "include_paths": [],
+      "pid": 2,
+      "request_id": "",
+      "role": "parent",
+      "threads": [
+        "MainProcess",
+        "Task-61",
+        "Task-69",
+        "Task-70",
+        "Task-71",
+        "Task-72",
+        "Task-73",
+        "Task-74",
+        "Task-75",
+        "Task-76",
+        "Task-77",
+        "Thread-5",
+        "Thread-6",
+        "asyncio_0",
+        "asyncio_1",
+        "clip-skeleton_0",
+        "golden-unet-layout-preresolve",
+        "tqdm_monitor"
+      ],
+      "trace_entry_capacity": 8000000,
+      "trace_entry_count": 909915,
+      "trace_id": "ddb6c39a7fdc4c4890a4724bd617038a",
+      "trace_source": "viztracer.json.gz",
+      "traced": true,
+      "truncated": false,
+      "viztracer_version": "1.1.1"
+    }
+  ],
+  "schema_version": "v2-golden-exhaustive-profile/1",
+  "traced_processes": 1
+}
