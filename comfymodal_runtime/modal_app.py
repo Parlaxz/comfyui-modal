@@ -19626,6 +19626,191 @@ class ModalRuntimeEntrypoint:
             pass
         return result
 
+    def run_triton_introspection_probe(
+        self,
+        *,
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        """SHADOW-ONLY no-generation method: report the EXACT installed Triton.
+
+        Production-009 Phase 2A requires reading the Triton that is actually
+        installed on this image rather than assuming upstream-current
+        behaviour.  This reports, read-only:
+
+          * triton / torch / CUDA / cuDNN versions and the resolved target arch
+          * the ptxas that Triton would invoke, and its version
+          * the cache root Triton would use and whether it is writable
+          * the CUDA-driver helper (``CudaUtils``): where its built object
+            lives, its cache key inputs, and whether it is already present
+          * the compiled-kernel cache: whether any artifacts exist, and the
+            ``JITFunction`` compile/cache-key entry points that own them
+
+        It never compiles, never builds, never imports a model, never touches
+        GPU state, and never mutates a flag.  Every probe is individually
+        guarded so one unavailable attribute cannot lose the whole report.
+        """
+        import glob as _glob
+        import inspect as _inspect
+        import os as _os
+        import sys as _sys
+
+        def _safe(label: str, fn: Any) -> Any:
+            try:
+                return fn()
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+        report: dict[str, Any] = {
+            "probe": "run_triton_introspection_probe",
+            "python": _sys.version,
+            "app_name": _os.environ.get("COMFYMODAL_V2_APP_NAME", ""),
+            "triton_cache_dir_env": _os.environ.get("TRITON_CACHE_DIR", ""),
+            "home": _os.environ.get("HOME", ""),
+        }
+
+        # ── versions ──────────────────────────────────────────────────
+        try:
+            import triton  # noqa: PLC0415
+
+            report["triton_version"] = str(getattr(triton, "__version__", ""))
+            report["triton_file"] = str(getattr(triton, "__file__", ""))
+        except Exception as exc:  # noqa: BLE001
+            report["triton_import_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        try:
+            import torch  # noqa: PLC0415
+
+            report["torch_version"] = str(torch.__version__)
+            report["torch_cuda"] = str(getattr(torch.version, "cuda", "") or "")
+            report["cudnn_version"] = str(getattr(torch.backends.cudnn, "version", "") or "")
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability()
+                report["device_name"] = str(torch.cuda.get_device_name())
+                report["compute_capability"] = f"{major}.{minor}"
+                report["target_arch"] = f"sm{major}{minor}"
+                props = torch.cuda.get_device_properties(0)
+                report["multi_processor_count"] = int(props.multi_processor_count)
+                report["total_memory_bytes"] = int(props.total_memory)
+            else:
+                report["cuda_available"] = False
+        except Exception as exc:  # noqa: BLE001
+            report["torch_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        # ── the CUDA-driver helper Triton builds at first use ──────────
+        def _cuda_utils() -> Any:
+            from triton.backends.nvidia.driver import (  # noqa: PLC0415
+                CudaUtils,
+                CudaUtilsDriver,
+            )
+
+            out: dict[str, Any] = {
+                "module_file": str(_inspect.getfile(CudaUtils)),
+                "class_init_file": str(_inspect.getfile(CudaUtils.__init__)),
+                "has_compile_module_from_file": hasattr(
+                    CudaUtils, "compile_module_from_file"
+                ),
+            }
+            # The built helper's location and the inputs that key it.
+            for attr in ("module_load", "load_binary", "inline_utils"):
+                value = getattr(CudaUtils, attr, None)
+                if callable(value):
+                    try:
+                        out[f"{attr}_file"] = str(_inspect.getfile(value))
+                    except Exception:  # noqa: BLE001
+                        pass
+            driver_init = getattr(CudaUtilsDriver, "__init__", None)
+            if callable(driver_init):
+                try:
+                    src = _inspect.getsource(driver_init)
+                    out["driver_init_source"] = src[:4000]
+                except Exception as exc:  # noqa: BLE001
+                    out["driver_init_source_error"] = str(exc)[:200]
+            return out
+
+        report["cuda_utils"] = _safe("cuda_utils", _cuda_utils)
+
+        # ── cache root and what is already in it ───────────────────────
+        def _cache_root() -> Any:
+            from triton.runtime.cache import default_cache_dir  # noqa: PLC0415
+
+            root = default_cache_dir()
+            info: dict[str, Any] = {"root": str(root), "exists": _os.path.isdir(root)}
+            try:
+                entries = sorted(_os.listdir(root))
+                info["entry_count"] = len(entries)
+                info["entries_sample"] = entries[:20]
+            except Exception as exc:  # noqa: BLE001
+                info["list_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            for pattern in ("**/*.cubin", "**/*.json", "**/*.so", "**/*.ptx"):
+                try:
+                    found = _glob.glob(str(_os.path.join(root, pattern)), recursive=True)
+                    info[f"glob_{pattern}"] = {
+                        "count": len(found),
+                        "sample": [str(p) for p in found[:10]],
+                    }
+                except Exception:  # noqa: BLE001
+                    info[f"glob_{pattern}"] = {"count": -1, "sample": []}
+            return info
+
+        report["kernel_cache"] = _safe("cache_root", _cache_root)
+
+        # ── the JIT compile path that owns the kernel artifacts ────────
+        def _jit_path() -> Any:
+            from triton.runtime.jit import JITFunction  # noqa: PLC0415
+
+            out: dict[str, Any] = {"file": str(_inspect.getfile(JITFunction))}
+            for attr in ("_do_compile", "run", "warmup"):
+                fn = getattr(JITFunction, attr, None)
+                if callable(fn):
+                    out[f"has_{attr}"] = True
+                    try:
+                        out[f"{attr}_file"] = str(_inspect.getfile(fn))
+                        out[f"{attr}_source"] = _inspect.getsource(fn)[:6000]
+                    except Exception as exc:  # noqa: BLE001
+                        out[f"{attr}_source_error"] = str(exc)[:160]
+            return out
+
+        report["jit_function"] = _safe("jit_path", _jit_path)
+
+        # ── the exact kernel this request compiles ─────────────────────
+        def _kernel_sources() -> Any:
+            import importlib.util  # noqa: PLC0415
+
+            found: dict[str, Any] = {}
+            roots = [
+                _os.path.join("/root/comfy/ComfyUI"),
+                _os.path.join(_os.path.dirname(_sys.executable), "..", "lib"),
+            ]
+            for filename in ("triton_kernels.py", "triton_impl.py", "llama.py"):
+                hits: list[str] = []
+                for root in roots:
+                    if not _os.path.isdir(root):
+                        continue
+                    try:
+                        hits.extend(
+                            _glob.glob(
+                                _os.path.join(root, "**", filename), recursive=True
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if hits:
+                        break
+                record: dict[str, Any] = {"paths": hits[:5]}
+                if hits:
+                    try:
+                        with open(hits[0], "r", encoding="utf-8", errors="replace") as fh:
+                            record["source"] = fh.read()[:12000]
+                    except Exception as exc:  # noqa: BLE001
+                        record["read_error"] = str(exc)[:160]
+                found[filename] = record
+            return found
+
+        report["kernel_sources"] = _safe("kernel_sources", _kernel_sources)
+
+        report["status"] = "ok"
+        return report
+
     def source_identity_probe(
         self,
         *,
@@ -24551,6 +24736,11 @@ def _build_decorated_v2_class() -> type:
         cls,
         "run_golden_parallel_stream",
         _modal.method(is_generator=True)(cls.run_golden_parallel_stream),
+    )
+    setattr(
+        cls,
+        "run_triton_introspection_probe",
+        _modal.method()(cls.run_triton_introspection_probe),
     )
     setattr(cls, "read_output_asset", _modal.method()(cls.read_output_asset))
     setattr(cls, "run_checkpoint_stream", _modal.method(is_generator=True)(cls.run_checkpoint_stream))
