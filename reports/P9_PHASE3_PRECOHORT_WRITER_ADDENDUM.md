@@ -97,3 +97,41 @@ comfyapp 2.16.30. Modal Volumes are workspace-scoped, so its models Volume is no
 known to hold this cohort's three models, and completing the gate there may
 require re-provisioning the weights. That is a provisioning decision, not a
 patch, so it was not made unilaterally.
+## Addendum 2: Testing 1 verified, and one hypothesis eliminated
+
+Destination switched to Testing 1 (ws_e677ab553606) after Testing 9 ran out of
+credit. Testing 1 is fully viable - no model reprovisioning needed.
+
+| check | Testing 9 (ab12f0ed) | Testing 1 (dc69bfd6) |
+|---|---|---|
+| deploy | exit=0 | exit=0 |
+| models present | 3/3 ok | 3/3 ok |
+| blob written | 11817 B | 11811 B |
+| volume handle | available | available |
+| reader sees blob | absent | not yet run |
+
+**Eliminated: wrong-volume.** Both sides resolve to the same volume.
+`comfyapp.py` binds `runtime_config_vol = modal.Volume.from_name(
+RUNTIME_CONFIG_VOLUME_NAME)` with `RUNTIME_CONFIG_VOLUME_NAME =
+"comfymodal-runtime-config"`, and the deployed class mounts
+`RUNTIME_STATE_VOLUME_NAME = os.environ.get(
+"COMFYMODAL_RUNTIME_STATE_VOLUME", "comfymodal-runtime-config")`. Identical
+name, identical mount path `RUNTIME_CONFIG_PATH =
+"/root/comfymodal_runtime_state"`, identical blob path. The publish and the read
+address the same physical volume.
+
+**Also eliminated: missing reload.** `reload_runtime_state` is already a
+wrapped restore stage and appears in the restore stage list, and the class
+already calls `runtime_config_vol.reload()` on several paths. A reload does
+happen; adding another is therefore not obviously the fix and was not applied.
+
+**Remaining open question.** The read happens in a process that may not have the
+runtime-config volume mounted. The Golden request path spawns separate
+processes (`golden_io_process_v2`, `source_copy_probe`), and hydration is
+reached through `golden_model_transport.py` / `golden_serial.py`. If the
+hydrating process is a spawned subprocess rather than the container process that
+mounts the volume, the blob is genuinely not visible to it and no amount of
+`reload()` in the parent would help. This was not confirmed before the session
+ended and is the single next thing to check.
+
+Gate remains NOT passed. Treatment remains uncommitted.
