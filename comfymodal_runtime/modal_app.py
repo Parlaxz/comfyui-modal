@@ -5414,6 +5414,18 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         _RESTORE_CLIP_PROBE_SOURCE_ENV: os.environ.get(
             _RESTORE_CLIP_PROBE_SOURCE_ENV, "models_volume"
         ),
+        # ── Production-009 source copy stall probe (diagnostic, default off).
+        # Explicit passthrough for the same reason as every key above: this
+        # dict is a hand-written allowlist, so a flag that is registered in
+        # config_authority and the v2ctl flag registry but absent here never
+        # reaches the container.  The probe then silently reports itself as
+        # unavailable instead of collecting evidence.
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE", "0"
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE_MINCORE": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE_MINCORE", "0"
+        ),
         "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
             "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
         ),
