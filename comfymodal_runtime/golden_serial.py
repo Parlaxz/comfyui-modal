@@ -15328,6 +15328,18 @@ SAMPLING_VAE_SCHEDULE_ENV = "COMFYMODAL_GOLDEN_SAMPLING_VAE_SCHEDULE"
 CLIP_UNET_OVERLAP_PAIR = ("golden_clip_forward", "golden_unet_load")
 SAMPLING_VAE_OVERLAP_PAIR = ("golden_vae_load", "golden_sampling")
 OVERLAP_CLEANUP_TIMEOUT_S = 5.0
+# Bound each leg of a stage-pair overlap.  Both legs await the child's IPC,
+# which itself permits 900s (golden_io_process_v2) to 1800s
+# (golden_loader_process), so an unbounded join here turned a stuck lane into a
+# container that produced no telemetry and no stage marks for the whole Modal
+# call - observed as a 13-minute silent stall at clip_forward_unet_window_begin
+# that only ended when the client cancelled.  120s is far above any measured
+# healthy leg (the slowest observed clip_forward/unet_load overlap pair is
+# ~6s) while still failing inside the container instead of hanging until Modal
+# gives up.  asyncio.shield keeps the timeout from cancelling a leg that would
+# otherwise have completed; the existing BaseException handler still cancels
+# both tasks and re-raises.
+_OVERLAP_JOIN_TIMEOUT_S = 120.0
 
 
 def _validate_overlap_schedule(value: Any, *, label: str) -> str:
@@ -15482,9 +15494,13 @@ async def _golden_stage_pair_overlap(
         if session.runner is not None:
             session.runner._golden_ignored_tasks.add(owner_task)
         try:
-            await owner_task
+            await asyncio.wait_for(
+                asyncio.shield(owner_task), timeout=_OVERLAP_JOIN_TIMEOUT_S
+            )
             join_start = time.monotonic_ns()
-            await sibling_task
+            await asyncio.wait_for(
+                asyncio.shield(sibling_task), timeout=_OVERLAP_JOIN_TIMEOUT_S
+            )
             join_wall = time.monotonic_ns() - join_start
         except BaseException:
             if not sibling_task.done():
