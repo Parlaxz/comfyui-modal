@@ -19686,6 +19686,15 @@ class ModalRuntimeEntrypoint:
             "comfymodal_runtime.golden_model_transport",
             "comfymodal_runtime.golden_qd_transport",
             "comfymodal_runtime.golden_source_threads",
+            # P9 source/destination copy-isolation experiment. Proved here
+            # because a deployment that omitted the experiment module would
+            # still pass every other identity check while silently running no
+            # arm at all, which is the failure 975aec14 had to fix for the
+            # per-copy probe.
+            "comfymodal_runtime.source_copy_isolation",
+            "comfymodal_runtime.source_copy_probe",
+            "comfymodal_runtime.source_stall_classification",
+            "comfymodal_runtime.golden_parallel",
             "comfymodal_runtime.output_durability",
         )
 
