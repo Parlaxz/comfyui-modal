@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import threading
 
 import pytest
 
@@ -175,3 +177,66 @@ def test_inspect_cache_hit_and_identity_refresh_regression(tmp_path, monkeypatch
 
     assert refreshed is not first
     assert len(calls) == 2
+
+
+def test_join_layout_preresolve_is_bounded_when_the_preresolve_never_finishes() -> None:
+    """The join must not put the request event loop behind an unbounded read.
+
+    The pre-resolve is an optimization: golden_unet_load's own inspect() stays
+    the canonical parse.  An unbounded wait here would serialize the whole
+    request behind one header read on a host that stalls, so the join is
+    budgeted and expiry is observable through ``completed``.
+    """
+    import threading
+    import time
+
+    from comfymodal_runtime.golden_model_transport import (
+        LAYOUT_PRERESOLVE_JOIN_BUDGET_S,
+        GoldenModelTransport,
+        LayoutPreresolve,
+    )
+
+    transport = GoldenModelTransport()
+    holder = LayoutPreresolve(
+        path=os.path.abspath("/nonexistent/model.safetensors"),
+        started_ns=time.perf_counter_ns(),
+        finished_ns=None,
+        done=threading.Event(),
+    )
+    transport._layout_preresolve = holder
+
+    started = time.monotonic()
+    joined = transport.join_layout_preresolve(
+        "/nonexistent/model.safetensors", timeout_s=0.05
+    )
+    elapsed = time.monotonic() - started
+
+    assert joined is holder
+    assert joined.completed is False, "expiry must be observable"
+    assert elapsed < 2.0, f"join took {elapsed:.3f}s; it must honour its budget"
+    # The production default must exist and be finite.
+    assert 0.0 < LAYOUT_PRERESOLVE_JOIN_BUDGET_S < 30.0
+
+
+def test_join_layout_preresolve_returns_completed_holder_when_the_work_landed() -> None:
+    from comfymodal_runtime.golden_model_transport import (
+        GoldenModelTransport,
+        LayoutPreresolve,
+    )
+
+    transport = GoldenModelTransport()
+    done = threading.Event()
+    done.set()
+    holder = LayoutPreresolve(
+        path=os.path.abspath("/nonexistent/model.safetensors"),
+        started_ns=1,
+        finished_ns=2_000_000,
+        done=done,
+    )
+    transport._layout_preresolve = holder
+
+    joined = transport.join_layout_preresolve("/nonexistent/model.safetensors")
+
+    assert joined is holder
+    assert joined.completed is True
+    assert joined.ms == pytest.approx(2.0)

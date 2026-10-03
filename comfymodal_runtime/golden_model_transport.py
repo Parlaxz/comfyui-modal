@@ -293,6 +293,21 @@ class LayoutPreresolve:
             return None
         return (self.finished_ns - self.started_ns) / 1e6
 
+    @property
+    def completed(self) -> bool:
+        """True once the background resolution has finished, successfully or not."""
+        return self.done.is_set()
+
+
+# The pre-resolve is an optimization, not a dependency: golden_unet_load's own
+# inspect() remains the canonical parse, and it reproduces the identical
+# deterministic failure if the pre-resolve did not finish.  Measured cost on a
+# healthy run is ~15 ms while CLIP bytes are still moving, so a generous budget
+# keeps the win and still bounds the wait.  It must be bounded: this join runs
+# synchronously on the request's event loop, and an unbounded wait would put
+# the whole request behind one header read on a host that stalls.
+LAYOUT_PRERESOLVE_JOIN_BUDGET_S = 2.0
+
 
 def _file_identity(path: str) -> tuple[int, int, int, int]:
     stat_result = os.stat(path)
@@ -1053,8 +1068,21 @@ class GoldenModelTransport:
             holder.done.set()
         return holder
 
-    def join_layout_preresolve(self, path: str) -> LayoutPreresolve:
-        """Wait for a started layout pre-resolve without raising its error."""
+    def join_layout_preresolve(
+        self, path: str, *, timeout_s: float = LAYOUT_PRERESOLVE_JOIN_BUDGET_S
+    ) -> LayoutPreresolve:
+        """Wait briefly for a started pre-resolve; never raises, never blocks forever.
+
+        Returns the holder when one exists for this path, otherwise a holder
+        with ``started_ns is None``.  An ``error`` on the holder is deliberately
+        NOT raised here: the caller's own inspect() call remains the canonical
+        operation and will reproduce the identical deterministic failure.
+
+        The wait is bounded by ``timeout_s``.  On expiry the holder is returned
+        unfinished and the caller's inspect() simply does the parse itself,
+        which is exactly the pre-pre-resolve behaviour.  A caller can tell the
+        two apart with ``holder.completed``.
+        """
         normalized = os.path.abspath(str(path))
         with self._layout_lock:
             holder = self._layout_preresolve
@@ -1067,7 +1095,7 @@ class GoldenModelTransport:
                 )
                 not_started.done.set()
                 return not_started
-        holder.done.wait()
+        holder.done.wait(timeout=max(0.0, float(timeout_s)))
         return holder
 
     async def load(self, path: str, *, role: str = "model") -> LoadedSafetensors:
