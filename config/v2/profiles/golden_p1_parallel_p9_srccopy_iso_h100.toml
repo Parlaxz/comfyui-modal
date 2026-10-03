@@ -1,0 +1,64 @@
+# v2ctl profile: P9 source/destination 64 MiB copy-isolation experiment on H100.
+#
+# DIAGNOSTIC EXPERIMENT.  This profile exists to answer one question: is the
+# pathological 1-4 second 64 MiB `libc.memmove` slow on its SOURCE side (the
+# whole-file MAP_PRIVATE mapping of the Volume-backed checkpoint), on its
+# DESTINATION side (the pinned shared arena), only when both are combined, or
+# because the host memory system as a whole is slow?
+#
+# Phase-1 already ruled out QD collapse, source slot starvation, one dead
+# reader, guest-visible descheduling, guest-visible block I/O and H2D.  It also
+# measured the worst copy at wall ~1460 ms / thread CPU ~1370 ms (ratio 1.07)
+# with zero majflt, zero inblock and zero context switches -- but under gVisor
+# those counters are NON-AUTHORITATIVE for ruling out backing-page work, so the
+# only way forward is to remove one side of the copy and re-measure.
+#
+# It extends the Phase-1 source-stall diagnostic profile
+# (golden_p1_parallel_p9opt1_source_diag_h100), so every runtime invariant is
+# inherited unchanged rather than restated here:
+#
+#   H100! / CPU=12 / memory 24576 MB
+#   whole mmap lifecycle                   COMFYMODAL_GOLDEN_C0_MMAP_LIFECYCLE=whole
+#   thread source owner                    COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND=thread
+#   qd4_64 source/transport geometry       64 MiB blocks, 16 x 64 MiB arena
+#   forced-miss conditioning               [workload] conditioning_cache=forced_miss
+#   fresh-run requirement                  [workload] fresh_required=true
+#   correctness SHA                        3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#   per-copy stall probe                   COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE=1
+#
+# What it adds is the copy-isolation experiment, which runs inside the parallel
+# container between golden_request_setup and the first model byte read, so it
+# measures one arm on an untouched true-cold container and never competes with
+# the real CLIP source load.  The arm is RUN-ONLY, so all four arms are measured
+# on one deployment instead of forcing four redeploys:
+#
+#   --set COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM=A   production control
+#   --set COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM=B   anonymous destination
+#   --set COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM=C   anonymous source
+#   --set COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM=D   anonymous/anonymous
+#
+# Source behaviour is deliberately UNCHANGED by the experiment: no
+# posix_fadvise, no readahead, no MADV_WILLNEED, no MADV_HUGEPAGE, no mlock, no
+# NUMA binding, no CPU affinity, no extra readers, and no change to QD, block
+# size, pacer or mmap lifecycle.  Adding any of those would confound the
+# measurement with the treatment.
+#
+# The target app is deliberately distinct from batch-p9opt1-diag-h100,
+# batch-p9opt1-h100 and batch-p9opt1-prof, so no counted or profiled deployment
+# and no Phase-1 diagnostic deployment is modified.
+#
+# This profile is NOT counted and NOT promotable.  It produces one arm per
+# container and must never be used to state a Golden performance number.
+schema_version = 1
+name = "golden_p1_parallel_p9_srccopy_iso_h100"
+extends = "golden_p1_parallel_p9opt1_source_diag_h100"
+owner = "p9-source-copy-isolation"
+
+[target]
+app = "batch-p9srccopy-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+# Deploy-baked experiment gate.  The four arms are selected run-only.
+COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION = "1"

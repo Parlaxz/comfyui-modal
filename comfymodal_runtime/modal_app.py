@@ -5426,6 +5426,26 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE_MINCORE": os.environ.get(
             "COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE_MINCORE", "0"
         ),
+        # ── P9 source/destination copy-isolation experiment (default off).
+        # Same reason as every key above: _runtime_env is a hand-written
+        # allowlist that becomes Modal's class-level env=, so anything absent
+        # here never reaches the container and the experiment would silently
+        # do nothing while the deployment looked correct.
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION", "0"
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ARM", "A"
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_COPIES": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_COPIES", "256"
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_MODEL": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_MODEL", "unet"
+        ),
+        "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ANON_GIB": os.environ.get(
+            "COMFYMODAL_GOLDEN_SOURCE_COPY_ISOLATION_ANON_GIB", "4"
+        ),
         "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA": os.environ.get(
             "COMFYMODAL_V2_OPT_DIAG_SYNC_CUDA", "0"
         ),

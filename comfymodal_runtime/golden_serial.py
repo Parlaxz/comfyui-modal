@@ -8303,6 +8303,10 @@ class GoldenSession:
         self.node_map: Optional[GoldenNodeMap] = None
         self.model_paths: dict[str, str] = {}
         self.clip_paths: list[str] = []
+        # P9 source/destination copy-isolation experiment report.  Stays None
+        # unless the opt-in flag is on, so the default request allocates
+        # nothing and carries nothing.
+        self.source_copy_isolation: Optional[dict[str, Any]] = None
         self.model_transport: Any = None
         self.model_transport_records: list[dict[str, Any]] = []
         self.clip: Any = None

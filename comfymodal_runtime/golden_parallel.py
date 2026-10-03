@@ -338,6 +338,22 @@ async def golden_parallel_execute(
         with _golden_trace_span("golden_request_setup"):
             await golden_request_setup(session)
         _hb("request_setup_done")
+        # P9 source/destination copy-isolation experiment (opt-in, default OFF).
+        # It runs HERE, after the model paths are resolved but before the first
+        # model byte is read, so it measures one arm on an otherwise untouched
+        # true-cold container and cannot compete with the real CLIP source load
+        # it is meant to explain.  Disabled resolves to one boolean test.
+        from . import source_copy_isolation as _source_copy_isolation
+
+        if _source_copy_isolation.enabled():
+            _iso_report = _source_copy_isolation.run_from_session(session)
+            session.source_copy_isolation = _iso_report
+            session.recorder.event(
+                "golden_source_copy_isolation",
+                arm=_iso_report.get("arm"),
+                status=_iso_report.get("status"),
+                report=_iso_report,
+            )
         if presnapshot_active:
             loader_worker = get_pre_snapshot_worker()
             init_evidence = loader_worker.initialize_session(
