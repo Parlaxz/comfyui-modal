@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from . import m2_source_core
 from . import source_race_gpu
@@ -274,6 +274,24 @@ class LoadedSafetensors:
             return self[key]
         except KeyError:
             return default
+
+
+@dataclass
+class LayoutPreresolve:
+    """Evidence holder for one background safetensors layout resolution."""
+
+    path: str
+    started_ns: Optional[int]
+    finished_ns: Optional[int]
+    done: threading.Event
+    result: Any = None
+    error: Optional[BaseException] = None
+
+    @property
+    def ms(self) -> Optional[float]:
+        if self.started_ns is None or self.finished_ns is None:
+            return None
+        return (self.finished_ns - self.started_ns) / 1e6
 
 
 def _file_identity(path: str) -> tuple[int, int, int, int]:
@@ -731,6 +749,8 @@ class GoldenModelTransport:
         self._cuda: dict[str, Any] = {}
         self._event_pool: list[Any] = []
         self._layout_cache: collections.OrderedDict[str, SafetensorsLayout] = collections.OrderedDict()
+        self._layout_lock = threading.Lock()
+        self._layout_preresolve: Optional[LayoutPreresolve] = None
         self._models_generation = ""
         self._generation = 0
         self._reader_done: set[int] = set()
@@ -964,7 +984,8 @@ class GoldenModelTransport:
         if selected == self._models_generation:
             return
         self._models_generation = selected
-        self._layout_cache.clear()
+        with self._layout_lock:
+            self._layout_cache.clear()
         if self._prepared:
             for connection in self._connections:
                 connection.send({"command": "INVALIDATE_FDS"})
@@ -978,16 +999,76 @@ class GoldenModelTransport:
     def inspect(self, path: str) -> SafetensorsLayout:
         normalized = os.path.abspath(str(path))
         identity = _file_identity(normalized)
-        cached = self._layout_cache.get(normalized)
-        if cached is not None and cached.identity == identity:
-            self._layout_cache.move_to_end(normalized)
-            return cached
+        with self._layout_lock:
+            cached = self._layout_cache.get(normalized)
+            if cached is not None and cached.identity == identity:
+                self._layout_cache.move_to_end(normalized)
+                return cached
         layout = _parse_layout(normalized, identity)
-        self._layout_cache[normalized] = layout
-        self._layout_cache.move_to_end(normalized)
-        while len(self._layout_cache) > LAYOUT_CACHE_LIMIT:
-            self._layout_cache.popitem(last=False)
+        with self._layout_lock:
+            self._layout_cache[normalized] = layout
+            self._layout_cache.move_to_end(normalized)
+            while len(self._layout_cache) > LAYOUT_CACHE_LIMIT:
+                self._layout_cache.popitem(last=False)
         return layout
+
+    def begin_layout_preresolve(self, path: str) -> LayoutPreresolve:
+        """Start, or join, one background resolution of ``path``'s layout."""
+        normalized = os.path.abspath(str(path))
+        with self._layout_lock:
+            existing = self._layout_preresolve
+            if existing is not None and existing.path == normalized:
+                return existing
+            holder = LayoutPreresolve(
+                path=normalized,
+                started_ns=time.perf_counter_ns(),
+                finished_ns=None,
+                done=threading.Event(),
+            )
+            self._layout_preresolve = holder
+
+        def resolve() -> None:
+            try:
+                try:
+                    holder.result = self.inspect(normalized)
+                except BaseException as exc:
+                    holder.error = exc
+            except BaseException as exc:
+                # The worker is evidence-only and must never escape into the
+                # interpreter's thread exception machinery.
+                holder.error = exc
+            finally:
+                holder.finished_ns = time.perf_counter_ns()
+                holder.done.set()
+
+        try:
+            threading.Thread(
+                target=resolve,
+                name="golden-unet-layout-preresolve",
+                daemon=True,
+            ).start()
+        except BaseException as exc:
+            holder.error = exc
+            holder.finished_ns = time.perf_counter_ns()
+            holder.done.set()
+        return holder
+
+    def join_layout_preresolve(self, path: str) -> LayoutPreresolve:
+        """Wait for a started layout pre-resolve without raising its error."""
+        normalized = os.path.abspath(str(path))
+        with self._layout_lock:
+            holder = self._layout_preresolve
+            if holder is None or holder.path != normalized:
+                not_started = LayoutPreresolve(
+                    path=normalized,
+                    started_ns=None,
+                    finished_ns=None,
+                    done=threading.Event(),
+                )
+                not_started.done.set()
+                return not_started
+        holder.done.wait()
+        return holder
 
     async def load(self, path: str, *, role: str = "model") -> LoadedSafetensors:
         # The transport body, including the C0 source-thread fan-out, runs on
@@ -2096,6 +2177,7 @@ __all__ = [
     "GpuAllocationLease",
     "GpuDestinationPool",
     "GoldenModelTransport",
+    "LayoutPreresolve",
     "LoadedSafetensors",
     "SafetensorsLayout",
     "get_golden_model_transport",
