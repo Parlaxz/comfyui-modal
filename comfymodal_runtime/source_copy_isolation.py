@@ -258,7 +258,35 @@ class PinnedSharedArena:
             "notes": list(self.notes),
         }
 
-    def close(self) -> None:
+    def close(self) -> dict[str, Any]:
+        """Unregister before releasing the mapping, exactly as production does.
+
+        ``cudaHostUnregister`` is not optional here.  A registration outlives the
+        Python object: if the arena's shared-memory segment is closed and
+        unlinked while it is still registered, the driver keeps the virtual
+        address range registered, the next 1 GiB shared-memory allocation is
+        handed the same address by the kernel, and the production
+        ``cudaHostRegister`` in ``SharedArenaRing.ensure`` then fails with
+        ``cudaErrorAlreadyMapped``.  That is exactly what the first arm-A
+        request did, so this method mirrors ``SharedArenaRing``'s own teardown
+        order rather than inventing its own.
+        """
+        outcome: dict[str, Any] = {"cuda_host_unregistered": False}
+        if self.register_rc == 0:
+            try:
+                import torch  # noqa: PLC0415 - only needed to unregister
+
+                cudart = torch.cuda.cudart()
+                unregister = getattr(cudart, "cudaHostUnregister", None)
+                if not callable(unregister):
+                    outcome["error"] = "cudaHostUnregister_unavailable"
+                else:
+                    started = time.perf_counter()
+                    outcome["rc"] = int(unregister(self.address))
+                    outcome["ms"] = round((time.perf_counter() - started) * 1000.0, 4)
+                    outcome["cuda_host_unregistered"] = outcome["rc"] == 0
+            except BaseException as exc:  # noqa: BLE001 - teardown never raises
+                outcome["error"] = f"{type(exc).__name__}: {exc}"[:200]
         try:
             self.buffer.release()
         except Exception:
@@ -268,6 +296,7 @@ class PinnedSharedArena:
             self.shm.unlink()
         except Exception:
             pass
+        return outcome
 
 
 def _anonymous_destination_evidence(buffer: Any, address: int) -> dict[str, Any]:
@@ -1008,7 +1037,9 @@ def run_arm(
         if source_buffer is not None:
             _release_anonymous(source_buffer)
         if arena is not None:
-            arena.close()
+            # Observable, because a failed unregister poisons every later
+            # cudaHostRegister in this container with cudaErrorAlreadyMapped.
+            report["teardown"] = arena.close()
         elif destination_buffer is not None:
             _release_anonymous(destination_buffer)
     return report

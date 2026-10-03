@@ -47,6 +47,14 @@ REQUIRED_MODULES = (
     "comfymodal_runtime/golden_model_transport.py",
     "comfymodal_runtime/golden_qd_transport.py",
     "comfymodal_runtime/golden_source_threads.py",
+    # P9 source/destination copy-isolation experiment.  Proven here because a
+    # deployment that omitted it would still pass every other identity check
+    # while silently running no arm at all -- exactly the failure 975aec14 had
+    # to fix for the per-copy probe.
+    "comfymodal_runtime/source_copy_isolation.py",
+    "comfymodal_runtime/source_copy_probe.py",
+    "comfymodal_runtime/source_stall_classification.py",
+    "comfymodal_runtime/golden_parallel.py",
     "comfymodal_runtime/output_durability.py",
 )
 
@@ -67,6 +75,10 @@ REMOTE_MODULE_NAMES = {
     "comfymodal_runtime/golden_model_transport.py": "comfymodal_runtime.golden_model_transport",
     "comfymodal_runtime/golden_qd_transport.py": "comfymodal_runtime.golden_qd_transport",
     "comfymodal_runtime/golden_source_threads.py": "comfymodal_runtime.golden_source_threads",
+    "comfymodal_runtime/source_copy_isolation.py": "comfymodal_runtime.source_copy_isolation",
+    "comfymodal_runtime/source_copy_probe.py": "comfymodal_runtime.source_copy_probe",
+    "comfymodal_runtime/source_stall_classification.py": "comfymodal_runtime.source_stall_classification",
+    "comfymodal_runtime/golden_parallel.py": "comfymodal_runtime.golden_parallel",
     "comfymodal_runtime/output_durability.py": "comfymodal_runtime.output_durability",
 }
 

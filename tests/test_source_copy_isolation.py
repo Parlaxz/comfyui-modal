@@ -173,6 +173,21 @@ def test_pinned_and_anonymous_destinations_are_different_objects():
     assert evidence["bytes"] == gsrc.ARENA_BYTES
 
 
+def test_pinned_arena_unregisters_before_it_releases_the_mapping():
+    # A registration outlives the Python object.  Closing and unlinking the
+    # shared-memory segment while it is still registered leaves the address
+    # range registered in the driver, the next 1 GiB allocation reuses that
+    # address, and the production cudaHostRegister then fails with
+    # cudaErrorAlreadyMapped.  That was a real first-run failure, not a
+    # hypothetical, so the contract is pinned here.
+    source = inspect.getsource(sci.PinnedSharedArena.close)
+    assert "cudaHostUnregister" in source
+    assert source.index("cudaHostUnregister") < source.index("self.shm.close()")
+    assert "self.buffer.release()" in source
+    run_arm_source = inspect.getsource(sci.run_arm)
+    assert 'report["teardown"] = arena.close()' in run_arm_source
+
+
 def test_pinned_arena_geometry_is_the_production_arena():
     arena = sci.PinnedSharedArena()
     try:
