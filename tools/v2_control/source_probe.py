@@ -411,6 +411,77 @@ def run_source_probe(
     return (0 if result["verdict"] == "MATCH" else 1), report
 
 
+def call_remote_runtime_method(
+    repo_root: Path,
+    *,
+    workspace: dict[str, Any],
+    gpu: str,
+    method_name: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Invoke a non-streaming method on the deployed v2 runtime class.
+
+    This keeps the pre-cohort metadata publication on the same transport and
+    destination selection as ``source-probe`` without making it a generation.
+    """
+    import asyncio
+
+    if "id" not in workspace and workspace.get("workspace_id"):
+        workspace = {
+            **workspace,
+            "id": workspace["workspace_id"],
+            "label": workspace.get("workspace_label", ""),
+        }
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    from comfymodal_runtime.modal_transport import ModalTransport
+
+    def _do() -> dict[str, Any]:
+        transport = ModalTransport()
+        handle = transport._v2_handle(workspace=workspace, gpu=gpu)
+        fn = getattr(handle, method_name, None)
+        if fn is None:
+            raise RuntimeError(f"deployed class has no {method_name} method")
+        remote = getattr(fn, "remote", None)
+        if remote is not None and callable(getattr(remote, "aio", None)):
+            return remote.aio(request_id=request_id)
+        if asyncio.iscoroutinefunction(fn):
+            return fn(request_id=request_id)
+        return fn(request_id=request_id)
+
+    @contextmanager
+    def _destination_environment():
+        original = dict(os.environ)
+        try:
+            for name in list(os.environ):
+                if name.startswith("MODAL_") or name in {
+                    "COMFYMODAL_ENVIRONMENT",
+                    "COMFYMODAL_V2_ENVIRONMENT",
+                    "COMFYMODAL_MODAL_PROFILE",
+                }:
+                    os.environ.pop(name, None)
+            os.environ["MODAL_TOKEN_ID"] = str(workspace.get("token_id") or "")
+            os.environ["MODAL_TOKEN_SECRET"] = str(workspace.get("token_secret") or "")
+            environment = str(workspace.get("environment") or "(default)")
+            if environment != "(default)":
+                os.environ["MODAL_ENVIRONMENT"] = environment
+                os.environ["COMFYMODAL_ENVIRONMENT"] = environment
+                os.environ["COMFYMODAL_V2_ENVIRONMENT"] = environment
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    with _destination_environment():
+        result = asyncio.run(asyncio.to_thread(_do))
+    if asyncio.iscoroutine(result):
+        result = asyncio.run(result)
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{method_name} returned {type(result).__name__}")
+    return result
+
+
 def _load_workspace(repo_root: Path) -> dict[str, Any]:
     """Compatibility loader for the immutable config-owned destination."""
     try:

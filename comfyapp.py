@@ -9493,6 +9493,31 @@ def _ensure_url_scheme(url: str) -> str:
     return url
 
 
+def _publish_downloaded_model_metadata(path: str, save_path: str, filename: str) -> None:
+    """Best-effort cache publication owned by the dedicated downloader."""
+    try:
+        from comfymodal_runtime.golden_model_metadata_cache import (
+            canonical_model_relative_path,
+            publish_model_metadata,
+        )
+        relative = canonical_model_relative_path(str(path)) or "/".join(
+            part for part in (str(save_path).replace("\\", "/"), str(filename).replace("\\", "/")) if part
+        )
+        result = publish_model_metadata(path, relative, runtime_config_vol)
+        print(f"[comfyapp] golden_model_metadata_publish {result}")
+    except Exception as exc:
+        # Metadata is an optimization.  A bad header/cache/runtime volume must
+        # never turn a completed model download into a failed model download.
+        print(f"[comfyapp] golden_model_metadata_publish_failed {type(exc).__name__}:{exc}")
+
+
+@app.function(
+    image=download_image,
+    cpu=2,
+    memory=512,
+    timeout=1800,
+    volumes={MODELS_PATH: vol, RUNTIME_CONFIG_PATH: runtime_config_vol},
+)
 def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
     import httpx
     from pathlib import Path
@@ -9502,6 +9527,11 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists():
+        # The weights are already durable on the volume, so this is a valid
+        # publication point too.  Publishing is keyed by model identity and
+        # merged into the blob, so repeating it is a cheap no-op.  Without this
+        # the cache would only ever be populated on a first-ever download.
+        _publish_downloaded_model_metadata(str(dest), save_path, filename)
         return {"status": "ok", "skipped": True, "path": str(dest)}
 
     headers = {}
@@ -9535,6 +9565,7 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
 
     os.replace(str(_part), str(dest))
     vol.commit()
+    _publish_downloaded_model_metadata(str(dest), save_path, filename)
     return {"status": "ok", "path": str(dest)}
 
 
@@ -9543,7 +9574,7 @@ def download_model_to_volume(url: str, filename: str, save_path: str = "checkpoi
     cpu=2,
     memory=512,
     timeout=1800,
-    volumes={MODELS_PATH: vol},
+    volumes={MODELS_PATH: vol, RUNTIME_CONFIG_PATH: runtime_config_vol},
 )
 def download_model_stream(url: str, filename: str, save_path: str = "checkpoints", hf_token: str = "", civitai_token: str = ""):
     import httpx
@@ -9554,6 +9585,9 @@ def download_model_stream(url: str, filename: str, save_path: str = "checkpoints
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if dest.exists():
+        # Already durable on the volume: still a valid publication point.  See
+        # download_model_to_volume for why this must not be download-only.
+        _publish_downloaded_model_metadata(str(dest), save_path, filename)
         yield {"type": "complete", "status": "ok", "skipped": True, "path": str(dest), "filename": filename}
         return
 
@@ -9594,6 +9628,7 @@ def download_model_stream(url: str, filename: str, save_path: str = "checkpoints
 
     os.replace(str(_part), str(dest))
     vol.commit()
+    _publish_downloaded_model_metadata(str(dest), save_path, filename)
     yield {"type": "complete", "status": "ok", "path": str(dest), "filename": filename}
 
 
