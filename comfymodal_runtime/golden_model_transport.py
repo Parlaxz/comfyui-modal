@@ -20,6 +20,11 @@ from typing import Any
 from . import m2_source_core
 from . import source_race_gpu
 from . import golden_source_threads
+from .source_latency_telemetry import (
+    collect_placement_telemetry,
+    summarize_first_h2d,
+    summarize_source_operations,
+)
 
 
 class _DeferredC0Backend:
@@ -1291,6 +1296,9 @@ class GoldenModelTransport:
             span = golden_source_threads.canonical_source_span(
                 source_telemetry.get("source_operation_records") or []
             )
+            source_operation_records = source_telemetry.get("source_operation_records") or []
+            source_telemetry_compact = dict(source_telemetry)
+            source_telemetry_compact.pop("source_operation_records", None)
             source_start_ns = span.get("source_start_ns")
             source_end_ns = span.get("source_end_ns")
             source_wall_ms = span.get("source_wall_ms")
@@ -1307,6 +1315,30 @@ class GoldenModelTransport:
             final_h2d_completion_observed_ns = dispatcher_timing.get(
                 "final_h2d_completion_observed_ns"
             )
+            first_h2d_submit_ns = dispatcher_timing.get("first_h2d_submit_ns")
+            first_h2d_completion_ns = dispatcher_timing.get(
+                "first_h2d_completion_observed_ns"
+            )
+            source_latency_counters = {
+                **source_telemetry,
+                "source_gbps": source_gbps,
+                "source_final_byte_complete_ns": source_final_byte_complete_ns,
+                "final_h2d_submit_ns": final_h2d_submit_ns,
+                "final_h2d_completion_observed_ns": final_h2d_completion_observed_ns,
+                "gpu_ready_tail_ms": (
+                    (final_h2d_completion_observed_ns - source_final_byte_complete_ns) / 1e6
+                    if final_h2d_completion_observed_ns and source_final_byte_complete_ns
+                    else None
+                ),
+            }
+            # Placement is collected from live handles, once per process.  The
+            # source owner keeps its child on ``_proc``; ``SharedArenaRing``
+            # mirrors the same pid onto ``child_pid`` when it adopts the owner.
+            source_owner = getattr(runtime, "_source_thread_process", None)
+            source_child_pid = getattr(getattr(source_owner, "_proc", None), "pid", None)
+            source_child_pid = source_child_pid or getattr(runtime, "child_pid", None)
+            arena_shm = getattr(runtime, "_shm", None)
+            arena_name = getattr(arena_shm, "name", None)
             stats = {
                 "status": "ok",
                 "execution_architecture": "c0_parallel",
@@ -1356,7 +1388,10 @@ class GoldenModelTransport:
                     "bytes": int(result.completed_bytes),
                     "blocks": len(result.records),
                 },
-                "source_thread_telemetry": source_telemetry,
+                "source_thread_telemetry": {
+                    **source_telemetry_compact,
+                    "source_operation_record_count": len(source_operation_records),
+                },
                 "source_detail": {
                     "arena_ensure": arena_ensure_detail(runtime),
                     "dispatcher": result.telemetry,
@@ -1417,6 +1452,22 @@ class GoldenModelTransport:
                         "mmap_unmap_count": source_telemetry.get("mmap_unmap_count"),
                         "source_span_ms": span.get("source_wall_ms"),
                     },
+                    "source_latency": summarize_source_operations(
+                        source_operation_records,
+                        source_span=span,
+                        counters_source=source_latency_counters,
+                    ),
+                    "first_h2d": summarize_first_h2d(
+                        source_operation_records,
+                        source_start_ns=source_start_ns,
+                        first_h2d_submit_ns=first_h2d_submit_ns,
+                        first_h2d_completion_ns=first_h2d_completion_ns,
+                    ),
+                    "placement": collect_placement_telemetry(
+                        arena_name=arena_name,
+                        arena_bytes=getattr(runtime, "size_bytes", None),
+                        source_child_pid=source_child_pid,
+                    ),
                 },
                 "quiescence": {
                     "workers_joined": False,
