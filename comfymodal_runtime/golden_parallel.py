@@ -290,6 +290,12 @@ async def golden_parallel_execute(
         # plane and evidence foundation; overlap belongs to a later change.
         _PROGRESS_STATE["t0_ns"] = time.monotonic_ns()
         _PROGRESS_STATE["last_stage"] = "execute_enter"
+        # _OUTER_MARKS is module-global, so on a reused or concurrent container
+        # it otherwise accumulates marks from earlier requests and mixes their
+        # timestamps into this request's telemetry.  Reset it with the rest of
+        # the per-request progress state so every mark below belongs to this
+        # request's clock.
+        _OUTER_MARKS.clear()
         _install_request_wall_gate()
         _hb("execute_enter")
         # THE authoritative Golden Parallel root.  It opens before any request

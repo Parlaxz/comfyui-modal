@@ -23344,6 +23344,11 @@ class ModalRuntimeEntrypoint:
         marker selects ``golden_parallel_execute`` at the final orchestration
         seam; no serial loader or sampler implementation is duplicated.
         """
+        # Clear the instance telemetry path at entry.  It is only assigned deep
+        # in the impl, so without this a request that fails validation (or any
+        # early return) would leave the PREVIOUS request's path in place for the
+        # post-yield outer-marks write below to overwrite.
+        self._golden_telemetry_path = None
         outer_mark_lifetime = __import__(
             "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
         )._OuterLifetime
@@ -24441,6 +24446,16 @@ def _build_decorated_v2_class() -> type:
                 # made while the generator frame is still alive).
                 _release_on_close = orig_method.__name__ in (
                     "run_plan_stream", "run_prompt_stream",
+                    # The Golden streaming entrypoints are single-use
+                    # containers: Modal destroys the container once the method
+                    # returns, so there is no next request to release a GPU for.
+                    # COMFYMODAL_V2_MINIMAL_GPU_TEARDOWN exists specifically to
+                    # drop the heavyweight unload on this path, but it was
+                    # unreachable because the Golden methods were absent here -
+                    # the flag was a no-op on Golden while the profile claimed
+                    # otherwise.  Running the release lets the flag actually
+                    # select minimal teardown, which is its intended contract.
+                    "run_golden_serial_stream", "run_golden_parallel_stream",
                 )
                 @functools.wraps(orig_method)
                 async def _wrapper(self, *args, **kwargs):

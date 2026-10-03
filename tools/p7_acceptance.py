@@ -157,7 +157,11 @@ for r in rows:
 
 print(f"\nACCEPTED: {len(accepted)}/{len(rows)}")
 if not accepted:
-    sys.exit(0)
+    # This is an acceptance gate: an empty accepted set is a FAILURE, not a
+    # pass. Exiting 0 here green-litened "no runs were accepted at all", so a
+    # broken experiment or a mis-pointed glob could never fail the gate.
+    print("GATE: FAIL (no accepted runs)")
+    sys.exit(1)
 
 def dist(vals, label):
     v = sorted(x for x in vals if isinstance(x, float))
@@ -198,3 +202,10 @@ for r in accepted[:3]:
           f"image_data_present={r['image_data_present']} occurrences={r['image_count']}")
 print(f"  runs carrying image_data: {sum(1 for r in accepted if r['image_data_present'])}/{len(accepted)}")
 print(f"  runs with >1 image_data occurrence: {sum(1 for r in accepted if r['image_count'] > 1)}/{len(accepted)}")
+
+# An acceptance gate must also fail when some runs were rejected: the contract
+# is that every counted run passes, so a partial pass is not a pass.
+if len(accepted) != len(rows):
+    print(f"\nGATE: FAIL ({len(rows) - len(accepted)}/{len(rows)} runs rejected)")
+    sys.exit(1)
+print("\nGATE: PASS (all runs accepted)")
