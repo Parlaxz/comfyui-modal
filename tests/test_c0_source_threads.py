@@ -1059,7 +1059,7 @@ def test_publish_ready_refuses_a_slot_whose_generation_changed_during_fill() -> 
     claim = source.claim_block(buf, _plan())
     # Someone else advanced the slot while the copy was in flight.
     source._put_slot(buf, claim.slot_index, (source.FILLING, claim.slot_generation + 5, 0, 0, 0, 4, 0, 0))
-    record = (0,) * 18
+    record = (0,) * len(source.OP_FIELDS)
     with pytest.raises(source.SourceProtocolError, match="slot_generation_changed_during_fill"):
         source.publish_ready(buf, 0, claim, record)
 
@@ -1078,6 +1078,10 @@ def test_publish_ready_allocates_a_shared_ring_index() -> None:
             7, 0, 1, claim.slot_index, claim.range_index, 0, 4,
             1, 0, 1, 1, 2, 0, 0, 0, 0, 3, 1,
         )
+        # The ring carries per-copy stall evidence after the original 18
+        # fields.  Padding from the declared field list keeps this test honest
+        # about the real record width instead of a stale literal.
+        record = record + (0,) * (len(source.OP_FIELDS) - len(record))
         allocated.append(source.publish_ready(buf, 0, claim, record))
     assert allocated == [0, 1, 2]
     assert source.COUNTERS.unpack_from(buf, source.COUNTER_OFFSET)[6] == 3

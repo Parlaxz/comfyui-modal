@@ -25,6 +25,7 @@ from .source_latency_telemetry import (
     summarize_first_h2d,
     summarize_source_operations,
 )
+from .source_stall_classification import summarize_copy_stalls
 
 
 class _DeferredC0Backend:
@@ -1566,6 +1567,10 @@ class GoldenModelTransport:
                         source_span=span,
                         counters_source=source_latency_counters,
                     ),
+                    # Per-copy stall evidence: wall vs thread CPU, fault and
+                    # context-switch deltas, and an evidence-based label for
+                    # each slow copy.  Bounded: aggregates plus the top eight.
+                    "copy_stalls": summarize_copy_stalls(source_operation_records),
                     "first_h2d": summarize_first_h2d(
                         source_operation_records,
                         source_start_ns=source_start_ns,

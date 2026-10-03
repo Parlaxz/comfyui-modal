@@ -99,12 +99,21 @@ SLOT = struct.Struct("<IIQQQQQQ")
 # Fixed-size raw operation records.  The source process writes these records
 # into the control segment; JSON is produced only when the parent asks for
 # evidence after the measured work has drained.
-OP = struct.Struct("<18Q")
+OP = struct.Struct("<30Q")
 OP_FIELDS = (
     "generation", "reader_id", "thread_id", "slot_index", "ordinal",
     "source_offset", "nbytes", "source_start_ns", "map_start_ns",
     "access_start_ns", "memcpy_start_ns", "memcpy_end_ns", "munmap_start_ns",
     "munmap_end_ns", "slot_wait_ns", "pacing_wait_ns", "ready_ns", "flags",
+    # Per-copy stall evidence, appended so the pre-existing field order stays
+    # byte-for-byte compatible with every existing reader of the ring.  Each is
+    # a wall/CPU/fault/context measurement taken strictly around the native
+    # memmove -- never around the slot claim, pacer sleep, or READY publish.
+    # A value of SENTINEL means "probe unavailable", which is deliberately
+    # distinct from a real zero delta.
+    "copy_wall_ns", "thread_cpu_ns_before", "thread_cpu_ns_after",
+    "minflt_delta", "majflt_delta", "inblock_delta", "nvcsw_delta",
+    "nivcsw_delta", "start_cpu", "end_cpu", "diag_flags", "resident_pre_ppm",
 )
 HEADER_SIZE = 128
 SLOT_OFFSET = HEADER_SIZE
@@ -1712,11 +1721,21 @@ def execute_block(plan: _ChildPlan, arena_buf: Any, control_buf: Any, lock: Any,
         copy_address = base_address + source_offset - aligned
         temporary_map = True
     target_address = ctypes.addressof(ctypes.c_char.from_buffer(target))
+    probe = _PROBE
+    # Holds the single copy's evidence between the closure and the record.
+    probe_record = _PROBE_SENTINEL_RECORD
 
     def _copy(mark_actual_start: Any) -> int:
+        nonlocal probe_record
         start = mark_actual_start()
+        # The probe brackets the memmove itself and nothing else.
+        # ``mark_actual_start`` already recorded the pacer's start, so the pacer
+        # sleep stays outside the measured interval; the READY publish happens
+        # after this returns.
+        probe_state = probe.begin(copy_address, length)
         _MAPPER.memmove(ctypes.c_void_p(target_address), ctypes.c_void_p(copy_address),
                         ctypes.c_size_t(length))
+        probe_record = probe.end(probe_state)
         return start
 
     try:
@@ -1739,6 +1758,18 @@ def execute_block(plan: _ChildPlan, arena_buf: Any, control_buf: Any, lock: Any,
             int(claim.effective_concurrency)
             | (int(plan.mmap_lifecycle == "whole") << 8)
             | (int(bool(map_start)) << 9),
+            int(probe_record["copy_wall_ns"]),
+            int(probe_record["thread_cpu_ns_before"]),
+            int(probe_record["thread_cpu_ns_after"]),
+            int(probe_record["minflt_delta"]),
+            int(probe_record["majflt_delta"]),
+            int(probe_record["inblock_delta"]),
+            int(probe_record["nvcsw_delta"]),
+            int(probe_record["nivcsw_delta"]),
+            int(probe_record["start_cpu"]),
+            int(probe_record["end_cpu"]),
+            int(probe_record["diag_flags"]),
+            int(probe_record["resident_pre_ppm"]),
         )
         with lock:
             publish_ready(control_buf, reader_id, claim, record)
@@ -1763,11 +1794,22 @@ def _paced_copy(pacer: Any, control_buf: Any, lock: Any, callback: Any,
 _MAPPER: Any = None
 _PAGE_SIZE: int = 4096
 
+# Diagnostic-only per-copy stall probe.  Constructed once per address space so
+# every capability question is answered before the first measured copy.  When
+# its env gate is off it is inert and the record carries the sentinel payload,
+# which keeps the un-instrumented behaviour and the ring layout identical.
+_PROBE: Any = None
+_PROBE_SENTINEL_RECORD: dict = {}
+
 
 def _init_native() -> None:
-    global _MAPPER, _PAGE_SIZE
+    global _MAPPER, _PAGE_SIZE, _PROBE, _PROBE_SENTINEL_RECORD
     _MAPPER = _native_mmap_setup()
     _PAGE_SIZE = int(os.sysconf("SC_PAGE_SIZE"))
+    from .source_copy_probe import SourceCopyProbe, sentinel_record
+
+    _PROBE_SENTINEL_RECORD = sentinel_record()
+    _PROBE = SourceCopyProbe()
 
 
 def _run_reader_loop(
