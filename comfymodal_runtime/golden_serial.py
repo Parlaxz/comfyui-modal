@@ -9851,54 +9851,33 @@ def validate_attention_backend_diagnostics(
         )
 
 
-def _container_restore_facts() -> dict:
-    """Capture container-side facts that explain source-read throughput.
-
-    Model-load bandwidth on this lane spans roughly 1.5-7 GB/s between
-    otherwise identical runs, and the only known mechanism that would force a
-    cold model re-read is a failed memory-snapshot restore.  Neither the Modal
-    execution region nor the snapshot outcome is recoverable from the produced
-    artifacts, so record them at the restore boundary where the metadata is
-    already persisted.
-
-    Strictly observation-only: every lookup is individually guarded and any
-    unexpected condition degrades to ``None`` rather than raising, because
-    telemetry must never be able to fail a production request.
-    """
-
-    def _safe(fn):
-        try:
-            return fn()
-        except BaseException:
-            return None
-
-    facts: dict = {
-        # Whether this app asked Modal for a memory snapshot at all.  The
-        # resolver defaults to True, so a restore failure here means a cold
-        # container start and a full model re-read.
-        "memory_snapshot_enabled": _safe(
-            lambda: (
-                os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT", "").strip().lower()
-                not in {"0", "false", "no", "off"}
-            )
-        ),
-        "memory_snapshot_env_raw": _safe(
-            lambda: os.environ.get("COMFYMODAL_V2_ENABLE_MEMORY_SNAPSHOT")
-        ),
-    }
-    # Modal does not expose the execution region as a stable documented env var,
-    # so probe the plausible spellings instead of assuming one.
-    for name in (
-        "MODAL_REGION",
-        "MODAL_DEFAULT_REGION",
-        "MODAL_ENVIRONMENT",
-        "MODAL_CONTAINER_ID",
-        "MODAL_TASK_ID",
-    ):
-        value = _safe(lambda n=name: os.environ.get(n))
-        if value:
-            facts[name.lower()] = value
-    return facts
+# REMOVED: _container_restore_facts() and its two call sites.
+#
+# This diagnostic - seven os.environ reads plus one rec.end_stage kwarg at the
+# restore boundary - was the entire P6->P8 CLIP source-read regression.  Isolated
+# by a forward bisect from the production-006 tag and confirmed by an
+# interleaved same-window A/B, 10 unprofiled runs per arm, alternating:
+#
+#   facts removed : CLIP p50 4.80 GB/s, mean 4.49, slow mode 1/10
+#   facts present : CLIP p50 2.63 GB/s, mean 3.13, slow mode 8/16
+#
+# i.e. -2.17 GB/s p50 and -1.36 GB/s mean, with the bimodal ~1.2 GB/s slow mode
+# going from rare to common.  The whole cost lands in source_open_read, and
+# within it almost entirely in ready_queue_wait_ms - the parent blocking at the
+# restore boundary before the C0 readers start.  The readers do identical work
+# either way: concurrency, pacing_wait_count and all_slots_occupied_count are
+# unchanged between fast and slow runs, so nothing reads more slowly; the parent
+# just waits longer for blocks that have already been produced.
+#
+# Removing only the rec.end_stage kwarg is NOT sufficient - the pair is atomic,
+# because the kwarg reads baseline["container_facts"] that the helper creates -
+# so the helper goes too rather than being computed into the baseline.
+#
+# It could not have answered its own question in any case: memory_snapshot_enabled
+# records whether the app ASKED for a memory snapshot, not whether Modal actually
+# restored one, so it cannot distinguish a snapshot restore from a cold container
+# start.  That distinction has to come from the platform, not from an
+# environment variable read at the restore boundary.
 
 
 async def golden_restore(session: GoldenSession) -> dict:
@@ -9976,7 +9955,6 @@ async def golden_restore(session: GoldenSession) -> dict:
             "request_id": session.request.request_id,
             "observation_only": True,
             "external_restore_interval": metadata,
-            "container_facts": _container_restore_facts(),
         }
         session.restore_baseline = baseline
         rec.end_stage(
@@ -9985,17 +9963,10 @@ async def golden_restore(session: GoldenSession) -> dict:
             observation_only=True,
             external_restore_interval=metadata,
             device=str(baseline["device"]),
-            # NOTE: this used to also pass container_facts=baseline["container_facts"]
-            # so the restore-stage record would carry them.  That single kwarg is
-            # the whole P6->P8 CLIP source-read regression, isolated by a forward
-            # bisect from the production-006 tag: with it, source_open_read went
-            # 2095 -> 2642 ms mean and the bimodal slow mode went 1/10 -> 3/10,
-            # with the extra time showing up almost entirely as
-            # ready_queue_wait_ms.  Computing the facts into the returned baseline
-            # (above) is harmless and stays; only the stage recording is dropped.
-            # These facts could not answer their own question anyway -
-            # memory_snapshot_enabled records configuration intent, not whether a
-            # restore actually happened.
+            # container_facts used to be recorded here as well as computed into
+            # the baseline.  Both call sites are gone with the helper; see the
+            # REMOVED note above _container_restore_facts for the interleaved
+            # A/B that attributed the whole regression to them.
         )
         return baseline
     except BaseException as exc:
