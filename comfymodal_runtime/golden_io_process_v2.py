@@ -4230,8 +4230,18 @@ class SharedArenaRing:
             resolve_c0_source_worker_kind() if self.source_thread_mode else "thread"
         )
         if self.source_thread_mode:
-            if self.size_bytes != 512 * 1024 * 1024 or self.slot_count != 8 or self.slot_bytes != 64 * 1024 * 1024:
-                raise RuntimeError("source_threads_requires_8x64m_arena")
+            from . import golden_source_threads
+
+            # The source owner attaches the arena by name and size and asserts
+            # its own geometry on the way in, so this gate compares against the
+            # one module that owns that geometry rather than restating it.  It
+            # stays exact: any other slot count or block size still fails closed.
+            if (
+                self.size_bytes != golden_source_threads.ARENA_BYTES
+                or self.slot_count != golden_source_threads.SLOT_COUNT
+                or self.slot_bytes != golden_source_threads.SLOT_BYTES
+            ):
+                raise RuntimeError("source_threads_requires_16x64m_arena")
             if not c0_host_register_enabled():
                 raise RuntimeError("source_threads_requires_cuda_host_register")
             # Report the lifecycle the implementation actually runs, never a
