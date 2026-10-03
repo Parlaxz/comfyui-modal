@@ -52,4 +52,8 @@ method = "run_golden_parallel_stream"
 [environment]
 # Diagnostic per-copy stall probe.  Observation only; no source behaviour change.
 COMFYMODAL_GOLDEN_SOURCE_COPY_PROBE = "1"
+# Triton cache observation, enabled on THIS diagnostic profile only so the
+# exact on-disk artifacts and compile events can be measured. Never on a
+# counted or profiled profile.
+COMFYMODAL_GOLDEN_TRITON_CACHE = "1"
 # mincore() residency intentionally left unset (off).  See the header.

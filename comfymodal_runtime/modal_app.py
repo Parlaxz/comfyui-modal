@@ -667,6 +667,21 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             if isinstance(row, Mapping)
         }
         events = compile_events()
+        # Report the artifacts that are ACTUALLY on disk right now. Without this
+        # the observation can only say "not present in the manifest"; it cannot
+        # distinguish "never compiled" from "compiled but not recorded", which
+        # is exactly the ambiguity Phase 2C has to resolve.
+        listing = sorted(
+            (
+                {
+                    "name": str(row.get("name") or ""),
+                    "suffix": str(row.get("suffix") or ""),
+                    "bytes": int(row.get("bytes") or 0),
+                }
+                for row in cache_files(TRITON_CACHE_DIR)
+            ),
+            key=lambda row: (row["suffix"], row["name"]),
+        )
         base.update({
             "cache_identity_match": compatible,
             "cuda_utils_cache_present_before_request": bool(
@@ -677,6 +692,10 @@ def _triton_cache_observation(*, reset_compile_events: bool = False) -> dict[str
             ),
             "cache_manifest": manifest,
             "triton_compile_events": events,
+            "cache_root": TRITON_CACHE_DIR,
+            "cache_file_count": len(listing),
+            "cache_artifacts": listing[:64],
+            "cache_artifact_suffixes": sorted({row["suffix"] for row in listing}),
             "request_time_kernel_compile": bool(events),
             "request_time_helper_build": not bool(
                 compatible and helper_files and helper_files <= files
@@ -19924,6 +19943,30 @@ class ModalRuntimeEntrypoint:
                         out[f"{attr}_source"] = _inspect.getsource(fn)[:3000]
                     except Exception as exc:  # noqa: BLE001
                         out[f"{attr}_source_error"] = str(exc)[:160]
+            # The cache root is knobs.cache.dir on 3.8.0. TRITON_CACHE_DIR is
+            # only a hint; report what Triton actually resolved, and whether
+            # that directory exists, so a stale assumption about the cache
+            # location cannot masquerade as "nothing was cached".
+            try:
+                from triton import knobs as _knobs  # noqa: PLC0415
+
+                resolved: dict[str, Any] = {}
+                for attr in ("dir", "dump_dir", "override_dir"):
+                    value = getattr(getattr(_knobs, "cache", None), attr, None)
+                    if value is None:
+                        continue
+                    text = str(value)
+                    resolved[attr] = {
+                        "value": text,
+                        "exists": _os.path.isdir(text) if text else False,
+                        "file_count": (
+                            len(_os.listdir(text)) if text and _os.path.isdir(text) else 0
+                        ),
+                    }
+                out["knobs_cache"] = resolved
+            except Exception as exc:  # noqa: BLE001
+                out["knobs_cache_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+
             # What directory Triton would actually use right now.
             for attr in ("get_cache_dir", "default_cache_dir"):
                 fn = getattr(_cache, attr, None)
