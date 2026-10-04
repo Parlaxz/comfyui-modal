@@ -1,0 +1,34 @@
+# v2ctl profile: P10 2x2 arm B -- 16 slots, hoisted context preinit ON.
+#
+# COUNTED PERFORMANCE arm of the P10 hoisted-CUDA-context x arena-depth
+# factorial.  Identical inheritance to arms A/C/D (see
+# golden_p10_reg_a_16_nopreinit_h100 for the full invariant list) and identical
+# geometry to arm A; the ONLY behavioural difference from arm A is:
+#
+#   COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "1"
+#       The post-snapshot (snap=False) minimal restore starts a bounded
+#       driver-level CUDA primary-context worker FIRST, lets restore's own
+#       CUDA-free state repair run beside it, and joins it inside
+#       initialize_cuda() before anything needs a CUDA context.
+#       cudaHostRegister itself is unchanged and still mandatory: this arm only
+#       moves the lazy primary-context creation off the registration path.
+#
+#   COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "16"
+#       16 x 64 MiB = 1 GiB, identical to arm A.
+#
+# Arm identity is verified inside the container against the observed slot count
+# and observed preinit flag, and fails closed on disagreement.
+schema_version = 1
+name = "golden_p10_reg_b_16_preinit_h100"
+extends = "golden_p1_parallel_c0_p8_h100"
+owner = "p10-context-slots"
+
+[target]
+app = "batch-p10-reg-b-16-preinit-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "16"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "1"
+COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM = "p10-16-preinit"

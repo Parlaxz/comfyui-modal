@@ -1,0 +1,35 @@
+# v2ctl profile: P10 2x2 arm D -- 12 slots, hoisted context preinit ON.
+#
+# COUNTED PERFORMANCE arm of the P10 hoisted-CUDA-context x arena-depth
+# factorial.  Identical inheritance to arms A/B/C (see
+# golden_p10_reg_a_16_nopreinit_h100 for the full invariant list).  Arm D is the
+# only cell that has BOTH the reduced arena and the hoisted preinit, so it is
+# what exposes the interaction: if the preinit saves materially different time at
+# 12 slots than at 16, the two axes are not additive and a pooled average would
+# hide that.
+#
+# The ONLY differences from arm C are the preinit flag and the arm name:
+#
+#   COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "12"
+#       12 x 64 MiB = 805306368 bytes (768 MiB).  SLOT_BYTES still 64 MiB; QD,
+#       READER_COUNT, pacer, source owner, mmap lifecycle, source engine and
+#       H2D dispatcher unchanged.
+#
+#   COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "1"
+#       Bounded driver-level CUDA primary-context worker started at the
+#       snap=False restore boundary and joined before the first CUDA caller.
+#       cudaHostRegister is unchanged and still mandatory.
+schema_version = 1
+name = "golden_p10_reg_d_12_preinit_h100"
+extends = "golden_p1_parallel_c0_p8_h100"
+owner = "p10-context-slots"
+
+[target]
+app = "batch-p10-reg-d-12-preinit-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "12"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "1"
+COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM = "p10-12-preinit"

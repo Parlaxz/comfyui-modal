@@ -507,8 +507,10 @@ def test_source_thread_arena_gate_follows_the_source_threads_module(monkeypatch)
     assert ring.slot_count == 16
     assert ring.slot_bytes == 64 * 1024 * 1024
 
-    # The gate is still exact: the retired 8-slot geometry fails closed.
-    with pytest.raises(RuntimeError, match="source_threads_requires_16x64m_arena"):
+    # The gate is still exact: the retired 8-slot geometry fails closed.  The
+    # message names the geometry the owner module actually resolved, so it stays
+    # truthful on both sides of the P10 arena-depth axis.
+    with pytest.raises(RuntimeError, match="source_threads_arena_geometry_mismatch:8x"):
         SharedArenaRing(
             size_bytes=512 * 1024 * 1024,
             slot_count=8,

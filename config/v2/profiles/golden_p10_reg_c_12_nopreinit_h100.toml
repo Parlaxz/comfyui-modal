@@ -1,0 +1,35 @@
+# v2ctl profile: P10 2x2 arm C -- 12 slots, no context preinit.
+#
+# COUNTED PERFORMANCE arm of the P10 hoisted-CUDA-context x arena-depth
+# factorial.  Identical inheritance to arms A/B/D (see
+# golden_p10_reg_a_16_nopreinit_h100 for the full invariant list).  The ONLY
+# differences from the arm-A control are:
+#
+#   COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "12"
+#       12 x 64 MiB = 805306368 bytes (768 MiB) instead of 1 GiB.  SLOT_BYTES is
+#       still 64 MiB; QD (4), READER_COUNT (4), the 4 ms pacer, the thread source
+#       owner, the whole mmap lifecycle, the mmap_fresh engine and the H2D
+#       dispatcher are byte-for-byte unchanged.  This is an arena-depth axis
+#       only, so the comparison isolates exactly how much host-registration work
+#       the deeper arena was buying.
+#
+#   COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "0"
+#       Exact production control: no CUDA is touched before cudaHostRegister.
+#
+# This arm is the one that can reintroduce source-capacity starvation, so its
+# slot_wait / all_slots_occupied / capacity-wait telemetry is a stability guard,
+# not a secondary metric.
+schema_version = 1
+name = "golden_p10_reg_c_12_nopreinit_h100"
+extends = "golden_p1_parallel_c0_p8_h100"
+owner = "p10-context-slots"
+
+[target]
+app = "batch-p10-reg-c-12-nopreinit-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "12"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "0"
+COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM = "p10-12-nopreinit"

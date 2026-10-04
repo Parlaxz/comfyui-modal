@@ -12805,6 +12805,24 @@ class ModalRuntimeEntrypoint:
             telemetry[_name] = round((time.perf_counter() - _started_at) * 1000.0, 3)
 
         try:
+            from .golden_io_process_v2 import (
+                c0_context_preinit_telemetry,
+                start_c0_context_preinit,
+            )
+
+            # ── P10 hoisted CUDA primary-context preinit ─────────────────────
+            # Start the bounded driver-level primary-context worker FIRST, then
+            # let restore's own CUDA-free state repair run beside it.  The join
+            # happens inside initialize_cuda() below, before anything can need a
+            # CUDA context, so this is a real overlap rather than the same cost
+            # relocated one line earlier.  snap=False is passed explicitly: this
+            # method is the post-snapshot boundary and a snapshot capture must
+            # never create CUDA state.
+            _t = time.perf_counter()
+            _context_preinit = start_c0_context_preinit(snap=False)
+            _mark("context_preinit_launch_ms", _t)
+            telemetry["context_preinit_launch"] = _context_preinit
+
             _t = time.perf_counter()
             telemetry["legacy_api_reset"] = self._golden_minimal_reset_container_state()
             _mark("mutable_state_reset_ms", _t)
@@ -12828,6 +12846,10 @@ class ModalRuntimeEntrypoint:
                 get_golden_model_transport().initialize_cuda()
                 _mark("source_thread_restore_setup_ms", _t)
                 telemetry["source_thread_restore_setup"] = "initialized"
+                # Post-join preinit evidence, so the run artifact carries the
+                # hoist outcome (mode, wall, join wait) rather than only the
+                # launch-time snapshot.
+                telemetry["context_preinit_after_join"] = c0_context_preinit_telemetry()
 
             _t = time.perf_counter()
             _models_decision = self._golden_minimal_assert_models_generation()

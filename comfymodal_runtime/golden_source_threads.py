@@ -63,18 +63,61 @@ else:  # pragma: no cover - the runtime arm is deliberately POSIX-only.
     _fcntl = None
 
 
+class SourceProtocolError(RuntimeError):
+    """A source protocol or identity violation; callers must fail closed."""
+
+
 EXPERIMENT_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_THREADS"
 WORKER_KIND_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_WORKER_KIND"
-# 16 x 64 MiB, not 8 x 64 MiB.  Production-009 proved the 8-slot arena can be
-# outrun by a healthy QD4 source: all eight slots were occupied repeatedly with
-# ~654 ms of cumulative slot wait, holding effective reader concurrency at
-# ~3.51/4.  Doubling the buffering is the only variable in this treatment --
+# Slot count is the P10 arena-depth axis, resolved once here because this module
+# owns the arena geometry: the source owner attaches the mapping by name and size
+# and asserts slot_count/slot_bytes/arena_bytes on the way in, and
+# ``SharedArenaRing`` re-checks the same three values before it creates or
+# registers anything.  ``16`` is the accepted Production-009 default (16 x 64 MiB
+# = 1 GiB) because the 8-slot arena could be outrun by a healthy QD4 source --
+# all eight slots occupied repeatedly with ~654 ms cumulative slot wait and
+# ~3.51/4 effective reader concurrency.  ``12`` x 64 MiB = 768 MiB asks whether
+# that stability actually needs the full gigabyte of host registration.
 # READER_COUNT, the 64 MiB block size, the 4 ms pacer, the worker topology, the
-# mmap lifecycle and the H2D dispatcher semantics are all unchanged, so this
-# asks one question: can healthy QD4 stay fed when the arena is deeper?
-# Six readers is a separate, later experiment.
-ARENA_BYTES = 16 * 64 * 1024 * 1024
-SLOT_COUNT = 16
+# mmap lifecycle and the H2D dispatcher are unchanged by this axis.
+SLOT_COUNT_ENV = "COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT"
+SUPPORTED_SLOT_COUNTS = (12, 16)
+DEFAULT_SLOT_COUNT = 16
+
+
+def resolve_slot_count(value: Any = None) -> int:
+    """Return the validated source-arena slot count for the selected arm.
+
+    Only the declared capacities are admissible.  An unknown count fails closed
+    instead of inheriting the default, because the child attaches the arena by
+    size and a silently different geometry would either fail late or, worse,
+    register a mapping the source owner never wrote.
+    """
+    selected = (
+        os.environ.get(SLOT_COUNT_ENV, str(DEFAULT_SLOT_COUNT))
+        if value is None
+        else value
+    )
+    allowed = ",".join(str(count) for count in SUPPORTED_SLOT_COUNTS)
+    try:
+        count = int(str(selected).strip())
+    except (TypeError, ValueError):
+        raise SourceProtocolError(
+            f"unsupported_source_slot_count:{selected!r};allowed={allowed}"
+        ) from None
+    if count not in SUPPORTED_SLOT_COUNTS:
+        raise SourceProtocolError(
+            f"unsupported_source_slot_count:{selected!r};allowed={allowed}"
+        )
+    return count
+
+
+# 16 x 64 MiB by default.  SLOT_BYTES never varies: it is the block size, the
+# pacing quantum and the dispatcher handoff unit, so it is deliberately NOT an
+# axis here.  ARENA_BYTES stays the exact product so the full-utilisation
+# invariant SharedArenaRing enforces holds for every admissible slot count.
+SLOT_COUNT = resolve_slot_count()
+ARENA_BYTES = SLOT_COUNT * 64 * 1024 * 1024
 SLOT_BYTES = 64 * 1024 * 1024
 READER_COUNT = 4
 THREAD_COUNT = READER_COUNT
@@ -162,10 +205,6 @@ WORKER_KINDS = ("thread", "process")
 # wakeups are delivered by the parent's completion-proven release message; this
 # only bounds a pathological lost-message stall and is not a poll loop.
 CAPACITY_WAIT_SLICE_S = 0.25
-
-
-class SourceProtocolError(RuntimeError):
-    """A source protocol or identity violation; callers must fail closed."""
 
 
 def enabled(value: Any = None) -> bool:

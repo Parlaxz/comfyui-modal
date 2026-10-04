@@ -126,6 +126,246 @@ def c0_registration_context_preinit_enabled() -> bool:
     return str(os.environ.get(C0_REGISTRATION_CONTEXT_PREINIT_ENV) or "").strip().lower() in _TRUTHY
 
 
+# ── hoisted CUDA primary-context preinitialization ───────────────────────────
+#
+# The P9 CUDA arena lifecycle audit classified the 1 GiB registration as
+# REGISTRATION_REQUIRED_BUT_OVERLAPPABLE: cudaHostRegister must stay, but the
+# lazy primary-context creation it forces is independent CPU-independent work
+# that can start as soon as the process is alive.  Running it inline immediately
+# before the registration call only relocates the cost, because nothing else is
+# running to overlap with -- the same time stays on the critical path.
+#
+# This worker is the overlap: restore starts it, continues its own CUDA-free
+# state repair, and joins it immediately before the first caller that needs a
+# CUDA context.  It is deliberately NOT a detached background task:
+#   * snap=True refuses to start it at all (a snapshot must carry no CUDA state);
+#   * join() is bounded and raises on failure, so a broken context is reported
+#     before arena registration rather than surfacing later as a CUDA error;
+#   * join() runs the same _preinit_primary_context the inline arm used, so the
+#     driver work performed is identical -- only its position changes.
+C0_CONTEXT_PREINIT_JOIN_TIMEOUT_S = 30.0
+
+
+# ── experiment arm identity ─────────────────────────────────────────────────
+#
+# A deploy-baked arm name is the claim; the resolved slot count and preinit flag
+# are the observation.  They are compared at arena construction so a deployment
+# whose environment did not reach the container fails closed at restore instead
+# of producing a valid-looking run for the wrong arm.
+C0_EXPERIMENT_ARM_ENV = "COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM"
+C0_EXPERIMENT_ARMS = ("p10-12-nopreinit", "p10-12-preinit", "p10-16-nopreinit", "p10-16-preinit")
+
+
+def resolve_experiment_arm(value: Any = None) -> Optional[str]:
+    """Return the declared experiment arm, or None when the arm axis is unused.
+
+    An arm name that is present but not exactly one of the four declared 2x2
+    cells fails closed: a typo must never silently select the control.
+    """
+    selected = os.environ.get(C0_EXPERIMENT_ARM_ENV) if value is None else value
+    selected = str(selected or "").strip().lower()
+    if not selected:
+        return None
+    if selected not in C0_EXPERIMENT_ARMS:
+        raise ValueError(
+            f"{C0_EXPERIMENT_ARM_ENV}_invalid:{selected};"
+            f"allowed={','.join(C0_EXPERIMENT_ARMS)}"
+        )
+    return selected
+
+
+def verify_experiment_arm(
+    arm: Optional[str], *, slot_count: int, slot_bytes: int, context_preinit: bool
+) -> dict[str, Any]:
+    """Fail closed unless the declared arm matches the observed configuration.
+
+    The observation is the geometry this ring actually carries, not the
+    module-level geometry, so an explicitly constructed ring is described by its
+    own bytes.  Returns the identity record that travels into the arena evidence
+    so the run artifact carries both the claim and the observation.
+    """
+    observed_slots = int(slot_count)
+    observed_slot_bytes = int(slot_bytes)
+    observed_preinit = bool(context_preinit)
+    identity = {
+        "declared_arm": arm,
+        "observed_slot_count": observed_slots,
+        "observed_slot_bytes": observed_slot_bytes,
+        "observed_context_preinit": observed_preinit,
+        "observed_arena_bytes": observed_slots * observed_slot_bytes,
+        "arm_declared": bool(arm),
+        "arm_verified": False,
+    }
+    if arm is None:
+        # Arm axis unused: this deployment is not one of the four cells, so it
+        # is not evidence for any of them.  Nothing to compare.
+        identity["arm_status"] = "unassigned"
+        return identity
+    declared_slots = int(arm.split("-")[1])
+    declared_preinit = arm.split("-")[2] == "preinit"
+    if declared_slots != observed_slots:
+        raise RuntimeError(
+            f"c0_experiment_arm_slot_mismatch:{arm}!={observed_slots}"
+        )
+    if declared_preinit != observed_preinit:
+        raise RuntimeError(
+            f"c0_experiment_arm_preinit_mismatch:{arm}!={observed_preinit}"
+        )
+    identity["arm_verified"] = True
+    identity["arm_status"] = "verified"
+    return identity
+
+
+class _C0ContextPreinit:
+    """One process-wide, bounded CUDA primary-context preinit worker."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._started_ns: Optional[int] = None
+        self._ended_ns: Optional[int] = None
+        self._thread_cpu_ns: Optional[int] = None
+        self._result: Optional[dict[str, Any]] = None
+        self._error: Optional[BaseException] = None
+        self._joined = False
+
+    # ── lifecycle ──
+    def start(self, *, device_index: int = 0, snap: bool = False) -> dict[str, Any]:
+        """Launch the preinit worker if it has not already been started."""
+        if snap:
+            # Hard boundary: a snapshot-capture boundary must not create CUDA
+            # state, so this is a refusal rather than a silent skip.
+            return {"context_preinit": "refused", "reason": "snapshot_capture"}
+        if not c0_registration_context_preinit_enabled():
+            return {"context_preinit": "disabled"}
+        with self._lock:
+            if self._thread is not None:
+                return dict(self.telemetry())
+            self._started_ns = time.monotonic_ns()
+
+            def _run() -> None:
+                # time.thread_time_ns() is per-thread, so the baseline must be
+                # taken here on the worker.  Reading it on the launching thread
+                # and subtracting would mix two unrelated clocks.
+                cpu_start = time.thread_time_ns()
+                try:
+                    self._result = _preinit_primary_context(int(device_index))
+                except BaseException as exc:  # surfaced by join()
+                    self._error = exc
+                finally:
+                    self._thread_cpu_ns = time.thread_time_ns() - cpu_start
+                    self._ended_ns = time.monotonic_ns()
+
+            self._thread = threading.Thread(
+                target=_run, name="c0_context_preinit", daemon=False
+            )
+            self._thread.start()
+        return dict(self.telemetry())
+
+    def join(self, timeout_s: float = C0_CONTEXT_PREINIT_JOIN_TIMEOUT_S) -> dict[str, Any]:
+        """Confirm the preinit worker finished; raise if it did not or failed.
+
+        Returns the same evidence the inline arm recorded, plus the join wait so
+        a caller can prove how much of the cost was actually hidden.
+        """
+        with self._lock:
+            thread = self._thread
+        if thread is None:
+            # No worker was started (the flag is on but this container never ran
+            # the restore hoist, e.g. a legacy restore).  Fall back to the
+            # inline behaviour so the arm keeps working, and say so in evidence.
+            return self._run_inline()
+        wait_start_ns = time.monotonic_ns()
+        thread.join(timeout=float(timeout_s))
+        join_wait_ms = round((time.monotonic_ns() - wait_start_ns) / 1e6, 4)
+        if thread.is_alive():
+            raise RuntimeError(
+                f"c0_context_preinit_join_timeout:{join_wait_ms}ms>{float(timeout_s) * 1000.0}ms"
+            )
+        with self._lock:
+            self._joined = True
+            if self._error is not None:
+                error = self._error
+                raise RuntimeError(f"c0_context_preinit_failed:{type(error).__name__}:{error}")
+        return self._telemetry(join_wait_ms=join_wait_ms, mode="hoisted_worker")
+
+    # ── internals ──
+    def _run_inline(self) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        cpu_start = time.thread_time_ns()
+        self._started_ns = time.monotonic_ns()
+        result = _preinit_primary_context(0)
+        self._result = result
+        self._thread_cpu_ns = time.thread_time_ns() - cpu_start
+        self._ended_ns = time.monotonic_ns()
+        self._joined = True
+        wall_ms = round((time.perf_counter() - t0) * 1000.0, 4)
+        return self._telemetry(join_wait_ms=0.0, mode="inline_fallback", wall_ms=wall_ms)
+
+    def _telemetry(
+        self, *, join_wait_ms: float, mode: str, wall_ms: Optional[float] = None
+    ) -> dict[str, Any]:
+        started = int(self._started_ns or 0)
+        ended = int(self._ended_ns or 0)
+        measured_wall = (
+            float(wall_ms)
+            if wall_ms is not None
+            else round(max(0, ended - started) / 1e6, 4)
+        )
+        return {
+            "context_preinit": dict(self._result or {}),
+            "context_preinit_mode": mode,
+            "context_preinit_start": started,
+            "context_preinit_end": ended,
+            "context_preinit_wall_ms": measured_wall,
+            "context_preinit_thread_cpu_ms": (
+                round(int(self._thread_cpu_ns or 0) / 1e6, 4)
+            ),
+            "context_preinit_join_wait_ms": round(float(join_wait_ms), 4),
+            "context_preinit_status": "ok",
+            "context_preinit_joined": True,
+        }
+
+    def telemetry(self) -> dict[str, Any]:
+        """Current state without joining (never blocks, never raises)."""
+        started = int(self._started_ns or 0)
+        ended = int(self._ended_ns or 0)
+        return {
+            "context_preinit": dict(self._result or {}),
+            "context_preinit_mode": "started" if self._thread is not None else "not_started",
+            "context_preinit_start": started,
+            "context_preinit_end": ended,
+            "context_preinit_wall_ms": round(max(0, ended - started) / 1e6, 4),
+            "context_preinit_thread_cpu_ms": round(int(self._thread_cpu_ns or 0) / 1e6, 4),
+            "context_preinit_status": "running" if self._thread is not None else "idle",
+            "context_preinit_joined": bool(self._joined),
+        }
+
+
+_C0_CONTEXT_PREINIT = _C0ContextPreinit()
+
+
+def start_c0_context_preinit(*, device_index: int = 0, snap: bool = False) -> dict[str, Any]:
+    """Start the bounded CUDA primary-context preinit worker.
+
+    ``snap=True`` is refused outright.  Call only from the post-snapshot
+    (snap=False) restore boundary.
+    """
+    return _C0_CONTEXT_PREINIT.start(device_index=device_index, snap=snap)
+
+
+def join_c0_context_preinit(
+    timeout_s: float = C0_CONTEXT_PREINIT_JOIN_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Join the preinit worker before the first caller needs a CUDA context."""
+    return _C0_CONTEXT_PREINIT.join(timeout_s=timeout_s)
+
+
+def c0_context_preinit_telemetry() -> dict[str, Any]:
+    """Non-blocking snapshot of the preinit worker state."""
+    return _C0_CONTEXT_PREINIT.telemetry()
+
+
 def io_process_v2_enabled() -> bool:
     """Return True only when the V2 full-backing switch is ON (default OFF)."""
     return str(os.environ.get(IO_PROCESS_V2_ENV) or "").strip().lower() in _TRUTHY
@@ -1490,6 +1730,10 @@ C0_PREADV_SICKNESS_HYPOTHESIS_STATUSES = (
 _C0_TREATMENT_SOURCE_GEOMETRY = "qd4_64"
 _C0_TREATMENT_GEOMETRY = {
     "slot_bytes": 64 * 1024 * 1024,
+    # Resolved from the arena owner (golden_source_threads) below, never
+    # restated: this module's slot_count must describe the same mapping the
+    # source owner attaches, and the P10 arena-depth axis lives with the module
+    # that owns the geometry.
     "slot_count": 16,
     "source_workers": 4,
     "slot_owners": (0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1, 2, 2, 3, 3),
@@ -1513,6 +1757,31 @@ _C0_CONTROL_GEOMETRY = {
 _C0_QD_DISTRIBUTION_MAX = 4
 
 
+def _qd4_64_slot_owners(slot_count: int, source_workers: int) -> tuple[int, ...]:
+    """Assign two slots to each static source worker per group of eight.
+
+    This reproduces the accepted 16-slot assignment exactly and extends it to
+    any admissible slot count.  The assignment stays evidence only: the
+    dispatcher's StagingPool hands a free slot to whichever producer leases
+    next, so no behaviour depends on which worker a slot nominally belongs to.
+    """
+    return tuple(
+        (index // 2) % int(source_workers) for index in range(int(slot_count))
+    )
+
+
+def _qd4_64_geometry() -> dict:
+    """The qd4_64 arm, with its slot count taken from the arena owner."""
+    from . import golden_source_threads
+
+    resolved = dict(_C0_TREATMENT_GEOMETRY)
+    resolved["slot_count"] = int(golden_source_threads.SLOT_COUNT)
+    resolved["slot_owners"] = _qd4_64_slot_owners(
+        resolved["slot_count"], resolved["source_workers"]
+    )
+    return resolved
+
+
 def resolve_c0_geometry(value: Any = None) -> dict:
     """Resolve the selected C0 arena/slot/worker geometry in one place.
 
@@ -1529,7 +1798,7 @@ def resolve_c0_geometry(value: Any = None) -> dict:
         geometry = _C0_TREATMENT_128_GEOMETRY
     else:
         geometry = (
-            _C0_TREATMENT_GEOMETRY
+            _qd4_64_geometry()
             if selected == _C0_TREATMENT_SOURCE_GEOMETRY
             else _C0_CONTROL_GEOMETRY
         )
@@ -4241,7 +4510,15 @@ class SharedArenaRing:
                 or self.slot_count != golden_source_threads.SLOT_COUNT
                 or self.slot_bytes != golden_source_threads.SLOT_BYTES
             ):
-                raise RuntimeError("source_threads_requires_16x64m_arena")
+                # Name the geometry the owner module actually resolved, not a
+                # historical constant: the slot count is an experiment axis and
+                # a hardcoded 16 here would mislabel a legitimate 12-slot arm.
+                raise RuntimeError(
+                    "source_threads_arena_geometry_mismatch:"
+                    f"{self.slot_count}x{self.slot_bytes}"
+                    f"!={golden_source_threads.SLOT_COUNT}"
+                    f"x{golden_source_threads.SLOT_BYTES}"
+                )
             if not c0_host_register_enabled():
                 raise RuntimeError("source_threads_requires_cuda_host_register")
             # Report the lifecycle the implementation actually runs, never a
@@ -4334,10 +4611,29 @@ class SharedArenaRing:
         self.registration_diag_enabled = c0_registration_diag_enabled()
         self.registration_order = c0_registration_order()
         self.registration_context_preinit = c0_registration_context_preinit_enabled()
+        # Arm identity, resolved from the arena owner at construction so the
+        # evidence records the geometry this container actually registered and
+        # not whatever the environment says at evidence time.
+        self.declared_slot_count = int(self.slot_count)
+        self.declared_slot_bytes = int(self.slot_bytes)
+        self.declared_arena_bytes = int(self.size_bytes)
+        # Fail closed here -- before the mapping exists -- if the deploy-baked
+        # arm name disagrees with the geometry and preinit flag actually in
+        # force.  A run from a mislabelled deployment must not look valid.
+        self.experiment_arm = verify_experiment_arm(
+            resolve_experiment_arm(),
+            slot_count=int(self.slot_count),
+            slot_bytes=int(self.slot_bytes),
+            context_preinit=bool(self.registration_context_preinit),
+        )
         self.registration_diagnostic: dict[str, Any] = {
             "enabled": bool(self.registration_diag_enabled),
             "order": self.registration_order,
             "context_preinit": bool(self.registration_context_preinit),
+            "declared_slot_count": self.declared_slot_count,
+            "declared_slot_bytes": self.declared_slot_bytes,
+            "declared_arena_bytes": self.declared_arena_bytes,
+            "experiment_arm": dict(self.experiment_arm),
         }
         self.reader_gate_enabled = c0_reader_gate_enabled()
         # Experiment-3 DMA ring: 5-slot pageable source pool + 2-slot pinned
@@ -4502,12 +4798,31 @@ class SharedArenaRing:
 
         if self.registration_context_preinit:
             marks["registration_context_preinit_begin"] = int(time.monotonic_ns())
-            context_t0 = time.perf_counter()
-            context_info = _preinit_primary_context(int(self.device_index))
-            self.registration_diagnostic["context_preinit_ms"] = round(
-                (time.perf_counter() - context_t0) * 1000.0, 4
-            )
-            self.registration_diagnostic["context_preinit"] = context_info
+            # Join the worker the post-snapshot restore hoisted.  If no worker was
+            # started, join_c0_context_preinit runs the identical driver call
+            # inline in this thread, so the arm never silently skips the work.
+            # Either way the failure (if any) surfaces here, before the arena
+            # exists and long before any model touches it.
+            context = join_c0_context_preinit()
+            self.registration_diagnostic["context_preinit_ms"] = context[
+                "context_preinit_wall_ms"
+            ]
+            self.registration_diagnostic["context_preinit"] = context["context_preinit"]
+            self.registration_diagnostic["context_preinit_mode"] = context[
+                "context_preinit_mode"
+            ]
+            self.registration_diagnostic["context_preinit_join_wait_ms"] = context[
+                "context_preinit_join_wait_ms"
+            ]
+            self.registration_diagnostic["context_preinit_start"] = context[
+                "context_preinit_start"
+            ]
+            self.registration_diagnostic["context_preinit_end"] = context[
+                "context_preinit_end"
+            ]
+            self.registration_diagnostic["context_preinit_thread_cpu_ms"] = context[
+                "context_preinit_thread_cpu_ms"
+            ]
             marks["registration_context_preinit_end"] = int(time.monotonic_ns())
 
         register = getattr(cudart, "cudaHostRegister", None)
@@ -5936,6 +6251,23 @@ class SharedArenaRing:
         return status
 
     # ── evidence ──────────────────────────────────────────────────────────
+    def arena_establish_wall_ms(self) -> Optional[float]:
+        """Total arena establishment wall, ``ensure()`` entry to arena-ready.
+
+        For the source-owner arm the arena is ready when the child's ready
+        barrier is observed, because that is the first instant the registered
+        mapping is guaranteed usable.  Registration is a subspan of this window,
+        not a substitute for it.
+        """
+        marks = getattr(self, "startup_marks", None) or {}
+        enter = int(marks.get("c0_ensure_enter", 0) or 0)
+        ready = int(
+            marks.get("source_thread_ready") or marks.get("source_thread_start_end") or 0
+        )
+        if not enter or not ready or ready < enter:
+            return None
+        return round((ready - enter) / 1e6, 4)
+
     def evidence(self) -> dict:
         models = {role: dict(ev) for role, ev in self.events.items()}
         # The retained stage readers own the per-(path, producer) child
@@ -5981,6 +6313,18 @@ class SharedArenaRing:
             # above proves what actually happened; this proves which arm the
             # deploy baked even if registration failed before evidence.
             "host_register_enabled": bool(self.host_register_enabled),
+            # Arm identity: the resolved geometry this container registered, and
+            # the preinit arm it declared.  ``registered`` above proves the
+            # registration actually happened; these prove which arm ran.
+            "declared_slot_count": self.declared_slot_count,
+            "declared_slot_bytes": self.declared_slot_bytes,
+            "declared_arena_bytes": self.declared_arena_bytes,
+            "slot_geometry_exact": bool(
+                int(self.size_bytes) == int(self.slot_count) * int(self.slot_bytes)
+            ),
+            "context_preinit_enabled": bool(self.registration_context_preinit),
+            "context_preinit_state": c0_context_preinit_telemetry(),
+            "experiment_arm": dict(self.experiment_arm),
             "registration_diagnostic": dict(self.registration_diagnostic),
             "registration_order": self.registration_order,
             "reader_gate_enabled": bool(self.reader_gate_enabled),
@@ -6000,6 +6344,10 @@ class SharedArenaRing:
             "register_ms_one_time": self.register_ms,
             "register_start_ns": self.register_start_ns,
             "register_end_ns": self.register_end_ns,
+            # Total arena establishment wall: the authoritative enclosing window
+            # for registration, so a treatment that only relocates cost inside it
+            # cannot look like a win.  Restoration-to-ready is the real endpoint.
+            "arena_establish_wall_ms": self.arena_establish_wall_ms(),
             "shm_populate_enabled": bool(self.shm_populate_enabled),
             "populate_ms": self.populate_ms,
             "populate_cpu_ms": self.populate_cpu_ms,
@@ -11298,6 +11646,11 @@ __all__ = [
     "close_arena_runtime",
     "ensure_arena_runtime",
     "get_arena_runtime",
+    "start_c0_context_preinit",
+    "join_c0_context_preinit",
+    "c0_context_preinit_telemetry",
+    "resolve_experiment_arm",
+    "verify_experiment_arm",
     "io_process_v2_streaming_enabled",
     "io_process_v2_persistent_fds_enabled",
     "reconcile_destination_coverage",

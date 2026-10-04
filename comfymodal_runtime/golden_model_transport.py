@@ -872,6 +872,15 @@ class GoldenModelTransport:
             self.prepare_cpu()
             if self._cuda_ready:
                 return self.lifecycle_telemetry(reused=True)
+            # Confirm the hoisted CUDA primary-context worker before the first
+            # call that needs a context.  Join is bounded and raises on failure,
+            # so a broken context is reported here rather than surfacing later as
+            # an opaque CUDA error during model load.  prepare_cpu() above is
+            # deliberately still ahead of the join: it is CPU-only work that the
+            # preinit overlaps instead of waiting behind.
+            from . import golden_io_process_v2 as c0_preinit
+
+            c0_preinit.join_c0_context_preinit()
             import torch
 
             if not torch.cuda.is_available():

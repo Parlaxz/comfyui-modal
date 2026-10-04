@@ -1,0 +1,44 @@
+# v2ctl profile: P10 2x2 arm A -- 16 slots, no context preinit.
+#
+# COUNTED PERFORMANCE arm of the P10 hoisted-CUDA-context x arena-depth
+# factorial.  It extends the Production-008 counted C0 profile
+# (golden_p1_parallel_c0_p8_h100) so every inherited invariant is identical to
+# the measured production-009 candidate:
+#
+#   H100! / CPU=12 / memory 24576 MB
+#   method run_golden_parallel_stream, class ModalRuntimeEntrypointV2
+#   whole mmap lifecycle, thread source owner, mmap_fresh engine
+#   qd4_64 source/transport geometry, persistent reader FDs
+#   cudaHostRegister ON, MINIMAL_GPU_TEARDOWN=1, MINIMAL_RESTORE=1
+#   forced-miss conditioning, fresh_required=true
+#   correctness SHA 3a6a03064c7e6e01ede339ada63daaea4cbf793f387f4faadbb101a787024577
+#   all intrusive diagnostics OFF (full trace / E27 / C0 window trace /
+#   stage diagnostics / deep profile / mmap copy diag)
+#
+# This arm adds exactly two declared values and nothing else:
+#
+#   COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "16"
+#       16 x 64 MiB = 1 GiB, the accepted Production-009 default geometry.
+#   COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "0"
+#       No hoisted primary-context preinit.  This is the exact production
+#       control: with the flag OFF the restore hoist does not start a worker at
+#       all, so no CUDA is touched before cudaHostRegister.
+#
+# COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM is the deploy-level arm identity.  The
+# container verifies it against the observed slot count and observed preinit
+# flag at arena construction and fails closed if they disagree, so a run cannot
+# silently be counted as arm A when the environment did not arrive.
+schema_version = 1
+name = "golden_p10_reg_a_16_nopreinit_h100"
+extends = "golden_p1_parallel_c0_p8_h100"
+owner = "p10-context-slots"
+
+[target]
+app = "batch-p10-reg-a-16-nopreinit-h100"
+class = "ModalRuntimeEntrypointV2"
+method = "run_golden_parallel_stream"
+
+[environment]
+COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT = "16"
+COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT = "0"
+COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM = "p10-16-nopreinit"

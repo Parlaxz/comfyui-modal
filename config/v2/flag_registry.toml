@@ -786,6 +786,26 @@ owner = "golden-c0-source"
 description = "Reader isolation for the C0 source owner. 'thread' = one source process with four reader threads sharing one address space, one descriptor and at most one whole-file mapping. 'process' = one CUDA-sterile supervisor with four independent persistent reader processes, each with its own address space, descriptor and whole-file mapping. Any other value fails closed; there is no fallback between the two."
 
 [[flag]]
+name = "COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT"
+type = "enum"
+enum_values = ["12", "16"]
+default = "16"
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "p10-context-slots"
+description = "Slot count of the registered C0 source arena, owned by golden_source_threads. SLOT_BYTES is always 64 MiB, so 16 is 1 GiB (the accepted Production-009 default that removed 8-slot source-capacity starvation) and 12 is 768 MiB. Any other value fails closed. This is an arena-depth axis only: QD, reader count, block size, pacer, source engine, mmap lifecycle and the H2D dispatcher are unchanged."
+
+[[flag]]
+name = "COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM"
+type = "enum"
+enum_values = ["p10-12-nopreinit", "p10-12-preinit", "p10-16-nopreinit", "p10-16-preinit"]
+default = ""
+consumed_at = "restore"
+change_requires = "deploy"
+owner = "p10-context-slots"
+description = "Declared 2x2 experiment arm (arena slot count x hoisted CUDA primary-context preinit). Empty means the arm axis is unused and the deployment is not evidence for any P10 cell. A non-empty value that does not exactly match the observed slot count and preinit flag fails closed at arena construction, so a deployment whose environment did not reach the container cannot produce a valid-looking run for the wrong arm."
+
+[[flag]]
 name = "COMFYMODAL_PHASE1_C0_ARENA"
 type = "bool"
 default = "0"
@@ -856,7 +876,7 @@ default = "0"
 consumed_at = "restore"
 change_requires = "deploy"
 owner = "c0-registration-investigation"
-description = "Diagnostic-only primary-context preinitialization before cudaHostRegister; default OFF."
+description = "Hoist the CUDA primary-context preinitialization onto a bounded worker started at the post-snapshot (snap=False) restore boundary, joined before the first caller needs a CUDA context, so it overlaps restore's own CUDA-free state repair instead of running serially in front of cudaHostRegister. Default OFF is the exact production control. snap=True never starts it; the join is bounded and fails closed before arena use."
 
 [[flag]]
 name = "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE"
