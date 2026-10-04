@@ -545,6 +545,45 @@ def test_registration_joins_the_worker_instead_of_running_it_inline() -> None:
 
 
 @pytest.mark.fast_unit
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT",
+        "COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT",
+        "COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM",
+    ],
+)
+def test_axis_flag_crosses_the_container_env_boundary(flag: str) -> None:
+    """Regression: a deploy-baked flag that never reaches the container fails
+    silently, not loudly.
+
+    The first P10 deployment carried all three flags in the v2ctl run manifest,
+    but the container still resolved the default slot count and reported no arm,
+    because each flag has to be forwarded in BOTH the config_authority allowlist
+    and the modal_app runtime-env boundary.  Assert both sites carry the flag.
+    """
+    from comfymodal_runtime import config_authority, modal_app
+
+    assert flag in config_authority.GOLDEN_CONTROL_FLAGS, (
+        f"{flag} missing from the config_authority allowlist"
+    )
+    assert f'"{flag}": os.environ.get(' in _source_of(modal_app), (
+        f"{flag} missing from the modal_app runtime-env boundary"
+    )
+
+
+@pytest.mark.fast_unit
+def test_slot_count_default_is_the_accepted_16_slot_geometry() -> None:
+    """The two boundaries must agree on the default, or an unset flag silently
+    produces a different arena than the profile declares."""
+    from comfymodal_runtime import config_authority
+
+    spec = config_authority.GOLDEN_CONTROL_FLAGS["COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT"]
+    assert str(spec["default"]) == "16"
+    assert tuple(spec["choices"]) == ("12", "16")
+
+
+@pytest.mark.fast_unit
 def test_restore_hook_is_not_reachable_from_a_snapshot_capture_boundary() -> None:
     """snap=True is bound to startup, snap=False to restore.  The treatment must
     only be reachable from the snap=False method, and never ask for snap=True."""

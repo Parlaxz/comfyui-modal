@@ -5090,6 +5090,15 @@ def _runtime_env(spec: ModalRuntimeSpec | None = None) -> dict[str, str]:
         "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT": os.environ.get(
             "COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT", "0"
         ),
+        # P10 arena-depth and arm-identity selectors must cross the same class-env
+        # boundary, otherwise the container silently keeps the default slot count
+        # and reports no arm at all.
+        "COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_SOURCE_SLOT_COUNT", "16"
+        ),
+        "COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM": os.environ.get(
+            "COMFYMODAL_GOLDEN_C0_EXPERIMENT_ARM", ""
+        ),
         "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE": os.environ.get(
             "COMFYMODAL_GOLDEN_CLIP_UNET_SCHEDULE", "serial"
         ),
