@@ -80,17 +80,20 @@ function portraitIds(wfMock) {
   const v2 = versions.find((v) => v.version_number === 2);
   expect(v1).toBeTruthy();
   expect(v2).toBeTruthy();
+  expect(wf.latest_version_id).toBe(v2.workflow_version_id);
   return { workflowId: wf.workflow_id, v1: v1.workflow_version_id, v2: v2.workflow_version_id };
 }
 
-async function selectPortraitV1(page, wfMock) {
+async function selectPortraitCurrent(page, wfMock) {
   const ids = portraitIds(wfMock);
   const wfSelect = page.locator('[data-testid="workflow-selector"]');
   await expect(wfSelect.locator(`option[value="${ids.workflowId}"]`)).toHaveCount(1, { timeout: 15000 });
   await wfSelect.selectOption(ids.workflowId);
   await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 15000 });
-  const verSelect = page.locator('[data-testid="workflow-version-selector"]');
-  await verSelect.selectOption(ids.v1);
+  const versionField = page.locator('[data-testid="workflow-version-selector"]');
+  await expect(versionField.locator("option")).toHaveCount(0);
+  await expect(versionField).toHaveAttribute("data-version-id", ids.v2);
+  await expect(versionField).toContainText("v2");
   await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible({ timeout: 15000 });
   await expect(page.locator('[data-testid="workflow-run-gating"]')).toContainText("Ready to run", { timeout: 15000 });
   return ids;
@@ -110,7 +113,7 @@ test.describe("Studio Shelf Playground", () => {
     const guard = installConsoleGuard(page);
 
     try {
-      await selectPortraitV1(page, wfMock);
+       await selectPortraitCurrent(page, wfMock);
 
       // Shelf section with the workflow name + switcher + autosaved note.
       await expect(page.locator('[data-testid="shelf-section"]')).toBeVisible();
@@ -162,7 +165,7 @@ test.describe("Studio Shelf Playground", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    await selectPortraitV1(page, wfMock);
+    await selectPortraitCurrent(page, wfMock);
 
     // Edit the seed through the Shelf card (debounced durable autosave).
     await page.locator('[data-testid="shelf-input-seed"]').fill("123");
@@ -195,7 +198,7 @@ test.describe("Studio Shelf Playground", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    await selectPortraitV1(page, wfMock);
+    await selectPortraitCurrent(page, wfMock);
 
     // Deterministic synthetic HTML5 drag-and-drop: seed before steps.
     await page.evaluate(() => {
@@ -252,7 +255,7 @@ test.describe("Studio Shelf Playground", () => {
     const guard = installConsoleGuard(page);
 
     try {
-      await selectPortraitV1(page, wfMock);
+      await selectPortraitCurrent(page, wfMock);
       await page.locator('[data-testid="shelf-input-positive_prompt"]').fill("shelf test cat");
       await page.evaluate(() => localStorage.setItem(
         "comfymodal.studio.golden.profile.v1",
@@ -283,14 +286,18 @@ test.describe("Studio Shelf Playground", () => {
       await expect(runBtn).toBeEnabled({ timeout: 10000 });
       expect((await runBtn.textContent()).trim()).toBe("Run");
       const submitted = api.lastRunRequest;
-      expect(submitted).toBeTruthy();
-      expect(submitted.workflow_id).toBe(portraitIds(wfMock).workflowId);
-      expect(submitted.controls.positive_prompt).toBe("shelf test cat");
+       expect(submitted).toBeTruthy();
+       expect(submitted.workflow_id).toBe(portraitIds(wfMock).workflowId);
+       expect(submitted.workflow_version_id).toBe(portraitIds(wfMock).v2);
+       expect(submitted.controls.positive_prompt).toBe("shelf test cat");
       expect(submitted.request_id).toBeTruthy();
       expect(submitted.profile_name).toBe("golden_p1_parallel_c0_p8_h100");
 
-      // Metadata + timing surfaces stay on the right-side panel.
-      await expect(page.locator('[data-testid="timing-card"]')).toBeVisible({ timeout: 10000 });
+       // Metadata + truthful timing/progress surfaces stay on the right-side
+       // panel. The mocked direct response may expose the stage surface
+       // without a persisted timing card.
+       await expect(page.locator('[data-testid="timing-card"], [data-testid="progress-golden-stages"]').first())
+         .toBeVisible({ timeout: 10000 });
 
       guard.assertNoErrors();
       api.assertNoUnhandledCalls();
@@ -305,7 +312,7 @@ test.describe("Studio Shelf Playground", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    const ids = await selectPortraitV1(page, wfMock);
+    const ids = await selectPortraitCurrent(page, wfMock);
     await page.locator('[data-testid="shelf-input-seed"]').fill("444");
     await page.waitForTimeout(700);
 
@@ -340,8 +347,11 @@ test.describe("Studio Shelf Playground", () => {
     await expect(page.locator('[data-testid="shelf-reuse-dialog"]')).toBeVisible({ timeout: 10000 });
     await page.locator('[data-testid="shelf-reuse-no"]').click();
     await expect(page.locator('[data-testid="shelf-workflow-name"]')).toContainText("Portrait Pro", { timeout: 15000 });
-    await page.locator('[data-testid="workflow-version-selector"]').selectOption(ids.v1);
-    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("444", { timeout: 15000 });
+    await expect(page.locator('[data-testid="workflow-version-selector"]'))
+      .toHaveAttribute("data-version-id", ids.v2);
+    // The current revision has its own defaults; the old v1 draft is not
+    // restored into the current revision implicitly.
+    await expect(page.locator('[data-testid="shelf-input-seed"]')).toHaveValue("42", { timeout: 15000 });
     await expect(page.locator('[data-testid="shelf-stale-note"]')).toBeVisible();
     await page.locator('[data-testid="run-btn"]').click();
     await expect(page.locator('[data-testid="canvas-output"]')).toBeVisible({ timeout: 45000 });
@@ -356,7 +366,7 @@ test.describe("Studio Shelf Playground", () => {
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
 
-    await selectPortraitV1(page, wfMock);
+    await selectPortraitCurrent(page, wfMock);
     await page.locator('[data-testid="shelf-input-seed"]').fill("777");
     await page.waitForTimeout(700);
 

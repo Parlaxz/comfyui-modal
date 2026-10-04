@@ -12,8 +12,9 @@
 // Dataset facts (from studio-workflows-mock.mjs):
 //   "Portrait Pro"  — folder "Portraits", tags ["portrait"], source author
 //     "Modal Team"; versions 1 AND 2 both mapped (version 2 is the latest);
-//     preset "Portrait Default" on version 1; version 2 carries
-//     dependency_metadata (model_stack + node_classes).
+//     historical preset "Portrait Default" on version 1 and runnable current
+//     preset data on version 2; version 2 carries dependency_metadata
+//     (model_stack + node_classes).
 //   "Abstract Test" — folder "Abstract", tags ["experiment"]; version 1
 //     UNMAPPED → state incomplete, run button disabled.
 
@@ -630,6 +631,8 @@ test.describe("Studio Workflows", () => {
       const pp = await openDetail(page, "Portrait Pro");
       const v2 = wfMock.getVersions(pp.workflow_id).find((v) => v.version_number === 2);
       await expect(page.locator(`[data-testid="version-item"][data-version-id="${v2.workflow_version_id}"]`)).toHaveClass(/active/);
+      // The current version already has its runnable seeded preset.
+      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(1);
 
       await clickNewPreset(page);
       await page.locator('[data-testid="preset-name-input"]').fill("Zero Values");
@@ -657,6 +660,7 @@ test.describe("Studio Workflows", () => {
       expect("cfg" in post.body.values).toBe(true);
       expect("positive_prompt" in post.body.values).toBe(true);
       expect("hires_fix" in post.body.values).toBe(true);
+      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(2);
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
       api.assertNoUnhandledCalls();
@@ -673,6 +677,9 @@ test.describe("Studio Workflows", () => {
       guard = installConsoleGuard(page);
 
       await openDetail(page, "Portrait Pro");
+      // The current version starts with the seeded runnable preset; the new
+      // incomplete preset is added alongside it and remains in the editor.
+      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(1);
       await clickNewPreset(page);
       await page.locator('[data-testid="preset-name-input"]').fill("Incomplete Preset");
       // Leave the required "Model" control empty.
@@ -683,6 +690,7 @@ test.describe("Studio Workflows", () => {
         "missing value for required control"
       );
       await expect(page.locator(".comfymodal-studio-notice")).not.toContainText("Preset saved");
+      expect(wfMock.getPresets(wfMock.getWorkflow("Portrait Pro").latest_version_id)).toHaveLength(2);
 
       guard.assertNoErrors(APP_NOISE_PATTERNS);
       api.assertNoUnhandledCalls();
@@ -818,6 +826,9 @@ test.describe("Studio Workflows", () => {
       await stubGraphCapture(page, RICH_WIZARD_GRAPH);
 
       await openDetail(page, "Abstract Test");
+      // Abstract Test has no seeded preset, so the unmapped version must stay
+      // gated until the mapping wizard creates its mapping.
+      await expect(page.locator('[data-testid="preset-card"]')).toHaveCount(0);
       await expect(page.locator('[data-testid="run-button"]')).toBeDisabled();
 
       // Mapping alone makes the version runnable → run enabled.
@@ -1200,13 +1211,15 @@ test.describe("Studio Workflows", () => {
 
   /** Legacy Backend/Preset route calls the migrated UI must never make. */
   function legacyPresetRouteCalls() {
-    return api.state.calls.filter((c) =>
+    return api.state.calls.slice(backendPresetsCallStart).filter((c) =>
       c.pathname === "/comfymodal/studio/presets" ||
       c.pathname.startsWith("/comfymodal/studio/presets/") ||
       c.pathname === "/comfymodal/studio/snapshots" ||
       c.pathname.startsWith("/comfymodal/studio/snapshots/")
     );
   }
+
+  let backendPresetsCallStart = 0;
 
   // ── Test 24: Backend Presets page is backed by workflow routes ─────────
   test("24. backend presets page lists and mutates through workflow routes only", async ({ page }) => {
@@ -1215,11 +1228,12 @@ test.describe("Studio Workflows", () => {
       guard = installConsoleGuard(page);
       page.on("dialog", (d) => d.accept());
 
+      backendPresetsCallStart = api.state.calls.length;
       await openBackendPresets(page);
 
-      // Seeded "Portrait Default" (Portrait Pro v1) resolves through the
-      // workflows domain: workflows → versions → version presets.
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("1 preset");
+      // Historical and current presets both resolve through the workflows
+      // domain: workflows → versions → version presets.
+      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets");
       await expect(page.getByText("Portrait Default").first()).toBeVisible();
       const versionPresetLists = wfMock
         .callsFor("GET", "/comfymodal/studio/workflows/versions/")
@@ -1231,7 +1245,7 @@ test.describe("Studio Workflows", () => {
 
       // Duplicate through the workflow duplicate route.
       await detail.getByRole("button", { name: "Duplicate", exact: true }).click();
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets", { timeout: 10000 });
+      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("3 presets", { timeout: 10000 });
       await expect(page.getByText("Portrait Default (Copy)").first()).toBeVisible();
       expect(wfMock.callsFor("POST", "/comfymodal/studio/workflows/presets/").filter((c) => c.path.endsWith("/duplicate")).length).toBe(1);
       expect(legacyPresetRouteCalls().length).toBe(0);
@@ -1247,7 +1261,7 @@ test.describe("Studio Workflows", () => {
 
       // Delete through the workflow preset route (confirm accepted above).
       await detail.getByRole("button", { name: "Delete preset" }).click();
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("1 preset", { timeout: 10000 });
+      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets", { timeout: 10000 });
       expect(wfMock.callsFor("DELETE", "/comfymodal/studio/workflows/presets/").length).toBe(1);
       expect(legacyPresetRouteCalls().length).toBe(0);
 
@@ -1265,6 +1279,7 @@ test.describe("Studio Workflows", () => {
     try {
       guard = installConsoleGuard(page);
 
+      backendPresetsCallStart = api.state.calls.length;
       await openBackendPresets(page);
       await page.getByRole("button", { name: "+ New Preset (Manual)" }).click();
       const detail = page.locator('[data-testid="backend-detail"]');
@@ -1276,7 +1291,7 @@ test.describe("Studio Workflows", () => {
       await detail.locator('input[type="text"]').first().fill("Manual From Legacy");
       await detail.getByRole("button", { name: "Create", exact: true }).click();
 
-      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("2 presets", { timeout: 10000 });
+      await expect(page.locator('[data-testid="backend-presets-count"]')).toHaveText("3 presets", { timeout: 10000 });
       await expect(page.getByText("Manual From Legacy").first()).toBeVisible();
 
       const fromLegacy = wfMock.callsFor("POST", "/presets/from-legacy");

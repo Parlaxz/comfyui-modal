@@ -54,12 +54,6 @@ async function selectWorkflowOption(page, workflowId) {
   await expect(page.locator(WF_SELECTOR)).toHaveValue(workflowId);
 }
 
-async function selectVersionOption(page, versionId) {
-  await page.locator(VER_SELECTOR).selectOption(versionId);
-  await expect(page.locator(VER_SELECTOR)).toHaveValue(versionId, { timeout: 10000 });
-  await expect(page.locator('[data-testid="workflow-control-seed"]')).toBeVisible({ timeout: 10000 });
-}
-
 async function runModernAndWait(page, fx) {
   await expect(page.locator(RUN_BTN)).toBeEnabled({ timeout: 10000 });
   await page.locator(RUN_BTN).click();
@@ -112,21 +106,13 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     }
   });
 
-  test("2. version list follows selected workflow", async ({ page }) => {
+  test("2. current version field follows selected workflow", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
       await selectWorkflowOption(page, "wf_text2img");
-      const versionSel = page.locator(VER_SELECTOR);
-      const options = await versionSel.locator("option").evaluateAll((els) =>
-        els.map((o) => ({ value: o.getAttribute("value"), text: o.textContent }))
-      );
-      // Placeholder + the two immutable versions.
-      expect(options.filter((o) => o.value !== "").map((o) => o.value)).toEqual([
-        "wv1_latest",
-        "wv1_old",
-      ]);
-      // Latest version is selected by default.
-      await expect(versionSel).toHaveValue("wv1_latest");
+      const versionField = page.locator(VER_SELECTOR);
+      await expect(versionField.locator("option")).toHaveCount(0);
+      await expect(versionField).toHaveAttribute("data-version-id", "wv1_latest");
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();
@@ -153,7 +139,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     }
   });
 
-  test("4. older immutable version explicitly selectable", async ({ page }) => {
+  test("4. current immutable version is read-only", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
       await selectWorkflowOption(page, "wf_text2img");
@@ -161,14 +147,13 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       await expect(page.locator('[data-testid="workflow-input-seed"]')).toHaveValue("111");
       await expect(page.locator('[data-testid="workflow-input-steps"]')).toHaveValue("25");
 
-      await selectVersionOption(page, "wv1_old");
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv1_old");
-      // The mapped control values now reflect the OLD version's default
-      // preset (wpres_old_a: seed 55 / steps 22) — distinct from v2's
-      // (wpres_a: seed 111 / steps 25), proving the version switch re-derived
-      // the control values from that version's data.
-      await expect(page.locator('[data-testid="workflow-input-seed"]')).toHaveValue("55");
-      await expect(page.locator('[data-testid="workflow-input-steps"]')).toHaveValue("22");
+      const versionField = page.locator(VER_SELECTOR);
+      await expect(versionField).toHaveAttribute("data-version-id", "wv1_latest");
+      await expect(versionField.locator("option")).toHaveCount(0);
+      // The current version's defaults remain active; historical revisions
+      // are retained for compatibility but are not Shelf choices.
+      await expect(page.locator('[data-testid="workflow-input-seed"]')).toHaveValue("111");
+      await expect(page.locator('[data-testid="workflow-input-steps"]')).toHaveValue("25");
       fx.assertNoConsoleErrors();
     } finally {
       fx.guard.dispose();
@@ -189,14 +174,14 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       await page.locator('[data-version-id="wv1_old"]').click();
       await expect(page.getByTestId("run-button")).toBeEnabled({ timeout: 15000 });
 
-      // The Run bar hands off workflow + selected version + that version's
-      // default preset (wpres_old_a) and navigates to the Playground. The
+      // The admin revision Run handoff preserves workflow + selected version
+      // + that revision's default preset (wpres_old_a) and navigates to the Playground. The
       // handoff is consumed IN THE SAME SESSION: the Playground applies the
       // exact workflow/version/preset immediately (no reload needed) and shows
       // the "from Workflows" notice.
       await page.getByTestId("run-button").click();
       await expect(page.locator(WF_SELECTOR)).toHaveValue("wf_text2img", { timeout: 15000 });
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv1_old");
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv1_old");
       await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_old_a");
       await expect(page.locator('[data-testid="workflow-handoff-notice"]')).toBeVisible();
 
@@ -219,12 +204,12 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       expect(persisted.workflowVersionId).toBe("wv1_old");
       expect(persisted.presetId).toBe("wpres_old_a");
 
-      // A full reload still restores the same exact selection — now from the
-      // persisted selection, since the one-shot handoff was already consumed.
+      // A full reload returns to the Workflow's current version. The explicit
+      // historical handoff is not an ordinary Shelf restore path.
       await fx.reload();
       await expect(page.locator(WF_SELECTOR)).toHaveValue("wf_text2img", { timeout: 15000 });
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv1_old");
-      await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_old_a");
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv1_latest");
+      await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_a");
       const handoffAfterReload = await page.evaluate(() => {
         try { return localStorage.getItem("comfymodal.studio.playground.workflow-handoff.v1"); }
         catch (e) { return null; }
@@ -259,7 +244,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       // consumed (cleared from storage).
       await page.getByTestId("run-button").click();
       await expect(page.locator(WF_SELECTOR)).toHaveValue("wf_text2img", { timeout: 15000 });
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv1_old");
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv1_old");
       await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_old_a");
       await expect(page.locator('[data-testid="workflow-handoff-notice"]')).toBeVisible();
 
@@ -286,7 +271,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       await expect(page.getByTestId("run-button")).toBeEnabled({ timeout: 15000 });
       await page.getByTestId("run-button").click();
       await expect(page.locator(WF_SELECTOR)).toHaveValue("wf_fail", { timeout: 15000 });
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv_fail");
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv_fail");
       await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_fail");
 
       const handoffFinal = await page.evaluate(() => {
@@ -436,7 +421,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     const fx = await setupFakeTest(page);
     try {
       await page.locator(WF_SELECTOR).selectOption("wf_incomplete");
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv_incomplete", { timeout: 10000 });
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv_incomplete", { timeout: 10000 });
       await expect(page.locator(RUN_BTN)).toBeDisabled({ timeout: 10000 });
       await expect(page.locator(GATING)).toContainText("missing mapping");
       fx.assertNoConsoleErrors();
@@ -449,7 +434,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     const fx = await setupFakeTest(page);
     try {
       await page.locator(WF_SELECTOR).selectOption("wf_incomplete");
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv_incomplete", { timeout: 10000 });
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv_incomplete", { timeout: 10000 });
       await expect(page.locator(GATING)).toContainText("missing custom node 'SomeCustomClass'");
       await expect(page.locator(RUN_BTN)).toBeDisabled();
       fx.assertNoConsoleErrors();
@@ -525,13 +510,13 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     }
   });
 
-  test("15. exact executable request uses the selected version", async ({ page }) => {
+  test("15. exact executable request pins the current version", async ({ page }) => {
     const fx = await setupFakeTest(page);
     try {
       await selectWorkflowOption(page, "wf_text2img");
-      await selectVersionOption(page, "wv1_old");
-      // wv1_old's default preset (wpres_old_a) is auto-selected.
-      await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_old_a");
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv1_latest");
+      // The current version's default preset (wpres_a) is auto-selected.
+      await expect(page.locator(PRESET_SELECTOR)).toHaveValue("wpres_a");
 
       // Override the prompt via the mapped control.
       await page.locator('[data-testid="workflow-input-prompt"]').fill("overridden modern prompt");
@@ -543,12 +528,12 @@ test.describe("Studio Workflow Run (fake backend)", () => {
       const run = await latestWorkflowRun(fx);
       expect(run).toBeTruthy();
       expect(run.workflow_id).toBe("wf_text2img");
-      expect(run.workflow_version_id).toBe("wv1_old");
-      expect(run.preset_id).toBe("wpres_old_a");
+      expect(run.workflow_version_id).toBe("wv1_latest");
+      expect(run.preset_id).toBe("wpres_a");
       expect(run.featureId).toBe("txt2img");
       expect(run.controls.prompt).toBe("overridden modern prompt");
       expect(run.metadata.workflow_name).toBe("Text2Img Workflow");
-      expect(run.metadata.preset_name).toBe("Old Preset A");
+      expect(run.metadata.preset_name).toBe("Preset A");
       expect(run.metadata.workflow_hash).toBeTruthy();
       expect(run.metadata.source).toBe("studio_playground");
 
@@ -702,7 +687,7 @@ test.describe("Studio Workflow Run (fake backend)", () => {
     const fx = await setupFakeTest(page);
     try {
       await page.locator(WF_SELECTOR).selectOption("wf_incomplete");
-      await expect(page.locator(VER_SELECTOR)).toHaveValue("wv_incomplete", { timeout: 10000 });
+      await expect(page.locator(VER_SELECTOR)).toHaveAttribute("data-version-id", "wv_incomplete", { timeout: 10000 });
       await expect(page.locator(RUN_BTN)).toBeDisabled({ timeout: 10000 });
 
       // Even a forced click on the disabled Run must never produce a modern

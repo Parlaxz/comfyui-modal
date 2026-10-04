@@ -387,7 +387,8 @@ export async function installWorkflowsMock(page, seed) {
   }
 
   function seedDefaultDataset() {
-    // Portrait Pro: versions 1 + 2, both mapped. Version 2 is the latest.
+    // Portrait Pro: versions 1 + 2, both mapped. Version 2 is the latest and
+    // carries the runnable current preset; v1 remains historical fixture data.
     const pp = seedWorkflow({
       name: "Portrait Pro",
       folder: "Portraits",
@@ -395,31 +396,38 @@ export async function installWorkflowsMock(page, seed) {
       source_author: "Modal Team",
     });
     const ppV1 = seedVersion(pp.workflow_id, { version_number: 1, mapping: true });
+    const portraitValues = {
+      sampler: "euler",
+      scheduler: "normal",
+      seed: 42,
+      steps: 28,
+      cfg: 7,
+      positive_prompt: "A portrait of a woman",
+      negative_prompt: "blurry",
+      model: "test-model.safetensors",
+      width: 1024,
+      height: 1024,
+      denoise: 1,
+      source_image: "",
+      hires_fix: false,
+    };
     seedPreset(ppV1.workflow_version_id, {
       name: "Portrait Default",
-      values: {
-        sampler: "euler",
-        scheduler: "normal",
-        seed: 42,
-        steps: 28,
-        cfg: 7,
-        positive_prompt: "A portrait of a woman",
-        negative_prompt: "blurry",
-        model: "test-model.safetensors",
-        width: 1024,
-        height: 1024,
-        denoise: 1,
-        source_image: "",
-        hires_fix: false,
-      },
+      values: { ...portraitValues },
     });
-    seedVersion(pp.workflow_id, {
+    const ppV2 = seedVersion(pp.workflow_id, {
       version_number: 2,
       mapping: true,
       dependency_metadata: {
         model_stack: ["sd_xl_base_1.0.safetensors"],
         node_classes: ["KSampler", "CLIPTextEncode"],
       },
+    });
+    // Keep v1 as historical fixture data while ensuring the current version
+    // is runnable in the Shelf.
+    seedPreset(ppV2.workflow_version_id, {
+      name: "Portrait Current",
+      values: { ...portraitValues },
     });
 
     // Abstract Test: version 1 UNMAPPED → state incomplete, run disabled.

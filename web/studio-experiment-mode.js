@@ -1149,7 +1149,7 @@ export function experimentRunSurface(state) {
 export function modernExperimentDisabledReason(state) {
   var selection = resolveModernWorkflowSelection(state);
   if (!selection.workflowId) return "Select a Workflow and Version before running an experiment.";
-  if (!selection.workflowVersionId) return "Select a Workflow Version before running an experiment.";
+  if (!selection.workflowVersionId) return "The selected Workflow has no current version available for this experiment.";
   return "";
 }
 

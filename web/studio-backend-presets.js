@@ -446,10 +446,11 @@ export function renderPresetForm(existing, apiBase, listPanel, detailPanel) {
   const statusEl = el("p", { style: "font-size:10px;color:#f87171;margin:0 0 8px;display:none;" });
   formCard.appendChild(statusEl);
 
-  // Workflow + version scope: presets are version-scoped, so the target
-  // version is chosen explicitly (only mapped versions accept presets).
+  // Legacy/admin surface: presets remain version-scoped for compatibility,
+  // so this form may target an immutable revision explicitly. The Shelf does
+  // not expose this chooser.
   const workflowSelect = el("select", { class: "comfymodal-studio-select", "aria-label": "Workflow" });
-  const versionSelect = el("select", { class: "comfymodal-studio-select", "aria-label": "Workflow version" });
+  const versionSelect = el("select", { class: "comfymodal-studio-select", "aria-label": "Version" });
   const scopeGroup = el("div", { class: "comfymodal-studio-backend-field" });
   scopeGroup.appendChild(el("label", { text: "Workflow" }));
   scopeGroup.appendChild(workflowSelect);

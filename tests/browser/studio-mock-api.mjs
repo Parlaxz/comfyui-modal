@@ -983,6 +983,11 @@ export async function installStudioMockApi(page, options = {}) {
     return _json({ status: "ok", backends: [] });
   }
 
+  /** GET /comfymodal/studio/models — empty model catalog for workflow pickers. */
+  async function listStudioModels(route, url) {
+    return _json({ status: "ok", models: [] });
+  }
+
   /**
    * Config endpoint — the real backend returns Modal/ComfyUI settings.
    * The Playground does not read this directly; it is called during
@@ -1154,6 +1159,9 @@ export async function installStudioMockApi(page, options = {}) {
 
     // Backend discovery (returns empty — Playground uses presets instead)
     ["GET", "/comfymodal/studio/backends", listBackends],
+
+    // Model library used by the workflow preset editor's model pickers.
+    ["GET", "/comfymodal/studio/models", listStudioModels],
 
     // Remote model-volume inventory (wizard Dependencies overlay).
     ["GET", "/comfymodal/models", listRemoteModelsMock],

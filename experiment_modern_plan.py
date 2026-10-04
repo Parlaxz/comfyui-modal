@@ -246,8 +246,9 @@ def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
     """Normalise one workflow value into a list of target specs.
 
     Each target spec is ``{"workflow_id", "workflow_version_id", "preset_id"}``
-    with ``None`` for unpinned ids.  A value may pin version/preset directly
-    or expand via ``versions`` / ``presets`` lists (cartesian when both).
+    with ``None`` for unpinned ids. Workflow values resolve one current
+    version at plan time; explicit version ids remain supported for frozen
+    replay and provenance. Multi-version expansion is rejected.
     """
     if isinstance(entry, str):
         value = entry.strip()
@@ -267,10 +268,11 @@ def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
         )
     wf_id = wf_id.strip()
 
-    versions = entry.get("versions")
     presets = entry.get("presets")
-    if versions is not None and not isinstance(versions, list):
-        raise ExperimentDefinitionError("'versions' must be a list")
+    if "versions" in entry:
+        raise ExperimentDefinitionError(
+            "workflow 'versions' expansion is not supported; provide one explicit version pin"
+        )
     if presets is not None and not isinstance(presets, list):
         raise ExperimentDefinitionError("'presets' must be a list")
 
@@ -295,41 +297,19 @@ def _normalize_workflow_targets(entry: Any) -> list[dict[str, Any]]:
             "workflow 'presets' entries must be strings or dicts"
         )
 
-    if versions is None and presets is None:
+    if presets is None:
         return [{
             "workflow_id": wf_id,
             "workflow_version_id": version_pin,
             "preset_id": preset_pin,
         }]
-    if versions is None:
-        if not presets:
-            raise ExperimentDefinitionError("workflow 'presets' must not be empty")
-        return [{
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(p),
-            "preset_id": _preset_pin(p),
-        } for p in presets]
-    if presets is None:
-        if not versions:
-            raise ExperimentDefinitionError("workflow 'versions' must not be empty")
-        return [{
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(v),
-            "preset_id": _preset_pin(v),
-        } for v in versions]
-    if not versions or not presets:
-        raise ExperimentDefinitionError(
-            "workflow 'versions' and 'presets' must not be empty"
-        )
-    return [
-        {
-            "workflow_id": wf_id,
-            "workflow_version_id": _version_pin(v),
-            "preset_id": _preset_pin(p),
-        }
-        for v in versions
-        for p in presets
-    ]
+    if not presets:
+        raise ExperimentDefinitionError("workflow 'presets' must not be empty")
+    return [{
+        "workflow_id": wf_id,
+        "workflow_version_id": _version_pin(p),
+        "preset_id": _preset_pin(p),
+    } for p in presets]
 
 
 # ── Public types ───────────────────────────────────────────────────────────
@@ -640,8 +620,8 @@ def resolve_workflow_axis_value(
     * Domain failures (workflow/version/preset missing, unrunnable version,
       mapping missing, preset mismatch) return ``status == "error"`` — the
       caller rejects only the affected cells.
-    * A value that expands to multiple targets (``versions``/``presets``
-      lists) or that is structurally malformed raises
+    * A value that expands to multiple targets (``presets`` lists) or that is
+      structurally malformed raises
       ``ExperimentDefinitionError``.
     """
     targets = _normalize_workflow_targets(workflow_value)
@@ -910,8 +890,8 @@ def build_cell_plan(
     Accepts the aliases ``workflows``/``workflow`` (top level), ``axes``/
     ``axis`` (axis container), and version/preset pinning via
     ``workflow_version_id``/``version_id``/``version`` and
-    ``preset_id``/``preset`` (plus ``versions``/``presets`` expansion lists
-    on a workflow value).
+     ``preset_id``/``preset`` (plus ``presets`` expansion lists on a workflow
+     value). Workflow ``versions`` expansion is intentionally unsupported.
     """
     if not isinstance(experiment_def, dict):
         raise ExperimentDefinitionError("experiment definition must be a dict")

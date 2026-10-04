@@ -1754,7 +1754,7 @@ export function renderWorkflows(state, context) {
     const valid = _view.data.versions.find((v) => v.workflow_version_id === _view.selectedVersionId);
     if (!valid) {
       const latest = _view.data.versions.find((v) => v.workflow_version_id === (workflow && workflow.latest_version_id))
-        || _view.data.versions[_view.data.versions.length - 1]
+        || _view.data.versions.slice().sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0]
         || null;
       _view.selectedVersionId = latest ? latest.workflow_version_id : "";
     }
@@ -1853,7 +1853,11 @@ export function renderWorkflows(state, context) {
     const versions = _unwrap(verResp, "versions");
     _view.data.versions = Array.isArray(versions) ? versions : [];
     if (newVerId) _view.selectedVersionId = newVerId;
-    else if (_view.data.versions.length) _view.selectedVersionId = _view.data.versions[_view.data.versions.length - 1].workflow_version_id;
+    else if (_view.data.versions.length) {
+      const latest = _view.data.versions.slice()
+        .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0];
+      _view.selectedVersionId = latest.workflow_version_id;
+    }
     render();
     await loadVersionData();
   }
@@ -2152,7 +2156,6 @@ export function renderWorkflows(state, context) {
         onclick: captureNewVersion,
       }),
     ]));
-
     const list = el("div", { class: "comfymodal-studio-version-list", "data-testid": "version-list" });
     if (versions.length === 0) {
       list.appendChild(el("p", { class: "comfymodal-studio-dependencies-note", text: "No versions yet. Capture the current ComfyUI graph to create the first version." }));

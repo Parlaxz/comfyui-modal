@@ -1718,9 +1718,9 @@ function _workflowSelectEl(state, actions, context) {
 }
 
 function _workflowVersionSelectEl(state, actions, context) {
-  // A workflow has one version, so this is a read-only label rather than a
-  // chooser. It keeps the field's place in the layout and its testid, so the
-  // surrounding run form is unchanged; only the ability to switch is gone.
+  // The Shelf runs the Workflow's current version. Internal immutable
+  // revisions are retained for compatibility and provenance but are not
+  // selectable here.
   const store = state && state.playground && state.playground._workflowRun;
   if (!store || !store.workflowId) {
     return el("span", {
@@ -1730,9 +1730,20 @@ function _workflowVersionSelectEl(state, actions, context) {
     });
   }
   const versions = store.versions || [];
-  const current = versions.find(
-    (v) => String(v.workflow_version_id) === String(store.workflowVersionId)
-  ) || versions[versions.length - 1];
+  const workflow = (store.library || []).find(
+    (w) => String(w.workflow_id) === String(store.workflowId)
+  );
+  // An explicit Workflows/admin compatibility handoff is a deterministic
+  // replay path and may intentionally pin an immutable historical revision.
+  const handoffVersion = store.handoff && store.handoff.workflowVersionId
+    ? versions.find((v) => String(v.workflow_version_id) === String(store.handoff.workflowVersionId))
+    : null;
+  const current = handoffVersion || versions.find(
+    (v) => String(v.workflow_version_id) === String(workflow && workflow.latest_version_id)
+  ) || versions
+    .filter((v) => v && v.workflow_version_id)
+    .slice()
+    .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0];
   if (!current) {
     return el("span", {
       class: "comfymodal-input comfymodal-studio-select",
@@ -2210,50 +2221,49 @@ async function _restoreWorkflowSelection(state, context, actions, wf, store, sav
     wf.clearWorkflowSelection();
     return;
   }
-  if (saved.workflowVersionId) {
-    // A workflow has one version, so a restored id is a hint, not a choice.
-    // Snap to whatever the workflow's latest is now rather than failing when
-    // the saved version is gone: the run context is version-agnostic to the
-    // user, who has no way to pick a different one any more.
-    const wanted = String(saved.workflowVersionId);
-    const versions = store.versions || [];
-    const target =
-      versions.find((v) => String(v.workflow_version_id) === wanted)
-      || versions[versions.length - 1];
-    if (!target) {
-      store.statusLine = "Requested version no longer available";
-      store.setVersionId("");
-      store.setPresetId("");
-      store.setPresetName("");
-      store.controlValues = {};
-      store.setStatus("ready");
-      store.setReasons(["Requested version no longer available"]);
-      return;
-    }
-    const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
-    if (!verRes.ok) {
-      store.statusLine = verRes.error || "Requested version no longer available";
-      return;
-    }
+  // Ordinary Shelf restore always follows the Workflow's current pointer.
+  // An old saved id is not an implicit historical replay path: there is no
+  // user-facing chooser that could recover from being pinned to it.
+  const versions = store.versions || [];
+  const target = versions.find(
+    (v) => String(v.workflow_version_id) === String(workflow.latest_version_id)
+  ) || versions
+    .filter((v) => v && v.workflow_version_id)
+    .slice()
+    .sort((a, b) => (Number(b.version_number) || 0) - (Number(a.version_number) || 0))[0];
+  if (!target) {
+    store.statusLine = "Workflow has no current version";
+    store.setVersionId("");
+    store.setPresetId("");
+    store.setPresetName("");
+    store.controlValues = {};
+    store.setStatus("ready");
+    store.setReasons(["Workflow has no current version"]);
+    return;
+  }
+  const verRes = await wf.selectVersion(apiBase, store, target.workflow_version_id);
+  if (!verRes.ok) {
+    store.statusLine = verRes.error || "Workflow current version is unavailable";
+    return;
   }
   if (saved.presetId) {
     const presetExists = (store.presets || []).some((p) => String(p.preset_id) === String(saved.presetId));
-    if (!presetExists) {
-      // Keep the workflow/version; never silently substitute a preset.
-      store.statusLine = "Requested preset no longer available";
-      store.setPresetId("");
-      store.setPresetName("");
-      store.setStatus("ready");
-      store.setReasons(["Requested preset no longer available"]);
-      return;
-    }
-    const preRes = await wf.selectPreset(apiBase, store, saved.presetId);
-    if (!preRes.ok) {
-      store.statusLine = preRes.error || "Requested preset no longer available";
-      return;
+    if (presetExists) {
+      const preRes = await wf.selectPreset(apiBase, store, saved.presetId);
+      if (!preRes.ok) {
+        store.statusLine = preRes.error || "Requested preset no longer available";
+        return;
+      }
     }
   }
   await _loadWorkflowModelLibrary(state, apiBase);
+  wf.saveWorkflowSelection({
+    workflowId: store.workflowId,
+    workflowVersionId: store.workflowVersionId,
+    presetId: store.presetId,
+    workflowName: store.workflowName || "",
+    presetName: store.presetName || "",
+  });
   _loadPersistedSelectionResult(state, store, null, context);
 }
 

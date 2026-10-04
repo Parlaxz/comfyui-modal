@@ -309,7 +309,7 @@ test.describe("Studio ZIT E2E", () => {
     } catch { /* fall through to import */ }
 
     let wfId = sifatida ? sifatida.workflow_id : "";
-    let verId = "";
+    let verId = sifatida ? (sifatida.latest_version_id || "") : "";
 
     if (!sifatida) {
       // ── 1. Import via file input (absolute ZIT path) ──────────────
@@ -474,7 +474,9 @@ test.describe("Studio ZIT E2E", () => {
     const wfSelect = page.locator('[data-testid="workflow-selector"]');
     await expect(wfSelect.locator(`option[value="${wfId}"]`)).toHaveCount(1, { timeout: 15000 });
     await wfSelect.selectOption(wfId);
-    await expect(page.locator('[data-testid="workflow-version-selector"] option')).toHaveCount(2, { timeout: 15000 });
+    const versionField = page.locator('[data-testid="workflow-version-selector"]');
+    await expect(versionField.locator("option")).toHaveCount(0, { timeout: 15000 });
+    await expect(versionField).toHaveAttribute("data-version-id", verId, { timeout: 15000 });
     const presetSelect = page.locator('[data-testid="workflow-preset-selector"]');
     await expect(presetSelect.locator(`option[value="${presetId}"]`)).toHaveCount(1, { timeout: 15000 });
     await presetSelect.selectOption(presetId);
