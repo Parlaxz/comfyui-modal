@@ -8368,6 +8368,7 @@ class GoldenSession:
         self.unet_owner: Optional[GoldenQDOwner] = None
         self.vae: Any = None
         self.vae_owner: Optional[GoldenQDOwner] = None
+        self.vae_dynamicvram_activation: Optional[dict[str, Any]] = None
         self.images: Any = None
         self.pending_durability: Optional[PendingDurability] = None
         self.output_artifact: Optional[ReadyOutputArtifact] = None
@@ -15725,6 +15726,44 @@ async def golden_clip_forward_unet_window(
         await unet_load()
 
 
+async def _golden_vae_load_then_early_activate(
+    session: GoldenSession, vae_load: Callable[[], Any]
+) -> Any:
+    """Load the VAE, then relocate its required DynamicVRAM activation.
+
+    ``golden_vae_load`` completes here while ``golden_sampling`` is still
+    running on the sibling leg, which is the only interval in the request where
+    there is real work to hide behind.  The activation performed by
+    :mod:`comfymodal_runtime.vae_dynamicvram_overlap` is the *same* canonical
+    ``load_models_gpu`` call ``VAE.decode`` would make -- it is relocated, not
+    removed, and it is registry-neutral so the decode-time call still derives its
+    own single entry.
+
+    Every failure mode is non-fatal: the canonical decode-time activation runs
+    unchanged, so a missed relocation costs wall, never correctness.
+    """
+    result = await vae_load()
+    try:
+        from . import vae_dynamicvram_overlap
+
+        identity = vae_dynamicvram_overlap.capture_identity(session)
+        record = vae_dynamicvram_overlap.early_activate(session, identity)
+    except Exception as exc:  # noqa: BLE001
+        record = {
+            "status": "error",
+            "reason": f"relocate:{type(exc).__name__}:{str(exc)[:120]}",
+            "activation_ms": None,
+            "activation_start_ns": None,
+            "activation_end_ns": None,
+        }
+    session.vae_dynamicvram_activation = record
+    try:
+        session.recorder.event("vae_dynamicvram_early_activation", **record)
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
 async def golden_sampling_vae_window(
     session: GoldenSession, *, schedule: str,
     sampling: Optional[Callable[[], Any]] = None,
@@ -15736,14 +15775,43 @@ async def golden_sampling_vae_window(
     if schedule == OVERLAP_SCHEDULE_OVERLAP:
         await _golden_stage_pair_overlap(
             session, kind="sampling_vae", pair=SAMPLING_VAE_OVERLAP_PAIR,
-            sibling_name="golden_vae_load", sibling_call=vae_load,
+            sibling_name="golden_vae_load",
+            sibling_call=(lambda: _golden_vae_load_then_early_activate(session, vae_load)),
             owner_name="golden_sampling", owner_call=sampling,
         )
+        _finalize_vae_dynamicvram_activation(session)
         return
     with _golden_trace_span("golden_vae_load"):
         await vae_load()
     with _golden_trace_span("golden_sampling"):
         await sampling()
+
+
+def _finalize_vae_dynamicvram_activation(session: GoldenSession) -> None:
+    """Annotate the early activation with the real sampling interval.
+
+    The stage-pair evidence is only complete once both legs have joined, so the
+    "did this actually land inside sampling" question is answered from measured
+    monotonic timestamps rather than assumed.  A relocation that merely moved
+    the cost earlier, without overlapping it, stays visible as
+    ``inside_sampling=False`` instead of reporting as a win.
+    """
+    record = getattr(session, "vae_dynamicvram_activation", None)
+    if not isinstance(record, dict):
+        return
+    evidence = getattr(session.recorder, "sampling_vae_overlap", None)
+    try:
+        from . import vae_dynamicvram_overlap
+
+        vae_dynamicvram_overlap.annotate_sampling_overlap(record, evidence or {})
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        session.recorder.event(
+            "vae_dynamicvram_activation_result", **record
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ── Top-level explicit serial executor ────────────────────────────────────
