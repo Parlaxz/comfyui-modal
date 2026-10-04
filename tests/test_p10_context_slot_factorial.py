@@ -202,6 +202,31 @@ def test_preinit_off_never_starts_a_worker_and_never_calls_the_driver(
 
 
 @pytest.mark.fast_unit
+def test_preinit_off_join_is_a_strict_no_op(arm_env, monkeypatch) -> None:
+    """Regression: join() is called unconditionally from initialize_cuda().
+
+    When it lacked its own flag gate it fell into the inline fallback, so the
+    declared "no preinit" control silently executed the 293 ms driver call that
+    the control exists to omit.  The OFF arm must run zero CUDA work at both the
+    start and the join site.
+    """
+    c0 = _load_c0(arm_env, COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT="0")
+    calls: list[int] = []
+    monkeypatch.setattr(
+        c0, "_preinit_primary_context", lambda device: calls.append(device) or {"ok": True}
+    )
+    assert c0.start_c0_context_preinit(snap=False) == {"context_preinit": "disabled"}
+    result = c0.join_c0_context_preinit()
+    assert calls == [], "preinit OFF must never reach the driver primitive"
+    assert result["context_preinit"] == "disabled"
+    assert result["context_preinit_mode"] == "disabled"
+    assert result["context_preinit_status"] == "disabled"
+    assert result["context_preinit_wall_ms"] == 0.0
+    assert result["context_preinit_join_wait_ms"] == 0.0
+    assert result["context_preinit_joined"] is False
+
+
+@pytest.mark.fast_unit
 def test_preinit_on_runs_the_driver_primitive_on_a_worker_thread(arm_env, monkeypatch) -> None:
     c0 = _load_c0(arm_env, COMFYMODAL_GOLDEN_C0_REGISTRATION_CONTEXT_PREINIT="1")
     main_ident = threading_ident()

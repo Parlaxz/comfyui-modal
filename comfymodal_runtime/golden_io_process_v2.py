@@ -268,12 +268,30 @@ class _C0ContextPreinit:
         Returns the same evidence the inline arm recorded, plus the join wait so
         a caller can prove how much of the cost was actually hidden.
         """
+        # The flag gate belongs here as well as in start().  join() is called
+        # from initialize_cuda() unconditionally, so without this check the
+        # OFF arm would fall into the inline fallback and silently pay the very
+        # cost the control is supposed to omit -- which would make "preinit off"
+        # indistinguishable from "preinit inline" instead of the exact
+        # production control it has to be.
+        if not c0_registration_context_preinit_enabled():
+            return {
+                "context_preinit": "disabled",
+                "context_preinit_mode": "disabled",
+                "context_preinit_start": 0,
+                "context_preinit_end": 0,
+                "context_preinit_wall_ms": 0.0,
+                "context_preinit_thread_cpu_ms": 0.0,
+                "context_preinit_join_wait_ms": 0.0,
+                "context_preinit_status": "disabled",
+                "context_preinit_joined": False,
+            }
         with self._lock:
             thread = self._thread
         if thread is None:
-            # No worker was started (the flag is on but this container never ran
-            # the restore hoist, e.g. a legacy restore).  Fall back to the
-            # inline behaviour so the arm keeps working, and say so in evidence.
+            # The flag is on but this container never ran the restore hoist
+            # (e.g. a legacy restore).  Fall back to the inline behaviour so the
+            # arm still does the work, and say so in evidence.
             return self._run_inline()
         wait_start_ns = time.monotonic_ns()
         thread.join(timeout=float(timeout_s))
