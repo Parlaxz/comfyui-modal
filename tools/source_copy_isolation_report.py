@@ -369,6 +369,8 @@ def warm_read_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     bytes_requested: list[int] = []
     calls: list[int] = []
     retries: list[int] = []
+    eintr: list[int] = []
+    complete_flags: list[bool] = []
     per_container: list[dict[str, Any]] = []
     for row in rows:
         population = (row.get("report") or {}).get("population") or {}
@@ -378,6 +380,9 @@ def warm_read_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             dict(item) for item in (population.get("warm_blocks") or [])
         ]
         blocks.extend(container_blocks)
+        complete_flags.append(bool(population.get("warm_complete")))
+        if isinstance(population.get("warm_eintr_retries"), int):
+            eintr.append(int(population["warm_eintr_retries"]))
         for key, sink in (
             ("warm_total_ms", totals),
             ("warm_effective_gbps", gbps),
@@ -426,8 +431,20 @@ def warm_read_evidence(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     )
     total_ms = sum(totals) if totals else None
     total_bytes = sum(bytes_read) if bytes_read else None
+    # FULL_READ_PROVEN, computed here rather than read from the population roll-up:
+    # this is the function that sees every container's own byte counts, so this is
+    # where "every warm read consumed exactly the file it declared" can be decided.
+    # A warm read that got 99.99% of the file did not prove anything.
+    every_exact = bool(
+        bytes_read
+        and len(bytes_read) == len(complete_flags)
+        and all(complete_flags)
+        and all(read == requested for read, requested in zip(bytes_read, bytes_requested))
+    )
     return {
         "containers": len(per_container),
+        "every_warm_read_exact": every_exact,
+        "eintr_retries": eintr,
         "block_count": len(blocks),
         "block_bytes": (
             blocks[0].get("requested_bytes") if blocks else None
@@ -643,6 +660,13 @@ PATHOLOGICAL_P99_MS = 100.0
 # a merely-slower-than-mmap primitive as broken and manufacture CASE 3.
 WARM_READ_PATHOLOGICAL_MS = 250.0
 
+# A positioned read only replaces the mapping if it is not slower. A full-file
+# positioned read costs one pass and the mapping it would replace also costs one
+# pass, so the ratio is the whole argument: below this, swapping the primitive
+# would regress the source pass no matter how healthy the reads look in
+# isolation. Fixed here, and applied to measurement, not to opinion.
+REPLACEMENT_REGRESSION_RATIO = 0.5
+
 
 def is_pathological(pooled: Mapping[str, Any], containers: int) -> bool:
     """One arm's pooled distribution, judged on its own absolute shape."""
@@ -851,6 +875,26 @@ def classify_population(summary: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _copy_throughput_gbps(verdict: Mapping[str, Any]) -> float | None:
+    """Median per-container GB/s actually moved by the timed mmap copy loop.
+
+    Median, not pooled: the sick containers are exactly the ones whose copy loop
+    takes seconds, and averaging them in would understate what the healthy path
+    delivers, which is the number the replacement would have to beat.
+    """
+    loops = []
+    for item in verdict.get("setup_costs") or []:
+        for variant in item.get("variants") or []:
+            wall = variant.get("setup_costs", {}).get("copy_loop_wall_ms")
+            copies = variant.get("copy_count")
+            if isinstance(wall, (int, float)) and wall > 0 and copies:
+                loops.append(float(copies) * 64 * 1024 * 1024 / (float(wall) / 1e3))
+    if not loops:
+        return None
+    loops.sort()
+    return round(loops[len(loops) // 2] / 1e9, 4)
+
+
 def classify_fullread(summary: Mapping[str, Any]) -> dict[str, Any]:
     """A4's question: did synchronously consuming the file fix the mapped copy?
 
@@ -968,25 +1012,54 @@ def classify_fullread(summary: Mapping[str, Any]) -> dict[str, Any]:
     postwarm_clean = treated_sick == 0
     result["postwarm_mmap_clean"] = postwarm_clean
 
+    # POSITIONED_READ_REPLACEMENT_JUSTIFIED, decided from measurement rather than
+    # asserted in prose.  "Justified" needs two independent things: that the mmap
+    # path is the problem, AND that the replacement is not slower.  The second is
+    # the one that is easy to skip, and it is decisive here: a full-file
+    # positioned read costs one pass, while the mapping it would replace also
+    # costs one pass, so the replacement is only ever worth it if it is faster.
+    warm_gbps = warm.get("effective_gbps")
+    copy_gbps = _copy_throughput_gbps(treated_verdict)
+    result["throughput_gbps"] = {
+        "warm_positioned_read": warm_gbps,
+        "postwarm_mmap_copy": copy_gbps,
+        "control_mmap_copy": _copy_throughput_gbps(control_verdict),
+    }
+    replacement = "unknown"
+    if warm_gbps and copy_gbps:
+        ratio = float(warm_gbps) / float(copy_gbps)
+        result["warm_read_vs_postwarm_mmap_ratio"] = round(ratio, 4)
+        if ratio < REPLACEMENT_REGRESSION_RATIO:
+            replacement = "no"
+            result["reasons"].append(
+                "positioned_read_is_materially_slower_than_the_warmed_mmap_copy_"
+                "so_replacing_it_would_regress_the_source_pass"
+            )
+
     if control_sick == 0:
         # CASE 4. The control did not reproduce the pathology, so there is nothing
         # for the warm read to have removed, and A4 is not evidence either way.
         result["classification"] = "INCONCLUSIVE_CURRENT_COHORT"
+        result["positioned_read_replacement_justified"] = replacement
         result["reasons"].append("control_did_not_reproduce_the_pathology")
         return result
     if postwarm_clean:
         # CASE 1.
         result["classification"] = "BACKING_AVAILABILITY_CONFIRMED"
+        result["positioned_read_replacement_justified"] = replacement
         result["reasons"].append(
             "control_pathological_and_no_treatment_container_pathological"
         )
     elif warm_sick == 0:
         # CASE 2. The source data was definitely consumed through another path and
         # the mapped reads are still pathological, while the positioned reads
-        # themselves look healthy.  That is the evidence that would justify
-        # replacing mmap -> memmove with positioned read -> arena.
+        # themselves look healthy.  That is the necessary evidence for replacing
+        # mmap -> memmove with positioned read -> arena -- but only if the
+        # replacement is also not slower, which is checked above.
         result["classification"] = "MMAP_PATH_CONFIRMED"
-        result["positioned_read_replacement_justified"] = "yes"
+        result["positioned_read_replacement_justified"] = (
+            "yes" if replacement != "no" else "no"
+        )
         result["reasons"].append(
             "mmap_still_pathological_after_a_proven_full_read_while_the_"
             "positioned_reads_themselves_are_clean"
@@ -996,12 +1069,14 @@ def classify_fullread(summary: Mapping[str, Any]) -> dict[str, Any]:
         # the control's mapped copies.  Reporting a decisive mechanism here would
         # over-read a small cohort.
         result["classification"] = "MIXED"
+        result["positioned_read_replacement_justified"] = replacement
         result["reasons"].append(
             "both_access_paths_show_a_tail_but_the_positioned_reads_are_fewer"
         )
     else:
         # CASE 3. Both primitives suffer, so the problem is not the mmap syscall.
         result["classification"] = "BROADER_SOURCE_BACKEND_PATHOLOGY"
+        result["positioned_read_replacement_justified"] = "no"
         result["reasons"].append(
             "positioned_reads_show_the_same_pathological_tail_as_the_mapped_copies"
         )

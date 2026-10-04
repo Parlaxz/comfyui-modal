@@ -670,7 +670,8 @@ def test_a_warm_read_is_never_reported_as_a_copy_loop_win():
 # ── the A4 decision: CASE 1-4, per container, never pooled-only ──────────
 
 def _fullread_summary(*, control_sick, a4_sick, warm_sick, warm_proven=True,
-                      same_deployment=True, warm_blocks=180):
+                      same_deployment=True, warm_blocks=180,
+                      warm_gbps=1.93, postwarm_gbps=14.89):
     def cohort(sick, with_warm):
         per_container = [
             {"request_id": f"r{index}", "over_thresholds": {">100ms": 0},
@@ -694,7 +695,7 @@ def _fullread_summary(*, control_sick, a4_sick, warm_sick, warm_proven=True,
                 blocks[b]["wall_ms"] = 900.0
             warm_per_container.append({
                 "request_id": f"r{index}", "blocks": len(blocks),
-                "warm_ms": 1500.0, "effective_gbps": 8.2,
+                "warm_ms": 1500.0, "effective_gbps": warm_gbps,
                 "wall_ms": {"p50": 12.0, "p99": 900.0 if warm_sick else 15.0,
                             "max": 900.0 if warm_sick else 20.0},
                 "over_thresholds": {">100ms": warm_sick, ">1000ms": warm_sick},
@@ -707,17 +708,28 @@ def _fullread_summary(*, control_sick, a4_sick, warm_sick, warm_proven=True,
                                 ">500ms": 0, ">1000ms": sick * 6},
             "per_container": per_container,
         }
+        # copy_loop_wall_ms is derived from the throughput the test wants to
+        # express, so the classifier's GB/s figures are the ones under test.
+        copies = 256
+        bytes_moved = copies * 64 * _MIB
+        copy_loop_ms = bytes_moved / (postwarm_gbps * 1e9) * 1e3
+        setup = [{"request_id": f"r{i}", "variants": [{
+            "variant": "concurrent4", "copy_count": copies,
+            "setup_costs": {"copy_loop_wall_ms": copy_loop_ms}}]}
+            for i in range(10)]
         if not with_warm:
             return {"pooled": population_pooled, "usable_containers": 10,
-                    "profiles": ["p"], "images": ["im"], "pathological": sick > 0}
+                    "profiles": ["p"], "images": ["im"], "pathological": sick > 0,
+                    "setup_costs": setup}
         return {
             "pooled": population_pooled, "usable_containers": 10,
             "profiles": ["p"], "images": ["im"], "pathological": sick > 0,
+            "setup_costs": setup,
             "warm_read": {
                 "containers": 10, "every_warm_read_exact": warm_proven,
                 "pathological_containers": warm_sick,
                 "total_ms": 15000.0, "bytes_read": 12_309_866_400,
-                "effective_gbps": 8.2,
+                "effective_gbps": warm_gbps,
                 "per_container": warm_per_container,
             },
         }
@@ -736,13 +748,17 @@ def test_case1_backing_availability_confirmed():
     assert decision["full_read_proven"] is True
     assert decision["postwarm_mmap_clean"] is True
     assert decision["pathological_containers"] == {"A": 2, "A4": 0, "A4_warm_reads": 0}
-    # A clean mechanism is not automatically a justified production change.
-    assert decision["positioned_read_replacement_justified"] == "unknown"
+    # A clean mechanism is not a justified production change. With the measured
+    # throughputs the positioned read is far slower, so the verdict is `no`.
+    assert decision["positioned_read_replacement_justified"] == "no"
 
 
 def test_case2_mmap_path_confirmed_and_replacement_justified():
+    # CASE 2 identifies the mechanism, but `yes` additionally requires the
+    # replacement to be materially faster than what it replaces.
     decision = report_tool.classify_fullread(_fullread_summary(
-        control_sick=2, a4_sick=2, warm_sick=0))
+        control_sick=2, a4_sick=2, warm_sick=0,
+        warm_gbps=40.0, postwarm_gbps=10.0))
     assert decision["classification"] == "MMAP_PATH_CONFIRMED"
     assert decision["postwarm_mmap_clean"] is False
     assert decision["pathological_containers"]["A4"] == 2
@@ -750,11 +766,21 @@ def test_case2_mmap_path_confirmed_and_replacement_justified():
     assert decision["positioned_read_replacement_justified"] == "yes"
 
 
+def test_case2_still_refuses_yes_when_the_positioned_read_is_slower():
+    decision = report_tool.classify_fullread(_fullread_summary(
+        control_sick=2, a4_sick=2, warm_sick=0,
+        warm_gbps=1.93, postwarm_gbps=14.89))
+    assert decision["classification"] == "MMAP_PATH_CONFIRMED"
+    assert decision["positioned_read_replacement_justified"] == "no"
+
+
 def test_case3_broader_source_backend_pathology():
     decision = report_tool.classify_fullread(_fullread_summary(
         control_sick=2, a4_sick=2, warm_sick=2))
     assert decision["classification"] == "BROADER_SOURCE_BACKEND_PATHOLOGY"
-    assert decision["positioned_read_replacement_justified"] == "unknown"
+    # Both primitives carry the same tail, so the positioned read is not a way
+    # out. The measured throughput ratio says so independently.
+    assert decision["positioned_read_replacement_justified"] == "no"
 
 
 def test_case4_control_clean_is_inconclusive_even_if_a4_looks_fine():
@@ -762,7 +788,7 @@ def test_case4_control_clean_is_inconclusive_even_if_a4_looks_fine():
         control_sick=0, a4_sick=0, warm_sick=0))
     assert decision["classification"] == "INCONCLUSIVE_CURRENT_COHORT"
     assert "control_did_not_reproduce_the_pathology" in decision["reasons"]
-    assert decision["positioned_read_replacement_justified"] == "unknown"
+    assert decision["positioned_read_replacement_justified"] == "no"
 
 
 def test_an_unproven_warm_read_blocks_the_whole_decision():
@@ -844,3 +870,46 @@ def test_warm_read_evidence_ignores_containers_that_never_warmed():
     assert evidence["total_ms"] is None
     assert evidence["effective_gbps"] is None
     assert evidence["pathological_containers"] == 0
+
+
+def test_the_replacement_verdict_is_computed_from_measured_throughput():
+    # The measured A4 cohort: positioned reads at 1.93 GB/s against a warmed mmap
+    # copy at 14.89 GB/s. A full-file read costs one pass and the mapping it would
+    # replace also costs one pass, so at a ratio of 0.13 the swap is a regression.
+    decision = report_tool.classify_fullread(_fullread_summary(
+        control_sick=3, a4_sick=1, warm_sick=1,
+        warm_gbps=1.9292, postwarm_gbps=14.8889))
+    assert decision["warm_read_vs_postwarm_mmap_ratio"] == 0.1296
+    assert decision["throughput_gbps"]["warm_positioned_read"] == 1.9292
+    assert decision["throughput_gbps"]["postwarm_mmap_copy"] == 14.8889
+    assert decision["positioned_read_replacement_justified"] == "no"
+    assert any("materially_slower" in reason for reason in decision["reasons"])
+
+
+def test_a_positioned_read_faster_than_the_mapping_is_not_rejected_on_throughput():
+    # If positioned reads were materially FASTER than the warmed mapping, the
+    # regression rule must not fire and CASE 2 could legitimately say yes.
+    decision = report_tool.classify_fullread(_fullread_summary(
+        control_sick=2, a4_sick=2, warm_sick=0,
+        warm_gbps=40.0, postwarm_gbps=10.0))
+    assert decision["classification"] == "MMAP_PATH_CONFIRMED"
+    assert decision["positioned_read_replacement_justified"] == "yes"
+    assert decision["warm_read_vs_postwarm_mmap_ratio"] == 4.0
+
+
+def test_the_regression_ratio_is_fixed_at_one_half():
+    assert report_tool.REPLACEMENT_REGRESSION_RATIO == 0.5
+
+
+def test_copy_throughput_is_a_median_over_containers_not_a_pooled_average():
+    # The sick containers are exactly the slow ones; averaging them in would
+    # understate what the healthy path delivers.
+    verdict = {"setup_costs": [
+        {"variants": [{"copy_count": 256, "setup_costs": {"copy_loop_wall_ms": 100.0}}]},
+        {"variants": [{"copy_count": 256, "setup_costs": {"copy_loop_wall_ms": 200.0}}]},
+        {"variants": [{"copy_count": 256, "setup_costs": {"copy_loop_wall_ms": 9000.0}}]},
+    ]}
+    gbps = report_tool._copy_throughput_gbps(verdict)
+    # 256 x 64 MiB = 17,179,869,184 B; the median container is the 200 ms one.
+    assert gbps == 85.8993, gbps
+    assert report_tool._copy_throughput_gbps({}) is None
