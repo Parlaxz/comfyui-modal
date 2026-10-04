@@ -53,8 +53,8 @@ async function pinPrimaryExtensionRequests(page) {
   });
 }
 
-async function installMocks(page) {
-  const api = await installStudioMockApi(page);
+async function installMocks(page, options) {
+  const api = await installStudioMockApi(page, options);
   const wfMock = await installWorkflowsMock(page);
   // Mount-pinning: rewrite sibling-lane extension requests to the primary
   // copy BEFORE the app loads (see pinPrimaryExtensionRequests).
@@ -246,7 +246,7 @@ test.describe("Studio Shelf Playground", () => {
   });
 
   test("4. single run completes into the right-side output panel", async ({ page }) => {
-    const { api, wfMock } = await installMocks(page);
+    const { api, wfMock } = await installMocks(page, { runDelayMs: 300 });
     await openStudio(page, COMFYUI_URL);
     await page.locator('[data-testid="control-panel"]').waitFor({ state: "visible", timeout: 15000 });
     const guard = installConsoleGuard(page);
@@ -254,10 +254,23 @@ test.describe("Studio Shelf Playground", () => {
     try {
       await selectPortraitV1(page, wfMock);
       await page.locator('[data-testid="shelf-input-positive_prompt"]').fill("shelf test cat");
+      await page.evaluate(() => localStorage.setItem(
+        "comfymodal.studio.golden.profile.v1",
+        "golden_p1_parallel_c0_p8_h100",
+      ));
 
       const runBtn = page.locator('[data-testid="run-btn"]');
       await expect(runBtn).toBeEnabled({ timeout: 10000 });
       await runBtn.click();
+
+      // Golden stage polling starts before the delayed POST resolves. The
+      // exact stage names and event-owned timing are visible while the POST
+      // is still in flight, but the run is not terminal yet.
+      await expect(page.locator('[data-testid="progress-golden-stage-row"]')).toHaveCount(2, { timeout: 10000 });
+      await expect(page.locator('[data-testid="progress-golden-stages"]')).toContainText("golden_clip_load");
+      await expect(page.locator('[data-testid="progress-golden-stages"]')).toContainText("golden_decode");
+      await expect(page.locator('[data-testid="progress-golden-stages"]')).toContainText("duration: 40ms");
+      await expect(page.locator('[data-testid="run-status-message"]')).toHaveCount(0);
 
       // Output lands in the right-side canvas (never a movable card).
       const canvasOutput = page.locator('[data-testid="canvas-output"]');
@@ -273,6 +286,8 @@ test.describe("Studio Shelf Playground", () => {
       expect(submitted).toBeTruthy();
       expect(submitted.workflow_id).toBe(portraitIds(wfMock).workflowId);
       expect(submitted.controls.positive_prompt).toBe("shelf test cat");
+      expect(submitted.request_id).toBeTruthy();
+      expect(submitted.profile_name).toBe("golden_p1_parallel_c0_p8_h100");
 
       // Metadata + timing surfaces stay on the right-side panel.
       await expect(page.locator('[data-testid="timing-card"]')).toBeVisible({ timeout: 10000 });

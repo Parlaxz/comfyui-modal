@@ -51,6 +51,12 @@ import {
   adaptSnapshot,
   adaptDirectResult,
 } from "./studio-run-adapters.js";
+import {
+  createGoldenProgressState,
+  applyGoldenProgressPage,
+  goldenProgressSnapshot,
+  markGoldenPostTerminal,
+} from "./studio-golden-progress.js";
 
 // ── Timing marks (Task 8: run-click instrumentation) ────────────────────
 
@@ -141,6 +147,7 @@ export function createPlaygroundRunController() {
 
   let _marks = [];
   let _lastExtras = {};
+  let _goldenProgress = createGoldenProgressState("");
 
   // Event source handles (for detach)
   let _sourceApi = null;
@@ -265,10 +272,11 @@ export function createPlaygroundRunController() {
      * steps control) are passed through to subscribers for the pre-telemetry
      * display. Returns { runId }.
      */
-    beginRun(extras) {
+    beginRun(extras, requestId) {
       _detachEventSource();
       _runId = _uuid();
-      _requestId = _uuid();
+      _requestId = requestId != null && String(requestId).trim() ? String(requestId) : _uuid();
+      _goldenProgress = createGoldenProgressState(_requestId);
       _backendRunId = null;
       _experimentId = null;
       _capturedPromptId = null;
@@ -293,6 +301,32 @@ export function createPlaygroundRunController() {
       }));
       _notify(store.getRun(_runId), _lastExtras);
       return { runId: _runId };
+    },
+
+    /** Apply a cursor page from the Golden stage stream. */
+    applyGoldenProgress(page) {
+      if (!_runId || _disposed || !page || typeof page !== "object") return this;
+      applyGoldenProgressPage(_goldenProgress, page);
+      _lastExtras = { ..._lastExtras, goldenProgress: goldenProgressSnapshot(_goldenProgress) };
+      _notify(store.getRun(_runId), _lastExtras);
+      return this;
+    },
+
+    /** Mark completion only after the Golden POST returns its terminal result. */
+    applyGoldenPostTerminal() {
+      if (!_runId || _disposed) return this;
+      markGoldenPostTerminal(_goldenProgress);
+      _lastExtras = { ..._lastExtras, goldenProgress: goldenProgressSnapshot(_goldenProgress) };
+      _notify(store.getRun(_runId), _lastExtras);
+      return this;
+    },
+
+    setGoldenProgressError(message) {
+      if (!_runId || _disposed) return this;
+      _goldenProgress.error = message != null ? String(message) : null;
+      _lastExtras = { ..._lastExtras, goldenProgress: goldenProgressSnapshot(_goldenProgress) };
+      _notify(store.getRun(_runId), _lastExtras);
+      return this;
     },
 
     /** Record a timing mark (idempotent by name). */
@@ -455,6 +489,11 @@ export function createPlaygroundRunController() {
       return _runId;
     },
 
+    /** Request identity sent to the Golden POST/progress stream. */
+    getRequestId() {
+      return _requestId;
+    },
+
     /**
      * Structured diagnostic data for the future Diagnose Run Details
      * waterfall: identity, canonical status, and ordered timing marks.
@@ -566,6 +605,12 @@ export function projectRunToLegacy(run, extras = {}) {
 
   out.queuePosition = run.queuePosition != null ? run.queuePosition : null;
   out.stage = run.stage != null ? run.stage : out.stage;
+  if (extras && extras.goldenProgress) {
+    out.goldenProgress = extras.goldenProgress;
+    out.goldenStage = extras.goldenProgress.currentStage || null;
+    out.goldenStageError = extras.goldenProgress.error || null;
+    out.goldenProgressPercent = extras.goldenProgress.percent;
+  }
   if (run.error && run.error.message != null) {
     out.error = run.error.message;
     out.message = run.error.message;

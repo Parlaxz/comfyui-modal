@@ -84,11 +84,45 @@ def _get_domain_service(node_dir: str | os.PathLike) -> Any:
 # ── Bundle resolution ─────────────────────────────────────────────────────
 
 
+def default_controls_from_version(
+    executable_prompt: dict[str, Any],
+    control_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Read each mapped role's current value out of the version's own prompt.
+
+    This is the documented no-preset path: control defaults come from the
+    version's ``executable_prompt`` rather than from a stored preset.  Values
+    are read literally through each mapping entry's ``node_id`` +
+    ``input_name``; a role that cannot be resolved is simply omitted rather
+    than guessed, so required-control validation still fails closed on it.
+    """
+    defaults: dict[str, Any] = {}
+    if not isinstance(executable_prompt, dict):
+        return defaults
+    for role, entry in (control_schema or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        node_id = str(entry.get("node_id", "") or "")
+        input_name = str(entry.get("input_name", "") or "")
+        if not node_id or not input_name:
+            continue
+        node = executable_prompt.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict) or input_name not in inputs:
+            continue
+        defaults[str(role)] = copy.deepcopy(inputs[input_name])
+    return defaults
+
+
 def resolve_workflow_run_bundle(
     workflow_id: str,
     version_id: str,
     preset_id: str,
     node_dir: str | os.PathLike,
+    *,
+    allow_remote_execution: bool = False,
 ) -> dict[str, Any]:
     """Resolve and gate a workflow run: workflow + version + mapping + preset.
 
@@ -131,12 +165,38 @@ def resolve_workflow_run_bundle(
 
     state = service.derive_version_state(version_id).to_dict()
     if not state.get("runnable"):
-        return {
-            "status": "error",
-            "error_code": "WORKFLOW_VERSION_NOT_RUNNABLE",
-            "message": "workflow version is not runnable",
-            "reasons": list(state.get("reasons") or []),
-        }
+        reasons = [str(r) for r in (state.get("reasons") or [])]
+        # Presets are optional in this domain (see the synthesized preset above),
+        # so "no preset selected" never blocks a run on its own.
+        reasons = [r for r in reasons if not r.startswith("no preset")]
+        if allow_remote_execution:
+            # A remote Golden run executes on the deployed Modal container, not
+            # on this host.  Reasons about files and custom nodes missing from
+            # THIS machine therefore say nothing about that run: the models and
+            # the published custom-node set live remotely.  Only
+            # host-independent reasons (an incomplete version, absent mapping,
+            # undefined controls) may still refuse the request.
+            #
+            # Remote admission is not weakened by this filter.  Golden's own
+            # ``resolve_golden_node_map`` remains fail-closed on structure
+            # (exactly one CLIPLoader/UNETLoader/VAELoader/CLIPTextEncode/
+            # VAEDecode and one sampler, with concrete declared model names),
+            # and the deployment must already satisfy its published
+            # custom-node contract for the run to be admitted at all.
+            reasons = [
+                r for r in reasons
+                if not (
+                    r.startswith("missing model ")
+                    or r.startswith("required custom node ")
+                )
+            ]
+        if reasons:
+            return {
+                "status": "error",
+                "error_code": "WORKFLOW_VERSION_NOT_RUNNABLE",
+                "message": "workflow version is not runnable",
+                "reasons": reasons,
+            }
 
     mapping = service.get_mapping(version_id)
     if mapping is None:
@@ -179,10 +239,15 @@ def resolve_workflow_run_bundle(
             except Exception:
                 preset = None
         if preset is None:
-            return {
-                "status": "error",
-                "error_code": "NO_PRESET",
-                "message": "no preset is available for this workflow run",
+            # Presets are optional in this domain: control defaults are read
+            # from the version's own ``executable_prompt`` (see
+            # ``default_controls_from_version``).  A workflow with no default
+            # preset therefore still runs with the version's own values
+            # instead of being refused.
+            preset = {
+                "preset_id": "",
+                "name": "",
+                "values": {},
             }
 
     executable_prompt = version.get("executable_prompt") or {}
@@ -190,6 +255,16 @@ def resolve_workflow_run_bundle(
     for entry in mapping.get("entries") or []:
         if isinstance(entry, dict) and entry.get("semantic_role"):
             control_schema[str(entry["semantic_role"])] = entry
+
+    # A synthesized (absent) preset carries no values of its own, so seed it
+    # from the version's own executable prompt.  Without this the required
+    # controls would read as missing even though the version defines them.
+    if not str(preset.get("preset_id") or "").strip():
+        seeded = default_controls_from_version(
+            executable_prompt if isinstance(executable_prompt, dict) else {},
+            control_schema,
+        )
+        preset = {**preset, "values": seeded}
 
     return {
         "status": "ok",
@@ -1473,6 +1548,7 @@ async def handle_workflow_run_async(
     gpu: Any = None,
     modal_options: dict[str, Any] | None = None,
     workspace: dict[str, Any] | None = None,
+    allow_remote_execution: bool = False,
 ) -> dict[str, Any]:
     """Async handler for a single Studio Workflow run.
 
@@ -1488,7 +1564,10 @@ async def handle_workflow_run_async(
     Returns the same result dict shapes as the legacy adapter.
     """
     try:
-        bundle = resolve_workflow_run_bundle(workflow_id, version_id, preset_id, node_dir)
+        bundle = resolve_workflow_run_bundle(
+            workflow_id, version_id, preset_id, node_dir,
+            allow_remote_execution=allow_remote_execution,
+        )
         if bundle.get("status") != "ok":
             return bundle
 

@@ -24036,23 +24036,74 @@ class ModalRuntimeEntrypoint:
                     if _full_trace_claimed
                     else nullcontext()
                 )
+                stream_golden_stage_events = (
+                    request.get("stream_golden_stage_events") is True
+                )
                 with _golden_trace_scope:
                     execute_golden = (
                         golden_parallel_execute
                         if requested_mode == "parallel"
                         else golden_serial_execute
                     )
-                    result = await execute_golden(
-                        golden_request,
-                        volume=volume,
-                        volume_mount_root=volume_mount_root,
-                        output_root=str(output_root),
-                        telemetry_path=str(telemetry_path),
-                        node_classes=node_classes,
-                        snapshot_proof=_golden_snapshot_proof_supplier,
-                        restore_metadata=restore_metadata,
-                        cpu_prefetch_ticket=cpu_prefetch_ticket,
-                    )
+                    if not stream_golden_stage_events:
+                        result = await execute_golden(
+                            golden_request,
+                            volume=volume,
+                            volume_mount_root=volume_mount_root,
+                            output_root=str(output_root),
+                            telemetry_path=str(telemetry_path),
+                            node_classes=node_classes,
+                            snapshot_proof=_golden_snapshot_proof_supplier,
+                            restore_metadata=restore_metadata,
+                            cpu_prefetch_ticket=cpu_prefetch_ticket,
+                        )
+                    else:
+                        stage_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+
+                        def _observe_golden_stage(event: dict[str, Any]) -> None:
+                            try:
+                                stage_queue.put_nowait(event)
+                            except BaseException:
+                                pass
+
+                        execution_task = asyncio.create_task(
+                            execute_golden(
+                                golden_request,
+                                volume=volume,
+                                volume_mount_root=volume_mount_root,
+                                output_root=str(output_root),
+                                telemetry_path=str(telemetry_path),
+                                node_classes=node_classes,
+                                snapshot_proof=_golden_snapshot_proof_supplier,
+                                restore_metadata=restore_metadata,
+                                cpu_prefetch_ticket=cpu_prefetch_ticket,
+                                stage_observer=_observe_golden_stage,
+                            )
+                        )
+                if stream_golden_stage_events:
+                    try:
+                        while True:
+                            if execution_task.done():
+                                while True:
+                                    try:
+                                        yield stage_queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        break
+                                result = execution_task.result()
+                                break
+                            try:
+                                yield await asyncio.wait_for(
+                                    stage_queue.get(), timeout=0.05
+                                )
+                            except asyncio.TimeoutError:
+                                continue
+                    finally:
+                        if not execution_task.done():
+                            execution_task.cancel()
+                        try:
+                            await execution_task
+                        except BaseException:
+                            pass
             finally:
                 golden_call_end_wall_ns = time.time_ns()
                 golden_call_end_mono_ns = time.monotonic_ns()

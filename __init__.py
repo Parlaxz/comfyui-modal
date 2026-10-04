@@ -7274,6 +7274,65 @@ if _server:
         }, status=409)
 
     # ── Studio run / experiment routes ─────────────────────────────────
+    @_server.routes.get("/comfymodal/studio/golden/profiles")
+    async def studio_golden_profiles(request: web.Request) -> web.Response:
+        """Return the config-owned, read-only Golden profile catalog."""
+        try:
+            from tools.v2_control.profile_catalog import catalog_golden_profiles
+
+            profiles = catalog_golden_profiles()
+            projected = [profile.to_dict() for profile in profiles]
+            ready = [profile.name for profile in profiles if profile.deployed]
+            default_profile = ready[0] if len(ready) == 1 else None
+            return web.json_response({
+                "status": "ok",
+                "defaultProfile": default_profile,
+                "profiles": projected,
+            })
+        except Exception as exc:
+            _log.warning("Golden profile catalog failed closed: %s", exc)
+            return web.json_response({
+                "status": "ok",
+                "defaultProfile": None,
+                "profiles": [],
+            })
+
+    @_server.routes.get("/comfymodal/studio/run-progress/{request_id}")
+    async def studio_run_progress(request: web.Request) -> web.Response:
+        """Poll bounded in-memory Golden events using the caller cursor."""
+        try:
+            raw_cursor = request.query.get("cursor", "0")
+            if not str(raw_cursor).isdigit():
+                raise ValueError("cursor must be a non-negative integer")
+            cursor = int(raw_cursor)
+            from studio_golden_run import EVENT_STORE, GoldenRunError
+
+            result = EVENT_STORE.read(request.match_info["request_id"], cursor)
+            return web.json_response(result)
+        except KeyError:
+            return web.json_response({
+                "status": "error",
+                "message": "unknown or expired request_id",
+            }, status=404)
+        except GoldenRunError as exc:
+            return web.json_response({
+                "status": "error",
+                "message": "unknown or expired request_id",
+            }, status=404)
+        except ValueError as exc:
+            return web.json_response({
+                "status": "error",
+                "message": str(exc),
+            }, status=400)
+        except Exception as exc:
+            # The store validates request IDs with Golden's path containment
+            # rules; malformed IDs are not allowed to become a lookup oracle.
+            _log.warning("Golden progress lookup failed: %s", exc)
+            return web.json_response({
+                "status": "error",
+                "message": "unknown or expired request_id",
+            }, status=404)
+
     @_server.routes.post("/comfymodal/studio/run")
     async def studio_run(request: web.Request) -> web.Response:
         """Execute a single Studio preset run.
@@ -7338,6 +7397,83 @@ if _server:
             or (body or {}).get("workflowVersionId")
             or ""
         ).strip()
+
+        # An explicit Golden profile is the only opt-in to the bounded direct
+        # lane.  Its target and resources are config-owned; the browser may
+        # still provide the selected workflow and its validated controls.
+        # Accept both spellings, matching the existing presetId/preset_id and
+        # workflow_id/workflowId convention.  The Studio frontend sends
+        # ``profile_name``; without this the request silently fell through to
+        # the local lane and was refused by the host-local dependency gate.
+        _golden_profile = str(
+            (body or {}).get("profile")
+            or (body or {}).get("profile_name")
+            or ""
+        ).strip()
+        if _golden_profile:
+            try:
+                import asyncio as _studio_asyncio
+                from studio_golden_run import (
+                    browser_override_error,
+                    run_golden_workflow,
+                )
+                _override_error = browser_override_error(body or {})
+                if _override_error:
+                    return web.json_response({
+                        "status": "error",
+                        "error_code": "GOLDEN_BROWSER_OVERRIDE_REJECTED",
+                        "message": _override_error,
+                    }, status=400)
+                if not _workflow_version_id:
+                    return web.json_response({
+                        "status": "error",
+                        "error_code": "GOLDEN_WORKFLOW_REQUIRED",
+                        "message": "workflow_version_id is required for a Golden Studio run",
+                    }, status=400)
+                _golden_request_id = str(
+                    (body or {}).get("request_id")
+                    or (body or {}).get("requestId")
+                    or ""
+                ).strip()
+                if not _golden_request_id:
+                    return web.json_response({
+                        "status": "error",
+                        "error_code": "GOLDEN_REQUEST_ID_REQUIRED",
+                        "message": "request_id is required for Golden progress polling",
+                    }, status=400)
+                result = await _studio_asyncio.wait_for(
+                    run_golden_workflow(
+                        workflow_id=str(
+                            (body or {}).get("workflow_id")
+                            or (body or {}).get("workflowId")
+                            or ""
+                        ),
+                        version_id=_workflow_version_id,
+                        preset_id=str(
+                            (body or {}).get("preset_id")
+                            or (body or {}).get("presetId")
+                            or ""
+                        ),
+                        controls=controls,
+                        request_id=_golden_request_id,
+                        node_dir=_NODE_DIR,
+                        profile_name=_golden_profile,
+                        workspace=_studio_ws,
+                    ),
+                    timeout=600.0,
+                )
+                return web.json_response(
+                    result,
+                    status=200 if result.get("status") == "ok" else 400,
+                )
+            except Exception as exc:
+                _log.exception("Studio Golden workflow run error")
+                return web.json_response({
+                    "status": "error",
+                    "error_code": "STUDIO_GOLDEN_RUN_ERROR",
+                    "message": str(exc)[:500],
+                }, status=400)
+
         if _workflow_version_id:
             import asyncio as _studio_asyncio
             try:

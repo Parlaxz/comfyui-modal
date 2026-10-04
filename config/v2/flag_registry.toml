@@ -1260,7 +1260,7 @@ default = "1"
 consumed_at = "request"
 change_requires = "deploy"
 owner = "golden-p1"
-description = "P1 serial-Golden workflow SHA equality guard; hash computation and telemetry remain enabled when this guard is explicitly disabled."
+description = "Advisory P1 workflow SHA comparison. Hash computation and telemetry are unconditional; a mismatch is recorded as a warning event and on the result (workflow_sha_match / workflow_sha_warning) but never blocks execution, because Studio runs legitimately carry a caller-selected workflow. Structural admission remains fail-closed in resolve_golden_node_map."
 
 # ── Harness selectors (consumed by the request harness; run-only) ───────────
 

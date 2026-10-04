@@ -10,6 +10,25 @@ const STORAGE_KEY = "comfymodal.studio.playground.v1";
 const DRAFTS_STORAGE_KEY = "comfymodal.studio.playground.drafts.v1";
 const RESULTS_STORAGE_KEY = "comfymodal.studio.playground.results.v1";
 const CAROUSEL_CLEARED_KEY = "comfymodal.studio.playground.carousel-cleared.v1";
+const GOLDEN_PROFILE_KEY = "comfymodal.studio.golden.profile.v1";
+
+export function saveGoldenProfileSelection(profileName) {
+  if (typeof profileName !== "string" || !profileName.trim()) return;
+  try { localStorage.setItem(GOLDEN_PROFILE_KEY, profileName.trim()); } catch (e) {}
+}
+
+export function loadGoldenProfileSelection() {
+  try {
+    const value = localStorage.getItem(GOLDEN_PROFILE_KEY);
+    return typeof value === "string" && value.trim() ? value.trim() : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+export function clearGoldenProfileSelection() {
+  try { localStorage.removeItem(GOLDEN_PROFILE_KEY); } catch (e) {}
+}
 
 function makeDraftKey(presetId, featureId) {
   return `${presetId || ""}::${featureId || ""}`;
