@@ -1675,6 +1675,44 @@ def _golden_telemetry_stage_duration_ms(stage: Mapping[str, Any]) -> float | Non
 _GOLDEN_WATERFALL_STAGE_LIMIT = _GOLDEN_LOG_COLLECTION_LIMIT
 _GOLDEN_WATERFALL_STAGE_WIDTH = 42
 _GOLDEN_WATERFALL_VALUE_WIDTH = 10
+
+# --- Golden call-envelope marks (measurement only) --------------------------
+# Modal's UI "Execution time" spans the whole method call, while every Golden
+# mark starts at golden_call_start_mono_ns (just before execute_golden) and ends
+# at return_armed. The interval between the two boundaries is therefore
+# unattributed by construction. These scalar monotonic marks bracket it so the
+# gap can be split into pre-Golden, result-construction, wire-handoff and
+# post-stream-release instead of estimated from the outside.
+_GOLDEN_ENVELOPE: dict[str, dict[str, int]] = {}
+_GOLDEN_ENVELOPE_MAX = 64
+_GOLDEN_ENVELOPE_ORDER = (
+    "method_entry_mono_ns",
+    "golden_call_start_mono_ns",
+    "golden_return_mono_ns",
+    "yield_mono_ns",
+    "stream_drained_mono_ns",
+    "release_start_mono_ns",
+    "release_end_mono_ns",
+)
+
+
+def _emit_golden_envelope(request_id: str) -> None:
+    """Print the measured call envelope as deltas from method entry."""
+    marks = _GOLDEN_ENVELOPE.pop(request_id, None)
+    if not marks:
+        return
+    base = marks.get("method_entry_mono_ns")
+    parts = []
+    for key in _GOLDEN_ENVELOPE_ORDER:
+        value = marks.get(key)
+        if value is None:
+            continue
+        delta = "" if base is None else " delta_ms=%.3f" % ((value - base) / 1e6)
+        parts.append("%s=%d%s" % (key, value, delta))
+    print(
+        "[v2.golden.envelope] request_id=%s %s" % (request_id, " ".join(parts)),
+        flush=True,
+    )
 _GOLDEN_WATERFALL_STATUS_WIDTH = 10
 
 
@@ -23488,6 +23526,29 @@ class ModalRuntimeEntrypoint:
         # early return) would leave the PREVIOUS request's path in place for the
         # post-yield outer-marks write below to overwrite.
         self._golden_telemetry_path = None
+
+        # --- Golden call-envelope instrumentation (measurement only) ----------
+        # Modal's UI "Execution time" covers the whole method call, but
+        # golden_call_start_mono_ns is only stamped just before execute_golden.
+        # Everything between here and there (adapter validation, volume and
+        # path work, node registry resolution, isolation checks, DynamicVRAM
+        # activation, ensure_gpu_ready) sits outside every Golden mark, as does
+        # result construction and the post-yield release. These scalar
+        # monotonic marks bracket that envelope so the interval can be
+        # attributed instead of guessed. Stamped first, before the lazy
+        # imports below, so it is a true method-entry mark. Behaviour is
+        # unchanged: this only reads the request id and stamps the clock.
+        _env_request_id = ""
+        try:
+            _env_request_id = str(request.get("request_id") or "")
+        except Exception:  # noqa: BLE001 - instrumentation must never fail a run
+            _env_request_id = ""
+        _envelope: dict[str, int] = {}
+        if _env_request_id:
+            _envelope["method_entry_mono_ns"] = time.monotonic_ns()
+            _GOLDEN_ENVELOPE[_env_request_id] = _envelope
+            while len(_GOLDEN_ENVELOPE) > _GOLDEN_ENVELOPE_MAX:
+                _GOLDEN_ENVELOPE.pop(next(iter(_GOLDEN_ENVELOPE)), None)
         outer_mark_lifetime = __import__(
             "comfymodal_runtime.golden_parallel", fromlist=["_OuterLifetime"]
         )._OuterLifetime
@@ -24148,6 +24209,7 @@ class ModalRuntimeEntrypoint:
             self._golden_execution_active = True
             golden_call_start_wall_ns = time.time_ns()
             golden_call_start_mono_ns = time.monotonic_ns()
+            _envelope["golden_call_start_mono_ns"] = golden_call_start_mono_ns
             try:
                 # VizTracer/Kineto must begin and end on this same async
                 # caller thread.  This boundary intentionally surrounds only
@@ -24364,6 +24426,7 @@ class ModalRuntimeEntrypoint:
         # and monotonic boundaries.
         _return_wall_unix_ns = time.time_ns()
         _return_mono_ns = time.monotonic_ns()
+        _envelope["golden_return_mono_ns"] = _return_mono_ns
         result_data = dataclasses.asdict(result)
         # Off-mode Golden owns no output file, so project its validated
         # in-memory bytes through the existing legacy ``images[].data``
@@ -24561,6 +24624,7 @@ class ModalRuntimeEntrypoint:
             result_data["golden_telemetry_error"] = telemetry_error
         _yield_wall_unix_ns = time.time_ns()
         _yield_mono_ns = time.monotonic_ns()
+        _envelope["yield_mono_ns"] = _yield_mono_ns
         _terminal_timing.update({
             "yield_wall_unix_ns": _yield_wall_unix_ns,
             "yield_mono_ns": _yield_mono_ns,
@@ -24569,6 +24633,11 @@ class ModalRuntimeEntrypoint:
         result_data["terminal"] = dict(_terminal_timing)
         result_data["terminal_timing"] = dict(_terminal_timing)
         yield {"type": "result", "data": result_data}
+        # Reached only after the consumer has drained the response stream, i.e.
+        # after Modal finished shipping the result (including the inline ~4 MB
+        # base64 PNG) and asked the generator for its next item. This is the
+        # only in-process point that observes the wire-handoff cost.
+        _envelope["stream_drained_mono_ns"] = time.monotonic_ns()
 
     async def run_prompt_stream(
         self,
@@ -24784,9 +24853,17 @@ def _build_decorated_v2_class() -> type:
                             yield item
                     finally:
                         if _release_on_close:
+                            _env = _GOLDEN_ENVELOPE.get(
+                                str(kwargs.get("request_id", "") or "")
+                            )
+                            if _env is not None:
+                                _env["release_start_mono_ns"] = time.monotonic_ns()
                             self._release_after_stream_complete(
                                 request_id=str(kwargs.get("request_id", "") or ""),
                             )
+                            if _env is not None:
+                                _env["release_end_mono_ns"] = time.monotonic_ns()
+                        _emit_golden_envelope(str(kwargs.get("request_id", "") or ""))
                 return _wrapper
             elif inspect.isgeneratorfunction(orig_method):
                 @functools.wraps(orig_method)
