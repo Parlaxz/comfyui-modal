@@ -42,7 +42,11 @@ def _cohort(tmp_path: Path, *, invocation_id: str, request_id: str, extra: dict 
         "sage_runtime_mode_effective_input": "auto",
         "sage_runtime_mode_resolution_source": "auto_resolution",
         "sage_runtime_mode_resolved": "baked_cuda",
-        "attempts": [{"v2ctl_invocation_id": invocation_id, "request_id": request_id}],
+        "attempts": [{
+            "v2ctl_invocation_id": invocation_id,
+            "request_id": request_id,
+            "observed_output_shas": ["a" * 64],
+        }],
     }
     if extra:
         base.update(extra)
@@ -56,7 +60,11 @@ def _cohort(tmp_path: Path, *, invocation_id: str, request_id: str, extra: dict 
         "sage_runtime_mode_effective_input": "auto",
         "sage_runtime_mode_resolution_source": "auto_resolution",
         "sage_runtime_mode_resolved": "baked_cuda",
-        "attempts": [{"v2ctl_invocation_id": invocation_id, "request_id": request_id}],
+        "attempts": [{
+            "v2ctl_invocation_id": invocation_id,
+            "request_id": request_id,
+            "observed_output_shas": ["a" * 64],
+        }],
     }
     if extra:
         # propagate extras to summary where relevant
@@ -73,6 +81,7 @@ def _cohort(tmp_path: Path, *, invocation_id: str, request_id: str, extra: dict 
         "valid": True,
         "dnf": False,
         "failures": [],
+        "observed_output_shas": ["a" * 64],
         "attention_backend_configured": "pytorch",
         "attention_backend_resolved": "pytorch",
         "sage_runtime_mode_configured": "auto",
